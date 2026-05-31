@@ -1,0 +1,5 @@
+openai
+httpx
+html2text
+pytest
+pytest-mock
