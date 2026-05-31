@@ -1,6 +1,6 @@
 import json
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 # Module-level todo store (keyed by a session id or default)
 _store: list[dict] = []
@@ -24,7 +24,7 @@ def _run(arg: agdata) -> agdata:
     )
 
 
-todowrite = tool(
+todowrite = agtool(
     name="todowrite",
     fn=_run,
     description="Update the todo list with a new set of items.",

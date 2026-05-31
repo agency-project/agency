@@ -74,3 +74,66 @@ def test_messages_pattern():
     h = agdata(messages=[])
     h.messages.append({"role": "user", "content": "hi"})
     assert len(h.messages) == 1
+
+
+# ---------------------------------------------------------------------------
+# Pending state
+# ---------------------------------------------------------------------------
+
+def test_pending_agdata_resolves_on_field_access():
+    from concurrent.futures import Future
+    f: Future[agdata] = Future()
+    pending = agdata(_future=f)
+    assert pending.is_pending() is True
+
+    f.set_result(agdata(answer=42))
+    assert pending.answer == 42
+    assert pending.is_pending() is False
+
+
+def test_pending_agdata_resolves_on_to_dict():
+    from concurrent.futures import Future
+    f: Future[agdata] = Future()
+    f.set_result(agdata(x=1, y=2))
+    pending = agdata(_future=f)
+    assert pending.to_dict() == {"x": 1, "y": 2}
+
+
+def test_pending_agdata_resolves_on_to_json():
+    from concurrent.futures import Future
+    f: Future[agdata] = Future()
+    f.set_result(agdata(val="hello"))
+    pending = agdata(_future=f)
+    import json as _json
+    assert _json.loads(pending.to_json()) == {"val": "hello"}
+
+
+def test_pending_repr_before_resolution():
+    from concurrent.futures import Future
+    f: Future[agdata] = Future()
+    pending = agdata(_future=f)
+    assert "pending" in repr(pending)
+
+
+def test_pending_repr_after_resolution():
+    from concurrent.futures import Future
+    f: Future[agdata] = Future()
+    f.set_result(agdata(x=99))
+    pending = agdata(_future=f)
+    _ = pending.x  # trigger resolution
+    assert "pending" not in repr(pending)
+
+
+def test_pending_equality_resolves_both():
+    from concurrent.futures import Future
+    f1: Future[agdata] = Future()
+    f2: Future[agdata] = Future()
+    f1.set_result(agdata(v=1))
+    f2.set_result(agdata(v=1))
+    assert agdata(_future=f1) == agdata(_future=f2)
+
+
+def test_normal_agdata_pending_is_false():
+    d = agdata(x=1)
+    assert d.is_pending() is False
+

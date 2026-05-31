@@ -2,7 +2,7 @@ import subprocess
 import shutil
 from pathlib import Path
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 _LIMIT = 100
 
@@ -47,7 +47,7 @@ def _run(arg: agdata) -> agdata:
     )
 
 
-glob = tool(
+glob = agtool(
     name="glob",
     fn=_run,
     description="Find files matching a glob pattern in a directory tree.",

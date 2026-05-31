@@ -1,6 +1,6 @@
 import subprocess
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 _MAX_BYTES = 50 * 1024
 
@@ -31,7 +31,7 @@ def _run(arg: agdata) -> agdata:
         return agdata(output=str(e), exit_code=-1, truncated=False)
 
 
-bash = tool(
+bash = agtool(
     name="bash",
     fn=_run,
     description="Run a shell command and return its output.",

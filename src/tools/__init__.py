@@ -6,7 +6,7 @@ from .glob import glob
 from .grep import grep
 from .webfetch import webfetch
 from .todowrite import todowrite
-from ..tool import tool as _tool_cls
+from ..agtool import agtool as _tool_cls
 
 default_tools: list[_tool_cls] = [bash, read, write, edit, glob, grep, webfetch, todowrite]
 

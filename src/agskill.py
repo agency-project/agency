@@ -1,8 +1,12 @@
 from __future__ import annotations
 import json
+from typing import TYPE_CHECKING, Callable
 import openai
 from .agdata import agdata
-from .tool import tool
+from .agtool import agtool
+
+if TYPE_CHECKING:
+    from .agterm import agterm
 
 _TYPE_MAP: dict[str, type] = {
     "str": str, "int": int, "float": float,
@@ -27,9 +31,10 @@ class agskill:
         self,
         name: str,
         system_prompt: str,
-        tools: list[tool] | None = None,
+        tools: list[agtool] | None = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
+        output_validator: "Callable[[agdata], list[str]] | None" = None,
         max_retries: int = 3,
     ):
         self.name = name
@@ -37,6 +42,7 @@ class agskill:
         self.tools = tools          # None → inherit from agent
         self.input_schema = input_schema
         self.output_schema = output_schema
+        self.output_validator = output_validator   # extra check beyond type schema
         self.max_retries = max_retries
 
     # ------------------------------------------------------------------
@@ -81,12 +87,15 @@ class agskill:
         llm_config: dict,
         input: agdata,
         history: agdata,
-        agent_tools: list[tool],
+        agent_tools: list[agtool],
         max_steps: int = 10,
-    ) -> tuple[agdata, agdata]:
+        term: "agterm | None" = None,
+    ) -> tuple[agdata, agdata, list[dict]]:
         """Run the ReAct loop.
 
-        Returns (result_agdata, updated_history_agdata).
+        Returns (result_agdata, updated_history_agdata, history_delta).
+        history_delta is the list of new messages added during this skill's
+        execution (user input → tool calls / results → final answer).
         The system_prompt (+ schemas) is prepended to every call but is NOT
         persisted in history.
         """
@@ -94,9 +103,10 @@ class agskill:
         if self.input_schema is not None:
             errors = self._check_schema(input, self.input_schema)
             if errors:
-                return agdata(error=f"input schema error: {errors}"), history
+                sys_msg = {"role": "system", "content": self._build_system_prompt()}
+                return agdata(error=f"input schema error: {errors}"), history, [sys_msg]
 
-        active_tools: list[tool] = self.tools if self.tools is not None else agent_tools
+        active_tools: list[agtool] = self.tools if self.tools is not None else agent_tools
         tool_map = {t.name: t for t in active_tools}
         openai_tools = [t.to_openai_tool() for t in active_tools] or None
 
@@ -106,6 +116,7 @@ class agskill:
         )
 
         history_msgs: list[dict] = list(history._data.get("messages", []))
+        n_before = len(history_msgs)
         messages: list[dict] = (
             [{"role": "system", "content": self._build_system_prompt()}]
             + history_msgs
@@ -122,6 +133,8 @@ class agskill:
             if openai_tools:
                 kwargs["tools"] = openai_tools
 
+            if term:
+                term.log("LLM      ", f"model={llm_config.get('model','?')}  messages={len(messages)}")
             resp = client.chat.completions.create(**kwargs)
             msg = resp.choices[0].message
 
@@ -143,8 +156,12 @@ class agskill:
                 for tc in msg.tool_calls:
                     t = tool_map.get(tc.function.name)
                     if t is None:
+                        if term:
+                            term.log("TOOL     ", f"{tc.function.name}  → unknown tool")
                         result_content = json.dumps({"error": f"unknown tool: {tc.function.name}"})
                     else:
+                        if term:
+                            term.log("TOOL     ", f"{tc.function.name}({tc.function.arguments[:80]})")
                         try:
                             result_content = t(agdata.from_json(tc.function.arguments)).to_json()
                         except Exception as e:
@@ -162,6 +179,8 @@ class agskill:
                 # --- Output validation + retry --------------------------------
                 if self.output_schema is not None:
                     errors = self._check_schema(result, self.output_schema)
+                    if not errors and self.output_validator is not None:
+                        errors = self.output_validator(result)
                     if errors:
                         if retries_left > 0:
                             retries_left -= 1
@@ -178,13 +197,14 @@ class agskill:
                         return (
                             agdata(error=f"output schema error after retries: {errors}"),
                             updated_history,
+                            [messages[0]] + messages[1:][n_before:],
                         )
 
                 updated_history = agdata(messages=messages[1:])
-                return result, updated_history
+                return result, updated_history, [messages[0]] + messages[1:][n_before:]
 
         updated_history = agdata(messages=messages[1:])
-        return agdata(error="max_steps exceeded"), updated_history
+        return agdata(error="max_steps exceeded"), updated_history, [messages[0]] + messages[1:][n_before:]
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

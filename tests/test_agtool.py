@@ -1,15 +1,15 @@
-"""Tests for the tool class (formerly the agskill class)."""
+"""Tests for the agtool class."""
 import json
 from src.agdata import agdata
-from src.tool import tool
+from src.agtool import agtool
 
 
 def _echo(arg: agdata) -> agdata:
     return agdata(echoed=arg.to_dict())
 
 
-def make_tool() -> tool:
-    return tool(
+def make_tool() -> agtool:
+    return agtool(
         name="echo",
         description="Echoes the input.",
         fn=_echo,
@@ -52,5 +52,5 @@ def test_repr():
 
 
 def test_default_params():
-    t = tool(name="noop", description="", fn=lambda a: a)
+    t = agtool(name="noop", description="", fn=lambda a: a)
     assert t.to_openai_tool()["function"]["parameters"]["type"] == "object"

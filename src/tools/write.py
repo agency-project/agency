@@ -1,6 +1,6 @@
 from pathlib import Path
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 
 def _run(arg: agdata) -> agdata:
@@ -20,7 +20,7 @@ def _run(arg: agdata) -> agdata:
         return agdata(error=str(e))
 
 
-write = tool(
+write = agtool(
     name="write",
     fn=_run,
     description="Write content to a file, creating parent directories if needed.",

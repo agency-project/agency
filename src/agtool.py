@@ -3,7 +3,7 @@ from typing import Callable
 from .agdata import agdata
 
 
-class tool:
+class agtool:
     """A named callable tool that an LLM can invoke via function calling.
 
     Provides the OpenAI tool schema and executes when called.
@@ -35,4 +35,4 @@ class tool:
         }
 
     def __repr__(self) -> str:
-        return f"tool(name={self.name!r})"
+        return f"agtool(name={self.name!r})"

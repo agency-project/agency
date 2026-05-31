@@ -84,13 +84,13 @@ def smoke_history_shared_across_skills():
 
 def smoke_skill_own_tools():
     """A skill with its own tools list ignores agent-level tools."""
-    from src.tool import tool
+    from src.agtool import agtool
 
     agent_tool_called = []
     skill_tool_called = []
 
-    agent_t = tool(name="agent_tool", description="", fn=lambda a: (agent_tool_called.append(1) or agdata()))
-    skill_t = tool(name="skill_tool", description="", fn=lambda a: (skill_tool_called.append(1) or agdata(r=1)))
+    agent_t = agtool(name="agent_tool", description="", fn=lambda a: (agent_tool_called.append(1) or agdata()))
+    skill_t = agtool(name="skill_tool", description="", fn=lambda a: (skill_tool_called.append(1) or agdata(r=1)))
 
     # skill overrides with its own tool set
     skill = agskill(name="s", system_prompt="", tools=[skill_t])

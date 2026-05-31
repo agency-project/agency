@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 _DEFAULT_LIMIT = 2000
 _MAX_BYTES = 50 * 1024
@@ -68,7 +68,7 @@ def _run(arg: agdata) -> agdata:
     )
 
 
-read = tool(
+read = agtool(
     name="read",
     fn=_run,
     description="Read a file (with optional offset/limit) or list a directory.",

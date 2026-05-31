@@ -1,7 +1,7 @@
 import httpx
 import html2text
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 _MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 _DEFAULT_TIMEOUT = 30
@@ -52,7 +52,7 @@ def _run(arg: agdata) -> agdata:
     return agdata(url=url, content_type=content_type, output=output)
 
 
-webfetch = tool(
+webfetch = agtool(
     name="webfetch",
     fn=_run,
     description="Fetch a URL and return its content as text, markdown, or raw HTML.",

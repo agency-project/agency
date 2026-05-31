@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Generator
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +261,7 @@ def _run(arg: agdata) -> agdata:
         return agdata(error=str(e))
 
 
-edit = tool(
+edit = agtool(
     name="edit",
     fn=_run,
     description="Replace a string in a file. Uses fuzzy matching as fallback.",

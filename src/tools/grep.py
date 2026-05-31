@@ -4,7 +4,7 @@ import subprocess
 import shutil
 from pathlib import Path
 from ..agdata import agdata
-from ..tool import tool
+from ..agtool import agtool
 
 _LIMIT = 100
 _MAX_LINE_LEN = 2000
@@ -91,7 +91,7 @@ def _run(arg: agdata) -> agdata:
     )
 
 
-grep = tool(
+grep = agtool(
     name="grep",
     fn=_run,
     description="Search for a regex pattern in file contents.",
