@@ -29,9 +29,9 @@ from src import agent, agskill, agdata, default_tools
 # LLM config — override via environment variables
 # ---------------------------------------------------------------------------
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "http://localhost:18000/v1"),
-    "api_key":  os.environ.get("VLLM_API_KEY",  "EMPTY"),
-    "model":    os.environ.get("VLLM_MODEL",     "kimi_k2.6"),
+    "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
+    "api_key":  os.environ.get("VLLM_API_KEY", ""),
+    "model":    os.environ.get("VLLM_MODEL",     "moonshotai/Kimi-K2.6"),
 }
 
 
