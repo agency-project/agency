@@ -59,7 +59,6 @@ def main():
             path="str",       # the file path that was written
             content="str",    # the content that was confirmed on disk
         ),
-        max_retries=3,
     )
 
     qa_skill = agskill(
@@ -75,7 +74,6 @@ def main():
             answer="str",
         ),
         tools=[],       # no filesystem access needed
-        max_retries=3,
     )
 
     # --- Build agent -----------------------------------------------------

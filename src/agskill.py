@@ -35,7 +35,7 @@ class agskill:
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
         output_validator: "Callable[[agdata], list[str]] | None" = None,
-        max_retries: int = 3,
+        max_retries: int = 6,
     ):
         self.name = name
         self.system_prompt = system_prompt

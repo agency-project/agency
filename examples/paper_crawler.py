@@ -31,11 +31,11 @@ from src.agtool import agtool
 from src.tools import write
 
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "http://localhost:18000/v1"),
-    "api_key":  os.environ.get("VLLM_API_KEY",  "EMPTY"),
-    "model":    os.environ.get("VLLM_MODEL",     "kimi_k2.6"),
+    "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
+    "api_key":  os.environ.get("VLLM_API_KEY", ""),
+    "model":    os.environ.get("VLLM_MODEL",     "moonshotai/Kimi-K2.6"),
 }
-MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
+MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "10"))
 
 # ---------------------------------------------------------------------------
 # Custom tool: search arxiv
@@ -97,7 +97,6 @@ find_papers_skill = agskill(
         ["papers list is empty — you MUST call the search_arxiv tool before responding"]
         if not r._data.get("papers") else []
     ),
-    max_retries=3,
 )
 
 summarise_paper_skill = agskill(
@@ -110,7 +109,6 @@ summarise_paper_skill = agskill(
     input_schema=agdata(title="str", url="str", abstract="str"),
     output_schema=agdata(summary="str"),
     tools=[],
-    max_retries=2,
 )
 
 compile_report_skill = agskill(
@@ -125,7 +123,6 @@ compile_report_skill = agskill(
     ),
     input_schema=agdata(topic="str", summaries="list", output_path="str"),
     output_schema=agdata(report_path="str", paper_count="int"),
-    max_retries=2,
 )
 
 # ---------------------------------------------------------------------------
