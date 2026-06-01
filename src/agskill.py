@@ -35,7 +35,7 @@ class agskill:
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
         output_validator: "Callable[[agdata], list[str]] | None" = None,
-        max_retries: int = 6,
+        max_retries: int = 3,
     ):
         self.name = name
         self.system_prompt = system_prompt
@@ -171,6 +171,13 @@ class agskill:
             else:
                 # --- Parse final answer --------------------------------------
                 content = msg.content or "{}"
+                # Strip markdown code fences that some models add despite instructions
+                stripped = content.strip()
+                if stripped.startswith("```"):
+                    stripped = stripped[stripped.find("\n") + 1:] if "\n" in stripped else stripped[3:]
+                    if stripped.endswith("```"):
+                        stripped = stripped[:-3]
+                    content = stripped.strip()
                 try:
                     result = agdata.from_json(content)
                 except (json.JSONDecodeError, TypeError):

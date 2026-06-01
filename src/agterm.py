@@ -56,6 +56,7 @@ class agterm:
     enabled: bool = True
     _lock: threading.Lock = threading.Lock()
     _color_counter: int = 0
+    _uuid_colors: dict[str, str] = {}   # uuid[:8] → ANSI color; shared across all instances
 
     def __init__(self, agent_uuid: str) -> None:
         with agterm._lock:
@@ -63,6 +64,19 @@ class agterm:
             agterm._color_counter += 1
         self._color = _AGENT_COLORS[idx]
         self._id = agent_uuid[:8]
+        agterm._uuid_colors[self._id] = self._color  # register for cross-agent colorization
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _colorize_uuids(msg: str) -> str:
+        """Wrap every registered agent UUID appearing in msg with its color."""
+        for uid, color in agterm._uuid_colors.items():
+            if uid in msg:
+                msg = msg.replace(uid, f"{color}{_BOLD}{uid}{_RESET}")
+        return msg
 
     # ------------------------------------------------------------------
     # Public log method
@@ -91,6 +105,6 @@ class agterm:
         ev_tag    = f"{ev_style}[{ev_key}]{_RESET}"
         src       = f"{_DIM}({filename}:{lineno}){_RESET}"
 
-        line = f"{ts}  {agent_tag}  {ev_tag}  {msg}  {src}"
+        line = f"{ts}  {agent_tag}  {ev_tag}  {agterm._colorize_uuids(msg)}  {src}"
         with agterm._lock:
             print(line, file=sys.stderr, flush=True)
