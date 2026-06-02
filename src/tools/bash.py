@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 from typing import TYPE_CHECKING
 from ..agdata import agdata
 from ..agtool import agtool
@@ -21,45 +20,11 @@ _BASH_PARAMS = {
 }
 
 
-def _run(arg: agdata) -> agdata:
-    command: str = arg.command  # type: ignore[assignment]
-    timeout: int = getattr(arg, "timeout", 120)
-    workdir: str | None = getattr(arg, "workdir", None)
-
-    try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=workdir,
-        )
-        output = proc.stdout + proc.stderr
-        truncated = False
-        if len(output.encode()) > _MAX_BYTES:
-            output = "...output truncated...\n\n" + output[-_MAX_BYTES:]
-            truncated = True
-        return agdata(output=output, exit_code=proc.returncode, truncated=truncated)
-    except subprocess.TimeoutExpired:
-        return agdata(output=f"Command timed out after {timeout}s", exit_code=-1, truncated=False)
-    except Exception as e:
-        return agdata(output=str(e), exit_code=-1, truncated=False)
-
-
-bash = agtool(
-    name="bash",
-    fn=_run,
-    description="Run a shell command and return its output.",
-    params=_BASH_PARAMS,
-)
-
-
 def make_bash(sandbox: "agSandbox") -> agtool:
     """Return a bash tool that executes commands inside *sandbox*'s container.
 
-    Background processes started with ``&`` are automatically tracked.
-    The agent's skill future will not resolve until all such processes exit.
+    All spawned processes are tracked via /proc diff.  The agent's skill future
+    will not resolve until all such processes exit or are released as daemons.
     The default working directory is ``/workspace`` inside the container.
     """
     def _run_sandboxed(arg: agdata) -> agdata:
@@ -91,7 +56,8 @@ def make_bash(sandbox: "agSandbox") -> agtool:
         description=(
             "Run a shell command inside the agent's sandbox container and return its output. "
             "The default working directory is /workspace. "
-            "Commands run with & are tracked; the skill will not finish until they exit."
+            "All spawned processes are tracked; the skill will not finish until they exit "
+            "or are released via daemon_release."
         ),
         params=_BASH_PARAMS,
         log_fn=_log,

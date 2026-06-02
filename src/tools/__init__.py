@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .bash import bash, make_bash
-from .read import read, make_read
-from .write import write, make_write
-from .edit import edit, make_edit
-from .glob import glob, make_glob
-from .grep import grep, make_grep
+from .bash import make_bash
+from .read import make_read
+from .write import make_write
+from .edit import make_edit
+from .glob import make_glob
+from .grep import make_grep
 from .webfetch import webfetch
 from .todowrite import todowrite
 from .resource import make_gpu_acquire, make_gpu_release, make_cpu_acquire, make_cpu_release, make_daemon_release
@@ -17,8 +17,6 @@ if TYPE_CHECKING:
     from ..agsandbox import agSandbox
     from ..agresources import agResourcePool
 
-default_tools: list[_tool_cls] = [bash, read, write, edit, glob, grep, webfetch, todowrite]
-
 
 def make_sandboxed_tools(
     sandbox: "agSandbox",
@@ -26,7 +24,7 @@ def make_sandboxed_tools(
 ) -> list[_tool_cls]:
     """Build the tool list for a sandboxed agent.
 
-    All filesystem tools route through *sandbox*'s container (docker or podman).
+    All filesystem tools route through *sandbox*'s container.
     ``webfetch`` and ``todowrite`` remain host-side.
     GPU/CPU resource tools are added when *pool* is provided.
     """
@@ -39,8 +37,8 @@ def make_sandboxed_tools(
         make_grep(sandbox),
         webfetch,
         todowrite,
+        make_daemon_release(sandbox),
     ]
-    tools += [make_daemon_release(sandbox)]
     if pool is not None:
         tools += [
             make_gpu_acquire(sandbox, pool),
@@ -52,9 +50,8 @@ def make_sandboxed_tools(
 
 
 __all__ = [
-    "bash", "read", "write", "edit", "glob", "grep", "webfetch", "todowrite",
-    "default_tools",
+    "webfetch", "todowrite",
     "make_bash", "make_read", "make_write", "make_edit", "make_glob", "make_grep",
-    "make_gpu_acquire", "make_gpu_release", "make_cpu_acquire", "make_cpu_release", "make_daemon_release",
-    "make_sandboxed_tools",
+    "make_gpu_acquire", "make_gpu_release", "make_cpu_acquire", "make_cpu_release",
+    "make_daemon_release", "make_sandboxed_tools",
 ]

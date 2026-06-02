@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 from ..agdata import agdata
 from ..agtool import agtool
@@ -16,31 +15,6 @@ _WRITE_PARAMS = {
     },
     "required": ["filePath", "content"],
 }
-
-
-def _run(arg: agdata) -> agdata:
-    file_path = Path(str(arg.filePath))  # type: ignore[arg-type]
-    content: str = str(arg.content)  # type: ignore[arg-type]
-
-    try:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        existed = file_path.exists()
-        file_path.write_text(content, encoding="utf-8")
-        return agdata(
-            path=str(file_path),
-            created=not existed,
-            bytes_written=len(content.encode()),
-        )
-    except Exception as e:
-        return agdata(error=str(e))
-
-
-write = agtool(
-    name="write",
-    fn=_run,
-    description="Write content to a file, creating parent directories if needed.",
-    params=_WRITE_PARAMS,
-)
 
 
 def make_write(sandbox: "agSandbox") -> agtool:
@@ -62,7 +36,7 @@ def make_write(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        path  = str(getattr(arg, "filePath", "?"))
+        path   = str(getattr(arg, "filePath", "?"))
         nbytes = getattr(result, "bytes_written", "?")
         tool._term.log("TOOL ✓   ", f"write  {path}  ({nbytes} bytes)  ({elapsed_ms}ms)")
         if tool._aglog is not None:

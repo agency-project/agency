@@ -23,11 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from _run_dir import make_run_dir
 
-from src import agent, agskill, agdata, default_tools
+from src import agent, agskill, agdata
 
-# ---------------------------------------------------------------------------
-# LLM config — override via environment variables
-# ---------------------------------------------------------------------------
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
@@ -37,27 +34,26 @@ LLM_CONFIG = {
 
 def main():
     run_dir = make_run_dir("base_example")
-    note_path = str(run_dir / "note.txt")
-    agent.log_dir = run_dir / "logs"
+    agent.log_dir    = run_dir / "logs"
+    agent.output_dir = run_dir / "agent_output"
     print(f"Run dir  : {run_dir}\n")
-
-    # --- Define skills with typed input/output schemas -------------------
 
     file_skill = agskill(
         name="file_manager",
         system_prompt=(
             "You are a file management assistant. "
             "Use the write and read tools to complete the task. "
-            "Always confirm what you wrote by reading the file back."
+            "Always confirm what you wrote by reading the file back. "
+            "Write files to /workspace."
         ),
         input_schema=agdata(
-            task="str",       # what the user wants done
-            file_path="str",  # absolute path to operate on
+            task="str",
+            file_path="str",
         ),
         output_schema=agdata(
-            status="str",     # "ok" or short description
-            path="str",       # the file path that was written
-            content="str",    # the content that was confirmed on disk
+            status="str",
+            path="str",
+            content="str",
         ),
     )
 
@@ -67,20 +63,15 @@ def main():
             "Answer the user's question directly and concisely. "
             "You have access to prior conversation context."
         ),
-        input_schema=agdata(
-            question="str",
-        ),
-        output_schema=agdata(
-            answer="str",
-        ),
-        tools=[],       # no filesystem access needed
+        input_schema=agdata(question="str"),
+        output_schema=agdata(answer="str"),
+        tools=[],
     )
 
-    # --- Build agent -----------------------------------------------------
+    # No tools= argument — uses the default sandboxed tool list
     ag = agent(
         llm_config=LLM_CONFIG,
         agskills=[file_skill, qa_skill],
-        tools=default_tools,
     )
 
     print(f"Endpoint : {LLM_CONFIG['base_url']}")
@@ -89,13 +80,12 @@ def main():
     print(f"Tools    : {[t.name for t in ag.tools]}")
     print()
 
-    # --- Turn 1: file_manager creates and verifies a note ----------------
     print(">> [file_manager] write and verify a note")
     r1 = ag.run(
         "file_manager",
         agdata(
             task="Write 'Hello from the agent!' to the given file and verify it.",
-            file_path=note_path,
+            file_path="/workspace/note.txt",
         ),
     )
     print(f"   status  : {r1.status!r}")
@@ -103,7 +93,6 @@ def main():
     print(f"   content : {r1.content!r}")
     print()
 
-    # --- Turn 2: qa answers using shared history -------------------------
     print(">> [qa] ask about the note using shared history")
     r2 = ag.run(
         "qa",

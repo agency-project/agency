@@ -5,7 +5,6 @@ Edit tool: port of opencode's edit.ts replacer pipeline.
 
 Tries 9 replacement strategies in order, raising on not-found or ambiguity.
 """
-from pathlib import Path
 from typing import TYPE_CHECKING, Generator
 from ..agdata import agdata
 from ..agtool import agtool
@@ -247,24 +246,6 @@ def _replace(content: str, old: str, new: str, replace_all: bool = False) -> str
     )
 
 
-def _run(arg: agdata) -> agdata:
-    file_path = Path(str(arg.filePath))  # type: ignore[arg-type]
-    old_string: str = str(arg.oldString)  # type: ignore[arg-type]
-    new_string: str = str(arg.newString)  # type: ignore[arg-type]
-    replace_all: bool = bool(getattr(arg, "replaceAll", False))
-
-    if not file_path.exists():
-        return agdata(error=f"File not found: {file_path}")
-
-    try:
-        content = file_path.read_text(encoding="utf-8")
-        updated = _replace(content, old_string, new_string, replace_all)
-        file_path.write_text(updated, encoding="utf-8")
-        return agdata(path=str(file_path), success=True)
-    except (ValueError, OSError) as e:
-        return agdata(error=str(e))
-
-
 _EDIT_PARAMS = {
     "type": "object",
     "properties": {
@@ -275,14 +256,6 @@ _EDIT_PARAMS = {
     },
     "required": ["filePath", "oldString", "newString"],
 }
-
-edit = agtool(
-    name="edit",
-    fn=_run,
-    description="Replace a string in a file. Uses fuzzy matching as fallback.",
-    params=_EDIT_PARAMS,
-)
-
 
 def make_edit(sandbox: "agSandbox") -> agtool:
     """Return an edit tool that edits files inside *sandbox*'s container.

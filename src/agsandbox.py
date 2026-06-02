@@ -84,7 +84,7 @@ class agSandbox:
     resolving the skill future.
     """
 
-    BASE_IMAGE: ClassVar[str] = "python:3.12-slim"
+    BASE_IMAGE: ClassVar[str] = "agency-sandbox:latest"
 
     def __init__(
         self,
@@ -138,12 +138,6 @@ class agSandbox:
             self._run(
                 [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
                 check=False,
-            )
-            # Install ripgrep (needed by glob/grep sandbox tools)
-            self._run(
-                [self._runtime, "exec", name, "sh", "-c",
-                 "apt-get update -qq && apt-get install -y -qq ripgrep 2>/dev/null || true"],
-                timeout=120,
             )
 
         # Capture the process baseline after the container is fully ready.

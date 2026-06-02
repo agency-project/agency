@@ -1,12 +1,9 @@
 """Smoke check: end-to-end agent + agskill + tools with mocked LLM."""
 import json
-import tempfile
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 from src.agdata import agdata
 from src.agskill import agskill
 from src.agent import agent
-from src.tools import write, read, bash
 
 LLM_CONFIG = {"api_key": "dummy", "model": "gpt-4o"}
 
@@ -34,34 +31,30 @@ def _tool_call(name: str, args: dict, call_id: str = "c1"):
 
 
 def smoke_write_read_cycle():
-    """Skill uses write then read, then answers."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        target = str(Path(tmpdir) / "greeting.txt")
+    """Skill uses write then read inside the sandbox container, then answers."""
+    file_skill = agskill(
+        name="file_ops",
+        system_prompt="You manage files. Use write and read tools.",
+    )
+    # No tools= → uses default sandboxed tool list; files live in container
+    ag = agent(llm_config=LLM_CONFIG, agskills=[file_skill])
 
-        file_skill = agskill(
-            name="file_ops",
-            system_prompt="You manage files. Use write and read tools.",
-        )
-        ag = agent(
-            llm_config=LLM_CONFIG,
-            agskills=[file_skill],
-            tools=[write, read, bash],
-        )
+    responses = [
+        _tool_call("write", {"filePath": "/workspace/greeting.txt", "content": "Hello, World!"}),
+        _tool_call("read", {"filePath": "/workspace/greeting.txt"}),
+        _direct('{"result": "File written and read successfully"}'),
+    ]
 
-        responses = [
-            _tool_call("write", {"filePath": target, "content": "Hello, World!"}),
-            _tool_call("read", {"filePath": target}),
-            _direct('{"result": "File written and read successfully"}'),
-        ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result = ag.run("file_ops", agdata(task="write then read a greeting file"))
 
-        with patch("openai.OpenAI") as MockClient:
-            MockClient.return_value.chat.completions.create.side_effect = responses
-            result = ag.run("file_ops", agdata(task="write then read a greeting file"))
-
-        assert result.result == "File written and read successfully"
-        assert Path(target).read_text() == "Hello, World!"
-        print(f"  history: {len(ag.history.messages)} messages")
-        return True
+    assert result.result == "File written and read successfully"
+    # Verify the file is in the container, not on the host
+    content = ag.sandbox.read_file("/workspace/greeting.txt")
+    assert content == "Hello, World!"
+    print(f"  history: {len(ag.history.messages)} messages")
+    return True
 
 
 def smoke_history_shared_across_skills():
@@ -92,7 +85,6 @@ def smoke_skill_own_tools():
     agent_t = agtool(name="agent_tool", description="", fn=lambda a: (agent_tool_called.append(1) or agdata()))
     skill_t = agtool(name="skill_tool", description="", fn=lambda a: (skill_tool_called.append(1) or agdata(r=1)))
 
-    # skill overrides with its own tool set
     skill = agskill(name="s", system_prompt="", tools=[skill_t])
     ag = agent(llm_config=LLM_CONFIG, agskills=[skill], tools=[agent_t])
 
@@ -101,14 +93,14 @@ def smoke_skill_own_tools():
         MockClient.return_value.chat.completions.create.side_effect = responses
         ag.run("s", agdata())
 
-    assert skill_tool_called  # skill's own tool was called
-    assert not agent_tool_called  # agent-level tool was NOT called
+    assert skill_tool_called
+    assert not agent_tool_called
     return True
 
 
 if __name__ == "__main__":
     tests = [
-        ("write/read cycle", smoke_write_read_cycle),
+        ("write/read cycle (sandboxed)", smoke_write_read_cycle),
         ("history shared across skills", smoke_history_shared_across_skills),
         ("skill owns tools", smoke_skill_own_tools),
     ]

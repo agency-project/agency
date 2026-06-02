@@ -11,6 +11,9 @@ Workflow:
                           original agent; each is resolved automatically before
                           the skill starts.
 
+The report is written to /agent_output/<uuid>/report.md inside the container
+and appears on the host at <run_dir>/agent_output/<uuid>/report.md.
+
 Run:
     uv run python examples/paper_crawler.py
     uv run python examples/paper_crawler.py "speculative decoding"
@@ -28,7 +31,6 @@ import httpx
 
 from src import agent, agskill, agdata
 from src.agtool import agtool
-from src.tools import write
 
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "https://gemma.js-park.info/v1"),
@@ -38,7 +40,7 @@ LLM_CONFIG = {
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 
 # ---------------------------------------------------------------------------
-# Custom tool: search arxiv
+# Custom tool: search arxiv (host-side; no filesystem access needed)
 # ---------------------------------------------------------------------------
 
 def _search_arxiv_fn(arg: agdata) -> agdata:
@@ -97,18 +99,20 @@ find_papers_skill = agskill(
         ["papers list is empty — you MUST call the search_arxiv tool before responding"]
         if not r._data.get("papers") else []
     ),
+    tools=[search_arxiv],  # only needs arxiv search, not filesystem
 )
 
 summarise_paper_skill = agskill(
     name="summarise_paper",
     system_prompt=(
         "You are a research paper summariser. "
-        "Given the title, URL, and abstract of a paper, write a concise"
-        "technical summary that captures the core contribution, method, results, limitations and conclusions."
+        "Given the title, URL, and abstract of a paper, write a concise "
+        "technical summary that captures the core contribution, method, results, "
+        "limitations and conclusions."
     ),
     input_schema=agdata(title="str", url="str", abstract="str"),
     output_schema=agdata(summary="str"),
-    tools=[],
+    tools=[],  # no tools needed — pure reasoning
 )
 
 compile_report_skill = agskill(
@@ -116,36 +120,43 @@ compile_report_skill = agskill(
     system_prompt=(
         "You are a research report writer. "
         "Given a topic and a list of paper summaries, use the write tool to save "
-        "a well-structured markdown report to the given output_path. "
+        "a well-structured markdown report to the given output_path inside the sandbox. "
         "The report should have: a title, a brief introduction, "
         "one section per paper with its title, URL, and summary, "
         "and a concluding paragraph."
     ),
     input_schema=agdata(topic="str", summaries="list", output_path="str"),
     output_schema=agdata(report_path="str", paper_count="int"),
+    # inherits default sandboxed tools — write goes to the container
 )
 
 # ---------------------------------------------------------------------------
 # Workflow
 # ---------------------------------------------------------------------------
 
-def run(topic: str = "KV cache quantization", output_dir: str = "."):
-    output_path = str(Path(output_dir) / "report.md")
-    agent.log_dir = Path(output_dir) / "logs"
+def run(topic: str = "KV cache quantization", run_dir: Path | None = None):
+    if run_dir is None:
+        run_dir = make_run_dir("paper_crawler")
+
+    agent.log_dir    = run_dir / "logs"
+    agent.output_dir = run_dir / "agent_output"
 
     main_agent = agent(
         llm_config=LLM_CONFIG,
         agskills=[find_papers_skill, summarise_paper_skill, compile_report_skill],
-        tools=[search_arxiv, write],
     )
+
+    # The report is written inside the container at this path.
+    # It appears on the host at: run_dir/agent_output/<uuid>/report.md
+    output_path = f"/agent_output/{main_agent.uuid}/report.md"
+    host_report = agent.output_dir / main_agent.uuid / "report.md"
 
     print(f"Endpoint : {LLM_CONFIG['base_url']}")
     print(f"Model    : {LLM_CONFIG['model']}")
     print(f"Topic    : {topic!r}")
-    print(f"Output   : {output_path}")
+    print(f"Output   : {host_report}")
     print()
 
-    # Step 1: find papers — AgError raised automatically if skill fails
     print("Step 1 — searching for papers...")
     papers = main_agent.run("find_papers", agdata(topic=topic)).papers
     if not papers:
@@ -156,28 +167,27 @@ def run(topic: str = "KV cache quantization", output_dir: str = "."):
         print(f"    • {p['title'][:70]}")
     print()
 
-    # Step 2: one local agent copy per paper — all run() calls fire in parallel
     print("Step 2 — submitting parallel summarisation tasks...")
     summaries = [
         agent(main_agent).run(
             "summarise_paper",
             agdata(title=p["title"], url=p["url"], abstract=p["abstract"]),
         )
-        for p in papers   # each is a pending agdata; all running concurrently
+        for p in papers
     ]
     for i, p in enumerate(papers):
         print(f"  [{i}] {p['title'][:60]}...")
     print()
 
-    # Step 3: compile report — pending agdata list resolved automatically
     print("Step 3 — compiling markdown report...")
     r3 = main_agent.run(
         "compile_report",
         agdata(topic=topic, summaries=summaries, output_path=output_path),
     )
     print(f"  report written → {r3.report_path}  ({r3.paper_count} papers)")
-    if Path(output_path).exists():
-        print(f"\n--- report preview ---\n{Path(output_path).read_text()[:400]}\n...")
+
+    if host_report.exists():
+        print(f"\n--- report preview ---\n{host_report.read_text()[:400]}\n...")
 
     print(f"\nMain agent history: {len(main_agent.history.messages)} messages total")
 
@@ -188,6 +198,6 @@ if __name__ == "__main__":
     run_dir = make_run_dir("paper_crawler")
     print(f"Run dir  : {run_dir}\n")
     try:
-        run(topic=topic, output_dir=str(run_dir))
+        run(topic=topic, run_dir=run_dir)
     except AgError as e:
         print(f"\nERROR: {e}")
