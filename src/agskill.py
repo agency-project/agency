@@ -90,6 +90,7 @@ class agskill:
         agent_tools: list[agtool],
         max_steps: int = 10,
         term: "agterm | None" = None,
+        _is_continuation: bool = False,
     ) -> tuple[agdata, agdata, list[dict]]:
         """Run the ReAct loop.
 
@@ -98,9 +99,13 @@ class agskill:
         execution (user input → tool calls / results → final answer).
         The system_prompt (+ schemas) is prepended to every call but is NOT
         persisted in history.
+
+        When *_is_continuation* is True (outer monitoring loop re-entry), input
+        schema validation is skipped so process-status ping messages can flow
+        through without matching the skill's declared input schema.
         """
         # --- Input validation ------------------------------------------------
-        if self.input_schema is not None:
+        if self.input_schema is not None and not _is_continuation:
             errors = self._check_schema(input, self.input_schema)
             if errors:
                 sys_msg = {"role": "system", "content": self._build_system_prompt()}

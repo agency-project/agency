@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 """
 Edit tool: port of opencode's edit.ts replacer pipeline.
 
 Tries 9 replacement strategies in order, raising on not-found or ambiguity.
 """
-from __future__ import annotations
 from pathlib import Path
-from typing import Generator
+from typing import TYPE_CHECKING, Generator
 from ..agdata import agdata
 from ..agtool import agtool
+
+if TYPE_CHECKING:
+    from ..sandbox import agSandbox
 
 
 # ---------------------------------------------------------------------------
@@ -261,18 +265,54 @@ def _run(arg: agdata) -> agdata:
         return agdata(error=str(e))
 
 
+_EDIT_PARAMS = {
+    "type": "object",
+    "properties": {
+        "filePath": {"type": "string", "description": "Absolute path to the file to edit"},
+        "oldString": {"type": "string", "description": "The text to replace"},
+        "newString": {"type": "string", "description": "The replacement text"},
+        "replaceAll": {"type": "boolean", "description": "Replace all occurrences (default false)"},
+    },
+    "required": ["filePath", "oldString", "newString"],
+}
+
 edit = agtool(
     name="edit",
     fn=_run,
     description="Replace a string in a file. Uses fuzzy matching as fallback.",
-    params={
-        "type": "object",
-        "properties": {
-            "filePath": {"type": "string", "description": "Absolute path to the file to edit"},
-            "oldString": {"type": "string", "description": "The text to replace"},
-            "newString": {"type": "string", "description": "The replacement text"},
-            "replaceAll": {"type": "boolean", "description": "Replace all occurrences (default false)"},
-        },
-        "required": ["filePath", "oldString", "newString"],
-    },
+    params=_EDIT_PARAMS,
 )
+
+
+def make_edit(sandbox: "agSandbox") -> agtool:
+    """Return an edit tool that edits files inside *sandbox*'s container.
+
+    Reads the file via ``sandbox.read_file``, applies the existing ``_replace``
+    fuzzy-match pipeline in Python, then writes back via ``sandbox.write_file``.
+    """
+    def _run_sandboxed(arg: agdata) -> agdata:
+        file_path = str(arg.filePath)  # type: ignore[arg-type]
+        old_string: str = str(arg.oldString)  # type: ignore[arg-type]
+        new_string: str = str(arg.newString)  # type: ignore[arg-type]
+        replace_all: bool = bool(getattr(arg, "replaceAll", False))
+
+        try:
+            content = sandbox.read_file(file_path)
+        except FileNotFoundError:
+            return agdata(error=f"File not found: {file_path}")
+        except Exception as e:
+            return agdata(error=str(e))
+
+        try:
+            updated = _replace(content, old_string, new_string, replace_all)
+            sandbox.write_file(file_path, updated)
+            return agdata(path=file_path, success=True)
+        except (ValueError, OSError) as e:
+            return agdata(error=str(e))
+
+    return agtool(
+        name="edit",
+        fn=_run_sandboxed,
+        description="Replace a string in a file inside the sandbox. Uses fuzzy matching as fallback.",
+        params=_EDIT_PARAMS,
+    )

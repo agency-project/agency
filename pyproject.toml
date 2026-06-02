@@ -6,6 +6,7 @@ dependencies = [
     "openai",
     "httpx",
     "html2text",
+    "podman>=5.8.0",
 ]
 
 [project.optional-dependencies]
