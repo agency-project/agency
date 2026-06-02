@@ -10,12 +10,12 @@ from .glob import glob, make_glob
 from .grep import grep, make_grep
 from .webfetch import webfetch
 from .todowrite import todowrite
-from .resource import make_gpu_acquire, make_gpu_release, make_cpu_acquire, make_cpu_release
+from .resource import make_gpu_acquire, make_gpu_release, make_cpu_acquire, make_cpu_release, make_daemon_release
 from ..agtool import agtool as _tool_cls
 
 if TYPE_CHECKING:
-    from ..sandbox import agSandbox
-    from ..resources import agResourcePool
+    from ..agsandbox import agSandbox
+    from ..agresources import agResourcePool
 
 default_tools: list[_tool_cls] = [bash, read, write, edit, glob, grep, webfetch, todowrite]
 
@@ -40,6 +40,7 @@ def make_sandboxed_tools(
         webfetch,
         todowrite,
     ]
+    tools += [make_daemon_release(sandbox)]
     if pool is not None:
         tools += [
             make_gpu_acquire(sandbox, pool),
@@ -54,6 +55,6 @@ __all__ = [
     "bash", "read", "write", "edit", "glob", "grep", "webfetch", "todowrite",
     "default_tools",
     "make_bash", "make_read", "make_write", "make_edit", "make_glob", "make_grep",
-    "make_gpu_acquire", "make_gpu_release", "make_cpu_acquire", "make_cpu_release",
+    "make_gpu_acquire", "make_gpu_release", "make_cpu_acquire", "make_cpu_release", "make_daemon_release",
     "make_sandboxed_tools",
 ]

@@ -1,0 +1,125 @@
+# Tools
+
+Tools are the functions an LLM can call during a ReAct loop. Each tool is an `agtool` instance: a name, a description, an OpenAI-compatible JSON Schema for parameters, and a Python callable that receives and returns `agdata`.
+
+## Built-in tools
+
+| Tool | Host or sandbox | Description |
+|---|---|---|
+| `bash` | sandbox | Run a shell command; all spawned processes tracked automatically |
+| `read` | sandbox | Read a file with line-range pagination, or list a directory |
+| `write` | sandbox | Write a file, creating parent directories as needed |
+| `edit` | sandbox | Fuzzy in-place string replacement (read → replace in Python → write) |
+| `glob` | sandbox | Find files matching a glob pattern (`rg --files` or `find` fallback) |
+| `grep` | sandbox | Search file contents by regex (`rg --json` or Python fallback) |
+| `webfetch` | host | Fetch a URL and convert HTML to Markdown |
+| `todowrite` | host | Persist a structured todo list to disk |
+| `daemon_release` | sandbox | Release a PID from monitoring so a long-lived service doesn't block skill completion |
+| `gpu_acquire` | sandbox | Acquire exclusive GPU access from the resource pool |
+| `gpu_release` | sandbox | Return the GPU to the pool |
+| `cpu_acquire` | sandbox | Boost container CPU/memory limits for compute-intensive work |
+| `cpu_release` | sandbox | Reset CPU/memory limits back to idle defaults |
+
+All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker exec`.
+
+## Sandboxed tool construction
+
+`make_sandboxed_tools(sandbox, pool=None)` in `src/tools/__init__.py` builds the full tool list for an agent:
+
+```python
+tools = [
+    make_bash(sandbox),
+    make_read(sandbox),
+    make_write(sandbox),
+    make_edit(sandbox),
+    make_glob(sandbox),
+    make_grep(sandbox),
+    webfetch,               # host-side
+    todowrite,              # host-side
+    make_daemon_release(sandbox),  # always included
+]
+if pool is not None:
+    tools += [
+        make_gpu_acquire(sandbox, pool),
+        make_gpu_release(sandbox, pool),
+        make_cpu_acquire(sandbox),
+        make_cpu_release(sandbox, pool),
+    ]
+```
+
+## Tool logging
+
+Every tool call is logged automatically after it returns. `agent.__init__` calls `tool.attach_logger(term, log)` on each tool, wiring up both terminal and file logging.
+
+Each tool has a `log(arg, result, elapsed_ms)` method called from `__call__` after the tool function returns. The default implementation logs input/output key names. Sandboxed tool factories override it with per-tool summaries:
+
+| Tool | Terminal line |
+|---|---|
+| `bash` | `bash  rc=0  (42ms)  $ ls /workspace` |
+| `read` | `read  file  /workspace/train.py  (120 lines)  (8ms)` |
+| `write` | `write  /workspace/out.txt  (1024 bytes)  (5ms)` |
+| `edit` | `edit  /workspace/main.py  ✓  (12ms)` |
+| `glob` | `glob  '*.py'  → 14 files  (30ms)` |
+| `grep` | `grep  'def train'  → 3 matches  (25ms)` |
+| others | `<name>  in=[...]  out=[...]  (Nms)` |
+
+Every call also appends a `type="tool"` entry to the agent's JSONL log file. See [logging.md](logging.md).
+
+To override logging for a custom tool, pass `log_fn` to the constructor:
+
+```python
+def my_log(tool, arg, result, elapsed_ms):
+    tool._term.log("TOOL ✓   ", f"my_tool  key={arg.key}  ({elapsed_ms}ms)")
+    if tool._aglog:
+        tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)
+
+my_tool = agtool(name="my_tool", description="...", fn=my_fn, log_fn=my_log)
+```
+
+## Defining a custom tool
+
+```python
+from src.agtool import agtool
+from src.agdata import agdata
+
+my_tool = agtool(
+    name="add",
+    description="Add two integers and return their sum.",
+    fn=lambda arg: agdata(result=arg.a + arg.b),
+    params={
+        "type": "object",
+        "properties": {
+            "a": {"type": "integer"},
+            "b": {"type": "integer"},
+        },
+        "required": ["a", "b"],
+    },
+)
+```
+
+Pass custom tools to a skill or directly to an agent:
+
+```python
+skill = agskill("math", "You are a calculator.", tools=[my_tool])
+ag = agent(llm_config, agskills=[skill])
+```
+
+If `agskill.tools` is `None`, the skill inherits the agent's full sandboxed tool list. If it is set, only those tools are available for that skill.
+
+## Tool output
+
+Tool functions receive an `agdata` and must return an `agdata`. The return value is serialized to JSON and injected into the LLM's message history as a `tool` role message. Errors should be returned as `agdata(error="...")` rather than raised — the LLM will see the error and can decide how to proceed.
+
+## bash process tracking
+
+The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID in `/proc` that wasn't present before is added to `sandbox._watched_pids` and monitored by the outer loop. See [container.md](container.md) for the exec wrapper details and [execution_loop.md](execution_loop.md) for the outer monitoring loop.
+
+## `daemon_release` tool
+
+Use this when a process is intentionally long-lived (a server, monitor, or background service) and should not block skill completion:
+
+```
+LLM calls: daemon_release({"pid": 1234})
+```
+
+This moves PID 1234 (and all its future descendants) from `_watched_pids` to `_daemon_pids`. The outer loop no longer waits for it, and the skill resolves normally. The process keeps running in the container until the container is destroyed.

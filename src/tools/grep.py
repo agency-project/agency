@@ -11,7 +11,7 @@ from ..agdata import agdata
 from ..agtool import agtool
 
 if TYPE_CHECKING:
-    from ..sandbox import agSandbox
+    from ..agsandbox import agSandbox
 
 _LIMIT = 100
 _MAX_LINE_LEN = 2000
@@ -153,6 +153,16 @@ def make_grep(sandbox: "agSandbox") -> agtool:
 
         return agdata(matches=matches, count=len(matches), truncated=truncated)
 
+    def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
+        if tool._term is None:
+            return
+        pattern = str(getattr(arg, "pattern", "?"))
+        count   = getattr(result, "count", "?")
+        trunc   = " [truncated]" if getattr(result, "truncated", False) else ""
+        tool._term.log("TOOL ✓   ", f"grep  {pattern!r}  → {count} matches{trunc}  ({elapsed_ms}ms)")
+        if tool._aglog is not None:
+            tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)
+
     return agtool(
         name="grep",
         fn=_run_sandboxed,
@@ -161,4 +171,5 @@ def make_grep(sandbox: "agSandbox") -> agtool:
             "Defaults to searching /workspace."
         ),
         params=_GREP_PARAMS,
+        log_fn=_log,
     )

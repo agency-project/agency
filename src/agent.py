@@ -10,8 +10,8 @@ from .agskill import agskill
 from .agtool import agtool
 from .aglog import aglog, _ts
 from .agterm import agterm
-from .sandbox import agSandbox
-from .resources import agResourcePool
+from .agsandbox import agSandbox
+from .agresources import agResourcePool
 from .tools import make_sandboxed_tools
 
 
@@ -60,18 +60,19 @@ class agent:
     Class-level configuration (set once before creating agents)::
 
         agent.log_dir        = Path("runs/logs")
-        agent.agresource_pool  = agResourcePool(gpus=[0, 1])
-        agent.min_wait_s     = 30    # silence window before first ping
-        agent.ping_interval_s = 300  # re-enter ReAct every N s for live PIDs
-        agent.max_outer_iters = 12   # safety cap (~1 hour at 5-min intervals)
+        agent.agresource_pool  = agResourcePool()    # auto-detected by default
+        agent.ping_interval_s = 300  # max seconds between process-status re-entries
+        agent.poll_interval_s = 5    # granularity of the liveness poll inside that window
+        agent.max_outer_iters = 144   # safety cap (~12 hours at 5-minute intervals)
     """
 
     _pool: ClassVar[ThreadPoolExecutor] = ThreadPoolExecutor()
     log_dir:          ClassVar[Path | None]          = None
-    agresource_pool:  ClassVar[agResourcePool | None]  = None
-    min_wait_s:       ClassVar[int]                  = 30
+    output_dir:       ClassVar[Path | None]          = None
+    agresource_pool:  ClassVar[agResourcePool]       = agResourcePool()
     ping_interval_s:  ClassVar[int]                  = 300
-    max_outer_iters:  ClassVar[int]                  = 12
+    poll_interval_s:  ClassVar[int]                  = 5
+    max_outer_iters:  ClassVar[int]                  = 144
 
     def __init__(
         self,
@@ -90,12 +91,14 @@ class agent:
             src._history._resolve()
             self._history: agdata = copy.deepcopy(src._history)
             # Snapshot parent container → fork starts from parent's exact state
-            self.sandbox = agSandbox(self.uuid, parent_uuid=src.uuid)
+            self.sandbox = agSandbox(self.uuid, parent_uuid=src.uuid,
+                                     output_dir=Path(agent.output_dir) if agent.output_dir else None)
         else:
             self.llm_config = llm_config
             self.agskills   = list(agskills or [])
             self._history   = agdata(messages=[])
-            self.sandbox    = agSandbox(self.uuid)
+            self.sandbox    = agSandbox(self.uuid,
+                                        output_dir=Path(agent.output_dir) if agent.output_dir else None)
 
         # Build sandboxed tool list; user-supplied tools override if provided
         if tools is not None:
@@ -106,6 +109,10 @@ class agent:
         log_path = Path(agent.log_dir) / f"{self.uuid}.jsonl" if agent.log_dir is not None else None
         self.log  = aglog(path=log_path)
         self._term = agterm(self.uuid)
+
+        # Wire terminal + file logging into every tool.
+        for t in self.tools:
+            t.attach_logger(self._term, self.log)
 
         if isinstance(llm_config, agent):
             self._term.log("FORKED   ", f"from {src.uuid[:8]}  skills={[s.name for s in self.agskills]}")
@@ -205,30 +212,67 @@ class agent:
                     outer_history = new_history
                     outer_delta.extend(history_delta)
 
-                    # Short-wait window: give processes up to min_wait_s to
-                    # exit naturally before considering a ping.
-                    deadline = time.monotonic() + agent.min_wait_s
+                    # Snapshot which PIDs were outstanding when this ReAct
+                    # iteration ended — used below to detect completion.
+                    pids_at_end = set(self.sandbox._watched_pids)
+
+                    if not pids_at_end:
+                        break  # no background work — skill is done
+
+                    # Background processes detected — log the start of the wait.
+                    summary = self.sandbox.pid_status_summary()
+                    self._term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
+                    self.log._lifecycle("procs_started", uuid=self.uuid,
+                                        skill=skill_name, pids=list(pids_at_end),
+                                        summary=summary)
+
+                    # Poll liveness at poll_interval_s granularity for up to
+                    # ping_interval_s total.  Break as soon as all PIDs are
+                    # gone — whether that takes 2 seconds or 5 minutes.
+                    deadline = time.monotonic() + agent.ping_interval_s
                     while time.monotonic() < deadline:
+                        time.sleep(agent.poll_interval_s)
                         if not self.sandbox.get_live_pids():
                             break
-                        time.sleep(2)
 
-                    if not self.sandbox.get_live_pids():
-                        break  # all done — no ping needed
+                    live_now = self.sandbox.get_live_pids()
 
-                    # Long-running processes: build a status ping and loop.
+                    if not live_now:
+                        # All background processes finished — re-enter so the
+                        # agent can read their output and act on the results.
+                        self._term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
+                        self.log._lifecycle("procs_completed", uuid=self.uuid,
+                                            skill=skill_name)
+                        current_input = agdata(
+                            _event="process_completed",
+                            message=(
+                                "Background processes have completed. "
+                                "Read their output and act on the results."
+                            ),
+                        )
+                        current_history = new_history
+                        is_continuation = True
+                        continue
+
+                    # Processes still running after ping_interval_s — ping agent.
                     summary = self.sandbox.pid_status_summary()
-                    self._term.log("SKILL ⏳  ", f"{skill_name}  waiting on: {summary}")
+                    self._term.log("PROCS ⏳  ", f"{skill_name}  still running: {summary}")
+                    self.log._lifecycle("procs_ping", uuid=self.uuid,
+                                        skill=skill_name, pids=list(live_now),
+                                        summary=summary)
                     current_input   = agdata(
                         _event="process_update",
                         message=(
                             f"Background processes are still running: {summary}. "
-                            f"You may check their output, wait, or proceed if appropriate."
+                            f"You may check their output, wait, or proceed if appropriate. "
+                            f"If any of these processes are intentional long-running services "
+                            f"(daemons, servers, monitors) that should not block completion, "
+                            f"call daemon_release(pid) for each such PID to release it from "
+                            f"monitoring."
                         ),
                     )
                     current_history = new_history
                     is_continuation = True
-                    time.sleep(agent.ping_interval_s)
 
             except Exception as exc:
                 outer_result  = agdata(error=str(exc))

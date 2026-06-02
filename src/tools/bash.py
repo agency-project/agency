@@ -6,7 +6,7 @@ from ..agdata import agdata
 from ..agtool import agtool
 
 if TYPE_CHECKING:
-    from ..sandbox import agSandbox
+    from ..agsandbox import agSandbox
 
 _MAX_BYTES = 50 * 1024
 
@@ -75,6 +75,16 @@ def make_bash(sandbox: "agSandbox") -> agtool:
             truncated = True
         return agdata(output=output, exit_code=rc, truncated=truncated)
 
+    def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
+        if tool._term is None:
+            return
+        cmd = str(getattr(arg, "command", ""))[:100]
+        rc  = getattr(result, "exit_code", "?")
+        trunc = " [truncated]" if getattr(result, "truncated", False) else ""
+        tool._term.log("TOOL ✓   ", f"bash  rc={rc}  ({elapsed_ms}ms){trunc}  $ {cmd}")
+        if tool._aglog is not None:
+            tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)
+
     return agtool(
         name="bash",
         fn=_run_sandboxed,
@@ -84,4 +94,5 @@ def make_bash(sandbox: "agSandbox") -> agtool:
             "Commands run with & are tracked; the skill will not finish until they exit."
         ),
         params=_BASH_PARAMS,
+        log_fn=_log,
     )

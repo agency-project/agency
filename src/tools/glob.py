@@ -9,7 +9,7 @@ from ..agdata import agdata
 from ..agtool import agtool
 
 if TYPE_CHECKING:
-    from ..sandbox import agSandbox
+    from ..agsandbox import agSandbox
 
 _LIMIT = 100
 
@@ -88,6 +88,16 @@ def make_glob(sandbox: "agSandbox") -> agtool:
         files = sorted(files[:_LIMIT])
         return agdata(files=files, count=len(files), truncated=truncated)
 
+    def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
+        if tool._term is None:
+            return
+        pattern = str(getattr(arg, "pattern", "?"))
+        count   = getattr(result, "count", "?")
+        trunc   = " [truncated]" if getattr(result, "truncated", False) else ""
+        tool._term.log("TOOL ✓   ", f"glob  {pattern!r}  → {count} files{trunc}  ({elapsed_ms}ms)")
+        if tool._aglog is not None:
+            tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)
+
     return agtool(
         name="glob",
         fn=_run_sandboxed,
@@ -96,4 +106,5 @@ def make_glob(sandbox: "agSandbox") -> agtool:
             "Defaults to searching /workspace."
         ),
         params=_GLOB_PARAMS,
+        log_fn=_log,
     )

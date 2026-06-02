@@ -75,6 +75,26 @@ class aglog:
             self._events.append(entry)
             self._write(entry)
 
+    def _tool_call(
+        self,
+        tool: str,
+        input_dict: dict,
+        output_dict: dict,
+        elapsed_ms: int,
+    ) -> None:
+        """Record a single tool invocation."""
+        entry = {
+            "type":       "tool",
+            "ts":         _ts(),
+            "tool":       tool,
+            "input":      input_dict,
+            "output":     output_dict,
+            "elapsed_ms": elapsed_ms,
+        }
+        with self._lock:
+            self._events.append(entry)
+            self._write(entry)
+
     def _lifecycle(self, event: str, **kwargs) -> None:
         """Record a lifecycle event (created / forked / destroyed)."""
         entry = {"type": "lifecycle", "event": event, "ts": _ts(), **kwargs}

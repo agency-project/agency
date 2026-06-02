@@ -4,10 +4,11 @@ import shlex
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
-    from .resources import agResourcePool
+    from .agresources import agResourcePool
 
 _BGPIDS_MARKER = "__BGPIDS__:"
 _RUNTIME: str | None = None
@@ -55,6 +56,25 @@ def get_container_runtime() -> str:
     return _RUNTIME
 
 
+def _gpu_flags() -> list[str]:
+    """Return ``--gpus all`` when the host has NVIDIA GPUs, otherwise ``[]``.
+
+    Without ``--gpus all`` the NVIDIA device files are never mounted and
+    CUDA is inaccessible regardless of CUDA_VISIBLE_DEVICES.  We only add
+    the flag when GPUs are actually present so CPU-only hosts keep working.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return ["--gpus", "all"]
+    except Exception:
+        pass
+    return []
+
+
 class agSandbox:
     """Manages a single container for one agent via docker or podman.
 
@@ -66,12 +86,38 @@ class agSandbox:
 
     BASE_IMAGE: ClassVar[str] = "python:3.12-slim"
 
-    def __init__(self, uuid: str, parent_uuid: str | None = None) -> None:
+    def __init__(
+        self,
+        uuid: str,
+        parent_uuid: str | None = None,
+        output_dir: Path | None = None,
+    ) -> None:
         self._uuid = uuid
         self._runtime = get_container_runtime()
         self._snapshot_name: str | None = None
         self._gpu_id: int | None = None
         self._watched_pids: dict[int, float] = {}
+        self._baseline_pids: set[int] = set()   # populated after container starts
+        self._daemon_pids:   set[int] = set()   # explicitly released; never waited on
+
+        # Pass --gpus all if GPUs are available so device files are present.
+        # CUDA_VISIBLE_DEVICES is set to "" in every exec call when no GPU is
+        # held, so idle containers cannot access any GPU even though the
+        # device files exist.
+        gpu_flags = _gpu_flags()
+
+        # Shared output volume:
+        #   /agent_output          → read-only  (all agents' exports visible)
+        #   /agent_output/<uuid>   → read-write (this agent's own export dir)
+        # The more-specific rw mount shadows the parent ro mount for this dir.
+        vol_flags: list[str] = []
+        if output_dir is not None:
+            own_dir = output_dir / uuid
+            own_dir.mkdir(parents=True, exist_ok=True)
+            vol_flags = [
+                "-v", f"{output_dir.resolve()}:/agent_output:ro",
+                "-v", f"{own_dir.resolve()}:/agent_output/{uuid}:rw",
+            ]
 
         name = self._container_name()
         if parent_uuid is not None:
@@ -79,22 +125,54 @@ class agSandbox:
             self._run([self._runtime, "commit", f"sandbox-{parent_uuid}", snap], check=True)
             self._snapshot_name = snap
             self._run(
-                [self._runtime, "run", "-d", "--name", name, snap, "tail", "-f", "/dev/null"],
+                [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
+                [snap, "tail", "-f", "/dev/null"],
                 check=True,
             )
         else:
             self._run(
-                [self._runtime, "run", "-d", "--name", name,
-                 self.BASE_IMAGE, "tail", "-f", "/dev/null"],
+                [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
+                [self.BASE_IMAGE, "tail", "-f", "/dev/null"],
                 check=True,
             )
             self._run(
                 [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
                 check=False,
             )
+            # Install ripgrep (needed by glob/grep sandbox tools)
+            self._run(
+                [self._runtime, "exec", name, "sh", "-c",
+                 "apt-get update -qq && apt-get install -y -qq ripgrep 2>/dev/null || true"],
+                timeout=120,
+            )
+
+        # Capture the process baseline after the container is fully ready.
+        # Any PID not in this set was spawned by user commands and must be
+        # monitored by the outer loop until it exits.
+        self._baseline_pids = self._snapshot_pids()
 
     def _container_name(self) -> str:
         return f"sandbox-{self._uuid}"
+
+    def _snapshot_pids(self) -> set[int]:
+        """Return the set of all live PIDs currently in the container, excluding
+        the snapshot shell itself so that monitoring shells are not mistaken
+        for user-spawned processes."""
+        out, _ = self._container_exec(
+            "__SELF=$$\n"
+            "for __d in /proc/[0-9]*; do\n"
+            "  [ -f \"$__d/status\" ] || continue\n"
+            "  __p=${__d##*/}\n"
+            "  [ \"$__p\" != \"$__SELF\" ] && echo \"$__p\"\n"
+            "done",
+            timeout=10, shell="sh",
+        )
+        pids: set[int] = set()
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+        return pids
 
     def _run(
         self,
@@ -148,15 +226,32 @@ class agSandbox:
         timeout: int = 120,
     ) -> tuple[str, int]:
         """Run a user command inside the container."""
-        env_prefix = ""
-        if self._gpu_id is not None:
-            env_prefix = f"CUDA_VISIBLE_DEVICES={self._gpu_id} "
+        # Always export CUDA_VISIBLE_DEVICES so the container cannot access
+        # GPUs that were not explicitly acquired via gpu_acquire, even if
+        # --gpus all was passed at container startup.
+        cuda_id = str(self._gpu_id) if self._gpu_id is not None else ""
+        env_export = f"export CUDA_VISIBLE_DEVICES={cuda_id}\n"
 
         wrapped = (
-            f"set -m\n"
-            f"{env_prefix}{cmd}\n"
+            f"exec 2>&1\n"      # merge stderr into stdout so the BGPIDS marker is never split
+            # Snapshot every live PID in the container before the command runs.
+            # Filtering on /proc/<N>/status avoids races with short-lived kernel threads.
+            f"__AGENCY_BEFORE=$(for __d in /proc/[0-9]*; do"
+            f" [ -f \"$__d/status\" ] && echo \"${{__d##*/}}\"; done | tr '\\n' ' ')\n"
+            f"__AGENCY_SHELL=$$\n"
+            f"{env_export}{cmd}\n"
             f"__AGENCY_RC=$?\n"
-            f"__AGENCY_BGPIDS=$(jobs -p 2>/dev/null | tr '\\n' ' ')\n"
+            # Diff /proc after the command: any PID not in the before-snapshot
+            # and not the shell itself was spawned by the command.
+            f"__AGENCY_BGPIDS=''\n"
+            f"for __d in /proc/[0-9]*; do\n"
+            f"  [ -f \"$__d/status\" ] || continue\n"
+            f"  __p=${{__d##*/}}\n"
+            f"  case \" $__AGENCY_BEFORE $__AGENCY_SHELL \" in\n"
+            f"    *\" $__p \"*) ;;\n"
+            f"    *) __AGENCY_BGPIDS=\"$__AGENCY_BGPIDS $__p\" ;;\n"
+            f"  esac\n"
+            f"done\n"
             f"printf '\\n{_BGPIDS_MARKER}%s' \"$__AGENCY_BGPIDS\"\n"
             f"exit $__AGENCY_RC"
         )
@@ -211,28 +306,75 @@ class agSandbox:
         cmd.append(self._container_name())
         self._run(cmd, timeout=10)
 
+    def release_daemon(self, pid: int) -> None:
+        """Move *pid* out of the monitored set into the daemon set.
+
+        The process and all its future descendants will continue running in the
+        container but will never block the outer monitoring loop.
+        """
+        self._daemon_pids.add(pid)
+        self._watched_pids.pop(pid, None)
+
     def get_live_pids(self) -> set[int]:
         if not self._watched_pids:
             return set()
 
-        pid_list = " ".join(str(p) for p in self._watched_pids)
+        # Read pid, ppid, and state for every entry in /proc, excluding the
+        # monitoring shell itself so it is never mistaken for a user process.
         script = (
-            f"for __p in {pid_list}; do\n"
-            f"  kill -0 $__p 2>/dev/null && echo \"alive:$__p\"\n"
-            f"done"
+            "__SELF=$$\n"
+            "for __d in /proc/[0-9]*; do\n"
+            "  [ -f \"$__d/status\" ] || continue\n"
+            "  __p=${__d##*/}\n"
+            "  [ \"$__p\" = \"$__SELF\" ] && continue\n"
+            "  __ppid=$(awk '/^PPid:/{print $2}' $__d/status 2>/dev/null)\n"
+            "  __st=$(awk '/^State:/{print $2}' $__d/status 2>/dev/null)\n"
+            "  echo \"$__p $__ppid $__st\"\n"
+            "done"
         )
         output, _ = self._container_exec(script, timeout=10, shell="sh")
 
-        alive: set[int] = set()
+        proc_info: dict[int, tuple[int, str]] = {}   # pid → (ppid, state)
         for line in output.splitlines():
-            if line.startswith("alive:"):
-                try:
-                    alive.add(int(line[6:].strip()))
-                except ValueError:
-                    pass
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                pid  = int(parts[0])
+                ppid = int(parts[1])
+                state = parts[2] if len(parts) > 2 else "?"
+            except ValueError:
+                continue
+            proc_info[pid] = (ppid, state)
 
-        for pid in set(self._watched_pids) - alive:
-            del self._watched_pids[pid]
+        # Propagate daemon status down the tree: if a process's parent is a
+        # daemon, the child inherits that status and is also excluded from
+        # monitoring.  Repeat until no new daemons are discovered.
+        changed = True
+        while changed:
+            changed = False
+            for pid, (ppid, _) in proc_info.items():
+                if pid not in self._daemon_pids and ppid in self._daemon_pids:
+                    self._daemon_pids.add(pid)
+                    self._watched_pids.pop(pid, None)
+                    changed = True
+
+        # A PID is alive if it exists in /proc, is not baseline, not a daemon,
+        # and not a zombie.  Any newly discovered non-baseline PID is added to
+        # _watched_pids so the outer loop waits for it.
+        alive: set[int] = set()
+        now = time.monotonic()
+        for pid, (_, state) in proc_info.items():
+            if pid in self._baseline_pids or pid in self._daemon_pids or state == "Z":
+                continue
+            alive.add(pid)
+            if pid not in self._watched_pids:
+                self._watched_pids[pid] = now
+
+        # Prune _watched_pids entries that are no longer alive.
+        for pid in set(self._watched_pids):
+            if pid not in alive:
+                del self._watched_pids[pid]
 
         return alive
 

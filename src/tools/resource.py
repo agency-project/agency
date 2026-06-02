@@ -5,8 +5,8 @@ from ..agdata import agdata
 from ..agtool import agtool
 
 if TYPE_CHECKING:
-    from ..sandbox import agSandbox
-    from ..resources import agResourcePool
+    from ..agsandbox import agSandbox
+    from ..agresources import agResourcePool
 
 
 def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
@@ -31,7 +31,7 @@ def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
         name="gpu_acquire",
         fn=_run,
         description=(
-            "Acquire exclusive access to a GPU before running GPU-intensive commands. "
+            "Acquire exclusive access to a GPU before running commands with GPU acceleration. "
             "Returns the assigned GPU ID. CUDA_VISIBLE_DEVICES is set automatically for "
             "all subsequent bash calls. Always call gpu_release when finished."
         ),
@@ -124,7 +124,46 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
         name="cpu_release",
         fn=_run,
         description=(
-            "Reset CPU and memory limits back to idle defaults after compute-intensive work."
+            f"Reset CPU and memory limits back to idle defaults after compute-intensive work "
+            f"(idle: {pool.idle_cpus} CPUs, {pool.idle_memory} memory)."
         ),
         params={"type": "object", "properties": {}},
+    )
+
+
+def make_daemon_release(sandbox: "agSandbox") -> agtool:
+    """Return a tool that releases a PID from monitoring as a daemon.
+
+    Call this for intentionally long-lived services (servers, monitors) that
+    should keep running after the skill finishes.  The process and all its
+    descendants will continue running in the sandbox but will never block the
+    outer monitoring loop.
+    """
+    def _run(arg: agdata) -> agdata:
+        pid_val = getattr(arg, "pid", None)
+        if pid_val is None:
+            return agdata(error="pid is required")
+        try:
+            pid = int(pid_val)
+        except (TypeError, ValueError):
+            return agdata(error=f"invalid pid: {pid_val!r}")
+        sandbox.release_daemon(pid)
+        return agdata(message=f"PID {pid} released as daemon — will not block skill completion")
+
+    return agtool(
+        name="daemon_release",
+        fn=_run,
+        description=(
+            "Release a background process as a daemon so the skill can complete "
+            "without waiting for it. Use this for intentionally long-lived services "
+            "(servers, monitors) that should keep running after the skill finishes. "
+            "The process and all its descendants will continue running in the sandbox."
+        ),
+        params={
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer", "description": "PID of the process to release as a daemon"},
+            },
+            "required": ["pid"],
+        },
     )

@@ -384,3 +384,463 @@ def test_chained_run_output_as_next_input():
 
     # ag2 received the resolved r1 as its input
     assert received_inputs[1] == {"done": True}
+
+
+# ---------------------------------------------------------------------------
+# Outer monitoring loop
+# ---------------------------------------------------------------------------
+
+def _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0):
+    """Build a fake agskill.run that records each call's input.
+
+    On the iteration numbered *inject_pid_on_call*, it plants a fake PID into
+    the sandbox's _watched_pids dict to simulate a background process having
+    been launched.  On subsequent calls it does not add any PIDs, so the loop
+    can break cleanly.
+    """
+    skill = agskill(name="s", system_prompt="")
+    import time as _time
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        idx = len(calls)
+        calls.append(dict(inp._data))
+        if idx == inject_pid_on_call:
+            ag.sandbox._watched_pids[99999] = _time.monotonic()
+        else:
+            # Clear stale fake PID so the next pids_at_end snapshot is empty
+            ag.sandbox._watched_pids.clear()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill.run = fake_run
+    return skill
+
+
+def test_outer_loop_no_background_process_exits_immediately():
+    """When no background processes are started, the skill resolves in one iteration."""
+    calls = []
+    skill = agskill(name="s", system_prompt="")
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        calls.append(dict(inp._data))
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill.run = fake_run
+    ag = make_agent(agskills=[skill])
+    agent.poll_interval_s = 0
+
+    ag.run("s", agdata()).result  # block until done
+
+    assert len(calls) == 1
+
+
+def test_outer_loop_re_enters_with_completed_event_when_process_finishes():
+    """When a background process finishes before ping_interval_s elapses, the
+    agent gets a process_completed re-entry so it can act on the output."""
+    calls = []
+    ag = make_agent(agskills=[])  # placeholder; skill added below
+    skill = _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0)
+    ag.agskills = [skill]
+
+    # Patch get_live_pids: process is already gone by the time we check
+    ag.sandbox.get_live_pids = lambda: set()
+    agent.poll_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    assert len(calls) == 2
+    assert calls[1].get("_event") == "process_completed"
+
+
+def test_outer_loop_re_enters_with_update_event_when_process_still_running():
+    """When a process is still running after ping_interval_s elapses, the
+    agent gets a process_update re-entry with a status summary."""
+    import time as _time
+
+    calls = []
+    ag = make_agent(agskills=[])
+    skill = agskill(name="s", system_prompt="")
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        idx = len(calls)
+        calls.append(dict(inp._data))
+        if idx == 0:
+            ag.sandbox._watched_pids[99999] = _time.monotonic()
+        else:
+            ag.sandbox._watched_pids.clear()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill.run = fake_run
+    ag.agskills = [skill]
+
+    # Patch get_live_pids: process still alive on first check, gone on second
+    check_count = [0]
+    def fake_live_pids():
+        check_count[0] += 1
+        if check_count[0] == 1:
+            return {99999}   # still running → triggers process_update path
+        ag.sandbox._watched_pids.clear()
+        return set()
+
+    ag.sandbox.get_live_pids = fake_live_pids
+    ag.sandbox.pid_status_summary = lambda: "PID 99999 (running 0m 0s)"
+    agent.poll_interval_s = 0
+    agent.ping_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    assert len(calls) == 2
+    assert calls[1].get("_event") == "process_update"
+    assert "still running" in calls[1].get("message", "")
+
+
+def test_outer_loop_completed_event_precedes_update_event():
+    """process_completed fires before process_update: if a process finishes
+    it always gets a completion re-entry, never an update."""
+    calls = []
+    ag = make_agent(agskills=[])
+    skill = _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0)
+    ag.agskills = [skill]
+
+    ag.sandbox.get_live_pids = lambda: set()   # always done instantly
+    agent.poll_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    events = [c.get("_event") for c in calls if "_event" in c]
+    assert "process_completed" in events
+    assert "process_update" not in events
+
+
+def test_outer_loop_max_iters_cap():
+    """The loop never runs more than max_outer_iters iterations."""
+    import time as _time
+
+    calls = []
+    ag = make_agent(agskills=[])
+    skill = agskill(name="s", system_prompt="")
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        calls.append(1)
+        ag.sandbox._watched_pids[99999] = _time.monotonic()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill.run = fake_run
+    ag.agskills = [skill]
+
+    ag.sandbox.get_live_pids = lambda: set()
+    agent.poll_interval_s = 0
+    agent.max_outer_iters = 3
+
+    ag.run("s", agdata()).result
+
+    assert len(calls) <= 3
+
+
+def test_outer_loop_long_job_multiple_update_cycles():
+    """A single long-running job stays alive across multiple ping intervals.
+    The agent gets a process_update on each cycle and a final process_completed
+    once the job exits.
+
+    Sequence:
+      iter 0  initial call     → starts PID 1
+      check 1 get_live_pids()  → {1}  alive  → process_update
+      iter 1  process_update   → PID 1 still in _watched_pids
+      check 2 get_live_pids()  → {1}  alive  → process_update
+      iter 2  process_update   → PID 1 still in _watched_pids
+      check 3 get_live_pids()  → {}   done   → process_completed
+      iter 3  process_completed→ clears _watched_pids
+      pids_at_end = {}  → break
+    """
+    import time as _time
+
+    ag = make_agent(agskills=[])
+    calls = []
+
+    live_seq = [{1}, {1}, set()]
+    live_idx = [0]
+
+    def fake_live_pids():
+        resp = live_seq[min(live_idx[0], len(live_seq) - 1)]
+        live_idx[0] += 1
+        if not resp:
+            ag.sandbox._watched_pids.clear()
+        return resp
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        event = inp._data.get("_event")
+        calls.append(event)
+        if event is None:                       # initial call
+            ag.sandbox._watched_pids[1] = _time.monotonic()
+        elif event == "process_completed":
+            ag.sandbox._watched_pids.clear()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.run = fake_run
+    ag.agskills = [skill]
+    ag.sandbox.get_live_pids = fake_live_pids
+    ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 0s)"
+    agent.poll_interval_s = 0
+    agent.ping_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    update_count = calls.count("process_update")
+    assert update_count == 2
+    assert calls[-1] == "process_completed"
+    assert len(calls) == 4   # initial + 2 updates + 1 completed
+
+
+def test_outer_loop_two_jobs_different_end_times():
+    """Two background jobs started together; the fast one finishes first.
+    The loop should fire process_update while the slow job is still alive,
+    then process_completed once both are gone.
+
+    Sequence:
+      iter 0  initial call     → starts PID 1 (fast) and PID 2 (slow)
+      check 1 get_live_pids()  → {2}  (1 already done)  → process_update
+      iter 1  process_update   → no new PIDs
+      check 2 get_live_pids()  → {}   (2 now done)       → process_completed
+      iter 2  process_completed→ clears _watched_pids
+      pids_at_end = {}  → break
+    """
+    import time as _time
+
+    ag = make_agent(agskills=[])
+    calls = []
+
+    live_seq = [{2}, set()]
+    live_idx = [0]
+
+    def fake_live_pids():
+        resp = live_seq[min(live_idx[0], len(live_seq) - 1)]
+        live_idx[0] += 1
+        if not resp:
+            ag.sandbox._watched_pids.clear()
+        return resp
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        event = inp._data.get("_event")
+        calls.append(event)
+        if event is None:
+            ag.sandbox._watched_pids[1] = _time.monotonic()   # fast job
+            ag.sandbox._watched_pids[2] = _time.monotonic()   # slow job
+        elif event == "process_completed":
+            ag.sandbox._watched_pids.clear()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.run = fake_run
+    ag.agskills = [skill]
+    ag.sandbox.get_live_pids = fake_live_pids
+    ag.sandbox.pid_status_summary = lambda: "PID 2 (running 0m 0s)"
+    agent.poll_interval_s = 0
+    agent.ping_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    assert calls.count("process_update") == 1
+    assert calls[-1] == "process_completed"
+    assert len(calls) == 3
+
+
+def test_outer_loop_agent_starts_new_job_on_completed_reentry():
+    """Agent reacts to process_completed by launching another background job.
+    The loop must track the new PID and re-enter again when it finishes.
+
+    Sequence:
+      iter 0  initial call      → starts PID 1
+      check 1 get_live_pids()   → {}  → process_completed
+      iter 1  process_completed → starts PID 2 (new job)
+      check 2 get_live_pids()   → {}  → process_completed
+      iter 2  process_completed → no new PIDs, clears _watched_pids
+      pids_at_end = {}  → break
+    """
+    import time as _time
+
+    ag = make_agent(agskills=[])
+    calls = []
+    live_idx = [0]
+
+    def fake_live_pids():
+        live_idx[0] += 1
+        ag.sandbox._watched_pids.clear()
+        return set()   # every check: process already done
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        event = inp._data.get("_event")
+        calls.append(event)
+        if event is None:
+            ag.sandbox._watched_pids[1] = _time.monotonic()
+        elif event == "process_completed" and len(calls) == 2:
+            # React to first completion by kicking off a second job
+            ag.sandbox._watched_pids[2] = _time.monotonic()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.run = fake_run
+    ag.agskills = [skill]
+    ag.sandbox.get_live_pids = fake_live_pids
+    agent.poll_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    assert calls.count("process_completed") == 2
+    assert "process_update" not in calls
+    assert len(calls) == 3
+
+
+def test_outer_loop_jobs_added_at_different_points_with_different_latencies():
+    """Agent dynamically adds jobs during re-entries; each has a different
+    lifetime.  Tests that newly added PIDs are tracked across outer iterations
+    and that the loop does not resolve until all work is truly done.
+
+    Sequence:
+      iter 0  initial call      → starts PID 1 (slow) and PID 2 (fast)
+      check 1 get_live_pids()   → {1}  (2 done)  → process_update
+      iter 1  process_update    → agent adds PID 3 (medium)
+      check 2 get_live_pids()   → {3}  (1 done)  → process_update
+      iter 2  process_update    → no new PIDs
+      check 3 get_live_pids()   → {}   (3 done)  → process_completed
+      iter 3  process_completed → clears _watched_pids
+      pids_at_end = {}  → break
+    """
+    import time as _time
+
+    ag = make_agent(agskills=[])
+    calls = []
+
+    live_seq = [{1}, {3}, set()]
+    live_idx = [0]
+
+    def fake_live_pids():
+        resp = live_seq[min(live_idx[0], len(live_seq) - 1)]
+        live_idx[0] += 1
+        if not resp:
+            ag.sandbox._watched_pids.clear()
+        return resp
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        event = inp._data.get("_event")
+        calls.append(event)
+        if event is None:                          # initial: start slow + fast
+            ag.sandbox._watched_pids[1] = _time.monotonic()
+            ag.sandbox._watched_pids[2] = _time.monotonic()
+        elif event == "process_update" and len(calls) == 2:
+            # First update: fast job done, slow still running; add a medium job
+            ag.sandbox._watched_pids[3] = _time.monotonic()
+        elif event == "process_completed":
+            ag.sandbox._watched_pids.clear()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.run = fake_run
+    ag.agskills = [skill]
+    ag.sandbox.get_live_pids = fake_live_pids
+    ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"
+    agent.poll_interval_s = 0
+    agent.ping_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    assert calls.count("process_update") == 2
+    assert calls[-1] == "process_completed"
+    assert len(calls) == 4   # initial + 2 updates + 1 completed
+
+
+def test_outer_loop_process_completed_fires_when_new_batch_exits_quickly():
+    """When the agent starts a new batch of PIDs during a re-entry and they
+    finish before ping_interval_s, process_completed fires promptly.
+
+    Sequence:
+      iter 0  initial call     → starts PID 1; PID 1 still alive → process_update
+      iter 1  process_update   → starts PID 2; PID 2 already done → process_completed
+      iter 2  process_completed→ clears _watched_pids → break
+    """
+    import time as _time
+
+    ag = make_agent(agskills=[])
+    calls = []
+
+    live_seq = [{1}, set()]
+    live_idx = [0]
+
+    def fake_live_pids():
+        resp = live_seq[min(live_idx[0], len(live_seq) - 1)]
+        live_idx[0] += 1
+        if not resp:
+            ag.sandbox._watched_pids.clear()
+        return resp
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        event = inp._data.get("_event")
+        calls.append(event)
+        if event is None:
+            ag.sandbox._watched_pids[1] = _time.monotonic()
+        elif event == "process_update":
+            ag.sandbox._watched_pids.clear()
+            ag.sandbox._watched_pids[2] = _time.monotonic()
+        elif event == "process_completed":
+            ag.sandbox._watched_pids.clear()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.run = fake_run
+    ag.agskills = [skill]
+    ag.sandbox.get_live_pids = fake_live_pids
+    ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"
+    agent.poll_interval_s = 0
+    agent.ping_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    assert calls[1] == "process_update"
+    assert calls[2] == "process_completed"
+    assert len(calls) == 3
+
+
+def test_outer_loop_daemon_release_unblocks_skill():
+    """When the agent calls daemon_release during a process_update re-entry,
+    _watched_pids becomes empty and the outer loop breaks immediately —
+    the skill resolves without waiting for the daemon to exit.
+
+    Sequence:
+      iter 0  initial call    → starts PID 1 (daemon server)
+              PID 1 still alive after poll window → process_update
+      iter 1  process_update  → agent calls daemon_release(1)
+                                _watched_pids now empty
+              pids_at_end = {} → break
+    """
+    import time as _time
+
+    ag = make_agent(agskills=[])
+    calls = []
+
+    def fake_live_pids():
+        # PID 1 is always alive — it's a daemon that never exits
+        return {1} if ag.sandbox._watched_pids else set()
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        event = inp._data.get("_event")
+        calls.append(event)
+        if event is None:
+            # Initial call: start a daemon process
+            ag.sandbox._watched_pids[1] = _time.monotonic()
+        elif event == "process_update":
+            # Agent recognises PID 1 as a daemon and releases it
+            ag.sandbox.release_daemon(1)
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.run = fake_run
+    ag.agskills = [skill]
+    ag.sandbox.get_live_pids = fake_live_pids
+    ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 5s)"
+    agent.poll_interval_s = 0
+    agent.ping_interval_s = 0
+
+    ag.run("s", agdata()).result
+
+    assert calls == [None, "process_update"]   # no process_completed — daemon was released
+    assert 1 in ag.sandbox._daemon_pids        # PID moved to daemon set
+    assert ag.sandbox._watched_pids == {}      # nothing left to monitor

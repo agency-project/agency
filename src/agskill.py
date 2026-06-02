@@ -162,11 +162,9 @@ class agskill:
                     t = tool_map.get(tc.function.name)
                     if t is None:
                         if term:
-                            term.log("TOOL     ", f"{tc.function.name}  → unknown tool")
+                            term.log("TOOL ✗   ", f"{tc.function.name}  → unknown tool")
                         result_content = json.dumps({"error": f"unknown tool: {tc.function.name}"})
                     else:
-                        if term:
-                            term.log("TOOL     ", f"{tc.function.name}({tc.function.arguments[:80]})")
                         try:
                             result_content = t(agdata.from_json(tc.function.arguments)).to_json()
                         except Exception as e:
