@@ -1,9 +1,18 @@
 from __future__ import annotations
 import json
+import re
 from typing import TYPE_CHECKING, Callable
 import openai
+
+_THINKING_RE = re.compile(r"<think(?:ing)?>\s*.*?\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(content: str) -> str:
+    """Remove <think>…</think> / <thinking>…</thinking> blocks from model output."""
+    return _THINKING_RE.sub("", content).strip()
 from .agdata import agdata
 from .agtool import agtool
+from .agcompaction import compact, should_compact
 
 if TYPE_CHECKING:
     from .agterm import agterm
@@ -94,6 +103,8 @@ class agskill:
         _state_fn: "Callable | None" = None,
         _live_messages_fn: "Callable | None" = None,
         _inbox_fn: "Callable | None" = None,
+        _context_limit: "int | None" = None,
+        _compact_log_fn: "Callable | None" = None,
     ) -> tuple[agdata, agdata, list[dict]]:
         """Run the ReAct loop.
 
@@ -134,6 +145,7 @@ class agskill:
             _live_messages_fn(messages[1:])
 
         retries_left = self.max_retries
+        _compaction_summary: str | None = None
 
         for _ in range(max_steps):
             had_inbox = False
@@ -162,11 +174,41 @@ class agskill:
             resp = client.chat.completions.create(**kwargs)
             if _state_fn:
                 _state_fn("skill", skill=self.name)
+
+            # Auto-compaction: if we're burning through context, summarise old
+            # messages now so the next iteration has headroom.
+            if _context_limit is not None and resp.usage is not None:
+                prompt_tokens = resp.usage.prompt_tokens
+                if should_compact(prompt_tokens, _context_limit):
+                    if term:
+                        term.log(
+                            "COMPACT  ",
+                            f"skill={self.name}  "
+                            f"tokens={prompt_tokens}/{_context_limit}  "
+                            f"msgs={len(messages)}",
+                        )
+                    msgs_before = len(messages)
+                    messages, _compaction_summary = compact(
+                        messages, llm_config,
+                        context_limit=_context_limit,
+                        previous_summary=_compaction_summary,
+                    )
+                    if _compact_log_fn:
+                        _compact_log_fn(
+                            skill=self.name,
+                            prompt_tokens=prompt_tokens,
+                            context_limit=_context_limit,
+                            msgs_before=msgs_before,
+                            msgs_after=len(messages),
+                        )
+                    if _live_messages_fn:
+                        _live_messages_fn(messages[1:])
+
             msg = resp.choices[0].message
 
             msg_dict: dict = {"role": "assistant"}
             if msg.content:
-                msg_dict["content"] = msg.content
+                msg_dict["content"] = _strip_thinking(msg.content)
             if msg.tool_calls:
                 msg_dict["tool_calls"] = [
                     {
@@ -210,7 +252,7 @@ class agskill:
                     continue
 
                 # --- Parse final answer --------------------------------------
-                content = msg.content or "{}"
+                content = _strip_thinking(msg.content or "{}")
                 # Strip markdown code fences that some models add despite instructions
                 stripped = content.strip()
                 if stripped.startswith("```"):

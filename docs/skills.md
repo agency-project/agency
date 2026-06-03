@@ -5,8 +5,7 @@ An `agskill` is a named, self-contained ReAct loop with its own system prompt, o
 ## Defining a skill
 
 ```python
-from src.agskill import agskill
-from src.agdata import agdata
+from agency import agskill, agdata
 
 skill = agskill(
     name="summarize",
@@ -35,11 +34,13 @@ Both schemas are serialized and appended to the system prompt so the LLM knows t
 Each call to `agskill.run()` executes a standard ReAct loop:
 
 1. Build messages: `[system] + history + [user: input.to_json()]`
-2. Call the LLM
-3. If the response contains tool calls → execute each tool, append results, go to 2
-4. If the response is a final answer → parse JSON, validate against `output_schema`
-5. If validation fails and retries remain → inject correction message, go to 2
-6. Return `(result, updated_history, history_delta)`
+2. Drain user inbox (injected mid-conversation messages from `agUI` or `agent._inbox`)
+3. Call the LLM
+4. Check token usage — compact context if over threshold (see [compaction.md](compaction.md))
+5. If response contains tool calls → execute each tool, append results, go to 2
+6. If response is a final answer → parse JSON, validate against `output_schema`
+7. If validation fails and retries remain → inject correction message, go to 2
+8. Return `(result, updated_history, history_delta)`
 
 The loop exits early on `max_steps` (default `10`) exceeded.
 
@@ -47,7 +48,7 @@ The loop exits early on `max_steps` (default `10`) exceeded.
 
 Input is validated against `input_schema` before the loop starts. Validation checks that all required fields are present and have the correct Python type. If validation fails, the skill returns immediately with an `agdata(error=...)` without calling the LLM.
 
-Input validation is **skipped** on outer-loop re-entries (`_is_continuation=True`) so that `process_completed` and `process_update` ping messages can flow through without matching the skill's declared input schema.
+Input validation is **skipped** on outer-loop re-entries (`_is_continuation=True`) so that process-status ping messages can flow through without matching the skill's declared input schema.
 
 ## Output validation and retries
 
@@ -59,9 +60,11 @@ After a non-tool-call LLM response:
 4. If errors exist and `retries_left > 0`: inject a correction message and loop
 5. If errors persist after all retries: return `agdata(error="output schema error after retries: ...")`
 
+Output validation is skipped when the LLM response is answering a mid-conversation user message injected via the inbox (`had_inbox=True`), because the LLM is engaged in dialogue rather than producing a final structured answer.
+
 ## History
 
-The history passed to `agskill.run()` is the agent's shared conversation context. The skill appends its full message exchange (user → tool calls → tool results → assistant) to this history and returns the updated version. The system prompt is included in `history_delta` but not persisted in the stored history, so it is re-injected fresh on every call.
+The history passed to `agskill.run()` is the agent's shared conversation context. The skill appends its full message exchange to this history and returns the updated version. The system prompt is re-injected fresh on every call and is not persisted in the stored history.
 
 ## Skill-level tool override
 
@@ -74,6 +77,8 @@ skill = agskill(
     tools=[search_tool],   # agent's sandbox tools are not available in this skill
 )
 ```
+
+Setting `tools=[]` gives the skill no tools at all — pure reasoning only.
 
 ## Example with output validator
 

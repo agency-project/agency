@@ -11,7 +11,6 @@ dependencies = [
     { name = "httpx" },
     { name = "openai" },
     { name = "podman" },
-    { name = "rich" },
     { name = "textual" },
 ]
 
@@ -31,7 +30,6 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-mock", marker = "extra == 'dev'" },
     { name = "pytest-timeout", marker = "extra == 'dev'" },
-    { name = "rich", specifier = ">=15.0.0" },
     { name = "textual", specifier = ">=8.2.7" },
 ]
 provides-extras = ["dev"]

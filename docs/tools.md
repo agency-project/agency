@@ -9,22 +9,23 @@ Tools are the functions an LLM can call during a ReAct loop. Each tool is an `ag
 | `bash` | sandbox | Run a shell command; all spawned processes tracked automatically |
 | `read` | sandbox | Read a file with line-range pagination, or list a directory |
 | `write` | sandbox | Write a file, creating parent directories as needed |
-| `edit` | sandbox | Fuzzy in-place string replacement (read → replace in Python → write) |
+| `edit` | sandbox | Fuzzy in-place string replacement |
 | `glob` | sandbox | Find files matching a glob pattern (`rg --files` or `find` fallback) |
 | `grep` | sandbox | Search file contents by regex (`rg --json` or Python fallback) |
 | `webfetch` | host | Fetch a URL and convert HTML to Markdown |
 | `todowrite` | host | Persist a structured todo list to disk |
+| `ask_human` | host | Ask the user a question; blocks until a reply arrives (from UI or stdin) |
 | `daemon_release` | sandbox | Release a PID from monitoring so a long-lived service doesn't block skill completion |
 | `gpu_acquire` | sandbox | Acquire exclusive GPU access from the resource pool |
 | `gpu_release` | sandbox | Return the GPU to the pool |
 | `cpu_acquire` | sandbox | Boost container CPU/memory limits for compute-intensive work |
 | `cpu_release` | sandbox | Reset CPU/memory limits back to idle defaults |
 
-All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker exec`.
+All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker/podman exec`.
 
 ## Sandboxed tool construction
 
-`make_sandboxed_tools(sandbox, pool=None)` in `src/tools/__init__.py` builds the full tool list for an agent:
+`make_sandboxed_tools(sandbox, pool=None)` in `agency/tools/__init__.py` builds the full tool list for an agent:
 
 ```python
 tools = [
@@ -34,9 +35,10 @@ tools = [
     make_edit(sandbox),
     make_glob(sandbox),
     make_grep(sandbox),
-    webfetch,               # host-side
-    todowrite,              # host-side
-    make_daemon_release(sandbox),  # always included
+    webfetch,                         # host-side singleton
+    todowrite,                        # host-side singleton
+    make_ask_human(sandbox._agname),  # host-side, routes to agUI or stdin
+    make_daemon_release(sandbox),
 ]
 if pool is not None:
     tools += [
@@ -50,8 +52,6 @@ if pool is not None:
 ## Tool logging
 
 Every tool call is logged automatically after it returns. `agent.__init__` calls `tool.attach_logger(term, log)` on each tool, wiring up both terminal and file logging.
-
-Each tool has a `log(arg, result, elapsed_ms)` method called from `__call__` after the tool function returns. The default implementation logs input/output key names. Sandboxed tool factories override it with per-tool summaries:
 
 | Tool | Terminal line |
 |---|---|
@@ -79,8 +79,8 @@ my_tool = agtool(name="my_tool", description="...", fn=my_fn, log_fn=my_log)
 ## Defining a custom tool
 
 ```python
-from src.agtool import agtool
-from src.agdata import agdata
+from agency.agtool import agtool
+from agency.agdata import agdata
 
 my_tool = agtool(
     name="add",
@@ -101,10 +101,9 @@ Pass custom tools to a skill or directly to an agent:
 
 ```python
 skill = agskill("math", "You are a calculator.", tools=[my_tool])
-ag = agent(llm_config, agskills=[skill])
 ```
 
-If `agskill.tools` is `None`, the skill inherits the agent's full sandboxed tool list. If it is set, only those tools are available for that skill.
+If `agskill.tools` is `None`, the skill inherits the agent's full sandboxed tool list. Setting `tools=[]` gives the skill no tools (pure reasoning).
 
 ## Tool output
 
@@ -112,7 +111,7 @@ Tool functions receive an `agdata` and must return an `agdata`. The return value
 
 ## bash process tracking
 
-The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID in `/proc` that wasn't present before is added to `sandbox._watched_pids` and monitored by the outer loop. See [container.md](container.md) for the exec wrapper details and [execution_loop.md](execution_loop.md) for the outer monitoring loop.
+The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by the outer loop. See [container.md](container.md) for exec wrapper details and [execution_loop.md](execution_loop.md) for the outer monitoring loop.
 
 ## `daemon_release` tool
 
@@ -123,3 +122,13 @@ LLM calls: daemon_release({"pid": 1234})
 ```
 
 This moves PID 1234 (and all its future descendants) from `_watched_pids` to `_daemon_pids`. The outer loop no longer waits for it, and the skill resolves normally. The process keeps running in the container until the container is destroyed.
+
+## `ask_human` tool
+
+The agent calls `ask_human` when it needs information it cannot determine on its own:
+
+```
+LLM calls: ask_human({"question": "Which dataset should I use?"})
+```
+
+When `agUI` is active, the question is displayed in the interaction pane and the UI blocks until the user types a reply. Without `agUI`, the question is printed to stdout and the agent reads from stdin. The reply is returned as `agdata(reply="...")` and injected into the ReAct loop. The agent's state is set to `"human"` while waiting.

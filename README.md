@@ -110,11 +110,13 @@ Detailed engineering documentation is in `docs/`:
 
 | File | Topic |
 |---|---|
-| `agent.md` | Agent construction, `run()`, forking, class-level config |
+| `agent.md` | Agent construction, `run()`, forking, class-level config, UI callbacks |
 | `container.md` | Sandbox container — lifecycle, GPU access, output dir, exec wrapper, PID tracking |
-| `execution_loop.md` | Full execution path — outer monitoring loop, inner ReAct loop, input/output handling |
+| `execution_loop.md` | Full execution path — outer monitoring loop, inner ReAct loop, inbox drain, compaction |
 | `execution_process_control.md` | Per-scenario trace: background job, foreground job, daemon |
-| `skills.md` | Skills — ReAct loop, schemas, validation, retries |
-| `tools.md` | Built-in tools, sandboxed factories, tool logging, `daemon_release` |
+| `skills.md` | Skills — ReAct loop, schemas, validation, retries, inbox handling |
+| `tools.md` | Built-in tools, sandboxed factories, tool logging, `ask_human`, `daemon_release` |
 | `resource_control.md` | GPU/CPU/memory resource pool |
-| `logging.md` | Structured log — skill entries, tool entries, lifecycle events |
+| `logging.md` | Structured log — skill entries, tool entries, lifecycle events, compaction events |
+| `compaction.md` | Auto-compaction — trigger, algorithm, incremental summaries, tuning |
+| `ui.md` | agUI TUI — layout, keyboard bindings, interaction pane, agent list |

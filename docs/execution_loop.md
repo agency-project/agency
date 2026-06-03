@@ -6,17 +6,15 @@ This document traces the complete execution path of a single `agent.run()` call 
 
 ## 1. `agent.run()` — submission and future construction
 
-**File:** `src/agent.py` · `agent.run(skill_name, input, max_steps=10)`
+**File:** `agency/agent.py` · `agent.run(skill_name, input, max_steps=10)`
 
 The caller receives a pending `agdata` immediately. No LLM call has happened yet.
 
 ```python
-# Runs synchronously on the caller's thread
-prev_history = self._history                    # agdata wrapping a Future or a resolved agdata
+prev_history = self._history                    # agdata wrapping a Future or resolved agdata
 result_future:  Future[agdata] = Future()
 history_future: Future[agdata] = Future()
-ts_start = _ts()                                # ISO-8601 timestamp captured now for the log
-pool = agent.agresource_pool                    # snapshot class-level pool reference
+ts_start = _ts()                                # ISO-8601 timestamp for the log
 
 agent._pool.submit(_task)                       # hand _task to shared ThreadPoolExecutor
 
@@ -30,18 +28,18 @@ return agdata(_future=result_future)            # caller gets this — pending u
 
 ## 2. `_task()` — the task thread
 
-**File:** `src/agent.py` · `_task()` (closure inside `agent.run()`)
+**File:** `agency/agent.py` · `_task()` (closure inside `agent.run()`)
 
 Runs on a thread from `agent._pool`. Everything below executes on this thread.
 
 ### 2a. Input resolution
 
 ```python
-prev_history._resolve()    # agdata._resolve() → _future.result() → blocks if still pending
+prev_history._resolve()    # blocks if still pending
 _resolve_input(input)      # recursively resolves any pending agdata nested inside input fields
 ```
 
-`_resolve_input` (module-level in `agent.py`) walks `input._data`:
+`_resolve_input` walks `input._data`:
 - Top-level values that are pending `agdata` → `val._resolve()`
 - List elements that are pending `agdata` → `item._resolve()`
 
@@ -49,7 +47,7 @@ This allows the caller to pass a prior `run()` result directly as input without 
 
 ```python
 r1 = ag.run("search", agdata(query="..."))   # pending
-r2 = ag.run("summarize", agdata(text=r1))    # r1 resolved here inside _task for r2, not by caller
+r2 = ag.run("summarize", agdata(text=r1))    # r1 resolved here inside _task for r2
 ```
 
 ### 2b. Skill lookup
@@ -58,16 +56,7 @@ r2 = ag.run("summarize", agdata(text=r1))    # r1 resolved here inside _task for
 af = next((f for f in self.agskills if f.name == skill_name), None)
 ```
 
-Linear scan over `self.agskills`. On failure:
-
-```python
-err = agdata(error=f"agskill not found: {skill_name!r}")
-result_future.set_result(err)
-history_future.set_result(prev_history)
-return
-```
-
-Both futures resolve immediately. The caller's pending `agdata` unblocks with an error; the history chain is unblocked with the unchanged history.
+On failure, both futures resolve immediately with an error and unchanged history.
 
 ### 2c. Outer loop state initialization
 
@@ -84,7 +73,7 @@ is_continuation = False       # suppresses input schema validation on re-entries
 
 ## 3. Outer monitoring loop
 
-**File:** `src/agent.py` · `for _outer_iter in range(agent.max_outer_iters)`
+**File:** `agency/agent.py` · `for _outer_iter in range(agent.max_outer_iters)`
 
 Each iteration runs the inner ReAct loop once, then checks for background processes.
 
@@ -92,7 +81,7 @@ Each iteration runs the inner ReAct loop once, then checks for background proces
 ┌─── outer iteration N ────────────────────────────────────────────────┐
 │                                                                      │
 │  agskill.run(current_input, current_history, tools, max_steps,      │
-│              _is_continuation=is_continuation)                       │
+│              _is_continuation, _context_limit, ...)                  │
 │  → result, new_history, history_delta                                │
 │                                                                      │
 │  outer_result  = result                                              │
@@ -107,53 +96,34 @@ Each iteration runs the inner ReAct loop once, then checks for background proces
 │  for up to ping_interval_s total                                     │
 │  break as soon as all PIDs are gone                                  │
 │                                                                      │
-│  live_now = get_live_pids()                                          │
-│                                                                      │
 │  if not live_now:                    ← all processes finished        │
-│    current_input = agdata(                                           │
-│        _event="process_completed",                                   │
-│        message="Background processes have completed. ..."            │
-│    )                                                                 │
-│    current_history = new_history                                     │
+│    current_input = agdata(_event="process_completed", ...)           │
 │    is_continuation = True                                            │
 │    continue  ────────────────────────────────────────────────────────┤
 │                                                                      │
 │  else:                               ← still running after full wait │
-│    summary = sandbox.pid_status_summary()                            │
-│    current_input = agdata(                                           │
-│        _event="process_update",                                      │
-│        message=f"...still running: {summary}..."                     │
-│    )                                                                 │
-│    current_history = new_history                                     │
+│    current_input = agdata(_event="process_update", ...)              │
 │    is_continuation = True                                            │
 │    continue  ────────────────────────────────────────────────────────┘
 ```
 
 ### History threading across outer iterations
 
-`new_history` from each `agskill.run()` becomes `current_history` for the next iteration, so the LLM carries the full conversation context forward — including tool calls from background-process re-entries. `outer_delta` grows by concatenation across all iterations; the final log entry includes the complete delta for the entire skill invocation.
-
-### PID snapshot timing
-
-`pids_at_end = set(sandbox._watched_pids)` is taken **after** `agskill.run()` returns. By this point, every `bash` tool call that ran inside the ReAct loop has already written its background PIDs into `sandbox._watched_pids` — the `exec` wrapper extracts PIDs synchronously before returning output to the LLM.
-
-### Polling loop
-
-After detecting background PIDs, the loop polls `get_live_pids()` every `poll_interval_s` (default 5s) for up to `ping_interval_s` total (default 300s). It breaks as soon as all PIDs are gone — whether that takes 2 seconds or 5 minutes. This means a fast job fires `process_completed` promptly rather than waiting for a full ping interval.
+`new_history` from each `agskill.run()` becomes `current_history` for the next iteration, so the LLM carries the full conversation context forward — including tool calls from background-process re-entries.
 
 ### `process_completed` vs `process_update`
 
 | `pids_at_end` | `live_now` after poll window | Action |
 |---|---|---|
 | empty | — | `break` — skill done |
-| non-empty | empty (job finished during poll) | `continue` with `_event="process_completed"` immediately |
+| non-empty | empty (job finished during poll) | `continue` with `_event="process_completed"` |
 | non-empty | non-empty (still alive after `ping_interval_s`) | `continue` with `_event="process_update"` + summary |
 
 ---
 
 ## 4. Inner ReAct loop — `agskill.run()`
 
-**File:** `src/agskill.py` · `agskill.run(llm_config, input, history, agent_tools, max_steps, term, _is_continuation)`
+**File:** `agency/agskill.py`
 
 Returns `(result: agdata, updated_history: agdata, history_delta: list[dict])`.
 
@@ -165,8 +135,6 @@ tool_map = {t.name: t for t in active_tools}
 openai_tools = [t.to_openai_tool() for t in active_tools] or None
 ```
 
-If the skill has its own `tools` override, those are used exclusively. Otherwise, `agent_tools` (the sandboxed tool list built in `agent.__init__`) is used. `agtool.to_openai_tool()` returns the OpenAI function-calling dict (`{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}`).
-
 ### 4b. Input validation
 
 ```python
@@ -176,11 +144,7 @@ if self.input_schema is not None and not _is_continuation:
         return agdata(error=f"input schema error: {errors}"), history, [sys_msg]
 ```
 
-`_check_schema` verifies:
-1. Every key in `input_schema._data` is present in `input._data`
-2. If the value in the schema is a recognized type name (`"str"`, `"int"`, `"float"`, `"bool"`, `"list"`, `"dict"`), the actual value's `type()` must match
-
-`_is_continuation=True` bypasses this check entirely — `process_completed` and `process_update` agdata will not match the skill's declared input schema and must not be rejected.
+Skipped on continuation entries — process-status ping messages will not match the skill's declared input schema.
 
 ### 4c. Message list construction
 
@@ -195,146 +159,93 @@ messages = (
 )
 ```
 
-`_build_system_prompt()` concatenates:
-1. `self.system_prompt`
-2. `"\nInput JSON format:\n" + input_schema.to_json()` (if defined)
-3. `"\nOutput JSON format (respond ONLY with this JSON):\n" + output_schema.to_json()` (if defined)
+The system message is prepended on every call but never stored — `updated_history = agdata(messages=messages[1:])` strips it before returning.
 
-`input.to_json()` → `agdata.to_dict()` → `json.dumps()`, recursively resolving nested agdata. The system message is **prepended on every call but never stored** — `updated_history = agdata(messages=messages[1:])` strips it before returning.
+### 4d. Per-step: inbox drain
 
-### 4d. LLM call
+At the top of each step, the agent drains `agent._inbox` — a `queue.Queue[str]` that `agUI` (or any external caller) can push messages into:
 
 ```python
-client = openai.OpenAI(
-    api_key=llm_config.get("api_key", ""),
-    base_url=llm_config.get("base_url", None),
-)
+if _inbox_fn:
+    while True:
+        msg = _inbox_fn()
+        if msg is None:
+            break
+        messages.append({"role": "user", "content": msg})
+        had_inbox = True
+```
+
+When `had_inbox` is True and the LLM replies with text (no tool calls), output schema validation is skipped — the LLM is in mid-conversation with the user, not producing a final answer.
+
+### 4e. LLM call
+
+```python
 resp = client.chat.completions.create(
     model=llm_config.get("model", "gpt-4o"),
     messages=messages,
-    tools=openai_tools,    # omitted entirely (not passed as None) if no tools
+    tools=openai_tools,    # omitted entirely if no tools
 )
 msg = resp.choices[0].message
 ```
 
-A new `openai.OpenAI` client is constructed on every `agskill.run()` call. Any OpenAI-compatible endpoint is supported via `base_url`.
+### 4f. Auto-compaction check
 
-### 4e. Tool-call branch
+Immediately after each LLM response, `resp.usage.prompt_tokens` is checked against `_context_limit`. If over threshold, the context is compacted before proceeding:
+
+```python
+if _context_limit is not None and resp.usage is not None:
+    if should_compact(resp.usage.prompt_tokens, _context_limit):
+        messages, _compaction_summary = compact(
+            messages, llm_config,
+            previous_summary=_compaction_summary,
+        )
+```
+
+See [compaction.md](compaction.md) for the full algorithm.
+
+### 4g. Tool-call branch
 
 ```python
 if msg.tool_calls:
-    msg_dict = {
-        "role": "assistant",
-        "tool_calls": [{"id": tc.id, "type": "function",
-                         "function": {"name": tc.function.name,
-                                      "arguments": tc.function.arguments}}
-                        for tc in msg.tool_calls]
-    }
-    messages.append(msg_dict)
-
     for tc in msg.tool_calls:
-        t = tool_map.get(tc.function.name)
-        if t is None:
-            result_content = json.dumps({"error": f"unknown tool: {tc.function.name}"})
-        else:
-            try:
-                arg = agdata.from_json(tc.function.arguments)   # JSON string → agdata
-                result_content = t(arg).to_json()               # agdata → fn() → agdata → JSON
-            except Exception as e:
-                result_content = json.dumps({"error": str(e)})
+        result_content = tool_map[tc.function.name](agdata.from_json(tc.function.arguments)).to_json()
         messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
-
     # loop back to LLM call
 ```
 
-For the sandboxed `bash` tool, `t(arg)` calls `_run_sandboxed(arg)` which calls `sandbox.exec(arg.command, ...)`:
-- Wraps the command in the `exec 2>&1 / set -m / __BGPIDS__` shell script
-- Runs `docker exec -w <workdir> sandbox-<uuid> bash -c <wrapped_cmd>`
-- Parses the `__BGPIDS__` annotation, writes PIDs to `sandbox._watched_pids`
-- Strips the annotation, returns `(clean_output, returncode)`
-- Wraps in `agdata(output=..., exit_code=..., truncated=...)`
+Errors from tools (`Exception` raised or unknown tool name) are caught and injected as tool-result messages so the LLM can recover.
 
-### 4f. Final-answer branch
+### 4h. Final-answer branch
 
 ```python
 else:
+    if had_inbox:
+        continue   # LLM is answering user message, not producing final output
+
     content = msg.content or "{}"
-    # Strip markdown code fences that models add despite instructions
-    stripped = content.strip()
-    if stripped.startswith("```"):
-        stripped = stripped[stripped.find("\n")+1:] if "\n" in stripped else stripped[3:]
-        if stripped.endswith("```"):
-            stripped = stripped[:-3]
-        content = stripped.strip()
-    try:
-        result = agdata.from_json(content)        # JSON string → agdata
-    except (json.JSONDecodeError, TypeError):
-        result = agdata(result=content)           # fallback: wrap raw string
+    # strip markdown code fences that some models add
+    result = agdata.from_json(content)
+    # output schema validation + retry...
+    return result, updated_history, history_delta
 ```
 
-### 4g. Output validation and retry
-
-```python
-if self.output_schema is not None:
-    errors = self._check_schema(result, self.output_schema)
-    if not errors and self.output_validator is not None:
-        errors = self.output_validator(result)   # custom fn: agdata → list[str]
-
-    if errors:
-        if retries_left > 0:
-            retries_left -= 1
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Output schema errors: {errors}. "
-                    f"Respond ONLY with valid JSON matching exactly: "
-                    f"{self.output_schema.to_json()}"
-                ),
-            })
-            continue    # retry in the same for loop, same messages list, new LLM call
-        # retries exhausted
-        updated_history = agdata(messages=messages[1:])
-        return agdata(error=f"output schema error after retries: {errors}"), updated_history, delta
-```
-
-Retries are **in-loop** — the correction message is appended to the existing `messages` list and the LLM is called again immediately, without starting a new outer iteration or creating a new `agskill.run()` call.
-
-### 4h. Return value construction
+### 4i. Return value construction
 
 ```python
 updated_history = agdata(messages=messages[1:])         # strip system message
 history_delta   = [messages[0]] + messages[1:][n_before:]   # system + new messages only
-return result, updated_history, history_delta
 ```
-
-`messages[1:][n_before:]` is the slice of messages added during this particular `agskill.run()` call — new user message, tool calls/results, and final assistant message. The system prompt is prepended to this delta so the log shows which prompt was active, but it is not persisted in `updated_history`.
 
 ---
 
 ## 5. Post-loop: resource release, logging, future resolution
 
-**File:** `src/agent.py` · after the outer `for` loop, still inside `_task()`
-
 ```python
-# finally block — always runs
 finally:
     self.sandbox.release_resources(pool)
-    # → pool.release_gpu(sandbox._gpu_id) if held
-    # → sandbox.update_limits(cpus=pool.idle_cpus, memory=pool.idle_memory)
-```
 
-Then outside `try/finally`:
-
-```python
-ts_end = _ts()
-self.log._record(
-    skill_name, ts_start, ts_end,
-    input.to_dict(),           # original input, fully resolved
-    outer_result.to_dict(),    # final result from last outer iteration
-    len(outer_history._data.get("messages", [])),
-    history_before=history_before,
-    history_delta=outer_delta,  # full delta across ALL outer iterations
-)
+# after finally:
+self.log._record(skill_name, ts_start, ts_end, input, outer_result, outer_history, outer_delta)
 result_future.set_result(outer_result)    # unblocks caller's field access
 history_future.set_result(outer_history)  # unblocks next run() on same agent
 ```
@@ -363,16 +274,15 @@ caller.field ────────────── blocks ─────�
                                                                │   │  ├─ input validation          │
                                                                │   │  ├─ message construction      │
                                                                │   │  └─ for _ in range(max_steps) │
+                                                               │   │       inbox drain             │
                                                                │   │       LLM call                │
+                                                               │   │       compaction check        │
                                                                │   │       ├─ tool calls?          │
-                                                               │   │       │   agdata.from_json()  │
                                                                │   │       │   tool.fn(agdata)     │
                                                                │   │       │   → sandbox.exec()    │
-                                                               │   │       │     docker exec       │
-                                                               │   │       │     PID extraction    │
-                                                               │   │       │   result.to_json()    │
                                                                │   │       │   loop back           │
                                                                │   │       └─ final answer?        │
+                                                               │   │           had_inbox? continue │
                                                                │   │           parse JSON          │
                                                                │   │           schema check        │
                                                                │   │           retry? loop back    │
@@ -400,52 +310,13 @@ next run()   ◀─────────────── unblocks ───
 
 | Where it occurs | How it surfaces |
 |---|---|
-| Skill not found | `result_future.set_result(agdata(error=...))` immediately; `history_future` set to unchanged `prev_history` |
-| Input schema failure | `agskill.run()` returns `agdata(error=...)` before any LLM call; outer loop sees it as a result |
-| Exception in `_task` | Caught by `except Exception as exc`; `outer_result = agdata(error=str(exc))`; `finally` still runs |
-| Unknown tool name | `{"error": "unknown tool: <name>"}` injected as tool result; LLM sees it and continues |
-| Tool `fn` raises | Caught per-tool; `{"error": str(e)}` injected as tool result; LLM continues |
-| Output schema failure after retries | `agskill.run()` returns `agdata(error=...)`; outer loop propagates it as `outer_result` |
+| Skill not found | Both futures resolved immediately with error / unchanged history |
+| Input schema failure | `agskill.run()` returns `agdata(error=...)` before any LLM call |
+| Exception in `_task` | Caught; `outer_result = agdata(error=str(exc))`; `finally` still runs |
+| Unknown tool name | `{"error": "unknown tool"}` injected as tool result; LLM recovers |
+| Tool `fn` raises | Per-tool catch; `{"error": str(e)}` injected; LLM recovers |
+| Output schema failure after retries | `agskill.run()` returns `agdata(error=...)` |
 | `max_steps` exceeded | `agskill.run()` returns `agdata(error="max_steps exceeded")` |
-| `max_outer_iters` exhausted | Loop exits; last `outer_result` is used as-is (may be a valid partial result) |
+| `max_outer_iters` exhausted | Loop exits; last `outer_result` used as-is |
 
-Accessing any field on an error `agdata` via `__getattr__` raises `AgError`. `.error` (a property) and `.is_error()` are safe accessors that do not raise.
-
----
-
-## 8. `agdata` flow through the execution
-
-```
-caller constructs:    agdata(question="What is X?")
-                          │
-                          │  input.to_json()
-                          ▼
-LLM user message:     '{"question": "What is X?"}'
-                          │
-              ┌───────────┴───────────────────────────┐
-              │ tool call branch                      │ final answer branch
-              │                                       │
-              │  tc.function.arguments                │  msg.content
-              │  '{"command": "ls /workspace"}'       │  '{"answer": "X is..."}'
-              │          │                            │          │
-              │  agdata.from_json()                   │  agdata.from_json()
-              │  agdata(command="ls /workspace")      │  agdata(answer="X is...")
-              │          │                            │          │
-              │  tool.fn(agdata)                      │  _check_schema()
-              │  → sandbox.exec("ls /workspace")      │  output_validator()
-              │  → agdata(output="...", exit_code=0)  │          │
-              │          │                            │  return agdata(answer="X is...")
-              │  result.to_json()                     │          │
-              │  '{"output":"...","exit_code":0}'     │          ▼
-              │  → tool message in messages list      │  outer_result = agdata(answer="X is...")
-              │          │                            │
-              └──────────┴────────────────────────────┘
-                          │
-                  result_future.set_result(outer_result)
-                          │
-caller reads:     result.answer
-                  → agdata.__getattr__("answer")
-                  → _resolve() → future.result() → "X is..."
-```
-
-If the resolved agdata contains an `"error"` key, `__getattr__` raises `AgError` on any field access other than `.error`. This propagates skill failures as Python exceptions to the caller without any special handling at the `run()` call site.
+Accessing any field on an error `agdata` via `__getattr__` raises `AgError`. `.error` and `.is_error()` are safe accessors.

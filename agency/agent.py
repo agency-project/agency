@@ -31,6 +31,7 @@ from .aglog import aglog, _ts
 from .agterm import agterm
 from .agsandbox import agSandbox, get_container_runtime
 from .agresources import agResourcePool
+from .agcompaction import fetch_context_limit, _prune_tool_outputs
 from .tools import make_sandboxed_tools
 
 _NOUNS = [
@@ -166,18 +167,20 @@ class agent:
 
         if isinstance(llm_config, agent):
             src = llm_config
-            self.llm_config = src.llm_config
-            self.agskills   = list(agskills if agskills is not None else src.agskills)
+            self.llm_config    = src.llm_config
+            self._context_limit: int | None = src._context_limit
+            self.agskills      = list(agskills if agskills is not None else src.agskills)
             # Block until source's in-flight task finishes, then deep-copy history
             src._history._resolve()
             self._history: agdata = copy.deepcopy(src._history)
             # Snapshot parent container → fork starts from parent's exact state
             self.sandbox = agSandbox(self.agname, parent_agname=src.agname, output_dir=_out)
         else:
-            self.llm_config = llm_config
-            self.agskills   = list(agskills or [])
-            self._history   = agdata(messages=[])
-            self.sandbox    = agSandbox(self.agname, output_dir=_out)
+            self.llm_config    = llm_config
+            self._context_limit = fetch_context_limit(llm_config)
+            self.agskills      = list(agskills or [])
+            self._history      = agdata(messages=[])
+            self.sandbox       = agSandbox(self.agname, output_dir=_out)
 
         # Build sandboxed tool list; user-supplied tools override if provided
         if tools is not None:
@@ -219,13 +222,15 @@ class agent:
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
             )
         else:
-            self._term.log("CREATED  ", f"skills={[s.name for s in self.agskills]}  model={self.llm_config.get('model','?')}")
+            ctx = f"  context={self._context_limit}" if self._context_limit else "  context=unknown"
+            self._term.log("CREATED  ", f"skills={[s.name for s in self.agskills]}  model={self.llm_config.get('model','?')}{ctx}")
             self.log._lifecycle(
                 "created",
                 agname=self.agname,
                 agskills=[s.name for s in self.agskills],
                 tools=[t.name for t in self.tools],
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
+                context_limit=self._context_limit,
             )
 
     # ------------------------------------------------------------------
@@ -331,6 +336,9 @@ class agent:
                         except queue.Empty:
                             return None
 
+                    def _compact_log(**kw) -> None:
+                        self.log._lifecycle("compacted", agname=self.agname, **kw)
+
                     result, new_history, history_delta = af.run(
                         self.llm_config, current_input, current_history,
                         self.tools, max_steps, term=self._term,
@@ -338,6 +346,8 @@ class agent:
                         _state_fn=self._set_ui_state,
                         _live_messages_fn=self._push_live_messages,
                         _inbox_fn=_drain_inbox,
+                        _context_limit=self._context_limit,
+                        _compact_log_fn=_compact_log,
                     )
                     outer_result  = result
                     outer_history = new_history
@@ -436,6 +446,19 @@ class agent:
 
             self._snapshot_messages = list(outer_history._data.get("messages", []))
             result_future.set_result(outer_result)
+
+            # Post-skill history pruning — trim old oversized tool outputs from
+            # the shared history before unblocking the next run() on this agent.
+            # Runs after result_future so the caller can unblock immediately;
+            # history_future holds until pruning is done so the dependency chain
+            # sees clean history.
+            pruned_msgs = _prune_tool_outputs(
+                outer_history._data.get("messages", [])
+            )
+            if pruned_msgs is not outer_history._data.get("messages", []):
+                outer_history = agdata(messages=pruned_msgs)
+                self._term.log("PRUNE    ", f"{skill_name}  history pruned to {len(pruned_msgs)} msgs")
+
             history_future.set_result(outer_history)
 
         agent._pool.submit(_task)

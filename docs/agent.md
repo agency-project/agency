@@ -1,20 +1,30 @@
 # Agent
 
-The `agent` class is the top-level orchestrator. It owns a sandbox container, a shared conversation history, a set of skills, and a pool of tools. Skills are submitted by name and always run asynchronously; the caller blocks only when it actually reads a result field.
+The `agent` class is the top-level orchestrator. It owns a sandbox container, a shared conversation history, a set of skills, and a pool of tools. Skills are submitted by name and always run asynchronously; the caller blocks only when it reads a result field.
 
 ## Construction
 
 ```python
-from src.agent import agent
-from src.agskill import agskill
+from agency import agent, agskill
 
 ag = agent(
-    llm_config={"api_key": "...", "model": "claude-opus-4-8", "base_url": "..."},
+    llm_config={
+        "base_url": "http://localhost:8000/v1",
+        "api_key":  "EMPTY",
+        "model":    "meta-llama/Llama-3.1-8B-Instruct",
+    },
     agskills=[skill_a, skill_b],
 )
 ```
 
-`llm_config` is passed unchanged to every skill run. Any OpenAI-compatible endpoint works via `base_url`.
+`llm_config` is passed to every skill run. Any OpenAI-compatible endpoint works via `base_url`.
+
+An optional `"context_limit"` key in `llm_config` pins the model's context window size for auto-compaction. If omitted, the agent queries the endpoint at startup (vLLM exposes `max_model_len`). Compaction is silently disabled when the limit cannot be determined.
+
+```python
+# explicit override — useful for non-vLLM backends
+llm_config = {..., "context_limit": 131072}
+```
 
 ## Running a skill
 
@@ -28,7 +38,7 @@ print(result.answer)   # blocks here until the skill finishes
 
 ## Serialized history
 
-Calls on the **same** agent are automatically serialized: each `run()` chains on the previous one's history future, so history is always consistent even under concurrent callers.
+Calls on the **same** agent are automatically serialized: each `run()` chains on the previous history future, so history is always consistent even under concurrent callers.
 
 ```python
 r1 = ag.run("search", agdata(query="..."))
@@ -38,10 +48,10 @@ r2 = ag.run("summarize", agdata(text=r1.text))   # waits for r1 internally
 ## Forking
 
 ```python
-child = agent(ag)   # or ag.fork()
+child = agent(ag)
 ```
 
-Forking blocks until the parent's in-flight task completes, then deep-copies the resolved history and snapshots the parent's container via `docker commit`. The child starts from the parent's exact filesystem state. All subsequent writes in either direction are isolated. Forked agents run concurrently.
+Forking blocks until the parent's in-flight task completes, then deep-copies the resolved history and snapshots the parent's container via `docker/podman commit`. The child starts from the parent's exact filesystem state. All subsequent writes in either direction are isolated. Forked agents run concurrently.
 
 ## Class-level configuration
 
@@ -50,7 +60,7 @@ Set once before creating agents:
 | Variable | Default | Meaning |
 |---|---|---|
 | `agent.log_dir` | `None` | Directory for per-agent JSONL logs |
-| `agent.output_dir` | `None` | Shared output directory mounted into every container (see below) |
+| `agent.output_dir` | `None` | Shared output directory mounted into every container |
 | `agent.agresource_pool` | auto-detected | Shared GPU/CPU/memory pool |
 | `agent.ping_interval_s` | `300` | Max seconds between process-status re-entries |
 | `agent.poll_interval_s` | `5` | Liveness poll granularity within each ping window |
@@ -58,22 +68,42 @@ Set once before creating agents:
 
 ## Shared output directory
 
-When `agent.output_dir` is set, every container gets a shared volume mounted at `/agent_output`:
+When `agent.output_dir` is set, every container gets a per-agent subdirectory mounted at `/agent_output/<agname>`:
 
 ```python
 agent.output_dir = Path("runs/agent_output")
-```
+ag = agent(...)
 
-All agents share the same `/agent_output` directory with full read-write access. Files written there appear immediately on the host at `agent.output_dir/`.
+# inside container: write to /agent_output/agent_smith/report.md
+# on host:          runs/agent_output/agent_smith/report.md
 
-```python
-agent.output_dir = Path("runs/agent_output")
-# inside container: write to /agent_output/report.md
-# on host:          runs/agent_output/report.md
+# access the paths
+ag.container_output_path   # → "/agent_output/agent_smith"
+ag.output_path             # → Path("runs/agent_output/agent_smith")
 ```
 
 See [container.md](container.md) for mount implementation details.
 
-## Lifecycle
+## Agent naming
 
-`__del__` calls `sandbox.destroy()` as a best-effort cleanup. For deterministic cleanup, call `ag.sandbox.destroy()` explicitly.
+Each agent is assigned a unique pronounceable name (adjective + noun, e.g. `swift_hawk`) if none is provided. Pass `agname` to pin a specific name:
+
+```python
+ag = agent(llm_config, agskills=[...], agname="agent_smith")
+```
+
+Names are globally unique for the process lifetime — a second agent with the same name gets a numeric suffix.
+
+## Lifecycle and cleanup
+
+Containers are destroyed automatically on process exit via `atexit`. Stale containers from a previous run (e.g. after a hard kill) are removed at startup before the new container is created. Call `ag.sandbox.destroy()` explicitly for deterministic cleanup.
+
+## UI callbacks
+
+Three internal callbacks are used by `agUI` but are also available for custom monitoring:
+
+| Attribute | Type | Updated |
+|---|---|---|
+| `ag._ui_state` | `dict` | After every state transition (`inactive`, `skill`, `llm`, `tool`, `proc_wait`, `human`) |
+| `ag._snapshot_messages` | `list[dict]` | After every LLM response and tool result within a skill |
+| `ag._inbox` | `queue.Queue[str]` | Drain to inject a user message before the next LLM call |

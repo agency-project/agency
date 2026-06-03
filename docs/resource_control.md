@@ -5,7 +5,7 @@
 ## Auto-detection
 
 ```python
-from src.agresources import agResourcePool
+from agency.agresources import agResourcePool
 pool = agResourcePool()   # detects everything automatically
 ```
 
