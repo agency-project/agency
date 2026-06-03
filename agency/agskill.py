@@ -91,6 +91,9 @@ class agskill:
         max_steps: int = 10,
         term: "agterm | None" = None,
         _is_continuation: bool = False,
+        _state_fn: "Callable | None" = None,
+        _live_messages_fn: "Callable | None" = None,
+        _inbox_fn: "Callable | None" = None,
     ) -> tuple[agdata, agdata, list[dict]]:
         """Run the ReAct loop.
 
@@ -127,10 +130,13 @@ class agskill:
             + history_msgs
             + [{"role": "user", "content": input.to_json()}]
         )
+        if _live_messages_fn:
+            _live_messages_fn(messages[1:])
 
         retries_left = self.max_retries
 
         for _ in range(max_steps):
+            had_inbox = False
             kwargs: dict = dict(
                 model=llm_config.get("model", "gpt-4o"),
                 messages=messages,
@@ -138,9 +144,24 @@ class agskill:
             if openai_tools:
                 kwargs["tools"] = openai_tools
 
+            # Drain user inbox before firing — appended as user turns mid-conversation
+            if _inbox_fn:
+                while True:
+                    msg = _inbox_fn()
+                    if msg is None:
+                        break
+                    messages.append({"role": "user", "content": msg})
+                    had_inbox = True
+                    if _live_messages_fn:
+                        _live_messages_fn(messages[1:])
+
             if term:
                 term.log("LLM      ", f"model={llm_config.get('model','?')}  messages={len(messages)}")
+            if _state_fn:
+                _state_fn("llm", skill=self.name)
             resp = client.chat.completions.create(**kwargs)
+            if _state_fn:
+                _state_fn("skill", skill=self.name)
             msg = resp.choices[0].message
 
             msg_dict: dict = {"role": "assistant"}
@@ -156,6 +177,8 @@ class agskill:
                     for tc in msg.tool_calls
                 ]
             messages.append(msg_dict)
+            if _live_messages_fn:
+                _live_messages_fn(messages[1:])
 
             if msg.tool_calls:
                 for tc in msg.tool_calls:
@@ -166,12 +189,26 @@ class agskill:
                         result_content = json.dumps({"error": f"unknown tool: {tc.function.name}"})
                     else:
                         try:
+                            if _state_fn:
+                                _state_fn("tool", skill=self.name, tool=tc.function.name)
                             result_content = t(agdata.from_json(tc.function.arguments)).to_json()
+                            if _state_fn:
+                                _state_fn("skill", skill=self.name)
                         except Exception as e:
+                            if _state_fn:
+                                _state_fn("skill", skill=self.name)
                             result_content = json.dumps({"error": str(e)})
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
+                    if _live_messages_fn:
+                        _live_messages_fn(messages[1:])
 
             else:
+                # If this step consumed inbox messages, the LLM is mid-conversation
+                # with the user — not producing a final answer yet. Continue the
+                # loop so the exchange can complete before output validation runs.
+                if had_inbox:
+                    continue
+
                 # --- Parse final answer --------------------------------------
                 content = msg.content or "{}"
                 # Strip markdown code fences that some models add despite instructions

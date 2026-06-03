@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import atexit
 import shlex
 import shutil
 import subprocess
 import time
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -12,6 +14,21 @@ if TYPE_CHECKING:
 
 _BGPIDS_MARKER = "__BGPIDS__:"
 _RUNTIME: str | None = None
+
+# Global registry of live sandboxes for atexit cleanup.
+_live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
+
+
+def _cleanup_all_sandboxes() -> None:
+    """Destroy all live sandbox containers on process exit."""
+    for sandbox in list(_live_sandboxes):
+        try:
+            sandbox.destroy()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_all_sandboxes)
 
 
 def _runtime_works(runtime: str) -> bool:
@@ -142,6 +159,8 @@ class agSandbox:
                 [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
                 check=False,
             )
+
+        _live_sandboxes.add(self)
 
         # Capture the process baseline after the container is fully ready.
         # Any PID not in this set was spawned by user commands and must be
@@ -398,6 +417,8 @@ class agSandbox:
                 pass
 
     def destroy(self) -> None:
+        _live_sandboxes.discard(self)
+
         if self._watched_pids:
             pids = " ".join(str(p) for p in self._watched_pids)
             try:

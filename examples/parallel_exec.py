@@ -95,14 +95,18 @@ def demo_fork_fanout():
     print()
 
 if __name__ == "__main__":
-    from agency import AgError
-    print(f"Endpoint : {LLM_CONFIG['base_url']}")
-    print(f"Model    : {LLM_CONFIG['model']}\n")
+    from agency import AgError, agUI
     run_dir = _make_run_dir("parallel_exec")
-    print(f"Run dir  : {run_dir}\n")
     agent.log_dir = run_dir / "logs"
-    try:
-        demo_sequential_chain(run_dir)
-        demo_fork_fanout()
-    except AgError as e:
-        print(f"\nERROR: {e}")
+
+    def _script():
+        print(f"Endpoint : {LLM_CONFIG['base_url']}")
+        print(f"Model    : {LLM_CONFIG['model']}\n")
+        print(f"Run dir  : {run_dir}\n")
+        try:
+            demo_sequential_chain(run_dir)
+            demo_fork_fanout()
+        except AgError as e:
+            print(f"\nERROR: {e}")
+
+    agUI.run(_script)

@@ -106,8 +106,5 @@ def main():
     print(f"Shared history : {len(ag.history.messages)} messages total")
 
 if __name__ == "__main__":
-    from agency import AgError
-    try:
-        main()
-    except AgError as e:
-        print(f"\nERROR: {e}")
+    from agency import agUI
+    agUI.run(main)

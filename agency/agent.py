@@ -2,6 +2,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import queue
 import random
 import subprocess
 import tarfile
@@ -37,7 +38,7 @@ _NOUNS = [
     "colt", "crab", "crow", "zinc", "deer", "dove", "duck", "fawn",
     "fish", "rice", "frog", "pole", "gull", "hare", "hawk", "hind",
     "ibex", "ibis", "kite", "lamb", "lark", "lion", "lynx", "mare",
-    "mink", "mole", "moth", "mule", "tree", "newt", "onix", "pika",
+    "mink", "mole", "moth", "mule", "tree", "bald", "onix", "pika",
     "pony", "puma", "ruff", "seal", "slug", "coin", "swan", "toad",
     "vole", "wasp", "wolf", "wren", "zebu",
     "cape", "cave", "clay", "cove", "crag", "dale", "dune", "fern",
@@ -45,8 +46,8 @@ _NOUNS = [
     "blue", "isle", "lake", "lava", "leaf", "tail", "loch", "mesa",
     "mist", "moon", "moor", "moss", "nook", "peat", "pine", "pool",
     "rain", "reed", "reef", "rill", "rock", "root", "rush", "rust",
-    "sage", "salt", "sand", "silt", "snow", "soil", "surf", "tarn",
-    "tide", "till", "turf", "vale", "vent", "wake", "dude", "well",
+    "sage", "salt", "sand", "song", "snow", "soil", "surf", "tarn",
+    "tide", "till", "turf", "vale", "vent", "wake", "silk", "well",
     "wind", "wood",
     "arch", "axle", "bale", "bark", "beam", "bell", "belt", "bolt",
     "bone", "brad", "brim", "bung", "burr", "cage", "cant", "cask",
@@ -54,11 +55,11 @@ _NOUNS = [
     "byte", "dome", "down", "drum", "dust", "edge", "felt", "film",
     "flaw", "floe", "flux", "foam", "font", "fork", "fuse", "gate",
     "gear", "land", "grit", "helm", "hemp", "hilt", "hoop", "hull",
-    "dart", "keel", "joey", "vast", "knob", "knot", "lash", "lath",
+    "dart", "keel", "joey", "vast", "knob", "knot", "lash", "park",
     "bake", "loom", "mast", "maul", "mill", "nail", "node", "pane",
     "pier", "pile", "soda", "plug", "bart", "reel", "rein", "mask",
     "rope", "road", "slab", "slag", "fast", "spar", "cart", "tire",
-    "stem", "fire", "tack", "tine", "tuft", "vane", "weld", "wick",
+    "stem", "fire", "tack", "vine", "tuft", "pork", "weld", "wick",
     "wire",
 ]
 
@@ -193,6 +194,18 @@ class agent:
         for t in self.tools:
             t.attach_logger(self._term, self.log)
 
+        # Last fully-resolved message list — updated at the end of every skill
+        # run and read (without blocking) by the UI for the history pane.
+        self._snapshot_messages: list[dict] = []
+
+        # Per-agent inbox — user messages injected from the UI between ReAct iterations.
+        self._inbox: queue.Queue[str] = queue.Queue()
+
+        # UI state dict — written from the agent thread, read by the UI timer.
+        # Keys: state ("inactive"|"skill"|"llm"|"tool"|"proc_wait"|"human"),
+        #       skill (str|None), tool (str|None)
+        self._ui_state: dict = {"state": "inactive", "skill": None, "tool": None}
+
         _live_agents.add(self)
 
         if isinstance(llm_config, agent):
@@ -253,6 +266,13 @@ class agent:
     # Execution
     # ------------------------------------------------------------------
 
+    def _set_ui_state(self, state: str, skill: str | None = None,
+                      tool: str | None = None) -> None:
+        self._ui_state = {"state": state, "skill": skill, "tool": tool}
+
+    def _push_live_messages(self, messages: list) -> None:
+        self._snapshot_messages = list(messages)
+
     def run(self, skill_name: str, input: agdata, max_steps: int = 10) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
@@ -289,6 +309,7 @@ class agent:
                     return
 
                 self._term.log("SKILL ▶  ", f"{skill_name}  input={list(input._data.keys())}")
+                self._set_ui_state("skill", skill=skill_name)
 
                 # ----------------------------------------------------------
                 # Outer monitoring loop
@@ -304,10 +325,19 @@ class agent:
                 is_continuation  = False
 
                 for _outer_iter in range(agent.max_outer_iters):
+                    def _drain_inbox() -> str | None:
+                        try:
+                            return self._inbox.get_nowait()
+                        except queue.Empty:
+                            return None
+
                     result, new_history, history_delta = af.run(
                         self.llm_config, current_input, current_history,
                         self.tools, max_steps, term=self._term,
                         _is_continuation=is_continuation,
+                        _state_fn=self._set_ui_state,
+                        _live_messages_fn=self._push_live_messages,
+                        _inbox_fn=_drain_inbox,
                     )
                     outer_result  = result
                     outer_history = new_history
@@ -322,6 +352,7 @@ class agent:
 
                     # Background processes detected — log the start of the wait.
                     summary = self.sandbox.pid_status_summary()
+                    self._set_ui_state("proc_wait", skill=skill_name)
                     self._term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
                     self.log._lifecycle("procs_started", agname=self.agname,
                                         skill=skill_name, pids=list(pids_at_end),
@@ -382,6 +413,7 @@ class agent:
                 history_before = list(prev_history._data.get("messages", []))
                 self._term.log("SKILL ✗  ", f"{skill_name}  exception={exc}")
             finally:
+                self._set_ui_state("inactive")
                 self.sandbox.release_resources(pool)
 
             # Log and resolve futures after all background work is done
@@ -402,6 +434,7 @@ class agent:
             except Exception as log_exc:
                 self._term.log("SKILL ✗  ", f"[log error] {log_exc}")
 
+            self._snapshot_messages = list(outer_history._data.get("messages", []))
             result_future.set_result(outer_result)
             history_future.set_result(outer_history)
 

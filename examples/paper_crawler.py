@@ -147,6 +147,7 @@ def run(topic: str = "KV cache quantization", run_dir: Path | None = None):
     main_agent = agent(
         llm_config=LLM_CONFIG,
         agskills=[find_papers_skill, summarise_paper_skill, compile_report_skill],
+        agname="agent_smith",
     )
 
     # The report is written inside the container at this path.
@@ -196,11 +197,15 @@ def run(topic: str = "KV cache quantization", run_dir: Path | None = None):
     print(f"\nMain agent history: {len(main_agent.history.messages)} messages total")
 
 if __name__ == "__main__":
-    from agency import AgError
+    from agency import AgError, agUI
     topic = " ".join(sys.argv[1:]) or "KV cache quantization"
     run_dir = _make_run_dir("paper_crawler")
-    print(f"Run dir  : {run_dir}\n")
-    try:
-        run(topic=topic, run_dir=run_dir)
-    except AgError as e:
-        print(f"\nERROR: {e}")
+
+    def _script():
+        print(f"Run dir  : {run_dir}\n")
+        try:
+            run(topic=topic, run_dir=run_dir)
+        except AgError as e:
+            print(f"\nERROR: {e}")
+
+    agUI.run(_script)
