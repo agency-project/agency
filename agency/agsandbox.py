@@ -142,6 +142,9 @@ class agSandbox:
             vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
 
         name = self._container_name()
+        # Remove any stale container with the same name (e.g. from a previous
+        # run that was killed before atexit cleanup could fire).
+        self._run([self._runtime, "rm", "-f", name], check=False)
         if restore_image is not None:
             # Start container from a previously saved checkpoint image
             self._run(
