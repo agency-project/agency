@@ -17,13 +17,16 @@ Run this script:
     VLLM_BASE_URL=http://127.0.0.1:18000/v1 VLLM_MODEL=kimi_k2.6 uv run python example.py
 """
 import os
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-from _run_dir import make_run_dir
+from agency import agent, agskill, agdata
 
-from src import agent, agskill, agdata
+def _make_run_dir(name: str):
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
@@ -31,9 +34,8 @@ LLM_CONFIG = {
     "model":    os.environ.get("VLLM_MODEL",     "moonshotai/Kimi-K2.6"),
 }
 
-
 def main():
-    run_dir = make_run_dir("base_example")
+    run_dir = _make_run_dir("base_example")
     agent.log_dir    = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
     print(f"Run dir  : {run_dir}\n")
@@ -103,9 +105,8 @@ def main():
 
     print(f"Shared history : {len(ag.history.messages)} messages total")
 
-
 if __name__ == "__main__":
-    from src import AgError
+    from agency import AgError
     try:
         main()
     except AgError as e:

@@ -24,20 +24,24 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-from _run_dir import make_run_dir
-
 import httpx
 
-from src import agent, agskill, agdata
-from src.agtool import agtool
+from agency import agent, agskill, agdata
+from agency.agtool import agtool
+
+def _make_run_dir(name: str):
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "https://gemma.js-park.info/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
     "model":    os.environ.get("VLLM_MODEL",     "google/gemma-4-31B-it"),
 }
-MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
+MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "16"))
 
 # ---------------------------------------------------------------------------
 # Custom tool: search arxiv (host-side; no filesystem access needed)
@@ -65,7 +69,6 @@ def _search_arxiv_fn(arg: agdata) -> agdata:
         link = (entry.find("atom:id", ns).text or "").strip()  # type: ignore[union-attr]
         papers.append({"title": title, "url": link, "abstract": abstract})
     return agdata(papers=papers, count=len(papers))
-
 
 search_arxiv = agtool(
     name="search_arxiv",
@@ -136,7 +139,7 @@ compile_report_skill = agskill(
 
 def run(topic: str = "KV cache quantization", run_dir: Path | None = None):
     if run_dir is None:
-        run_dir = make_run_dir("paper_crawler")
+        run_dir = _make_run_dir("paper_crawler")
 
     agent.log_dir    = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
@@ -147,12 +150,13 @@ def run(topic: str = "KV cache quantization", run_dir: Path | None = None):
     )
 
     # The report is written inside the container at this path.
-    # It appears on the host at: run_dir/agent_output/<uuid>/report.md
-    output_path = f"/agent_output/{main_agent.uuid}/report.md"
-    host_report = agent.output_dir / main_agent.uuid / "report.md"
+    # It appears on the host at: run_dir/agent_output/<agname>/report.md
+    output_path = f"{main_agent.container_output_path}/report.md"
+    host_report = main_agent.output_path / "report.md"
 
     print(f"Endpoint : {LLM_CONFIG['base_url']}")
     print(f"Model    : {LLM_CONFIG['model']}")
+    print(f"Agent    : {main_agent.agname}")
     print(f"Topic    : {topic!r}")
     print(f"Output   : {host_report}")
     print()
@@ -191,11 +195,10 @@ def run(topic: str = "KV cache quantization", run_dir: Path | None = None):
 
     print(f"\nMain agent history: {len(main_agent.history.messages)} messages total")
 
-
 if __name__ == "__main__":
-    from src import AgError
+    from agency import AgError
     topic = " ".join(sys.argv[1:]) or "KV cache quantization"
-    run_dir = make_run_dir("paper_crawler")
+    run_dir = _make_run_dir("paper_crawler")
     print(f"Run dir  : {run_dir}\n")
     try:
         run(topic=topic, run_dir=run_dir)

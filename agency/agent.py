@@ -1,10 +1,12 @@
 from __future__ import annotations
 import copy
+import random
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import ClassVar
+
 from .agdata import agdata
 from .agskill import agskill
 from .agtool import agtool
@@ -13,6 +15,64 @@ from .agterm import agterm
 from .agsandbox import agSandbox
 from .agresources import agResourcePool
 from .tools import make_sandboxed_tools
+
+_NOUNS = [
+    "bass", "bear", "bird", "boar", "bull", "cane", "cake", "clam",
+    "colt", "crab", "crow", "zinc", "deer", "dove", "duck", "fawn",
+    "fish", "rice", "frog", "pole", "gull", "hare", "hawk", "hind",
+    "ibex", "ibis", "kite", "lamb", "lark", "lion", "lynx", "mare",
+    "mink", "mole", "moth", "mule", "tree", "newt", "onix", "pika",
+    "pony", "puma", "ruff", "seal", "slug", "coin", "swan", "toad",
+    "vole", "wasp", "wolf", "wren", "zebu",
+    "cape", "cave", "clay", "cove", "crag", "dale", "dune", "fern",
+    "flat", "malt", "gale", "glen", "gust", "hail", "haze", "hill",
+    "blue", "isle", "lake", "lava", "leaf", "tail", "loch", "mesa",
+    "mist", "moon", "moor", "moss", "nook", "peat", "pine", "pool",
+    "rain", "reed", "reef", "rill", "rock", "root", "rush", "rust",
+    "sage", "salt", "sand", "silt", "snow", "soil", "surf", "tarn",
+    "tide", "till", "turf", "vale", "vent", "wake", "dude", "well",
+    "wind", "wood",
+    "arch", "axle", "bale", "bark", "beam", "bell", "belt", "bolt",
+    "bone", "brad", "brim", "bung", "burr", "cage", "cant", "cask",
+    "band", "chip", "pike", "coal", "coil", "cord", "core", "corn",
+    "byte", "dome", "down", "drum", "dust", "edge", "felt", "film",
+    "flaw", "floe", "flux", "foam", "font", "fork", "fuse", "gate",
+    "gear", "land", "grit", "helm", "hemp", "hilt", "hoop", "hull",
+    "dart", "keel", "joey", "vast", "knob", "knot", "lash", "lath",
+    "bake", "loom", "mast", "maul", "mill", "nail", "node", "pane",
+    "pier", "pile", "soda", "plug", "bart", "reel", "rein", "mask",
+    "rope", "road", "slab", "slag", "fast", "spar", "cart", "tire",
+    "stem", "fire", "tack", "tine", "tuft", "vane", "weld", "wick",
+    "wire",
+]
+
+_noun_counters:   dict[str, int] = {}
+_allocated_agnames: set[str]    = set()
+_agname_lock      = __import__("threading").Lock()
+
+
+def _allocate_agname(name: str) -> str:
+    """Register *name* as in-use and return it, raising if already taken."""
+    with _agname_lock:
+        if name in _allocated_agnames:
+            raise ValueError(f"agname {name!r} is already in use by another agent")
+        _allocated_agnames.add(name)
+    return name
+
+
+def _generate_agname() -> str:
+    """Return a unique agname in the form <noun>_<3-digit number>.
+
+    The number increments independently per noun, so bear_000 and wolf_000
+    can coexist and bear_001 is the second agent that received 'bear'.
+    Registration goes through _allocate_agname — the single allocation guard.
+    """
+    with _agname_lock:
+        noun = random.choice(_NOUNS)
+        n = _noun_counters.get(noun, 0)
+        _noun_counters[noun] = n + 1
+        name = f"{noun}_{n:03d}"
+    return _allocate_agname(name)
 
 
 def _resolve_input(inp: agdata) -> None:
@@ -24,11 +84,11 @@ def _resolve_input(inp: agdata) -> None:
     - list fields whose elements are pending agdata
     """
     inp._resolve()
-    for key, val in list(inp._data.items()):
+    for val in inp._data.values():
         if isinstance(val, agdata):
             val._resolve()
         elif isinstance(val, list):
-            for i, item in enumerate(val):
+            for item in val:
                 if isinstance(item, agdata):
                     item._resolve()
 
@@ -79,9 +139,14 @@ class agent:
         llm_config: "dict | agent",
         agskills: list[agskill] | None = None,
         tools: list[agtool] | None = None,
+        agname: str | None = None,
     ):
-        self.uuid = str(uuid.uuid4())
+        self.uuid     = str(uuid.uuid4())
+        self.agname = _generate_agname() if agname is None else _allocate_agname(agname)
         pool = agent.agresource_pool
+
+        # Per-agent output subdir: <output_dir>/<agname>/
+        _out = Path(agent.output_dir) / self.agname if agent.output_dir else None
 
         if isinstance(llm_config, agent):
             src = llm_config
@@ -91,14 +156,12 @@ class agent:
             src._history._resolve()
             self._history: agdata = copy.deepcopy(src._history)
             # Snapshot parent container → fork starts from parent's exact state
-            self.sandbox = agSandbox(self.uuid, parent_uuid=src.uuid,
-                                     output_dir=Path(agent.output_dir) if agent.output_dir else None)
+            self.sandbox = agSandbox(self.uuid, parent_uuid=src.uuid, output_dir=_out)
         else:
             self.llm_config = llm_config
             self.agskills   = list(agskills or [])
             self._history   = agdata(messages=[])
-            self.sandbox    = agSandbox(self.uuid,
-                                        output_dir=Path(agent.output_dir) if agent.output_dir else None)
+            self.sandbox    = agSandbox(self.uuid, output_dir=_out)
 
         # Build sandboxed tool list; user-supplied tools override if provided
         if tools is not None:
@@ -108,14 +171,14 @@ class agent:
 
         log_path = Path(agent.log_dir) / f"{self.uuid}.jsonl" if agent.log_dir is not None else None
         self.log  = aglog(path=log_path)
-        self._term = agterm(self.uuid)
+        self._term = agterm(self.agname)
 
         # Wire terminal + file logging into every tool.
         for t in self.tools:
             t.attach_logger(self._term, self.log)
 
         if isinstance(llm_config, agent):
-            self._term.log("FORKED   ", f"from {src.uuid[:8]}  skills={[s.name for s in self.agskills]}")
+            self._term.log("FORKED   ", f"from {src.agname}  skills={[s.name for s in self.agskills]}")
             self.log._lifecycle(
                 "forked",
                 uuid=self.uuid,
@@ -137,6 +200,26 @@ class agent:
     # ------------------------------------------------------------------
     # History property — blocks until the current chain link resolves
     # ------------------------------------------------------------------
+
+    @property
+    def output_path(self) -> Path | None:
+        """Host-side output directory for this agent, or None if output_dir is not set.
+
+        Files written to ``container_output_path`` inside the container appear here.
+        """
+        if agent.output_dir is None:
+            return None
+        return Path(agent.output_dir) / self.agname
+
+    @property
+    def container_output_path(self) -> str | None:
+        """Path inside the container where this agent should write output files.
+
+        Mounted read-write from ``output_path`` on the host.
+        """
+        if agent.output_dir is None:
+            return None
+        return f"/agent_output/{self.agname}"
 
     @property
     def history(self) -> agdata:
@@ -331,4 +414,4 @@ class agent:
 
     def __repr__(self) -> str:
         names = [f.name for f in self.agskills]
-        return f"agent(uuid={self.uuid[:8]!r}, agskills={names!r})"
+        return f"agent(agname={self.agname!r}, agskills={names!r})"

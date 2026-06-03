@@ -1,6 +1,6 @@
 """Reset mutable agent class-level config between tests so they don't bleed into each other."""
 import pytest
-from src.agent import agent
+from agency.agent import agent
 
 
 @pytest.fixture(autouse=True)

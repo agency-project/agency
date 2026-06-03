@@ -1,9 +1,9 @@
 """Tests for aglog — automatic skill call logging on agent."""
 import pytest
-from src.agdata import agdata
-from src.agskill import agskill
-from src.aglog import aglog
-from src.agent import agent
+from agency.agdata import agdata
+from agency.agskill import agskill
+from agency.aglog import aglog
+from agency.agent import agent
 
 
 def make_agent(**kwargs) -> agent:

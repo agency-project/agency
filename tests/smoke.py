@@ -1,9 +1,9 @@
 """Smoke check: end-to-end agent + agskill + tools with mocked LLM."""
 import json
 from unittest.mock import patch, MagicMock
-from src.agdata import agdata
-from src.agskill import agskill
-from src.agent import agent
+from agency.agdata import agdata
+from agency.agskill import agskill
+from agency.agent import agent
 
 LLM_CONFIG = {"api_key": "dummy", "model": "gpt-4o"}
 
@@ -77,7 +77,7 @@ def smoke_history_shared_across_skills():
 
 def smoke_skill_own_tools():
     """A skill with its own tools list ignores agent-level tools."""
-    from src.agtool import agtool
+    from agency.agtool import agtool
 
     agent_tool_called = []
     skill_tool_called = []

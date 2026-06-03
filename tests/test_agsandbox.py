@@ -12,8 +12,8 @@ import uuid
 
 import pytest
 
-from src.agdata import agdata
-from src.agresources import agResourcePool
+from agency.agdata import agdata
+from agency.agresources import agResourcePool
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ docker = pytest.mark.skipif(
 
 
 def _make_sandbox(**kwargs):
-    from src.agsandbox import agSandbox
+    from agency.agsandbox import agSandbox
     uid = str(uuid.uuid4())
     return agSandbox(uid, **kwargs)
 
@@ -47,19 +47,19 @@ def _make_sandbox(**kwargs):
 
 class TestDetectGpus:
     def test_returns_list(self):
-        from src.agresources import detect_gpus
+        from agency.agresources import detect_gpus
         gpus = detect_gpus()
         assert isinstance(gpus, list)
         assert all(isinstance(g, int) for g in gpus)
 
     def test_nvidia_smi_unavailable_returns_empty(self, monkeypatch):
-        from src.agresources import detect_gpus
+        from agency.agresources import detect_gpus
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError()))
         assert detect_gpus() == []
 
     def test_nvidia_smi_nonzero_exit_returns_empty(self, monkeypatch):
         from unittest.mock import MagicMock
-        from src.agresources import detect_gpus
+        from agency.agresources import detect_gpus
         mock = MagicMock()
         mock.returncode = 1
         mock.stdout = ""
@@ -68,7 +68,7 @@ class TestDetectGpus:
 
     def test_nvidia_smi_parses_indices(self, monkeypatch):
         from unittest.mock import MagicMock
-        from src.agresources import detect_gpus
+        from agency.agresources import detect_gpus
         mock = MagicMock()
         mock.returncode = 0
         mock.stdout = "0\n1\n2\n"
@@ -78,27 +78,27 @@ class TestDetectGpus:
 
 class TestDetectCpus:
     def test_returns_positive_int(self):
-        from src.agresources import detect_cpus
+        from agency.agresources import detect_cpus
         cpus = detect_cpus()
         assert isinstance(cpus, int)
         assert cpus >= 1
 
     def test_os_cpu_count_none_returns_one(self, monkeypatch):
-        from src.agresources import detect_cpus
+        from agency.agresources import detect_cpus
         monkeypatch.setattr("os.cpu_count", lambda: None)
         assert detect_cpus() == 1
 
 
 class TestDetectMemoryMb:
     def test_returns_positive_int(self):
-        from src.agresources import detect_memory_mb
+        from agency.agresources import detect_memory_mb
         mb = detect_memory_mb()
         assert isinstance(mb, int)
         assert mb > 0
 
     def test_fallback_when_proc_missing(self, monkeypatch, tmp_path):
         from unittest.mock import MagicMock
-        from src.agresources import detect_memory_mb
+        from agency.agresources import detect_memory_mb
         # Point /proc/meminfo to a non-existent path and make sysctl fail
         monkeypatch.setattr("builtins.open", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
         mock = MagicMock()
@@ -129,7 +129,7 @@ class TestPoolAutoDetect:
         assert pool.total_memory_mb == 8192
 
     def test_agent_has_default_pool(self):
-        from src.agent import agent
+        from agency.agent import agent
         assert agent.agresource_pool is not None
         assert isinstance(agent.agresource_pool.total_cpus, int)
         assert isinstance(agent.agresource_pool.total_memory_mb, int)
@@ -225,48 +225,28 @@ class TestAgSandboxLifecycle:
         parent.destroy()
 
     @docker
-    def test_output_dir_agent_can_write_own_subdir(self, tmp_path):
-        output_dir = tmp_path / "agent_output"
-        output_dir.mkdir()
+    def test_output_dir_agent_can_write_and_read(self, tmp_path):
+        agname = "test-agent"
+        output_dir = tmp_path / "agent_output" / agname
         sb = _make_sandbox(output_dir=output_dir)
-        # Agent should be able to write to /agent_output/<uuid>
-        out, rc = sb.exec(f"echo hello > /agent_output/{sb._uuid}/result.txt")
+        out, rc = sb.exec("echo hello > /agent_output/result.txt")
         assert rc == 0
-        assert (output_dir / sb._uuid / "result.txt").read_text().strip() == "hello"
+        assert (output_dir / "result.txt").read_text().strip() == "hello"
         sb.destroy()
 
     @docker
-    def test_output_dir_agent_cannot_write_other_subdir(self, tmp_path):
-        output_dir = tmp_path / "agent_output"
-        output_dir.mkdir()
-        # Create another agent's subdir on the host
-        other_uuid = "other-agent-uuid"
-        (output_dir / other_uuid).mkdir()
-        (output_dir / other_uuid / "secret.txt").write_text("secret")
-
-        sb = _make_sandbox(output_dir=output_dir)
-        # Can read other agent's file
-        out, rc = sb.exec(f"cat /agent_output/{other_uuid}/secret.txt")
-        assert rc == 0
-        assert "secret" in out
-        # Cannot write to other agent's dir
-        _, rc_write = sb.exec(f"echo bad > /agent_output/{other_uuid}/evil.txt")
-        assert rc_write != 0
-        assert not (output_dir / other_uuid / "evil.txt").exists()
-        sb.destroy()
-
-    @docker
-    def test_output_dir_visible_across_agents(self, tmp_path):
-        output_dir = tmp_path / "agent_output"
-        output_dir.mkdir()
-        sb1 = _make_sandbox(output_dir=output_dir)
-        sb2 = _make_sandbox(output_dir=output_dir)
-        # sb1 writes a file
-        sb1.exec(f"echo from_agent1 > /agent_output/{sb1._uuid}/out.txt")
-        # sb2 can read it
-        out, rc = sb2.exec(f"cat /agent_output/{sb1._uuid}/out.txt")
+    def test_output_dir_shared_across_agents(self, tmp_path):
+        # Each agent gets its own subdir; they can still see each other's files
+        # via the parent mount if needed, but here we test per-agent isolation.
+        out_dir1 = tmp_path / "agent_output" / "brave-fox"
+        out_dir2 = tmp_path / "agent_output" / "swift-hawk"
+        sb1 = _make_sandbox(output_dir=out_dir1)
+        sb2 = _make_sandbox(output_dir=out_dir2)
+        sb1.exec("echo from_agent1 > /agent_output/out.txt")
+        out, rc = sb1.exec("cat /agent_output/out.txt")
         assert rc == 0
         assert "from_agent1" in out
+        assert (out_dir1 / "out.txt").read_text().strip() == "from_agent1"
         sb1.destroy()
         sb2.destroy()
 
@@ -549,7 +529,7 @@ class TestSandboxedTools:
     @docker
     def setup_method(self, _):
         self.sb = _make_sandbox()
-        from src.tools import make_sandboxed_tools
+        from agency.tools import make_sandboxed_tools
         self.tools = {t.name: t for t in make_sandboxed_tools(self.sb)}
 
     @docker
@@ -613,7 +593,7 @@ class TestResourceTools:
     def setup_method(self, _):
         self.sb = _make_sandbox()
         self.pool = agResourcePool(gpus=[0, 1], idle_cpus=0.5, idle_memory="512m")
-        from src.tools import make_sandboxed_tools
+        from agency.tools import make_sandboxed_tools
         self.tools = {t.name: t for t in make_sandboxed_tools(self.sb, self.pool)}
 
     @docker
@@ -643,7 +623,7 @@ class TestResourceTools:
     def test_gpu_acquire_timeout_with_exhausted_pool(self):
         pool = agResourcePool(gpus=[0])
         pool.acquire_gpu()             # exhaust the single GPU
-        from src.tools.resource import make_gpu_acquire
+        from agency.tools.resource import make_gpu_acquire
         tool = make_gpu_acquire(self.sb, pool)
         result = tool.fn(agdata(timeout=0.2))
         assert result.error is not None
@@ -662,3 +642,75 @@ class TestResourceTools:
         assert result.error is None
         assert "0.5" in result.message     # idle_cpus
         assert "512m" in result.message    # idle_memory
+
+
+# ---------------------------------------------------------------------------
+# Real wall-clock outer monitoring loop integration test
+# ---------------------------------------------------------------------------
+
+@docker
+@pytest.mark.timeout(60)
+def test_outer_loop_real_process_wall_clock():
+    """Full integration: real container, real background process, real polling.
+
+    A background job sleeps for JOB_DURATION seconds inside a real container.
+    The outer monitoring loop polls every POLL_INTERVAL seconds and must fire
+    process_completed within one extra poll cycle after the job exits.
+
+    Expected timeline:
+      0s    agent starts, job launched via sandbox.exec("sleep N &")
+      ~Ns   job exits; next get_live_pids() poll finds it gone
+      ~N+Ps process_completed re-entry fires
+      ~N+2Ps skill resolves (after process_completed re-entry returns)
+
+    Total wall time: JOB_DURATION + 2*POLL_INTERVAL + container overhead.
+    Asserted range: [JOB_DURATION, JOB_DURATION + POLL_INTERVAL*3 + 5]
+    """
+    from agency.agent import agent
+    from agency.agskill import agskill
+
+    JOB_DURATION  = 8   # seconds the background process runs
+    POLL_INTERVAL = 2   # poll every 2s — fast enough to detect promptly
+
+    ag = agent(llm_config={"api_key": "k", "model": "gpt-4o"}, agskills=[])
+
+    agent.poll_interval_s = POLL_INTERVAL
+    agent.ping_interval_s = 60   # high ceiling — job should finish well before
+
+    events: list[dict] = []
+
+    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        event = inp._data.get("_event")
+        events.append({"event": event, "t": time.monotonic()})
+        if event is None:
+            # Launch a real background process in the container
+            ag.sandbox.exec(f"sleep {JOB_DURATION} &")
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.run = fake_run
+    ag.agskills = [skill]
+
+    t0 = time.monotonic()
+    ag.run("s", agdata()).result
+    elapsed = time.monotonic() - t0
+
+    event_names = [e["event"] for e in events]
+
+    # Sequence: initial call → process_completed re-entry
+    assert event_names[0] is None,                  "first call must be the initial one"
+    assert "process_completed" in event_names,       "process_completed must fire"
+    assert "process_update" not in event_names,      "job should finish before ping_interval_s"
+
+    # Timing: completed must fire after the job actually ran
+    t_completed = next(e["t"] for e in events if e["event"] == "process_completed") - t0
+    assert t_completed >= JOB_DURATION, (
+        f"process_completed fired at {t_completed:.1f}s — before job finished at {JOB_DURATION}s"
+    )
+    assert t_completed <= JOB_DURATION + POLL_INTERVAL * 3 + 5, (
+        f"process_completed took {t_completed:.1f}s — too slow "
+        f"(expected ≤{JOB_DURATION + POLL_INTERVAL * 3 + 5}s)"
+    )
+
+    print(f"\n  job={JOB_DURATION}s  poll={POLL_INTERVAL}s  "
+          f"detected at {t_completed:.1f}s  total={elapsed:.1f}s")

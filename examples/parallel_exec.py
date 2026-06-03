@@ -14,21 +14,23 @@ Run:
     uv run python examples/parallel_exec.py
 """
 import os
-import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-from _run_dir import make_run_dir
+from agency import agent, agskill, agdata
 
-from src import agent, agskill, agdata
+def _make_run_dir(name: str):
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
     "model":    os.environ.get("VLLM_MODEL",     "moonshotai/Kimi-K2.6"),
 }
-
 
 def demo_sequential_chain(run_dir: Path):
     """One agent runs two tasks sequentially via the history chain."""
@@ -57,7 +59,6 @@ def demo_sequential_chain(run_dir: Path):
     print(f"  r1 status={r1.status!r}  r2 status={r2.status!r}")
     print(f"  total history: {len(ag.history.messages)} messages  elapsed {elapsed:.2f}s")
     print()
-
 
 def demo_fork_fanout():
     """Three local copies summarise texts concurrently via agent(parent).run()."""
@@ -93,12 +94,11 @@ def demo_fork_fanout():
     print(f"  parent history unchanged: {len(parent.history.messages)} messages")
     print()
 
-
 if __name__ == "__main__":
-    from src import AgError
+    from agency import AgError
     print(f"Endpoint : {LLM_CONFIG['base_url']}")
     print(f"Model    : {LLM_CONFIG['model']}\n")
-    run_dir = make_run_dir("parallel_exec")
+    run_dir = _make_run_dir("parallel_exec")
     print(f"Run dir  : {run_dir}\n")
     agent.log_dir = run_dir / "logs"
     try:

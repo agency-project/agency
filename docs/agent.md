@@ -64,13 +64,12 @@ When `agent.output_dir` is set, every container gets a shared volume mounted at 
 agent.output_dir = Path("runs/agent_output")
 ```
 
-Each agent gets its own writable subdirectory at `/agent_output/<uuid>` and read-only access to all other agents' subdirectories. This allows agents to publish results that other agents (or the caller on the host) can read.
+All agents share the same `/agent_output` directory with full read-write access. Files written there appear immediately on the host at `agent.output_dir/`.
 
-```
-/agent_output/
-  <agent-uuid-1>/   ← read-write for agent 1, read-only for all others
-  <agent-uuid-2>/   ← read-write for agent 2, read-only for all others
-  ...
+```python
+agent.output_dir = Path("runs/agent_output")
+# inside container: write to /agent_output/report.md
+# on host:          runs/agent_output/report.md
 ```
 
 See [container.md](container.md) for mount implementation details.

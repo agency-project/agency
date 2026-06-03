@@ -2,10 +2,10 @@ import json
 import threading
 import pytest
 from unittest.mock import MagicMock, patch
-from src.agdata import agdata
-from src.agskill import agskill
-from src.agtool import agtool
-from src.agent import agent
+from agency.agdata import agdata
+from agency.agskill import agskill
+from agency.agtool import agtool
+from agency.agent import agent
 
 
 def _direct(content: str):

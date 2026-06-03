@@ -1,7 +1,7 @@
 """Tests for the agtool class."""
 import json
-from src.agdata import agdata
-from src.agtool import agtool
+from agency.agdata import agdata
+from agency.agtool import agtool
 
 
 def _echo(arg: agdata) -> agdata:

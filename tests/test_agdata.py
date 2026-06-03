@@ -1,6 +1,6 @@
 import json
 import pytest
-from src.agdata import agdata
+from agency.agdata import agdata
 
 
 def test_init_and_dot_access():

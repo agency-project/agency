@@ -106,18 +106,11 @@ class agSandbox:
         # device files exist.
         gpu_flags = _gpu_flags()
 
-        # Shared output volume:
-        #   /agent_output          → read-only  (all agents' exports visible)
-        #   /agent_output/<uuid>   → read-write (this agent's own export dir)
-        # The more-specific rw mount shadows the parent ro mount for this dir.
+        # Shared output volume: all agents read and write the same directory.
         vol_flags: list[str] = []
         if output_dir is not None:
-            own_dir = output_dir / uuid
-            own_dir.mkdir(parents=True, exist_ok=True)
-            vol_flags = [
-                "-v", f"{output_dir.resolve()}:/agent_output:ro",
-                "-v", f"{own_dir.resolve()}:/agent_output/{uuid}:rw",
-            ]
+            output_dir.mkdir(parents=True, exist_ok=True)
+            vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
 
         name = self._container_name()
         if parent_uuid is not None:

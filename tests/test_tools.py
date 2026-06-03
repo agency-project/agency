@@ -8,7 +8,7 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 
-from src.agdata import agdata
+from agency.agdata import agdata
 
 
 # ---------------------------------------------------------------------------
@@ -17,7 +17,7 @@ from src.agdata import agdata
 
 class TestEditLogic:
     def setup_method(self):
-        from src.tools.edit import _replace
+        from agency.tools.edit import _replace
         self._replace = _replace
 
     def test_simple_replace(self):
@@ -52,7 +52,7 @@ class TestEditLogic:
 
 class TestWebfetch:
     def setup_method(self):
-        from src.tools.webfetch import webfetch
+        from agency.tools.webfetch import webfetch
         self.tool = webfetch
 
     def _mock_response(self, text: str, content_type: str = "text/html"):
@@ -95,9 +95,9 @@ class TestWebfetch:
 
 class TestTodowrite:
     def setup_method(self):
-        import src.tools.todowrite as m
+        import agency.tools.todowrite as m
         m._store = []
-        from src.tools.todowrite import todowrite
+        from agency.tools.todowrite import todowrite
         self.tool = todowrite
 
     def test_set_todos(self):

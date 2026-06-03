@@ -24,17 +24,13 @@ Even with `--gpus all`, GPUs are **not accessible by default** — every `exec()
 
 ## Shared output directory
 
-When `agent.output_dir` is set, two volume mounts are added to `docker run`:
+When `agent.output_dir` is set, a single read-write volume is mounted into every container:
 
 ```
--v <output_dir>:/agent_output:ro               # full shared dir, read-only
--v <output_dir>/<uuid>:/agent_output/<uuid>:rw  # own subdir, read-write
+-v <output_dir>:/agent_output:rw
 ```
 
-The more-specific rw mount shadows the parent ro mount for the agent's own directory. The result:
-- `/agent_output/<uuid>/` — writable; the agent exports its work here
-- `/agent_output/<other-uuid>/` — read-only; the agent can read other agents' exports
-- The host directory mirrors the container paths exactly
+All agents share the same `/agent_output` directory and can freely read and write it. Files written there appear on the host at `agent.output_dir/` immediately.
 
 ## Forking
 
