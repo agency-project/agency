@@ -103,6 +103,17 @@ class agSandbox:
 
     BASE_IMAGE: ClassVar[str] = "agency-sandbox:latest"
 
+    def _resolve_image(self, name: str) -> str:
+        """Prefix bare image names with ``localhost/`` for Podman.
+
+        Podman requires fully-qualified names when no unqualified-search
+        registries are configured in /etc/containers/registries.conf.
+        Docker accepts bare names fine, so the prefix is Podman-only.
+        """
+        if self._runtime == "podman" and "/" not in name:
+            return f"localhost/{name}"
+        return name
+
     def __init__(
         self,
         agname: str,
@@ -141,7 +152,7 @@ class agSandbox:
             # Remove the image tag now — container holds a reference by digest
             self._run([self._runtime, "rmi", restore_image], check=False)
         elif parent_agname is not None:
-            snap = f"snapshot-{agname}"
+            snap = self._resolve_image(f"snapshot-{agname}")
             self._run([self._runtime, "commit", f"sandbox-{parent_agname}", snap], check=True)
             self._snapshot_name = snap
             self._run(
@@ -152,7 +163,7 @@ class agSandbox:
         else:
             self._run(
                 [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
-                [self.BASE_IMAGE, "tail", "-f", "/dev/null"],
+                [self._resolve_image(self.BASE_IMAGE), "tail", "-f", "/dev/null"],
                 check=True,
             )
             self._run(

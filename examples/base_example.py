@@ -107,4 +107,5 @@ def main():
 
 if __name__ == "__main__":
     from agency import agUI
-    agUI.run(main)
+    # agUI.run(main)
+    main()

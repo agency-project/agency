@@ -15,7 +15,10 @@ git clone https://github.com/agency-project/agency
 cd agency
 
 # Build the sandbox base image (once)
-docker build -t agency-sandbox:latest docker/
+# Docker:
+docker build -t agency-sandbox:latest images/
+# Podman (requires localhost/ prefix):
+podman build -t localhost/agency-sandbox:latest images/
 
 # Install the package in development mode
 uv pip install -e .
