@@ -35,32 +35,32 @@ from .agcompaction import fetch_context_limit, _prune_tool_outputs
 from .tools import make_sandboxed_tools
 
 _NOUNS = [
-    "bass", "bear", "bird", "boar", "bull", "cane", "cake", "clam",
+    "base", "bear", "bird", "lord", "bull", "cane", "cake", "clam",
     "colt", "crab", "crow", "zinc", "deer", "dove", "duck", "fawn",
     "fish", "rice", "frog", "pole", "gull", "hare", "hawk", "hind",
-    "ibex", "ibis", "kite", "lamb", "lark", "lion", "lynx", "mare",
-    "mink", "mole", "moth", "mule", "tree", "bald", "onix", "pika",
+    "ibex", "tony", "kite", "lamb", "lark", "lion", "lynx", "mare",
+    "mink", "lego", "moth", "mule", "tree", "bond", "onix", "pika",
     "pony", "puma", "ruff", "seal", "slug", "coin", "swan", "toad",
-    "vole", "wasp", "wolf", "wren", "zebu",
+    "boss", "wasp", "wolf", "boat", "spam",
     "cape", "cave", "clay", "cove", "crag", "dale", "dune", "fern",
     "flat", "malt", "gale", "glen", "gust", "hail", "haze", "hill",
-    "blue", "isle", "lake", "lava", "leaf", "tail", "loch", "mesa",
-    "mist", "moon", "moor", "moss", "nook", "peat", "pine", "pool",
-    "rain", "reed", "reef", "rill", "rock", "root", "rush", "rust",
+    "blue", "fate", "lake", "lava", "leaf", "tail", "real", "mesa",
+    "mist", "moon", "mert", "many", "book", "peat", "pine", "pool",
+    "rain", "fist", "reef", "rill", "rock", "root", "rush", "rust",
     "sage", "salt", "sand", "song", "snow", "soil", "surf", "tarn",
-    "tide", "till", "turf", "vale", "vent", "wake", "silk", "well",
+    "tide", "till", "turf", "evil", "vent", "wake", "silk", "well",
     "wind", "wood",
-    "arch", "axle", "bale", "bark", "beam", "bell", "belt", "bolt",
-    "bone", "brad", "brim", "bung", "burr", "cage", "cant", "cask",
+    "arch", "axle", "bale", "bark", "beam", "bell", "game", "bolt",
+    "bone", "grip", "brim", "bung", "burr", "cage", "cant", "cask",
     "band", "chip", "pike", "coal", "coil", "cord", "core", "corn",
     "byte", "dome", "down", "drum", "dust", "edge", "felt", "film",
-    "flaw", "floe", "flux", "foam", "font", "fork", "fuse", "gate",
-    "gear", "land", "grit", "helm", "hemp", "hilt", "hoop", "hull",
-    "dart", "keel", "joey", "vast", "knob", "knot", "lash", "park",
-    "bake", "loom", "mast", "maul", "mill", "nail", "node", "pane",
+    "flaw", "meta", "flux", "foam", "font", "fork", "fuse", "gate",
+    "gear", "land", "must", "make", "hemp", "hilt", "hoop", "hull",
+    "dart", "buzz", "joey", "vast", "knob", "knot", "lash", "park",
+    "bake", "loom", "mast", "kodo", "mill", "nail", "node", "pane",
     "pier", "pile", "soda", "plug", "bart", "reel", "rein", "mask",
     "rope", "road", "slab", "slag", "fast", "spar", "cart", "tire",
-    "stem", "fire", "tack", "vine", "tuft", "pork", "weld", "wick",
+    "stem", "fire", "tack", "vine", "love", "pork", "weld", "wick",
     "wire",
 ]
 
@@ -277,6 +277,12 @@ class agent:
 
     def _push_live_messages(self, messages: list) -> None:
         self._snapshot_messages = list(messages)
+        try:
+            from . import agui as _agui
+            if _agui._active is not None:
+                _agui._active._app.call_from_thread(_agui._active._app._render_history)
+        except Exception:
+            pass
 
     def run(self, skill_name: str, input: agdata, max_steps: int = 10) -> agdata:
         """Submit the skill and return a pending agdata immediately.

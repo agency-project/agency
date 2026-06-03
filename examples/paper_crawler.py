@@ -146,8 +146,7 @@ def run(topic: str = "KV cache quantization", run_dir: Path | None = None):
 
     main_agent = agent(
         llm_config=LLM_CONFIG,
-        agskills=[find_papers_skill, summarise_paper_skill, compile_report_skill],
-        agname="agent_smith",
+        agskills=[find_papers_skill, summarise_paper_skill, compile_report_skill]
     )
 
     # The report is written inside the container at this path.
@@ -208,5 +207,5 @@ if __name__ == "__main__":
         except AgError as e:
             print(f"\nERROR: {e}")
 
-    # agUI.run(_script)
-    _script()
+    agUI.run(_script)
+    # _script()

@@ -373,6 +373,33 @@ def test_compact_prunes_large_tool_outputs():
 # Integration: agskill triggers compaction when threshold exceeded
 # ---------------------------------------------------------------------------
 
+def _make_stream(content: str, prompt_tokens: int) -> list:
+    """Build a minimal list of streaming chunks that agskill.run() can iterate."""
+    # Chunk 1: content delta
+    delta1 = MagicMock()
+    delta1.content = content
+    delta1.tool_calls = None
+    choice1 = MagicMock()
+    choice1.delta = delta1
+    choice1.finish_reason = None
+    chunk1 = MagicMock()
+    chunk1.choices = [choice1]
+    chunk1.usage = None
+
+    # Chunk 2: final chunk carrying usage, no content
+    delta2 = MagicMock()
+    delta2.content = None
+    delta2.tool_calls = None
+    choice2 = MagicMock()
+    choice2.delta = delta2
+    choice2.finish_reason = "stop"
+    chunk2 = MagicMock()
+    chunk2.choices = [choice2]
+    chunk2.usage = MagicMock(prompt_tokens=prompt_tokens)
+
+    return [chunk1, chunk2]
+
+
 def test_agskill_triggers_compaction_when_over_threshold():
     from agency.agskill import agskill
     from agency.agdata import agdata
@@ -381,12 +408,6 @@ def test_agskill_triggers_compaction_when_over_threshold():
 
     limit = BIG_CTX
     over = max(limit - _RESERVED, limit // 2) + 1
-
-    resp = MagicMock()
-    resp.choices = [MagicMock(message=MagicMock(
-        content='{"result": "done"}', tool_calls=None
-    ))]
-    resp.usage = MagicMock(prompt_tokens=over)
 
     compact_calls = []
 
@@ -397,7 +418,8 @@ def test_agskill_triggers_compaction_when_over_threshold():
     with patch("agency.agskill.openai.OpenAI") as MockClient, \
          patch("agency.agskill.compact", side_effect=fake_compact):
         MockClient.return_value = MagicMock()
-        MockClient.return_value.chat.completions.create.return_value = resp
+        MockClient.return_value.chat.completions.create.return_value = \
+            _make_stream('{"result": "done"}', over)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
                   agent_tools=[], _context_limit=limit)
 
@@ -413,12 +435,6 @@ def test_agskill_skips_compaction_when_under_threshold():
     limit = BIG_CTX
     under = max(limit - _RESERVED, limit // 2) - 1
 
-    resp = MagicMock()
-    resp.choices = [MagicMock(message=MagicMock(
-        content='{"result": "ok"}', tool_calls=None
-    ))]
-    resp.usage = MagicMock(prompt_tokens=under)
-
     compact_calls = []
 
     def fake_compact(messages, llm_config, **kw):
@@ -428,7 +444,8 @@ def test_agskill_skips_compaction_when_under_threshold():
     with patch("agency.agskill.openai.OpenAI") as MockClient, \
          patch("agency.agskill.compact", side_effect=fake_compact):
         MockClient.return_value = MagicMock()
-        MockClient.return_value.chat.completions.create.return_value = resp
+        MockClient.return_value.chat.completions.create.return_value = \
+            _make_stream('{"result": "ok"}', under)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
                   agent_tools=[], _context_limit=limit)
 
@@ -444,12 +461,6 @@ def test_agskill_passes_context_limit_to_compact():
     limit = BIG_CTX
     over = max(limit - _RESERVED, limit // 2) + 1
 
-    resp = MagicMock()
-    resp.choices = [MagicMock(message=MagicMock(
-        content='{"result": "done"}', tool_calls=None
-    ))]
-    resp.usage = MagicMock(prompt_tokens=over)
-
     received_kwargs = {}
 
     def fake_compact(messages, llm_config, **kw):
@@ -459,7 +470,8 @@ def test_agskill_passes_context_limit_to_compact():
     with patch("agency.agskill.openai.OpenAI") as MockClient, \
          patch("agency.agskill.compact", side_effect=fake_compact):
         MockClient.return_value = MagicMock()
-        MockClient.return_value.chat.completions.create.return_value = resp
+        MockClient.return_value.chat.completions.create.return_value = \
+            _make_stream('{"result": "done"}', over)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
                   agent_tools=[], _context_limit=limit)
 

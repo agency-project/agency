@@ -53,7 +53,23 @@ _ANSI_TO_RICH: dict[str, str] = {
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.events import Click
 from textual.widgets import RichLog, Input, Static
+from rich.markup import escape as _escape
+
+class _CopyStatic(Static):
+    """Static widget that copies plain text to clipboard on right-click."""
+
+    def __init__(self, markup: str, plain: str, **kwargs) -> None:
+        super().__init__(markup, **kwargs)
+        self._plain = plain
+
+    def on_click(self, event: Click) -> None:
+        if event.button == 3:
+            self.app.copy_to_clipboard(self._plain)
+            self.notify("Copied", timeout=1.5)
+            event.stop()
+
 
 # Module-level singleton — set while an agUI() context is active.
 _active: "agUI | None" = None
@@ -130,7 +146,6 @@ class _AgencyApp(App):
     BINDINGS = [
         Binding("tab",       "cycle_fwd", "→ agent", priority=True, show=True),
         Binding("shift+tab", "cycle_bck", "← agent", priority=True, show=True),
-        Binding("q",         "quit",      "Quit",    show=True),
         Binding("ctrl+c",    "quit",      "Quit",    priority=True, show=False),
     ]
 
@@ -167,10 +182,7 @@ class _AgencyApp(App):
         self._done_event.set()
 
     def _mark_done(self) -> None:
-        self._add_log(
-            "\n\033[1;32m✓ All done\033[0m  —  "
-            "\033[1mq\033[0m to exit"
-        )
+        self._add_log("\n\033[1;32m✓ All done\033[0m  —  press \033[1mCtrl+C\033[0m to exit")
 
     # ------------------------------------------------------------------
     # Thread-safe update methods — call via call_from_thread()
@@ -238,16 +250,21 @@ class _AgencyApp(App):
                 content = msg.get("content") or ""
 
                 if role == "system":
-                    # Show first line of system prompt as a dim separator
-                    first_line = content.split("\n")[0][:120]
-                    container.mount(Static(f"[dim]─── sys: {first_line}[/]"))
+                    first_line = _escape(content.split("\n")[0][:120])
+                    container.mount(_CopyStatic(
+                        f"[dim]─── sys: {first_line}[/]", content))
 
                 elif role == "user":
-                    # Skill input — show as compact JSON header
-                    preview = content[:300].replace("\n", " ")
-                    container.mount(Static(f"[bold cyan]▶ user[/]  {preview}"))
+                    preview = _escape(content[:300].replace("\n", " "))
+                    container.mount(_CopyStatic(
+                        f"[bold cyan]▶ user[/]  {preview}", content))
 
                 elif role == "assistant":
+                    thinking = msg.get("_thinking") or ""
+                    if thinking:
+                        preview = _escape(thinking[:800])
+                        container.mount(_CopyStatic(
+                            f"[dim italic]💭 thinking\n{preview}[/]", thinking))
                     tool_calls = msg.get("tool_calls") or []
                     if tool_calls:
                         for tc in tool_calls:
@@ -255,23 +272,21 @@ class _AgencyApp(App):
                             name = fn.get("name", "?")
                             try:
                                 raw = _json.loads(fn.get("arguments", "{}"))
-                                args_lines = [f"  {k}: {str(v)[:120]}" for k, v in raw.items()]
+                                args_lines = [f"  {_escape(k)}: {_escape(str(v)[:120])}"
+                                              for k, v in raw.items()]
                                 args_text = "\n".join(args_lines)
                             except Exception:
-                                args_text = f"  {fn.get('arguments','')[:200]}"
-                            container.mount(Static(
-                                f"[bold yellow]⚙ {name}[/]\n[dim]{args_text}[/]"
-                            ))
+                                args_text = _escape(fn.get("arguments", "")[:200])
+                            container.mount(_CopyStatic(
+                                f"[bold yellow]⚙ {_escape(name)}[/]\n[dim]{args_text}[/]",
+                                f"{name}\n{fn.get('arguments', '')}"))
                     if content:
-                        # Full assistant text, preserve newlines, dim label
-                        container.mount(Static(
-                            f"[bold green]◆ asst[/]\n{content}"
-                        ))
+                        container.mount(_CopyStatic(
+                            f"[bold green]◆ asst[/]\n{_escape(content)}", content))
 
                 elif role == "tool":
-                    # Tool result — show up to 600 chars, preserve structure
-                    preview = content[:600]
-                    container.mount(Static(f"[dim]← {preview}[/]"))
+                    preview = _escape(content[:600])
+                    container.mount(_CopyStatic(f"[dim]← {preview}[/]", content))
 
             # Running indicator — label depends on ui_state, dots cycle each tick
             if ag is not None:
@@ -301,7 +316,8 @@ class _AgencyApp(App):
         # Pending ask_human question for this agent
         if ag in self._pending:
             question, _ = self._pending[ag]
-            container.mount(Static(f"[bold yellow]? {question}[/]"))
+            container.mount(_CopyStatic(
+                f"[bold yellow]? {question}[/]", question))
 
         self.call_after_refresh(
             lambda: self.query_one("#agent-history", ScrollableContainer)
@@ -459,7 +475,7 @@ class agUI:
     ----------
     linger : bool
         When True (default), keep the UI open after the script finishes and
-        show a "Done — press q to exit" banner.  When False, exit immediately.
+        show a "Done" banner.  When False, exit immediately.
     """
 
     def __init__(self, linger: bool = True) -> None:

@@ -109,5 +109,5 @@ if __name__ == "__main__":
         except AgError as e:
             print(f"\nERROR: {e}")
 
-    # agUI.run(_script)
-    _script()
+    agUI.run(_script)
+    # _script()

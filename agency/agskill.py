@@ -4,12 +4,17 @@ import re
 from typing import TYPE_CHECKING, Callable
 import openai
 
-_THINKING_RE = re.compile(r"<think(?:ing)?>\s*.*?\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_thinking(content: str) -> str:
     """Remove <think>…</think> / <thinking>…</thinking> blocks from model output."""
     return _THINKING_RE.sub("", content).strip()
+
+
+def _extract_thinking(content: str) -> str:
+    """Return the concatenated text of all thinking blocks, or empty string if none."""
+    return "\n\n".join(m.group(1).strip() for m in _THINKING_RE.finditer(content))
 from .agdata import agdata
 from .agtool import agtool
 from .agcompaction import compact, should_compact
@@ -151,7 +156,10 @@ class agskill:
             had_inbox = False
             kwargs: dict = dict(
                 model=llm_config.get("model", "gpt-4o"),
-                messages=messages,
+                # Strip private (_-prefixed) keys before sending to the API.
+                # _thinking and similar fields are for internal/logging use only.
+                messages=[{k: v for k, v in m.items() if not k.startswith("_")}
+                          for m in messages],
             )
             if openai_tools:
                 kwargs["tools"] = openai_tools
@@ -171,14 +179,86 @@ class agskill:
                 term.log("LLM      ", f"model={llm_config.get('model','?')}  messages={len(messages)}")
             if _state_fn:
                 _state_fn("llm", skill=self.name)
-            resp = client.chat.completions.create(**kwargs)
+
+            # --- Streaming call ----------------------------------------------
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            tool_calls_raw: dict[int, dict] = {}
+            prompt_tokens: int | None = None
+
+            # Partial placeholder so live UI shows tokens as they arrive
+            partial_msg: dict = {"role": "assistant", "content": ""}
+            messages.append(partial_msg)
+            # Push immediately so the placeholder appears before any tokens arrive
+            if _live_messages_fn:
+                _live_messages_fn(messages[1:])
+            _live_chars = 0
+
+            _PARTIAL_THINK_RE = re.compile(
+                r"<think(?:ing)?>(.*?)(?:</think(?:ing)?>|$)", re.DOTALL | re.IGNORECASE
+            )
+
+            for chunk in client.chat.completions.create(**kwargs):
+                if chunk.usage is not None:
+                    prompt_tokens = chunk.usage.prompt_tokens
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                # Reasoning tokens — field name varies by model/backend:
+                # "reasoning_content" (DeepSeek-R1 / some vLLM builds)
+                # "reasoning"         (Kimi-K2 and others via model_extra)
+                extra = getattr(delta, "model_extra", None) or {}
+                rc = getattr(delta, "reasoning_content", None)
+                if not isinstance(rc, str):
+                    rc = extra.get("reasoning_content")
+                if not isinstance(rc, str):
+                    rc = extra.get("reasoning")
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
+                    partial_msg["_thinking"] = "".join(reasoning_parts)
+
+                if delta.content:
+                    content_parts.append(delta.content)
+                    raw = "".join(content_parts)
+                    # For <think>-tag models: expose thinking live even before closing tag
+                    m = _PARTIAL_THINK_RE.search(raw)
+                    if m:
+                        partial_msg["_thinking"] = m.group(1).strip()
+                        partial_msg["content"] = _THINKING_RE.sub("", raw).strip()
+                    else:
+                        partial_msg["content"] = raw
+
+                # Throttle UI redraws: push every ~100 new combined chars
+                new_chars = len(partial_msg.get("content", "")) + len(partial_msg.get("_thinking", ""))
+                if _live_messages_fn and new_chars - _live_chars >= 100:
+                    _live_messages_fn(messages[1:])
+                    _live_chars = new_chars
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        slot = tool_calls_raw.setdefault(tc_delta.index, {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        })
+                        if tc_delta.id:
+                            slot["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                slot["function"]["name"] += tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                slot["function"]["arguments"] += tc_delta.function.arguments
+
+            messages.pop()  # remove partial placeholder
+
             if _state_fn:
                 _state_fn("skill", skill=self.name)
 
             # Auto-compaction: if we're burning through context, summarise old
             # messages now so the next iteration has headroom.
-            if _context_limit is not None and resp.usage is not None:
-                prompt_tokens = resp.usage.prompt_tokens
+            if _context_limit is not None and prompt_tokens is not None:
                 if should_compact(prompt_tokens, _context_limit):
                     if term:
                         term.log(
@@ -204,43 +284,49 @@ class agskill:
                     if _live_messages_fn:
                         _live_messages_fn(messages[1:])
 
-            msg = resp.choices[0].message
-
+            # Build final assistant message dict from accumulated stream
+            full_content = "".join(content_parts)
+            full_reasoning = "".join(reasoning_parts)
             msg_dict: dict = {"role": "assistant"}
-            if msg.content:
-                msg_dict["content"] = _strip_thinking(msg.content)
-            if msg.tool_calls:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in msg.tool_calls
-                ]
+            if full_reasoning:
+                # vLLM / DeepSeek-R1: thinking arrives in reasoning_content
+                msg_dict["_thinking"] = full_reasoning
+                if full_content:
+                    msg_dict["content"] = full_content
+            elif full_content:
+                # <think>-tag models: thinking is embedded in content
+                thinking = _extract_thinking(full_content)
+                if thinking:
+                    msg_dict["_thinking"] = thinking
+                msg_dict["content"] = _strip_thinking(full_content)
+            if tool_calls_raw:
+                msg_dict["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
             messages.append(msg_dict)
             if _live_messages_fn:
                 _live_messages_fn(messages[1:])
 
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    t = tool_map.get(tc.function.name)
+            if msg_dict.get("tool_calls"):
+                for tc in msg_dict["tool_calls"]:
+                    fn_name = tc["function"]["name"]
+                    fn_args = tc["function"]["arguments"]
+                    tc_id   = tc["id"]
+                    t = tool_map.get(fn_name)
                     if t is None:
                         if term:
-                            term.log("TOOL ✗   ", f"{tc.function.name}  → unknown tool")
-                        result_content = json.dumps({"error": f"unknown tool: {tc.function.name}"})
+                            term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
+                        result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
                     else:
                         try:
                             if _state_fn:
-                                _state_fn("tool", skill=self.name, tool=tc.function.name)
-                            result_content = t(agdata.from_json(tc.function.arguments)).to_json()
+                                _state_fn("tool", skill=self.name, tool=fn_name)
+                            result_content = t(agdata.from_json(fn_args)).to_json()
                             if _state_fn:
                                 _state_fn("skill", skill=self.name)
                         except Exception as e:
                             if _state_fn:
                                 _state_fn("skill", skill=self.name)
                             result_content = json.dumps({"error": str(e)})
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": result_content})
                     if _live_messages_fn:
                         _live_messages_fn(messages[1:])
 
@@ -252,7 +338,9 @@ class agskill:
                     continue
 
                 # --- Parse final answer --------------------------------------
-                content = _strip_thinking(msg.content or "{}")
+                # full_content is already thinking-stripped via msg_dict["content"];
+                # use msg_dict.get() so we don't re-process.
+                content = msg_dict.get("content") or "{}"
                 # Strip markdown code fences that some models add despite instructions
                 stripped = content.strip()
                 if stripped.startswith("```"):
