@@ -88,11 +88,12 @@ class agSandbox:
 
     def __init__(
         self,
-        uuid: str,
-        parent_uuid: str | None = None,
+        agname: str,
+        parent_agname: str | None = None,
         output_dir: Path | None = None,
+        restore_image: str | None = None,
     ) -> None:
-        self._uuid = uuid
+        self._agname = agname
         self._runtime = get_container_runtime()
         self._snapshot_name: str | None = None
         self._gpu_id: int | None = None
@@ -113,9 +114,18 @@ class agSandbox:
             vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
 
         name = self._container_name()
-        if parent_uuid is not None:
-            snap = f"snapshot-{uuid}"
-            self._run([self._runtime, "commit", f"sandbox-{parent_uuid}", snap], check=True)
+        if restore_image is not None:
+            # Start container from a previously saved checkpoint image
+            self._run(
+                [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
+                [restore_image, "tail", "-f", "/dev/null"],
+                check=True,
+            )
+            # Remove the image tag now — container holds a reference by digest
+            self._run([self._runtime, "rmi", restore_image], check=False)
+        elif parent_agname is not None:
+            snap = f"snapshot-{agname}"
+            self._run([self._runtime, "commit", f"sandbox-{parent_agname}", snap], check=True)
             self._snapshot_name = snap
             self._run(
                 [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
@@ -139,7 +149,7 @@ class agSandbox:
         self._baseline_pids = self._snapshot_pids()
 
     def _container_name(self) -> str:
-        return f"sandbox-{self._uuid}"
+        return f"sandbox-{self._agname}"
 
     def _snapshot_pids(self) -> set[int]:
         """Return the set of all live PIDs currently in the container, excluding

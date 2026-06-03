@@ -844,3 +844,150 @@ def test_outer_loop_daemon_release_unblocks_skill():
     assert calls == [None, "process_update"]   # no process_completed — daemon was released
     assert 1 in ag.sandbox._daemon_pids        # PID moved to daemon set
     assert ag.sandbox._watched_pids == {}      # nothing left to monitor
+
+
+# ---------------------------------------------------------------------------
+# Agent registry
+# ---------------------------------------------------------------------------
+
+def test_agent_all_tracks_live_agents():
+    ag1 = make_agent()
+    ag2 = make_agent()
+    live = agent.all()
+    assert ag1 in live
+    assert ag2 in live
+
+
+def test_agent_all_excludes_destroyed():
+    import gc
+    ag1 = make_agent()
+    ag2 = make_agent()
+    ag2.sandbox.destroy()
+    ag2_name = ag2.agname
+    del ag2
+    gc.collect()
+    # agname should no longer be in the live registry
+    assert ag2_name not in [a.agname for a in agent.all()]
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing (requires Docker)
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess
+
+_docker_ok = pytest.mark.skipif(
+    not (lambda: __import__("subprocess").run(
+        ["docker", "info"], capture_output=True, timeout=10
+    ).returncode == 0)(),
+    reason="Docker not available",
+)
+
+
+@_docker_ok
+def test_save_and_load_restores_history_and_filesystem(tmp_path):
+    from agency.agent import _allocated_agnames
+    skill = agskill(name="s", system_prompt="")
+    def fake_run(cfg, inp, hist, tools, ms, **_):
+        return agdata(answer="42"), agdata(messages=[{"role": "assistant", "content": "42"}]), []
+    skill.run = fake_run
+
+    ag = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[skill])
+    ag.sandbox.write_file("/workspace/state.txt", "hello\n")
+    ag.run("s", agdata(q="test")).answer   # run a skill so history is non-empty
+
+    ckpt = tmp_path / "agent.ckpt"
+    ag.save(ckpt)
+    assert ckpt.exists()
+    saved_agname = ag.agname
+    ag.sandbox.destroy()
+    _allocated_agnames.discard(saved_agname)
+
+    ag2 = agent.load(ckpt, llm_config={"api_key": "k", "model": "m"}, agskills=[skill])
+    assert ag2.agname == saved_agname
+    assert ag2.sandbox.read_file("/workspace/state.txt") == "hello\n"
+    assert len(ag2._history._data.get("messages", [])) > 0
+    assert ag2 in agent.all()
+
+    # Structured log entry written
+    events = ag2.log.events
+    assert any(e.get("event") == "loaded" for e in events)
+    ag2.sandbox.destroy()
+
+
+@_docker_ok
+def test_save_all_and_load_all(tmp_path):
+    import gc
+    from agency.agent import _allocated_agnames
+
+    saved_names = set()
+
+    def _create_and_save():
+        ag1 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+        ag2 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+        ag1.sandbox.write_file("/workspace/id.txt", f"{ag1.agname}\n")
+        ag2.sandbox.write_file("/workspace/id.txt", f"{ag2.agname}\n")
+        saved_names.update([ag1.agname, ag2.agname])
+        agent.save_all(tmp_path)
+        ag1.sandbox.destroy()
+        ag2.sandbox.destroy()
+        # ag1, ag2 go fully out of scope here
+
+    _create_and_save()
+    gc.collect()
+    _allocated_agnames.difference_update(saved_names)
+
+    restored = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
+    assert len(restored) == 2
+    names = {ag.agname for ag in restored}
+    assert names == saved_names
+    for ag in restored:
+        assert ag.sandbox.read_file("/workspace/id.txt").strip() == ag.agname
+        ag.sandbox.destroy()
+
+
+@_docker_ok
+def test_load_all_skips_already_live_agent(tmp_path):
+    import gc
+    from agency.agent import _allocated_agnames
+
+    ag1 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+    ag1_name = ag1.agname
+    ag2_name = [None]
+
+    def _create_save_destroy_ag2():
+        ag2 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+        ag2_name[0] = ag2.agname
+        agent.save_all(tmp_path)
+        ag2.sandbox.destroy()
+        # ag2 goes out of scope here
+
+    _create_save_destroy_ag2()
+    gc.collect()
+    _allocated_agnames.discard(ag2_name[0])
+
+    # ag1 still live; ag2 gone — load_all should skip ag1 and restore ag2
+    result = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
+    assert len(result) == 2
+    assert ag1 in result
+    restored_ag2 = next(a for a in result if a.agname == ag2_name[0])
+    assert restored_ag2 is not None
+
+    for ag in result:
+        if ag is not ag1:
+            ag.sandbox.destroy()
+    ag1.sandbox.destroy()
+
+
+@_docker_ok
+def test_load_raises_if_agname_already_live(tmp_path):
+    from agency.agent import _allocated_agnames
+    ag = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+    ckpt = tmp_path / "ag.ckpt"
+    ag.save(ckpt)
+
+    # agname still allocated — load should raise
+    with pytest.raises(ValueError, match="already in use"):
+        agent.load(ckpt, llm_config={"api_key": "k", "model": "m"})
+
+    ag.sandbox.destroy()

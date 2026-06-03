@@ -161,7 +161,7 @@ def test_created_event_logged():
     ev = ag.log.events[0]
     assert ev["type"] == "lifecycle"
     assert ev["event"] == "created"
-    assert ev["uuid"] == ag.uuid
+    assert ev["agname"] == ag.agname
     assert "ts" in ev
 
 
@@ -170,14 +170,14 @@ def test_forked_event_logged():
     fork = agent(parent)
     ev = fork.log.events[0]
     assert ev["event"] == "forked"
-    assert ev["uuid"] == fork.uuid
-    assert ev["parent_uuid"] == parent.uuid
+    assert ev["agname"] == fork.agname
+    assert ev["parent_agname"] == parent.agname
 
 
-def test_forked_agent_has_own_uuid():
+def test_forked_agent_has_own_agname():
     parent = make_agent()
     fork = agent(parent)
-    assert fork.uuid != parent.uuid
+    assert fork.agname != parent.agname
 
 
 def test_destroyed_event_logged():

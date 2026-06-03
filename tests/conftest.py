@@ -1,10 +1,10 @@
-"""Reset mutable agent class-level config between tests so they don't bleed into each other."""
+"""Reset mutable agent class-level and module-level state between tests."""
 import pytest
-from agency.agent import agent
+from agency.agent import agent, _allocated_agnames, _noun_counters, _live_agents
 
 
 @pytest.fixture(autouse=True)
-def reset_agent_class_config():
+def reset_agent_state():
     saved = {
         "ping_interval_s": agent.ping_interval_s,
         "poll_interval_s": agent.poll_interval_s,
@@ -18,3 +18,9 @@ def reset_agent_class_config():
     agent.max_outer_iters = saved["max_outer_iters"]
     agent.log_dir         = saved["log_dir"]
     agent.output_dir      = saved["output_dir"]
+    # Reset module-level name registry so tests don't bleed agnames into each other
+    _allocated_agnames.clear()
+    _noun_counters.clear()
+    # WeakSet clears itself as objects die; force a GC pass to help along
+    import gc
+    gc.collect()

@@ -33,7 +33,7 @@ class aglog:
       event       : "created" | "forked" | "destroyed"
       ts          : ISO-8601 timestamp
       uuid        : agent UUID
-      parent_uuid : (forked only) UUID of the source agent
+      parent_agname : (forked only) agname of the source agent
     """
 
     def __init__(self, path: "Path | str | None" = None) -> None:
@@ -137,10 +137,10 @@ class aglog:
         for i, e in enumerate(self.events):
             if e["type"] == "lifecycle":
                 extra = ""
-                if "parent_uuid" in e:
-                    extra = f"  ← forked from {e['parent_uuid'][:8]}"
+                if "parent_agname" in e:
+                    extra = f"  ← forked from {e['parent_agname']}"
                 lines.append(
-                    f"[{i}] {e['event'].upper()}  {e['ts']}  uuid={e['uuid'][:8]}{extra}"
+                    f"[{i}] {e['event'].upper()}  {e['ts']}  agname={e['agname']}{extra}"
                 )
             else:
                 delta_lines = []

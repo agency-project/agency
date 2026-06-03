@@ -7,6 +7,7 @@ dependencies = [
     "httpx",
     "html2text",
     "podman>=5.8.0",
+    "rich>=15.0.0",
 ]
 
 [project.optional-dependencies]

@@ -37,9 +37,9 @@ def _make_run_dir(name: str):
     return run_dir
 
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "https://gemma.js-park.info/v1"),
+    "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",     "google/gemma-4-31B-it"),
+    "model":    os.environ.get("VLLM_MODEL",     "moonshotai/Kimi-K2.6"),
 }
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "16"))
 

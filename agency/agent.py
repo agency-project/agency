@@ -1,18 +1,34 @@
 from __future__ import annotations
 import copy
+import io
+import json
 import random
+import subprocess
+import tarfile
 import time
-import uuid
+import uuid as _uuid_mod
+import weakref
 from concurrent.futures import ThreadPoolExecutor, Future
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
+
+# Single run-level ID for the default log directory.
+# Created once at import time so all agents in one process share it.
+_RUN_ID  = _uuid_mod.uuid4().hex[:12]
+_RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+_DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
+
+# Global weak registry of all live agent instances.
+# WeakSet entries disappear automatically when agents are garbage-collected.
+_live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 from .agdata import agdata
 from .agskill import agskill
 from .agtool import agtool
 from .aglog import aglog, _ts
 from .agterm import agterm
-from .agsandbox import agSandbox
+from .agsandbox import agSandbox, get_container_runtime
 from .agresources import agResourcePool
 from .tools import make_sandboxed_tools
 
@@ -141,7 +157,6 @@ class agent:
         tools: list[agtool] | None = None,
         agname: str | None = None,
     ):
-        self.uuid     = str(uuid.uuid4())
         self.agname = _generate_agname() if agname is None else _allocate_agname(agname)
         pool = agent.agresource_pool
 
@@ -156,12 +171,12 @@ class agent:
             src._history._resolve()
             self._history: agdata = copy.deepcopy(src._history)
             # Snapshot parent container → fork starts from parent's exact state
-            self.sandbox = agSandbox(self.uuid, parent_uuid=src.uuid, output_dir=_out)
+            self.sandbox = agSandbox(self.agname, parent_agname=src.agname, output_dir=_out)
         else:
             self.llm_config = llm_config
             self.agskills   = list(agskills or [])
             self._history   = agdata(messages=[])
-            self.sandbox    = agSandbox(self.uuid, output_dir=_out)
+            self.sandbox    = agSandbox(self.agname, output_dir=_out)
 
         # Build sandboxed tool list; user-supplied tools override if provided
         if tools is not None:
@@ -169,7 +184,8 @@ class agent:
         else:
             self.tools = make_sandboxed_tools(self.sandbox, pool)
 
-        log_path = Path(agent.log_dir) / f"{self.uuid}.jsonl" if agent.log_dir is not None else None
+        log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
+        log_path = log_dir / f"{self.agname}.jsonl"
         self.log  = aglog(path=log_path)
         self._term = agterm(self.agname)
 
@@ -177,12 +193,14 @@ class agent:
         for t in self.tools:
             t.attach_logger(self._term, self.log)
 
+        _live_agents.add(self)
+
         if isinstance(llm_config, agent):
             self._term.log("FORKED   ", f"from {src.agname}  skills={[s.name for s in self.agskills]}")
             self.log._lifecycle(
                 "forked",
-                uuid=self.uuid,
-                parent_uuid=src.uuid,
+                agname=self.agname,
+                parent_agname=src.agname,
                 agskills=[s.name for s in self.agskills],
                 tools=[t.name for t in self.tools],
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
@@ -191,7 +209,7 @@ class agent:
             self._term.log("CREATED  ", f"skills={[s.name for s in self.agskills]}  model={self.llm_config.get('model','?')}")
             self.log._lifecycle(
                 "created",
-                uuid=self.uuid,
+                agname=self.agname,
                 agskills=[s.name for s in self.agskills],
                 tools=[t.name for t in self.tools],
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
@@ -305,7 +323,7 @@ class agent:
                     # Background processes detected — log the start of the wait.
                     summary = self.sandbox.pid_status_summary()
                     self._term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
-                    self.log._lifecycle("procs_started", uuid=self.uuid,
+                    self.log._lifecycle("procs_started", agname=self.agname,
                                         skill=skill_name, pids=list(pids_at_end),
                                         summary=summary)
 
@@ -324,7 +342,7 @@ class agent:
                         # All background processes finished — re-enter so the
                         # agent can read their output and act on the results.
                         self._term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
-                        self.log._lifecycle("procs_completed", uuid=self.uuid,
+                        self.log._lifecycle("procs_completed", agname=self.agname,
                                             skill=skill_name)
                         current_input = agdata(
                             _event="process_completed",
@@ -340,7 +358,7 @@ class agent:
                     # Processes still running after ping_interval_s — ping agent.
                     summary = self.sandbox.pid_status_summary()
                     self._term.log("PROCS ⏳  ", f"{skill_name}  still running: {summary}")
-                    self.log._lifecycle("procs_ping", uuid=self.uuid,
+                    self.log._lifecycle("procs_ping", agname=self.agname,
                                         skill=skill_name, pids=list(live_now),
                                         summary=summary)
                     current_input   = agdata(
@@ -398,9 +416,10 @@ class agent:
 
     def __del__(self) -> None:
         """Best-effort: log destruction and destroy the sandbox container."""
+        _live_agents.discard(self)
         try:
             self._term.log("DESTROYED", "")
-            self.log._lifecycle("destroyed", uuid=self.uuid)
+            self.log._lifecycle("destroyed", agname=self.agname)
         except Exception:
             pass
         try:
@@ -411,6 +430,236 @@ class agent:
     def fork(self) -> "agent":
         """Return an independent copy of this agent (same as agent(self))."""
         return agent(self)
+
+    async def asyncio_run(
+        self,
+        skill_name: str,
+        input: "agdata",
+        max_steps: int = 10,
+    ) -> "agdata":
+        """Async wrapper around ``run()`` for use in asyncio event loops.
+
+        Submits the skill to the thread pool (same as ``run()``) and awaits
+        completion without blocking the event loop thread.  The returned
+        ``agdata`` is fully resolved — no further blocking on field access.
+
+        Equivalent to ``await Runner.run(agent, input)`` in openai-agents.
+
+        Example — FastAPI endpoint::
+
+            @app.post("/ask")
+            async def ask(question: str):
+                result = await ag.asyncio_run("qa", agdata(question=question))
+                return {"answer": result.answer}
+
+        Example — parallel execution with asyncio.gather::
+
+            results = await asyncio.gather(*[
+                agent(parent).asyncio_run("translate", agdata(text=msg))
+                for _ in range(3)
+            ])
+        """
+        import asyncio
+        loop = asyncio.get_event_loop()
+        pending = self.run(skill_name, input, max_steps)
+        await loop.run_in_executor(None, pending._resolve)
+        return pending
+
+    # ------------------------------------------------------------------
+    # Live agent registry
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def all(cls) -> "list[agent]":
+        """Return all currently live agent instances in this process."""
+        return list(_live_agents)
+
+    @classmethod
+    def save_all(cls, directory: "Path | str") -> "list[Path]":
+        """Checkpoint every live agent to *directory*/<agname>.ckpt.
+
+        Waits for any in-flight run() on each agent before snapshotting.
+        Returns the list of paths written.
+        """
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        for ag in cls.all():
+            path = directory / f"{ag.agname}.ckpt"
+            ag.save(path)
+            paths.append(path)
+        return paths
+
+    @classmethod
+    def load_all(
+        cls,
+        directory: "Path | str",
+        llm_config: dict,
+        agskills: "list[agskill] | None" = None,
+        tools: "list[agtool] | None" = None,
+    ) -> "list[agent]":
+        """Restore all ``*.ckpt`` files from *directory*.
+
+        Behaviour for each checkpoint found:
+
+        - **agname already live**: the checkpoint is skipped and the existing
+          agent is returned as-is.  The running agent is never overwritten —
+          a live agent always takes precedence over a checkpoint on disk.
+        - **agname not live**: a new agent is restored from the checkpoint and
+          added to the live registry.
+
+        ``agskills`` and ``tools`` are shared across all restored agents.
+        Returns the full list (both existing and newly restored agents).
+        """
+        directory = Path(directory)
+        live_names = {ag.agname: ag for ag in cls.all()}
+        restored: list[agent] = []
+
+        for ckpt in sorted(directory.glob("*.ckpt")):
+            # Peek at the agname without loading the full image
+            with tarfile.open(ckpt, "r:gz") as tar:
+                state = json.loads(tar.extractfile("state.json").read())
+            agname = state["agname"]
+
+            if agname in live_names:
+                # Already running — skip, return existing
+                existing = live_names[agname]
+                existing._term.log("CKPT     ", f"load_all: {agname} already live, skipping {ckpt.name}")
+                restored.append(existing)
+            else:
+                ag = cls.load(ckpt, llm_config=llm_config, agskills=agskills, tools=tools)
+                restored.append(ag)
+
+        return restored
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def save(self, path: "Path | str") -> None:
+        """Checkpoint this agent to a single .ckpt file.
+
+        Blocks until any in-flight ``run()`` completes so history and the
+        container filesystem are consistent before the snapshot is taken.
+
+        The file is a gzip-compressed tar archive containing:
+          - ``state.json``   — history, agname, llm_config keys, skill names
+          - ``container.tar`` — full Docker image export of the container filesystem
+
+        The api_key is never written to disk.
+        """
+        path = Path(path)
+        runtime = self.sandbox._runtime
+        image_tag = f"agency/ckpt-{self.agname}"
+
+        # 1. Wait for any in-flight run() to complete so history and the
+        #    container filesystem are in a consistent, quiescent state.
+        if self._history.is_pending():
+            self._term.log("CKPT ⏳  ", "waiting for in-flight task to complete...")
+        self._history._resolve()
+
+        # 2. Snapshot the now-idle container to an image
+        self.sandbox._run([runtime, "commit", self.sandbox._container_name(), image_tag], check=True)
+
+        try:
+            # 2. Export image to bytes
+            result = subprocess.run(
+                [runtime, "save", image_tag],
+                capture_output=True, check=True, timeout=600,
+            )
+            image_bytes = result.stdout
+
+            # 3. Build state dict
+            state = {
+                "agname":      self.agname,
+                "llm_config":  {k: v for k, v in self.llm_config.items() if k != "api_key"},
+                "history":     self._history._data.get("messages", []),
+                "skill_names": [s.name for s in self.agskills],
+                "ts":          _ts(),
+            }
+            state_bytes = json.dumps(state, indent=2).encode()
+
+            # 4. Bundle into a single .tar.gz
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(path, "w:gz") as tar:
+                for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
+                    info = tarfile.TarInfo(name=name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+
+        finally:
+            subprocess.run([runtime, "rmi", "-f", image_tag], capture_output=True)
+
+        size_kb = path.stat().st_size // 1024
+        self._term.log("CKPT ✓   ", f"saved → {path}  ({size_kb} KB)")
+        self.log._lifecycle("saved", agname=self.agname, path=str(path), size_kb=size_kb)
+
+    @classmethod
+    def load(
+        cls,
+        path: "Path | str",
+        llm_config: dict,
+        agskills: "list[agskill] | None" = None,
+        tools: "list[agtool] | None" = None,
+    ) -> "agent":
+        """Restore an agent from a checkpoint file created by ``agent.save()``.
+
+        Always creates a **new** agent instance — it never modifies or replaces
+        any currently live agent, even if an agent with the same agname already
+        exists.  If the checkpoint's agname is already taken in this process,
+        ``ValueError`` is raised; discard the conflicting agent first or use
+        ``agent.load_all()`` which handles this automatically.
+
+        The caller must re-supply ``llm_config`` (api_key is never stored) and
+        ``agskills`` (Python code is not serialised).  The restored agent has
+        the same conversation history and container filesystem as at checkpoint
+        time and can continue running skills immediately.
+        """
+        path = Path(path)
+        runtime = get_container_runtime()
+        image_tag = f"agency/ckpt-restore-{_uuid_mod.uuid4().hex[:8]}"
+
+        with tarfile.open(path, "r:gz") as tar:
+            state       = json.loads(tar.extractfile("state.json").read())
+            image_bytes = tar.extractfile("container.tar").read()
+
+        # Load image — docker restores the original tag (agency/ckpt-{agname})
+        subprocess.run(
+            [runtime, "load"],
+            input=image_bytes, capture_output=True, check=True, timeout=600,
+        )
+        original_tag = f"agency/ckpt-{state['agname']}"
+        # Re-tag to a unique name so concurrent restores don't collide,
+        # then remove the original tag
+        subprocess.run([runtime, "tag", original_tag, image_tag], capture_output=True, check=True)
+        subprocess.run([runtime, "rmi", original_tag], capture_output=True)
+
+        # Build agent without going through normal __init__ to avoid creating a fresh container
+        ag: agent = cls.__new__(cls)
+        ag.agname    = _allocate_agname(state["agname"])
+        ag.llm_config = {**state.get("llm_config", {}), **llm_config}
+        ag.agskills   = list(agskills or [])
+        ag._history   = agdata(messages=list(state.get("history", [])))
+
+        _out = Path(agent.output_dir) / ag.agname if agent.output_dir else None
+        ag.sandbox = agSandbox(ag.agname, restore_image=image_tag, output_dir=_out)
+
+        pool = agent.agresource_pool
+        ag.tools = list(tools) if tools is not None else make_sandboxed_tools(ag.sandbox, pool)
+
+        log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
+        ag.log   = aglog(path=log_dir / f"{ag.agname}.jsonl")
+        ag._term = agterm(ag.agname)
+
+        for t in ag.tools:
+            t.attach_logger(ag._term, ag.log)
+
+        _live_agents.add(ag)
+
+        ag._term.log("LOADED   ", f"from {path}  skills={state.get('skill_names', [])}")
+        ag.log._lifecycle("loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts"))
+
+        return ag
 
     def __repr__(self) -> str:
         names = [f.name for f in self.agskills]

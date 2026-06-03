@@ -218,7 +218,7 @@ class TestAgSandboxLifecycle:
     @docker
     def test_fork_creates_independent_container(self):
         parent = _make_sandbox()
-        child = _make_sandbox(parent_uuid=parent._uuid)
+        child = _make_sandbox(parent_agname=parent._agname)
         assert parent._container_name() != child._container_name()
         assert child._snapshot_name is not None
         child.destroy()
@@ -253,7 +253,7 @@ class TestAgSandboxLifecycle:
     @docker
     def test_destroy_removes_snapshot_image(self):
         parent = _make_sandbox()
-        child = _make_sandbox(parent_uuid=parent._uuid)
+        child = _make_sandbox(parent_agname=parent._agname)
         snap = child._snapshot_name
         assert snap is not None
         child.destroy()
@@ -503,7 +503,7 @@ class TestAgSandboxForkIsolation:
     def test_fork_inherits_parent_files(self):
         parent = _make_sandbox()
         parent.write_file("/workspace/shared.txt", "from parent\n")
-        child = _make_sandbox(parent_uuid=parent._uuid)
+        child = _make_sandbox(parent_agname=parent._agname)
         content = child.read_file("/workspace/shared.txt")
         assert "from parent" in content
         child.destroy()
@@ -513,7 +513,7 @@ class TestAgSandboxForkIsolation:
     def test_fork_writes_do_not_affect_parent(self):
         parent = _make_sandbox()
         parent.write_file("/workspace/base.txt", "original\n")
-        child = _make_sandbox(parent_uuid=parent._uuid)
+        child = _make_sandbox(parent_agname=parent._agname)
         child.write_file("/workspace/base.txt", "modified\n")
         # Parent should still have the original content
         assert "original" in parent.read_file("/workspace/base.txt")
