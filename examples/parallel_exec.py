@@ -123,9 +123,12 @@ if __name__ == "__main__":
         print(f"Model    : {LLM_CONFIG['model']}\n")
         print(f"Run dir  : {run_dir}\n")
         try:
-            SequentialChainTeam().run()
-            agsync(SequentialChainTeam())
-            ForkFanoutTeam().run()
+            seq_team = SequentialChainTeam()
+            seq_team.run()
+            agsync(seq_team)
+            fork_team = ForkFanoutTeam()
+            fork_team.run()
+            agsync(fork_team)
         except AgError as e:
             print(f"\nERROR: {e}")
 

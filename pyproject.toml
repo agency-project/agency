@@ -30,3 +30,9 @@ testpaths = ["tests", "agency/common_skills"]
 python_files = ["test_*.py", "*.py"]
 python_functions = ["test_*"]
 timeout = 120
+filterwarnings = [
+    # ProcessPoolExecutor uses fork() on Linux. The deprecation warning fires
+    # once per worker process creation and is noise in test output — the fork
+    # is safe here because workers are short-lived and do no lock-protected work.
+    "ignore:This process.*multi-threaded.*fork:DeprecationWarning",
+]

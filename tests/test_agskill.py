@@ -144,22 +144,23 @@ def test_existing_history_included_in_call():
 # ---------------------------------------------------------------------------
 
 def test_tool_call_executes_and_continues():
-    calls = []
     def fn(arg: agdata) -> agdata:
-        calls.append(arg.to_dict())
-        return agdata(val=99)
+        return agdata(val=arg.x * 10)
 
     t = agtool(name="calc", description="", fn=fn,
              params={"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]})
 
     s = make_skill(tools=[t])
-    responses = [_tool_call("calc", {"x": 7}), _direct('{"result": 99}')]
+    responses = [_tool_call("calc", {"x": 7}), _direct('{"result": 70}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
         result, hist, delta = s.run(LLM_CONFIG, agdata(task="calc"), agdata(messages=[]), [])
 
-    assert calls == [{"x": 7}]
-    assert result.result == 99
+    # Verify the tool ran with the right args and its output reached the LLM
+    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert json.loads(tool_msgs[0]["content"]) == {"val": 70}
+    assert result.result == 70
 
 
 def test_unknown_tool_error_in_history():

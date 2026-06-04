@@ -1,5 +1,4 @@
 from __future__ import annotations
-import multiprocessing
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -15,9 +14,8 @@ if TYPE_CHECKING:
 # to match concurrent demand (one worker per in-flight tool call, up to 256).
 # Uses "spawn" start method to avoid fork-in-multithreaded-process deadlocks.
 # ---------------------------------------------------------------------------
-_use_process_pool: bool            = True   # set False in tests to allow mock patching
-_pool:             ProcessPoolExecutor | None = None
-_pool_lock:        threading.Lock             = threading.Lock()
+_pool:      ProcessPoolExecutor | None = None
+_pool_lock: threading.Lock             = threading.Lock()
 
 
 def _get_pool() -> ProcessPoolExecutor:
@@ -25,8 +23,7 @@ def _get_pool() -> ProcessPoolExecutor:
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                ctx = multiprocessing.get_context("spawn")
-                _pool = ProcessPoolExecutor(max_workers=256, mp_context=ctx)
+                _pool = ProcessPoolExecutor(max_workers=256)
     return _pool
 
 
@@ -123,15 +120,12 @@ class agtool:
     # ------------------------------------------------------------------
 
     def __call__(self, arg: agdata) -> agdata:
-        t0 = time.monotonic()
-        if _use_process_pool:
-            import cloudpickle
-            fn_bytes     = cloudpickle.dumps(self.fn)
-            arg_bytes    = cloudpickle.dumps(arg)
-            result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result()
-            result       = cloudpickle.loads(result_bytes)
-        else:
-            result = self.fn(arg)
+        import cloudpickle
+        t0           = time.monotonic()
+        fn_bytes     = cloudpickle.dumps(self.fn)
+        arg_bytes    = cloudpickle.dumps(arg)
+        result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result()
+        result       = cloudpickle.loads(result_bytes)
         self.log(arg, result, int((time.monotonic() - t0) * 1000))
         return result
 

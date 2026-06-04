@@ -1,13 +1,9 @@
 """Tests for the agtool class."""
 import os
-import sys
-import json
 import pytest
 from unittest.mock import MagicMock
 from agency.agdata import agdata
 from agency.agtool import agtool
-import agency.agtool   # ensure module in sys.modules
-_agtool_module = sys.modules["agency.agtool"]
 
 
 def _echo(arg: agdata) -> agdata:
@@ -98,27 +94,11 @@ def test_cloudpickle_round_trip():
 
 
 # ---------------------------------------------------------------------------
-# _use_process_pool bypass (conftest sets this to False for all tests)
+# Process pool — fn always runs in a separate worker process
 # ---------------------------------------------------------------------------
 
-def test_bypass_calls_fn_directly(monkeypatch):
-    """When _use_process_pool is False, __call__ invokes fn in the same process."""
-    monkeypatch.setattr(_agtool_module, "_use_process_pool", False)
-    seen_pids = []
-
-    def fn(arg: agdata) -> agdata:
-        seen_pids.append(os.getpid())
-        return agdata(ok=True)
-
-    t = agtool(name="pid_check", description="", fn=fn)
-    t(agdata())
-    assert seen_pids == [os.getpid()]
-
-
-def test_process_pool_runs_in_different_pid(monkeypatch):
-    """When _use_process_pool is True, fn runs in a worker process (different PID)."""
-    monkeypatch.setattr(_agtool_module, "_use_process_pool", True)
-
+def test_process_pool_runs_in_different_pid():
+    """__call__ always offloads fn to a worker process (different PID)."""
     def fn(arg: agdata) -> agdata:
         return agdata(worker_pid=os.getpid())
 

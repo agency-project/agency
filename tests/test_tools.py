@@ -53,7 +53,9 @@ class TestEditLogic:
 class TestWebfetch:
     def setup_method(self):
         from agency.tools.webfetch import webfetch
-        self.tool = webfetch
+        # Call .fn() directly: tests fetch/convert logic in-process with mocked
+        # httpx. The process-pool mechanism is covered by test_agtool.py.
+        self.fn = webfetch.fn
 
     def _mock_response(self, text: str, content_type: str = "text/html"):
         mock_resp = MagicMock()
@@ -66,17 +68,17 @@ class TestWebfetch:
     def test_html_to_markdown(self):
         html = "<html><body><h1>Hello</h1><p>World</p></body></html>"
         with patch("httpx.get", return_value=self._mock_response(html)):
-            result = self.tool(agdata(url="https://example.com"))
+            result = self.fn(agdata(url="https://example.com"))
         assert "Hello" in result.output
         assert getattr(result, "error", None) is None
 
     def test_plain_text(self):
         with patch("httpx.get", return_value=self._mock_response("plain text", "text/plain")):
-            result = self.tool(agdata(url="https://example.com", format="text"))
+            result = self.fn(agdata(url="https://example.com", format="text"))
         assert "plain text" in result.output
 
     def test_invalid_url(self):
-        result = self.tool(agdata(url="ftp://bad"))
+        result = self.fn(agdata(url="ftp://bad"))
         assert result.error is not None
 
     def test_http_error(self):
@@ -85,7 +87,7 @@ class TestWebfetch:
         mock_resp.status_code = 404
         exc = _httpx.HTTPStatusError("404", request=MagicMock(), response=mock_resp)
         with patch("httpx.get", side_effect=exc):
-            result = self.tool(agdata(url="https://example.com/missing"))
+            result = self.fn(agdata(url="https://example.com/missing"))
         assert result.error is not None
 
 

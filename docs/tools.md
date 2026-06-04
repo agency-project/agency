@@ -104,17 +104,18 @@ class MySkill(agskill):
 
 ### Testing tools with mocked I/O
 
-Set `agency.agtool._use_process_pool = False` (done automatically by the test `conftest.py`) to call tool functions directly in the test process. This lets `patch("httpx.get", ...)` and similar mock patches work normally:
+Tool functions run in a worker subprocess, so `unittest.mock.patch` applied in the test process is invisible to the worker. To test tool logic with mocked I/O, call the underlying function directly:
 
 ```python
-import sys
-import agency.agtool
-_mod = sys.modules["agency.agtool"]
+from agency.tools.webfetch import webfetch
 
-@pytest.fixture(autouse=True)
-def bypass_pool(monkeypatch):
-    monkeypatch.setattr(_mod, "_use_process_pool", False)
+def test_html_to_markdown():
+    with patch("httpx.get", return_value=mock_response):
+        result = webfetch.fn(agdata(url="https://example.com"))  # .fn(), not webfetch()
+    assert "Hello" in result.output
 ```
+
+This tests the fetch/convert logic in-process. The process-pool dispatch mechanism is tested separately via `test_agtool.py::test_process_pool_runs_in_different_pid`.
 
 ## Defining a custom tool
 
