@@ -8,6 +8,14 @@ from agency.agtool import agtool
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
 
+
+def _noop(arg: agdata) -> agdata:
+    return agdata()
+
+
+def _noop_r1(arg: agdata) -> agdata:
+    return agdata(r=1)
+
 # ---------------------------------------------------------------------------
 # Streaming mock helpers
 # agskill uses stream=True; the mock must return a list of chunk objects.
@@ -187,7 +195,7 @@ def test_max_steps_exceeded():
 
 def test_tools_none_inherits_agent_tools():
     """When agskill.tools is None, agent_tools are used."""
-    agent_tool = agtool(name="at", description="agent tool", fn=lambda a: agdata(r=1))
+    agent_tool = agtool(name="at", description="agent tool", fn=_noop_r1)
     s = agskill(name="s", system_prompt="", tools=None)
     captured = {}
     def capture(**kwargs):
@@ -202,7 +210,7 @@ def test_tools_none_inherits_agent_tools():
 
 def test_tools_empty_list_overrides_agent_tools():
     """When agskill.tools=[], no tools are passed even if agent has tools."""
-    agent_tool = agtool(name="at", description="", fn=lambda a: agdata())
+    agent_tool = agtool(name="at", description="", fn=_noop)
     s = agskill(name="s", system_prompt="", tools=[])
     captured = {}
     def capture(**kwargs):

@@ -82,23 +82,30 @@ Every `agtool.__call__` runs the tool function in a **separate worker process** 
 
 **Why a separate process?** Python's GIL serialises bytecode execution across threads, so a CPU-bound tool running in the same process would block every other agent thread for its duration. A subprocess gets its own GIL — tools can burn CPU freely without affecting LLM streaming or other agents.
 
-The `cloudpickle` library serialises tool functions for cross-process transport, which handles bound methods and closures that Python's built-in pickle cannot.
+`cloudpickle` serialises the tool function for cross-process transport, so lambdas and closures work at runtime. Nevertheless, **prefer module-level functions or bound methods** in your own code — they are debuggable, importable, and can be pickled by standard `pickle` if needed.
 
-The pool uses the `"spawn"` start method, avoiding `fork`-in-multithreaded-process deadlocks on Linux.
+The pool uses the default `"fork"` start method on Linux for low-overhead worker creation.
 
-### Making your tool picklable
+### Making your tool function serialisable
 
-Define the tool function as a top-level function or a method on a picklable class:
+Tool functions are sent to a worker process via `cloudpickle`, so lambdas, closures, and locally-defined functions all work. Despite that flexibility, the **recommended pattern** is a module-level function or a bound method on a picklable class — it is easier to test, import, and reason about:
 
 ```python
+# Recommended: bound method on the skill class
 class MySkill(agskill):
     def __init__(self):
         tool = agtool(name="compute", description="...", fn=self._compute, params={...})
         super().__init__(name="my_skill", system_prompt="...", tools=[tool])
 
-    def _compute(self, arg: agdata) -> agdata:   # bound method — picklable
+    def _compute(self, arg: agdata) -> agdata:
         return agdata(result=heavy_computation(arg.value))
+
+# Also fine: module-level function
+def _my_compute(arg: agdata) -> agdata:
+    return agdata(result=heavy_computation(arg.value))
 ```
+
+> **Warning:** Even though `cloudpickle` handles lambdas and closures, avoid using them for tool functions that capture large objects (e.g. model weights, database connections) — those objects will be serialised and sent to each worker process on every call.
 
 `agtool.__getstate__` excludes the logger references (`_term`, `_aglog`) from serialisation — they hold threading locks and file handles that cannot safely cross process boundaries. They are restored to `None` in the worker and re-attached via `attach_logger` when needed.
 
@@ -123,10 +130,13 @@ This tests the fetch/convert logic in-process. The process-pool dispatch mechani
 from agency.agtool import agtool
 from agency.agdata import agdata
 
+def _add(arg: agdata) -> agdata:
+    return agdata(result=arg.a + arg.b)
+
 my_tool = agtool(
     name="add",
     description="Add two integers and return their sum.",
-    fn=lambda arg: agdata(result=arg.a + arg.b),
+    fn=_add,
     params={
         "type": "object",
         "properties": {

@@ -28,11 +28,12 @@ def _get_pool() -> ProcessPoolExecutor:
 
 
 def _process_worker(fn_bytes: bytes, arg_bytes: bytes) -> bytes:
-    """Worker entry-point: unpickle a cloudpickle-serialised tool fn and call it."""
+    """Worker entry-point: unpickle the tool fn and call it."""
     import cloudpickle
-    fn:    Callable[[agdata], agdata] = cloudpickle.loads(fn_bytes)
-    arg:   agdata                     = cloudpickle.loads(arg_bytes)
-    return cloudpickle.dumps(fn(arg))
+    import pickle
+    fn:  Callable[[agdata], agdata] = cloudpickle.loads(fn_bytes)
+    arg: agdata                     = pickle.loads(arg_bytes)
+    return pickle.dumps(fn(arg))
 
 
 class agtool:
@@ -121,11 +122,12 @@ class agtool:
 
     def __call__(self, arg: agdata) -> agdata:
         import cloudpickle
+        import pickle
         t0           = time.monotonic()
         fn_bytes     = cloudpickle.dumps(self.fn)
-        arg_bytes    = cloudpickle.dumps(arg)
+        arg_bytes    = pickle.dumps(arg)
         result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result()
-        result       = cloudpickle.loads(result_bytes)
+        result       = pickle.loads(result_bytes)
         self.log(arg, result, int((time.monotonic() - t0) * 1000))
         return result
 

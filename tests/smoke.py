@@ -1,33 +1,59 @@
 """Smoke check: end-to-end agent + agskill + tools with mocked LLM."""
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agent import agent
+from agency.agtool import agtool
 
 LLM_CONFIG = {"api_key": "dummy", "model": "gpt-4o"}
 
 
-def _direct(content: str):
-    msg = MagicMock()
-    msg.content = content
-    msg.tool_calls = None
-    resp = MagicMock()
-    resp.choices = [MagicMock(message=msg)]
-    return resp
+# ---------------------------------------------------------------------------
+# Streaming mock helpers (agskill uses stream=True)
+# ---------------------------------------------------------------------------
+
+class _Delta:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content; self.tool_calls = tool_calls
+        self.model_extra = {}; self.reasoning_content = None
+
+class _Choice:
+    def __init__(self, delta): self.delta = delta
+
+class _Usage:
+    prompt_tokens = 5
+
+class _Chunk:
+    def __init__(self, content=None, tool_calls=None, usage=None):
+        self.usage = usage
+        self.choices = [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+
+class _TCDelta:
+    def __init__(self, name, args_json, call_id):
+        self.id = call_id; self.index = 0
+        self.function = type("F", (), {"name": name, "arguments": args_json})()
 
 
-def _tool_call(name: str, args: dict, call_id: str = "c1"):
-    tc = MagicMock()
-    tc.id = call_id
-    tc.function.name = name
-    tc.function.arguments = json.dumps(args)
-    msg = MagicMock()
-    msg.content = None
-    msg.tool_calls = [tc]
-    resp = MagicMock()
-    resp.choices = [MagicMock(message=msg)]
-    return resp
+def _direct(content: str) -> list:
+    return [_Chunk(content=content), _Chunk(usage=_Usage())]
+
+
+def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
+    tc = _TCDelta(name, json.dumps(args), call_id)
+    return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
+
+
+# ---------------------------------------------------------------------------
+# Module-level tool functions (must be picklable — no lambdas, no closures)
+# ---------------------------------------------------------------------------
+
+def _skill_tool_fn(arg: agdata) -> agdata:
+    return agdata(r=1)
+
+
+def _agent_tool_fn(arg: agdata) -> agdata:
+    return agdata()
 
 
 def smoke_write_read_cycle():
@@ -77,13 +103,8 @@ def smoke_history_shared_across_skills():
 
 def smoke_skill_own_tools():
     """A skill with its own tools list ignores agent-level tools."""
-    from agency.agtool import agtool
-
-    agent_tool_called = []
-    skill_tool_called = []
-
-    agent_t = agtool(name="agent_tool", description="", fn=lambda a: (agent_tool_called.append(1) or agdata()))
-    skill_t = agtool(name="skill_tool", description="", fn=lambda a: (skill_tool_called.append(1) or agdata(r=1)))
+    skill_t = agtool(name="skill_tool", description="", fn=_skill_tool_fn)
+    agent_t = agtool(name="agent_tool", description="", fn=_agent_tool_fn)
 
     skill = agskill(name="s", system_prompt="", tools=[skill_t])
     ag = agent(llm_config=LLM_CONFIG, agskills=[skill], tools=[agent_t])
@@ -93,8 +114,10 @@ def smoke_skill_own_tools():
         MockClient.return_value.chat.completions.create.side_effect = responses
         ag.run("s", agdata())
 
-    assert skill_tool_called
-    assert not agent_tool_called
+    # Verify via history: skill_tool ran (tool message present), agent_tool did not
+    tool_msgs = [m for m in ag.history.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert json.loads(tool_msgs[0]["content"]) == {"r": 1}
     return True
 
 

@@ -38,6 +38,10 @@ class _TCFnDelta:
     def __init__(self, name, args): self.name = name; self.arguments = args
 
 
+def _noop(arg: agdata) -> agdata:
+    return agdata()
+
+
 def _direct(content: str) -> list:
     return [_Chunk(content=content), _Chunk(usage=_Usage())]
 
@@ -163,7 +167,7 @@ def test_history_passed_to_agskill():
 # ---------------------------------------------------------------------------
 
 def test_agent_tools_passed_to_agskill():
-    t = agtool(name="t1", description="", fn=lambda a: agdata())
+    t = agtool(name="t1", description="", fn=_noop)
     ag = make_agent(agskills=[agskill("s", "")], tools=[t])
 
     received = {}

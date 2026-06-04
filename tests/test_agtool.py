@@ -10,6 +10,14 @@ def _echo(arg: agdata) -> agdata:
     return agdata(echoed=arg.to_dict())
 
 
+def _identity(arg: agdata) -> agdata:
+    return arg
+
+
+def _get_pid(arg: agdata) -> agdata:
+    return agdata(worker_pid=os.getpid())
+
+
 def make_tool() -> agtool:
     return agtool(
         name="echo",
@@ -54,7 +62,7 @@ def test_repr():
 
 
 def test_default_params():
-    t = agtool(name="noop", description="", fn=lambda a: a)
+    t = agtool(name="noop", description="", fn=_identity)
     assert t.to_openai_tool()["function"]["parameters"]["type"] == "object"
 
 
@@ -84,11 +92,11 @@ def test_setstate_restores_none_loggers():
     assert t2.name   == "echo"
 
 
-def test_cloudpickle_round_trip():
-    """Tool and its fn survive a cloudpickle serialisation cycle."""
-    import cloudpickle
+def test_pickle_round_trip():
+    """Tool and its fn survive a pickle serialisation cycle."""
+    import pickle
     t = make_tool()
-    restored = cloudpickle.loads(cloudpickle.dumps(t))
+    restored = pickle.loads(pickle.dumps(t))
     result = restored.fn(agdata(message="ping"))
     assert result.echoed == {"message": "ping"}
 
@@ -99,9 +107,6 @@ def test_cloudpickle_round_trip():
 
 def test_process_pool_runs_in_different_pid():
     """__call__ always offloads fn to a worker process (different PID)."""
-    def fn(arg: agdata) -> agdata:
-        return agdata(worker_pid=os.getpid())
-
-    t = agtool(name="pid_check", description="", fn=fn)
+    t = agtool(name="pid_check", description="", fn=_get_pid)
     result = t(agdata())
     assert result.worker_pid != os.getpid()
