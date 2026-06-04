@@ -249,7 +249,7 @@ def compact(
         api_key=llm_config.get("api_key", ""),
         base_url=llm_config.get("base_url"),
     )
-    resp = client.chat.completions.create(
+    compact_kwargs: dict = dict(
         model=llm_config.get("model", "gpt-4o"),
         messages=[
             {"role": "system", "content": _SUMMARY_SYSTEM},
@@ -257,6 +257,9 @@ def compact(
         ],
         max_tokens=1024,
     )
+    if "extra_body" in llm_config:
+        compact_kwargs["extra_body"] = llm_config["extra_body"]
+    resp = client.chat.completions.create(**compact_kwargs)
     summary = (resp.choices[0].message.content or "").strip()
 
     injection: list[dict] = [

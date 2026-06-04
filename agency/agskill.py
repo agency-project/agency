@@ -165,6 +165,8 @@ class agskill:
                 messages=[{k: v for k, v in m.items() if not k.startswith("_")}
                           for m in messages],
             )
+            if "extra_body" in llm_config:
+                kwargs["extra_body"] = llm_config["extra_body"]
             if openai_tools:
                 kwargs["tools"] = openai_tools
 
