@@ -17,10 +17,11 @@ class AgError(RuntimeError):
 class agdata:
     """Generic data container with JSON/dict serialization.
 
-    An agdata may be in a *pending* state when created by agent.submit().
-    In that case it wraps a Future[agdata] internally.  Any field access or
-    serialization call automatically blocks until the future resolves and
-    populates _data.  Use agdata.is_pending() to check without blocking.
+    An agdata may be in a *pending* state when created by agent.run() or
+    agteam.run().  In that case it wraps a Future[agdata] internally.  Any
+    field access or serialization call automatically blocks until the future
+    resolves and populates _data.  Use agdata.is_pending() to check without
+    blocking.
     """
 
     def __init__(self, _future: "Future[agdata] | None" = None, **data):
@@ -44,6 +45,36 @@ class agdata:
         """Return True if this agdata is still waiting for a future result."""
         f = object.__getattribute__(self, "_future")
         return f is not None and not f.done()
+
+    def wait(self) -> "agdata":
+        """Block until this agdata is resolved and return self.
+
+        Use as a barrier on a single result::
+
+            result = team.run()
+            # ... do other work ...
+            result.wait()   # block here until the team finishes
+            print(result.report_path)   # guaranteed resolved
+        """
+        self._resolve()
+        return self
+
+    @staticmethod
+    def wait_all(pending: "list[agdata]") -> "list[agdata]":
+        """Block until every agdata in *pending* is resolved.
+
+        Use as a barrier over a fan-out::
+
+            teams   = [MyTeam(topic=t) for t in topics]
+            results = [t.run() for t in teams]
+            # ... do other work ...
+            agdata.wait_all(results)    # barrier — wait for all teams
+            for r in results:
+                print(r.report_path)   # all resolved, no further blocking
+        """
+        for p in pending:
+            p._resolve()
+        return pending
 
     def is_error(self) -> bool:
         """Return True if this agdata holds a skill error (without raising)."""

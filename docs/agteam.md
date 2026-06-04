@@ -22,30 +22,25 @@ Subclass `agteam` and override two methods:
 | Method | Purpose |
 |---|---|
 | `setup()` | Create tools, skills, and agents. Called once at construction. |
-| `run()` | Implement the workflow. Called by the user. |
+| `run()` | Implement the workflow. Always non-blocking — returns a pending `agdata`. |
 
 Configuration specific to the team (topic, file paths, limits, …) is passed as keyword arguments to `__init__` and becomes a plain instance attribute.
 
 ```python
-from agency import agteam, agent, agskill, agdata
+from agency import agteam, agent, agskill, agdata, agsync
 from agency.agtool import agtool
 
 class PaperCrawlerTeam(agteam):
     llm_config = LLM_CONFIG          # class-level default; overridable per instance
 
     def setup(self) -> None:
-        # Tools
         self.search_arxiv = agtool(name="search_arxiv", ...)
-
-        # Skills
         self.find_papers   = agskill(name="find_papers",   ..., tools=[self.search_arxiv])
         self.summarise     = agskill(name="summarise_paper", ..., tools=[])
         self.compile       = agskill(name="compile_report", ...)
 
-        # Agent — registered automatically via make_agent()
-        self.main_agent = self.make_agent(
-            [self.find_papers, self.summarise, self.compile]
-        )
+        # llm_config injected automatically from the team
+        self.main_agent = agent(agskills=[self.find_papers, self.summarise, self.compile])
 
     def run(self) -> agdata:
         papers = self.main_agent.run("find_papers", agdata(topic=self.topic)).papers
@@ -79,30 +74,64 @@ team = PaperCrawlerTeam(
 )
 ```
 
-## make_agent()
+## run() — always non-blocking
+
+`run()` starts the workflow in a background thread and returns a pending `agdata` immediately. Field access on the returned value blocks until the team finishes:
 
 ```python
-self.agent = self.make_agent(agskills, tools=None, **kwargs)
+result = PaperCrawlerTeam(topic="KV cache").run()  # returns immediately
+print(result.report_path)                           # blocks here
 ```
 
-A thin wrapper around `agent(llm_config=self.llm_config, agskills=..., tools=..., **kwargs)` that also registers the new agent in `self.agents`. Keyword arguments are forwarded to `agent.__init__` unchanged.
-
-`self.agents` is a list of all agents created by `make_agent()` for this team instance.
-
-## Scaling
-
-Because each team instance owns its own agents and sandbox containers, you can instantiate as many teams as you need and run them concurrently:
+If the workflow produces no meaningful return value (e.g. it only writes files), you can ignore the return value and use `agsync` as the only synchronisation point:
 
 ```python
-topics = ["KV cache", "flash attention", "speculative decoding"]
-teams  = [PaperCrawlerTeam(topic=t) for t in topics]
-
-from concurrent.futures import ThreadPoolExecutor
-with ThreadPoolExecutor() as ex:
-    results = list(ex.map(lambda t: t.run(), teams))
+team = BuildTeam(output_path="/workspace/out")
+team.run()       # fire and forget
+agsync(team)     # wait for completion
 ```
 
-Each team gets its own agents (with distinct names), its own sandbox containers, and its own log files. There is no shared mutable state between instances.
+## Parallel fan-out
+
+Since `run()` is non-blocking, parallel execution is just a list comprehension:
+
+```python
+from agency import agsync
+
+topics  = ["KV cache", "flash attention", "speculative decoding"]
+teams   = [PaperCrawlerTeam(topic=t) for t in topics]
+pending = [t.run() for t in teams]   # all three start immediately
+
+agsync(teams)                        # wait for all to finish
+for topic, result in zip(topics, pending):
+    print(f"{topic}: {result.report_path}")
+```
+
+## Error handling
+
+If `run()` raises, the exception is captured and re-raised when any field on the pending `agdata` is first accessed, or when `agsync` is called on the team:
+
+```python
+try:
+    agsync(team)
+except Exception as e:
+    print(f"team failed: {e}")
+```
+
+## Backpressure
+
+All `run()` calls share a single `ThreadPoolExecutor` (`agteam._pool`). The pool queues work automatically if the number of in-flight teams exceeds the thread count, so you can safely start hundreds of teams without spawning hundreds of threads.
+
+## Auto agent tracking
+
+Any `agent(...)` call made inside `setup()` or `run()` is automatically registered with the team. The `llm_config` argument is optional — it defaults to `self.llm_config` from the active team:
+
+```python
+def setup(self) -> None:
+    self.main_agent = agent(agskills=[...])   # llm_config injected automatically
+```
+
+`self.agents` returns a snapshot list of all agents currently registered with this team instance. Completed anonymous agents (fork agents with no other live reference) are GC'd automatically — only agents held via `self.*` or still in-flight are visible.
 
 ## llm_config class attribute
 
@@ -140,14 +169,10 @@ Creates the team. Sets all `config` kwargs as instance attributes, then calls `s
 
 Override to define tools, skills, and agents. Default implementation does nothing.
 
-### `agteam.run()`
+### `agteam.run() → agdata`
 
-Override with the team's workflow. Raises `NotImplementedError` if not overridden.
-
-### `agteam.make_agent(agskills, tools=None, **kwargs) → agent`
-
-Create and register an agent. `llm_config` defaults to `self.llm_config`.
+Override with the team's workflow. Always non-blocking — runs in a background thread and returns a pending `agdata` immediately. Raises `NotImplementedError` if not overridden on the base class.
 
 ### `agteam.agents → list[agent]`
 
-All agents created via `make_agent()` for this instance.
+Snapshot of all agents currently registered with this team instance (auto-tracked from `setup()` and `run()`).

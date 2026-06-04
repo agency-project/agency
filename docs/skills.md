@@ -156,8 +156,8 @@ class PaperCrawlerTeam(agteam):
         self.find_papers     = FindPapersSkill(max_papers=10)
         self.summarise_paper = SummarisePaperSkill()
         self.compile_report  = CompileReportSkill()
-        self.agent           = self.make_agent(
-            [self.find_papers, self.summarise_paper, self.compile_report]
+        self.agent           = agent(
+            agskills=[self.find_papers, self.summarise_paper, self.compile_report]
         )
 ```
 

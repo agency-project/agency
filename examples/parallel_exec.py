@@ -47,7 +47,7 @@ class SequentialChainTeam(agteam):
 
     def setup(self) -> None:
         self.writer = WriterSkill()
-        self.agent = self.make_agent([self.writer])
+        self.agent = agent(agskills=[self.writer])
 
     def run(self) -> None:
         print("=" * 60)
@@ -82,7 +82,7 @@ class ForkFanoutTeam(agteam):
 
     def setup(self) -> None:
         self.summariser = SummariserSkill()
-        self.parent = self.make_agent([self.summariser])
+        self.parent = agent(agskills=[self.summariser])
 
     def run(self) -> None:
         print("=" * 60)

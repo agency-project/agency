@@ -60,6 +60,8 @@ from rich.markup import escape as _escape
 class _CopyStatic(Static):
     """Static widget that copies plain text to clipboard on right-click."""
 
+    ALLOW_SELECT = False  # prevents Textual's selection code from asserting on parent type
+
     def __init__(self, markup: str, plain: str, **kwargs) -> None:
         super().__init__(markup, **kwargs)
         self._plain = plain

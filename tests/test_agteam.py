@@ -2,7 +2,7 @@
 import pytest
 from agency.agteam import agteam
 from agency.agskill import agskill
-from agency.agdata import agdata, AgError
+from agency.agdata import agdata
 
 
 # ---------------------------------------------------------------------------
@@ -14,7 +14,8 @@ class _EchoTeam(agteam):
 
     def setup(self):
         self.skill = agskill(name="echo", system_prompt="Echo.")
-        self.agent = self.make_agent([self.skill])
+        from agency.agent import agent
+        self.agent = agent(agskills=[self.skill])
 
     def run(self):
         return agdata(done=True)
@@ -55,7 +56,6 @@ def test_init_multiple_kwargs_all_become_attributes():
 def test_init_llm_config_instance_override_does_not_affect_class(llm_cfg):
     team = _EchoTeam(llm_config=llm_cfg)
     assert team.llm_config is llm_cfg
-    # Class attribute unchanged for all other instances
     assert _EchoTeam.llm_config == {"api_key": "k", "model": "m"}
     other = _EchoTeam()
     assert other.llm_config == {"api_key": "k", "model": "m"}
@@ -67,7 +67,6 @@ def test_init_llm_config_none_falls_back_to_class_attr():
 
 
 def test_init_calls_setup_before_returning():
-    # setup() creates self.agent; if it wasn't called the attribute wouldn't exist
     team = _EchoTeam()
     assert hasattr(team, "agent")
     assert hasattr(team, "skill")
@@ -91,32 +90,33 @@ def test_setup_runs_before_run():
         def setup(self): calls.append("setup")
         def run(self): calls.append("run")
 
+    from agency.agsync import agsync
     t = _OrderTeam()
     t.run()
+    agsync(t)
     assert calls == ["setup", "run"]
 
 
 def test_base_agteam_setup_is_noop():
-    # Base agteam.setup() does nothing — must not raise
     t = agteam.__new__(agteam)
-    t._agents = []
+    t._agents = __import__("weakref").WeakSet()
     t.llm_config = {}
-    t.setup()   # should not raise
+    t.setup()
 
 
 # ---------------------------------------------------------------------------
-# make_agent
+# Auto-tracked agents
 # ---------------------------------------------------------------------------
 
-def test_make_agent_returns_agent_instance():
+def test_agent_created_in_setup_is_registered():
     from agency.agent import agent
     team = _EchoTeam()
     assert isinstance(team.agent, agent)
-
-
-def test_make_agent_registers_in_agents_list():
-    team = _EchoTeam()
     assert team.agent in team.agents
+
+
+def test_agent_created_in_setup_registered_count():
+    team = _EchoTeam()
     assert len(team.agents) == 1
 
 
@@ -125,95 +125,188 @@ def test_make_agent_registers_in_agents_list():
     {"api_key": "b", "model": "m2", "base_url": "https://x.com"},
     {"api_key": "c", "model": "m3", "temperature": 0.5},
 ])
-def test_make_agent_uses_team_llm_config(llm_cfg):
+def test_agent_inherits_team_llm_config(llm_cfg):
+    from agency.agent import agent
+
     class _T(agteam):
         def setup(self):
-            self.agent = self.make_agent([agskill(name="s", system_prompt="")])
+            self.ag = agent(agskills=[agskill(name="s", system_prompt="")])
         def run(self): pass
 
     team = _T(llm_config=llm_cfg)
-    assert team.agent.llm_config == llm_cfg
+    assert team.ag.llm_config == llm_cfg
 
 
-def test_make_agent_multiple_agents_all_registered():
+def test_multiple_agents_in_setup_all_registered():
+    from agency.agent import agent
+
     class _MultiTeam(agteam):
         def setup(self):
             s = agskill(name="s", system_prompt="")
-            self.a1 = self.make_agent([s])
-            self.a2 = self.make_agent([s])
-            self.a3 = self.make_agent([s])
+            self.a1 = agent(agskills=[s])
+            self.a2 = agent(agskills=[s])
+            self.a3 = agent(agskills=[s])
         def run(self): pass
 
-    team = _MultiTeam()
+    team = _MultiTeam(llm_config={"api_key": "k", "model": "m"})
     assert len(team.agents) == 3
     assert team.a1 in team.agents
     assert team.a2 in team.agents
     assert team.a3 in team.agents
-    # All distinct objects
     assert team.a1 is not team.a2
     assert team.a2 is not team.a3
 
 
-def test_make_agent_agname_kwarg_forwarded():
+def test_agent_agname_kwarg_accepted():
+    from agency.agent import agent
+
     class _T(agteam):
         def setup(self):
-            self.agent = self.make_agent(
-                [agskill(name="s", system_prompt="")],
+            self.ag = agent(
+                agskills=[agskill(name="s", system_prompt="")],
                 agname="my-custom-agent",
             )
         def run(self): pass
 
     team = _T(llm_config={"api_key": "k", "model": "m"})
-    assert team.agent.agname == "my-custom-agent"
+    assert team.ag.agname == "my-custom-agent"
 
 
 def test_agents_property_returns_copy_not_live_list():
     team = _EchoTeam()
     snapshot = team.agents
     snapshot.clear()
-    assert len(team.agents) == 1  # internal list unmodified
+    assert len(team.agents) == 1
 
 
-def test_agents_property_ordering_matches_make_agent_calls():
+def test_agents_property_contains_all_setup_agents():
+    from agency.agent import agent
+
     class _T(agteam):
         def setup(self):
             s = agskill(name="s", system_prompt="")
-            self.first  = self.make_agent([s])
-            self.second = self.make_agent([s])
-            self.third  = self.make_agent([s])
+            self.first  = agent(agskills=[s])
+            self.second = agent(agskills=[s])
+            self.third  = agent(agskills=[s])
         def run(self): pass
 
-    team = _T()
+    team = _T(llm_config={"api_key": "k", "model": "m"})
     agents = team.agents
-    assert agents[0] is team.first
-    assert agents[1] is team.second
-    assert agents[2] is team.third
+    assert team.first  in agents
+    assert team.second in agents
+    assert team.third  in agents
+    assert len(agents) == 3
 
 
 # ---------------------------------------------------------------------------
-# run()
+# run() — non-blocking, returns pending agdata
 # ---------------------------------------------------------------------------
 
 def test_run_not_implemented_on_base():
-    with pytest.raises(NotImplementedError) as exc_info:
+    with pytest.raises(NotImplementedError):
         agteam().run()
-    assert "run" in str(exc_info.value).lower() or "NotImplementedError" in type(exc_info.value).__name__
 
 
-@pytest.mark.parametrize("return_val", [
-    agdata(done=True),
-    agdata(result="ok", count=3),
-    agdata(papers=["p1", "p2"]),
-    None,
-    42,
-    "hello",
+def test_run_returns_pending_agdata():
+    result = _EchoTeam().run()
+    assert isinstance(result, agdata)
+
+
+def test_run_is_nonblocking():
+    import time
+
+    class _SlowTeam(agteam):
+        def setup(self): pass
+        def run(self):
+            time.sleep(0.2)
+            return agdata(done=True)
+
+    t0 = time.perf_counter()
+    result = _SlowTeam().run()
+    assert time.perf_counter() - t0 < 0.1
+    assert result.done is True  # blocks here
+
+
+@pytest.mark.parametrize("return_val,field,expected", [
+    (agdata(done=True),      "done",   True),
+    (agdata(result="ok"),    "result", "ok"),
+    (agdata(count=3),        "count",  3),
+    (agdata(papers=["p1"]),  "papers", ["p1"]),
+    (agdata(flag=False),     "flag",   False),
 ])
-def test_run_can_return_any_value(return_val):
+def test_run_result_fields_resolve(return_val, field, expected):
     class _T(agteam):
         def setup(self): pass
         def run(self): return return_val
 
-    assert _T().run() == return_val
+    assert getattr(_T().run(), field) == expected
+
+
+def test_run_wraps_non_agdata_return_in_result_field():
+    class _T(agteam):
+        def setup(self): pass
+        def run(self): return 99
+
+    assert _T().run().result == 99
+
+
+def test_run_exception_raises_on_field_access():
+    class _T(agteam):
+        def setup(self): pass
+        def run(self): raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        _ = _T().run().anything
+
+
+# ---------------------------------------------------------------------------
+# Parallel fan-out — [t.run() for t in teams]
+# ---------------------------------------------------------------------------
+
+def test_parallel_run_all_results_resolve():
+    teams = [_EchoTeam() for _ in range(4)]
+    results = [t.run() for t in teams]
+    assert all(r.done is True for r in results)
+
+
+def test_parallel_run_runs_concurrently():
+    import time
+
+    class _SlowTeam(agteam):
+        def setup(self): pass
+        def run(self):
+            time.sleep(0.2)
+            return agdata(ok=True)
+
+    teams = [_SlowTeam() for _ in range(4)]
+    t0 = time.perf_counter()
+    results = [t.run() for t in teams]
+    _ = [r.ok for r in results]
+    assert time.perf_counter() - t0 < 0.6  # 4×0.2s sequential = 0.8s
+
+
+@pytest.mark.parametrize("n", [1, 2, 5, 8])
+def test_parallel_run_scales_to_n_teams(n):
+    teams = [_EchoTeam() for _ in range(n)]
+    results = [t.run() for t in teams]
+    assert all(r.done is True for r in results)
+
+
+def test_parallel_run_mixed_success_and_failure():
+    class _Good(agteam):
+        def setup(self): pass
+        def run(self): return agdata(ok=True)
+
+    class _Bad(agteam):
+        def setup(self): pass
+        def run(self): raise ValueError("fail")
+
+    teams = [_Good(), _Bad(), _Good()]
+    results = [t.run() for t in teams]
+    assert results[0].ok is True
+    with pytest.raises(ValueError, match="fail"):
+        _ = results[1].anything
+    assert results[2].ok is True
 
 
 # ---------------------------------------------------------------------------
@@ -226,14 +319,15 @@ def test_run_can_return_any_value(return_val):
     (3, "3"),
 ])
 def test_repr_contains_class_name_and_agent_count(n_agents, expect_in_repr):
+    from agency.agent import agent
+
     class _T(agteam):
         def setup(self):
             s = agskill(name="s", system_prompt="")
-            for _ in range(n_agents):
-                self.make_agent([s])
+            self._ags = [agent(agskills=[s]) for _ in range(n_agents)]
         def run(self): pass
 
-    r = repr(_T())
+    r = repr(_T(llm_config={"api_key": "k", "model": "m"}))
     assert "_T" in r
     assert expect_in_repr in r
 
@@ -269,14 +363,13 @@ def test_llm_config_overrides_are_independent_per_instance():
     teams = [_EchoTeam(llm_config=c) for c in cfgs]
     for team, cfg in zip(teams, cfgs):
         assert team.llm_config is cfg
-    # Class attr still unchanged
     assert _EchoTeam.llm_config == {"api_key": "k", "model": "m"}
 
 
 def test_many_instances_each_have_own_agent_list():
     teams = [_EchoTeam() for _ in range(6)]
     agent_ids = [id(t.agents[0]) for t in teams]
-    assert len(set(agent_ids)) == 6  # all distinct
+    assert len(set(agent_ids)) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +377,6 @@ def test_many_instances_each_have_own_agent_list():
 # ---------------------------------------------------------------------------
 
 def test_kwargs_can_shadow_non_reserved_names():
-    # Passing a kwarg with any name sets it as an attribute
     team = _EchoTeam(name="custom_name")
     assert team.name == "custom_name"
 
@@ -298,10 +390,7 @@ def test_setup_exception_propagates_from_init():
         _BrokenTeam()
 
 
-def test_run_exception_propagates_to_caller():
-    class _FailTeam(agteam):
-        def setup(self): pass
-        def run(self): raise ValueError("run failed")
-
-    with pytest.raises(ValueError, match="run failed"):
-        _FailTeam().run()
+def test_agent_created_outside_team_requires_explicit_llm_config():
+    from agency.agent import agent
+    with pytest.raises(TypeError):
+        agent(agskills=[agskill(name="s", system_prompt="")])

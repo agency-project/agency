@@ -23,7 +23,7 @@ import os
 import sys
 from pathlib import Path
 
-from agency import agent, agdata, agteam
+from agency import agent, agdata, agteam, agsync
 from agency.common_skills import FindPapersSkill, SummarisePaperSkill, CompileReportSkill
 
 
@@ -74,8 +74,8 @@ class PaperCrawlerTeam(agteam):
         self.summarise_paper = SummarisePaperSkill()
         self.compile_report  = CompileReportSkill()
 
-        self.main_agent = self.make_agent(
-            [self.find_papers, self.summarise_paper, self.compile_report]
+        self.main_agent = agent(
+            agskills=[self.find_papers, self.summarise_paper, self.compile_report]
         )
 
     def run(self) -> agdata:
@@ -142,8 +142,16 @@ if __name__ == "__main__":
         print(f"Model    : {LLM_CONFIG['model']}")
         print(f"Run dir  : {run_dir}\n")
         try:
-            team = PaperCrawlerTeam(topic=topic)
-            team.run()
+            topics = [topic] if topic != "KV cache quantization" else [
+                "KV cache quantization",
+                "flash attention",
+                "speculative decoding",
+            ]
+            teams = [PaperCrawlerTeam(topic=t) for t in topics]
+            pending = [t.run() for t in teams]  # all start immediately
+            agsync(teams)
+            for t, r in zip(topics, pending):
+                print(f"\n[{t}] report → {r.report_path}  ({r.paper_count} papers)")
         except AgError as e:
             print(f"\nERROR: {e}")
 

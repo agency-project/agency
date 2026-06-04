@@ -154,11 +154,20 @@ class agent:
 
     def __init__(
         self,
-        llm_config: "dict | agent",
+        llm_config: "dict | agent | None" = None,
         agskills: list[agskill] | None = None,
         tools: list[agtool] | None = None,
         agname: str | None = None,
     ):
+        # Inject llm_config from the enclosing agteam when not supplied.
+        if llm_config is None:
+            from ._context import _active_team as _at
+            _t = _at.get(None)
+            if _t is not None:
+                llm_config = _t.llm_config
+            else:
+                raise TypeError("agent() requires llm_config when called outside an agteam context")
+
         self.agname = _generate_agname() if agname is None else _allocate_agname(agname)
         pool = agent.agresource_pool
 
@@ -213,6 +222,12 @@ class agent:
         self._ui_state: dict = {"state": "inactive", "skill": None, "tool": None}
 
         _live_agents.add(self)
+
+        # Auto-register with the enclosing agteam if run() is on the call stack.
+        from ._context import _active_team
+        _team = _active_team.get(None)
+        if _team is not None:
+            _team._agents.add(self)
 
         if isinstance(llm_config, agent):
             self._term.log("FORKED   ", f"from {src.agname}  skills={[s.name for s in self.agskills]}")
