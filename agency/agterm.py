@@ -11,24 +11,38 @@ Output format:
     HH:MM:SS.mmm  [uuid8]  [EVENT   ]  message          (file.py:lineno)
 """
 from __future__ import annotations
+import random as _random
 import sys
 import inspect
 import threading
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# Colour palette — 8 visually distinct ANSI foreground colours for agents
+# Colour palette — ~54 visually distinct xterm-256 colours, randomised once
+# per process so consecutive agents get varied assignments.
+#
+# Strategy: sample the 6×6×6 cube at component levels {0, 2, 4, 5}
+# (values 0 / 135 / 215 / 255).  That yields 4³ = 64 candidates; after
+# removing the 4 cube-greys and the 6 near-black entries (max level ≤ 2)
+# we get 54 clearly visible, well-spread colours.
 # ---------------------------------------------------------------------------
-_AGENT_COLORS = [
-    "\033[97m",   # bright white
-    "\033[96m",   # bright cyan
-    "\033[93m",   # bright yellow
-    "\033[92m",   # bright green
-    "\033[95m",   # bright magenta
-    "\033[94m",   # bright blue
-    "\033[91m",   # bright red
-    "\033[33m",   # orange/dark yellow
-]
+def _make_color_palette() -> list[str]:
+    _LEVELS = (0, 2, 4, 5)
+    indices: list[int] = []
+    for r in _LEVELS:
+        for g in _LEVELS:
+            for b in _LEVELS:
+                if r == g == b:       # cube grey diagonal
+                    continue
+                if max(r, g, b) <= 2: # near-black (brightest component ≤ 135)
+                    continue
+                indices.append(16 + 36 * r + 6 * g + b)
+    colors = [f"\033[38;5;{idx}m" for idx in indices]
+    _random.shuffle(colors)
+    return colors
+
+
+_AGENT_COLORS: list[str] = _make_color_palette()
 
 # Fixed greyscale styles for event tags — colours are reserved for agent IDs
 _EVENT_STYLES: dict[str, str] = {

@@ -3,7 +3,6 @@ import copy
 import io
 import json
 import queue
-import random
 import subprocess
 import tarfile
 import time
@@ -35,35 +34,34 @@ from .agcompaction import fetch_context_limit, _prune_tool_outputs
 from .tools import make_sandboxed_tools
 
 _NOUNS = [
-    "base", "bear", "bird", "lord", "bull", "cane", "cake", "clam",
-    "colt", "crab", "crow", "zinc", "deer", "dove", "duck", "fawn",
-    "fish", "rice", "frog", "pole", "gull", "hare", "hawk", "hind",
-    "ibex", "tony", "kite", "lamb", "lark", "lion", "lynx", "mare",
-    "mink", "lego", "moth", "mule", "tree", "bond", "onix", "pika",
-    "pony", "puma", "ruff", "seal", "slug", "coin", "swan", "toad",
-    "boss", "wasp", "wolf", "boat", "spam",
-    "cape", "cave", "clay", "cove", "crag", "dale", "dune", "fern",
-    "flat", "malt", "gale", "glen", "gust", "hail", "haze", "hill",
-    "blue", "fate", "lake", "lava", "leaf", "tail", "real", "mesa",
-    "mist", "moon", "mert", "many", "book", "peat", "pine", "pool",
-    "rain", "fist", "reef", "rill", "rock", "root", "rush", "rust",
-    "sage", "salt", "sand", "song", "snow", "soil", "surf", "tarn",
-    "tide", "till", "turf", "evil", "vent", "wake", "silk", "well",
-    "wind", "wood",
-    "arch", "axle", "bale", "bark", "beam", "bell", "game", "bolt",
-    "bone", "grip", "brim", "bung", "burr", "cage", "cant", "cask",
-    "band", "chip", "pike", "coal", "coil", "cord", "core", "corn",
-    "byte", "dome", "down", "drum", "dust", "edge", "felt", "film",
-    "flaw", "meta", "flux", "foam", "font", "fork", "fuse", "gate",
-    "gear", "land", "must", "make", "hemp", "hilt", "hoop", "hull",
-    "dart", "buzz", "joey", "vast", "knob", "knot", "lash", "park",
-    "bake", "loom", "mast", "kodo", "mill", "nail", "node", "pane",
-    "pier", "pile", "soda", "plug", "bart", "reel", "rein", "mask",
-    "rope", "road", "slab", "slag", "fast", "spar", "cart", "tire",
-    "stem", "fire", "tack", "vine", "love", "pork", "weld", "wick",
-    "wire",
+    "alex", "andy", "arch", "bake", "bale", "band", "bart", "base",
+    "beam", "bear", "beef", "bell", "bill", "bird", "blue", "boat",
+    "bolt", "bond", "bone", "bonk", "book", "boss", "brim", "buzz",
+    "byte", "cage", "cake", "cane", "cant", "cape", "cart", "cask",
+    "cave", "chip", "clam", "clay", "coal", "coil", "coin", "colt",
+    "cord", "core", "corn", "cove", "crab", "crag", "crow", "dale",
+    "dart", "deer", "dome", "dove", "down", "drum", "duck", "dune",
+    "dust", "east", "edge", "evil", "fang", "fast", "fate", "fawn",
+    "felt", "fern", "film", "fire", "fish", "fist", "flat", "flaw",
+    "flux", "foam", "font", "fork", "frog", "fuse", "gale", "game",
+    "gate", "gear", "glen", "greg", "grip", "gust", "hail", "hare",
+    "hawk", "haze", "hemp", "hill", "hind", "hole", "hoop", "hull",
+    "ibex", "ivan", "jake", "jane", "joey", "juke", "kite", "kodo",
+    "ksen", "lake", "land", "lard", "lash", "lava", "leaf", "lego",
+    "lily", "lion", "lord", "love", "lynx", "made", "many", "mark",
+    "mean", "mert", "mess", "meta", "mick", "mill", "mink", "moba",
+    "moon", "moth", "mule", "must", "nail", "nate", "next", "node",
+    "onix", "pain", "park", "peat", "pier", "pike", "pile", "pine",
+    "plug", "pony", "pool", "pork", "puma", "rain", "rate", "real",
+    "reef", "rest", "rice", "road", "rock", "roll", "rope", "rust",
+    "sage", "salt", "sand", "seal", "shot", "silk", "slag", "snow",
+    "soda", "soil", "sold", "song", "spam", "star", "surf", "swan",
+    "tack", "tail", "tide", "tire", "toad", "tony", "tool", "tree",
+    "tuna", "turf", "vast", "vent", "vine", "wake", "ward", "wasp",
+    "well", "wick", "wind", "wire", "wolf", "wood", "yang", "zinc",
 ]
 
+_noun_index:      int           = 0
 _noun_counters:   dict[str, int] = {}
 _allocated_agnames: set[str]    = set()
 _agname_lock      = __import__("threading").Lock()
@@ -81,12 +79,14 @@ def _allocate_agname(name: str) -> str:
 def _generate_agname() -> str:
     """Return a unique agname in the form <noun>_<3-digit number>.
 
-    The number increments independently per noun, so bear_000 and wolf_000
-    can coexist and bear_001 is the second agent that received 'bear'.
-    Registration goes through _allocate_agname — the single allocation guard.
+    Nouns are assigned in order from _NOUNS, cycling back to the start after
+    the last entry. The suffix increments independently per noun, so arch_000
+    and arch_001 are the first and second agents that received 'arch'.
     """
+    global _noun_index
     with _agname_lock:
-        noun = random.choice(_NOUNS)
+        noun = _NOUNS[_noun_index % len(_NOUNS)]
+        _noun_index += 1
         n = _noun_counters.get(noun, 0)
         _noun_counters[noun] = n + 1
         name = f"{noun}_{n:03d}"
@@ -144,7 +144,7 @@ class agent:
         agent.max_outer_iters = 144   # safety cap (~12 hours at 5-minute intervals)
     """
 
-    _pool: ClassVar[ThreadPoolExecutor] = ThreadPoolExecutor()
+    _pool: ClassVar[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=256)
     log_dir:          ClassVar[Path | None]          = None
     output_dir:       ClassVar[Path | None]          = None
     agresource_pool:  ClassVar[agResourcePool]       = agResourcePool()

@@ -6,6 +6,7 @@ dependencies = [
     "openai",
     "httpx",
     "html2text",
+    "cloudpickle",
     "podman>=5.8.0",
     "textual>=8.2.7",
 ]

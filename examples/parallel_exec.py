@@ -112,7 +112,7 @@ class ForkFanoutTeam(agteam):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from agency import AgError, agUI
+    from agency import AgError, agUI, agsync
 
     run_dir = _make_run_dir("parallel_exec")
     agent.log_dir    = run_dir / "logs"
@@ -124,6 +124,7 @@ if __name__ == "__main__":
         print(f"Run dir  : {run_dir}\n")
         try:
             SequentialChainTeam().run()
+            agsync(SequentialChainTeam())
             ForkFanoutTeam().run()
         except AgError as e:
             print(f"\nERROR: {e}")

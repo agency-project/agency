@@ -40,7 +40,7 @@ LLM_CONFIG = {
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
     "model":    os.environ.get("VLLM_MODEL",   "moonshotai/Kimi-K2.6"),
 }
-MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "16"))
+MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "6"))
 
 
 # ---------------------------------------------------------------------------

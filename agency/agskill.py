@@ -1,8 +1,59 @@
 from __future__ import annotations
 import json
+import queue
 import re
-from typing import TYPE_CHECKING, Callable
+import threading
+import time
+from typing import TYPE_CHECKING, Callable, Generator, Iterable, TypeVar
 import openai
+
+_T = TypeVar("_T")
+_BATCH_INTERVAL_S: float = 0.1   # main thread drains stream every 100 ms
+
+
+def _iter_batched(iterable: Iterable[_T]) -> Generator[list[_T], None, None]:
+    """Drain *iterable* in a background thread; yield batches to the caller.
+
+    The background thread does minimal Python per item (one queue.put).
+    The calling thread sleeps for _BATCH_INTERVAL_S between drains, releasing
+    the GIL for that entire interval so other threads run unimpeded.
+    GIL acquisitions drop from O(items) to O(items / avg_batch_size).
+    """
+    _SENTINEL = object()
+    q: queue.SimpleQueue = queue.SimpleQueue()
+
+    def _drain() -> None:
+        try:
+            for item in iterable:
+                q.put(item)
+        finally:
+            q.put(_SENTINEL)
+
+    threading.Thread(target=_drain, daemon=True).start()
+
+    while True:
+        # Block until the first item of the next batch arrives (GIL released).
+        item = q.get()
+        if item is _SENTINEL:
+            return
+
+        # Sleep for one interval — background thread accumulates more items
+        # while this thread holds no Python state (GIL fully released).
+        time.sleep(_BATCH_INTERVAL_S)
+
+        # Drain everything buffered during the sleep in one burst.
+        batch: list[_T] = [item]
+        while True:
+            try:
+                item = q.get_nowait()
+                if item is _SENTINEL:
+                    yield batch
+                    return
+                batch.append(item)
+            except queue.Empty:
+                break
+
+        yield batch
 
 _THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 
@@ -210,55 +261,56 @@ class agskill:
                 r"<think(?:ing)?>(.*?)(?:</think(?:ing)?>|$)", re.DOTALL | re.IGNORECASE
             )
 
-            for chunk in client.chat.completions.create(**kwargs):
-                if chunk.usage is not None:
-                    prompt_tokens = chunk.usage.prompt_tokens
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
+            for batch in _iter_batched(client.chat.completions.create(**kwargs)):
+                for chunk in batch:
+                    if chunk.usage is not None:
+                        prompt_tokens = chunk.usage.prompt_tokens
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
 
-                # Reasoning tokens — field name varies by model/backend:
-                # "reasoning_content" (DeepSeek-R1 / some vLLM builds)
-                # "reasoning"         (Kimi-K2 and others via model_extra)
-                extra = getattr(delta, "model_extra", None) or {}
-                rc = getattr(delta, "reasoning_content", None)
-                if not isinstance(rc, str):
-                    rc = extra.get("reasoning_content")
-                if not isinstance(rc, str):
-                    rc = extra.get("reasoning")
-                if isinstance(rc, str) and rc:
-                    reasoning_parts.append(rc)
-                    partial_msg["_thinking"] = "".join(reasoning_parts)
+                    # Reasoning tokens — field name varies by model/backend:
+                    # "reasoning_content" (DeepSeek-R1 / some vLLM builds)
+                    # "reasoning"         (Kimi-K2 and others via model_extra)
+                    extra = getattr(delta, "model_extra", None) or {}
+                    rc = getattr(delta, "reasoning_content", None)
+                    if not isinstance(rc, str):
+                        rc = extra.get("reasoning_content")
+                    if not isinstance(rc, str):
+                        rc = extra.get("reasoning")
+                    if isinstance(rc, str) and rc:
+                        reasoning_parts.append(rc)
+                        partial_msg["_thinking"] = "".join(reasoning_parts)
 
-                if delta.content:
-                    content_parts.append(delta.content)
-                    raw = "".join(content_parts)
-                    # For <think>-tag models: expose thinking live even before closing tag
-                    m = _PARTIAL_THINK_RE.search(raw)
-                    if m:
-                        partial_msg["_thinking"] = m.group(1).strip()
-                        partial_msg["content"] = _THINKING_RE.sub("", raw).strip()
-                    else:
-                        partial_msg["content"] = raw
+                    if delta.content:
+                        content_parts.append(delta.content)
+                        raw = "".join(content_parts)
+                        # For <think>-tag models: expose thinking live even before closing tag
+                        m = _PARTIAL_THINK_RE.search(raw)
+                        if m:
+                            partial_msg["_thinking"] = m.group(1).strip()
+                            partial_msg["content"] = _THINKING_RE.sub("", raw).strip()
+                        else:
+                            partial_msg["content"] = raw
 
-                # Throttle UI redraws: push every ~100 new combined chars
-                new_chars = len(partial_msg.get("content", "")) + len(partial_msg.get("_thinking", ""))
-                if _live_messages_fn and new_chars - _live_chars >= 100:
-                    _live_messages_fn(messages[1:])
-                    _live_chars = new_chars
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        slot = tool_calls_raw.setdefault(tc_delta.index, {
-                            "id": "", "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        })
-                        if tc_delta.id:
-                            slot["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                slot["function"]["name"] += tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                slot["function"]["arguments"] += tc_delta.function.arguments
+                    # Throttle UI redraws: push every ~100 new combined chars
+                    new_chars = len(partial_msg.get("content", "")) + len(partial_msg.get("_thinking", ""))
+                    if _live_messages_fn and new_chars - _live_chars >= 100:
+                        _live_messages_fn(messages[1:])
+                        _live_chars = new_chars
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            slot = tool_calls_raw.setdefault(tc_delta.index, {
+                                "id": "", "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            })
+                            if tc_delta.id:
+                                slot["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    slot["function"]["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    slot["function"]["arguments"] += tc_delta.function.arguments
 
             messages.pop()  # remove partial placeholder
 

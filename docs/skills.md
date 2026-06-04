@@ -35,14 +35,25 @@ Each call to `agskill.run()` executes a standard ReAct loop:
 
 1. Build messages: `[system] + history + [user: input.to_json()]`
 2. Drain user inbox (injected mid-conversation messages from `agUI` or `agent._inbox`)
-3. Call the LLM
+3. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below)
 4. Check token usage — compact context if over threshold (see [compaction.md](compaction.md))
-5. If response contains tool calls → execute each tool, append results, go to 2
+5. If response contains tool calls → execute each tool (offloaded to a worker process), append results, go to 2
 6. If response is a final answer → parse JSON, validate against `output_schema`
 7. If validation fails and retries remain → inject correction message, go to 2
 8. Return `(result, updated_history, history_delta)`
 
 The loop exits early on `max_steps` (default `10`) exceeded.
+
+### Streaming and GIL pressure
+
+The LLM call uses `stream=True`. Without batching, each SSE token chunk would acquire and release the Python GIL once, creating O(tokens) context switches that slow down all concurrent agent threads.
+
+`_iter_batched()` reduces this to O(tokens / batch_size):
+- A background thread drains the SSE stream, doing one `queue.put` per chunk (minimal GIL hold)
+- The main thread sleeps for `_BATCH_INTERVAL_S` (100 ms default) — GIL fully released
+- On wake, the main thread drains everything buffered during the sleep in one burst
+
+This means threads running other agents get 100 ms of uncontested GIL time for every batch of streamed tokens, dramatically improving throughput under concurrent load.
 
 ## Input validation
 
@@ -108,7 +119,7 @@ skill = SummariserSkill()
 
 ### `FindPapersSkill`
 
-Searches arxiv for papers on a topic using a bundled `search_arxiv` tool. Includes an output validator that rejects empty paper lists and forces a retry.
+Searches arxiv for papers on a topic using a bundled `search_papers` tool. Includes an output validator that rejects empty paper lists and forces a retry.
 
 ```python
 from agency.common_skills import FindPapersSkill
@@ -117,7 +128,7 @@ skill = FindPapersSkill(max_papers=8)   # default 16
 # output: agdata(papers="list", count="int")
 ```
 
-The bundled tool is also accessible as `skill.search_arxiv` if you need to reuse it elsewhere.
+The bundled tool is also accessible as `skill.search_papers` if you need to reuse it elsewhere.
 
 ### `SummarisePaperSkill`
 

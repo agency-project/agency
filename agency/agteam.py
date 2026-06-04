@@ -58,7 +58,10 @@ class agteam:
     llm_config: dict = {}
 
     # Shared pool across all agteam instances.
-    _pool: ThreadPoolExecutor = ThreadPoolExecutor()
+    _pool: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=256)
+
+    # Global weak registry of all live agteam instances.
+    _live_teams: "weakref.WeakSet[agteam]" = weakref.WeakSet()
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
@@ -73,6 +76,7 @@ class agteam:
             setattr(self, k, v)
         self._agents: weakref.WeakSet = weakref.WeakSet()
         self._run_future: Future | None = None
+        agteam._live_teams.add(self)
         token = _active_team.set(self)
         try:
             self.setup()
@@ -98,6 +102,11 @@ class agteam:
     def agents(self) -> list["_Agent"]:
         """All agents tracked by this team (setup + dynamic run-time forks)."""
         return list(self._agents)
+
+    @classmethod
+    def all(cls) -> "list[agteam]":
+        """Return all currently live agteam instances in this process."""
+        return list(cls._live_teams)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(agents={len(self._agents)})"

@@ -38,17 +38,40 @@ import sys
 import threading
 from typing import TYPE_CHECKING, Any
 
-# Map agterm ANSI codes → Rich color names for the agent list panel
-_ANSI_TO_RICH: dict[str, str] = {
-    "\033[97m": "bright_white",
-    "\033[96m": "bright_cyan",
-    "\033[93m": "bright_yellow",
-    "\033[92m": "bright_green",
-    "\033[95m": "bright_magenta",
-    "\033[94m": "bright_blue",
-    "\033[91m": "bright_red",
-    "\033[33m": "yellow",
-}
+def _xterm256_hex(n: int) -> str:
+    """Convert an xterm-256 colour index to a Rich-compatible hex string."""
+    if n < 16:
+        _ANSI16 = [
+            "#000000", "#aa0000", "#00aa00", "#aa8800",
+            "#0000aa", "#aa00aa", "#00aaaa", "#aaaaaa",
+            "#555555", "#ff5555", "#55ff55", "#ffff55",
+            "#5555ff", "#ff55ff", "#55ffff", "#e0e0e0",
+        ]
+        return _ANSI16[n]
+    if n < 232:
+        idx = n - 16
+        def _c(lvl: int) -> int: return 0 if lvl == 0 else 55 + 40 * lvl
+        return f"#{_c(idx // 36):02x}{_c((idx // 6) % 6):02x}{_c(idx % 6):02x}"
+    v = 8 + (n - 232) * 10
+    return f"#{v:02x}{v:02x}{v:02x}"
+
+
+def _ansi_to_rich_color(ansi: str) -> str:
+    """Map an agterm ANSI escape code to a Rich hex colour string."""
+    import re as _re
+    m = _re.match(r"\033\[38;5;(\d+)m", ansi)
+    if m:
+        return _xterm256_hex(int(m.group(1)))
+    # Standard 8/16-colour SGR codes
+    _SGR = {
+        "\033[30m": "#000000", "\033[31m": "#aa0000", "\033[32m": "#00aa00",
+        "\033[33m": "#aa8800", "\033[34m": "#0000aa", "\033[35m": "#aa00aa",
+        "\033[36m": "#00aaaa", "\033[37m": "#aaaaaa",
+        "\033[90m": "#555555", "\033[91m": "#ff5555", "\033[92m": "#55ff55",
+        "\033[93m": "#ffff55", "\033[94m": "#5555ff", "\033[95m": "#ff55ff",
+        "\033[96m": "#55ffff", "\033[97m": "#e0e0e0",
+    }
+    return _SGR.get(ansi, "#ffffff")
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -143,6 +166,9 @@ class _AgencyApp(App):
         text-style: bold underline;
         margin-bottom: 1;
     }
+    #agent-list-scroll {
+        height: 1fr;
+    }
     """
 
     BINDINGS = [
@@ -171,7 +197,8 @@ class _AgencyApp(App):
                     yield Input(placeholder="type reply, then Enter…", id="agent-input")
             with Vertical(id="right"):
                 yield Static("Agent List", id="right-title")
-                yield Static("", id="agent-list")
+                with ScrollableContainer(id="agent-list-scroll"):
+                    yield Static("", id="agent-list")
 
     def on_mount(self) -> None:
         self.query_one("#shared-log", RichLog).border_title = "Shared Log"
@@ -329,20 +356,40 @@ class _AgencyApp(App):
     def _refresh_agent_list(self) -> None:
         try:
             from .agent import agent as Agent
+            from .agteam import agteam as Agteam
             from .agterm import agterm
             live = Agent.all()
+            teams = Agteam.all()
         except Exception:
             return
 
         live_map = {a.agname: a for a in live}
 
-        # Sync _agents to only live agents, preserving order
+        # Build agent → team mapping (an agent may appear in at most one team)
+        agent_team: dict[str, Agteam] = {}
+        for team in teams:
+            for a in team.agents:
+                agent_team[a.agname] = team
+
+        # Ordered flat agent list: team agents first (by team), then standalone
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for team in teams:
+            for a in team.agents:
+                if a.agname not in seen:
+                    ordered.append(a.agname)
+                    seen.add(a.agname)
+        for a in live:
+            if a.agname not in seen:
+                ordered.append(a.agname)
+                seen.add(a.agname)
+
+        # Sync _agents (used for Tab cycling), preserving order
         current = self._current_agent()
         self._agents = [n for n in self._agents if n in live_map]
-        for a in live:
-            if a.agname not in self._agents:
-                self._agents.append(a.agname)
-        # Re-anchor the index to the same agent, or clamp it
+        for name in ordered:
+            if name not in self._agents:
+                self._agents.append(name)
         if current and current in self._agents:
             self._agent_idx = self._agents.index(current)
         elif self._agents:
@@ -351,54 +398,55 @@ class _AgencyApp(App):
             self._agent_idx = 0
         self._refresh_interaction_title()
 
-        lines: list[str] = []
-
-        for name in self._agents:
+        def _agent_lines(name: str, indent: str) -> str:
+            """Render one agent as Rich markup with the given indent prefix."""
             a = live_map.get(name)
-            # Resolve agent's color from agterm registry
-            ansi = agterm._agname_colors.get(name, "")
-            color = _ANSI_TO_RICH.get(ansi, "white")
-
             if a is None:
-                continue
-
-            st = getattr(a, "_ui_state", {"state": "inactive"})
-            state  = st.get("state", "inactive")
-            skill  = st.get("skill")
-            tool   = st.get("tool")
+                return ""
+            ansi  = agterm._agname_colors.get(name, "")
+            color = _ansi_to_rich_color(ansi)
+            st    = getattr(a, "_ui_state", {"state": "inactive"})
+            state = st.get("state", "inactive")
+            skill = st.get("skill")
+            tool  = st.get("tool")
+            si    = indent + "  "   # status indent = agent indent + 2 more spaces
 
             if state == "inactive":
-                lines.append(f"[dim]○ {name}\n  idle[/]")
-
+                return (f"[dim]{indent}○ [/][{color}]{name}[/]\n"
+                        f"[dim]{si}idle[/]")
             elif state == "llm":
-                lines.append(
-                    f"[bold {color}]● {name}[/]\n"
-                    f"  [dim]{skill}[/]: [cyan]Waiting LLM[/]"
-                )
-
+                return (f"[bold {color}]{indent}● {name}[/]\n"
+                        f"{si}[dim]{skill}[/]: [cyan]LLM Wait[/]")
             elif state == "tool":
-                lines.append(
-                    f"[bold {color}]● {name}[/]\n"
-                    f"  [dim]{skill}[/]: [yellow]{tool}[/]"
-                )
-
+                return (f"[bold {color}]{indent}● {name}[/]\n"
+                        f"{si}[dim]{skill}[/]: [yellow]{tool}[/]")
             elif state == "proc_wait":
-                lines.append(
-                    f"[bold {color}]● {name}[/]\n"
-                    f"  [dim]{skill}[/]: [dim]Waiting shell[/]"
-                )
-
+                return (f"[bold {color}]{indent}● {name}[/]\n"
+                        f"{si}[dim]{skill}[/]: [dim]Shell Wait[/]")
             elif state == "human":
-                lines.append(
-                    f"[bold {color}]● {name}[/] [bold yellow]?[/]\n"
-                    f"  [dim]{skill}[/]: [yellow]Waiting human[/]"
-                )
+                return (f"[bold {color}]{indent}● {name}[/] [bold yellow]?[/]\n"
+                        f"{si}[dim]{skill}[/]: [yellow]Input Pending[/]")
+            else:
+                return (f"[bold {color}]{indent}● {name}[/]\n"
+                        f"{si}[dim]{skill}[/] - running")
 
-            else:  # "skill" — generic running
-                lines.append(
-                    f"[bold {color}]● {name}[/]\n"
-                    f"  [dim]{skill}[/] - running"
-                )
+        lines: list[str] = []
+        emitted_teams: set[int] = set()
+
+        for name in ordered:
+            team = agent_team.get(name)
+            if team is not None:
+                tid = id(team)
+                if tid not in emitted_teams:
+                    emitted_teams.add(tid)
+                    if lines:
+                        lines.append("")
+                    lines.append(f"[bold]{type(team).__name__}[/]")
+                rendered = _agent_lines(name, "  ")
+            else:
+                rendered = _agent_lines(name, "")
+            if rendered:
+                lines.append(rendered)
 
         self.query_one("#agent-list", Static).update("\n".join(lines))
 

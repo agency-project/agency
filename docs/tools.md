@@ -76,6 +76,46 @@ def my_log(tool, arg, result, elapsed_ms):
 my_tool = agtool(name="my_tool", description="...", fn=my_fn, log_fn=my_log)
 ```
 
+## Process offloading
+
+Every `agtool.__call__` runs the tool function in a **separate worker process** via a shared `ProcessPoolExecutor(max_workers=256)`. Workers are created lazily on demand and scale up to 256 concurrent calls.
+
+**Why a separate process?** Python's GIL serialises bytecode execution across threads, so a CPU-bound tool running in the same process would block every other agent thread for its duration. A subprocess gets its own GIL — tools can burn CPU freely without affecting LLM streaming or other agents.
+
+The `cloudpickle` library serialises tool functions for cross-process transport, which handles bound methods and closures that Python's built-in pickle cannot.
+
+The pool uses the `"spawn"` start method, avoiding `fork`-in-multithreaded-process deadlocks on Linux.
+
+### Making your tool picklable
+
+Define the tool function as a top-level function or a method on a picklable class:
+
+```python
+class MySkill(agskill):
+    def __init__(self):
+        tool = agtool(name="compute", description="...", fn=self._compute, params={...})
+        super().__init__(name="my_skill", system_prompt="...", tools=[tool])
+
+    def _compute(self, arg: agdata) -> agdata:   # bound method — picklable
+        return agdata(result=heavy_computation(arg.value))
+```
+
+`agtool.__getstate__` excludes the logger references (`_term`, `_aglog`) from serialisation — they hold threading locks and file handles that cannot safely cross process boundaries. They are restored to `None` in the worker and re-attached via `attach_logger` when needed.
+
+### Testing tools with mocked I/O
+
+Set `agency.agtool._use_process_pool = False` (done automatically by the test `conftest.py`) to call tool functions directly in the test process. This lets `patch("httpx.get", ...)` and similar mock patches work normally:
+
+```python
+import sys
+import agency.agtool
+_mod = sys.modules["agency.agtool"]
+
+@pytest.fixture(autouse=True)
+def bypass_pool(monkeypatch):
+    monkeypatch.setattr(_mod, "_use_process_pool", False)
+```
+
 ## Defining a custom tool
 
 ```python
