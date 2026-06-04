@@ -191,6 +191,9 @@ class agent:
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{self.agname}.jsonl"
         self.log  = aglog(path=log_path)
+        self._full_history: list[dict] = []
+        self._full_history_path: Path = log_dir / f"{self.agname}_full.jsonl"
+        self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
         self._term = agterm(self.agname)
 
         # Wire terminal + file logging into every tool.
@@ -266,6 +269,18 @@ class agent:
     @history.setter
     def history(self, value: agdata) -> None:
         self._history = value
+
+    @property
+    def full_history(self) -> list[dict]:
+        """Append-only transcript: every message ever sent/received, including
+        thinking blocks. Never compacted or pruned."""
+        return list(self._full_history)
+
+    def _append_full_history(self, msg: dict) -> None:
+        """Append one message to the append-only full history (thread-safe write)."""
+        self._full_history.append(msg)
+        with self._full_history_path.open("a") as f:
+            f.write(json.dumps(msg) + "\n")
 
     # ------------------------------------------------------------------
     # Execution
@@ -345,6 +360,13 @@ class agent:
                     def _compact_log(**kw) -> None:
                         self.log._lifecycle("compacted", agname=self.agname, **kw)
 
+                    # Skill-start marker in full history
+                    self._append_full_history({
+                        "type": "skill_start",
+                        "skill": skill_name,
+                        "ts": ts_start,
+                    })
+
                     result, new_history, history_delta = af.run(
                         self.llm_config, current_input, current_history,
                         self.tools, max_steps, term=self._term,
@@ -354,6 +376,7 @@ class agent:
                         _inbox_fn=_drain_inbox,
                         _context_limit=self._context_limit,
                         _compact_log_fn=_compact_log,
+                        _full_history_fn=self._append_full_history,
                     )
                     outer_result  = result
                     outer_history = new_history

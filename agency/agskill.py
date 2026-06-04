@@ -110,6 +110,7 @@ class agskill:
         _inbox_fn: "Callable | None" = None,
         _context_limit: "int | None" = None,
         _compact_log_fn: "Callable | None" = None,
+        _full_history_fn: "Callable[[dict], None] | None" = None,
     ) -> tuple[agdata, agdata, list[dict]]:
         """Run the ReAct loop.
 
@@ -148,6 +149,9 @@ class agskill:
         )
         if _live_messages_fn:
             _live_messages_fn(messages[1:])
+        if _full_history_fn:
+            _full_history_fn(messages[0])          # system prompt
+            _full_history_fn(messages[-1])         # user input
 
         retries_left = self.max_retries
         _compaction_summary: str | None = None
@@ -170,10 +174,13 @@ class agskill:
                     msg = _inbox_fn()
                     if msg is None:
                         break
-                    messages.append({"role": "user", "content": msg})
+                    inbox_msg = {"role": "user", "content": msg}
+                    messages.append(inbox_msg)
                     had_inbox = True
                     if _live_messages_fn:
                         _live_messages_fn(messages[1:])
+                    if _full_history_fn:
+                        _full_history_fn(inbox_msg)
 
             if term:
                 term.log("LLM      ", f"model={llm_config.get('model','?')}  messages={len(messages)}")
@@ -304,6 +311,8 @@ class agskill:
             messages.append(msg_dict)
             if _live_messages_fn:
                 _live_messages_fn(messages[1:])
+            if _full_history_fn:
+                _full_history_fn(msg_dict)
 
             if msg_dict.get("tool_calls"):
                 for tc in msg_dict["tool_calls"]:
@@ -326,9 +335,12 @@ class agskill:
                             if _state_fn:
                                 _state_fn("skill", skill=self.name)
                             result_content = json.dumps({"error": str(e)})
-                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": result_content})
+                    tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
+                    messages.append(tool_msg)
                     if _live_messages_fn:
                         _live_messages_fn(messages[1:])
+                    if _full_history_fn:
+                        _full_history_fn(tool_msg)
 
             else:
                 # If this step consumed inbox messages, the LLM is mid-conversation
