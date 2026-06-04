@@ -25,5 +25,7 @@ build-backend = "hatchling.build"
 packages = ["agency"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "agency/common_skills"]
+python_files = ["test_*.py", "*.py"]
+python_functions = ["test_*"]
 timeout = 120

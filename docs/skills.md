@@ -80,6 +80,87 @@ skill = agskill(
 
 Setting `tools=[]` gives the skill no tools at all — pure reasoning only.
 
+## Common skills (`agency.common_skills`)
+
+`agency.common_skills` provides ready-made skill classes for common tasks. Each is a thin subclass of `agskill` with a fixed name, system prompt, and schemas. All accept `**kwargs` forwarded to `agskill.__init__` (e.g. `max_retries=1`).
+
+### `WriterSkill`
+
+Writes content to a file path inside the sandbox container. Requires the agent to have the sandbox `write` tool available (inherited via `tools=None`).
+
+```python
+from agency.common_skills import WriterSkill
+skill = WriterSkill()
+# input:  agdata(file_path="str", content="str")
+# output: agdata(path="str", status="str")
+```
+
+### `SummariserSkill`
+
+Summarises a piece of text in one sentence. Has no tools (`tools=[]`) — pure reasoning.
+
+```python
+from agency.common_skills import SummariserSkill
+skill = SummariserSkill()
+# input:  agdata(text="str")
+# output: agdata(summary="str")
+```
+
+### `FindPapersSkill`
+
+Searches arxiv for papers on a topic using a bundled `search_arxiv` tool. Includes an output validator that rejects empty paper lists and forces a retry.
+
+```python
+from agency.common_skills import FindPapersSkill
+skill = FindPapersSkill(max_papers=8)   # default 16
+# input:  agdata(topic="str")
+# output: agdata(papers="list", count="int")
+```
+
+The bundled tool is also accessible as `skill.search_arxiv` if you need to reuse it elsewhere.
+
+### `SummarisePaperSkill`
+
+Fetches the full text of an arxiv paper and writes a technical summary covering contribution, method, results, limitations, and conclusions. Uses a bundled `fetch_paper` tool that converts any arxiv URL form (`/abs/`, `/pdf/`, `/html/`) to the HTML version and extracts plain text via `html2text` (capped at 32 000 characters).
+
+```python
+from agency.common_skills import SummarisePaperSkill
+skill = SummarisePaperSkill()
+# input:  agdata(title="str", url="str", abstract="str")
+# output: agdata(summary="str")
+```
+
+The system prompt requires the agent to call `fetch_paper` before responding — it will not summarise from the abstract alone.
+
+### `CompileReportSkill`
+
+Writes a structured markdown research report to a path inside the sandbox. Requires the agent to have the sandbox `write` tool available.
+
+```python
+from agency.common_skills import CompileReportSkill
+skill = CompileReportSkill()
+# input:  agdata(topic="str", summaries="list", output_path="str")
+# output: agdata(report_path="str", paper_count="int")
+```
+
+### Using common skills in an `agteam`
+
+```python
+from agency import agteam, agdata
+from agency.common_skills import FindPapersSkill, SummarisePaperSkill, CompileReportSkill
+
+class PaperCrawlerTeam(agteam):
+    llm_config = LLM_CONFIG
+
+    def setup(self):
+        self.find_papers     = FindPapersSkill(max_papers=10)
+        self.summarise_paper = SummarisePaperSkill()
+        self.compile_report  = CompileReportSkill()
+        self.agent           = self.make_agent(
+            [self.find_papers, self.summarise_paper, self.compile_report]
+        )
+```
+
 ## Example with output validator
 
 ```python
