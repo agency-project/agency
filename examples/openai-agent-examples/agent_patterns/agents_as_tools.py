@@ -26,8 +26,8 @@ def _make_translator_tool(language: str, instructions: str) -> agtool:
     )
 
     def _fn(arg: agdata) -> agdata:
-        sub_ag = agent(llm_config=LLM_CONFIG, agskills=[translate_skill])
-        result = sub_ag.run("translate", agdata(text=str(arg.text)))
+        sub_ag = agent(llm_config=LLM_CONFIG)
+        result = sub_ag.run(translate_skill, agdata(text=str(arg.text)))
         return agdata(translation=result.translation)
 
     return agtool(
@@ -66,14 +66,14 @@ synthesizer_skill = agskill(
     tools=[],
 )
 
-ag = agent(llm_config=LLM_CONFIG, agskills=[orchestrator_skill, synthesizer_skill])
+ag = agent(llm_config=LLM_CONFIG)
 
 if __name__ == "__main__":
     msg = input("What would you like translated, and to which languages? ") or \
           "Translate 'Hello, world!' to French and Spanish."
 
-    orchestrated = ag.run("orchestrate", agdata(message=msg))
+    orchestrated = ag.run(orchestrator_skill, agdata(message=msg))
     print(f"Translations: {orchestrated.result}")
 
-    final = ag.run("synthesize", agdata(translations=orchestrated.result))
+    final = ag.run(synthesizer_skill, agdata(translations=orchestrated.result))
     print(f"\nFinal response:\n{final.final_response}")

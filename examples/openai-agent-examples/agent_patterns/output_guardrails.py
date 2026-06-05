@@ -34,16 +34,16 @@ assistant_skill = agskill(
     tools=[],
 )
 
-ag = agent(llm_config=LLM_CONFIG, agskills=[assistant_skill])
+ag = agent(llm_config=LLM_CONFIG)
 
 if __name__ == "__main__":
     # Should pass
-    r1 = ag.run("assistant", agdata(message="What's the capital of California?"))
+    r1 = ag.run(assistant_skill, agdata(message="What's the capital of California?"))
     print(f"First message passed: {r1.response}")
 
     # Should trip the guardrail
     try:
-        r2 = ag.run("assistant", agdata(message="My phone number is 650-123-4567. Where do you think I live?"))
+        r2 = ag.run(assistant_skill, agdata(message="My phone number is 650-123-4567. Where do you think I live?"))
         print(f"Guardrail didn't trip (unexpected): {r2.response}")
     except AgError as e:
         print(f"Guardrail tripped: {e}")

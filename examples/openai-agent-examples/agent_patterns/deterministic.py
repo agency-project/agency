@@ -42,17 +42,17 @@ story_skill = agskill(
     tools=[],
 )
 
-ag = agent(llm_config=LLM_CONFIG, agskills=[outline_skill, checker_skill, story_skill])
+ag = agent(llm_config=LLM_CONFIG)
 
 if __name__ == "__main__":
     prompt = input("What kind of story do you want? ") or "Write a short sci-fi story."
 
     # Step 1: generate outline
-    r1 = ag.run("outline", agdata(prompt=prompt))
+    r1 = ag.run(outline_skill, agdata(prompt=prompt))
     print(f"Outline: {r1.outline}\n")
 
     # Step 2: check quality and genre
-    r2 = ag.run("check", agdata(outline=r1.outline))
+    r2 = ag.run(checker_skill, agdata(outline=r1.outline))
 
     if not r2.good_quality:
         print("Outline is not good quality — stopping.")
@@ -65,5 +65,5 @@ if __name__ == "__main__":
     print("Outline passed quality check — writing story...")
 
     # Step 3: write the story
-    r3 = ag.run("story", agdata(outline=r1.outline))
+    r3 = ag.run(story_skill, agdata(outline=r1.outline))
     print(f"\nStory:\n{r3.story}")

@@ -35,7 +35,6 @@ summarise = agskill(
     system_prompt="Summarise the given text in one sentence.",
     input_schema=agdata(text="str"),
     output_schema=agdata(summary="str"),
-    tools=[],
 )
 
 ag = agent(
@@ -44,10 +43,9 @@ ag = agent(
         "api_key":  "EMPTY",
         "model":    "meta-llama/Llama-3.1-8B-Instruct",
     },
-    agskills=[summarise],
 )
 
-result = ag.run("summarise", agdata(text="The quick brown fox jumps over the lazy dog."))
+result = ag.run(summarise, agdata(text="The quick brown fox jumps over the lazy dog."))
 print(result.summary)   # blocks until done
 ```
 
@@ -59,9 +57,9 @@ print(result.summary)   # blocks until done
 
 **`agtool`** — a named callable an LLM can invoke via function calling. Every tool call is offloaded to a `ProcessPoolExecutor` worker so CPU-bound tools don't block other agents. Tools are serialised with `cloudpickle`, so bound methods work without any extra machinery.
 
-**`agent`** — holds an LLM config, a list of skills, sandboxed tools, and a conversation history. `agent.run(skill, input)` is non-blocking; the result is a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Forking via `agent(parent)` deep-copies the history and runs the new task concurrently.
+**`agent`** — holds an LLM config, sandboxed tools, and a conversation history. `agent.run(skill, input)` accepts an `agskill` object directly and is non-blocking; the result is a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Forking via `agent(parent)` deep-copies the history and runs the new task concurrently.
 
-**`agteam`** — coordinates multiple agents or tasks via a `ThreadPoolExecutor`. Subclass, define `setup()` to wire up agents and skills, override `run()` (or `plan()`) with your workflow.
+**`agteam`** — coordinates multiple agents or tasks via a `ThreadPoolExecutor`. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow.
 
 **`agUI`** — a terminal UI (Textual) that shows all live agents, their current state, streaming token output, tool calls, and a human-in-the-loop interaction pane.
 
@@ -144,7 +142,7 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [agent.md](docs/agent.md) | Agent construction, `run()`, forking, history, UI callbacks |
 | [skills.md](docs/skills.md) | ReAct loop, schemas, validation, retries, streaming batching |
 | [tools.md](docs/tools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
-| [agteam.md](docs/agteam.md) | Team coordination, `plan()` / `run()`, `agsync` |
+| [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
 | [container.md](docs/container.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |
 | [execution_loop.md](docs/execution_loop.md) | Outer monitoring loop, inner ReAct loop, inbox drain, compaction |
 | [execution_process_control.md](docs/execution_process_control.md) | Trace: background job, foreground job, daemon |

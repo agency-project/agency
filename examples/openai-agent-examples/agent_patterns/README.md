@@ -12,7 +12,7 @@ Ports of the `agent_patterns/` examples from openai-agents-python.
 
 ```
 agent.as_tool(tool_name=..., tool_description=...)
-→ agtool(fn=lambda arg: agent(...).run("translate", agdata(...)).translation)
+→ agtool(fn=lambda arg: agent(...).run(translate_skill, agdata(...)).translation)
 ```
 
 **Run:**
@@ -30,7 +30,7 @@ python examples/openai-agent-examples/agent_patterns/agents_as_tools.py
 
 ```
 triage_agent.handoffs=[french_agent, spanish_agent, english_agent]
-→ triage_skill returns {language: "french"} → ag.run("french", ...)
+→ triage_skill returns {language: "french"} → ag.run(french_skill, ...)
 ```
 
 **Gap:** In the original, the handoff happens *inside* a single `Runner.run()` call — the triage agent can hand off mid-turn without returning to the caller. In our port, the caller drives the dispatch explicitly between two `ag.run()` calls.
@@ -51,15 +51,15 @@ python examples/openai-agent-examples/agent_patterns/routing.py
 **Async** — `asyncio_run()` + `asyncio.gather()`, directly equivalent to the original:
 ```python
 r1, r2, r3 = await asyncio.gather(
-    agent(parent).asyncio_run("translate", agdata(text=msg)),
-    agent(parent).asyncio_run("translate", agdata(text=msg)),
-    agent(parent).asyncio_run("translate", agdata(text=msg)),
+    agent(parent).asyncio_run(translate_skill, agdata(text=msg)),
+    agent(parent).asyncio_run(translate_skill, agdata(text=msg)),
+    agent(parent).asyncio_run(translate_skill, agdata(text=msg)),
 )
 ```
 
 **Sync** — fork fan-out without asyncio; `run()` returns pending `agdata` immediately and all three resolve concurrently in the thread pool:
 ```python
-pending = [agent(parent).run("translate", agdata(text=msg)) for _ in range(3)]
+pending = [agent(parent).run(translate_skill, agdata(text=msg)) for _ in range(3)]
 translations = [r.translation for r in pending]  # each blocks until its fork finishes
 ```
 
@@ -82,10 +82,10 @@ checker_result = await Runner.run(checker_agent, outline_result.final_output)
 if not checker_result.final_output.good_quality: exit()
 story_result = await Runner.run(story_agent, ...)
 
-→ r1 = ag.run("outline", agdata(prompt=...))
-  r2 = ag.run("check", agdata(outline=r1.outline))
+→ r1 = ag.run(outline_skill, agdata(prompt=...))
+  r2 = ag.run(check_skill, agdata(outline=r1.outline))
   if not r2.good_quality: raise SystemExit
-  r3 = ag.run("story", agdata(outline=r1.outline))
+  r3 = ag.run(story_skill, agdata(outline=r1.outline))
 ```
 
 **Run:**
@@ -116,9 +116,9 @@ python examples/openai-agent-examples/agent_patterns/llm_as_a_judge.py
 
 ```
 @input_guardrail async def math_guardrail(...) → GuardrailFunctionOutput
-→ check = ag.run("check_input", agdata(message=...))
+→ check = ag.run(check_input_skill, agdata(message=...))
   if check.is_math_homework: print("Sorry...")
-  else: ag.run("support", agdata(message=...))
+  else: ag.run(support_skill, agdata(message=...))
 ```
 
 **Gap:** In the original the guardrail runs *in parallel* with the main agent and can abort it mid-flight. In our port the check is sequential — the main skill only starts after the guardrail passes. This is slightly slower but functionally equivalent for most use cases.

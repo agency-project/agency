@@ -71,20 +71,16 @@ def main():
     )
 
     # No tools= argument — uses the default sandboxed tool list
-    ag = agent(
-        llm_config=LLM_CONFIG,
-        agskills=[file_skill, qa_skill],
-    )
+    ag = agent(llm_config=LLM_CONFIG)
 
     print(f"Endpoint : {LLM_CONFIG['base_url']}")
     print(f"Model    : {LLM_CONFIG['model']}")
-    print(f"Skills   : {[f.name for f in ag.agskills]}")
     print(f"Tools    : {[t.name for t in ag.tools]}")
     print()
 
     print(">> [file_manager] write and verify a note")
     r1 = ag.run(
-        "file_manager",
+        file_skill,
         agdata(
             task="Write 'Hello from the agent!' to the given file and verify it.",
             file_path="/workspace/note.txt",
@@ -97,7 +93,7 @@ def main():
 
     print(">> [qa] ask about the note using shared history")
     r2 = ag.run(
-        "qa",
+        qa_skill,
         agdata(question="What was written to the note file, and where is it?"),
     )
     print(f"   answer : {r2.answer!r}")

@@ -22,15 +22,18 @@ Where CPU is genuinely needed — executing a Python tool function synchronously
 
 ## agteam — team-level parallelism
 
-`agteam` is the entry point for multi-agent coordination. Its `run()` method dispatches tasks defined in `plan()` to a class-level `ThreadPoolExecutor`. Each task calls `agent.run(skill_name, input)` on whatever agent the subclass wires up.
+`agteam` is the entry point for multi-agent coordination. Its `run()` method implements the workflow and dispatches work to a class-level `ThreadPoolExecutor`. Each step calls `agent.run(skill, input)` on whatever agents the subclass wires up.
 
 ```python
 class ResearchTeam(agteam):
-    def plan(self, topic: agdata) -> list[tuple[str, agdata]]:
-        return [
-            ("find_papers",   agdata(topic=topic.query)),
-            ("summarise",     agdata(topic=topic.query)),
-        ]
+    def setup(self):
+        self.find_papers = agskill(name="find_papers", ...)
+        self.summarise   = agskill(name="summarise", ...)
+        self.agent       = agent()
+
+    def run(self) -> agdata:
+        papers = self.agent.run(self.find_papers, agdata(topic=self.topic)).papers
+        return self.agent.run(self.summarise, agdata(papers=papers))
 ```
 
 Workers are OS threads. The thread count (256) is far above `os.cpu_count()` because threads spend almost all their time waiting on I/O — a higher cap allows more concurrent LLM calls without wasting real CPU slots.
@@ -42,7 +45,7 @@ Each `agent` instance serializes its own runs: `agent.run()` submits work to the
 **Fork for parallelism.** When you need several independent runs from the same starting state, fork the agent:
 
 ```python
-results = [agent(ag).run("summarise", agdata(text=t)) for t in texts]
+results = [agent(ag).run(summarise_skill, agdata(text=t)) for t in texts]
 # All three forks run concurrently in the thread pool
 ```
 
@@ -62,7 +65,7 @@ Tool functions execute in a separate OS process via a module-level `ProcessPoolE
 
 **Transport.** Tool functions are serialised with `cloudpickle` (handles bound methods and closures) and deserialised in the worker. Arguments and results travel as pickled bytes. The round-trip cost is typically 1–5 ms for small payloads; for tools that do significant work the overhead is negligible.
 
-**Spawn context.** The pool uses `multiprocessing.get_context("spawn")` rather than the default `fork`. `fork` in a multithreaded process can deadlock if a background thread holds a lock at the time of the fork (a Python 3.12+ DeprecationWarning). `spawn` starts a clean interpreter in each worker — slightly slower to launch but safe.
+**Fork context.** The pool uses the default `fork` start method. Workers are short-lived and the fork happens before any heavy multithreading, so lock-inheritance issues are avoided in practice. `fork` avoids the ~100–300 ms interpreter-startup cost of `spawn` and allows workers to reuse already-imported modules.
 
 **Logger exclusion.** `agtool.__getstate__` strips `_term` and `_aglog` before serialisation — these hold threading locks and open file handles that cannot cross process boundaries. They are re-attached via `attach_logger` on the main-process side; workers do not log.
 
@@ -84,14 +87,14 @@ The result: at 60 tokens/s a 100 ms window buffers ~6 tokens per batch, reducing
 
 | Bottleneck | Current approach | Remaining gap |
 |---|---|---|
-| GIL during tool execution | Process offload via `ProcessPoolExecutor` | `spawn` start adds ~100–300 ms to first call; subsequent calls reuse workers |
+| GIL during tool execution | Process offload via `ProcessPoolExecutor` | First call pays fork overhead (~5–20 ms); subsequent calls reuse workers |
 | GIL during LLM streaming | `_iter_batched` with 100 ms sleep | Adds 100 ms latency to each LLM response (final token → result). Acceptable for interactive use; tunable via `_BATCH_INTERVAL_S` |
 | Process pool serialisation | `cloudpickle` bytes round-trip | ~1–5 ms overhead per tool call for small payloads |
 
 ### Scaling
 
 - **Thread pool (256 workers):** Workers are OS threads created lazily. Beyond ~256 concurrent agents, new runs queue. There is no auto-shrink — idle workers hold memory indefinitely. The cap is a constant; adjust `agent._pool` and `agteam._pool` at import time if needed.
-- **Process pool (256 workers):** Workers are OS processes created lazily on first call. Spawning a new process costs ~100–300 ms. At extreme concurrency (hundreds of simultaneous tool calls), spawn latency can visibly delay the first call; subsequent calls reuse the warm pool.
+- **Process pool (256 workers):** Workers are OS processes created lazily on first call using `fork`. Fork overhead is ~5–20 ms. At extreme concurrency (hundreds of simultaneous tool calls), new workers are created on demand; subsequent calls reuse the warm pool.
 - **Memory:** Each process worker loads the full Python interpreter and all imported modules (~30–50 MB RSS typical). 256 workers = up to ~10 GB RSS if all are active. In practice, workers are created on demand and the OS reclaims pages from idle workers.
 
 ### Resources

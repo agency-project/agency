@@ -672,12 +672,14 @@ def test_outer_loop_real_process_wall_clock():
     JOB_DURATION  = 8   # seconds the background process runs
     POLL_INTERVAL = 2   # poll every 2s — fast enough to detect promptly
 
-    ag = agent(llm_config={"api_key": "k", "model": "gpt-4o"}, agskills=[])
+    ag = agent(llm_config={"api_key": "k", "model": "gpt-4o"})
 
     agent.poll_interval_s = POLL_INTERVAL
     agent.ping_interval_s = 60   # high ceiling — job should finish well before
 
     events: list[dict] = []
+
+    skill = agskill(name="s", system_prompt="")
 
     def fake_run(llm_cfg, inp, hist, tools, ms, **_):
         event = inp._data.get("_event")
@@ -687,12 +689,10 @@ def test_outer_loop_real_process_wall_clock():
             ag.sandbox.exec(f"sleep {JOB_DURATION} &")
         return agdata(result="ok"), agdata(messages=[]), []
 
-    skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.agskills = [skill]
 
     t0 = time.monotonic()
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
     elapsed = time.monotonic() - t0
 
     event_names = [e["event"] for e in events]

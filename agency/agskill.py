@@ -182,7 +182,7 @@ class agskill:
                 sys_msg = {"role": "system", "content": self._build_system_prompt()}
                 return agdata(error=f"input schema error: {errors}"), history, [sys_msg]
 
-        active_tools: list[agtool] = self.tools if self.tools is not None else agent_tools
+        active_tools: list[agtool] = list(agent_tools or []) + list(self.tools or [])
         tool_map = {t.name: t for t in active_tools}
         openai_tools = [t.to_openai_tool() for t in active_tools] or None
 

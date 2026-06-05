@@ -6,8 +6,8 @@ Ports of the [openai/openai-agents-python](https://github.com/openai/openai-agen
 
 | OpenAI agents | Agency |
 |---|---|
-| `Agent(name, instructions, tools)` | `agent(llm_config, agskills=[agskill(name, system_prompt, tools)])` |
-| `Runner.run(agent, input)` | `ag.run(skill_name, agdata(...))` — sync, blocks on field access |
+| `Agent(name, instructions, tools)` | `agent(llm_config)` + `agskill(name, system_prompt, tools)` |
+| `Runner.run(agent, input)` | `ag.run(skill, agdata(...))` — sync, blocks on field access |
 | `@function_tool` | `agtool(name, description, fn, params)` |
 | `output_type=SomeModel` | `output_schema=agdata(...)` + `output_validator` |
 | `handoffs=[...]` | Explicit routing skill + skill dispatch by caller |
@@ -75,13 +75,13 @@ python examples/openai-agent-examples/agent_patterns/parallelization.py
 
 ```python
 # Single await
-result = await ag.asyncio_run("summarise", agdata(text=text))
+result = await ag.asyncio_run(summarise_skill, agdata(text=text))
 
 # Parallel execution — equivalent to asyncio.gather in the original
 r1, r2, r3 = await asyncio.gather(
-    agent(parent).asyncio_run("translate", agdata(text=msg)),
-    agent(parent).asyncio_run("translate", agdata(text=msg)),
-    agent(parent).asyncio_run("translate", agdata(text=msg)),
+    agent(parent).asyncio_run(translate_skill, agdata(text=msg)),
+    agent(parent).asyncio_run(translate_skill, agdata(text=msg)),
+    agent(parent).asyncio_run(translate_skill, agdata(text=msg)),
 )
 ```
 

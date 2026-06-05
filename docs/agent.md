@@ -1,6 +1,6 @@
 # Agent
 
-The `agent` class is the top-level orchestrator. It owns a sandbox container, a shared conversation history, a set of skills, and a pool of tools. Skills are submitted by name and always run asynchronously; the caller blocks only when it reads a result field.
+The `agent` class is the top-level orchestrator. It owns a sandbox container, a shared conversation history, and a pool of tools. Skills are passed directly to `run()` and always run asynchronously; the caller blocks only when it reads a result field.
 
 ## Construction
 
@@ -13,7 +13,6 @@ ag = agent(
         "api_key":  "EMPTY",
         "model":    "meta-llama/Llama-3.1-8B-Instruct",
     },
-    agskills=[skill_a, skill_b],
 )
 ```
 
@@ -29,7 +28,8 @@ llm_config = {..., "context_limit": 131072}
 ## Running a skill
 
 ```python
-result = ag.run("skill_name", agdata(question="What is 2+2?"))
+skill = agskill(name="answer", system_prompt="Answer the question.")
+result = ag.run(skill, agdata(question="What is 2+2?"))
 # non-blocking — result is a pending agdata
 print(result.answer)   # blocks here until the skill finishes
 ```
@@ -41,8 +41,8 @@ print(result.answer)   # blocks here until the skill finishes
 Calls on the **same** agent are automatically serialized: each `run()` chains on the previous history future, so history is always consistent even under concurrent callers.
 
 ```python
-r1 = ag.run("search", agdata(query="..."))
-r2 = ag.run("summarize", agdata(text=r1.text))   # waits for r1 internally
+r1 = ag.run(search_skill, agdata(query="..."))
+r2 = ag.run(summarize_skill, agdata(text=r1.text))   # waits for r1 internally
 ```
 
 ## Forking
@@ -86,13 +86,14 @@ See [container.md](container.md) for mount implementation details.
 
 ## Agent naming
 
-Each agent is assigned a unique pronounceable name (adjective + noun, e.g. `swift_hawk`) if none is provided. Pass `agname` to pin a specific name:
+Each agent is assigned a unique pronounceable name (adjective + noun, e.g. `swift_hawk`) if none is provided. Pass `agname` to use a specific base name:
 
 ```python
-ag = agent(llm_config, agskills=[...], agname="agent_smith")
+ag = agent(llm_config, agname="worker")
+# ag.agname == "worker_000"
 ```
 
-Names are globally unique for the process lifetime — a second agent with the same name gets a numeric suffix.
+The name is always postfixed with `_NNN` (a zero-padded counter) to guarantee global uniqueness for the process lifetime. The first agent with a given base name gets `_000`, the second `_001`, and so on.
 
 ## Lifecycle and cleanup
 

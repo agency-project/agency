@@ -208,9 +208,9 @@ def test_tools_none_inherits_agent_tools():
     assert captured["tools"][0]["function"]["name"] == "at"
 
 
-def test_tools_empty_list_overrides_agent_tools():
-    """When agskill.tools=[], no tools are passed even if agent has tools."""
-    agent_tool = agtool(name="at", description="", fn=_noop)
+def test_tools_empty_list_passes_agent_tools():
+    """When agskill.tools=[], agent tools are still passed (empty extension = same as None)."""
+    agent_tool = agtool(name="at", description="agent tool", fn=_noop_r1)
     s = agskill(name="s", system_prompt="", tools=[])
     captured = {}
     def capture(**kwargs):
@@ -219,7 +219,8 @@ def test_tools_empty_list_overrides_agent_tools():
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [agent_tool])
-    assert captured.get("tools") is None
+    assert captured["tools"] is not None
+    assert captured["tools"][0]["function"]["name"] == "at"
 
 
 # ---------------------------------------------------------------------------

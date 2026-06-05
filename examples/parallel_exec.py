@@ -47,7 +47,7 @@ class SequentialChainTeam(agteam):
 
     def setup(self) -> None:
         self.writer = WriterSkill()
-        self.agent = agent(agskills=[self.writer])
+        self.agent = agent()
 
     def run(self) -> None:
         print("=" * 60)
@@ -55,8 +55,8 @@ class SequentialChainTeam(agteam):
         print("=" * 60)
 
         t0 = time.perf_counter()
-        r1 = self.agent.run("writer", agdata(file_path="/workspace/out.txt", content="first write"))
-        r2 = self.agent.run("writer", agdata(file_path="/workspace/out.txt", content="second write"))
+        r1 = self.agent.run(self.writer, agdata(file_path="/workspace/out.txt", content="first write"))
+        r2 = self.agent.run(self.writer, agdata(file_path="/workspace/out.txt", content="second write"))
         elapsed = time.perf_counter() - t0
 
         print(f"  r1 status={r1.status!r}  r2 status={r2.status!r}")
@@ -82,7 +82,7 @@ class ForkFanoutTeam(agteam):
 
     def setup(self) -> None:
         self.summariser = SummariserSkill()
-        self.parent = agent(agskills=[self.summariser])
+        self.parent = agent()
 
     def run(self) -> None:
         print("=" * 60)
@@ -93,7 +93,7 @@ class ForkFanoutTeam(agteam):
 
         t0 = time.perf_counter()
         pending = [
-            agent(self.parent).run("summarise", agdata(text=t))
+            agent(self.parent).run(self.summariser, agdata(text=t))
             for t in texts
         ]
         elapsed_submit = time.perf_counter() - t0

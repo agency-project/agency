@@ -41,9 +41,9 @@ weather_skill = agskill(
     tools=[get_weather],
 )
 
-ag = agent(llm_config=LLM_CONFIG, agskills=[weather_skill])
+ag = agent(llm_config=LLM_CONFIG)
 
 if __name__ == "__main__":
-    result = ag.run("weather", agdata(question="What's the weather in Tokyo?"))
+    result = ag.run(weather_skill, agdata(question="What's the weather in Tokyo?"))
     print(result.response)
     # The weather in Tokyo is sunny with temperatures between 14-20°C.

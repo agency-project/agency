@@ -24,7 +24,7 @@ python examples/openai-agent-examples/basic/hello_world.py
 
 **Original pattern:** Agent is given a `@function_tool`-decorated Python function. The LLM calls it as a JSON function, the framework executes it, and the result is fed back.
 
-**Port:** `agtool(name, description, fn, params)` replaces `@function_tool`. The `fn` receives an `agdata` (from the LLM's JSON arguments) and returns an `agdata`. The skill's `tools=[get_weather]` override means only this tool is available — the sandboxed filesystem tools are not included.
+**Port:** `agtool(name, description, fn, params)` replaces `@function_tool`. The `fn` receives an `agdata` (from the LLM's JSON arguments) and returns an `agdata`. The skill's `tools=[get_weather]` adds the weather tool on top of any agent-level tools already available.
 
 ```
 @function_tool def get_weather(...) → Weather

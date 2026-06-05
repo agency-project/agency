@@ -15,7 +15,7 @@ class _EchoTeam(agteam):
     def setup(self):
         self.skill = agskill(name="echo", system_prompt="Echo.")
         from agency.agent import agent
-        self.agent = agent(agskills=[self.skill])
+        self.agent = agent()
 
     def run(self):
         return agdata(done=True)
@@ -130,7 +130,7 @@ def test_agent_inherits_team_llm_config(llm_cfg):
 
     class _T(agteam):
         def setup(self):
-            self.ag = agent(agskills=[agskill(name="s", system_prompt="")])
+            self.ag = agent()
         def run(self): pass
 
     team = _T(llm_config=llm_cfg)
@@ -142,10 +142,9 @@ def test_multiple_agents_in_setup_all_registered():
 
     class _MultiTeam(agteam):
         def setup(self):
-            s = agskill(name="s", system_prompt="")
-            self.a1 = agent(agskills=[s])
-            self.a2 = agent(agskills=[s])
-            self.a3 = agent(agskills=[s])
+            self.a1 = agent()
+            self.a2 = agent()
+            self.a3 = agent()
         def run(self): pass
 
     team = _MultiTeam(llm_config={"api_key": "k", "model": "m"})
@@ -162,10 +161,7 @@ def test_agent_agname_kwarg_accepted():
 
     class _T(agteam):
         def setup(self):
-            self.ag = agent(
-                agskills=[agskill(name="s", system_prompt="")],
-                agname="my-custom-agent",
-            )
+            self.ag = agent(agname="my-custom-agent")
         def run(self): pass
 
     team = _T(llm_config={"api_key": "k", "model": "m"})
@@ -184,10 +180,9 @@ def test_agents_property_contains_all_setup_agents():
 
     class _T(agteam):
         def setup(self):
-            s = agskill(name="s", system_prompt="")
-            self.first  = agent(agskills=[s])
-            self.second = agent(agskills=[s])
-            self.third  = agent(agskills=[s])
+            self.first  = agent()
+            self.second = agent()
+            self.third  = agent()
         def run(self): pass
 
     team = _T(llm_config={"api_key": "k", "model": "m"})
@@ -323,8 +318,7 @@ def test_repr_contains_class_name_and_agent_count(n_agents, expect_in_repr):
 
     class _T(agteam):
         def setup(self):
-            s = agskill(name="s", system_prompt="")
-            self._ags = [agent(agskills=[s]) for _ in range(n_agents)]
+            self._ags = [agent() for _ in range(n_agents)]
         def run(self): pass
 
     r = repr(_T(llm_config={"api_key": "k", "model": "m"}))
@@ -393,4 +387,4 @@ def test_setup_exception_propagates_from_init():
 def test_agent_created_outside_team_requires_explicit_llm_config():
     from agency.agent import agent
     with pytest.raises(TypeError):
-        agent(agskills=[agskill(name="s", system_prompt="")])
+        agent()

@@ -41,7 +41,7 @@ evaluator_skill = agskill(
     tools=[],
 )
 
-ag = agent(llm_config=LLM_CONFIG, agskills=[generator_skill, evaluator_skill])
+ag = agent(llm_config=LLM_CONFIG)
 
 if __name__ == "__main__":
     prompt = input("What kind of story would you like? ") or "A detective story in space."
@@ -49,11 +49,11 @@ if __name__ == "__main__":
     latest_outline = None
 
     for attempt in range(10):
-        gen = ag.run("generate", agdata(prompt=current_prompt))
+        gen = ag.run(generator_skill, agdata(prompt=current_prompt))
         latest_outline = gen.outline
         print(f"[attempt {attempt+1}] Outline: {latest_outline[:80]}...")
 
-        ev = ag.run("evaluate", agdata(outline=latest_outline))
+        ev = ag.run(evaluator_skill, agdata(outline=latest_outline))
         print(f"  Score: {ev.score}  Feedback: {ev.feedback[:60]}...")
 
         if str(ev.score).lower() == "pass":

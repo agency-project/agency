@@ -29,14 +29,12 @@ class agteam:
                 self.find_papers   = agskill(...)
                 self.summarise     = agskill(...)
                 self.compile       = agskill(...)
-                self.agent         = agent(agskills=[self.find_papers,
-                                                     self.summarise,
-                                                     self.compile])
+                self.agent         = agent()
 
             def run(self):
-                papers = self.agent.run("find_papers", agdata(topic=self.topic)).papers
-                summaries = [agent(self.agent).run("summarise", agdata(**p)) for p in papers]
-                return self.agent.run("compile", agdata(summaries=summaries))
+                papers = self.agent.run(self.find_papers, agdata(topic=self.topic)).papers
+                summaries = [agent(self.agent).run(self.summarise, agdata(**p)) for p in papers]
+                return self.agent.run(self.compile, agdata(summaries=summaries))
 
         result = PaperCrawlerTeam(topic="KV cache").run()  # returns immediately
         print(result.report_path)                           # blocks here

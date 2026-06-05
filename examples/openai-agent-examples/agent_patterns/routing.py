@@ -50,22 +50,25 @@ triage_skill = agskill(
     tools=[],
 )
 
-ag = agent(
-    llm_config=LLM_CONFIG,
-    agskills=[triage_skill, french_skill, spanish_skill, english_skill],
-)
+ag = agent(llm_config=LLM_CONFIG)
+
+_skill_map = {
+    "french": french_skill,
+    "spanish": spanish_skill,
+    "english": english_skill,
+}
 
 if __name__ == "__main__":
     msg = input("Hi! We speak French, Spanish and English. How can I help? ") or \
           "Hello, how do I say good evening in French?"
 
     while True:
-        route = ag.run("triage", agdata(message=msg))
+        route = ag.run(triage_skill, agdata(message=msg))
         skill_name = route.language.lower().strip()
-        if skill_name not in ("french", "spanish", "english"):
+        if skill_name not in _skill_map:
             skill_name = "english"
 
-        result = ag.run(skill_name, agdata(message=route.message))
+        result = ag.run(_skill_map[skill_name], agdata(message=route.message))
         print(result.response)
 
         msg = input("\nEnter a message (or empty to quit): ")

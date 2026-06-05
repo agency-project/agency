@@ -166,7 +166,6 @@ class agent:
     def __init__(
         self,
         llm_config: "dict | agent | None" = None,
-        agskills: list[agskill] | None = None,
         tools: list[agtool] | None = None,
         agname: str | None = None,
     ):
@@ -189,7 +188,6 @@ class agent:
             src = llm_config
             self.llm_config    = src.llm_config
             self._context_limit: int | None = src._context_limit
-            self.agskills      = list(agskills if agskills is not None else src.agskills)
             # Block until source's in-flight task finishes, then deep-copy history
             src._history._resolve()
             self._history: agdata = copy.deepcopy(src._history)
@@ -198,7 +196,6 @@ class agent:
         else:
             self.llm_config    = llm_config
             self._context_limit = fetch_context_limit(llm_config)
-            self.agskills      = list(agskills or [])
             self._history      = agdata(messages=[])
             self.sandbox       = agSandbox(self.agname, output_dir=_out)
 
@@ -241,22 +238,20 @@ class agent:
             _team._agents.add(self)
 
         if isinstance(llm_config, agent):
-            self._term.log("FORKED   ", f"from {src.agname}  skills={[s.name for s in self.agskills]}")
+            self._term.log("FORKED   ", f"from {src.agname}")
             self.log._lifecycle(
                 "forked",
                 agname=self.agname,
                 parent_agname=src.agname,
-                agskills=[s.name for s in self.agskills],
                 tools=[t.name for t in self.tools],
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
             )
         else:
             ctx = f"  context={self._context_limit}" if self._context_limit else "  context=unknown"
-            self._term.log("CREATED  ", f"skills={[s.name for s in self.agskills]}  model={self.llm_config.get('model','?')}{ctx}")
+            self._term.log("CREATED  ", f"model={self.llm_config.get('model','?')}{ctx}")
             self.log._lifecycle(
                 "created",
                 agname=self.agname,
-                agskills=[s.name for s in self.agskills],
                 tools=[t.name for t in self.tools],
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
                 context_limit=self._context_limit,
@@ -325,7 +320,7 @@ class agent:
         except Exception:
             pass
 
-    def run(self, skill_name: str, input: agdata, max_steps: int = 10) -> agdata:
+    def run(self, skill: "agskill", input: agdata, max_steps: int = 10) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
         The future resolves only after:
@@ -336,8 +331,8 @@ class agent:
         Calls on the same agent are serialized via the history chain.
         Calls on different agents (forks) run concurrently.
         """
-        if not any(f.name == skill_name for f in self.agskills):
-            raise ValueError(f"agskill not found: {skill_name!r}")
+        skill_name = skill.name
+        af         = skill
 
         prev_history = self._history
         result_future: Future[agdata] = Future()
@@ -351,8 +346,6 @@ class agent:
                 _resolve_input(input)
 
                 history_before = list(prev_history._data.get("messages", []))
-
-                af = next(f for f in self.agskills if f.name == skill_name)
 
                 self._term.log("SKILL ▶  ", f"{skill_name}  input={list(input._data.keys())}")
                 self._set_ui_state("skill", skill=skill_name)
@@ -538,7 +531,7 @@ class agent:
 
     async def asyncio_run(
         self,
-        skill_name: str,
+        skill: "agskill",
         input: "agdata",
         max_steps: int = 10,
     ) -> "agdata":
@@ -554,19 +547,19 @@ class agent:
 
             @app.post("/ask")
             async def ask(question: str):
-                result = await ag.asyncio_run("qa", agdata(question=question))
+                result = await ag.asyncio_run(qa_skill, agdata(question=question))
                 return {"answer": result.answer}
 
         Example — parallel execution with asyncio.gather::
 
             results = await asyncio.gather(*[
-                agent(parent).asyncio_run("translate", agdata(text=msg))
+                agent(parent).asyncio_run(translate_skill, agdata(text=msg))
                 for _ in range(3)
             ])
         """
         import asyncio
         loop = asyncio.get_event_loop()
-        pending = self.run(skill_name, input, max_steps)
+        pending = self.run(skill, input, max_steps)
         await loop.run_in_executor(None, pending._resolve)
         return pending
 
@@ -600,7 +593,6 @@ class agent:
         cls,
         directory: "Path | str",
         llm_config: dict,
-        agskills: "list[agskill] | None" = None,
         tools: "list[agtool] | None" = None,
     ) -> "list[agent]":
         """Restore all ``*.ckpt`` files from *directory*.
@@ -613,7 +605,6 @@ class agent:
         - **agname not live**: a new agent is restored from the checkpoint and
           added to the live registry.
 
-        ``agskills`` and ``tools`` are shared across all restored agents.
         Returns the full list (both existing and newly restored agents).
         """
         directory = Path(directory)
@@ -621,18 +612,16 @@ class agent:
         restored: list[agent] = []
 
         for ckpt in sorted(directory.glob("*.ckpt")):
-            # Peek at the agname without loading the full image
             with tarfile.open(ckpt, "r:gz") as tar:
                 state = json.loads(tar.extractfile("state.json").read())
             agname = state["agname"]
 
             if agname in live_names:
-                # Already running — skip, return existing
                 existing = live_names[agname]
                 existing._term.log("CKPT     ", f"load_all: {agname} already live, skipping {ckpt.name}")
                 restored.append(existing)
             else:
-                ag = cls.load(ckpt, llm_config=llm_config, agskills=agskills, tools=tools)
+                ag = cls.load(ckpt, llm_config=llm_config, tools=tools)
                 restored.append(ag)
 
         return restored
@@ -676,11 +665,10 @@ class agent:
 
             # 3. Build state dict
             state = {
-                "agname":      self.agname,
-                "llm_config":  {k: v for k, v in self.llm_config.items() if k != "api_key"},
-                "history":     self._history._data.get("messages", []),
-                "skill_names": [s.name for s in self.agskills],
-                "ts":          _ts(),
+                "agname":     self.agname,
+                "llm_config": {k: v for k, v in self.llm_config.items() if k != "api_key"},
+                "history":    self._history._data.get("messages", []),
+                "ts":         _ts(),
             }
             state_bytes = json.dumps(state, indent=2).encode()
 
@@ -704,7 +692,6 @@ class agent:
         cls,
         path: "Path | str",
         llm_config: dict,
-        agskills: "list[agskill] | None" = None,
         tools: "list[agtool] | None" = None,
     ) -> "agent":
         """Restore an agent from a checkpoint file created by ``agent.save()``.
@@ -715,10 +702,9 @@ class agent:
         ``ValueError`` is raised; discard the conflicting agent first or use
         ``agent.load_all()`` which handles this automatically.
 
-        The caller must re-supply ``llm_config`` (api_key is never stored) and
-        ``agskills`` (Python code is not serialised).  The restored agent has
-        the same conversation history and container filesystem as at checkpoint
-        time and can continue running skills immediately.
+        The caller must re-supply ``llm_config`` (api_key is never stored).
+        The restored agent has the same conversation history and container
+        filesystem as at checkpoint time and can continue running skills immediately.
         """
         path = Path(path)
         runtime = get_container_runtime()
@@ -741,9 +727,8 @@ class agent:
 
         # Build agent without going through normal __init__ to avoid creating a fresh container
         ag: agent = cls.__new__(cls)
-        ag.agname    = _register_agname(state["agname"])
+        ag.agname     = _register_agname(state["agname"])
         ag.llm_config = {**state.get("llm_config", {}), **llm_config}
-        ag.agskills   = list(agskills or [])
         ag._history   = agdata(messages=list(state.get("history", [])))
 
         _out = Path(agent.output_dir) / ag.agname if agent.output_dir else None
@@ -761,11 +746,10 @@ class agent:
 
         _live_agents.add(ag)
 
-        ag._term.log("LOADED   ", f"from {path}  skills={state.get('skill_names', [])}")
+        ag._term.log("LOADED   ", f"from {path}")
         ag.log._lifecycle("loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts"))
 
         return ag
 
     def __repr__(self) -> str:
-        names = [f.name for f in self.agskills]
-        return f"agent(agname={self.agname!r}, agskills={names!r})"
+        return f"agent(agname={self.agname!r})"

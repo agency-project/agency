@@ -63,7 +63,7 @@ def smoke_write_read_cycle():
         system_prompt="You manage files. Use write and read tools.",
     )
     # No tools= → uses default sandboxed tool list; files live in container
-    ag = agent(llm_config=LLM_CONFIG, agskills=[file_skill])
+    ag = agent(llm_config=LLM_CONFIG)
 
     responses = [
         _tool_call("write", {"filePath": "/workspace/greeting.txt", "content": "Hello, World!"}),
@@ -73,7 +73,7 @@ def smoke_write_read_cycle():
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result = ag.run("file_ops", agdata(task="write then read a greeting file"))
+        result = ag.run(file_skill, agdata(task="write then read a greeting file"))
 
     assert result.result == "File written and read successfully"
     # Verify the file is in the container, not on the host
@@ -87,37 +87,40 @@ def smoke_history_shared_across_skills():
     """Two different skills share and accumulate history."""
     skill_a = agskill(name="a", system_prompt="Skill A")
     skill_b = agskill(name="b", system_prompt="Skill B")
-    ag = agent(llm_config=LLM_CONFIG, agskills=[skill_a, skill_b])
+    ag = agent(llm_config=LLM_CONFIG)
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"turn": 1}')
-        ag.run("a", agdata(msg="first"))
+        ag.run(skill_a, agdata(msg="first"))
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"turn": 2}')
-        ag.run("b", agdata(msg="second"))
+        ag.run(skill_b, agdata(msg="second"))
 
     assert len(ag.history.messages) >= 4
     return True
 
 
 def smoke_skill_own_tools():
-    """A skill with its own tools list ignores agent-level tools."""
+    """A skill with its own tools list extends agent-level tools."""
     skill_t = agtool(name="skill_tool", description="", fn=_skill_tool_fn)
     agent_t = agtool(name="agent_tool", description="", fn=_agent_tool_fn)
 
     skill = agskill(name="s", system_prompt="", tools=[skill_t])
-    ag = agent(llm_config=LLM_CONFIG, agskills=[skill], tools=[agent_t])
+    ag = agent(llm_config=LLM_CONFIG, tools=[agent_t])
 
-    responses = [_tool_call("skill_tool", {}), _direct("{}")]
+    # With merging, skill has both agent_tool + skill_tool available.
+    # The LLM calls skill_tool first, then agent_tool, then finishes.
+    responses = [_tool_call("skill_tool", {}), _tool_call("agent_tool", {}), _direct("{}")]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        ag.run("s", agdata())
+        ag.run(skill, agdata())
 
-    # Verify via history: skill_tool ran (tool message present), agent_tool did not
+    # Verify via history: both skill_tool and agent_tool ran
     tool_msgs = [m for m in ag.history.messages if m.get("role") == "tool"]
-    assert len(tool_msgs) == 1
-    assert json.loads(tool_msgs[0]["content"]) == {"r": 1}
+    tool_names_in_history = [m.get("name") for m in ag.history.messages if m.get("role") == "tool"]
+    assert any(json.loads(m["content"]) == {"r": 1} for m in tool_msgs), "skill_tool result missing"
+    assert any(json.loads(m["content"]) == {} for m in tool_msgs), "agent_tool result missing"
     return True
 
 

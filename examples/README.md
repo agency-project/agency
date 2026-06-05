@@ -7,7 +7,7 @@ End-to-end examples showing how to use the agency framework.
 **What it shows:** The simplest complete agent — one agent, two skills, shared history.
 
 - `file_manager` skill writes a file to `/workspace/note.txt` inside the sandbox container using the `write` and `read` tools, then confirms the content.
-- `qa` skill answers a follow-up question using the conversation history accumulated from the first skill run, demonstrating that history is shared across all skills on the same agent.
+- `qa` skill answers a follow-up question using the conversation history accumulated from the first skill run, demonstrating that history is shared across skill runs on the same agent.
 
 ```bash
 python examples/base_example.py
@@ -34,7 +34,7 @@ python examples/parallel_exec.py
 **What it shows:** A multi-step, multi-agent research pipeline combining a custom host-side tool, parallel summarisation forks, and the shared output directory.
 
 1. **`find_papers`** — calls a custom `search_arxiv` tool (HTTP request to the arXiv API, runs on the host) and returns a list of papers.
-2. **Parallel summarisation** — one `agent(main_agent)` fork per paper; all `run("summarise_paper")` calls fire concurrently. Each fork runs in its own sandbox container.
+2. **Parallel summarisation** — one `agent(main_agent)` fork per paper; all `run(summarise_paper, ...)` calls fire concurrently. Each fork runs in its own sandbox container.
 3. **`compile_report`** — waits for all pending summaries (resolved automatically when passed as input), then uses the sandboxed `write` tool to save a markdown report to `/agent_output/<agname>/report.md`.
 
 The report appears on the host at `runs/<timestamp>_paper_crawler/agent_output/<agname>/report.md`.

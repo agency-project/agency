@@ -6,7 +6,10 @@ from agency.aglog import aglog
 from agency.agent import agent
 
 
-def make_agent(**kwargs) -> agent:
+def make_agent(tools=None) -> agent:
+    kwargs = {}
+    if tools is not None:
+        kwargs["tools"] = tools
     return agent(llm_config={"api_key": "k", "model": "m"}, **kwargs)
 
 
@@ -40,15 +43,17 @@ def test_log_empty_initially():
 
 
 def test_log_records_after_run():
-    ag = make_agent(agskills=[make_skill("search")])
-    result = ag.run("search", agdata(query="test"))
+    skill = make_skill("search")
+    ag = make_agent()
+    result = ag.run(skill, agdata(query="test"))
     _ = result.ok   # wait for completion
     assert len(ag.log) == 1
 
 
 def test_log_entry_fields():
-    ag = make_agent(agskills=[make_skill("s", out={"value": 42})])
-    result = ag.run("s", agdata(x=1))
+    skill = make_skill("s", out={"value": 42})
+    ag = make_agent()
+    result = ag.run(skill, agdata(x=1))
     _ = result.value
 
     entry = ag.log.entries[0]
@@ -62,8 +67,9 @@ def test_log_entry_fields():
 
 def test_log_timestamps_are_iso8601():
     from datetime import datetime
-    ag = make_agent(agskills=[make_skill()])
-    _ = ag.run("s", agdata()).ok
+    skill = make_skill()
+    ag = make_agent()
+    _ = ag.run(skill, agdata()).ok
 
     e = ag.log.entries[0]
     datetime.fromisoformat(e["ts_start"])   # raises if invalid
@@ -71,8 +77,9 @@ def test_log_timestamps_are_iso8601():
 
 
 def test_log_ts_end_after_ts_start():
-    ag = make_agent(agskills=[make_skill()])
-    _ = ag.run("s", agdata()).ok
+    skill = make_skill()
+    ag = make_agent()
+    _ = ag.run(skill, agdata()).ok
 
     e = ag.log.entries[0]
     assert e["ts_end"] >= e["ts_start"]
@@ -83,9 +90,11 @@ def test_log_ts_end_after_ts_start():
 # ---------------------------------------------------------------------------
 
 def test_log_accumulates_multiple_calls():
-    ag = make_agent(agskills=[make_skill("a"), make_skill("b")])
-    ag.run("a", agdata(step=1))
-    ag.run("b", agdata(step=2))
+    skill_a = make_skill("a")
+    skill_b = make_skill("b")
+    ag = make_agent()
+    ag.run(skill_a, agdata(step=1))
+    ag.run(skill_b, agdata(step=2))
     _ = ag.history   # wait for both
 
     assert len(ag.log) == 2
@@ -94,9 +103,10 @@ def test_log_accumulates_multiple_calls():
 
 
 def test_log_history_len_grows():
-    ag = make_agent(agskills=[make_skill("s")])
-    ag.run("s", agdata())
-    ag.run("s", agdata())
+    skill = make_skill("s")
+    ag = make_agent()
+    ag.run(skill, agdata())
+    ag.run(skill, agdata())
     _ = ag.history
 
     lens = [e["history_len"] for e in ag.log.entries]
@@ -108,10 +118,12 @@ def test_log_history_len_grows():
 # Error path is also logged
 # ---------------------------------------------------------------------------
 
-def test_unknown_skill_raises_and_nothing_logged():
+def test_invalid_skill_arg_raises_and_nothing_logged():
+    from agency.agskill import agskill as agskill_cls
     ag = make_agent()
-    with pytest.raises(ValueError, match="ghost"):
-        ag.run("ghost", agdata())
+    # Passing a string (old API) or a non-agskill object should raise
+    with pytest.raises((TypeError, AttributeError, ValueError)):
+        ag.run("not_a_skill_object", agdata())
     assert len(ag.log) == 0
 
 
@@ -120,13 +132,14 @@ def test_unknown_skill_raises_and_nothing_logged():
 # ---------------------------------------------------------------------------
 
 def test_fork_has_independent_log():
-    ag = make_agent(agskills=[make_skill("s")])
-    _ = ag.run("s", agdata()).ok   # parent logs one call
+    skill = make_skill("s")
+    ag = make_agent()
+    _ = ag.run(skill, agdata()).ok   # parent logs one call
 
     fork = agent(ag)
     assert len(fork.log) == 0   # fork starts fresh
 
-    _ = fork.run("s", agdata()).ok
+    _ = fork.run(skill, agdata()).ok
     assert len(fork.log) == 1
     assert len(ag.log) == 1   # parent unaffected
 
@@ -142,8 +155,9 @@ def test_dump_empty():
 
 
 def test_dump_contains_skill_name():
-    ag = make_agent(agskills=[make_skill("my_skill")])
-    _ = ag.run("my_skill", agdata(x=1)).ok
+    skill = make_skill("my_skill")
+    ag = make_agent()
+    _ = ag.run(skill, agdata(x=1)).ok
     assert "my_skill" in ag.log.dump()
 
 
@@ -184,23 +198,26 @@ def test_destroyed_event_logged():
 
 
 def test_events_includes_skill_and_lifecycle():
-    ag = make_agent(agskills=[make_skill("s")])
-    _ = ag.run("s", agdata()).ok
+    skill = make_skill("s")
+    ag = make_agent()
+    _ = ag.run(skill, agdata()).ok
     types = [e["type"] for e in ag.log.events]
     assert "lifecycle" in types   # at least the "created" event
     assert "skill" in types
 
 
 def test_skill_entry_has_type_field():
-    ag = make_agent(agskills=[make_skill("s", out={"v": 1})])
-    _ = ag.run("s", agdata()).v
+    skill = make_skill("s", out={"v": 1})
+    ag = make_agent()
+    _ = ag.run(skill, agdata()).v
     skill_entries = ag.log.entries
     assert skill_entries[0]["type"] == "skill"
 
 
 def test_dump_shows_lifecycle_and_skills():
-    ag = make_agent(agskills=[make_skill("my_skill")])
-    _ = ag.run("my_skill", agdata()).ok
+    skill = make_skill("my_skill")
+    ag = make_agent()
+    _ = ag.run(skill, agdata()).ok
     d = ag.log.dump()
     assert "CREATED" in d
     assert "my_skill" in d

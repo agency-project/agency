@@ -20,10 +20,10 @@ haiku_skill = agskill(
     tools=[],
 )
 
-ag = agent(llm_config=LLM_CONFIG, agskills=[haiku_skill])
+ag = agent(llm_config=LLM_CONFIG)
 
 if __name__ == "__main__":
-    result = ag.run("haiku", agdata(message="Tell me about recursion in programming."))
+    result = ag.run(haiku_skill, agdata(message="Tell me about recursion in programming."))
     print(result.response)
     # Function calls itself,
     # Looping in smaller pieces,

@@ -3,7 +3,6 @@ import time
 import pytest
 from agency.agsync import agsync
 from agency.agteam import agteam
-from agency.agskill import agskill
 from agency.agdata import agdata
 from agency.agent import agent
 from agency._context import _active_team
@@ -21,7 +20,7 @@ class _SimpleTeam(agteam):
     llm_config = LLM_CFG
 
     def setup(self):
-        self.ag = agent(agskills=[agskill(name="s", system_prompt="")])
+        self.ag = agent()
 
     def run(self):
         return agdata(done=True)
@@ -107,8 +106,7 @@ def test_agsync_raises_on_nested_list():
 def test_agsync_resolves_all_agents_in_team(n_agents):
     class _T(agteam):
         def setup(self):
-            s = agskill(name="s", system_prompt="")
-            self.ags = [agent(agskills=[s]) for _ in range(n_agents)]
+            self.ags = [agent() for _ in range(n_agents)]
         def run(self): pass
 
     agsync(_T())   # must not raise or deadlock
@@ -211,7 +209,7 @@ def test_fork_agents_created_in_run_are_auto_registered():
     class _T(agteam):
         llm_config = LLM_CFG
         def setup(self):
-            self.parent = agent(agskills=[agskill(name="s", system_prompt="")])
+            self.parent = agent()
         def run(self):
             self.f1 = agent(self.parent)
             self.f2 = agent(self.parent)
@@ -232,7 +230,7 @@ def test_agents_in_setup_are_tracked():
     class _T(agteam):
         llm_config = LLM_CFG
         def setup(self):
-            self.parent = agent(agskills=[agskill(name="s", system_prompt="")])
+            self.parent = agent()
             self.fork = agent(self.parent)   # fork in setup — also tracked
         def run(self): return agdata(done=True)
 
@@ -247,7 +245,7 @@ def test_fork_agents_tracked_in_run_thread():
     class _T(agteam):
         llm_config = LLM_CFG
         def setup(self):
-            self.parent = agent(agskills=[agskill(name="s", system_prompt="")])
+            self.parent = agent()
         def run(self):
             self.fork = agent(self.parent)
             return agdata(done=True)
@@ -263,7 +261,7 @@ def test_fork_agents_scale_correctly(n_forks):
     class _T(agteam):
         llm_config = LLM_CFG
         def setup(self):
-            self.parent = agent(agskills=[agskill(name="s", system_prompt="")])
+            self.parent = agent()
         def run(self):
             self.forks = [agent(self.parent) for _ in range(n_forks)]
             return agdata(done=True)
@@ -279,7 +277,7 @@ def test_no_duplicate_registration_on_multiple_run_calls():
     class _T(agteam):
         llm_config = LLM_CFG
         def setup(self):
-            self.ag = agent(agskills=[agskill(name="s", system_prompt="")])
+            self.ag = agent()
         def run(self): return agdata(done=True)
 
     team = _T()

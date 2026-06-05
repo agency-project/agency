@@ -31,7 +31,7 @@ support_skill = agskill(
     tools=[],
 )
 
-ag = agent(llm_config=LLM_CONFIG, agskills=[guardrail_skill, support_skill])
+ag = agent(llm_config=LLM_CONFIG)
 
 INPUTS = [
     "What's the capital of California?",
@@ -42,10 +42,10 @@ if __name__ == "__main__":
     for user_input in INPUTS:
         print(f"\nUser: {user_input}")
 
-        check = ag.run("check_input", agdata(message=user_input))
+        check = ag.run(guardrail_skill, agdata(message=user_input))
 
         if check.is_math_homework:
             print("Agent: Sorry, I can't help you with your math homework.")
         else:
-            result = ag.run("support", agdata(message=user_input))
+            result = ag.run(support_skill, agdata(message=user_input))
             print(f"Agent: {result.response}")

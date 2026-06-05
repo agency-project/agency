@@ -74,9 +74,7 @@ class PaperCrawlerTeam(agteam):
         self.summarise_paper = SummarisePaperSkill()
         self.compile_report  = CompileReportSkill()
 
-        self.main_agent = agent(
-            agskills=[self.find_papers, self.summarise_paper, self.compile_report]
-        )
+        self.main_agent = agent()
 
     def run(self) -> agdata:
         topic       = getattr(self, "topic", "machine learning")
@@ -89,7 +87,7 @@ class PaperCrawlerTeam(agteam):
         print()
 
         print("Step 1 — searching for papers...")
-        papers = self.main_agent.run("find_papers", agdata(topic=topic)).papers
+        papers = self.main_agent.run(self.find_papers, agdata(topic=topic)).papers
         if not papers:
             print("  No papers found — try a different topic or re-run.")
             return agdata(error="no papers found")
@@ -101,7 +99,7 @@ class PaperCrawlerTeam(agteam):
         print("Step 2 — submitting parallel summarisation tasks...")
         summaries = [
             agent(self.main_agent).run(
-                "summarise_paper",
+                self.summarise_paper,
                 agdata(title=p["title"], url=p["url"], abstract=p["abstract"]),
             )
             for p in papers
@@ -112,7 +110,7 @@ class PaperCrawlerTeam(agteam):
 
         print("Step 3 — compiling markdown report...")
         result = self.main_agent.run(
-            "compile_report",
+            self.compile_report,
             agdata(topic=topic, summaries=summaries, output_path=output_path),
         )
         print(f"  report written → {result.report_path}  ({result.paper_count} papers)")

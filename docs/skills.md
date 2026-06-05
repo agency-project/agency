@@ -1,6 +1,6 @@
 # Skills
 
-An `agskill` is a named, self-contained ReAct loop with its own system prompt, optional input/output schemas, and an optional tool override. Skills are the unit of work submitted to an agent via `agent.run("skill_name", input)`.
+An `agskill` is a named, self-contained ReAct loop with its own system prompt, optional input/output schemas, and an optional tool extension. Skills are the unit of work submitted to an agent via `agent.run(skill, input)`.
 
 ## Defining a skill
 
@@ -21,9 +21,9 @@ Both schemas are serialized and appended to the system prompt so the LLM knows t
 
 | Parameter | Type | Description |
 |---|---|---|
-| `name` | `str` | Identifier used in `agent.run("name", ...)` |
+| `name` | `str` | Descriptive identifier for the skill |
 | `system_prompt` | `str` | System message prepended to every LLM call |
-| `tools` | `list[agtool] \| None` | Tool override; `None` inherits the agent's full tool list |
+| `tools` | `list[agtool] \| None` | Extra tools added on top of the agent's tools; `None` or `[]` adds nothing |
 | `input_schema` | `agdata \| None` | Required input fields and their types |
 | `output_schema` | `agdata \| None` | Required output fields; enforced with retries |
 | `output_validator` | `Callable \| None` | Custom validation function, called after schema check |
@@ -77,19 +77,21 @@ Output validation is skipped when the LLM response is answering a mid-conversati
 
 The history passed to `agskill.run()` is the agent's shared conversation context. The skill appends its full message exchange to this history and returns the updated version. The system prompt is re-injected fresh on every call and is not persisted in the stored history.
 
-## Skill-level tool override
+## Skill-level tool extension
+
+Every skill always receives the agent's full tool set (sandbox tools such as `bash`, `read`, `write`, etc.). Skill-specific tools are added on top:
 
 ```python
 search_tool = agtool("search", "Search the web.", fn=my_search_fn, params={...})
 
 skill = agskill(
     name="research",
-    system_prompt="Research the topic using web search only.",
-    tools=[search_tool],   # agent's sandbox tools are not available in this skill
+    system_prompt="Research the topic.",
+    tools=[search_tool],   # agent tools + search_tool
 )
 ```
 
-Setting `tools=[]` gives the skill no tools at all — pure reasoning only.
+Passing `tools=None` or `tools=[]` leaves the tool list unchanged — the agent's full tool set is still available. There is no way to remove an agent-level tool from a skill.
 
 ## Common skills (`agency.common_skills`)
 
@@ -167,9 +169,7 @@ class PaperCrawlerTeam(agteam):
         self.find_papers     = FindPapersSkill(max_papers=10)
         self.summarise_paper = SummarisePaperSkill()
         self.compile_report  = CompileReportSkill()
-        self.agent           = agent(
-            agskills=[self.find_papers, self.summarise_paper, self.compile_report]
-        )
+        self.agent           = agent()
 ```
 
 ## Example with output validator

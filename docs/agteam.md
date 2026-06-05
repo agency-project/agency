@@ -9,8 +9,8 @@ Without `agteam`, a workflow is a loose collection of module-level objects:
 ```python
 search_tool  = agtool(...)
 find_skill   = agskill(..., tools=[search_tool])
-main_agent   = agent(llm_config=LLM_CONFIG, agskills=[find_skill])
-main_agent.run("find_papers", agdata(topic="KV cache"))
+main_agent   = agent(llm_config=LLM_CONFIG)
+main_agent.run(find_skill, agdata(topic="KV cache"))
 ```
 
 This works for a single run but scales poorly. To run the same workflow on multiple topics concurrently you have to manually manage separate tool/skill/agent instances for each. `agteam` encapsulates that structure so each instance is fully self-contained.
@@ -40,19 +40,19 @@ class PaperCrawlerTeam(agteam):
         self.compile       = agskill(name="compile_report", ...)
 
         # llm_config injected automatically from the team
-        self.main_agent = agent(agskills=[self.find_papers, self.summarise, self.compile])
+        self.main_agent = agent()
 
     def run(self) -> agdata:
-        papers = self.main_agent.run("find_papers", agdata(topic=self.topic)).papers
+        papers = self.main_agent.run(self.find_papers, agdata(topic=self.topic)).papers
         summaries = [
             agent(self.main_agent).run(
-                "summarise_paper",
+                self.summarise,
                 agdata(title=p["title"], url=p["url"], abstract=p["abstract"]),
             )
             for p in papers
         ]
         return self.main_agent.run(
-            "compile_report",
+            self.compile,
             agdata(topic=self.topic, summaries=summaries, output_path=self.output_path),
         )
 ```
@@ -128,7 +128,7 @@ Any `agent(...)` call made inside `setup()` or `run()` is automatically register
 
 ```python
 def setup(self) -> None:
-    self.main_agent = agent(agskills=[...])   # llm_config injected automatically
+    self.main_agent = agent()   # llm_config injected automatically
 ```
 
 `self.agents` returns a snapshot list of all agents currently registered with this team instance. Completed anonymous agents (fork agents with no other live reference) are GC'd automatically — only agents held via `self.*` or still in-flight are visible.

@@ -51,7 +51,10 @@ def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
     return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
-def make_agent(**kwargs) -> agent:
+def make_agent(tools=None) -> agent:
+    kwargs = {}
+    if tools is not None:
+        kwargs["tools"] = tools
     return agent(llm_config={"api_key": "k", "model": "gpt-4o"}, **kwargs)
 
 
@@ -66,8 +69,8 @@ def test_run_returns_pending_agdata():
         return agdata(done=True), agdata(messages=[]), []
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
-    result = ag.run("s", agdata())
+    ag = make_agent()
+    result = ag.run(skill, agdata())
     assert isinstance(result, agdata)
     assert result.done is True   # field access blocks until task finishes
 
@@ -81,21 +84,17 @@ def test_run_calls_named_agskill():
     skill = agskill(name="dowork", system_prompt="")
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
-    result = ag.run("dowork", agdata(task="go"))
+    ag = make_agent()
+    result = ag.run(skill, agdata(task="go"))
     assert result.done is True   # blocks until done
     assert called == [{"task": "go"}]
 
 
-def test_run_unknown_agskill_raises():
-    ag = make_agent()
-    with pytest.raises(ValueError, match="nonexistent"):
-        ag.run("nonexistent", agdata(x=1))
-
-
 def test_repr():
-    ag = make_agent(agskills=[agskill("a", ""), agskill("b", "")])
-    assert "a" in repr(ag) and "b" in repr(ag)
+    skill_a = agskill("a", "")
+    skill_b = agskill("b", "")
+    ag = make_agent()
+    assert repr(ag) is not None  # agent repr works without owned skills
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +112,12 @@ def test_history_updated_after_run():
         return agdata(ok=True), new_hist, []
 
     skill.run = fake_run
-    ag = make_agent(agskills=[skill])
+    ag = make_agent()
 
-    ag.run("s", agdata(turn=1))
+    ag.run(skill, agdata(turn=1))
     assert len(ag.history.messages) == 2   # ag.history blocks until done
 
-    ag.run("s", agdata(turn=2))
+    ag.run(skill, agdata(turn=2))
     assert len(ag.history.messages) == 4   # chain: step2 waited for step1
 
 
@@ -138,25 +137,28 @@ def test_sequential_calls_serialize_via_history_chain():
         sk.run = fake_run
         return sk
 
-    ag = make_agent(agskills=[make_skill("first"), make_skill("second")])
-    ag.run("first", agdata())
-    ag.run("second", agdata())
+    skill_first = make_skill("first")
+    skill_second = make_skill("second")
+    ag = make_agent()
+    ag.run(skill_first, agdata())
+    ag.run(skill_second, agdata())
     _ = ag.history   # wait for both to finish
 
     assert order == ["first", "second"]
 
 
 def test_history_passed_to_agskill():
-    ag = make_agent(agskills=[agskill("s", "")])
+    skill = agskill("s", "")
+    ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "prior"}])
 
     received = {}
     def fake_run(llm_cfg, inp, hist, tools, ms, **_):
         received["hist"] = hist
         return agdata(), agdata(messages=[]), []
-    ag.agskills[0].run = fake_run
+    skill.run = fake_run
 
-    ag.run("s", agdata(x=1))
+    ag.run(skill, agdata(x=1))
     _ = ag.history   # sync
     assert received["hist"].messages[0]["content"] == "prior"
 
@@ -167,15 +169,16 @@ def test_history_passed_to_agskill():
 
 def test_agent_tools_passed_to_agskill():
     t = agtool(name="t1", description="", fn=_noop)
-    ag = make_agent(agskills=[agskill("s", "")], tools=[t])
+    skill = agskill("s", "")
+    ag = make_agent(tools=[t])
 
     received = {}
     def fake_run(llm_cfg, inp, hist, tools, ms, **_):
         received["tools"] = tools
         return agdata(), agdata(messages=[]), []
-    ag.agskills[0].run = fake_run
+    skill.run = fake_run
 
-    ag.run("s", agdata())
+    ag.run(skill, agdata())
     _ = ag.history   # sync
     assert received["tools"] == [t]
 
@@ -186,11 +189,11 @@ def test_agent_tools_passed_to_agskill():
 
 def test_end_to_end_direct_answer():
     skill = agskill(name="qa", system_prompt="Answer questions.")
-    ag = make_agent(agskills=[skill])
+    ag = make_agent()
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "Paris"}')
-        result = ag.run("qa", agdata(question="Capital of France?"))
+        result = ag.run(skill, agdata(question="Capital of France?"))
         assert result.answer == "Paris"   # resolve inside the patch context
 
 
@@ -205,25 +208,31 @@ def test_end_to_end_with_tool():
         params={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]},
     )
     skill = agskill(name="math", system_prompt="You are a calculator.")
-    ag = make_agent(agskills=[skill], tools=[calc])
+    ag = make_agent(tools=[calc])
 
     responses = [_tool_resp("add", {"a": 3, "b": 4}), _direct('{"result": 7}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result = ag.run("math", agdata(task="add 3 and 4"))
+        result = ag.run(skill, agdata(task="add 3 and 4"))
         assert result.result == 7
 
 
 def test_multiple_agskills_coexist():
-    ag = make_agent(agskills=[agskill("a", ""), agskill("b", "")])
-    results = {}
-    for af in ag.agskills:
-        def fake(llm, inp, hist, tools, ms, _name=af.name, **_):
-            return agdata(from_skill=_name), agdata(messages=[]), []
-        af.run = fake
+    skill_a = agskill("a", "")
+    skill_b = agskill("b", "")
 
-    results["a"] = ag.run("a", agdata())
-    results["b"] = ag.run("b", agdata())
+    def fake_a(llm, inp, hist, tools, ms, **_):
+        return agdata(from_skill="a"), agdata(messages=[]), []
+    def fake_b(llm, inp, hist, tools, ms, **_):
+        return agdata(from_skill="b"), agdata(messages=[]), []
+
+    skill_a.run = fake_a
+    skill_b.run = fake_b
+
+    ag = make_agent()
+    results = {}
+    results["a"] = ag.run(skill_a, agdata())
+    results["b"] = ag.run(skill_b, agdata())
     assert results["a"].from_skill == "a"
     assert results["b"].from_skill == "b"
 
@@ -232,14 +241,11 @@ def test_multiple_agskills_coexist():
 # Copy constructor
 # ---------------------------------------------------------------------------
 
-def test_copy_constructor_inherits_config_and_skills():
-    skill = agskill("s", "")
-    ag = make_agent(agskills=[skill], tools=[])
+def test_copy_constructor_inherits_config():
+    ag = make_agent(tools=[])
 
     copy_ag = agent(ag)
     assert copy_ag.llm_config == ag.llm_config
-    assert copy_ag.agskills is not ag.agskills   # new list
-    assert copy_ag.agskills[0] is skill          # same skill objects
 
 
 def test_copy_constructor_deep_copies_history():
@@ -252,17 +258,19 @@ def test_copy_constructor_deep_copies_history():
     assert len(ag.history.messages) == 1   # parent unaffected
 
 
-def test_copy_constructor_overrides_agskills():
-    skill_a = agskill("a", "")
-    skill_b = agskill("b", "")
-    ag = make_agent(agskills=[skill_a])
+def test_copy_constructor_copies_history_and_config():
+    """Copy constructor copies history and llm_config from the source agent."""
+    ag = make_agent()
+    ag.history = agdata(messages=[{"role": "user", "content": "prior"}])
 
-    copy_ag = agent(ag, agskills=[skill_b])
-    assert [s.name for s in copy_ag.agskills] == ["b"]
+    copy_ag = agent(ag)
+    assert copy_ag.llm_config == ag.llm_config
+    assert len(copy_ag.history.messages) == 1
+    assert copy_ag.history.messages[0]["content"] == "prior"
 
 
 def test_fork_is_alias_for_copy_constructor():
-    ag = make_agent(agskills=[agskill("s", "")])
+    ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "x"}])
     forked = ag.fork()
     assert forked.llm_config == ag.llm_config
@@ -276,8 +284,8 @@ def test_copy_constructor_waits_for_inflight_task():
         return agdata(v=inp.v), agdata(messages=[{"role": "user", "content": str(inp.v)}]), []
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
-    ag.run("s", agdata(v=42))          # non-blocking, in-flight
+    ag = make_agent()
+    ag.run(skill, agdata(v=42))        # non-blocking, in-flight
 
     fork = agent(ag)                   # blocks until the run completes
     assert len(fork.history.messages) == 1
@@ -294,10 +302,10 @@ def test_fork_runs_do_not_update_parent_history():
         return agdata(ok=True), agdata(messages=[{"role": "user", "content": "fork_msg"}]), []
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
+    ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "original"}])
 
-    r = agent(ag).run("s", agdata())
+    r = agent(ag).run(skill, agdata())
     _ = r.ok   # wait for fork to finish
 
     assert len(ag.history.messages) == 1
@@ -313,8 +321,8 @@ def test_fork_runs_in_parallel():
         return agdata(n=inp.n), agdata(messages=[]), []
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
-    results = [agent(ag).run("s", agdata(n=i)) for i in range(3)]
+    ag = make_agent()
+    results = [agent(ag).run(skill, agdata(n=i)) for i in range(3)]
     assert sorted(r.n for r in results) == [0, 1, 2]
 
 
@@ -326,10 +334,10 @@ def test_fork_sees_parent_history_at_fork_time():
         return agdata(), agdata(messages=[]), []
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
+    ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "seed"}])
 
-    r = agent(ag).run("s", agdata())
+    r = agent(ag).run(skill, agdata())
     r._resolve()
     assert seen["hist"][0]["content"] == "seed"
 
@@ -348,13 +356,13 @@ def test_run_accepts_pending_agdata_as_input():
         return agdata(ok=True), agdata(messages=[]), []
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
+    ag = make_agent()
 
     f: Future[agdata] = Future()
     f.set_result(agdata(resolved=True, value=99))
     pending_input = agdata(_future=f)
 
-    result = ag.run("s", pending_input)
+    result = ag.run(skill, pending_input)
     _ = result.ok
     assert received["inp"] == {"resolved": True, "value": 99}
 
@@ -369,7 +377,7 @@ def test_run_resolves_list_of_pending_in_input():
         return agdata(ok=True), agdata(messages=[]), []
     skill.run = fake_run
 
-    ag = make_agent(agskills=[skill])
+    ag = make_agent()
 
     futures = []
     for i in range(3):
@@ -377,7 +385,7 @@ def test_run_resolves_list_of_pending_in_input():
         f.set_result(agdata(text=f"item {i}"))
         futures.append(agdata(_future=f))
 
-    result = ag.run("s", agdata(items=futures))
+    result = ag.run(skill, agdata(items=futures))
     _ = result.ok
     assert [r.text for r in received["items"]] == ["item 0", "item 1", "item 2"]
 
@@ -391,11 +399,11 @@ def test_chained_run_output_as_next_input():
         return agdata(done=True), agdata(messages=[]), []
     skill.run = fake_run
 
-    ag1 = make_agent(agskills=[skill])
-    ag2 = make_agent(agskills=[skill])
+    ag1 = make_agent()
+    ag2 = make_agent()
 
-    r1 = ag1.run("s", agdata(x=5))   # pending agdata, resolves to agdata(done=True)
-    r2 = ag2.run("s", r1)            # r1 passed as input; resolved before ag2's skill runs
+    r1 = ag1.run(skill, agdata(x=5))  # pending agdata, resolves to agdata(done=True)
+    r2 = ag2.run(skill, r1)           # r1 passed as input; resolved before ag2's skill runs
     r2._resolve()
 
     # ag2 received the resolved r1 as its input
@@ -441,10 +449,10 @@ def test_outer_loop_no_background_process_exits_immediately():
         return agdata(result="ok"), agdata(messages=[]), []
 
     skill.run = fake_run
-    ag = make_agent(agskills=[skill])
+    ag = make_agent()
     agent.poll_interval_s = 0
 
-    ag.run("s", agdata()).result  # block until done
+    ag.run(skill, agdata()).result  # block until done
 
     assert len(calls) == 1
 
@@ -453,15 +461,14 @@ def test_outer_loop_re_enters_with_completed_event_when_process_finishes():
     """When a background process finishes before ping_interval_s elapses, the
     agent gets a process_completed re-entry so it can act on the output."""
     calls = []
-    ag = make_agent(agskills=[])  # placeholder; skill added below
+    ag = make_agent()
     skill = _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0)
-    ag.agskills = [skill]
 
     # Patch get_live_pids: process is already gone by the time we check
     ag.sandbox.get_live_pids = lambda: set()
     agent.poll_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert len(calls) == 2
     assert calls[1].get("_event") == "process_completed"
@@ -473,7 +480,7 @@ def test_outer_loop_re_enters_with_update_event_when_process_still_running():
     import time as _time
 
     calls = []
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     skill = agskill(name="s", system_prompt="")
 
     def fake_run(llm_cfg, inp, hist, tools, ms, **_):
@@ -486,7 +493,6 @@ def test_outer_loop_re_enters_with_update_event_when_process_still_running():
         return agdata(result="ok"), agdata(messages=[]), []
 
     skill.run = fake_run
-    ag.agskills = [skill]
 
     # Patch get_live_pids: process still alive on first check, gone on second
     check_count = [0]
@@ -502,7 +508,7 @@ def test_outer_loop_re_enters_with_update_event_when_process_still_running():
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert len(calls) == 2
     assert calls[1].get("_event") == "process_update"
@@ -513,14 +519,13 @@ def test_outer_loop_completed_event_precedes_update_event():
     """process_completed fires before process_update: if a process finishes
     it always gets a completion re-entry, never an update."""
     calls = []
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     skill = _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0)
-    ag.agskills = [skill]
 
     ag.sandbox.get_live_pids = lambda: set()   # always done instantly
     agent.poll_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     events = [c.get("_event") for c in calls if "_event" in c]
     assert "process_completed" in events
@@ -532,7 +537,7 @@ def test_outer_loop_max_iters_cap():
     import time as _time
 
     calls = []
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     skill = agskill(name="s", system_prompt="")
 
     def fake_run(llm_cfg, inp, hist, tools, ms, **_):
@@ -541,13 +546,12 @@ def test_outer_loop_max_iters_cap():
         return agdata(result="ok"), agdata(messages=[]), []
 
     skill.run = fake_run
-    ag.agskills = [skill]
 
     ag.sandbox.get_live_pids = lambda: set()
     agent.poll_interval_s = 0
     agent.max_outer_iters = 3
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert len(calls) <= 3
 
@@ -569,7 +573,7 @@ def test_outer_loop_long_job_multiple_update_cycles():
     """
     import time as _time
 
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     calls = []
 
     live_seq = [{1}, {1}, set()]
@@ -593,13 +597,12 @@ def test_outer_loop_long_job_multiple_update_cycles():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.agskills = [skill]
     ag.sandbox.get_live_pids = fake_live_pids
     ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     update_count = calls.count("process_update")
     assert update_count == 2
@@ -622,7 +625,7 @@ def test_outer_loop_two_jobs_different_end_times():
     """
     import time as _time
 
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     calls = []
 
     live_seq = [{2}, set()]
@@ -647,13 +650,12 @@ def test_outer_loop_two_jobs_different_end_times():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.agskills = [skill]
     ag.sandbox.get_live_pids = fake_live_pids
     ag.sandbox.pid_status_summary = lambda: "PID 2 (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert calls.count("process_update") == 1
     assert calls[-1] == "process_completed"
@@ -674,7 +676,7 @@ def test_outer_loop_agent_starts_new_job_on_completed_reentry():
     """
     import time as _time
 
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     calls = []
     live_idx = [0]
 
@@ -695,11 +697,10 @@ def test_outer_loop_agent_starts_new_job_on_completed_reentry():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.agskills = [skill]
     ag.sandbox.get_live_pids = fake_live_pids
     agent.poll_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert calls.count("process_completed") == 2
     assert "process_update" not in calls
@@ -723,7 +724,7 @@ def test_outer_loop_jobs_added_at_different_points_with_different_latencies():
     """
     import time as _time
 
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     calls = []
 
     live_seq = [{1}, {3}, set()]
@@ -751,13 +752,12 @@ def test_outer_loop_jobs_added_at_different_points_with_different_latencies():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.agskills = [skill]
     ag.sandbox.get_live_pids = fake_live_pids
     ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert calls.count("process_update") == 2
     assert calls[-1] == "process_completed"
@@ -775,7 +775,7 @@ def test_outer_loop_process_completed_fires_when_new_batch_exits_quickly():
     """
     import time as _time
 
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     calls = []
 
     live_seq = [{1}, set()]
@@ -802,13 +802,12 @@ def test_outer_loop_process_completed_fires_when_new_batch_exits_quickly():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.agskills = [skill]
     ag.sandbox.get_live_pids = fake_live_pids
     ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert calls[1] == "process_update"
     assert calls[2] == "process_completed"
@@ -829,7 +828,7 @@ def test_outer_loop_daemon_release_unblocks_skill():
     """
     import time as _time
 
-    ag = make_agent(agskills=[])
+    ag = make_agent()
     calls = []
 
     def fake_live_pids():
@@ -849,13 +848,12 @@ def test_outer_loop_daemon_release_unblocks_skill():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.agskills = [skill]
     ag.sandbox.get_live_pids = fake_live_pids
     ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 5s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
-    ag.run("s", agdata()).result
+    ag.run(skill, agdata()).result
 
     assert calls == [None, "process_update"]   # no process_completed — daemon was released
     assert 1 in ag.sandbox._daemon_pids        # PID moved to daemon set
@@ -908,9 +906,9 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path):
         return agdata(answer="42"), agdata(messages=[{"role": "assistant", "content": "42"}]), []
     skill.run = fake_run
 
-    ag = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[skill])
+    ag = agent(llm_config={"api_key": "k", "model": "m"})
     ag.sandbox.write_file("/workspace/state.txt", "hello\n")
-    ag.run("s", agdata(q="test")).answer   # run a skill so history is non-empty
+    ag.run(skill, agdata(q="test")).answer   # run a skill so history is non-empty
 
     ckpt = tmp_path / "agent.ckpt"
     ag.save(ckpt)
@@ -919,7 +917,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path):
     ag.sandbox.destroy()
     _allocated_agnames.discard(saved_agname)
 
-    ag2 = agent.load(ckpt, llm_config={"api_key": "k", "model": "m"}, agskills=[skill])
+    ag2 = agent.load(ckpt, llm_config={"api_key": "k", "model": "m"})
     assert ag2.agname == saved_agname
     assert ag2.sandbox.read_file("/workspace/state.txt") == "hello\n"
     assert len(ag2._history._data.get("messages", [])) > 0
@@ -939,8 +937,8 @@ def test_save_all_and_load_all(tmp_path):
     saved_names = set()
 
     def _create_and_save():
-        ag1 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
-        ag2 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+        ag1 = agent(llm_config={"api_key": "k", "model": "m"})
+        ag2 = agent(llm_config={"api_key": "k", "model": "m"})
         ag1.sandbox.write_file("/workspace/id.txt", f"{ag1.agname}\n")
         ag2.sandbox.write_file("/workspace/id.txt", f"{ag2.agname}\n")
         saved_names.update([ag1.agname, ag2.agname])
@@ -955,11 +953,11 @@ def test_save_all_and_load_all(tmp_path):
 
     restored = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
     assert len(restored) == 2
-    names = {ag.agname for ag in restored}
+    names = {a.agname for a in restored}
     assert names == saved_names
-    for ag in restored:
-        assert ag.sandbox.read_file("/workspace/id.txt").strip() == ag.agname
-        ag.sandbox.destroy()
+    for a in restored:
+        assert a.sandbox.read_file("/workspace/id.txt").strip() == a.agname
+        a.sandbox.destroy()
 
 
 @_docker_ok
@@ -967,12 +965,12 @@ def test_load_all_skips_already_live_agent(tmp_path):
     import gc
     from agency.agent import _allocated_agnames
 
-    ag1 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+    ag1 = agent(llm_config={"api_key": "k", "model": "m"})
     ag1_name = ag1.agname
     ag2_name = [None]
 
     def _create_save_destroy_ag2():
-        ag2 = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+        ag2 = agent(llm_config={"api_key": "k", "model": "m"})
         ag2_name[0] = ag2.agname
         agent.save_all(tmp_path)
         ag2.sandbox.destroy()
@@ -998,7 +996,7 @@ def test_load_all_skips_already_live_agent(tmp_path):
 @_docker_ok
 def test_load_raises_if_agname_already_live(tmp_path):
     from agency.agent import _allocated_agnames
-    ag = agent(llm_config={"api_key": "k", "model": "m"}, agskills=[])
+    ag = agent(llm_config={"api_key": "k", "model": "m"})
     ckpt = tmp_path / "ag.ckpt"
     ag.save(ckpt)
 
