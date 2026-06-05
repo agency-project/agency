@@ -100,7 +100,8 @@ def _generate_agname() -> str:
         n = _noun_counters.get(noun, 0)
         _noun_counters[noun] = n + 1
         name = f"{noun}_{n:03d}"
-    return _allocate_agname(name)
+        _allocated_agnames.add(name)
+    return name
 
 
 def _resolve_input(inp: agdata) -> None:

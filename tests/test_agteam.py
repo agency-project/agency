@@ -169,7 +169,7 @@ def test_agent_agname_kwarg_accepted():
         def run(self): pass
 
     team = _T(llm_config={"api_key": "k", "model": "m"})
-    assert team.ag.agname == "my-custom-agent"
+    assert team.ag.agname == "my-custom-agent_000"
 
 
 def test_agents_property_returns_copy_not_live_list():
