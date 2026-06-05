@@ -38,7 +38,7 @@ def _make_run_dir(name: str) -> Path:
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   "moonshotai/Kimi-K2.6"),
+    "model":    os.environ.get("VLLM_MODEL",   "Qwen/Qwen3.5-397B-A17B-FP8"),
 }
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "6"))
 

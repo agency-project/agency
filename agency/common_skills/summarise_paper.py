@@ -15,7 +15,7 @@ def _arxiv_html_url(url: str) -> str:
     m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
     if not m:
         return url
-    paper_id = m.group(1).removesuffix(".pdf")
+    paper_id = m.group(1).removesuffix("")
     return f"https://arxiv.org/html/{paper_id}"
 
 
@@ -31,13 +31,20 @@ class SummarisePaperSkill(agskill):
             name="fetch_paper",
             description=(
                 "Fetch the full text of an arxiv paper given its URL. "
-                "Returns the paper content as plain text (up to 32 000 characters)."
+                "Returns up to 32000 characters at a time. "
+                "If truncated=true in the result, call again with offset incremented by 32000 to read the next chunk."
+                "The arxiv URLs follow these formats:"
+                "Abstract HTML page: https://arxiv.org/abs/2601.12345"
+                "PDF page: https://arxiv.org/pdf/2601.12345"
+                "HTML page: https://arxiv.org/html/2601.12345"
+                "HTML page is not always available for older papers."
             ),
             fn=self._fetch_paper,
             params={
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "The arxiv paper URL (abs, pdf, or html form)"},
+                    "url":    {"type": "string",  "description": "The arxiv paper URL (abs, pdf, or html form)"},
+                    "offset": {"type": "integer", "description": "Character offset to start reading from (default 0)"},
                 },
                 "required": ["url"],
             },
@@ -48,6 +55,8 @@ class SummarisePaperSkill(agskill):
                 "You are a research paper summariser. "
                 "You MUST call the fetch_paper tool to retrieve the full paper text before summarising. "
                 "Do NOT summarise from the abstract alone. "
+                "If the result has truncated=true, keep calling fetch_paper with increasing offset values "
+                "(0, 32000, 64000, …) until truncated=false, then write your summary. "
                 "After reading the full paper, write a concise technical summary that captures "
                 "the core contribution, method, results, limitations and conclusions."
             ),
@@ -61,6 +70,7 @@ class SummarisePaperSkill(agskill):
     def _fetch_paper(self, arg: agdata) -> agdata:
         url = str(arg.url)
         html_url = _arxiv_html_url(url)
+        offset = int(getattr(arg, "offset", 0) or 0)
         try:
             resp = httpx.get(html_url, timeout=30, follow_redirects=True)
             resp.raise_for_status()
@@ -75,9 +85,12 @@ class SummarisePaperSkill(agskill):
 
         lines = text.splitlines()
         start = next((i for i, l in enumerate(lines) if l.startswith("#")), 0)
-        trimmed = "\n".join(lines[start:])[:_MAX_CHARS]
+        full = "\n".join(lines[start:])
 
-        return agdata(text=trimmed, url=html_url, truncated=len(trimmed) == _MAX_CHARS)
+        chunk = full[offset : offset + _MAX_CHARS]
+        truncated = (offset + _MAX_CHARS) < len(full)
+
+        return agdata(text=chunk, url=html_url, offset=offset, truncated=truncated)
 
 
 # ---------------------------------------------------------------------------
@@ -109,17 +122,17 @@ try:
 
     @pytest.mark.parametrize("input_url,expected_html_url", [
         ("https://arxiv.org/abs/2301.12345",        "https://arxiv.org/html/2301.12345"),
-        ("https://arxiv.org/pdf/2301.12345.pdf",    "https://arxiv.org/html/2301.12345"),
+        ("https://arxiv.org/pdf/2301.12345",    "https://arxiv.org/html/2301.12345"),
         ("https://arxiv.org/html/2301.12345",       "https://arxiv.org/html/2301.12345"),
         ("https://arxiv.org/abs/2301.12345v2",      "https://arxiv.org/html/2301.12345v2"),
         ("https://arxiv.org/abs/1706.03762",        "https://arxiv.org/html/1706.03762"),
-        ("https://arxiv.org/pdf/1810.04805v3.pdf",  "https://arxiv.org/html/1810.04805v3"),
+        ("https://arxiv.org/pdf/1810.04805v3",  "https://arxiv.org/html/1810.04805v3"),
     ])
     def test_arxiv_html_url_conversion(input_url, expected_html_url):
         assert _arxiv_html_url(input_url) == expected_html_url
 
     @pytest.mark.parametrize("non_arxiv_url", [
-        "https://example.com/paper.pdf",
+        "https://example.com/paper",
         "https://openreview.net/forum?id=abc123",
         "https://proceedings.mlr.press/v97/paper.html",
         "https://github.com/user/repo",
@@ -165,6 +178,7 @@ try:
         result = s._fetch_paper(agdata(url="https://arxiv.org/abs/2301.12345"))
         assert len(result.text) <= _MAX_CHARS
         assert result.truncated is True
+        assert result.offset == 0
 
     def test_fetch_paper_short_content_not_flagged_truncated(monkeypatch):
         html = "<html><body><h1># Title</h1><p>Short paper.</p></body></html>"
@@ -173,6 +187,29 @@ try:
         result = s._fetch_paper(agdata(url="https://arxiv.org/abs/2301.12345"))
         assert len(result.text) < _MAX_CHARS
         assert result.truncated is False
+
+    def test_fetch_paper_offset_returns_next_chunk(monkeypatch):
+        # Build content slightly longer than two chunks
+        body = "x" * (_MAX_CHARS + 100)
+        long_html = f"<html><body><h1># T</h1><p>{body}</p></body></html>"
+        _mock_http(monkeypatch, long_html)
+        s = SummarisePaperSkill()
+        r0 = s._fetch_paper(agdata(url="https://arxiv.org/abs/2301.12345"))
+        assert r0.truncated is True
+        assert len(r0.text) == _MAX_CHARS
+
+        r1 = s._fetch_paper(agdata(url="https://arxiv.org/abs/2301.12345", offset=_MAX_CHARS))
+        assert r1.truncated is False
+        assert len(r1.text) > 0
+        assert r1.offset == _MAX_CHARS
+
+    def test_fetch_paper_offset_zero_same_as_default(monkeypatch):
+        html = "<html><body><h1># Title</h1><p>Short paper.</p></body></html>"
+        _mock_http(monkeypatch, html)
+        s = SummarisePaperSkill()
+        r_default = s._fetch_paper(agdata(url="https://arxiv.org/abs/2301.12345"))
+        r_zero    = s._fetch_paper(agdata(url="https://arxiv.org/abs/2301.12345", offset=0))
+        assert r_default.text == r_zero.text
 
     @pytest.mark.parametrize("exc_type,exc_args", [
         (httpx.ConnectError,    ("connection refused",)),
@@ -198,6 +235,8 @@ try:
         assert "fetch_paper" in s.system_prompt
         assert "MUST" in s.system_prompt
         assert "abstract alone" in s.system_prompt
+        assert "truncated" in s.system_prompt
+        assert "offset" in s.tools[0].params["properties"]
         assert "title" in s.input_schema._data
         assert "url" in s.input_schema._data
         assert "abstract" in s.input_schema._data

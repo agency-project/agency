@@ -67,13 +67,23 @@ _allocated_agnames: set[str]    = set()
 _agname_lock      = __import__("threading").Lock()
 
 
-def _allocate_agname(name: str) -> str:
-    """Register *name* as in-use and return it, raising if already taken."""
+def _register_agname(full_name: str) -> str:
+    """Register an already-final name as in-use, raising if taken."""
     with _agname_lock:
-        if name in _allocated_agnames:
-            raise ValueError(f"agname {name!r} is already in use by another agent")
-        _allocated_agnames.add(name)
-    return name
+        if full_name in _allocated_agnames:
+            raise ValueError(f"agname {full_name!r} is already in use by another agent")
+        _allocated_agnames.add(full_name)
+    return full_name
+
+
+def _allocate_agname(name: str) -> str:
+    """Return a unique name in the form <name>_NNN and register it as in-use."""
+    with _agname_lock:
+        n = _noun_counters.get(name, 0)
+        _noun_counters[name] = n + 1
+        full = f"{name}_{n:03d}"
+        _allocated_agnames.add(full)
+    return full
 
 
 def _generate_agname() -> str:
@@ -736,7 +746,7 @@ class agent:
 
         # Build agent without going through normal __init__ to avoid creating a fresh container
         ag: agent = cls.__new__(cls)
-        ag.agname    = _allocate_agname(state["agname"])
+        ag.agname    = _register_agname(state["agname"])
         ag.llm_config = {**state.get("llm_config", {}), **llm_config}
         ag.agskills   = list(agskills or [])
         ag._history   = agdata(messages=list(state.get("history", [])))
