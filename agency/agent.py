@@ -336,6 +336,9 @@ class agent:
         Calls on the same agent are serialized via the history chain.
         Calls on different agents (forks) run concurrently.
         """
+        if not any(f.name == skill_name for f in self.agskills):
+            raise ValueError(f"agskill not found: {skill_name!r}")
+
         prev_history = self._history
         result_future: Future[agdata] = Future()
         history_future: Future[agdata] = Future()
@@ -349,16 +352,7 @@ class agent:
 
                 history_before = list(prev_history._data.get("messages", []))
 
-                af = next((f for f in self.agskills if f.name == skill_name), None)
-                if af is None:
-                    err = agdata(error=f"agskill not found: {skill_name!r}")
-                    self._term.log("SKILL ✗  ", f"{skill_name!r} not found")
-                    self.log._record(skill_name, ts_start, _ts(),
-                                     input.to_dict(), err.to_dict(), len(history_before),
-                                     history_before=history_before, history_delta=[])
-                    result_future.set_result(err)
-                    history_future.set_result(prev_history)
-                    return
+                af = next(f for f in self.agskills if f.name == skill_name)
 
                 self._term.log("SKILL ▶  ", f"{skill_name}  input={list(input._data.keys())}")
                 self._set_ui_state("skill", skill=skill_name)

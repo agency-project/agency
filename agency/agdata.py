@@ -38,6 +38,7 @@ class agdata:
         if f is None:
             return
         resolved = f.result()
+        resolved._resolve()  # chain: future may resolve to another pending agdata
         object.__setattr__(self, "_data", object.__getattribute__(resolved, "_data"))
         object.__setattr__(self, "_future", None)
 

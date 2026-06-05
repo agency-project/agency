@@ -108,16 +108,11 @@ def test_log_history_len_grows():
 # Error path is also logged
 # ---------------------------------------------------------------------------
 
-def test_log_records_unknown_skill_error():
+def test_unknown_skill_raises_and_nothing_logged():
     ag = make_agent()
-    result = ag.run("ghost", agdata())
-    _ = result.error   # resolve
-
-    assert len(ag.log) == 1
-    e = ag.log.entries[0]
-    assert e["skill"] == "ghost"
-    assert "error" in e["output"]
-    assert "ghost" in e["output"]["error"]
+    with pytest.raises(ValueError, match="ghost"):
+        ag.run("ghost", agdata())
+    assert len(ag.log) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -87,11 +87,10 @@ def test_run_calls_named_agskill():
     assert called == [{"task": "go"}]
 
 
-def test_run_unknown_agskill_returns_error():
+def test_run_unknown_agskill_raises():
     ag = make_agent()
-    result = ag.run("nonexistent", agdata(x=1))
-    assert result.error is not None
-    assert "nonexistent" in result.error
+    with pytest.raises(ValueError, match="nonexistent"):
+        ag.run("nonexistent", agdata(x=1))
 
 
 def test_repr():
