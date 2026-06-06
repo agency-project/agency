@@ -151,3 +151,4 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [compaction.md](docs/compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
 | [ui.md](docs/ui.md) | Terminal UI — layout, keyboard bindings, interaction pane |
 | [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
+| [deadlock.md](docs/deadlock.md) | Deadlock patterns — shared agents across parallel threads, diagnosis, and fixes |

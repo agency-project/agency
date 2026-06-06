@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import os
 import shlex
 import shutil
 import subprocess
@@ -14,6 +15,9 @@ if TYPE_CHECKING:
 
 _BGPIDS_MARKER = "__BGPIDS__:"
 _RUNTIME: str | None = None
+
+# Per-process prefix so concurrent script invocations never share container names.
+_PID_PREFIX = f"p{os.getpid()}"
 
 # Global registry of live sandboxes for atexit cleanup.
 _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
@@ -155,8 +159,8 @@ class agSandbox:
             # Remove the image tag now — container holds a reference by digest
             self._run([self._runtime, "rmi", restore_image], check=False)
         elif parent_agname is not None:
-            snap = self._resolve_image(f"snapshot-{agname}")
-            self._run([self._runtime, "commit", f"sandbox-{parent_agname}", snap], check=True)
+            snap = self._resolve_image(f"snapshot-{_PID_PREFIX}-{agname}")
+            self._run([self._runtime, "commit", f"sandbox-{_PID_PREFIX}-{parent_agname}", snap], check=True)
             self._snapshot_name = snap
             self._run(
                 [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
@@ -182,7 +186,7 @@ class agSandbox:
         self._baseline_pids = self._snapshot_pids()
 
     def _container_name(self) -> str:
-        return f"sandbox-{self._agname}"
+        return f"sandbox-{_PID_PREFIX}-{self._agname}"
 
     def _snapshot_pids(self) -> set[int]:
         """Return the set of all live PIDs currently in the container, excluding

@@ -66,6 +66,19 @@ _noun_counters:   dict[str, int] = {}
 _allocated_agnames: set[str]    = set()
 _agname_lock      = __import__("threading").Lock()
 
+# URL-safe base-64 alphabet used for agent ID suffixes.
+# 3 digits → 64³ = 262 144 unique values per noun (vs 1 000 with decimal).
+_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _b64_suffix(n: int, width: int = 3) -> str:
+    """Encode *n* as a fixed-width base-64 string using _B64."""
+    digits = []
+    for _ in range(width):
+        digits.append(_B64[n & 63])
+        n >>= 6
+    return "".join(reversed(digits))
+
 
 def _register_agname(full_name: str) -> str:
     """Register an already-final name as in-use, raising if taken."""
@@ -77,21 +90,25 @@ def _register_agname(full_name: str) -> str:
 
 
 def _allocate_agname(name: str) -> str:
-    """Return a unique name in the form <name>_NNN and register it as in-use."""
+    """Return a unique name in the form <name>_XXX and register it as in-use.
+
+    XXX is a 3-character base-64 suffix (262 144 unique values per noun).
+    """
     with _agname_lock:
         n = _noun_counters.get(name, 0)
         _noun_counters[name] = n + 1
-        full = f"{name}_{n:03d}"
+        full = f"{name}_{_b64_suffix(n)}"
         _allocated_agnames.add(full)
     return full
 
 
 def _generate_agname() -> str:
-    """Return a unique agname in the form <noun>_<3-digit number>.
+    """Return a unique agname in the form <noun>_XXX.
 
     Nouns are assigned in order from _NOUNS, cycling back to the start after
-    the last entry. The suffix increments independently per noun, so arch_000
-    and arch_001 are the first and second agents that received 'arch'.
+    the last entry. The suffix is a 3-character base-64 string (262 144 unique
+    values per noun), so arch_AAA and arch_AAB are the first and second agents
+    that received 'arch'.
     """
     global _noun_index
     with _agname_lock:
@@ -99,7 +116,7 @@ def _generate_agname() -> str:
         _noun_index += 1
         n = _noun_counters.get(noun, 0)
         _noun_counters[noun] = n + 1
-        name = f"{noun}_{n:03d}"
+        name = f"{noun}_{_b64_suffix(n)}"
         _allocated_agnames.add(name)
     return name
 

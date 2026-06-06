@@ -90,10 +90,10 @@ Each agent is assigned a unique pronounceable name (adjective + noun, e.g. `swif
 
 ```python
 ag = agent(llm_config, agname="worker")
-# ag.agname == "worker_000"
+# ag.agname == "worker_AAA"
 ```
 
-The name is always postfixed with `_NNN` (a zero-padded counter) to guarantee global uniqueness for the process lifetime. The first agent with a given base name gets `_000`, the second `_001`, and so on.
+The name is always postfixed with `_XXX` (a 3-character base-64 counter, alphabet `A-Za-z0-9-_`) to guarantee global uniqueness for the process lifetime. The first agent with a given base name gets `_AAA`, the second `_AAB`, and so on. The 3-character suffix supports 64³ = 262 144 unique values per base name.
 
 ## Lifecycle and cleanup
 
