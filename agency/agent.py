@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import queue
+import shlex
 import subprocess
 import tarfile
 import time
@@ -24,6 +25,7 @@ _DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 from .agdata import agdata
+from .agtype import agtype
 from .agskill import agskill
 from .agtool import agtool
 from .aglog import aglog, _ts
@@ -66,17 +68,18 @@ _noun_counters:   dict[str, int] = {}
 _allocated_agnames: set[str]    = set()
 _agname_lock      = __import__("threading").Lock()
 
-# URL-safe base-64 alphabet used for agent ID suffixes.
-# 3 digits → 64³ = 262 144 unique values per noun (vs 1 000 with decimal).
-_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+# Lowercase alphanumeric alphabet used for agent ID suffixes.
+# 3 digits → 36³ = 46 656 unique values per noun (vs 1 000 with decimal).
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
-def _b64_suffix(n: int, width: int = 3) -> str:
-    """Encode *n* as a fixed-width base-64 string using _B64."""
+def _b36_suffix(n: int, width: int = 3) -> str:
+    """Encode *n* as a fixed-width base-36 string (000…009, 00a…00z, 010…)."""
+    base = len(_B36)
     digits = []
     for _ in range(width):
-        digits.append(_B64[n & 63])
-        n >>= 6
+        digits.append(_B36[n % base])
+        n //= base
     return "".join(reversed(digits))
 
 
@@ -97,7 +100,7 @@ def _allocate_agname(name: str) -> str:
     with _agname_lock:
         n = _noun_counters.get(name, 0)
         _noun_counters[name] = n + 1
-        full = f"{name}_{_b64_suffix(n)}"
+        full = f"{name}_{_b36_suffix(n)}"
         _allocated_agnames.add(full)
     return full
 
@@ -116,9 +119,101 @@ def _generate_agname() -> str:
         _noun_index += 1
         n = _noun_counters.get(noun, 0)
         _noun_counters[noun] = n + 1
-        name = f"{noun}_{_b64_suffix(n)}"
+        name = f"{noun}_{_b36_suffix(n)}"
         _allocated_agnames.add(name)
     return name
+
+
+# String fields longer than this many characters are offloaded to a file in
+# the agent's sandbox instead of being inlined in the LLM context window.
+INPUT_OFFLOAD_CHARS: int = 2000
+
+
+def _offload_large_fields(
+    inp: agdata, sandbox: "agSandbox", skill_name: str
+) -> tuple[list[str], list[str]]:
+    """Write oversized string fields to /workspace/inputs/ in the sandbox.
+
+    Each field whose serialized string value exceeds INPUT_OFFLOAD_CHARS is
+    replaced in-place with a short reference string pointing to the file.
+    Returns (paths_written, field_names) so the caller can delete files and
+    build an auto-offload note for the system prompt.
+    """
+    paths: list[str] = []
+    fields: list[str] = []
+    for key, val in list(inp._data.items()):
+        if not isinstance(val, str) or len(val) <= INPUT_OFFLOAD_CHARS:
+            continue
+        path = f"/workspace/inputs/{skill_name}_{key}.txt"
+        try:
+            sandbox.write_file(path, val)
+            inp._data[key] = (
+                f"(content saved to {path} — use the read tool to access it)"
+            )
+            paths.append(path)
+            fields.append(key)
+        except Exception:
+            pass  # leave the field unchanged if the write fails
+    return paths, fields
+
+
+def _prepare_agtype_inputs(
+    inp: agdata, schema: "agdata | None", sandbox: "agSandbox", skill_name: str
+) -> list[str]:
+    """Prepare agtype input fields before the skill runs.
+
+    For each schema field whose hint is an agtype subclass, calls
+    ``hint.prepare()`` which may transform the value and write sandbox files.
+    Returns all paths written for cleanup.
+    """
+    if schema is None:
+        return []
+    paths: list[str] = []
+    for key, hint in schema._data.items():
+        if not (isinstance(hint, type) and issubclass(hint, agtype)):
+            continue
+        val = inp._data.get(key)
+        try:
+            new_val, written = hint.prepare(val, sandbox, skill_name, key)
+            inp._data[key] = new_val
+            paths.extend(written)
+        except Exception:
+            pass
+    return paths
+
+
+def _recover_agtype_outputs(
+    result: agdata, schema: "agdata | None", sandbox: "agSandbox"
+) -> list[str]:
+    """Recover agtype output fields after the skill finishes.
+
+    For each schema field whose hint is an agtype subclass, calls
+    ``hint.recover()`` which may read sandbox files back into Python values.
+    Returns all paths written for cleanup.
+    """
+    if schema is None or result.is_error():
+        return []
+    paths: list[str] = []
+    for key, hint in schema._data.items():
+        if not (isinstance(hint, type) and issubclass(hint, agtype)):
+            continue
+        val = result._data.get(key)
+        try:
+            new_val, written = hint.recover(val, sandbox)
+            result._data[key] = new_val
+            paths.extend(written)
+        except Exception:
+            pass
+    return paths
+
+
+def _remove_offloaded_fields(paths: list[str], sandbox: "agSandbox") -> None:
+    """Delete files previously written by offload/agfile helpers."""
+    for path in paths:
+        try:
+            sandbox._container_exec(f"rm -f {shlex.quote(path)}", shell="sh")
+        except Exception:
+            pass
 
 
 def _resolve_input(inp: agdata) -> None:
@@ -358,6 +453,7 @@ class agent:
         pool = agent.agresource_pool
 
         def _task() -> None:
+            _offloaded_paths: list[str] = []   # declared before try for reliable finally cleanup
             try:
                 prev_history._resolve()
                 _resolve_input(input)
@@ -379,6 +475,29 @@ class agent:
                 outer_history:   agdata        = prev_history
                 outer_delta:     list[dict]    = []
                 is_continuation  = False
+
+                # Offload oversized fields and write agfile input fields to sandbox.
+                auto_paths, auto_fields = _offload_large_fields(
+                    current_input, self.sandbox, skill_name
+                )
+                _offloaded_paths.extend(auto_paths)
+                _offloaded_paths.extend(
+                    _prepare_agtype_inputs(current_input, af.input_schema, self.sandbox, skill_name)
+                )
+
+                # Build extra system prompt note for auto-offloaded fields so the
+                # agent knows they are temporary and how to access them.
+                _extra_system: str | None = None
+                if auto_fields:
+                    field_list = ", ".join(f"`{f}`" for f in auto_fields)
+                    _extra_system = (
+                        f"\nNote: The following input fields contain large content "
+                        f"that has been automatically saved to temporary files in "
+                        f"your sandbox: {field_list}. The file paths are shown in "
+                        f"the input JSON. Use the read tool to access the full "
+                        f"content. WARNING: these files are temporary and will be "
+                        f"automatically deleted after this task ends."
+                    )
 
                 for _outer_iter in range(agent.max_outer_iters):
                     def _drain_inbox() -> str | None:
@@ -407,6 +526,7 @@ class agent:
                         _context_limit=self._context_limit,
                         _compact_log_fn=_compact_log,
                         _full_history_fn=self._append_full_history,
+                        _extra_system=_extra_system,
                     )
                     outer_result  = result
                     outer_history = new_history
@@ -475,6 +595,12 @@ class agent:
                     current_history = new_history
                     is_continuation = True
 
+                # Recover agtype output fields from sandbox into the result agdata.
+                if outer_result is not None:
+                    _offloaded_paths.extend(
+                        _recover_agtype_outputs(outer_result, af.output_schema, self.sandbox)
+                    )
+
             except Exception as exc:
                 outer_result  = agdata(error=str(exc))
                 outer_history = prev_history
@@ -483,6 +609,7 @@ class agent:
                 self._term.log("SKILL ✗  ", f"{skill_name}  exception={exc}")
             finally:
                 self._set_ui_state("inactive")
+                _remove_offloaded_fields(_offloaded_paths, self.sandbox)
                 self.sandbox.release_resources(pool)
 
             # Log and resolve futures after all background work is done

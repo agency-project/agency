@@ -17,24 +17,24 @@ LLM_CONFIG = {
 french_skill = agskill(
     name="french",
     system_prompt="You only speak French.",
-    input_schema=agdata(message="str"),
-    output_schema=agdata(response="str"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(response=str),
     tools=[],
 )
 
 spanish_skill = agskill(
     name="spanish",
     system_prompt="You only speak Spanish.",
-    input_schema=agdata(message="str"),
-    output_schema=agdata(response="str"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(response=str),
     tools=[],
 )
 
 english_skill = agskill(
     name="english",
     system_prompt="You only speak English.",
-    input_schema=agdata(message="str"),
-    output_schema=agdata(response="str"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(response=str),
     tools=[],
 )
 
@@ -45,8 +45,8 @@ triage_skill = agskill(
         "Reply with the detected language (french, spanish, or english) in the 'language' field "
         "and pass the message through unchanged in the 'message' field."
     ),
-    input_schema=agdata(message="str"),
-    output_schema=agdata(language="str", message="str"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(language=str, message=str),
     tools=[],
 )
 

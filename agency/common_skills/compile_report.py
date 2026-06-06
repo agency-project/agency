@@ -16,8 +16,8 @@ class CompileReportSkill(agskill):
                 "one section per paper with its title, URL, and summary, "
                 "and a concluding paragraph."
             ),
-            input_schema=agdata(topic="str", summaries="list", output_path="str"),
-            output_schema=agdata(report_path="str", paper_count="int"),
+            input_schema=agdata(topic=str, summaries=list, output_path=str),
+            output_schema=agdata(report_path=str, paper_count=int),
             **kwargs,
         )
 

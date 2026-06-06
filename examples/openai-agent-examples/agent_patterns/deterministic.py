@@ -17,8 +17,8 @@ LLM_CONFIG = {
 outline_skill = agskill(
     name="outline",
     system_prompt="Generate a very short story outline based on the user's input.",
-    input_schema=agdata(prompt="str"),
-    output_schema=agdata(outline="str"),
+    input_schema=agdata(prompt=str),
+    output_schema=agdata(outline=str),
     tools=[],
 )
 
@@ -29,16 +29,16 @@ checker_skill = agskill(
         "Determine if it is a sci-fi story. "
         "Set good_quality to true/false and is_scifi to true/false."
     ),
-    input_schema=agdata(outline="str"),
-    output_schema=agdata(good_quality="bool", is_scifi="bool"),
+    input_schema=agdata(outline=str),
+    output_schema=agdata(good_quality=bool, is_scifi=bool),
     tools=[],
 )
 
 story_skill = agskill(
     name="story",
     system_prompt="Write a short story based on the given outline.",
-    input_schema=agdata(outline="str"),
-    output_schema=agdata(story="str"),
+    input_schema=agdata(outline=str),
+    output_schema=agdata(story=str),
     tools=[],
 )
 

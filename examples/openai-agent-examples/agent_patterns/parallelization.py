@@ -21,16 +21,16 @@ LLM_CONFIG = {
 translator_skill = agskill(
     name="translate",
     system_prompt="You translate the user's message to Spanish.",
-    input_schema=agdata(text="str"),
-    output_schema=agdata(translation="str"),
+    input_schema=agdata(text=str),
+    output_schema=agdata(translation=str),
     tools=[],
 )
 
 picker_skill = agskill(
     name="pick_best",
     system_prompt="You pick the best Spanish translation from the given options.",
-    input_schema=agdata(original="str", translations="str"),
-    output_schema=agdata(best="str"),
+    input_schema=agdata(original=str, translations=str),
+    output_schema=agdata(best=str),
     tools=[],
 )
 

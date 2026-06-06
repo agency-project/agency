@@ -15,8 +15,8 @@ LLM_CONFIG = {
 haiku_skill = agskill(
     name="haiku",
     system_prompt="You only respond in haikus.",
-    input_schema=agdata(message="str"),
-    output_schema=agdata(response="str"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(response=str),
     tools=[],
 )
 

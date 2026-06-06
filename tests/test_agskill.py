@@ -230,7 +230,7 @@ def test_tools_empty_list_passes_agent_tools():
 def test_input_schema_missing_field_returns_error():
     s = agskill(
         name="s", system_prompt="",
-        input_schema=agdata(question="str", context="str"),
+        input_schema=agdata(question=str, context=str),
     )
     result, _, _ = s.run(LLM_CONFIG, agdata(question="hi"), agdata(messages=[]), [])
     assert result.error is not None
@@ -240,7 +240,7 @@ def test_input_schema_missing_field_returns_error():
 def test_input_schema_type_error_returns_error():
     s = agskill(
         name="s", system_prompt="",
-        input_schema=agdata(count="int"),
+        input_schema=agdata(count=int),
     )
     result, _, _ = s.run(LLM_CONFIG, agdata(count="not-an-int"), agdata(messages=[]), [])
     assert result.error is not None
@@ -250,7 +250,7 @@ def test_input_schema_type_error_returns_error():
 def test_input_schema_valid_proceeds():
     s = agskill(
         name="s", system_prompt="",
-        input_schema=agdata(text="str"),
+        input_schema=agdata(text=str),
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": true}')
@@ -274,7 +274,7 @@ def test_output_schema_missing_field_triggers_retry():
     """LLM gives bad output first, correct output on retry."""
     s = agskill(
         name="s", system_prompt="",
-        output_schema=agdata(summary="str"),
+        output_schema=agdata(summary=str),
         max_retries=2,
     )
     responses = [
@@ -290,7 +290,7 @@ def test_output_schema_missing_field_triggers_retry():
 def test_output_schema_retry_exhausted_returns_error():
     s = agskill(
         name="s", system_prompt="",
-        output_schema=agdata(answer="str"),
+        output_schema=agdata(answer=str),
         max_retries=2,
     )
     with patch("openai.OpenAI") as MockClient:
@@ -303,7 +303,7 @@ def test_output_schema_retry_exhausted_returns_error():
 def test_output_schema_type_mismatch_triggers_retry():
     s = agskill(
         name="s", system_prompt="",
-        output_schema=agdata(count="int"),
+        output_schema=agdata(count=int),
         max_retries=1,
     )
     responses = [
@@ -320,7 +320,7 @@ def test_correction_message_appended_on_retry():
     """The retry message is appended to the conversation before the next LLM call."""
     s = agskill(
         name="s", system_prompt="",
-        output_schema=agdata(answer="str"),
+        output_schema=agdata(answer=str),
         max_retries=1,
     )
     call_messages: list[list[dict]] = []
@@ -354,8 +354,8 @@ def test_schemas_appended_to_system_prompt():
     s = agskill(
         name="s",
         system_prompt="Be helpful.",
-        input_schema=agdata(text="str"),
-        output_schema=agdata(summary="str"),
+        input_schema=agdata(text=str),
+        output_schema=agdata(summary=str),
     )
     prompt = s._build_system_prompt()
     assert "Be helpful." in prompt

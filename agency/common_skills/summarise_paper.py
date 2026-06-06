@@ -60,8 +60,8 @@ class SummarisePaperSkill(agskill):
                 "After reading the full paper, write a concise technical summary that captures "
                 "the core contribution, method, results, limitations and conclusions."
             ),
-            input_schema=agdata(title="str", url="str", abstract="str"),
-            output_schema=agdata(summary="str"),
+            input_schema=agdata(title=str, url=str, abstract=str),
+            output_schema=agdata(summary=str),
             tools=[fetch_paper],
             **kwargs,
         )

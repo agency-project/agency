@@ -37,8 +37,8 @@ class FindPapersSkill(agskill):
                 "Do NOT skip the tool call or invent papers. "
                 "Return the full list of papers exactly as the tool provided them."
             ),
-            input_schema=agdata(topic="str"),
-            output_schema=agdata(papers="list", count="int"),
+            input_schema=agdata(topic=str),
+            output_schema=agdata(papers=list, count=int),
             output_validator=self._validate_output,
             tools=[search_papers],
             **kwargs,

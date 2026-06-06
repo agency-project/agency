@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
+from .agtype import agtype, agfile
+
 
 class AgError(RuntimeError):
     """Raised when accessing a result field on an agdata that holds a skill error.
@@ -89,6 +91,10 @@ class agdata:
     @staticmethod
     def _to_serializable(obj):
         """Recursively convert agdata objects (including nested ones) to plain types."""
+        if isinstance(obj, type) and issubclass(obj, agtype):
+            return obj.schema_type()
+        if isinstance(obj, type):
+            return obj.__name__
         if isinstance(obj, agdata):
             obj._resolve()
             return {k: agdata._to_serializable(v) for k, v in obj._data.items()}

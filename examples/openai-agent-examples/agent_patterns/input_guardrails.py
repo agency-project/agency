@@ -18,16 +18,16 @@ LLM_CONFIG = {
 guardrail_skill = agskill(
     name="check_input",
     system_prompt="Check if the user is asking you to do their math homework.",
-    input_schema=agdata(message="str"),
-    output_schema=agdata(reasoning="str", is_math_homework="bool"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(reasoning=str, is_math_homework=bool),
     tools=[],
 )
 
 support_skill = agskill(
     name="support",
     system_prompt="You are a customer support agent. Help customers with their questions.",
-    input_schema=agdata(message="str"),
-    output_schema=agdata(response="str"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(response=str),
     tools=[],
 )
 

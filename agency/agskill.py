@@ -67,25 +67,21 @@ def _extract_thinking(content: str) -> str:
     """Return the concatenated text of all thinking blocks, or empty string if none."""
     return "\n\n".join(m.group(1).strip() for m in _THINKING_RE.finditer(content))
 from .agdata import agdata
+from .agtype import agtype
 from .agtool import agtool
 from .agcompaction import compact, should_compact
 
 if TYPE_CHECKING:
     from .agterm import agterm
 
-_TYPE_MAP: dict[str, type] = {
-    "str": str, "int": int, "float": float,
-    "bool": bool, "list": list, "dict": dict,
-}
-
-
 class agskill:
     """A named skill with its own system prompt and a self-contained ReAct loop.
 
     input_schema / output_schema are agdata objects whose keys define required
-    fields and whose values are either a recognised type name ("str", "int",
-    "float", "bool", "list", "dict") or a plain description string.  Both are
-    serialised and appended to the system prompt so the LLM knows the contract.
+    fields and whose values are Python types (``str``, ``int``, ``float``,
+    ``bool``, ``list``, ``dict``, or an ``agtype`` subclass such as ``agfile``).
+    Both schemas are serialised and appended to the system prompt so the LLM
+    knows the contract.
 
     Input is validated before the loop runs.  Output is validated after each
     final (non-tool-call) LLM response; on failure a correction message is
@@ -114,8 +110,33 @@ class agskill:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, extra: str | None = None) -> str:
         parts = [self.system_prompt]
+
+        # Collect agtype fields with extra prompt instructions and emit
+        # them before the JSON format sections.
+        extra_lines: list[str] = []
+        for key, hint in (self.input_schema._data.items() if self.input_schema else []):
+            if isinstance(hint, type) and issubclass(hint, agtype):
+                line = hint.extra_input_prompt(key)
+                if line:
+                    extra_lines.append(line)
+        for key, hint in (self.output_schema._data.items() if self.output_schema else []):
+            if isinstance(hint, type) and issubclass(hint, agtype):
+                line = hint.extra_output_prompt(key, self.name)
+                if line:
+                    extra_lines.append(line)
+
+        if extra_lines:
+            parts.append(
+                "\nFile-backed fields — WARNING: these files are temporary and will "
+                "be automatically deleted after this task ends:\n"
+                + "\n".join(extra_lines)
+            )
+
+        if extra:
+            parts.append(extra)
+
         if self.input_schema is not None:
             parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}")
         if self.output_schema is not None:
@@ -132,13 +153,18 @@ class agskill:
             if key not in data._data:
                 errors.append(f"missing required field '{key}'")
                 continue
-            type_name = hint if isinstance(hint, str) else None
-            if type_name and type_name.lower() in _TYPE_MAP:
-                expected = _TYPE_MAP[type_name.lower()]
-                actual = data._data[key]
-                if not isinstance(actual, expected):
+            if isinstance(hint, type) and issubclass(hint, agtype):
+                # agtype fields carry a string value after framework processing
+                if not isinstance(data._data[key], str):
                     errors.append(
-                        f"field '{key}': expected {type_name}, "
+                        f"field '{key}' ({hint.__name__}) must be a string"
+                    )
+                continue
+            if isinstance(hint, type):
+                actual = data._data[key]
+                if not isinstance(actual, hint):
+                    errors.append(
+                        f"field '{key}': expected {hint.__name__}, "
                         f"got {type(actual).__name__}"
                     )
         return errors
@@ -162,6 +188,7 @@ class agskill:
         _context_limit: "int | None" = None,
         _compact_log_fn: "Callable | None" = None,
         _full_history_fn: "Callable[[dict], None] | None" = None,
+        _extra_system: "str | None" = None,
     ) -> tuple[agdata, agdata, list[dict]]:
         """Run the ReAct loop.
 
@@ -179,7 +206,7 @@ class agskill:
         if self.input_schema is not None and not _is_continuation:
             errors = self._check_schema(input, self.input_schema)
             if errors:
-                sys_msg = {"role": "system", "content": self._build_system_prompt()}
+                sys_msg = {"role": "system", "content": self._build_system_prompt(_extra_system)}
                 return agdata(error=f"input schema error: {errors}"), history, [sys_msg]
 
         active_tools: list[agtool] = list(agent_tools or []) + list(self.tools or [])
@@ -194,7 +221,7 @@ class agskill:
         history_msgs: list[dict] = list(history._data.get("messages", []))
         n_before = len(history_msgs)
         messages: list[dict] = (
-            [{"role": "system", "content": self._build_system_prompt()}]
+            [{"role": "system", "content": self._build_system_prompt(_extra_system)}]
             + history_msgs
             + [{"role": "user", "content": input.to_json()}]
         )

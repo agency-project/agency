@@ -9,8 +9,8 @@ class SummariserSkill(agskill):
         super().__init__(
             name="summarise",
             system_prompt="Summarise the given text in one sentence.",
-            input_schema=agdata(text="str"),
-            output_schema=agdata(summary="str"),
+            input_schema=agdata(text=str),
+            output_schema=agdata(summary=str),
             tools=[],
             **kwargs,
         )

@@ -12,8 +12,8 @@ class WriterSkill(agskill):
                 "Write the given content to the given file path using the write tool. "
                 "The path is inside the sandbox container."
             ),
-            input_schema=agdata(file_path="str", content="str"),
-            output_schema=agdata(path="str", status="str"),
+            input_schema=agdata(file_path=str, content=str),
+            output_schema=agdata(path=str, status=str),
             **kwargs,
         )
 

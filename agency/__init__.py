@@ -1,4 +1,5 @@
 from .agdata import agdata, AgError
+from .agtype import agtype, agfile
 from .agskill import agskill
 from .agtool import agtool
 from .aglog import aglog
@@ -11,7 +12,7 @@ from .agresources import agResourcePool
 from .agui import agUI
 
 __all__ = [
-    "agdata", "AgError", "agskill", "agtool", "aglog", "agterm",
+    "agdata", "agtype", "agfile", "AgError", "agskill", "agtool", "aglog", "agterm",
     "agent", "agteam", "agsync", "agSandbox", "agResourcePool", "get_container_runtime",
     "agUI",
 ]

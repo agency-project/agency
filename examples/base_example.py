@@ -49,13 +49,13 @@ def main():
             "Write files to /workspace."
         ),
         input_schema=agdata(
-            task="str",
-            file_path="str",
+            task=str,
+            file_path=str,
         ),
         output_schema=agdata(
-            status="str",
-            path="str",
-            content="str",
+            status=str,
+            path=str,
+            content=str,
         ),
     )
 
@@ -65,8 +65,8 @@ def main():
             "Answer the user's question directly and concisely. "
             "You have access to prior conversation context."
         ),
-        input_schema=agdata(question="str"),
-        output_schema=agdata(answer="str"),
+        input_schema=agdata(question=str),
+        output_schema=agdata(answer=str),
         tools=[],
     )
 

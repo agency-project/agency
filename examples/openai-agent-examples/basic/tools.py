@@ -36,8 +36,8 @@ get_weather = agtool(
 weather_skill = agskill(
     name="weather",
     system_prompt="You are a helpful agent.",
-    input_schema=agdata(question="str"),
-    output_schema=agdata(response="str"),
+    input_schema=agdata(question=str),
+    output_schema=agdata(response=str),
     tools=[get_weather],
 )
 

@@ -27,8 +27,8 @@ def _no_phone_numbers(result: agdata) -> list[str]:
 assistant_skill = agskill(
     name="assistant",
     system_prompt="You are a helpful assistant.",
-    input_schema=agdata(message="str"),
-    output_schema=agdata(reasoning="str", response="str"),
+    input_schema=agdata(message=str),
+    output_schema=agdata(reasoning=str, response=str),
     output_validator=_no_phone_numbers,
     max_retries=1,
     tools=[],

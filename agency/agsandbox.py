@@ -325,6 +325,12 @@ class agSandbox:
         if rc != 0:
             raise OSError(f"Failed to write {path} in container")
 
+    def read_file(self, path: str) -> str:
+        out, rc = self._container_exec(f"cat {shlex.quote(path)}", shell="sh")
+        if rc != 0:
+            raise FileNotFoundError(f"Failed to read {path} from container")
+        return out
+
     def update_limits(
         self,
         *,

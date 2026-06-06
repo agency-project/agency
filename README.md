@@ -33,8 +33,8 @@ from agency import agent, agskill, agdata
 summarise = agskill(
     name="summarise",
     system_prompt="Summarise the given text in one sentence.",
-    input_schema=agdata(text="str"),
-    output_schema=agdata(summary="str"),
+    input_schema=agdata(text=str),
+    output_schema=agdata(summary=str),
 )
 
 ag = agent(
@@ -52,6 +52,8 @@ print(result.summary)   # blocks until done
 ## Core concepts
 
 **`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. Fields are accessed as attributes (`result.summary`). Supports JSON serialisation and schema validation.
+
+**`agtype`** — base class for typed agdata field values. Subclass to control how a schema field is serialised, transferred to/from the sandbox filesystem, represented in the system prompt, and cleaned up. `agfile` is the built-in subclass for file-backed fields.
 
 **`agskill`** — a named ReAct loop with its own system prompt, optional input/output schemas, and an optional tool list. The LLM calls tools, inspects results, and iterates until it produces a final JSON answer. Output is validated against the schema; failures inject a correction message and retry.
 
@@ -140,7 +142,8 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 |---|---|
 | [parallelization.md](docs/parallelization.md) | Parallelism design — threads, processes, GIL, limitations |
 | [agent.md](docs/agent.md) | Agent construction, `run()`, forking, history, UI callbacks |
-| [skills.md](docs/skills.md) | ReAct loop, schemas, validation, retries, streaming batching |
+| [skills.md](docs/skills.md) | ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
+| [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, custom subclasses |
 | [tools.md](docs/tools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
 | [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
 | [container.md](docs/container.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |

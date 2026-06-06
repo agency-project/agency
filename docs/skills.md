@@ -10,8 +10,8 @@ from agency import agskill, agdata
 skill = agskill(
     name="summarize",
     system_prompt="You are a concise summarizer. Return only valid JSON.",
-    input_schema=agdata(text="str"),
-    output_schema=agdata(summary="str", word_count="int"),
+    input_schema=agdata(text=str),
+    output_schema=agdata(summary=str, word_count=int),
 )
 ```
 
@@ -33,14 +33,15 @@ Both schemas are serialized and appended to the system prompt so the LLM knows t
 
 Each call to `agskill.run()` executes a standard ReAct loop:
 
-1. Build messages: `[system] + history + [user: input.to_json()]`
-2. Drain user inbox (injected mid-conversation messages from `agUI` or `agent._inbox`)
-3. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below)
-4. Check token usage — compact context if over threshold (see [compaction.md](compaction.md))
-5. If response contains tool calls → execute each tool (offloaded to a worker process), append results, go to 2
-6. If response is a final answer → parse JSON, validate against `output_schema`
-7. If validation fails and retries remain → inject correction message, go to 2
-8. Return `(result, updated_history, history_delta)`
+1. Offload oversized input fields to files in the agent's sandbox (see below)
+2. Build messages: `[system] + history + [user: input.to_json()]`
+3. Drain user inbox (injected mid-conversation messages from `agUI` or `agent._inbox`)
+4. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below)
+5. Check token usage — compact context if over threshold (see [compaction.md](compaction.md))
+6. If response contains tool calls → execute each tool (offloaded to a worker process), append results, go to 3
+7. If response is a final answer → parse JSON, validate against `output_schema`
+8. If validation fails and retries remain → inject correction message, go to 3
+9. Delete offloaded input files, return `(result, updated_history, history_delta)`
 
 The loop exits early on `max_steps` (default `10`) exceeded.
 
@@ -54,6 +55,79 @@ The LLM call uses `stream=True`. Without batching, each SSE token chunk would ac
 - On wake, the main thread drains everything buffered during the sleep in one burst
 
 This means threads running other agents get 100 ms of uncontested GIL time for every batch of streamed tokens, dramatically improving throughput under concurrent load.
+
+## Typed field values (`agtype` and `agfile`)
+
+Schema field types can be `agtype` subclasses as well as plain type-name strings.  The built-in subclass is `agfile`.  See [agtype.md](agtype.md) for the full interface and instructions for writing custom field types.
+
+Declare a schema field with `agfile` as its type to make the framework handle file I/O transparently for that field.
+
+```python
+from agency import agskill, agdata, agfile
+
+design_skill = agskill(
+    name="design",
+    system_prompt="Create a story design document.",
+    input_schema=agdata(theme=str, background=agfile),
+    output_schema=agdata(design_doc=agfile),
+)
+```
+
+### Input `agfile` fields
+
+Before the ReAct loop starts, each input field declared as `agfile` is written to `/workspace/inputs/<skill_name>_<field>.txt` inside the agent's sandbox. The field value in the JSON sent to the LLM is replaced with the file path:
+
+```json
+{"theme": "space opera", "background": "/workspace/inputs/design_background.txt"}
+```
+
+The system prompt automatically gains an instruction telling the agent to use the `read` tool to access the file, with a warning that the file is temporary and will be deleted after the task ends.
+
+From Python, the caller always passes and receives plain string content — the file path is an internal detail invisible outside the framework.
+
+### Output `agfile` fields
+
+For each output field declared as `agfile`, the system prompt instructs the agent to write the content to a file (e.g. `/workspace/outputs/<skill_name>_<field>.txt`) and return the path as the field value. After the skill completes, the framework reads the file content from the sandbox and stores it as a plain string in the result agdata. The caller receives content, not a path.
+
+### Cleanup
+
+All `agfile` files — both input and output — are deleted from the sandbox in the `finally` block after the skill ends, whether it succeeded or raised. They never persist between skill invocations on the same agent.
+
+### Schema display
+
+In the JSON format sections appended to the system prompt, `agfile` fields are shown with the type hint `"file"` (from `agfile.schema_type()`):
+
+```json
+{"background": "file", "theme": "string"}
+```
+
+---
+
+## Automatic input offloading
+
+Independently of `agfile`, the framework automatically offloads any top-level string field whose value exceeds `INPUT_OFFLOAD_CHARS` (default `2000`) to a temporary file in the sandbox. The field value in the JSON is replaced with a short reference:
+
+```
+(content saved to /workspace/inputs/create_chapter_design_doc.txt — use the read tool to access it)
+```
+
+When this happens, the system prompt receives an extra note listing the affected fields:
+
+```
+Note: The following input fields contain large content that has been automatically
+saved to temporary files in your sandbox: `design_doc`, `previous_chapter`. The
+file paths are shown in the input JSON. Use the read tool to access the full content.
+WARNING: these files are temporary and will be automatically deleted after this task ends.
+```
+
+The threshold can be adjusted at the module level:
+
+```python
+import agency.agent as _ag
+_ag.INPUT_OFFLOAD_CHARS = 4000
+```
+
+Only top-level string fields are auto-offloaded. Non-string values (integers, booleans, lists, nested agdata) are always inlined. Auto-offloaded files are cleaned up in the same `finally` block as `agfile` files.
 
 ## Input validation
 
@@ -104,8 +178,8 @@ Writes content to a file path inside the sandbox container. Requires the agent t
 ```python
 from agency.common_skills import WriterSkill
 skill = WriterSkill()
-# input:  agdata(file_path="str", content="str")
-# output: agdata(path="str", status="str")
+# input:  agdata(file_path=str, content=str)
+# output: agdata(path=str, status=str)
 ```
 
 ### `SummariserSkill`
@@ -115,8 +189,8 @@ Summarises a piece of text in one sentence. Has no tools (`tools=[]`) — pure r
 ```python
 from agency.common_skills import SummariserSkill
 skill = SummariserSkill()
-# input:  agdata(text="str")
-# output: agdata(summary="str")
+# input:  agdata(text=str)
+# output: agdata(summary=str)
 ```
 
 ### `FindPapersSkill`
@@ -126,8 +200,8 @@ Searches arxiv for papers on a topic using a bundled `search_papers` tool. Inclu
 ```python
 from agency.common_skills import FindPapersSkill
 skill = FindPapersSkill(max_papers=8)   # default 16
-# input:  agdata(topic="str")
-# output: agdata(papers="list", count="int")
+# input:  agdata(topic=str)
+# output: agdata(papers=list, count=int)
 ```
 
 The bundled tool is also accessible as `skill.search_papers` if you need to reuse it elsewhere.
@@ -139,8 +213,8 @@ Fetches the full text of an arxiv paper and writes a technical summary covering 
 ```python
 from agency.common_skills import SummarisePaperSkill
 skill = SummarisePaperSkill()
-# input:  agdata(title="str", url="str", abstract="str")
-# output: agdata(summary="str")
+# input:  agdata(title=str, url=str, abstract=str)
+# output: agdata(summary=str)
 ```
 
 The system prompt requires the agent to call `fetch_paper` before responding — it will not summarise from the abstract alone.
@@ -152,8 +226,8 @@ Writes a structured markdown research report to a path inside the sandbox. Requi
 ```python
 from agency.common_skills import CompileReportSkill
 skill = CompileReportSkill()
-# input:  agdata(topic="str", summaries="list", output_path="str")
-# output: agdata(report_path="str", paper_count="int")
+# input:  agdata(topic=str, summaries=list, output_path=str)
+# output: agdata(report_path=str, paper_count=int)
 ```
 
 ### Using common skills in an `agteam`
@@ -183,7 +257,7 @@ def validate_score(result: agdata) -> list[str]:
 skill = agskill(
     name="grade",
     system_prompt="Grade the submission from 0 to 100.",
-    output_schema=agdata(score="int", feedback="str"),
+    output_schema=agdata(score=int, feedback=str),
     output_validator=validate_score,
 )
 ```
