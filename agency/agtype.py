@@ -162,7 +162,8 @@ class agfile(agtype):
         return (
             f"  - Input `{field_name}`: the JSON value is a path to a temporary "
             f"file in your sandbox. Use the read tool to access the full content "
-            f"before completing the task."
+            f"before completing the task. This input file is temporary and will be cleaned up automatically "
+            f"after the task completes."
         )
 
     @classmethod
@@ -170,6 +171,6 @@ class agfile(agtype):
         return (
             f"  - Output `{field_name}`: write your output to a file (e.g. "
             f"/workspace/outputs/{skill_name}_{field_name}.txt) and return only "
-            f"the file path as the field value. The framework will read the "
-            f"content automatically."
+            f"the file path as the field value. This output file is temporary and will be cleaned up automatically "
+            f"after the task completes."
         )
