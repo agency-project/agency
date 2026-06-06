@@ -494,12 +494,15 @@ class agent:
             # Runs after result_future so the caller can unblock immediately;
             # history_future holds until pruning is done so the dependency chain
             # sees clean history.
-            pruned_msgs = _prune_tool_outputs(
-                outer_history._data.get("messages", [])
-            )
-            if pruned_msgs is not outer_history._data.get("messages", []):
-                outer_history = agdata(messages=pruned_msgs)
-                self._term.log("PRUNE    ", f"{skill_name}  history pruned to {len(pruned_msgs)} msgs")
+            try:
+                pruned_msgs = _prune_tool_outputs(
+                    outer_history._data.get("messages", [])
+                )
+                if pruned_msgs is not outer_history._data.get("messages", []):
+                    outer_history = agdata(messages=pruned_msgs)
+                    self._term.log("PRUNE    ", f"{skill_name}  history pruned to {len(pruned_msgs)} msgs")
+            except Exception as prune_exc:
+                self._term.log("PRUNE ✗  ", f"{skill_name}  pruning failed: {prune_exc}")
 
             history_future.set_result(outer_history)
 

@@ -78,6 +78,44 @@ agsync(team)     # wait for completion
 
 If a team's `run()` raised an exception, `agsync` re-raises it at the barrier. If multiple teams failed, the first exception encountered is raised; the rest are silently swallowed (their errors are still visible via the pending `agdata` objects returned by `run()`).
 
+## Serializing sequential calls on a shared agent
+
+When an `agteam` holds a persistent agent in `setup()` and calls it inside `run()`, concurrent `run()` invocations on the same team instance will race to register on that agent's history chain. Because `agteam.run()` is non-blocking, both invocations can submit their work and call the shared agent before either one finishes, producing a non-deterministic registration order that can deadlock (see [deadlock.md](deadlock.md)).
+
+The fix is an `agsync` barrier between the two calls, placed so the first invocation fully completes — including resolving the shared agent's history — before the second one registers:
+
+```python
+class WriterTeam(agteam):
+    def setup(self):
+        self.feedback_team = FeedbackTeam(llm_config=self.llm_config)
+        ...
+
+    def run(self, scene_goal, design_doc, previous_scenes=""):
+        # First call — must complete before the loop submits the second call,
+        # because both calls share feedback_team.main_feedback (a persistent agent).
+        feedback_doc = self.feedback_team.run(
+            section_goal=scene_goal, design_doc=design_doc,
+            previous_scenes=previous_scenes,
+        )
+        agsync(self.feedback_team)   # barrier: wait for all agent histories to resolve
+
+        while True:
+            plan_doc      = planner.run(self.plan_skill, agdata(feedback=feedback_doc, ...))
+            current_draft = writer.run(self.write_skill, agdata(plan=plan_doc, ...))
+
+            # Safe to submit now: agsync guarantees the first call has fully registered
+            # and resolved on the shared agent before this second call registers.
+            review = self.feedback_team.run(
+                section_goal=scene_goal, design_doc=design_doc,
+                previous_scenes=previous_scenes, draft=current_draft,
+            )
+            if review.is_good_enough:
+                break
+            feedback_doc = review
+```
+
+`agsync` is the right primitive here — not field access on the pending result — because it also waits for all tracked agent histories to resolve, not just the team's background thread. The shared agent's history is what the second invocation chains on.
+
 ## Relationship to field access on pending agdata
 
 Both `agsync(team)` and reading a field on the pending `agdata` returned by `run()` will block until the team finishes:
