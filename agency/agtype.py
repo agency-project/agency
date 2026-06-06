@@ -136,7 +136,7 @@ class agfile(agtype):
     ) -> tuple[str, list[str]]:
         if not isinstance(value, str):
             return value, []
-        path = f"/workspace/inputs/{skill_name}_{field_name}.txt"
+        path = f"/workspace/inputs/{field_name}.txt"
         try:
             sandbox.write_file(path, value)
             return path, [path]
@@ -170,7 +170,7 @@ class agfile(agtype):
     def extra_output_prompt(cls, field_name: str, skill_name: str) -> str:
         return (
             f"  - Output `{field_name}`: write your output to a file (e.g. "
-            f"/workspace/outputs/{skill_name}_{field_name}.txt) and return only "
+            f"/workspace/outputs/{field_name}.txt) and return only "
             f"the file path as the field value. This output file is temporary and will be cleaned up automatically "
             f"after the task completes."
         )

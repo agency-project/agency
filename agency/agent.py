@@ -130,12 +130,13 @@ INPUT_OFFLOAD_CHARS: int = 2000
 
 
 def _offload_large_fields(
-    inp: agdata, sandbox: "agSandbox", skill_name: str
+    inp: agdata, sandbox: "agSandbox", skill_name: str,
 ) -> tuple[list[str], list[str]]:
     """Write oversized string fields to /workspace/inputs/ in the sandbox.
 
-    Each field whose serialized string value exceeds INPUT_OFFLOAD_CHARS is
-    replaced in-place with a short reference string pointing to the file.
+    Called after agtype fields have already been prepared (so agfile inputs are
+    already short file paths).  Each remaining field whose string value still
+    exceeds INPUT_OFFLOAD_CHARS is replaced in-place with a short reference.
     Returns (paths_written, field_names) so the caller can delete files and
     build an auto-offload note for the system prompt.
     """
@@ -476,14 +477,15 @@ class agent:
                 outer_delta:     list[dict]    = []
                 is_continuation  = False
 
-                # Offload oversized fields and write agfile input fields to sandbox.
+                # Prepare agtype fields first (agfile → file path), then offload
+                # any remaining oversized plain-string fields.
+                _offloaded_paths.extend(
+                    _prepare_agtype_inputs(current_input, af.input_schema, self.sandbox, skill_name)
+                )
                 auto_paths, auto_fields = _offload_large_fields(
                     current_input, self.sandbox, skill_name
                 )
                 _offloaded_paths.extend(auto_paths)
-                _offloaded_paths.extend(
-                    _prepare_agtype_inputs(current_input, af.input_schema, self.sandbox, skill_name)
-                )
 
                 # Build extra system prompt note for auto-offloaded fields so the
                 # agent knows they are temporary and how to access them.

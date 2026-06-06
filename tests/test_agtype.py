@@ -85,16 +85,16 @@ def test_agfile_extra_output_prompt_mentions_write():
     prompt = agfile.extra_output_prompt("report", "design")
     assert "report" in prompt
     assert "write" in prompt.lower()
-    assert "design_report" in prompt  # skill_field in example path
+    assert "report.txt" in prompt
 
 def test_agfile_prepare_writes_to_sandbox_and_returns_path():
     sandbox = MagicMock()
     val, paths = agfile.prepare("file content", sandbox, "miskill", "myfield")
     sandbox.write_file.assert_called_once_with(
-        "/workspace/inputs/miskill_myfield.txt", "file content"
+        "/workspace/inputs/myfield.txt", "file content"
     )
-    assert val == "/workspace/inputs/miskill_myfield.txt"
-    assert paths == ["/workspace/inputs/miskill_myfield.txt"]
+    assert val == "/workspace/inputs/myfield.txt"
+    assert paths == ["/workspace/inputs/myfield.txt"]
 
 def test_agfile_prepare_non_string_passthrough():
     sandbox = MagicMock()
@@ -306,9 +306,9 @@ def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
     schema = agdata(theme=str, background=agfile)
     paths = _prepare_agtype_inputs(inp, schema, sandbox, "design")
     sandbox.write_file.assert_called_once_with(
-        "/workspace/inputs/design_background.txt", "long background text"
+        "/workspace/inputs/background.txt", "long background text"
     )
-    assert inp._data["background"] == "/workspace/inputs/design_background.txt"
+    assert inp._data["background"] == "/workspace/inputs/background.txt"
     assert inp._data["theme"] == "space opera"  # unchanged (plain str, not agfile)
     assert len(paths) == 1
 
