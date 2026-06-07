@@ -185,7 +185,7 @@ class agskill:
         history: agdata,
         sandbox: "agSandbox",
         pool: "agResourcePool | None" = None,
-        max_steps: int = 10,
+        max_steps: int = 100,
         term: "agterm | None" = None,
         log: "aglog | None" = None,
         _is_continuation: bool = False,

@@ -419,7 +419,7 @@ class agent:
         except Exception:
             pass
 
-    def run(self, skill: "agskill", input: agdata, max_steps: int = 10) -> agdata:
+    def run(self, skill: "agskill", input: agdata, max_steps: int = 100) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
         The future resolves only after:
@@ -668,7 +668,7 @@ class agent:
         self,
         skill: "agskill",
         input: "agdata",
-        max_steps: int = 10,
+        max_steps: int = 100,
     ) -> "agdata":
         """Async wrapper around ``run()`` for use in asyncio event loops.
 
