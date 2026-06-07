@@ -62,11 +62,12 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
     return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
-def make_skill(name="summarise", tools=None) -> agskill:
+def make_skill(name="summarise", add_tools=None, replace_tools=None) -> agskill:
     return agskill(
         name=name,
         system_prompt="You are a summarisation assistant.",
-        tools=tools,
+        add_tools=add_tools,
+        replace_tools=replace_tools,
     )
 
 
@@ -84,7 +85,7 @@ def test_run_returns_agdata_and_history():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"summary": "ok"}')
-        result, hist, delta = s.run(LLM_CONFIG, agdata(text="hello"), agdata(messages=[]), [])
+        result, hist, delta = s.run(LLM_CONFIG, agdata(text="hello"), agdata(messages=[]), sandbox=None)
     assert isinstance(result, agdata)
     assert isinstance(hist, agdata)
     assert isinstance(delta, list)
@@ -94,7 +95,7 @@ def test_run_direct_json_response():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "42"}')
-        result, _, _ = s.run(LLM_CONFIG, agdata(q="6*7"), agdata(messages=[]), [])
+        result, _, _ = s.run(LLM_CONFIG, agdata(q="6*7"), agdata(messages=[]), sandbox=None)
     assert result.answer == "42"
 
 
@@ -102,7 +103,7 @@ def test_run_plain_text_fallback():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("hello world")
-        result, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), [])
+        result, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), sandbox=None)
     assert result.result == "hello world"
 
 
@@ -118,7 +119,7 @@ def test_system_prompt_prepended_to_llm_call():
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [])
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
     assert captured["messages"][0]["role"] == "system"
     assert captured["messages"][0]["content"] == "You are a summarisation assistant."
 
@@ -127,7 +128,7 @@ def test_system_prompt_not_in_returned_history():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [])
+        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
     roles = [m["role"] for m in hist.messages]
     assert "system" not in roles
 
@@ -141,7 +142,7 @@ def test_existing_history_included_in_call():
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM_CONFIG, agdata(x=1), prior, [])
+        s.run(LLM_CONFIG, agdata(x=1), prior, sandbox=None)
     # system at [0], prior messages at [1] and [2], new user at [-1]
     assert captured["messages"][1]["content"] == "prior"
     assert captured["messages"][-1]["role"] == "user"
@@ -158,11 +159,11 @@ def test_tool_call_executes_and_continues():
     t = agtool(name="calc", description="", fn=fn,
              params={"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]})
 
-    s = make_skill(tools=[t])
+    s = make_skill(replace_tools=[t])
     responses = [_tool_call("calc", {"x": 7}), _direct('{"result": 70}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, hist, delta = s.run(LLM_CONFIG, agdata(task="calc"), agdata(messages=[]), [])
+        result, hist, delta = s.run(LLM_CONFIG, agdata(task="calc"), agdata(messages=[]), sandbox=None)
 
     # Verify the tool ran with the right args and its output reached the LLM
     tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
@@ -176,7 +177,7 @@ def test_unknown_tool_error_in_history():
     responses = [_tool_call("ghost", {}), _direct("{}")]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [])
+        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
     tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
     assert any("unknown tool" in m["content"] for m in tool_msgs)
 
@@ -185,42 +186,62 @@ def test_max_steps_exceeded():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = lambda **kw: _tool_call("x", {})
-        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [], max_steps=3)
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None, max_steps=3)
     assert result.error == "max_steps exceeded"
 
 
 # ---------------------------------------------------------------------------
-# Tool inheritance: None inherits agent tools, [] overrides with empty
+# replace_tools / add_tools
 # ---------------------------------------------------------------------------
 
-def test_tools_none_inherits_agent_tools():
-    """When agskill.tools is None, agent_tools are used."""
-    agent_tool = agtool(name="at", description="agent tool", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", tools=None)
+def test_replace_tools_overrides_defaults():
+    """replace_tools replaces the tool list entirely; no sandbox tools included."""
+    my_tool = agtool(name="mt", description="my tool", fn=_noop_r1)
+    s = agskill(name="s", system_prompt="", replace_tools=[my_tool])
     captured = {}
     def capture(**kwargs):
         captured["tools"] = kwargs.get("tools")
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [agent_tool])
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
     assert captured["tools"] is not None
-    assert captured["tools"][0]["function"]["name"] == "at"
+    assert len(captured["tools"]) == 1
+    assert captured["tools"][0]["function"]["name"] == "mt"
 
 
-def test_tools_empty_list_passes_agent_tools():
-    """When agskill.tools=[], agent tools are still passed (empty extension = same as None)."""
-    agent_tool = agtool(name="at", description="agent tool", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", tools=[])
+def test_replace_tools_empty_list_gives_no_tools():
+    """replace_tools=[] means no tools at all."""
+    s = agskill(name="s", system_prompt="", replace_tools=[])
     captured = {}
     def capture(**kwargs):
         captured["tools"] = kwargs.get("tools")
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [agent_tool])
-    assert captured["tools"] is not None
-    assert captured["tools"][0]["function"]["name"] == "at"
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert captured["tools"] is None
+
+
+def test_add_tools_extends_sandbox_defaults():
+    """add_tools appends to whatever make_sandboxed_tools returns."""
+    extra = agtool(name="extra", description="extra", fn=_noop_r1)
+    s = agskill(name="s", system_prompt="", add_tools=[extra])
+    captured = {}
+    fake_default = agtool(name="bash", description="", fn=_noop_r1)
+    def fake_make_sandboxed(sandbox, pool):
+        return [fake_default]
+    import agency.tools as _tools_mod
+    with patch("openai.OpenAI") as MockClient, \
+         patch.object(_tools_mod, "make_sandboxed_tools", side_effect=fake_make_sandboxed):
+        def capture(**kwargs):
+            captured["tools"] = kwargs.get("tools")
+            return _direct("{}")
+        MockClient.return_value.chat.completions.create.side_effect = capture
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=object())
+    names = [t["function"]["name"] for t in (captured.get("tools") or [])]
+    assert "bash" in names
+    assert "extra" in names
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +253,7 @@ def test_input_schema_missing_field_returns_error():
         name="s", system_prompt="",
         input_schema=agdata(question=str, context=str),
     )
-    result, _, _ = s.run(LLM_CONFIG, agdata(question="hi"), agdata(messages=[]), [])
+    result, _, _ = s.run(LLM_CONFIG, agdata(question="hi"), agdata(messages=[]), sandbox=None)
     assert result.error is not None
     assert "context" in result.error
 
@@ -242,7 +263,7 @@ def test_input_schema_type_error_returns_error():
         name="s", system_prompt="",
         input_schema=agdata(count=int),
     )
-    result, _, _ = s.run(LLM_CONFIG, agdata(count="not-an-int"), agdata(messages=[]), [])
+    result, _, _ = s.run(LLM_CONFIG, agdata(count="not-an-int"), agdata(messages=[]), sandbox=None)
     assert result.error is not None
     assert "count" in result.error
 
@@ -254,7 +275,7 @@ def test_input_schema_valid_proceeds():
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": true}')
-        result, _, _ = s.run(LLM_CONFIG, agdata(text="hello"), agdata(messages=[]), [])
+        result, _, _ = s.run(LLM_CONFIG, agdata(text="hello"), agdata(messages=[]), sandbox=None)
     assert getattr(result, "error", None) is None
 
 
@@ -266,7 +287,7 @@ def test_input_schema_description_value_only_checks_presence():
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        result, _, _ = s.run(LLM_CONFIG, agdata(query=42), agdata(messages=[]), [])
+        result, _, _ = s.run(LLM_CONFIG, agdata(query=42), agdata(messages=[]), sandbox=None)
     assert getattr(result, "error", None) is None  # 42 is not type-checked
 
 
@@ -283,7 +304,7 @@ def test_output_schema_missing_field_triggers_retry():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.run(LLM_CONFIG, agdata(text="hi"), agdata(messages=[]), [])
+        result, _, _ = s.run(LLM_CONFIG, agdata(text="hi"), agdata(messages=[]), sandbox=None)
     assert result.summary == "good"
 
 
@@ -295,7 +316,7 @@ def test_output_schema_retry_exhausted_returns_error():
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"wrong": 1}')
-        result, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), [], max_steps=10)
+        result, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), sandbox=None, max_steps=10)
     assert result.error is not None
     assert "output schema error" in result.error
 
@@ -312,7 +333,7 @@ def test_output_schema_type_mismatch_triggers_retry():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), [])
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
     assert result.count == 5
 
 
@@ -341,7 +362,7 @@ def test_correction_message_appended_on_retry():
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = side_effect
-        result, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), [])
+        result, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), sandbox=None)
 
     assert result.answer == "fixed"
     # Second call should have a correction user message near the end

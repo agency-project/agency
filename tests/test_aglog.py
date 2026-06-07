@@ -15,7 +15,7 @@ def make_agent(tools=None) -> agent:
 
 def make_skill(name: str = "s", out: dict | None = None):
     sk = agskill(name, "")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         return agdata(**(out or {"ok": True})), agdata(
             messages=list(hist._data.get("messages", [])) + [{"role": "user", "content": name}]
         ), []

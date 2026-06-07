@@ -73,6 +73,9 @@ from .agcompaction import compact, should_compact
 
 if TYPE_CHECKING:
     from .agterm import agterm
+    from .aglog import aglog
+    from .agsandbox import agSandbox
+    from .agresources import agResourcePool
 
 class agskill:
     """A named skill with its own system prompt and a self-contained ReAct loop.
@@ -92,7 +95,8 @@ class agskill:
         self,
         name: str,
         system_prompt: str,
-        tools: list[agtool] | None = None,
+        add_tools: list[agtool] | None = None,
+        replace_tools: list[agtool] | None = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
         output_validator: "Callable[[agdata], list[str]] | None" = None,
@@ -100,7 +104,8 @@ class agskill:
     ):
         self.name = name
         self.system_prompt = system_prompt
-        self.tools = tools          # None → inherit from agent
+        self.add_tools = add_tools
+        self.replace_tools = replace_tools
         self.input_schema = input_schema
         self.output_schema = output_schema
         self.output_validator = output_validator   # extra check beyond type schema
@@ -178,9 +183,11 @@ class agskill:
         llm_config: dict,
         input: agdata,
         history: agdata,
-        agent_tools: list[agtool],
+        sandbox: "agSandbox",
+        pool: "agResourcePool | None" = None,
         max_steps: int = 10,
         term: "agterm | None" = None,
+        log: "aglog | None" = None,
         _is_continuation: bool = False,
         _state_fn: "Callable | None" = None,
         _live_messages_fn: "Callable | None" = None,
@@ -209,7 +216,17 @@ class agskill:
                 sys_msg = {"role": "system", "content": self._build_system_prompt(_extra_system)}
                 return agdata(error=f"input schema error: {errors}"), history, [sys_msg]
 
-        active_tools: list[agtool] = list(agent_tools or []) + list(self.tools or [])
+        from .tools import make_sandboxed_tools
+        if self.replace_tools is not None:
+            active_tools: list[agtool] = list(self.replace_tools)
+        elif sandbox is not None:
+            active_tools = make_sandboxed_tools(sandbox, pool)
+            if self.add_tools:
+                active_tools.extend(self.add_tools)
+        else:
+            active_tools = list(self.add_tools or [])
+        for t in active_tools:
+            t.attach_logger(term, log)
         tool_map = {t.name: t for t in active_tools}
         openai_tools = [t.to_openai_tool() for t in active_tools] or None
 

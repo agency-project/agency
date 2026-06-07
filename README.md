@@ -142,16 +142,18 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 |---|---|
 | [parallelization.md](docs/parallelization.md) | Parallelism design — threads, processes, GIL, limitations |
 | [agent.md](docs/agent.md) | Agent construction, `run()`, forking, history, UI callbacks |
-| [skills.md](docs/skills.md) | ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
+| [agdata.md](docs/agdata.md) | Data container — pending results, schema types, serialization, error handling |
+| [agskill.md](docs/agskill.md) | ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
 | [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, custom subclasses |
-| [tools.md](docs/tools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
+| [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
 | [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
-| [container.md](docs/container.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |
+| [agsandbox.md](docs/agsandbox.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |
+| [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, agUI routing |
 | [execution_loop.md](docs/execution_loop.md) | Outer monitoring loop, inner ReAct loop, inbox drain, compaction |
 | [execution_process_control.md](docs/execution_process_control.md) | Trace: background job, foreground job, daemon |
-| [resource_control.md](docs/resource_control.md) | GPU/CPU/memory resource pool |
-| [logging.md](docs/logging.md) | Structured JSONL log — skills, tools, lifecycle, compaction |
+| [agresources.md](docs/agresources.md) | GPU/CPU/memory resource pool |
+| [aglog.md](docs/aglog.md) | Structured JSONL log — skills, tools, lifecycle, compaction |
 | [compaction.md](docs/compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
-| [ui.md](docs/ui.md) | Terminal UI — layout, keyboard bindings, interaction pane |
+| [agui.md](docs/agui.md) | Terminal UI — layout, keyboard bindings, interaction pane |
 | [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
 | [deadlock.md](docs/deadlock.md) | Deadlock patterns — shared agents across parallel threads, diagnosis, and fixes |

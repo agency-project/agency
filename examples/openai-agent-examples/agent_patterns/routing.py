@@ -19,7 +19,7 @@ french_skill = agskill(
     system_prompt="You only speak French.",
     input_schema=agdata(message=str),
     output_schema=agdata(response=str),
-    tools=[],
+    replace_tools=[],
 )
 
 spanish_skill = agskill(
@@ -27,7 +27,7 @@ spanish_skill = agskill(
     system_prompt="You only speak Spanish.",
     input_schema=agdata(message=str),
     output_schema=agdata(response=str),
-    tools=[],
+    replace_tools=[],
 )
 
 english_skill = agskill(
@@ -35,7 +35,7 @@ english_skill = agskill(
     system_prompt="You only speak English.",
     input_schema=agdata(message=str),
     output_schema=agdata(response=str),
-    tools=[],
+    replace_tools=[],
 )
 
 triage_skill = agskill(
@@ -47,7 +47,7 @@ triage_skill = agskill(
     ),
     input_schema=agdata(message=str),
     output_schema=agdata(language=str, message=str),
-    tools=[],
+    replace_tools=[],
 )
 
 ag = agent(llm_config=LLM_CONFIG)

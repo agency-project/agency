@@ -31,7 +31,7 @@ assistant_skill = agskill(
     output_schema=agdata(reasoning=str, response=str),
     output_validator=_no_phone_numbers,
     max_retries=1,
-    tools=[],
+    replace_tools=[],
 )
 
 ag = agent(llm_config=LLM_CONFIG)

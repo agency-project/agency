@@ -22,7 +22,7 @@ generator_skill = agskill(
     ),
     input_schema=agdata(prompt=str),
     output_schema=agdata(outline=str),
-    tools=[],
+    replace_tools=[],
 )
 
 evaluator_skill = agskill(
@@ -38,7 +38,7 @@ evaluator_skill = agskill(
         [] if str(getattr(r, "score", "")).lower() in ("pass", "needs_improvement", "fail")
         else ["score must be 'pass', 'needs_improvement', or 'fail'"]
     ),
-    tools=[],
+    replace_tools=[],
 )
 
 ag = agent(llm_config=LLM_CONFIG)

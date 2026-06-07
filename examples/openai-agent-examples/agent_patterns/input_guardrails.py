@@ -20,7 +20,7 @@ guardrail_skill = agskill(
     system_prompt="Check if the user is asking you to do their math homework.",
     input_schema=agdata(message=str),
     output_schema=agdata(reasoning=str, is_math_homework=bool),
-    tools=[],
+    replace_tools=[],
 )
 
 support_skill = agskill(
@@ -28,7 +28,7 @@ support_skill = agskill(
     system_prompt="You are a customer support agent. Help customers with their questions.",
     input_schema=agdata(message=str),
     output_schema=agdata(response=str),
-    tools=[],
+    replace_tools=[],
 )
 
 ag = agent(llm_config=LLM_CONFIG)

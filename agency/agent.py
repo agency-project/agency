@@ -33,7 +33,6 @@ from .agterm import agterm
 from .agsandbox import agSandbox, get_container_runtime
 from .agresources import agResourcePool
 from .agcompaction import fetch_context_limit, _prune_tool_outputs
-from .tools import make_sandboxed_tools
 
 _NOUNS = [
     "alex", "andy", "arch", "bake", "bale", "band", "bart", "base",
@@ -279,7 +278,6 @@ class agent:
     def __init__(
         self,
         llm_config: "dict | agent | None" = None,
-        tools: list[agtool] | None = None,
         agname: str | None = None,
     ):
         # Inject llm_config from the enclosing agteam when not supplied.
@@ -312,12 +310,6 @@ class agent:
             self._history      = agdata(messages=[])
             self.sandbox       = agSandbox(self.agname, output_dir=_out)
 
-        # Build sandboxed tool list; user-supplied tools override if provided
-        if tools is not None:
-            self.tools = list(tools)
-        else:
-            self.tools = make_sandboxed_tools(self.sandbox, pool)
-
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{self.agname}.jsonl"
         self.log  = aglog(path=log_path)
@@ -325,10 +317,6 @@ class agent:
         self._full_history_path: Path = log_dir / f"{self.agname}_full.jsonl"
         self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
         self._term = agterm(self.agname)
-
-        # Wire terminal + file logging into every tool.
-        for t in self.tools:
-            t.attach_logger(self._term, self.log)
 
         # Last fully-resolved message list — updated at the end of every skill
         # run and read (without blocking) by the UI for the history pane.
@@ -356,7 +344,6 @@ class agent:
                 "forked",
                 agname=self.agname,
                 parent_agname=src.agname,
-                tools=[t.name for t in self.tools],
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
             )
         else:
@@ -365,7 +352,6 @@ class agent:
             self.log._lifecycle(
                 "created",
                 agname=self.agname,
-                tools=[t.name for t in self.tools],
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
                 context_limit=self._context_limit,
             )
@@ -520,7 +506,7 @@ class agent:
 
                     result, new_history, history_delta = af.run(
                         self.llm_config, current_input, current_history,
-                        self.tools, max_steps, term=self._term,
+                        self.sandbox, pool, max_steps, term=self._term, log=self.log,
                         _is_continuation=is_continuation,
                         _state_fn=self._set_ui_state,
                         _live_messages_fn=self._push_live_messages,
@@ -742,7 +728,6 @@ class agent:
         cls,
         directory: "Path | str",
         llm_config: dict,
-        tools: "list[agtool] | None" = None,
     ) -> "list[agent]":
         """Restore all ``*.ckpt`` files from *directory*.
 
@@ -770,7 +755,7 @@ class agent:
                 existing._term.log("CKPT     ", f"load_all: {agname} already live, skipping {ckpt.name}")
                 restored.append(existing)
             else:
-                ag = cls.load(ckpt, llm_config=llm_config, tools=tools)
+                ag = cls.load(ckpt, llm_config=llm_config)
                 restored.append(ag)
 
         return restored
@@ -841,7 +826,6 @@ class agent:
         cls,
         path: "Path | str",
         llm_config: dict,
-        tools: "list[agtool] | None" = None,
     ) -> "agent":
         """Restore an agent from a checkpoint file created by ``agent.save()``.
 
@@ -883,15 +867,9 @@ class agent:
         _out = Path(agent.output_dir) / ag.agname if agent.output_dir else None
         ag.sandbox = agSandbox(ag.agname, restore_image=image_tag, output_dir=_out)
 
-        pool = agent.agresource_pool
-        ag.tools = list(tools) if tools is not None else make_sandboxed_tools(ag.sandbox, pool)
-
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         ag.log   = aglog(path=log_dir / f"{ag.agname}.jsonl")
         ag._term = agterm(ag.agname)
-
-        for t in ag.tools:
-            t.attach_logger(ag._term, ag.log)
 
         _live_agents.add(ag)
 

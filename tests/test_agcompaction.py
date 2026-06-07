@@ -404,7 +404,7 @@ def test_agskill_triggers_compaction_when_over_threshold():
     from agency.agskill import agskill
     from agency.agdata import agdata
 
-    skill = agskill(name="test", system_prompt="You are helpful.", tools=[])
+    skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
     limit = BIG_CTX
     over = max(limit - _RESERVED, limit // 2) + 1
@@ -421,7 +421,7 @@ def test_agskill_triggers_compaction_when_over_threshold():
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "done"}', over)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
-                  agent_tools=[], _context_limit=limit)
+                  sandbox=None, _context_limit=limit)
 
     assert len(compact_calls) == 1
 
@@ -430,7 +430,7 @@ def test_agskill_skips_compaction_when_under_threshold():
     from agency.agskill import agskill
     from agency.agdata import agdata
 
-    skill = agskill(name="test", system_prompt="You are helpful.", tools=[])
+    skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
     limit = BIG_CTX
     under = max(limit - _RESERVED, limit // 2) - 1
@@ -447,7 +447,7 @@ def test_agskill_skips_compaction_when_under_threshold():
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "ok"}', under)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
-                  agent_tools=[], _context_limit=limit)
+                  sandbox=None, _context_limit=limit)
 
     assert len(compact_calls) == 0
 
@@ -457,7 +457,7 @@ def test_agskill_passes_context_limit_to_compact():
     from agency.agskill import agskill
     from agency.agdata import agdata
 
-    skill = agskill(name="test", system_prompt="You are helpful.", tools=[])
+    skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
     limit = BIG_CTX
     over = max(limit - _RESERVED, limit // 2) + 1
 
@@ -473,6 +473,6 @@ def test_agskill_passes_context_limit_to_compact():
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "done"}', over)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
-                  agent_tools=[], _context_limit=limit)
+                  sandbox=None, _context_limit=limit)
 
     assert received_kwargs.get("context_limit") == limit

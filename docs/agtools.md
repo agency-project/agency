@@ -63,7 +63,7 @@ Every tool call is logged automatically after it returns. `agent.__init__` calls
 | `grep` | `grep  'def train'  → 3 matches  (25ms)` |
 | others | `<name>  in=[...]  out=[...]  (Nms)` |
 
-Every call also appends a `type="tool"` entry to the agent's JSONL log file. See [logging.md](logging.md).
+Every call also appends a `type="tool"` entry to the agent's JSONL log file. See [aglog.md](aglog.md).
 
 To override logging for a custom tool, pass `log_fn` to the constructor:
 
@@ -148,13 +148,20 @@ my_tool = agtool(
 )
 ```
 
-Pass custom tools to a skill or directly to an agent:
+Tools belong to skills, not agents. Pass custom tools when defining the skill:
 
 ```python
-skill = agskill("math", "You are a calculator.", tools=[my_tool])
+# Add a custom tool on top of the default sandboxed set:
+skill = agskill("research", "Research the topic.", add_tools=[my_tool])
+
+# Replace the full tool list with only your tool:
+skill = agskill("custom", "Use only my tool.", replace_tools=[my_tool])
+
+# No tools — pure LLM reasoning:
+skill = agskill("classify", "Classify this text.", replace_tools=[])
 ```
 
-If `agskill.tools` is `None`, the skill inherits the agent's full sandboxed tool list. Setting `tools=[]` gives the skill no tools (pure reasoning).
+Each skill run rebuilds the tool list from the sandbox. `add_tools` extends the defaults; `replace_tools` overrides them entirely.
 
 ## Tool output
 
@@ -162,7 +169,7 @@ Tool functions receive an `agdata` and must return an `agdata`. The return value
 
 ## bash process tracking
 
-The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by the outer loop. See [container.md](container.md) for exec wrapper details and [execution_loop.md](execution_loop.md) for the outer monitoring loop.
+The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by the outer loop. See [agsandbox.md](agsandbox.md) for exec wrapper details and [execution_loop.md](execution_loop.md) for the outer monitoring loop.
 
 ## `daemon_release` tool
 

@@ -681,7 +681,7 @@ def test_outer_loop_real_process_wall_clock():
 
     skill = agskill(name="s", system_prompt="")
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         event = inp._data.get("_event")
         events.append({"event": event, "t": time.monotonic()})
         if event is None:

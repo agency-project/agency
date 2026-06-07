@@ -82,7 +82,7 @@ ag.container_output_path   # → "/agent_output/agent_smith"
 ag.output_path             # → Path("runs/agent_output/agent_smith")
 ```
 
-See [container.md](container.md) for mount implementation details.
+See [agsandbox.md](agsandbox.md) for mount implementation details.
 
 ## Agent naming
 

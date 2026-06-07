@@ -23,11 +23,36 @@ Both schemas are serialized and appended to the system prompt so the LLM knows t
 |---|---|---|
 | `name` | `str` | Descriptive identifier for the skill |
 | `system_prompt` | `str` | System message prepended to every LLM call |
-| `tools` | `list[agtool] \| None` | Extra tools added on top of the agent's tools; `None` or `[]` adds nothing |
+| `add_tools` | `list[agtool] \| None` | Extra tools appended to the default sandboxed tool list |
+| `replace_tools` | `list[agtool] \| None` | Replaces the tool list entirely; use `replace_tools=[]` for no tools |
 | `input_schema` | `agdata \| None` | Required input fields and their types |
 | `output_schema` | `agdata \| None` | Required output fields; enforced with retries |
 | `output_validator` | `Callable \| None` | Custom validation function, called after schema check |
 | `max_retries` | `int` | Times to retry on output schema failure (default `3`) |
+
+## Schema field types
+
+Schema fields in `agdata` are plain Python type objects:
+
+| Type | JSON hint sent to LLM | Notes |
+|---|---|---|
+| `str` | `"string"` | Plain text |
+| `int` | `"integer"` | |
+| `float` | `"float"` | |
+| `bool` | `"boolean"` | |
+| `list` | `"list"` | |
+| `dict` | `"object"` | |
+| `agfile` | `"file"` | File-backed field — see [Typed field values](#typed-field-values-agtype-and-agfile) |
+
+Any `agtype` subclass is also valid; its `schema_type()` classmethod provides the JSON hint.
+
+```python
+# All built-in Python types work directly:
+output_schema=agdata(summary=str, word_count=int, passed=bool)
+
+# agfile for large text outputs:
+output_schema=agdata(report=agfile)
+```
 
 ## ReAct loop
 
@@ -105,13 +130,15 @@ In the JSON format sections appended to the system prompt, `agfile` fields are s
 
 ## Automatic input offloading
 
-Independently of `agfile`, the framework automatically offloads any top-level string field whose value exceeds `INPUT_OFFLOAD_CHARS` (default `2000`) to a temporary file in the sandbox. The field value in the JSON is replaced with a short reference:
+After `agfile` (and other `agtype`) fields have been prepared, the framework checks every remaining top-level string field. Any value that still exceeds `INPUT_OFFLOAD_CHARS` (default `2000`) is automatically written to a temporary file and the field value is replaced with a short reference:
 
 ```
-(content saved to /workspace/inputs/create_chapter_design_doc.txt — use the read tool to access it)
+(content saved to /workspace/inputs/design_doc.txt — use the read tool to access it)
 ```
 
-When this happens, the system prompt receives an extra note listing the affected fields:
+Because `agfile` fields are already converted to short file paths before this check runs, they are never double-offloaded.
+
+When auto-offloading occurs, the system prompt receives an extra note listing the affected fields:
 
 ```
 Note: The following input fields contain large content that has been automatically
@@ -151,21 +178,26 @@ Output validation is skipped when the LLM response is answering a mid-conversati
 
 The history passed to `agskill.run()` is the agent's shared conversation context. The skill appends its full message exchange to this history and returns the updated version. The system prompt is re-injected fresh on every call and is not persisted in the stored history.
 
-## Skill-level tool extension
+## Skill tools
 
-Every skill always receives the agent's full tool set (sandbox tools such as `bash`, `read`, `write`, etc.). Skill-specific tools are added on top:
+Tools live on the skill, not the agent. Each skill run builds its tool list fresh from the sandbox:
+
+| Parameter | Behaviour |
+|---|---|
+| Neither set (default) | Full sandboxed tool list (`bash`, `read`, `write`, `edit`, `glob`, `grep`, `webfetch`, …) |
+| `add_tools=[t]` | Default sandboxed tools **plus** `t` |
+| `replace_tools=[t]` | Only `t` — no sandboxed tools |
+| `replace_tools=[]` | No tools — pure LLM reasoning |
 
 ```python
 search_tool = agtool("search", "Search the web.", fn=my_search_fn, params={...})
 
-skill = agskill(
-    name="research",
-    system_prompt="Research the topic.",
-    tools=[search_tool],   # agent tools + search_tool
-)
-```
+# Add a custom tool on top of the defaults:
+skill = agskill(name="research", system_prompt="Research the topic.", add_tools=[search_tool])
 
-Passing `tools=None` or `tools=[]` leaves the tool list unchanged — the agent's full tool set is still available. There is no way to remove an agent-level tool from a skill.
+# Pure reasoning, no tools:
+skill = agskill(name="classify", system_prompt="Classify this text.", replace_tools=[])
+```
 
 ## Common skills (`agency.common_skills`)
 
@@ -173,7 +205,7 @@ Passing `tools=None` or `tools=[]` leaves the tool list unchanged — the agent'
 
 ### `WriterSkill`
 
-Writes content to a file path inside the sandbox container. Requires the agent to have the sandbox `write` tool available (inherited via `tools=None`).
+Writes content to a file path inside the sandbox container. Uses the default tool set (includes the sandbox `write` tool).
 
 ```python
 from agency.common_skills import WriterSkill
@@ -184,7 +216,7 @@ skill = WriterSkill()
 
 ### `SummariserSkill`
 
-Summarises a piece of text in one sentence. Has no tools (`tools=[]`) — pure reasoning.
+Summarises a piece of text in one sentence. Has no tools (`replace_tools=[]`) — pure reasoning.
 
 ```python
 from agency.common_skills import SummariserSkill

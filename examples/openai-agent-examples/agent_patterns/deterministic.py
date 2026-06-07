@@ -19,7 +19,7 @@ outline_skill = agskill(
     system_prompt="Generate a very short story outline based on the user's input.",
     input_schema=agdata(prompt=str),
     output_schema=agdata(outline=str),
-    tools=[],
+    replace_tools=[],
 )
 
 checker_skill = agskill(
@@ -31,7 +31,7 @@ checker_skill = agskill(
     ),
     input_schema=agdata(outline=str),
     output_schema=agdata(good_quality=bool, is_scifi=bool),
-    tools=[],
+    replace_tools=[],
 )
 
 story_skill = agskill(
@@ -39,7 +39,7 @@ story_skill = agskill(
     system_prompt="Write a short story based on the given outline.",
     input_schema=agdata(outline=str),
     output_schema=agdata(story=str),
-    tools=[],
+    replace_tools=[],
 )
 
 ag = agent(llm_config=LLM_CONFIG)

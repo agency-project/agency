@@ -38,7 +38,7 @@ weather_skill = agskill(
     system_prompt="You are a helpful agent.",
     input_schema=agdata(question=str),
     output_schema=agdata(response=str),
-    tools=[get_weather],
+    add_tools=[get_weather],
 )
 
 ag = agent(llm_config=LLM_CONFIG)

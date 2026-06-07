@@ -22,7 +22,7 @@ def _make_translator_tool(language: str, instructions: str) -> agtool:
         system_prompt=instructions,
         input_schema=agdata(text=str),
         output_schema=agdata(translation=str),
-        tools=[],
+        replace_tools=[],
     )
 
     def _fn(arg: agdata) -> agdata:
@@ -55,7 +55,7 @@ orchestrator_skill = agskill(
     ),
     input_schema=agdata(message=str),
     output_schema=agdata(result=str),
-    tools=[translate_to_spanish, translate_to_french, translate_to_italian],
+    add_tools=[translate_to_spanish, translate_to_french, translate_to_italian],
 )
 
 synthesizer_skill = agskill(
@@ -63,7 +63,7 @@ synthesizer_skill = agskill(
     system_prompt="Inspect the translations, correct them if needed, and produce a final concatenated response.",
     input_schema=agdata(translations=str),
     output_schema=agdata(final_response=str),
-    tools=[],
+    replace_tools=[],
 )
 
 ag = agent(llm_config=LLM_CONFIG)

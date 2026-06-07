@@ -102,25 +102,19 @@ def smoke_history_shared_across_skills():
 
 
 def smoke_skill_own_tools():
-    """A skill with its own tools list extends agent-level tools."""
+    """add_tools on a skill extends the default sandboxed tools."""
     skill_t = agtool(name="skill_tool", description="", fn=_skill_tool_fn)
-    agent_t = agtool(name="agent_tool", description="", fn=_agent_tool_fn)
 
-    skill = agskill(name="s", system_prompt="", tools=[skill_t])
-    ag = agent(llm_config=LLM_CONFIG, tools=[agent_t])
+    skill = agskill(name="s", system_prompt="", add_tools=[skill_t])
+    ag = agent(llm_config=LLM_CONFIG)
 
-    # With merging, skill has both agent_tool + skill_tool available.
-    # The LLM calls skill_tool first, then agent_tool, then finishes.
-    responses = [_tool_call("skill_tool", {}), _tool_call("agent_tool", {}), _direct("{}")]
+    responses = [_tool_call("skill_tool", {}), _direct("{}")]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
         ag.run(skill, agdata())
 
-    # Verify via history: both skill_tool and agent_tool ran
     tool_msgs = [m for m in ag.history.messages if m.get("role") == "tool"]
-    tool_names_in_history = [m.get("name") for m in ag.history.messages if m.get("role") == "tool"]
     assert any(json.loads(m["content"]) == {"r": 1} for m in tool_msgs), "skill_tool result missing"
-    assert any(json.loads(m["content"]) == {} for m in tool_msgs), "agent_tool result missing"
     return True
 
 

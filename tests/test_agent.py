@@ -51,11 +51,8 @@ def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
     return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
-def make_agent(tools=None) -> agent:
-    kwargs = {}
-    if tools is not None:
-        kwargs["tools"] = tools
-    return agent(llm_config={"api_key": "k", "model": "gpt-4o"}, **kwargs)
+def make_agent() -> agent:
+    return agent(llm_config={"api_key": "k", "model": "gpt-4o"})
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +62,7 @@ def make_agent(tools=None) -> agent:
 def test_run_returns_pending_agdata():
     """run() is non-blocking — result fields resolve lazily."""
     skill = agskill(name="s", system_prompt="")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         return agdata(done=True), agdata(messages=[]), []
     skill.run = fake_run
 
@@ -77,7 +74,7 @@ def test_run_returns_pending_agdata():
 
 def test_run_calls_named_agskill():
     called = []
-    def fake_run(llm_cfg, inp, hist, tools, max_steps, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, max_steps, **_):
         called.append(inp.to_dict())
         return agdata(done=True), agdata(messages=[]), []
 
@@ -103,7 +100,7 @@ def test_repr():
 
 def test_history_updated_after_run():
     skill = agskill(name="s", system_prompt="")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         existing = list(hist._data.get("messages", []))
         new_hist = agdata(messages=existing + [
             {"role": "user", "content": inp.to_json()},
@@ -128,7 +125,7 @@ def test_sequential_calls_serialize_via_history_chain():
 
     def make_skill(name):
         sk = agskill(name, "")
-        def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+        def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
             with lock:
                 order.append(name)
             return agdata(name=name), agdata(messages=list(hist._data.get("messages", [])) + [
@@ -153,7 +150,7 @@ def test_history_passed_to_agskill():
     ag.history = agdata(messages=[{"role": "user", "content": "prior"}])
 
     received = {}
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         received["hist"] = hist
         return agdata(), agdata(messages=[]), []
     skill.run = fake_run
@@ -164,23 +161,23 @@ def test_history_passed_to_agskill():
 
 
 # ---------------------------------------------------------------------------
-# Tools are passed to agskill
+# Tools live on skills, not agents
 # ---------------------------------------------------------------------------
 
-def test_agent_tools_passed_to_agskill():
+def test_skill_replace_tools_used_in_run():
+    """replace_tools on the skill replaces the full tool list."""
     t = agtool(name="t1", description="", fn=_noop)
-    skill = agskill("s", "")
-    ag = make_agent(tools=[t])
-
-    received = {}
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
-        received["tools"] = tools
+    skill = agskill("s", "", replace_tools=[t])
+    captured = {}
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
+        captured["replace_tools"] = skill.replace_tools
         return agdata(), agdata(messages=[]), []
     skill.run = fake_run
 
+    ag = make_agent()
     ag.run(skill, agdata())
-    _ = ag.history   # sync
-    assert received["tools"] == [t]
+    _ = ag.history
+    assert captured["replace_tools"] == [t]
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +204,8 @@ def test_end_to_end_with_tool():
         fn=calc_fn,
         params={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]},
     )
-    skill = agskill(name="math", system_prompt="You are a calculator.")
-    ag = make_agent(tools=[calc])
+    skill = agskill(name="math", system_prompt="You are a calculator.", add_tools=[calc])
+    ag = make_agent()
 
     responses = [_tool_resp("add", {"a": 3, "b": 4}), _direct('{"result": 7}')]
     with patch("openai.OpenAI") as MockClient:
@@ -221,9 +218,9 @@ def test_multiple_agskills_coexist():
     skill_a = agskill("a", "")
     skill_b = agskill("b", "")
 
-    def fake_a(llm, inp, hist, tools, ms, **_):
+    def fake_a(llm, inp, hist, sandbox, pool, ms, **_):
         return agdata(from_skill="a"), agdata(messages=[]), []
-    def fake_b(llm, inp, hist, tools, ms, **_):
+    def fake_b(llm, inp, hist, sandbox, pool, ms, **_):
         return agdata(from_skill="b"), agdata(messages=[]), []
 
     skill_a.run = fake_a
@@ -242,7 +239,7 @@ def test_multiple_agskills_coexist():
 # ---------------------------------------------------------------------------
 
 def test_copy_constructor_inherits_config():
-    ag = make_agent(tools=[])
+    ag = make_agent()
 
     copy_ag = agent(ag)
     assert copy_ag.llm_config == ag.llm_config
@@ -280,7 +277,7 @@ def test_fork_is_alias_for_copy_constructor():
 def test_copy_constructor_waits_for_inflight_task():
     """agent(src) blocks until src's current task finishes before copying history."""
     skill = agskill("s", "")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         return agdata(v=inp.v), agdata(messages=[{"role": "user", "content": str(inp.v)}]), []
     skill.run = fake_run
 
@@ -298,7 +295,7 @@ def test_copy_constructor_waits_for_inflight_task():
 
 def test_fork_runs_do_not_update_parent_history():
     skill = agskill("s", "")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         return agdata(ok=True), agdata(messages=[{"role": "user", "content": "fork_msg"}]), []
     skill.run = fake_run
 
@@ -316,7 +313,7 @@ def test_fork_runs_in_parallel():
     """Multiple forks reach the barrier together, proving concurrent execution."""
     barrier = threading.Barrier(3)
     skill = agskill("s", "")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         barrier.wait(timeout=5)
         return agdata(n=inp.n), agdata(messages=[]), []
     skill.run = fake_run
@@ -329,7 +326,7 @@ def test_fork_runs_in_parallel():
 def test_fork_sees_parent_history_at_fork_time():
     seen = {}
     skill = agskill("s", "")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         seen["hist"] = list(hist.messages)
         return agdata(), agdata(messages=[]), []
     skill.run = fake_run
@@ -351,7 +348,7 @@ def test_run_accepts_pending_agdata_as_input():
     received = {}
 
     skill = agskill("s", "")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         received["inp"] = inp.to_dict()
         return agdata(ok=True), agdata(messages=[]), []
     skill.run = fake_run
@@ -372,7 +369,7 @@ def test_run_resolves_list_of_pending_in_input():
     received = {}
 
     skill = agskill("s", "")
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         received["items"] = inp.items
         return agdata(ok=True), agdata(messages=[]), []
     skill.run = fake_run
@@ -394,7 +391,7 @@ def test_chained_run_output_as_next_input():
     """Output of one run() passed directly as input to the next — resolved automatically."""
     skill = agskill("s", "")
     received_inputs = []
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         received_inputs.append(dict(inp._data))
         return agdata(done=True), agdata(messages=[]), []
     skill.run = fake_run
@@ -425,7 +422,7 @@ def _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0):
     skill = agskill(name="s", system_prompt="")
     import time as _time
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         idx = len(calls)
         calls.append(dict(inp._data))
         if idx == inject_pid_on_call:
@@ -444,7 +441,7 @@ def test_outer_loop_no_background_process_exits_immediately():
     calls = []
     skill = agskill(name="s", system_prompt="")
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         calls.append(dict(inp._data))
         return agdata(result="ok"), agdata(messages=[]), []
 
@@ -483,7 +480,7 @@ def test_outer_loop_re_enters_with_update_event_when_process_still_running():
     ag = make_agent()
     skill = agskill(name="s", system_prompt="")
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         idx = len(calls)
         calls.append(dict(inp._data))
         if idx == 0:
@@ -540,7 +537,7 @@ def test_outer_loop_max_iters_cap():
     ag = make_agent()
     skill = agskill(name="s", system_prompt="")
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         calls.append(1)
         ag.sandbox._watched_pids[99999] = _time.monotonic()
         return agdata(result="ok"), agdata(messages=[]), []
@@ -586,7 +583,7 @@ def test_outer_loop_long_job_multiple_update_cycles():
             ag.sandbox._watched_pids.clear()
         return resp
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         event = inp._data.get("_event")
         calls.append(event)
         if event is None:                       # initial call
@@ -638,7 +635,7 @@ def test_outer_loop_two_jobs_different_end_times():
             ag.sandbox._watched_pids.clear()
         return resp
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         event = inp._data.get("_event")
         calls.append(event)
         if event is None:
@@ -685,7 +682,7 @@ def test_outer_loop_agent_starts_new_job_on_completed_reentry():
         ag.sandbox._watched_pids.clear()
         return set()   # every check: process already done
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         event = inp._data.get("_event")
         calls.append(event)
         if event is None:
@@ -737,7 +734,7 @@ def test_outer_loop_jobs_added_at_different_points_with_different_latencies():
             ag.sandbox._watched_pids.clear()
         return resp
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         event = inp._data.get("_event")
         calls.append(event)
         if event is None:                          # initial: start slow + fast
@@ -788,7 +785,7 @@ def test_outer_loop_process_completed_fires_when_new_batch_exits_quickly():
             ag.sandbox._watched_pids.clear()
         return resp
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         event = inp._data.get("_event")
         calls.append(event)
         if event is None:
@@ -835,7 +832,7 @@ def test_outer_loop_daemon_release_unblocks_skill():
         # PID 1 is always alive — it's a daemon that never exits
         return {1} if ag.sandbox._watched_pids else set()
 
-    def fake_run(llm_cfg, inp, hist, tools, ms, **_):
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         event = inp._data.get("_event")
         calls.append(event)
         if event is None:
@@ -902,7 +899,7 @@ _docker_ok = pytest.mark.skipif(
 def test_save_and_load_restores_history_and_filesystem(tmp_path):
     from agency.agent import _allocated_agnames
     skill = agskill(name="s", system_prompt="")
-    def fake_run(cfg, inp, hist, tools, ms, **_):
+    def fake_run(cfg, inp, hist, sandbox, pool, ms, **_):
         return agdata(answer="42"), agdata(messages=[{"role": "assistant", "content": "42"}]), []
     skill.run = fake_run
 

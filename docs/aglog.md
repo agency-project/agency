@@ -128,4 +128,4 @@ Process monitoring events:
 10:07:30  [agent_smith]  [PROCS ✓  ]  train  all processes completed, re-entering agent
 ```
 
-When `agUI` is active, `agterm` output is routed to the shared log pane instead of stderr. See [ui.md](ui.md).
+When `agUI` is active, `agterm` output is routed to the shared log pane instead of stderr. See [agui.md](agui.md).
