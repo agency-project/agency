@@ -1,4 +1,5 @@
 from __future__ import annotations
+import httpx
 import openai
 
 # --- Constants matching opencode's design -----------------------------------
@@ -88,6 +89,49 @@ def should_compact(prompt_tokens: int, context_limit: int) -> bool:
 
 
 # --- Internal helpers --------------------------------------------------------
+
+def count_messages_tokens(messages: list[dict], llm_config: dict) -> int:
+    """Return the token count for *messages*, using the vLLM /tokenize endpoint
+    when available and falling back to the character-based estimate otherwise.
+
+    The vLLM endpoint is at ``<base_url_without_v1>/tokenize`` and accepts::
+
+        POST /tokenize
+        {"model": "...", "messages": [...]}
+
+    Response: ``{"tokens": [...], "count": N, "max_model_len": N}``
+    """
+    base_url: str = llm_config.get("base_url", "") or ""
+    # Strip trailing /v1 (or /v1/) to reach the vLLM root
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    if root:
+        try:
+            resp = httpx.post(
+                f"{root}/tokenize",
+                json={
+                    "model": llm_config.get("model", ""),
+                    "messages": [{k: v for k, v in m.items() if not k.startswith("_")}
+                                 for m in messages],
+                },
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if "count" in data:
+                return int(data["count"])
+            if "tokens" in data:
+                return len(data["tokens"])
+        except Exception:
+            pass
+    return estimate_messages_tokens(messages)
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    """Rough total token count for a list of messages (~4 chars per token)."""
+    return sum(_estimate_tokens(m) for m in messages)
+
 
 def _estimate_tokens(msg: dict) -> int:
     """Rough token count via the ~4 chars-per-token rule."""

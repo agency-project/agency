@@ -243,7 +243,7 @@ def test_skill_with_agfile_output_schema_validates_path_string():
         MockClient.return_value.chat.completions.create.return_value = (
             _direct('{"doc": "/workspace/outputs/write_doc.txt"}')
         )
-        result, _, _ = sk.run(LLM_CONFIG, agdata(), agdata(messages=[]), [])
+        result, _, _ = sk.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=None)
     # schema check passes (path is a str); content reading is done by agent.py, not agskill
     assert result.doc == "/workspace/outputs/write_doc.txt"
 

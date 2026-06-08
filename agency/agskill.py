@@ -69,7 +69,7 @@ def _extract_thinking(content: str) -> str:
 from .agdata import agdata
 from .agtype import agtype
 from .agtool import agtool
-from .agcompaction import compact, should_compact
+from .agcompaction import compact, should_compact, count_messages_tokens
 
 if TYPE_CHECKING:
     from .agterm import agterm
@@ -278,6 +278,37 @@ class agskill:
                         _live_messages_fn(messages[1:])
                     if _full_history_fn:
                         _full_history_fn(inbox_msg)
+
+            # Pre-call compaction: compact before the API call so an already-
+            # oversized context doesn't cause the request to fail outright.
+            # Uses a character-based token estimate because we haven't heard
+            # back from the API yet.
+            if _context_limit is not None:
+                estimated = count_messages_tokens(messages, llm_config)
+                if should_compact(estimated, _context_limit):
+                    if term:
+                        term.log(
+                            "COMPACT  ",
+                            f"skill={self.name}  "
+                            f"tokens~{estimated}/{_context_limit}  "
+                            f"msgs={len(messages)}  (pre-call estimate)",
+                        )
+                    msgs_before = len(messages)
+                    messages, _compaction_summary = compact(
+                        messages, llm_config,
+                        context_limit=_context_limit,
+                        previous_summary=_compaction_summary,
+                    )
+                    if _compact_log_fn:
+                        _compact_log_fn(
+                            skill=self.name,
+                            prompt_tokens=estimated,
+                            context_limit=_context_limit,
+                            msgs_before=msgs_before,
+                            msgs_after=len(messages),
+                        )
+                    if _live_messages_fn:
+                        _live_messages_fn(messages[1:])
 
             if term:
                 term.log("LLM      ", f"model={llm_config.get('model','?')}  messages={len(messages)}")

@@ -1,8 +1,11 @@
 """Tests for agcompaction — context-limit fetch, tail selection, pruning, and compact()."""
 from __future__ import annotations
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from agency.agdata import agdata as _agdata
 
 from agency.agcompaction import (
     TAIL_TURNS,
@@ -21,6 +24,13 @@ from agency.agcompaction import (
 )
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o", "base_url": "http://localhost/v1"}
+
+# Module-level so ProcessPoolExecutor can pickle it.
+# Returns content large enough to push estimated tokens well past BIG_CTX threshold.
+_LARGE_CONTENT = "x" * (400_000)  # ~100k tokens estimated (chars // 4)
+
+def _large_file_tool_fn(arg: _agdata) -> _agdata:
+    return _agdata(output=_LARGE_CONTENT)
 # Use a large context so the threshold is clearly context_limit - _RESERVED.
 BIG_CTX = 100_000
 
@@ -476,3 +486,102 @@ def test_agskill_passes_context_limit_to_compact():
                   sandbox=None, _context_limit=limit)
 
     assert received_kwargs.get("context_limit") == limit
+
+
+# ---------------------------------------------------------------------------
+# Helpers for tool-call streaming mocks
+# ---------------------------------------------------------------------------
+
+class _TCFn:
+    def __init__(self, name: str, args: str) -> None:
+        self.name = name
+        self.arguments = args
+
+
+class _TC:
+    def __init__(self, name: str, args_json: str, call_id: str = "c1") -> None:
+        self.id = call_id
+        self.index = 0
+        self.function = _TCFn(name, args_json)
+
+
+def _make_tool_call_stream(name: str, args: dict, call_id: str = "c1") -> list:
+    """Minimal streaming chunks representing a tool-call LLM response."""
+    tc = _TC(name, json.dumps(args), call_id)
+
+    delta1 = MagicMock()
+    delta1.content = None
+    delta1.tool_calls = [tc]
+    delta1.model_extra = {}
+    delta1.reasoning_content = None
+    choice1 = MagicMock()
+    choice1.delta = delta1
+    chunk1 = MagicMock()
+    chunk1.choices = [choice1]
+    chunk1.usage = None
+
+    delta2 = MagicMock()
+    delta2.content = None
+    delta2.tool_calls = None
+    delta2.model_extra = {}
+    delta2.reasoning_content = None
+    choice2 = MagicMock()
+    choice2.delta = delta2
+    chunk2 = MagicMock()
+    chunk2.choices = [choice2]
+    chunk2.usage = MagicMock(prompt_tokens=500)
+
+    return [chunk1, chunk2]
+
+
+# ---------------------------------------------------------------------------
+# Pre-call compaction: tool result overloads context
+# ---------------------------------------------------------------------------
+
+def test_agskill_compacts_before_llm_call_when_tool_result_overloads_context():
+    """A single tool call that returns a large blob should trigger pre-call
+    compaction before the next LLM request, even if the context was under the
+    threshold before the tool call ran."""
+    from agency.agskill import agskill
+    from agency.agdata import agdata
+    from agency.agtool import agtool
+
+    limit = BIG_CTX  # 100_000
+    # threshold = max(100_000 - 20_000, 50_000) = 80_000
+    # _LARGE_CONTENT is 400_000 chars → ~100_000 estimated tokens → over threshold
+
+    read_tool = agtool(
+        name="read_file",
+        description="Read a file",
+        fn=_large_file_tool_fn,
+        params={"type": "object", "properties": {"path": {"type": "string"}},
+                "required": ["path"]},
+    )
+    skill = agskill(name="test", system_prompt="You are helpful.",
+                    replace_tools=[read_tool])
+
+    compact_calls: list[int] = []
+
+    def fake_compact(messages, llm_config, **kw):
+        compact_calls.append(len(messages))
+        # Return a drastically shorter list so the second LLM call succeeds
+        return messages[:3], "summary"
+
+    responses = [
+        _make_tool_call_stream("read_file", {"path": "/workspace/big.txt"}),
+        _make_stream('{"result": "done"}', 100),
+    ]
+    response_iter = iter(responses)
+
+    with patch("agency.agskill.openai.OpenAI") as MockClient, \
+         patch("agency.agskill.compact", side_effect=fake_compact), \
+         patch("agency.agcompaction.httpx.post", side_effect=ConnectionError("no vllm")):
+        MockClient.return_value = MagicMock()
+        MockClient.return_value.chat.completions.create.side_effect = \
+            lambda **kw: next(response_iter)
+        skill.run(LLM_CONFIG, agdata(task="read the file"), agdata(messages=[]),
+                  sandbox=None, _context_limit=limit)
+
+    assert len(compact_calls) >= 1, \
+        "compact() should have been triggered before the second LLM call " \
+        "because the tool result pushed estimated tokens past the threshold"
