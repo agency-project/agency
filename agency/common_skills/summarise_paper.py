@@ -62,7 +62,7 @@ class SummarisePaperSkill(agskill):
             ),
             input_schema=agdata(title=str, url=str, abstract=str),
             output_schema=agdata(summary=str),
-            tools=[fetch_paper],
+            replace_tools=[fetch_paper],
             **kwargs,
         )
         self.fetch_paper = fetch_paper
@@ -229,14 +229,14 @@ try:
     def test_summarise_paper_skill_fixed_attributes():
         s = SummarisePaperSkill()
         assert s.name == "summarise_paper"
-        assert len(s.tools) == 1
-        assert s.tools[0].name == "fetch_paper"
-        assert s.fetch_paper is s.tools[0]
+        assert len(s.replace_tools) == 1
+        assert s.replace_tools[0].name == "fetch_paper"
+        assert s.fetch_paper is s.replace_tools[0]
         assert "fetch_paper" in s.system_prompt
         assert "MUST" in s.system_prompt
         assert "abstract alone" in s.system_prompt
         assert "truncated" in s.system_prompt
-        assert "offset" in s.tools[0].params["properties"]
+        assert "offset" in s.replace_tools[0].params["properties"]
         assert "title" in s.input_schema._data
         assert "url" in s.input_schema._data
         assert "abstract" in s.input_schema._data
@@ -248,14 +248,14 @@ try:
 
     def test_summarise_paper_skill_run_missing_required_fields():
         s = SummarisePaperSkill()
-        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), [])
+        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
-        result2, _, _ = s.run(_LLM, agdata(title="T", abstract="A"), agdata(messages=[]), [])
+        result2, _, _ = s.run(_LLM, agdata(title="T", abstract="A"), agdata(messages=[]), sandbox=None)
         assert result2._data.get("error") is not None
 
         result3, _, _ = s.run(_LLM, agdata(url="https://arxiv.org/abs/1234.5678", abstract="A"),
-                              agdata(messages=[]), [])
+                              agdata(messages=[]), sandbox=None)
         assert result3._data.get("error") is not None
 
 except ImportError:

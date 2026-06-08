@@ -40,7 +40,7 @@ class FindPapersSkill(agskill):
             input_schema=agdata(topic=str),
             output_schema=agdata(papers=list, count=int),
             output_validator=self._validate_output,
-            tools=[search_papers],
+            replace_tools=[search_papers],
             **kwargs,
         )
         self.search_papers = search_papers
@@ -106,9 +106,9 @@ try:
     def test_find_papers_skill_fixed_attributes():
         s = FindPapersSkill()
         assert s.name == "find_papers"
-        assert len(s.tools) == 1
-        assert s.tools[0].name == "search_papers"
-        assert s.search_papers is s.tools[0]
+        assert len(s.replace_tools) == 1
+        assert s.replace_tools[0].name == "search_papers"
+        assert s.search_papers is s.replace_tools[0]
         assert "topic" in s.input_schema._data
         assert "papers" in s.output_schema._data
         assert "count" in s.output_schema._data
@@ -119,7 +119,7 @@ try:
     @pytest.mark.parametrize("max_papers", [1, 4, 8, 16, 32, 100])
     def test_find_papers_max_papers_reflected_in_tool_description(max_papers):
         s = FindPapersSkill(max_papers=max_papers)
-        desc = s.tools[0].params["properties"]["max_results"]["description"]
+        desc = s.replace_tools[0].params["properties"]["max_results"]["description"]
         assert str(max_papers) in desc
 
     @pytest.mark.parametrize("max_retries", [0, 1, 3, 5, 10])

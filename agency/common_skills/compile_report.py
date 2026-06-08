@@ -79,7 +79,7 @@ try:
             result, hist, delta = s.run(
                 _LLM,
                 agdata(topic=topic, summaries=summaries, output_path=output_path),
-                agdata(messages=[]), [],
+                agdata(messages=[]), sandbox=None,
             )
         assert result.report_path == output_path
         assert result.paper_count == exp_count
@@ -88,14 +88,14 @@ try:
 
     def test_compile_report_skill_run_missing_required_fields():
         s = CompileReportSkill()
-        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), [])
+        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
-        result2, _, _ = s.run(_LLM, agdata(topic="x", summaries=["s"]), agdata(messages=[]), [])
+        result2, _, _ = s.run(_LLM, agdata(topic="x", summaries=["s"]), agdata(messages=[]), sandbox=None)
         assert result2._data.get("error") is not None
 
         result3, _, _ = s.run(_LLM, agdata(topic="x", output_path="/tmp/r.md"),
-                              agdata(messages=[]), [])
+                              agdata(messages=[]), sandbox=None)
         assert result3._data.get("error") is not None
 
     def test_compile_report_skill_run_output_missing_field_triggers_retry():
@@ -109,7 +109,7 @@ try:
             result, _, _ = s.run(
                 _LLM,
                 agdata(topic="x", summaries=["a", "b"], output_path="/tmp/r.md"),
-                agdata(messages=[]), [],
+                agdata(messages=[]), sandbox=None,
             )
         assert result.paper_count == 2
 
@@ -121,7 +121,7 @@ try:
             result, _, _ = s.run(
                 _LLM,
                 agdata(topic="x", summaries=["s"], output_path="/tmp/r.md"),
-                agdata(messages=[]), [],
+                agdata(messages=[]), sandbox=None,
             )
         assert result._data.get("error") is not None
 

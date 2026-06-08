@@ -74,7 +74,7 @@ try:
             M.return_value.chat.completions.create.return_value = \
                 _make_stream(f'{{"path": "{exp_path}", "status": "{exp_status}"}}')
             result, hist, delta = s.run(_LLM, agdata(file_path=file_path, content=content),
-                                        agdata(messages=[]), [])
+                                        agdata(messages=[]), sandbox=None)
         assert result.path == exp_path
         assert result.status == exp_status
         assert isinstance(hist, agdata)
@@ -82,11 +82,11 @@ try:
 
     def test_writer_skill_run_missing_required_input_fields():
         s = WriterSkill()
-        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), [])
+        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
-        result2, _, _ = s.run(_LLM, agdata(file_path="/tmp/f.txt"), agdata(messages=[]), [])
+        result2, _, _ = s.run(_LLM, agdata(file_path="/tmp/f.txt"), agdata(messages=[]), sandbox=None)
         assert result2._data.get("error") is not None
-        result3, _, _ = s.run(_LLM, agdata(content="text"), agdata(messages=[]), [])
+        result3, _, _ = s.run(_LLM, agdata(content="text"), agdata(messages=[]), sandbox=None)
         assert result3._data.get("error") is not None
 
     def test_writer_skill_run_output_missing_field_triggers_retry():
@@ -98,7 +98,7 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: next(responses)
             result, _, _ = s.run(_LLM, agdata(file_path="/tmp/f.txt", content="x"),
-                                 agdata(messages=[]), [])
+                                 agdata(messages=[]), sandbox=None)
         assert result.status == "ok"
 
     def test_writer_skill_history_grows_with_messages():
@@ -107,7 +107,7 @@ try:
             M.return_value.chat.completions.create.return_value = \
                 _make_stream('{"path": "/tmp/f.txt", "status": "ok"}')
             _, hist, delta = s.run(_LLM, agdata(file_path="/tmp/f.txt", content="hi"),
-                                   agdata(messages=[]), [])
+                                   agdata(messages=[]), sandbox=None)
         assert len(hist.messages) >= 2
         assert len(delta) >= 2
 

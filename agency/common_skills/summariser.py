@@ -11,7 +11,7 @@ class SummariserSkill(agskill):
             system_prompt="Summarise the given text in one sentence.",
             input_schema=agdata(text=str),
             output_schema=agdata(summary=str),
-            tools=[],
+            replace_tools=[],
             **kwargs,
         )
 
@@ -47,7 +47,7 @@ try:
     def test_summariser_skill_fixed_attributes():
         s = SummariserSkill()
         assert s.name == "summarise"
-        assert s.tools == []
+        assert s.replace_tools == []
         assert s.input_schema is not None
         assert s.output_schema is not None
         assert "text" in s.input_schema._data
@@ -71,14 +71,14 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.return_value = \
                 _make_stream(f'{{"summary": "{summary}"}}')
-            result, hist, delta = s.run(_LLM, agdata(text=text), agdata(messages=[]), [])
+            result, hist, delta = s.run(_LLM, agdata(text=text), agdata(messages=[]), sandbox=None)
         assert result.summary == summary
         assert isinstance(hist, agdata)
         assert isinstance(delta, list)
 
     def test_summariser_skill_run_missing_text_input():
         s = SummariserSkill()
-        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), [])
+        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
     def test_summariser_skill_run_output_missing_summary_triggers_retry():
@@ -89,7 +89,7 @@ try:
         ])
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: next(responses)
-            result, _, _ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), [])
+            result, _, _ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
         assert result.summary == "Retried summary."
 
     def test_summariser_skill_run_exhausted_retries_returns_error():
@@ -97,7 +97,7 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: \
                 _make_stream('{"wrong_key": "value"}')
-            result, _, _ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), [])
+            result, _, _ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
     def test_summariser_skill_history_grows_after_run():
@@ -105,7 +105,7 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.return_value = \
                 _make_stream('{"summary": "Short."}')
-            _, hist, delta = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), [])
+            _, hist, delta = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
         assert len(hist.messages) >= 2
         assert len(delta) >= 2
 
