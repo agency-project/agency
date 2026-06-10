@@ -8,7 +8,7 @@ A deadlock can occur whenever the **same future-producing object**, usually `age
 
 The threads in question are typically:
 
-- Two `agteam.run()` bodies executing concurrently in the pool.
+- Two `agteam.run()` bodies executing concurrently in their own daemon threads.
 - The main thread and an `agteam.run()` body executing concurrently.
 - Two separate agteam instances whose run() bodies both reference the same external agent or agdata.
 
@@ -32,7 +32,7 @@ This mechanism is safe as long as `agent.run()` is only called from a single thr
 
 `agent.run()` is non-blocking. It accepts pending `agdata` objects as inputs and resolves them lazily inside the task — not at the call site. So a thread can call `agent.run(skill, agdata(x=pending_result))` and return in microseconds, before `pending_result` has resolved. The registration on the history chain happens at call time, not at execution time.
 
-The thread pool has no awareness of agdata dependency chains. It dispatches tasks as threads become free, regardless of whether a task's inputs are ready.
+Threads have no awareness of agdata dependency chains. A new thread starts immediately when `run()` is called, regardless of whether its inputs are ready.
 
 ---
 
@@ -47,13 +47,13 @@ class WriterTeam(agteam):
         ...
 
     def run(self, scene_goal, design_doc, previous_scenes=""):
-        feedback_doc  = self.feedback_team.run(...)          # FT1 — submitted to pool
+        feedback_doc  = self.feedback_team.run(...)          # FT1 — starts its own thread
         plan_doc      = planner.run(agdata(feedback=feedback_doc, ...))
         current_draft = writer.run(agdata(plan=plan_doc, ...))
-        review        = self.feedback_team.run(draft=current_draft, ...)  # FT2 — submitted to pool
+        review        = self.feedback_team.run(draft=current_draft, ...)  # FT2 — starts its own thread
 ```
 
-All four submissions happen before any result arrives. FT1 and FT2 are both in the pool queue. If FT2's body executes first:
+All four submissions happen before any result arrives. FT1 and FT2 both start their own threads. If FT2's body executes first:
 
 ```
 FT2 body:  self.main_feedback.run(...)  →  prev=empty,  _history=hf2
@@ -85,7 +85,7 @@ review = self.feedback_team.run(draft=current_draft, ...)
 
 ## Example 2: agent shared between two separate agteam instances
 
-An agent is created outside any team and passed to two teams that both run concurrently. Each team's `run()` body calls `shared.run()` from its own pool thread.
+An agent is created outside any team and passed to two teams that both run concurrently. Each team's `run()` body calls `shared.run()` from its own thread.
 
 ```python
 shared = agent(llm_config=LLM_CONFIG, agname="Shared")
@@ -104,7 +104,7 @@ class TeamB(agteam):
 a = TeamA(shared=shared)
 b = TeamB(shared=shared, a_result=a.run())   # b depends on a's result
 
-b.run()   # both pool threads race to call shared.run()
+b.run()   # both daemon threads race to call shared.run()
 ```
 
 If TeamB's body executes first:
@@ -131,7 +131,7 @@ b.run()             # TeamB registers on shared after TeamA
 
 ## Example 3: main thread and agteam sharing an agent
 
-The main thread calls `agent.run()` and then submits an agteam that also calls the same agent — but the agteam's pool thread can execute before the main thread's first call has registered.
+The main thread calls `agent.run()` and then submits an agteam that also calls the same agent — but the agteam's daemon thread can execute before the main thread's first call has registered.
 
 ```python
 shared = agent(llm_config=LLM_CONFIG, agname="Shared")
@@ -143,16 +143,16 @@ class SummaryTeam(agteam):
 
 outline = shared.run(outline_skill, agdata(topic="KV cache"))   # main thread
 team = SummaryTeam(shared=shared, outline=outline)
-team.run()   # pool thread may call shared.run() before the main thread's call above registers
+team.run()   # daemon thread may call shared.run() before the main thread's call above registers
 ```
 
-The main thread calls `shared.run(outline_skill, ...)` which sets `_history = hf_outline`. Then `team.run()` is submitted. If the pool thread picks up team's body immediately and reaches `self.shared.run(summary_skill, ...)` before the main thread's task has resolved `hf_outline`:
+The main thread calls `shared.run(outline_skill, ...)` which sets `_history = hf_outline`. Then `team.run()` is submitted. If the daemon thread executes team's body immediately and reaches `self.shared.run(summary_skill, ...)` before the main thread's task has resolved `hf_outline`:
 
 ```
-pool thread:  shared.run(summary_skill, ...)  →  prev=hf_outline, _history=hf_summary
+daemon thread:  shared.run(summary_skill, ...)  →  prev=hf_outline, _history=hf_summary
 ```
 
-Here the registration order is actually correct (main thread registered first), so no deadlock forms. But if the main thread had not yet called `shared.run()` at all before submitting the team — for example, because the outline result was itself a pending agdata passed in — the pool thread could register on `shared` before the main thread does, inverting the chain.
+Here the registration order is actually correct (main thread registered first), so no deadlock forms. But if the main thread had not yet called `shared.run()` at all before submitting the team — for example, because the outline result was itself a pending agdata passed in — the daemon thread could register on `shared` before the main thread does, inverting the chain.
 
 **Safer pattern:** call `agsync(shared)` after the main thread's agent call before submitting any team that uses the same agent.
 
@@ -172,7 +172,7 @@ team.run()
 |---|---|---|
 | `agent` in `agteam.setup()` | same instance's `run()` called twice concurrently | inverted history chain → deadlock if data dependency exists |
 | `agent` passed to two agteam instances | both `run()` bodies access it concurrently | same |
-| `agent` used on main thread and inside agteam | pool thread may register before main thread | same if order is inverted |
+| `agent` used on main thread and inside agteam | daemon thread may register before main thread | same if order is inverted |
 | pending `agdata` passed to two concurrent agteams | both bodies receive the same unresolved future | safe to read; deadlock only if a circular data dependency is separately introduced |
 
 ## Avoiding the pattern

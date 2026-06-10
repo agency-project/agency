@@ -100,7 +100,7 @@ class agskill:
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
         output_validator: "Callable[[agdata], list[str]] | None" = None,
-        max_retries: int = 3,
+        max_retries: int = 10,
     ):
         self.name = name
         self.system_prompt = system_prompt
@@ -158,15 +158,36 @@ class agskill:
             if key not in data._data:
                 errors.append(f"missing required field '{key}'")
                 continue
+            actual = data._data[key]
             if isinstance(hint, type) and issubclass(hint, agtype):
                 # agtype fields carry a string value after framework processing
-                if not isinstance(data._data[key], str):
+                if not isinstance(actual, str):
                     errors.append(
                         f"field '{key}' ({hint.__name__}) must be a string"
                     )
                 continue
+            if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+                # list[{key: type, ...}] — validate every item matches the template
+                item_template = hint[0]
+                if not isinstance(actual, list):
+                    errors.append(f"field '{key}': expected list, got {type(actual).__name__}")
+                    continue
+                for i, item in enumerate(actual):
+                    if not isinstance(item, dict):
+                        errors.append(
+                            f"field '{key}[{i}]': expected dict, got {type(item).__name__}"
+                        )
+                        continue
+                    for item_key, item_type in item_template.items():
+                        if item_key not in item:
+                            errors.append(f"field '{key}[{i}]': missing key '{item_key}'")
+                        elif isinstance(item_type, type) and not isinstance(item[item_key], item_type):
+                            errors.append(
+                                f"field '{key}[{i}].{item_key}': expected {item_type.__name__}, "
+                                f"got {type(item[item_key]).__name__}"
+                            )
+                continue
             if isinstance(hint, type):
-                actual = data._data[key]
                 if not isinstance(actual, hint):
                     errors.append(
                         f"field '{key}': expected {hint.__name__}, "
@@ -231,7 +252,7 @@ class agskill:
         openai_tools = [t.to_openai_tool() for t in active_tools] or None
 
         client = openai.OpenAI(
-            api_key=llm_config.get("api_key", ""),
+            api_key=llm_config.get("api_key", "") or "EMPTY",
             base_url=llm_config.get("base_url", None),
         )
 
@@ -340,6 +361,8 @@ class agskill:
                 for chunk in batch:
                     if chunk.usage is not None:
                         prompt_tokens = chunk.usage.prompt_tokens
+                        if term is not None:
+                            term._tokens = prompt_tokens
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta

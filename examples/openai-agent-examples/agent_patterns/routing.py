@@ -9,9 +9,9 @@ import os
 from agency import agent, agskill, agdata
 
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
+    "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL", "moonshotai/Kimi-K2.6"),
+    "model":    os.environ.get("VLLM_MODEL",   "google/gemma-4-E4B-it"),
 }
 
 french_skill = agskill(
@@ -71,6 +71,9 @@ if __name__ == "__main__":
         result = ag.run(_skill_map[skill_name], agdata(message=route.message))
         print(result.response)
 
-        msg = input("\nEnter a message (or empty to quit): ")
+        try:
+            msg = input("\nEnter a message (or empty to quit): ")
+        except EOFError:
+            break
         if not msg:
             break

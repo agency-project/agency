@@ -1,6 +1,6 @@
 # Container Sandboxing
 
-Each `agent` instance owns exactly one Docker or Podman container for the duration of its lifetime. All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside that container, never on the host.
+All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `need_sandbox=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. When a container is started it is committed to a checkpoint image at the end of the task and destroyed, with state persisted between tasks via those images.
 
 ## Runtime detection
 
@@ -22,12 +22,12 @@ The `images/Dockerfile` installs `ripgrep` on top of `python:3.12-slim`. Both ru
 
 | Event | What happens |
 |---|---|
-| `agent.__init__` (fresh) | Any stale container with the same name is removed, then: `run -d [--gpus all] [-v ...] --name sandbox-<agname> agency-sandbox:latest tail -f /dev/null` |
-| `agent.__init__` (fork) | `commit sandbox-<parent>` → `run -d [--gpus all] [-v ...] --name sandbox-<agname> <snapshot>` |
-| process exit | `atexit` handler calls `destroy()` on all live containers |
-| explicit | `ag.sandbox.destroy()` |
-
-Stale containers from a previously hard-killed process are removed automatically at the start of `__init__`, so container name conflicts never block a fresh run.
+| `agent.__init__` | No container created — `agSandbox` object is created cheaply; `_checkpoint=None` |
+| First `need_sandbox=True` tool call | Any stale container removed; `docker run` from `_checkpoint` image (or `BASE_IMAGE` on first task); `_ensure_started()` is called at most once per task |
+| `agent.run()` task end (container started) | `docker commit container → agency/ckpt-<pid>-<agname>` (returns `True`); container destroyed; `_checkpoint` updated |
+| `agent.run()` task end (no container started) | `commit()` returns `False`; `_checkpoint` unchanged; no Docker calls |
+| `agent.__del__` | Checkpoint image removed via `docker rmi` |
+| `atexit` | All live containers removed (guards against hard-killed processes) |
 
 ## GPU device access
 
@@ -48,15 +48,14 @@ All agents can write to `/agent_output/<own-agname>/` inside the container; file
 ## Forking
 
 ```
-parent container  ──commit──▶  snapshot-<child-agname>
-                                       │
-                                    run -d
-                                       │
-                                       ▼
-                                child container
+parent._checkpoint ──docker tag──▶ agency/ckpt-<pid>-<fork-agname>
+                                            │
+                                     (consumed by fork's first _task())
 ```
 
-The child starts from the parent's exact filesystem state. Subsequent writes in either direction are fully isolated. The snapshot image is deleted when the child's container is destroyed.
+Forking copies the parent's checkpoint image tag to a new tag for the fork via `docker tag`. No container is created at fork time — the fork's container is created lazily when the fork's first `_task()` runs, restoring from the copied tag.
+
+Because forks wait for `src._history._resolve()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
 ## exec wrapper
 
@@ -112,12 +111,16 @@ The `__BGPIDS__` annotation is stripped before output is returned to the LLM. PI
 
 ```python
 sb = agSandbox(agname)
-sb = agSandbox(agname, parent_agname="parent")
 sb = agSandbox(agname, output_dir=Path("runs/agent_output"))
+sb = agSandbox(agname, restore_image="agency/ckpt-p1234-myagent")
+
+# Construction is cheap — no Docker calls until _ensure_started() runs.
+sb._ensure_started()    # called automatically on first exec(); idempotent
 
 sb.exec(cmd, workdir="/workspace", timeout=120) -> (str, int)
 sb.read_file(path) -> str
 sb.write_file(path, content)
+sb.commit(tag) -> bool  # False if container never started; True after docker commit
 sb.update_limits(cpus=4.0, memory="8g")
 sb.get_live_pids() -> set[int]
 sb.pid_status_summary() -> str

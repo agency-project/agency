@@ -1,8 +1,8 @@
 # Agency
 
-A multi-agent framework where each agent runs inside its own sandbox container with isolated filesystem, GPU access control, and automatic background-process tracking.
+A multi-agent framework with sandboxed execution, isolated filesystems, GPU access control, and automatic background-process tracking. Containers are created lazily — only when a task actually calls a sandboxed tool (bash, file I/O, etc.). Tasks that complete using only host-side tools (web fetch, paper search, …) never start a container at all. When a container is started, it is committed to a checkpoint image at the end of the task and destroyed, so containers exist only while sandboxed work is actively running.
 
-Agents are non-blocking by default. `agent.run()` returns a pending `agdata` immediately; reading any field on it blocks until the result is ready. Multiple agents run concurrently in a thread pool. Tool calls are offloaded to a process pool so CPU-bound work never blocks the main interpreter.
+Agents are non-blocking by default. `agent.run()` returns a pending `agdata` immediately; reading any field on it blocks until the result is ready. Each `run()` call executes in its own daemon thread so agents run concurrently without any shared pool to exhaust. Tool calls are offloaded to a process pool so CPU-bound work never blocks the main interpreter.
 
 ## Requirements
 
@@ -59,9 +59,9 @@ print(result.summary)   # blocks until done
 
 **`agtool`** — a named callable an LLM can invoke via function calling. Every tool call is offloaded to a `ProcessPoolExecutor` worker so CPU-bound tools don't block other agents. Tools are serialised with `cloudpickle`, so bound methods work without any extra machinery.
 
-**`agent`** — holds an LLM config, sandboxed tools, and a conversation history. `agent.run(skill, input)` accepts an `agskill` object directly and is non-blocking; the result is a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Forking via `agent(parent)` deep-copies the history and runs the new task concurrently.
+**`agent`** — holds an LLM config, sandboxed tools, and a conversation history. `agent.run(skill, input)` accepts an `agskill` object directly and is non-blocking; each call spawns a daemon thread and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the history and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
 
-**`agteam`** — coordinates multiple agents or tasks via a `ThreadPoolExecutor`. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow.
+**`agteam`** — coordinates multiple agents or tasks. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow. Each `run()` call executes in its own daemon thread.
 
 **`agUI`** — a terminal UI (Textual) that shows all live agents, their current state, streaming token output, tool calls, and a human-in-the-loop interaction pane.
 
@@ -69,7 +69,7 @@ print(result.summary)   # blocks until done
 
 | Layer | Mechanism | Notes |
 |---|---|---|
-| Agents / team tasks | `ThreadPoolExecutor` (256 threads) | Threads release the GIL during LLM I/O |
+| Agents / team tasks | One daemon thread per `run()` call | Threads release the GIL during LLM I/O; no shared pool to exhaust |
 | LLM streaming | Background drain thread + 100 ms batch queue | Reduces GIL acquisitions from O(tokens) to O(tokens/batch) |
 | Tool execution | `ProcessPoolExecutor` (256 workers) | Each tool call gets its own GIL |
 

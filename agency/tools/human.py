@@ -55,4 +55,5 @@ def make_ask_human(agname: str) -> agtool:
             },
             "required": ["question"],
         },
+        need_sandbox=False,
     )

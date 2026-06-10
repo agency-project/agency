@@ -1,5 +1,7 @@
+import io
 import re
 
+import fitz  # pymupdf
 import html2text
 import httpx
 
@@ -17,6 +19,52 @@ def _arxiv_html_url(url: str) -> str:
         return url
     paper_id = m.group(1).removesuffix("")
     return f"https://arxiv.org/html/{paper_id}"
+
+
+def _arxiv_pdf_url(url: str) -> str:
+    """Convert any arxiv URL form to its PDF URL."""
+    m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
+    if not m:
+        return url
+    return f"https://arxiv.org/pdf/{m.group(1)}"
+
+
+def fetch_full_paper_text(url: str) -> str:
+    """Fetch the complete text of an arxiv paper as a single string.
+
+    Tries the arxiv HTML page first (cleaner text). Falls back to the PDF
+    via pymupdf if HTML is unavailable (older papers, 404s, etc.).
+    Returns an empty string only if both attempts fail.
+    """
+    # ── Try HTML first ────────────────────────────────────────────────────────
+    html_url = _arxiv_html_url(url)
+    try:
+        resp = httpx.get(html_url, timeout=30, follow_redirects=True)
+        resp.raise_for_status()
+        converter = html2text.HTML2Text()
+        converter.ignore_links = True
+        converter.ignore_images = True
+        converter.body_width = 0
+        text = converter.handle(resp.text)
+        lines = text.splitlines()
+        start = next((i for i, ln in enumerate(lines) if ln.startswith("# ")), 0)
+        result = "\n".join(lines[start:]).strip()
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # ── Fall back to PDF ──────────────────────────────────────────────────────
+    pdf_url = _arxiv_pdf_url(url)
+    try:
+        resp = httpx.get(pdf_url, timeout=60, follow_redirects=True)
+        resp.raise_for_status()
+        doc = fitz.open(stream=io.BytesIO(resp.content), filetype="pdf")
+        pages = [page.get_text() for page in doc]
+        doc.close()
+        return "\n".join(pages).strip()
+    except Exception:
+        return ""
 
 
 class SummarisePaperSkill(agskill):
@@ -84,7 +132,7 @@ class SummarisePaperSkill(agskill):
         text = converter.handle(resp.text)
 
         lines = text.splitlines()
-        start = next((i for i, l in enumerate(lines) if l.startswith("#")), 0)
+        start = next((i for i, l in enumerate(lines) if l.startswith("# ")), 0)
         full = "\n".join(lines[start:])
 
         chunk = full[offset : offset + _MAX_CHARS]

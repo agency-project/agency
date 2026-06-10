@@ -78,6 +78,7 @@ class agterm:
             agterm._color_counter += 1
         self._color = _AGENT_COLORS[idx]
         self._id = agname
+        self._tokens: int | None = None
         agterm._agname_colors[self._id] = self._color  # register for cross-agent colorization
 
     # ------------------------------------------------------------------
@@ -117,9 +118,10 @@ class agterm:
         ev_key    = event.ljust(9)[:9]
         ev_style  = _EVENT_STYLES.get(ev_key, "")
         ev_tag    = f"{ev_style}[{ev_key}]{_RESET}"
+        tok_tag   = f"  {_DIM}({self._tokens} toks){_RESET}" if self._tokens is not None else ""
         src       = f"{_DIM}({filename}:{lineno}){_RESET}"
 
-        line = f"{ts}  {agent_tag}  {ev_tag}  {agterm._colorize_agnames(msg)}  {src}"
+        line = f"{ts}  {agent_tag}  {ev_tag}  {agterm._colorize_agnames(msg)}{tok_tag}  {src}"
         with agterm._lock:
             try:
                 from . import agui as _agui

@@ -48,4 +48,5 @@ def make_write(sandbox: "agSandbox") -> agtool:
         description="Write content to a file inside the sandbox, creating parent directories if needed.",
         params=_WRITE_PARAMS,
         log_fn=_log,
+        need_sandbox=True,
     )

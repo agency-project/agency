@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import weakref
 from pathlib import Path
@@ -21,6 +22,12 @@ _PID_PREFIX = f"p{os.getpid()}"
 
 # Global registry of live sandboxes for atexit cleanup.
 _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
+
+# Limit the number of containers starting simultaneously.  Each agSandbox.__init__
+# acquires one slot for the duration of its startup sequence (docker run + first exec).
+# Without this, a burst of hundreds of parallel agent tasks overwhelms the Docker
+# daemon, causing docker exec calls to queue indefinitely and hang the calling threads.
+_startup_semaphore = threading.Semaphore(32)
 
 
 def _cleanup_all_sandboxes() -> None:
@@ -121,72 +128,69 @@ class agSandbox:
     def __init__(
         self,
         agname: str,
-        parent_agname: str | None = None,
         output_dir: Path | None = None,
         restore_image: str | None = None,
     ) -> None:
-        self._agname = agname
-        self._runtime = get_container_runtime()
-        self._snapshot_name: str | None = None
-        self._gpu_id: int | None = None
+        self._agname   = agname
+        self._runtime  = get_container_runtime()
+        self._gpu_id:  int | None           = None
         self._watched_pids: dict[int, float] = {}
-        self._baseline_pids: set[int] = set()   # populated after container starts
-        self._daemon_pids:   set[int] = set()   # explicitly released; never waited on
+        self._baseline_pids: set[int]        = set()
+        self._daemon_pids:   set[int]        = set()
+        self._started  = False
 
-        # Pass --gpus all if GPUs are available so device files are present.
-        # CUDA_VISIBLE_DEVICES is set to "" in every exec call when no GPU is
-        # held, so idle containers cannot access any GPU even though the
-        # device files exist.
-        gpu_flags = _gpu_flags()
+        # Container name is fixed at creation time using the main-process PID
+        # prefix so that worker processes (with different PIDs) use the correct name.
+        self._name = f"sandbox-{_PID_PREFIX}-{agname}"
 
-        # Shared output volume: all agents read and write the same directory.
-        vol_flags: list[str] = []
+        # Store startup parameters for _ensure_started().
+        self._restore_image = restore_image
+        self._gpu_flags     = _gpu_flags()
+        self._vol_flags: list[str] = []
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
-            vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
+            self._vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
 
-        name = self._container_name()
-        # Remove any stale container with the same name (e.g. from a previous
-        # run that was killed before atexit cleanup could fire).
-        self._run([self._runtime, "rm", "-f", name], check=False)
-        if restore_image is not None:
-            # Start container from a previously saved checkpoint image
-            self._run(
-                [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
-                [restore_image, "tail", "-f", "/dev/null"],
-                check=True,
-            )
-            # Remove the image tag now — container holds a reference by digest
-            self._run([self._runtime, "rmi", restore_image], check=False)
-        elif parent_agname is not None:
-            snap = self._resolve_image(f"snapshot-{_PID_PREFIX}-{agname}")
-            self._run([self._runtime, "commit", f"sandbox-{_PID_PREFIX}-{parent_agname}", snap], check=True)
-            self._snapshot_name = snap
-            self._run(
-                [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
-                [snap, "tail", "-f", "/dev/null"],
-                check=True,
-            )
-        else:
-            self._run(
-                [self._runtime, "run", "-d", "--name", name] + gpu_flags + vol_flags +
-                [self._resolve_image(self.BASE_IMAGE), "tail", "-f", "/dev/null"],
-                check=True,
-            )
-            self._run(
-                [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
-                check=False,
-            )
+    def _ensure_started(self) -> None:
+        """Start the Docker container on first use.
 
-        _live_sandboxes.add(self)
-
-        # Capture the process baseline after the container is fully ready.
-        # Any PID not in this set was spawned by user commands and must be
-        # monitored by the outer loop until it exits.
-        self._baseline_pids = self._snapshot_pids()
+        Called lazily by _container_exec() so containers are only created when
+        an agent actually needs sandboxed execution (bash, file I/O, etc.).
+        Tasks that complete using only host-side tools (webfetch, todowrite,
+        find_papers, …) never start a container at all.
+        """
+        if self._started:
+            return
+        name = self._name
+        with _startup_semaphore:
+            if self._started:   # re-check after acquiring the semaphore
+                return
+            self._run([self._runtime, "rm", "-f", name], check=False)
+            if self._restore_image is not None:
+                self._run(
+                    [self._runtime, "run", "-d", "--name", name]
+                    + self._gpu_flags + self._vol_flags
+                    + [self._restore_image, "tail", "-f", "/dev/null"],
+                    check=True,
+                )
+                self._run([self._runtime, "rmi", self._restore_image], check=False)
+            else:
+                self._run(
+                    [self._runtime, "run", "-d", "--name", name]
+                    + self._gpu_flags + self._vol_flags
+                    + [self._resolve_image(self.BASE_IMAGE), "tail", "-f", "/dev/null"],
+                    check=True,
+                )
+                self._run(
+                    [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
+                    check=False,
+                )
+            _live_sandboxes.add(self)
+            self._started = True  # set before _snapshot_pids() to prevent re-entry via _container_exec
+            self._baseline_pids = self._snapshot_pids()
 
     def _container_name(self) -> str:
-        return f"sandbox-{_PID_PREFIX}-{self._agname}"
+        return self._name
 
     def _snapshot_pids(self) -> set[int]:
         """Return the set of all live PIDs currently in the container, excluding
@@ -214,7 +218,7 @@ class agSandbox:
         *,
         check: bool = False,
         input: bytes | None = None,
-        timeout: int | None = None,
+        timeout: int = 120,
     ) -> subprocess.CompletedProcess[bytes]:
         try:
             return subprocess.run(
@@ -240,6 +244,7 @@ class agSandbox:
         shell: str = "bash",
     ) -> tuple[str, int]:
         """Run a raw shell command inside the container."""
+        self._ensure_started()
         args = [self._runtime, "exec"]
         if stdin is not None:
             args.append("-i")
@@ -338,6 +343,8 @@ class agSandbox:
         memory: str | None = None,
     ) -> None:
         """Live-update container CPU/memory limits."""
+        if not self._started:
+            return
         cmd = [self._runtime, "update"]
         if cpus is not None:
             cmd.append(f"--cpus={cpus}")
@@ -345,6 +352,21 @@ class agSandbox:
             cmd.append(f"--memory={memory}")
         cmd.append(self._container_name())
         self._run(cmd, timeout=10)
+
+    def commit(self, tag: str) -> bool:
+        """Commit the container filesystem to a new image tag.
+
+        Returns True if the commit succeeded, False if the container was never
+        started (nothing to commit).
+        """
+        if not self._started:
+            return False
+        self._run(
+            [self._runtime, "commit", self._container_name(), tag],
+            check=True,
+            timeout=120,
+        )
+        return True
 
     def release_daemon(self, pid: int) -> None:
         """Move *pid* out of the monitored set into the daemon set.
@@ -442,6 +464,8 @@ class agSandbox:
 
     def destroy(self) -> None:
         _live_sandboxes.discard(self)
+        if not self._started:
+            return
 
         if self._watched_pids:
             pids = " ".join(str(p) for p in self._watched_pids)
@@ -460,11 +484,3 @@ class agSandbox:
         except Exception:
             pass
 
-        if self._snapshot_name:
-            try:
-                self._run(
-                    [self._runtime, "rmi", self._snapshot_name],
-                    timeout=30,
-                )
-            except Exception:
-                pass

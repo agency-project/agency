@@ -29,9 +29,9 @@ def _make_run_dir(name: str):
     return run_dir
 
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "https://kimi.js-park.info:18000/v1"),
+    "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   "Qwen/Qwen3.5-397B-A17B-FP8"),
+    "model":    os.environ.get("VLLM_MODEL",   "google/gemma-4-E4B-it"),
 }
 
 def main():
@@ -75,7 +75,7 @@ def main():
 
     print(f"Endpoint : {LLM_CONFIG['base_url']}")
     print(f"Model    : {LLM_CONFIG['model']}")
-    print(f"Tools    : {[t.name for t in ag.tools]}")
+    print(f"Tools    : {[t.name for t in (file_skill.replace_tools or file_skill.add_tools or [])]}")
     print()
 
     print(">> [file_manager] write and verify a note")

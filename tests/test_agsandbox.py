@@ -203,6 +203,8 @@ class TestAgSandboxLifecycle:
     def test_container_starts_and_destroys(self):
         sb = _make_sandbox()
         name = sb._container_name()
+        # Container is started lazily on first use
+        sb.exec("true")
         result = subprocess.run(
             ["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
             capture_output=True, text=True,
@@ -216,13 +218,36 @@ class TestAgSandboxLifecycle:
         assert name not in result2.stdout
 
     @docker
-    def test_fork_creates_independent_container(self):
-        parent = _make_sandbox()
-        child = _make_sandbox(parent_agname=parent._agname)
-        assert parent._container_name() != child._container_name()
-        assert child._snapshot_name is not None
-        child.destroy()
-        parent.destroy()
+    def test_commit_creates_image(self):
+        sb = _make_sandbox()
+        tag = f"agency/test-commit-{sb._agname}"
+        try:
+            sb.write_file("/workspace/marker.txt", "committed\n")
+            sb.commit(tag)
+            # Image should exist
+            result = subprocess.run(
+                ["docker", "images", "-q", tag],
+                capture_output=True, text=True,
+            )
+            assert result.stdout.strip() != ""
+        finally:
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+            sb.destroy()
+
+    @docker
+    def test_checkpoint_restore_preserves_files(self):
+        tag = f"agency/test-ckpt-restore-{__import__('uuid').uuid4().hex[:8]}"
+        sb1 = _make_sandbox()
+        try:
+            sb1.write_file("/workspace/data.txt", "restored\n")
+            sb1.commit(tag)
+            sb1.destroy()
+            sb2 = _make_sandbox(restore_image=tag)
+            content = sb2.read_file("/workspace/data.txt")
+            assert content == "restored\n"
+            sb2.destroy()
+        finally:
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
 
     @docker
     def test_output_dir_agent_can_write_and_read(self, tmp_path):
@@ -249,20 +274,6 @@ class TestAgSandboxLifecycle:
         assert (out_dir1 / "out.txt").read_text().strip() == "from_agent1"
         sb1.destroy()
         sb2.destroy()
-
-    @docker
-    def test_destroy_removes_snapshot_image(self):
-        parent = _make_sandbox()
-        child = _make_sandbox(parent_agname=parent._agname)
-        snap = child._snapshot_name
-        assert snap is not None
-        child.destroy()
-        result = subprocess.run(
-            ["docker", "images", "-q", snap],
-            capture_output=True, text=True,
-        )
-        assert result.stdout.strip() == ""
-        parent.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -492,33 +503,6 @@ class TestAgSandboxResourceLimits:
     def test_release_resources_none_pool(self):
         # Should not raise even without a pool
         self.sb.release_resources(None)
-
-
-# ---------------------------------------------------------------------------
-# agSandbox — fork filesystem isolation
-# ---------------------------------------------------------------------------
-
-class TestAgSandboxForkIsolation:
-    @docker
-    def test_fork_inherits_parent_files(self):
-        parent = _make_sandbox()
-        parent.write_file("/workspace/shared.txt", "from parent\n")
-        child = _make_sandbox(parent_agname=parent._agname)
-        content = child.read_file("/workspace/shared.txt")
-        assert "from parent" in content
-        child.destroy()
-        parent.destroy()
-
-    @docker
-    def test_fork_writes_do_not_affect_parent(self):
-        parent = _make_sandbox()
-        parent.write_file("/workspace/base.txt", "original\n")
-        child = _make_sandbox(parent_agname=parent._agname)
-        child.write_file("/workspace/base.txt", "modified\n")
-        # Parent should still have the original content
-        assert "original" in parent.read_file("/workspace/base.txt")
-        child.destroy()
-        parent.destroy()
 
 
 # ---------------------------------------------------------------------------

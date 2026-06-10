@@ -36,12 +36,12 @@ Schema fields in `agdata` are plain Python type objects:
 
 | Type | JSON hint sent to LLM | Notes |
 |---|---|---|
-| `str` | `"string"` | Plain text |
-| `int` | `"integer"` | |
+| `str` | `"str"` | Plain text |
+| `int` | `"int"` | |
 | `float` | `"float"` | |
-| `bool` | `"boolean"` | |
-| `list` | `"list"` | |
-| `dict` | `"object"` | |
+| `bool` | `"bool"` | |
+| `list` | `"list"` | Untyped list — no item validation |
+| `dict` | `"dict"` | |
 | `agfile` | `"file"` | File-backed field — see [Typed field values](#typed-field-values-agtype-and-agfile) |
 
 Any `agtype` subclass is also valid; its `schema_type()` classmethod provides the JSON hint.
@@ -53,6 +53,25 @@ output_schema=agdata(summary=str, word_count=int, passed=bool)
 # agfile for large text outputs:
 output_schema=agdata(report=agfile)
 ```
+
+### Typed list fields
+
+To express a list whose items have a known structure, pass a one-element list containing a plain `dict` that maps field names to types:
+
+```python
+output_schema = agdata(
+    papers=[{"title": str, "url": str, "abstract": str}],
+    count=int,
+)
+```
+
+The serialized hint shown to the LLM is:
+
+```json
+{"papers": [{"title": "str", "url": "str", "abstract": "str"}], "count": "int"}
+```
+
+The framework validates every element against the template during output schema checking: each item must be a `dict` containing the declared keys with the declared Python types. A failure triggers an automatic retry with a message identifying the exact index and key that failed. Use this form instead of bare `list` whenever item structure matters.
 
 ## ReAct loop
 
@@ -227,16 +246,16 @@ skill = SummariserSkill()
 
 ### `FindPapersSkill`
 
-Searches arxiv for papers on a topic using a bundled `search_papers` tool. Includes an output validator that rejects empty paper lists and forces a retry.
+Searches Hugging Face Papers for papers on a topic using a bundled `search_papers` tool. The output schema uses a typed list field so the LLM sees the exact item structure and each element is validated on every response:
 
 ```python
 from agency.common_skills import FindPapersSkill
-skill = FindPapersSkill(max_papers=8)   # default 16
+skill = FindPapersSkill(max_papers=8)   # default 10
 # input:  agdata(topic=str)
-# output: agdata(papers=list, count=int)
+# output: agdata(papers=[{"title": str, "url": str, "abstract": str}], count=int)
 ```
 
-The bundled tool is also accessible as `skill.search_papers` if you need to reuse it elsewhere.
+If the LLM returns an empty list or items that are not dicts with a `title` key, the skill retries automatically. The bundled tool is also accessible as `skill.search_papers` if you need to reuse it elsewhere.
 
 ### `SummarisePaperSkill`
 

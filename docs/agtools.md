@@ -4,22 +4,22 @@ Tools are the functions an LLM can call during a ReAct loop. Each tool is an `ag
 
 ## Built-in tools
 
-| Tool | Host or sandbox | Description |
-|---|---|---|
-| `bash` | sandbox | Run a shell command; all spawned processes tracked automatically |
-| `read` | sandbox | Read a file with line-range pagination, or list a directory |
-| `write` | sandbox | Write a file, creating parent directories as needed |
-| `edit` | sandbox | Fuzzy in-place string replacement |
-| `glob` | sandbox | Find files matching a glob pattern (`rg --files` or `find` fallback) |
-| `grep` | sandbox | Search file contents by regex (`rg --json` or Python fallback) |
-| `webfetch` | host | Fetch a URL and convert HTML to Markdown |
-| `todowrite` | host | Persist a structured todo list to disk |
-| `ask_human` | host | Ask the user a question; blocks until a reply arrives (from UI or stdin) |
-| `daemon_release` | sandbox | Release a PID from monitoring so a long-lived service doesn't block skill completion |
-| `gpu_acquire` | sandbox | Acquire exclusive GPU access from the resource pool |
-| `gpu_release` | sandbox | Return the GPU to the pool |
-| `cpu_acquire` | sandbox | Boost container CPU/memory limits for compute-intensive work |
-| `cpu_release` | sandbox | Reset CPU/memory limits back to idle defaults |
+| Tool | Host or sandbox | `need_sandbox` | Description |
+|---|---|---|---|
+| `bash` | sandbox | `True` | Run a shell command; all spawned processes tracked automatically |
+| `read` | sandbox | `True` | Read a file with line-range pagination, or list a directory |
+| `write` | sandbox | `True` | Write a file, creating parent directories as needed |
+| `edit` | sandbox | `True` | Fuzzy in-place string replacement |
+| `glob` | sandbox | `True` | Find files matching a glob pattern (`rg --files` or `find` fallback) |
+| `grep` | sandbox | `True` | Search file contents by regex (`rg --json` or Python fallback) |
+| `webfetch` | host | `False` | Fetch a URL and convert HTML to Markdown |
+| `todowrite` | host | `False` | Persist a structured todo list to disk |
+| `ask_human` | host | `False` | Ask the user a question; blocks until a reply arrives (from UI or stdin) |
+| `daemon_release` | sandbox | `True` | Release a PID from monitoring so a long-lived service doesn't block skill completion |
+| `gpu_acquire` | sandbox | `True` | Acquire exclusive GPU access from the resource pool |
+| `gpu_release` | sandbox | `True` | Return the GPU to the pool |
+| `cpu_acquire` | sandbox | `True` | Boost container CPU/memory limits for compute-intensive work |
+| `cpu_release` | sandbox | `True` | Reset CPU/memory limits back to idle defaults |
 
 All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker/podman exec`.
 
@@ -145,8 +145,18 @@ my_tool = agtool(
         },
         "required": ["a", "b"],
     },
+    # need_sandbox defaults to True for custom tools — set False if the tool
+    # runs entirely on the host (HTTP calls, file reads from the host, etc.)
+    need_sandbox=False,
 )
 ```
+
+### `need_sandbox` flag
+
+Every `agtool` has a `need_sandbox` flag (default `True`). When an agent calls a tool with `need_sandbox=True`, the sandbox container is started on that first call if it has not been started yet. Tools with `need_sandbox=False` run without ever touching the container.
+
+- **Default `True`** — the safe default for custom tools; guarantees a container is available before the tool runs.
+- **Set `False`** explicitly for tools that are entirely host-side: HTTP requests, reading host files, spawning sub-agents, etc.
 
 Tools belong to skills, not agents. Pass custom tools when defining the skill:
 
@@ -161,7 +171,7 @@ skill = agskill("custom", "Use only my tool.", replace_tools=[my_tool])
 skill = agskill("classify", "Classify this text.", replace_tools=[])
 ```
 
-Each skill run rebuilds the tool list from the sandbox. `add_tools` extends the defaults; `replace_tools` overrides them entirely.
+`add_tools` extends the defaults; `replace_tools` overrides them entirely.
 
 ## Tool output
 

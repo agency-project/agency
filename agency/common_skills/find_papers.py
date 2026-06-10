@@ -11,15 +11,16 @@ class FindPapersSkill(agskill):
     Parameters
     ----------
     max_papers : int
-        Maximum number of results to fetch per query (default 16).
+        Maximum number of results to fetch per query (default 10).
     """
 
-    def __init__(self, max_papers: int = 16, **kwargs):
+    def __init__(self, max_papers: int = 10, **kwargs):
         self.max_papers = max_papers
         search_papers = agtool(
             name="search_papers",
             description="Search Hugging Face Papers for AI research papers. Returns title, URL, and abstract for each result.",
             fn=self._search,
+            need_sandbox=False,
             params={
                 "type": "object",
                 "properties": {
@@ -38,7 +39,7 @@ class FindPapersSkill(agskill):
                 "Return the full list of papers exactly as the tool provided them."
             ),
             input_schema=agdata(topic=str),
-            output_schema=agdata(papers=list, count=int),
+            output_schema=agdata(papers=[{"title": str, "url": str, "abstract": str}], count=int),
             output_validator=self._validate_output,
             replace_tools=[search_papers],
             **kwargs,

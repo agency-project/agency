@@ -411,13 +411,16 @@ def test_chained_run_output_as_next_input():
 # Outer monitoring loop
 # ---------------------------------------------------------------------------
 
-def _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0):
+def _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0, on_first_call=None):
     """Build a fake agskill.run that records each call's input.
 
     On the iteration numbered *inject_pid_on_call*, it plants a fake PID into
     the sandbox's _watched_pids dict to simulate a background process having
     been launched.  On subsequent calls it does not add any PIDs, so the loop
     can break cleanly.
+
+    If *on_first_call* is provided it is invoked with the agent on the first
+    call (idx == 0), when the sandbox is guaranteed to be live.
     """
     skill = agskill(name="s", system_prompt="")
     import time as _time
@@ -425,6 +428,8 @@ def _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0):
     def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         idx = len(calls)
         calls.append(dict(inp._data))
+        if idx == 0 and on_first_call is not None:
+            on_first_call(ag)
         if idx == inject_pid_on_call:
             ag.sandbox._watched_pids[99999] = _time.monotonic()
         else:
@@ -459,10 +464,11 @@ def test_outer_loop_re_enters_with_completed_event_when_process_finishes():
     agent gets a process_completed re-entry so it can act on the output."""
     calls = []
     ag = make_agent()
-    skill = _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0)
+    skill = _make_skill_with_pid_side_effect(
+        ag, calls, inject_pid_on_call=0,
+        on_first_call=lambda a: setattr(a.sandbox, 'get_live_pids', lambda: set()),
+    )
 
-    # Patch get_live_pids: process is already gone by the time we check
-    ag.sandbox.get_live_pids = lambda: set()
     agent.poll_interval_s = 0
 
     ag.run(skill, agdata()).result
@@ -480,17 +486,6 @@ def test_outer_loop_re_enters_with_update_event_when_process_still_running():
     ag = make_agent()
     skill = agskill(name="s", system_prompt="")
 
-    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
-        idx = len(calls)
-        calls.append(dict(inp._data))
-        if idx == 0:
-            ag.sandbox._watched_pids[99999] = _time.monotonic()
-        else:
-            ag.sandbox._watched_pids.clear()
-        return agdata(result="ok"), agdata(messages=[]), []
-
-    skill.run = fake_run
-
     # Patch get_live_pids: process still alive on first check, gone on second
     check_count = [0]
     def fake_live_pids():
@@ -500,8 +495,19 @@ def test_outer_loop_re_enters_with_update_event_when_process_still_running():
         ag.sandbox._watched_pids.clear()
         return set()
 
-    ag.sandbox.get_live_pids = fake_live_pids
-    ag.sandbox.pid_status_summary = lambda: "PID 99999 (running 0m 0s)"
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
+        idx = len(calls)
+        calls.append(dict(inp._data))
+        if idx == 0:
+            ag.sandbox._watched_pids[99999] = _time.monotonic()
+            ag.sandbox.get_live_pids = fake_live_pids       # ← moved here
+            ag.sandbox.pid_status_summary = lambda: "PID 99999 (running 0m 0s)"  # ← moved here
+        else:
+            ag.sandbox._watched_pids.clear()
+        return agdata(result="ok"), agdata(messages=[]), []
+
+    skill.run = fake_run
+
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
@@ -517,9 +523,11 @@ def test_outer_loop_completed_event_precedes_update_event():
     it always gets a completion re-entry, never an update."""
     calls = []
     ag = make_agent()
-    skill = _make_skill_with_pid_side_effect(ag, calls, inject_pid_on_call=0)
+    skill = _make_skill_with_pid_side_effect(
+        ag, calls, inject_pid_on_call=0,
+        on_first_call=lambda a: setattr(a.sandbox, 'get_live_pids', lambda: set()),
+    )
 
-    ag.sandbox.get_live_pids = lambda: set()   # always done instantly
     agent.poll_interval_s = 0
 
     ag.run(skill, agdata()).result
@@ -540,11 +548,11 @@ def test_outer_loop_max_iters_cap():
     def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
         calls.append(1)
         ag.sandbox._watched_pids[99999] = _time.monotonic()
+        ag.sandbox.get_live_pids = lambda: set()  # set here, before monitoring runs
         return agdata(result="ok"), agdata(messages=[]), []
 
     skill.run = fake_run
 
-    ag.sandbox.get_live_pids = lambda: set()
     agent.poll_interval_s = 0
     agent.max_outer_iters = 3
 
@@ -588,14 +596,14 @@ def test_outer_loop_long_job_multiple_update_cycles():
         calls.append(event)
         if event is None:                       # initial call
             ag.sandbox._watched_pids[1] = _time.monotonic()
+            ag.sandbox.get_live_pids = fake_live_pids       # ← moved here
+            ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 0s)"  # ← moved here
         elif event == "process_completed":
             ag.sandbox._watched_pids.clear()
         return agdata(result="ok"), agdata(messages=[]), []
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.sandbox.get_live_pids = fake_live_pids
-    ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
@@ -641,14 +649,14 @@ def test_outer_loop_two_jobs_different_end_times():
         if event is None:
             ag.sandbox._watched_pids[1] = _time.monotonic()   # fast job
             ag.sandbox._watched_pids[2] = _time.monotonic()   # slow job
+            ag.sandbox.get_live_pids = fake_live_pids       # ← moved here
+            ag.sandbox.pid_status_summary = lambda: "PID 2 (running 0m 0s)"  # ← moved here
         elif event == "process_completed":
             ag.sandbox._watched_pids.clear()
         return agdata(result="ok"), agdata(messages=[]), []
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.sandbox.get_live_pids = fake_live_pids
-    ag.sandbox.pid_status_summary = lambda: "PID 2 (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
@@ -687,6 +695,7 @@ def test_outer_loop_agent_starts_new_job_on_completed_reentry():
         calls.append(event)
         if event is None:
             ag.sandbox._watched_pids[1] = _time.monotonic()
+            ag.sandbox.get_live_pids = fake_live_pids       # ← moved here
         elif event == "process_completed" and len(calls) == 2:
             # React to first completion by kicking off a second job
             ag.sandbox._watched_pids[2] = _time.monotonic()
@@ -694,7 +703,6 @@ def test_outer_loop_agent_starts_new_job_on_completed_reentry():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.sandbox.get_live_pids = fake_live_pids
     agent.poll_interval_s = 0
 
     ag.run(skill, agdata()).result
@@ -740,6 +748,8 @@ def test_outer_loop_jobs_added_at_different_points_with_different_latencies():
         if event is None:                          # initial: start slow + fast
             ag.sandbox._watched_pids[1] = _time.monotonic()
             ag.sandbox._watched_pids[2] = _time.monotonic()
+            ag.sandbox.get_live_pids = fake_live_pids       # ← moved here
+            ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"  # ← moved here
         elif event == "process_update" and len(calls) == 2:
             # First update: fast job done, slow still running; add a medium job
             ag.sandbox._watched_pids[3] = _time.monotonic()
@@ -749,8 +759,6 @@ def test_outer_loop_jobs_added_at_different_points_with_different_latencies():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.sandbox.get_live_pids = fake_live_pids
-    ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
@@ -790,6 +798,8 @@ def test_outer_loop_process_completed_fires_when_new_batch_exits_quickly():
         calls.append(event)
         if event is None:
             ag.sandbox._watched_pids[1] = _time.monotonic()
+            ag.sandbox.get_live_pids = fake_live_pids       # ← moved here
+            ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"  # ← moved here
         elif event == "process_update":
             ag.sandbox._watched_pids.clear()
             ag.sandbox._watched_pids[2] = _time.monotonic()
@@ -799,8 +809,6 @@ def test_outer_loop_process_completed_fires_when_new_batch_exits_quickly():
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.sandbox.get_live_pids = fake_live_pids
-    ag.sandbox.pid_status_summary = lambda: "PID ? (running 0m 0s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
@@ -827,6 +835,7 @@ def test_outer_loop_daemon_release_unblocks_skill():
 
     ag = make_agent()
     calls = []
+    sandbox_state = {}
 
     def fake_live_pids():
         # PID 1 is always alive — it's a daemon that never exits
@@ -838,23 +847,25 @@ def test_outer_loop_daemon_release_unblocks_skill():
         if event is None:
             # Initial call: start a daemon process
             ag.sandbox._watched_pids[1] = _time.monotonic()
+            ag.sandbox.get_live_pids = fake_live_pids       # ← moved here
+            ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 5s)"  # ← moved here
         elif event == "process_update":
             # Agent recognises PID 1 as a daemon and releases it
             ag.sandbox.release_daemon(1)
+            sandbox_state['daemon_pids'] = set(ag.sandbox._daemon_pids)
+            sandbox_state['watched_pids'] = dict(ag.sandbox._watched_pids)
         return agdata(result="ok"), agdata(messages=[]), []
 
     skill = agskill(name="s", system_prompt="")
     skill.run = fake_run
-    ag.sandbox.get_live_pids = fake_live_pids
-    ag.sandbox.pid_status_summary = lambda: "PID 1 (running 0m 5s)"
     agent.poll_interval_s = 0
     agent.ping_interval_s = 0
 
     ag.run(skill, agdata()).result
 
     assert calls == [None, "process_update"]   # no process_completed — daemon was released
-    assert 1 in ag.sandbox._daemon_pids        # PID moved to daemon set
-    assert ag.sandbox._watched_pids == {}      # nothing left to monitor
+    assert 1 in sandbox_state['daemon_pids']   # PID moved to daemon set
+    assert sandbox_state['watched_pids'] == {} # nothing left to monitor
 
 
 # ---------------------------------------------------------------------------
@@ -873,11 +884,9 @@ def test_agent_all_excludes_destroyed():
     import gc
     ag1 = make_agent()
     ag2 = make_agent()
-    ag2.sandbox.destroy()
     ag2_name = ag2.agname
     del ag2
     gc.collect()
-    # agname should no longer be in the live registry
     assert ag2_name not in [a.agname for a in agent.all()]
 
 
@@ -898,32 +907,43 @@ _docker_ok = pytest.mark.skipif(
 @_docker_ok
 def test_save_and_load_restores_history_and_filesystem(tmp_path):
     from agency.agent import _allocated_agnames
-    skill = agskill(name="s", system_prompt="")
-    def fake_run(cfg, inp, hist, sandbox, pool, ms, **_):
+
+    file_content = [None]
+
+    skill_write = agskill(name="write", system_prompt="")
+    def fake_write(cfg, inp, hist, sandbox, pool, ms, **_):
+        sandbox.write_file("/workspace/state.txt", "hello\n")
         return agdata(answer="42"), agdata(messages=[{"role": "assistant", "content": "42"}]), []
-    skill.run = fake_run
+    skill_write.run = fake_write
+
+    skill_read = agskill(name="read", system_prompt="")
+    def fake_read(cfg, inp, hist, sandbox, pool, ms, **_):
+        file_content[0] = sandbox.read_file("/workspace/state.txt")
+        return agdata(ok=True), agdata(messages=[]), []
+    skill_read.run = fake_read
 
     ag = agent(llm_config={"api_key": "k", "model": "m"})
-    ag.sandbox.write_file("/workspace/state.txt", "hello\n")
-    ag.run(skill, agdata(q="test")).answer   # run a skill so history is non-empty
+    ag.run(skill_write, agdata(q="test")).answer
 
     ckpt = tmp_path / "agent.ckpt"
     ag.save(ckpt)
     assert ckpt.exists()
     saved_agname = ag.agname
-    ag.sandbox.destroy()
+    del ag
     _allocated_agnames.discard(saved_agname)
 
     ag2 = agent.load(ckpt, llm_config={"api_key": "k", "model": "m"})
     assert ag2.agname == saved_agname
-    assert ag2.sandbox.read_file("/workspace/state.txt") == "hello\n"
     assert len(ag2._history._data.get("messages", [])) > 0
     assert ag2 in agent.all()
 
-    # Structured log entry written
+    ag2.run(skill_read, agdata()).ok
+    assert file_content[0] == "hello\n"
+
     events = ag2.log.events
     assert any(e.get("event") == "loaded" for e in events)
-    ag2.sandbox.destroy()
+    del ag2
+    _allocated_agnames.discard(saved_agname)
 
 
 @_docker_ok
@@ -932,17 +952,27 @@ def test_save_all_and_load_all(tmp_path):
     from agency.agent import _allocated_agnames
 
     saved_names = set()
+    file_content = {}
+
+    skill_write = agskill(name="write", system_prompt="")
+    def fake_write(cfg, inp, hist, sandbox, pool, ms, **_):
+        sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
+        return agdata(ok=True), agdata(messages=[]), []
+    skill_write.run = fake_write
+
+    skill_read = agskill(name="read", system_prompt="")
+    def fake_read(cfg, inp, hist, sandbox, pool, ms, **_):
+        file_content[inp.name] = sandbox.read_file("/workspace/id.txt").strip()
+        return agdata(ok=True), agdata(messages=[]), []
+    skill_read.run = fake_read
 
     def _create_and_save():
         ag1 = agent(llm_config={"api_key": "k", "model": "m"})
         ag2 = agent(llm_config={"api_key": "k", "model": "m"})
-        ag1.sandbox.write_file("/workspace/id.txt", f"{ag1.agname}\n")
-        ag2.sandbox.write_file("/workspace/id.txt", f"{ag2.agname}\n")
+        ag1.run(skill_write, agdata(agname=ag1.agname)).ok
+        ag2.run(skill_write, agdata(agname=ag2.agname)).ok
         saved_names.update([ag1.agname, ag2.agname])
         agent.save_all(tmp_path)
-        ag1.sandbox.destroy()
-        ag2.sandbox.destroy()
-        # ag1, ag2 go fully out of scope here
 
     _create_and_save()
     gc.collect()
@@ -953,8 +983,10 @@ def test_save_all_and_load_all(tmp_path):
     names = {a.agname for a in restored}
     assert names == saved_names
     for a in restored:
-        assert a.sandbox.read_file("/workspace/id.txt").strip() == a.agname
-        a.sandbox.destroy()
+        a.run(skill_read, agdata(name=a.agname)).ok
+    for a in restored:
+        assert file_content[a.agname] == a.agname
+    _allocated_agnames.difference_update(saved_names)
 
 
 @_docker_ok
@@ -962,43 +994,48 @@ def test_load_all_skips_already_live_agent(tmp_path):
     import gc
     from agency.agent import _allocated_agnames
 
+    skill = agskill(name="s", system_prompt="")
+    def fake_run(cfg, inp, hist, sb, pool, ms, **_):
+        return agdata(ok=True), agdata(messages=[]), []
+    skill.run = fake_run
+
     ag1 = agent(llm_config={"api_key": "k", "model": "m"})
+    ag1.run(skill, agdata()).ok  # needs a checkpoint for save
     ag1_name = ag1.agname
     ag2_name = [None]
 
-    def _create_save_destroy_ag2():
+    def _create_save_ag2():
         ag2 = agent(llm_config={"api_key": "k", "model": "m"})
+        ag2.run(skill, agdata()).ok
         ag2_name[0] = ag2.agname
         agent.save_all(tmp_path)
-        ag2.sandbox.destroy()
-        # ag2 goes out of scope here
 
-    _create_save_destroy_ag2()
+    _create_save_ag2()
     gc.collect()
     _allocated_agnames.discard(ag2_name[0])
 
-    # ag1 still live; ag2 gone — load_all should skip ag1 and restore ag2
     result = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
     assert len(result) == 2
     assert ag1 in result
     restored_ag2 = next(a for a in result if a.agname == ag2_name[0])
     assert restored_ag2 is not None
-
-    for ag in result:
-        if ag is not ag1:
-            ag.sandbox.destroy()
-    ag1.sandbox.destroy()
+    _allocated_agnames.discard(ag2_name[0])
+    _allocated_agnames.discard(ag1_name)
 
 
 @_docker_ok
 def test_load_raises_if_agname_already_live(tmp_path):
     from agency.agent import _allocated_agnames
+    skill = agskill(name="s", system_prompt="")
+    def fake_run(cfg, inp, hist, sb, pool, ms, **_):
+        return agdata(done=True), agdata(messages=[]), []
+    skill.run = fake_run
+
     ag = agent(llm_config={"api_key": "k", "model": "m"})
+    ag.run(skill, agdata()).done  # must run a skill to get a checkpoint
     ckpt = tmp_path / "ag.ckpt"
     ag.save(ckpt)
 
-    # agname still allocated — load should raise
     with pytest.raises(ValueError, match="already in use"):
         agent.load(ckpt, llm_config={"api_key": "k", "model": "m"})
-
-    ag.sandbox.destroy()
+    _allocated_agnames.discard(ag.agname)

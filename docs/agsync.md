@@ -130,7 +130,7 @@ For most use cases they are equivalent. `agsync` is more thorough because it als
 
 ## How dynamic agent tracking works
 
-`agteam` uses a `contextvars.ContextVar` (`_active_team`) that is set to the current team instance for the duration of both `setup()` and `run()`. `agent.__init__` checks this variable and adds `self` to `_active_team._agents` (a `WeakSet`) if it is set. Because `contextvars` is thread-aware, this works correctly when teams run in the thread pool — each team's thread has its own context.
+`agteam` uses a `contextvars.ContextVar` (`_active_team`) that is set to the current team instance for the duration of both `setup()` and `run()`. `agent.__init__` checks this variable and adds `self` to `_active_team._agents` (a `WeakSet`) if it is set. Because `contextvars` is thread-aware, this works correctly when teams run in their own daemon threads — each team's thread has its own context.
 
 ```
 team.run() called

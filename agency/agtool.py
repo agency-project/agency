@@ -58,12 +58,14 @@ class agtool:
         fn: Callable[[agdata], agdata],
         params: dict | None = None,
         log_fn: "Callable[[agtool, agdata, agdata, int], None] | None" = None,
+        need_sandbox: bool = True,
     ):
-        self.name        = name
-        self.description = description
-        self.fn          = fn
-        self.params      = params or {"type": "object", "properties": {}}
-        self._log_fn     = log_fn
+        self.name         = name
+        self.description  = description
+        self.fn           = fn
+        self.params       = params or {"type": "object", "properties": {}}
+        self._log_fn      = log_fn
+        self.need_sandbox = need_sandbox
         self._term:  "agterm | None" = None
         self._aglog: "aglog  | None" = None
 
@@ -74,15 +76,17 @@ class agtool:
 
     def __getstate__(self) -> dict:
         return {
-            "name":        self.name,
-            "description": self.description,
-            "fn":          self.fn,
-            "params":      self.params,
-            "_log_fn":     self._log_fn,
+            "name":         self.name,
+            "description":  self.description,
+            "fn":           self.fn,
+            "params":       self.params,
+            "_log_fn":      self._log_fn,
+            "need_sandbox": self.need_sandbox,
         }
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
+        self.need_sandbox = state.get("need_sandbox", True)
         self._term  = None
         self._aglog = None
 
@@ -98,6 +102,12 @@ class agtool:
     # ------------------------------------------------------------------
     # Logging — override by supplying log_fn to __init__
     # ------------------------------------------------------------------
+
+    def log_start(self, arg: agdata) -> None:
+        """Called immediately before invocation."""
+        if self._term is not None:
+            in_keys = list(arg._data.keys())
+            self._term.log("TOOL ▶   ", f"{self.name}  in={in_keys}")
 
     def log(self, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         """Called after every invocation.  Default: log input/output key names."""
@@ -123,6 +133,7 @@ class agtool:
     def __call__(self, arg: agdata) -> agdata:
         import cloudpickle
         import pickle
+        self.log_start(arg)
         t0           = time.monotonic()
         fn_bytes     = cloudpickle.dumps(self.fn)
         arg_bytes    = pickle.dumps(arg)

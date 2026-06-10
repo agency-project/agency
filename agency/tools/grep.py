@@ -79,4 +79,5 @@ def make_grep(sandbox: "agSandbox") -> agtool:
         ),
         params=_GREP_PARAMS,
         log_fn=_log,
+        need_sandbox=True,
     )

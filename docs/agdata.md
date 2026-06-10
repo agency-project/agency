@@ -68,14 +68,35 @@ Supported schema types:
 
 | Type | JSON hint sent to LLM |
 |---|---|
-| `str` | `"string"` |
-| `int` | `"integer"` |
+| `str` | `"str"` |
+| `int` | `"int"` |
 | `float` | `"float"` |
-| `bool` | `"boolean"` |
+| `bool` | `"bool"` |
 | `list` | `"list"` |
-| `dict` | `"object"` |
+| `dict` | `"dict"` |
 | `agfile` | `"file"` |
 | any `agtype` subclass | `cls.schema_type()` |
+
+### Typed list schema
+
+To express a list of structured items, pass a one-element list containing a plain dict that maps field names to types:
+
+```python
+output_schema = agdata(
+    papers=[{"title": str, "url": str, "abstract": str}],
+    count=int,
+)
+```
+
+This serializes to:
+
+```json
+{"papers": [{"title": "str", "url": "str", "abstract": "str"}], "count": "int"}
+```
+
+The LLM sees the exact item shape. The framework also validates each element: every item must be a dict containing the declared keys with the declared types, and a failed check triggers an automatic retry with a precise error message identifying the offending index and key.
+
+A bare `list` hint (`papers=list`) gives the LLM no item-shape information and does not validate elements — prefer the typed form whenever item structure matters.
 
 See [agskill.md](agskill.md) for how schemas are used in validation and system prompt generation, and [agtype.md](agtype.md) for defining custom typed field values.
 

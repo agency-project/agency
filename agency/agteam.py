@@ -1,7 +1,8 @@
 from __future__ import annotations
 import functools
+import threading
 import weakref
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
 from ._context import _active_team
@@ -54,9 +55,6 @@ class agteam:
     """
 
     llm_config: dict = {}
-
-    # Shared pool across all agteam instances.
-    _pool: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=256)
 
     # Global weak registry of all live agteam instances.
     _live_teams: "weakref.WeakSet[agteam]" = weakref.WeakSet()
@@ -111,7 +109,7 @@ class agteam:
 
 
 def _wrap_run(cls) -> None:
-    """Replace cls.run with a non-blocking version that runs in a thread pool.
+    """Replace cls.run with a non-blocking version that runs in a daemon thread.
 
     The wrapped run() sets _active_team for the duration of the background
     task, stores the Future on self._run_future, and returns a pending agdata
@@ -135,7 +133,7 @@ def _wrap_run(cls) -> None:
                 _active_team.reset(token)
 
         self._run_future = future
-        agteam._pool.submit(_task)
+        threading.Thread(target=_task, daemon=True).start()
         return agdata(_future=future)
 
     cls.run = _async_run

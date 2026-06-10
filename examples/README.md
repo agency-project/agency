@@ -21,7 +21,7 @@ python examples/base_example.py
 
 **Pattern 1 — Sequential chain:** Two `ag.run()` calls on the same agent. The second call automatically waits for the first because they chain through the history future. The agent sees both turns in order.
 
-**Pattern 2 — Fork fan-out:** `agent(parent)` snapshots the parent's container; each fork's `run()` fires immediately and returns a pending `agdata`. All three forks run concurrently. Accessing `.summary` on each result blocks until that fork is done.
+**Pattern 2 — Fork fan-out:** `agent(parent)` deep-copies the history and copies the parent's checkpoint image via `docker tag`; each fork's `run()` fires immediately and returns a pending `agdata`. All three forks run concurrently in separate containers. Accessing `.summary` on each result blocks until that fork is done.
 
 ```bash
 python examples/parallel_exec.py

@@ -118,9 +118,9 @@ except Exception as e:
     print(f"team failed: {e}")
 ```
 
-## Backpressure
+## Thread model
 
-All `run()` calls share a single `ThreadPoolExecutor` (`agteam._pool`). The pool queues work automatically if the number of in-flight teams exceeds the thread count, so you can safely start hundreds of teams without spawning hundreds of threads.
+Each `run()` call executes in its own daemon thread. There is no shared pool to exhaust, so recursive team spawning — a team that creates and runs child teams inside its own `run()` — is safe by construction. Thread creation overhead (~100 µs) is negligible relative to any LLM call.
 
 ## Auto agent tracking
 

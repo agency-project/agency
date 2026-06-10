@@ -44,6 +44,7 @@ def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 },
             },
         },
+        need_sandbox=True,
     )
 
 
@@ -64,6 +65,7 @@ def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             "Call this as soon as GPU-intensive work is complete."
         ),
         params={"type": "object", "properties": {}},
+        need_sandbox=True,
     )
 
 
@@ -107,6 +109,7 @@ def make_cpu_acquire(sandbox: "agSandbox") -> agtool:
                 },
             },
         },
+        need_sandbox=True,
     )
 
 
@@ -128,6 +131,7 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             f"(idle: {pool.idle_cpus} CPUs, {pool.idle_memory} memory)."
         ),
         params={"type": "object", "properties": {}},
+        need_sandbox=True,
     )
 
 
@@ -166,4 +170,5 @@ def make_daemon_release(sandbox: "agSandbox") -> agtool:
             },
             "required": ["pid"],
         },
+        need_sandbox=True,
     )

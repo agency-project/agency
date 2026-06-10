@@ -1,6 +1,6 @@
 # Agent
 
-The `agent` class is the top-level orchestrator. It owns a sandbox container, a shared conversation history, and a pool of tools. Skills are passed directly to `run()` and always run asynchronously; the caller blocks only when it reads a result field.
+The `agent` class is the top-level orchestrator. It manages a sandbox container lifecycle, a shared conversation history, and a pool of tools. Skills are passed directly to `run()` and always run asynchronously; the caller blocks only when it reads a result field.
 
 ## Construction
 
@@ -17,6 +17,8 @@ ag = agent(
 ```
 
 `llm_config` is passed to every skill run. Any OpenAI-compatible endpoint works via `base_url`.
+
+No container is created at construction time. Within a task, a container is started lazily — only when a tool with `need_sandbox=True` is first called. Tasks that use only host-side tools never create a container at all. When a container is started, it is committed to a checkpoint image (`agency/ckpt-<pid>-<agname>`) when the task completes and then destroyed.
 
 An optional `"context_limit"` key in `llm_config` pins the model's context window size for auto-compaction. If omitted, the agent queries the endpoint at startup (vLLM exposes `max_model_len`). Compaction is silently disabled when the limit cannot be determined.
 
@@ -51,7 +53,7 @@ r2 = ag.run(summarize_skill, agdata(text=r1.text))   # waits for r1 internally
 child = agent(ag)
 ```
 
-Forking blocks until the parent's in-flight task completes, then deep-copies the resolved history and snapshots the parent's container via `docker/podman commit`. The child starts from the parent's exact filesystem state. All subsequent writes in either direction are isolated. Forked agents run concurrently.
+Forking blocks until the parent's in-flight task completes, then deep-copies the resolved history and copies the parent's checkpoint image via `docker tag`. The child's container is not started at fork time — it is created lazily when the child's first `run()` executes, restoring from the copied checkpoint. All subsequent writes in either direction are isolated.
 
 ## Class-level configuration
 
@@ -90,14 +92,14 @@ Each agent is assigned a unique pronounceable name (adjective + noun, e.g. `swif
 
 ```python
 ag = agent(llm_config, agname="worker")
-# ag.agname == "worker_000"
+# ag.agname == "worker_0000"
 ```
 
-The name is always postfixed with `_XXX` (a 3-character base-36 counter, digits `0-9` then `a-z`) to guarantee global uniqueness for the process lifetime. The first agent with a given base name gets `_000`, the tenth `_00a`, the 36th `_010`, and so on. The 3-character suffix supports 36³ = 46 656 unique values per base name.
+The name is always postfixed with `_XXXX` (a 4-character base-36 counter, digits `0-9` then `a-z`) to guarantee global uniqueness for the process lifetime. The first agent with a given base name gets `_0000`, the tenth `_000a`, the 36th `_0010`, and so on. The 4-character suffix supports 36⁴ = 1 679 616 unique values per base name.
 
 ## Lifecycle and cleanup
 
-Containers are destroyed automatically on process exit via `atexit`. Stale containers from a previous run (e.g. after a hard kill) are removed at startup before the new container is created. Call `ag.sandbox.destroy()` explicitly for deterministic cleanup.
+Containers are created lazily — only when a task calls a tool with `need_sandbox=True` for the first time. Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a container. When a container is started, stale containers from a previous run (e.g. after a hard kill) are removed first. The container is destroyed at task end. An `atexit` handler removes any containers still running at process exit.
 
 ## UI callbacks
 

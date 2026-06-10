@@ -16,7 +16,7 @@ result_future:  Future[agdata] = Future()
 history_future: Future[agdata] = Future()
 ts_start = _ts()                                # ISO-8601 timestamp for the log
 
-agent._pool.submit(_task)                       # hand _task to shared ThreadPoolExecutor
+threading.Thread(target=_task, daemon=True).start()  # spawn a daemon thread for this task
 
 self._history = agdata(_future=history_future)  # chain: next run() on this agent blocks here
 return agdata(_future=result_future)            # caller gets this — pending until _task resolves it
@@ -30,7 +30,7 @@ return agdata(_future=result_future)            # caller gets this — pending u
 
 **File:** `agency/agent.py` · `_task()` (closure inside `agent.run()`)
 
-Runs on a thread from `agent._pool`. Everything below executes on this thread.
+Runs on a dedicated daemon thread spawned by `agent.run()`. Everything below executes on this thread.
 
 ### 2a. Input resolution
 
@@ -255,13 +255,13 @@ history_future.set_result(outer_history)  # unblocks next run() on same agent
 ## 6. Complete call graph
 
 ```
-caller thread                        task thread (ThreadPoolExecutor)
+caller thread                        task thread (daemon)
 ──────────────────────────────────────────────────────────────────────────────
 agent.run(skill, input)
   ├─ prev_history = self._history
   ├─ result_future, history_future = Future(), Future()
   ├─ self._history = agdata(_future=history_future)
-  ├─ agent._pool.submit(_task) ──────────────────────────────────▶ _task()
+  ├─ Thread(target=_task, daemon=True).start() ──────────────────▶ _task()
   └─ return agdata(_future=result_future)                           │
                                                                    prev_history._resolve()
 caller.field ────────────── blocks ────────────────────────────┐   _resolve_input(input)

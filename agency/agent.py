@@ -6,10 +6,11 @@ import queue
 import shlex
 import subprocess
 import tarfile
+import threading
 import time
 import uuid as _uuid_mod
 import weakref
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import Future
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
@@ -30,7 +31,7 @@ from .agskill import agskill
 from .agtool import agtool
 from .aglog import aglog, _ts
 from .agterm import agterm
-from .agsandbox import agSandbox, get_container_runtime
+from .agsandbox import agSandbox, get_container_runtime, _PID_PREFIX
 from .agresources import agResourcePool
 from .agcompaction import fetch_context_limit, _prune_tool_outputs
 
@@ -68,12 +69,12 @@ _allocated_agnames: set[str]    = set()
 _agname_lock      = __import__("threading").Lock()
 
 # Lowercase alphanumeric alphabet used for agent ID suffixes.
-# 3 digits → 36³ = 46 656 unique values per noun (vs 1 000 with decimal).
+# 4 digits → 36⁴ = 1 679 616 unique values per noun.
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
-def _b36_suffix(n: int, width: int = 3) -> str:
-    """Encode *n* as a fixed-width base-36 string (000…009, 00a…00z, 010…)."""
+def _b36_suffix(n: int, width: int = 4) -> str:
+    """Encode *n* as a fixed-width base-36 string (0000…0009, 000a…)."""
     base = len(_B36)
     digits = []
     for _ in range(width):
@@ -94,7 +95,7 @@ def _register_agname(full_name: str) -> str:
 def _allocate_agname(name: str) -> str:
     """Return a unique name in the form <name>_XXX and register it as in-use.
 
-    XXX is a 3-character base-64 suffix (262 144 unique values per noun).
+    XXX is a 4-character base-36 suffix (1 679 616 unique values per noun).
     """
     with _agname_lock:
         n = _noun_counters.get(name, 0)
@@ -108,9 +109,9 @@ def _generate_agname() -> str:
     """Return a unique agname in the form <noun>_XXX.
 
     Nouns are assigned in order from _NOUNS, cycling back to the start after
-    the last entry. The suffix is a 3-character base-64 string (262 144 unique
-    values per noun), so arch_AAA and arch_AAB are the first and second agents
-    that received 'arch'.
+    the last entry. The suffix is a 5-character base-36 string (60 466 176
+    unique values per noun), so arch_00000 and arch_00001 are the first and
+    second agents that received 'arch', giving names like arch_0000, arch_0001.
     """
     global _noun_index
     with _agname_lock:
@@ -267,7 +268,6 @@ class agent:
         agent.max_outer_iters = 144   # safety cap (~12 hours at 5-minute intervals)
     """
 
-    _pool: ClassVar[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=256)
     log_dir:          ClassVar[Path | None]          = None
     output_dir:       ClassVar[Path | None]          = None
     agresource_pool:  ClassVar[agResourcePool]       = agResourcePool()
@@ -292,9 +292,6 @@ class agent:
         self.agname = _generate_agname() if agname is None else _allocate_agname(agname)
         pool = agent.agresource_pool
 
-        # Per-agent output subdir: <output_dir>/<agname>/
-        _out = Path(agent.output_dir) / self.agname if agent.output_dir else None
-
         if isinstance(llm_config, agent):
             src = llm_config
             self.llm_config    = src.llm_config
@@ -302,13 +299,22 @@ class agent:
             # Block until source's in-flight task finishes, then deep-copy history
             src._history._resolve()
             self._history: agdata = copy.deepcopy(src._history)
-            # Snapshot parent container → fork starts from parent's exact state
-            self.sandbox = agSandbox(self.agname, parent_agname=src.agname, output_dir=_out)
+            # Copy parent's checkpoint as this fork's starting state — no docker run yet
+            self._checkpoint: str | None = None
+            if src._checkpoint:
+                fork_tag = f"agency/ckpt-{_PID_PREFIX}-{self.agname}"
+                subprocess.run(
+                    [get_container_runtime(), "tag", src._checkpoint, fork_tag],
+                    capture_output=True, check=True,
+                )
+                self._checkpoint = fork_tag
+            self.sandbox: agSandbox | None = None
         else:
             self.llm_config    = llm_config
             self._context_limit = fetch_context_limit(llm_config)
             self._history      = agdata(messages=[])
-            self.sandbox       = agSandbox(self.agname, output_dir=_out)
+            self._checkpoint: str | None = None
+            self.sandbox:     agSandbox | None = None
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{self.agname}.jsonl"
@@ -441,9 +447,12 @@ class agent:
 
         def _task() -> None:
             _offloaded_paths: list[str] = []   # declared before try for reliable finally cleanup
+            _out = Path(agent.output_dir) / self.agname if agent.output_dir else None
             try:
                 prev_history._resolve()
                 _resolve_input(input)
+                self.sandbox = agSandbox(self.agname, restore_image=self._checkpoint, output_dir=_out)
+                self._checkpoint = None
 
                 history_before = list(prev_history._data.get("messages", []))
 
@@ -597,8 +606,18 @@ class agent:
                 self._term.log("SKILL ✗  ", f"{skill_name}  exception={exc}")
             finally:
                 self._set_ui_state("inactive")
-                _remove_offloaded_fields(_offloaded_paths, self.sandbox)
-                self.sandbox.release_resources(pool)
+                if self.sandbox is not None:
+                    _remove_offloaded_fields(_offloaded_paths, self.sandbox)
+                    if self.sandbox._gpu_id is not None:
+                        pool.release_gpu(self.sandbox._gpu_id)
+                    _ckpt_tag = f"agency/ckpt-{_PID_PREFIX}-{self.agname}"
+                    try:
+                        if self.sandbox.commit(_ckpt_tag):
+                            self._checkpoint = _ckpt_tag
+                    except Exception:
+                        pass
+                    self.sandbox.destroy()
+                    self.sandbox = None
 
             # Log and resolve futures after all background work is done
             ts_end = _ts()
@@ -638,7 +657,7 @@ class agent:
 
             history_future.set_result(outer_history)
 
-        agent._pool.submit(_task)
+        threading.Thread(target=_task, daemon=True).start()
 
         self._history = agdata(_future=history_future)
         return agdata(_future=result_future)
@@ -656,7 +675,16 @@ class agent:
         except Exception:
             pass
         try:
-            self.sandbox.destroy()
+            if self.sandbox is not None:
+                self.sandbox.destroy()
+        except Exception:
+            pass
+        try:
+            if self._checkpoint:
+                subprocess.run(
+                    [get_container_runtime(), "rmi", "-f", self._checkpoint],
+                    capture_output=True,
+                )
         except Exception:
             pass
 
@@ -777,45 +805,49 @@ class agent:
         The api_key is never written to disk.
         """
         path = Path(path)
-        runtime = self.sandbox._runtime
+        runtime = get_container_runtime()
         image_tag = f"agency/ckpt-{self.agname}"
 
-        # 1. Wait for any in-flight run() to complete so history and the
-        #    container filesystem are in a consistent, quiescent state.
         if self._history.is_pending():
             self._term.log("CKPT ⏳  ", "waiting for in-flight task to complete...")
         self._history._resolve()
 
-        # 2. Snapshot the now-idle container to an image
-        self.sandbox._run([runtime, "commit", self.sandbox._container_name(), image_tag], check=True)
+        # Build state dict
+        state = {
+            "agname":     self.agname,
+            "llm_config": {k: v for k, v in self.llm_config.items() if k != "api_key"},
+            "history":    self._history._data.get("messages", []),
+            "ts":         _ts(),
+        }
+        state_bytes = json.dumps(state, indent=2).encode()
 
-        try:
-            # 2. Export image to bytes
-            result = subprocess.run(
-                [runtime, "save", image_tag],
-                capture_output=True, check=True, timeout=600,
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self._checkpoint is not None:
+            # Retag checkpoint for export — keeps _checkpoint intact for next task
+            subprocess.run(
+                [runtime, "tag", self._checkpoint, image_tag],
+                capture_output=True, check=True,
             )
-            image_bytes = result.stdout
-
-            # 3. Build state dict
-            state = {
-                "agname":     self.agname,
-                "llm_config": {k: v for k, v in self.llm_config.items() if k != "api_key"},
-                "history":    self._history._data.get("messages", []),
-                "ts":         _ts(),
-            }
-            state_bytes = json.dumps(state, indent=2).encode()
-
-            # 4. Bundle into a single .tar.gz
-            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                result = subprocess.run(
+                    [runtime, "save", image_tag],
+                    capture_output=True, check=True, timeout=600,
+                )
+                image_bytes = result.stdout
+                with tarfile.open(path, "w:gz") as tar:
+                    for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
+                        info = tarfile.TarInfo(name=name)
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
+            finally:
+                subprocess.run([runtime, "rmi", "-f", image_tag], capture_output=True)
+        else:
+            # Agent never used a container — save history only (no filesystem state)
             with tarfile.open(path, "w:gz") as tar:
-                for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
-                    info = tarfile.TarInfo(name=name)
-                    info.size = len(data)
-                    tar.addfile(info, io.BytesIO(data))
-
-        finally:
-            subprocess.run([runtime, "rmi", "-f", image_tag], capture_output=True)
+                info = tarfile.TarInfo(name="state.json")
+                info.size = len(state_bytes)
+                tar.addfile(info, io.BytesIO(state_bytes))
 
         size_kb = path.stat().st_size // 1024
         self._term.log("CKPT ✓   ", f"saved → {path}  ({size_kb} KB)")
@@ -845,31 +877,41 @@ class agent:
 
         with tarfile.open(path, "r:gz") as tar:
             state       = json.loads(tar.extractfile("state.json").read())
-            image_bytes = tar.extractfile("container.tar").read()
+            container_member = next((m for m in tar.getmembers() if m.name == "container.tar"), None)
+            image_bytes = tar.extractfile(container_member).read() if container_member else None
 
-        # Load image — docker restores the original tag (agency/ckpt-{agname})
-        subprocess.run(
-            [runtime, "load"],
-            input=image_bytes, capture_output=True, check=True, timeout=600,
-        )
-        original_tag = f"agency/ckpt-{state['agname']}"
-        # Re-tag to a unique name so concurrent restores don't collide,
-        # then remove the original tag
-        subprocess.run([runtime, "tag", original_tag, image_tag], capture_output=True, check=True)
-        subprocess.run([runtime, "rmi", original_tag], capture_output=True)
+        checkpoint: str | None = None
+        if image_bytes is not None:
+            # Load image — docker restores the original tag (agency/ckpt-{agname})
+            subprocess.run(
+                [runtime, "load"],
+                input=image_bytes, capture_output=True, check=True, timeout=600,
+            )
+            original_tag = f"agency/ckpt-{state['agname']}"
+            # Re-tag to a unique name so concurrent restores don't collide,
+            # then remove the original tag
+            subprocess.run([runtime, "tag", original_tag, image_tag], capture_output=True, check=True)
+            subprocess.run([runtime, "rmi", original_tag], capture_output=True)
+            checkpoint = image_tag
 
         # Build agent without going through normal __init__ to avoid creating a fresh container
         ag: agent = cls.__new__(cls)
-        ag.agname     = _register_agname(state["agname"])
-        ag.llm_config = {**state.get("llm_config", {}), **llm_config}
-        ag._history   = agdata(messages=list(state.get("history", [])))
-
-        _out = Path(agent.output_dir) / ag.agname if agent.output_dir else None
-        ag.sandbox = agSandbox(ag.agname, restore_image=image_tag, output_dir=_out)
+        ag.agname        = _register_agname(state["agname"])
+        ag.llm_config    = {**state.get("llm_config", {}), **llm_config}
+        ag._history      = agdata(messages=list(state.get("history", [])))
+        ag._context_limit = fetch_context_limit(ag.llm_config)
+        ag._checkpoint   = checkpoint  # None for history-only saves; consumed by first _task()
+        ag.sandbox       = None
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         ag.log   = aglog(path=log_dir / f"{ag.agname}.jsonl")
+        ag._full_history: list[dict] = []
+        ag._full_history_path: Path = log_dir / f"{ag.agname}_full.jsonl"
+        ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
         ag._term = agterm(ag.agname)
+        ag._snapshot_messages: list[dict] = []
+        ag._inbox: queue.Queue = queue.Queue()
+        ag._ui_state: dict = {"state": "inactive", "skill": None, "tool": None}
 
         _live_agents.add(ag)
 
