@@ -89,6 +89,22 @@ Each call to `agskill.run()` executes a standard ReAct loop:
 
 The loop exits early on `max_steps` (default `10`) exceeded.
 
+### LLM timeout and exponential backoff
+
+Each LLM call is protected by an idle watchdog that doubles its deadline on every retry, following the sequence `[60, 120, 240, 480, 960]` seconds (1 → 2 → 4 → 8 → 16 minutes), for a maximum total wait of 31 minutes across 5 attempts.
+
+The watchdog runs in the main thread: it polls a queue fed by the streaming drain thread and raises `_LLMIdleTimeout` if no chunk arrives within the deadline. Unlike `httpx.ReadTimeout` (which is a per-chunk idle timer enforced inside httpcore), this approach works even when the underlying `ssl.read()` is blocked indefinitely — for example when the server closes the TCP connection without sending an SSL `close_notify` (CLOSE-WAIT state). On timeout, `client.close()` is called best-effort to unblock the drain thread.
+
+A timeout on attempt *N* logs a `LLM ✗` line and retries with the next deadline. If all 5 attempts time out, the skill returns `agdata(error="LLM timeout after 5 attempts")` without raising.
+
+The connect, write, and pool timeouts are fixed at 30 s, 180 s, and 30 s respectively.
+
+### Concurrency semaphore
+
+A process-wide semaphore (`_skill_semaphore`, size 128) limits how many skills can be in an active LLM call simultaneously. The semaphore is acquired just before the OpenAI client is constructed and released immediately after the streaming call finishes — whether it succeeds, times out, or retries. Skills waiting for input validation, tool execution, or output validation do not hold a slot.
+
+This prevents runaway parallelism from exhausting vLLM server connections when hundreds of agents are spawned concurrently.
+
 ### Streaming and GIL pressure
 
 The LLM call uses `stream=True`. Without batching, each SSE token chunk would acquire and release the Python GIL once, creating O(tokens) context switches that slow down all concurrent agent threads.

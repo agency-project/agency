@@ -10,10 +10,18 @@ from agency import agent
 
 agent.log_dir = Path("runs/logs")   # set before creating agents
 ag = agent(llm_config, agskills=[...])
-# writes to runs/logs/<agname>.jsonl
+# writes to runs/logs/<agname>_timeline.jsonl  (structured event log)
+# writes to runs/logs/<agname>_history.jsonl   (raw LLM message transcript)
 ```
 
-Each agent writes its own JSONL file. Lines are appended atomically under a lock so concurrent skill calls on the same agent are safe.
+Each agent writes two JSONL files:
+
+| File | Contents |
+|---|---|
+| `<agname>_timeline.jsonl` | Structured event log: lifecycle events, tool calls, skill start/end, compaction |
+| `<agname>_history.jsonl` | Raw LLM message transcript: every user/assistant/tool message in full |
+
+Lines are appended atomically under a lock so concurrent skill calls on the same agent are safe.
 
 ## Reading the log
 

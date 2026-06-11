@@ -73,6 +73,30 @@ class agteam:
         self._agents: weakref.WeakSet = weakref.WeakSet()
         self._run_future: Future | None = None
         agteam._live_teams.add(self)
+
+        parent = _active_team.get(None)
+        self._parent_team: "agteam | None" = parent
+
+        # Log team creation to both terminal and file
+        from .agent import agent as _Agent, _allocate_agname
+        from .aglog import aglog as _aglog, _ts
+        import sys
+        _base = config.get("name") or f"{type(self).__name__}"
+        self.team_name: str = _allocate_agname(_base)
+        parent_team_name    = parent.team_name if parent is not None else None
+        log_dir = _Agent.log_dir
+        self._log = _aglog(log_dir / "_teams.jsonl" if log_dir else None)
+        self._log._lifecycle(
+            "created",
+            team=self.team_name,
+            parent_team=parent_team_name,
+        )
+        if parent_team_name is not None:
+            print(
+                f"  [agteam] {self.team_name} created inside {parent_team_name}",
+                file=sys.stderr, flush=True,
+            )
+
         token = _active_team.set(self)
         try:
             self.setup()

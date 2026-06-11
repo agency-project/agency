@@ -1,6 +1,7 @@
 from __future__ import annotations
 import threading
 import time
+import multiprocessing as _mp
 from concurrent.futures import ProcessPoolExecutor
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata
@@ -23,7 +24,7 @@ def _get_pool() -> ProcessPoolExecutor:
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ProcessPoolExecutor(max_workers=256)
+                _pool = ProcessPoolExecutor(max_workers=256, mp_context=_mp.get_context("spawn"))
     return _pool
 
 

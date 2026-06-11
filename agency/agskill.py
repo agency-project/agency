@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import queue
 import re
+import ssl
 import threading
 import time
 from typing import TYPE_CHECKING, Callable, Generator, Iterable, TypeVar
@@ -10,32 +11,65 @@ import openai
 
 _T = TypeVar("_T")
 _BATCH_INTERVAL_S: float = 0.1   # main thread drains stream every 100 ms
+_IDLE_CHECK_INTERVAL_S: float = 1.0  # how often to check idle timeout
 
 
-def _iter_batched(iterable: Iterable[_T]) -> Generator[list[_T], None, None]:
+class _LLMIdleTimeout(Exception):
+    """Raised by _iter_batched when no chunk arrives within idle_timeout seconds."""
+
+
+def _iter_batched(
+    iterable: Iterable[_T],
+    idle_timeout: float | None = None,
+) -> Generator[list[_T], None, None]:
     """Drain *iterable* in a background thread; yield batches to the caller.
 
     The background thread does minimal Python per item (one queue.put).
     The calling thread sleeps for _BATCH_INTERVAL_S between drains, releasing
     the GIL for that entire interval so other threads run unimpeded.
     GIL acquisitions drop from O(items) to O(items / avg_batch_size).
+
+    If *idle_timeout* is given, raises _LLMIdleTimeout when no item arrives
+    for that many seconds.  The drain thread is left as a daemon (it will die
+    when the process exits or when the underlying socket is eventually closed).
     """
     _SENTINEL = object()
     q: queue.SimpleQueue = queue.SimpleQueue()
+
+    exc_box: list[BaseException] = []
 
     def _drain() -> None:
         try:
             for item in iterable:
                 q.put(item)
+        except BaseException as e:
+            exc_box.append(e)
         finally:
             q.put(_SENTINEL)
 
     threading.Thread(target=_drain, daemon=True).start()
 
+    _last_item = time.monotonic()
+
     while True:
         # Block until the first item of the next batch arrives (GIL released).
-        item = q.get()
+        # When idle_timeout is set, poll every _IDLE_CHECK_INTERVAL_S so we
+        # can detect dead connections (e.g. CLOSE-WAIT / stuck ssl.read()).
+        try:
+            if idle_timeout is not None:
+                item = q.get(timeout=_IDLE_CHECK_INTERVAL_S)
+            else:
+                item = q.get()
+        except queue.Empty:
+            if time.monotonic() - _last_item >= idle_timeout:  # type: ignore[operator]
+                raise _LLMIdleTimeout(f"no chunk received for {idle_timeout:.0f}s")
+            continue
+
+        _last_item = time.monotonic()
+
         if item is _SENTINEL:
+            if exc_box:
+                raise exc_box[0]
             return
 
         # Sleep for one interval — background thread accumulates more items
@@ -77,6 +111,8 @@ if TYPE_CHECKING:
     from .aglog import aglog
     from .agsandbox import agSandbox
     from .agresources import agResourcePool
+
+_skill_semaphore = threading.Semaphore(128)
 
 class agskill:
     """A named skill with its own system prompt and a self-contained ReAct loop.
@@ -252,11 +288,9 @@ class agskill:
         tool_map = {t.name: t for t in active_tools}
         openai_tools = [t.to_openai_tool() for t in active_tools] or None
 
-        client = openai.OpenAI(
-            api_key=llm_config.get("api_key", "") or "EMPTY",
-            base_url=llm_config.get("base_url", None),
-            timeout=httpx.Timeout(connect=30.0, read=15000.0, write=180.0, pool=30.0),
-        )
+        # Exponential backoff timeouts for LLM calls (seconds): 1,2,4,8,16 min
+        _TIMEOUT_SEQUENCE = [60, 120, 240, 480, 960]
+        _timeout_attempt = 0
 
         history_msgs: list[dict] = list(history._data.get("messages", []))
         n_before = len(history_msgs)
@@ -333,8 +367,16 @@ class agskill:
                     if _live_messages_fn:
                         _live_messages_fn(messages[1:])
 
+            read_timeout = _TIMEOUT_SEQUENCE[min(_timeout_attempt, len(_TIMEOUT_SEQUENCE) - 1)]
+            _skill_semaphore.acquire()
+            client = openai.OpenAI(
+                api_key=llm_config.get("api_key", "") or "EMPTY",
+                base_url=llm_config.get("base_url", None),
+                timeout=httpx.Timeout(connect=30.0, read=None, write=180.0, pool=30.0),
+            )
+
             if term:
-                term.log("LLM ▶    ", f"model={llm_config.get('model','?')}  messages={len(messages)}")
+                term.log("LLM ▶    ", f"model={llm_config.get('model','?')}  messages={len(messages)}  timeout={read_timeout}s")
             if _state_fn:
                 _state_fn("llm", skill=self.name)
 
@@ -360,61 +402,86 @@ class agskill:
                 r"<think(?:ing)?>(.*?)(?:</think(?:ing)?>|$)", re.DOTALL | re.IGNORECASE
             )
 
-            for batch in _iter_batched(client.chat.completions.create(**kwargs)):
-                for chunk in batch:
-                    if chunk.usage is not None:
-                        prompt_tokens = chunk.usage.prompt_tokens
-                        if term is not None:
-                            term._tokens = prompt_tokens
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
+            try:
+                for batch in _iter_batched(client.chat.completions.create(**kwargs), idle_timeout=float(read_timeout)):
+                    for chunk in batch:
+                        if chunk.usage is not None:
+                            prompt_tokens = chunk.usage.prompt_tokens
+                            if term is not None:
+                                term._tokens = prompt_tokens
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta
 
-                    # Reasoning tokens — field name varies by model/backend:
-                    # "reasoning_content" (DeepSeek-R1 / some vLLM builds)
-                    # "reasoning"         (Kimi-K2 and others via model_extra)
-                    extra = getattr(delta, "model_extra", None) or {}
-                    rc = getattr(delta, "reasoning_content", None)
-                    if not isinstance(rc, str):
-                        rc = extra.get("reasoning_content")
-                    if not isinstance(rc, str):
-                        rc = extra.get("reasoning")
-                    if isinstance(rc, str) and rc:
-                        reasoning_parts.append(rc)
-                        partial_msg["_thinking"] = "".join(reasoning_parts)
+                        # Reasoning tokens — field name varies by model/backend:
+                        # "reasoning_content" (DeepSeek-R1 / some vLLM builds)
+                        # "reasoning"         (Kimi-K2 and others via model_extra)
+                        extra = getattr(delta, "model_extra", None) or {}
+                        rc = getattr(delta, "reasoning_content", None)
+                        if not isinstance(rc, str):
+                            rc = extra.get("reasoning_content")
+                        if not isinstance(rc, str):
+                            rc = extra.get("reasoning")
+                        if isinstance(rc, str) and rc:
+                            reasoning_parts.append(rc)
+                            partial_msg["_thinking"] = "".join(reasoning_parts)
 
-                    if delta.content:
-                        content_parts.append(delta.content)
-                        raw = "".join(content_parts)
-                        # For <think>-tag models: expose thinking live even before closing tag
-                        m = _PARTIAL_THINK_RE.search(raw)
-                        if m:
-                            partial_msg["_thinking"] = m.group(1).strip()
-                            partial_msg["content"] = _THINKING_RE.sub("", raw).strip()
-                        else:
-                            partial_msg["content"] = raw
+                        if delta.content:
+                            content_parts.append(delta.content)
+                            raw = "".join(content_parts)
+                            # For <think>-tag models: expose thinking live even before closing tag
+                            m = _PARTIAL_THINK_RE.search(raw)
+                            if m:
+                                partial_msg["_thinking"] = m.group(1).strip()
+                                partial_msg["content"] = _THINKING_RE.sub("", raw).strip()
+                            else:
+                                partial_msg["content"] = raw
 
-                    # Throttle UI redraws: push every ~100 new combined chars
-                    new_chars = len(partial_msg.get("content", "")) + len(partial_msg.get("_thinking", ""))
-                    if _live_messages_fn and new_chars - _live_chars >= 100:
-                        _live_messages_fn(messages[1:])
-                        _live_chars = new_chars
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            slot = tool_calls_raw.setdefault(tc_delta.index, {
-                                "id": "", "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            })
-                            if tc_delta.id:
-                                slot["id"] = tc_delta.id
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    slot["function"]["name"] += tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    slot["function"]["arguments"] += tc_delta.function.arguments
+                        # Throttle UI redraws: push every ~100 new combined chars
+                        new_chars = len(partial_msg.get("content", "")) + len(partial_msg.get("_thinking", ""))
+                        if _live_messages_fn and new_chars - _live_chars >= 100:
+                            _live_messages_fn(messages[1:])
+                            _live_chars = new_chars
+                        if delta.tool_calls:
+                            for tc_delta in delta.tool_calls:
+                                slot = tool_calls_raw.setdefault(tc_delta.index, {
+                                    "id": "", "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                })
+                                if tc_delta.id:
+                                    slot["id"] = tc_delta.id
+                                if tc_delta.function:
+                                    if tc_delta.function.name:
+                                        slot["function"]["name"] += tc_delta.function.name
+                                    if tc_delta.function.arguments:
+                                        slot["function"]["arguments"] += tc_delta.function.arguments
+
+            except (_LLMIdleTimeout, ssl.SSLError, OSError) as _conn_err:
+                try:
+                    client.close()  # best-effort: unblock drain thread's ssl.read()
+                except Exception:
+                    pass
+                messages.pop()  # remove partial placeholder
+                _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
+                _skill_semaphore.release()
+                _err_desc = (
+                    f"timeout after {read_timeout}s"
+                    if isinstance(_conn_err, _LLMIdleTimeout)
+                    else f"connection error: {_conn_err}"
+                )
+                if _timeout_attempt < len(_TIMEOUT_SEQUENCE) - 1:
+                    _timeout_attempt += 1
+                    next_timeout = _TIMEOUT_SEQUENCE[_timeout_attempt]
+                    if term:
+                        term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  {_err_desc}  retrying with {next_timeout}s")
+                    continue
+                if term:
+                    term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  {_err_desc}  all retries exhausted")
+                return agdata(error=f"LLM connection error after {len(_TIMEOUT_SEQUENCE)} attempts: {_conn_err}"), history, []
 
             messages.pop()  # remove partial placeholder
             _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
+            _skill_semaphore.release()
             if term:
                 term.log("LLM ✓    ", f"model={llm_config.get('model','?')}  ({_llm_elapsed_ms}ms)")
 

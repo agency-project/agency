@@ -335,10 +335,10 @@ class agent:
             self.sandbox:     agSandbox | None = None
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
-        log_path = log_dir / f"{self.agname}.jsonl"
+        log_path = log_dir / f"{self.agname}_timeline.jsonl"
         self.log  = aglog(path=log_path)
         self._full_history: list[dict] = []
-        self._full_history_path: Path = log_dir / f"{self.agname}_full.jsonl"
+        self._full_history_path: Path = log_dir / f"{self.agname}_history.jsonl"
         self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
         self._term = agterm(self.agname)
 
@@ -362,20 +362,25 @@ class agent:
         if _team is not None:
             _team._agents.add(self)
 
+        team_name = _team.team_name if _team is not None else None
+
         if isinstance(llm_config, agent):
             self._term.log("FORKED   ", f"from {src.agname}")
             self.log._lifecycle(
                 "forked",
                 agname=self.agname,
                 parent_agname=src.agname,
+                team=team_name,
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
             )
         else:
             ctx = f"  context={self._context_limit}" if self._context_limit else "  context=unknown"
-            self._term.log("CREATED  ", f"model={self.llm_config.get('model','?')}{ctx}")
+            team_tag = f"  team={team_name}" if team_name else ""
+            self._term.log("CREATED  ", f"model={self.llm_config.get('model','?')}{ctx}{team_tag}")
             self.log._lifecycle(
                 "created",
                 agname=self.agname,
+                team=team_name,
                 llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
                 context_limit=self._context_limit,
             )
@@ -922,9 +927,9 @@ class agent:
         ag.sandbox       = None
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
-        ag.log   = aglog(path=log_dir / f"{ag.agname}.jsonl")
+        ag.log   = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl")
         ag._full_history: list[dict] = []
-        ag._full_history_path: Path = log_dir / f"{ag.agname}_full.jsonl"
+        ag._full_history_path: Path = log_dir / f"{ag.agname}_history.jsonl"
         ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
         ag._term = agterm(ag.agname)
         ag._snapshot_messages: list[dict] = []

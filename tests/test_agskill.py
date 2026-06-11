@@ -389,3 +389,124 @@ def test_schemas_appended_to_system_prompt():
 def test_no_schemas_system_prompt_unchanged():
     s = agskill(name="s", system_prompt="Be helpful.")
     assert s._build_system_prompt() == "Be helpful."
+
+
+# ---------------------------------------------------------------------------
+# Concurrency semaphore
+# ---------------------------------------------------------------------------
+
+from agency.agskill import _skill_semaphore as _sem
+
+
+def test_semaphore_released_after_success():
+    s = make_skill()
+    before = _sem._value
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert _sem._value == before
+
+
+def test_semaphore_released_after_timeout():
+    from agency.agskill import _LLMIdleTimeout as _IdleTimeout
+    s = make_skill()
+    before = _sem._value
+
+    def _timeout_iter(iterable, idle_timeout=None):
+        raise _IdleTimeout("no chunk received")
+        yield  # makes this a generator function
+
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _timeout_iter):
+        MockClient.return_value.chat.completions.create.return_value = []
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert result.error is not None
+    assert _sem._value == before
+
+
+def test_semaphore_limits_concurrency():
+    """When all slots are held, an extra acquire blocks until one is released."""
+    sem = _sem
+    # Grab all but one slot
+    grabbed = []
+    for _ in range(127):
+        sem.acquire()
+        grabbed.append(True)
+    try:
+        # One slot remains — non-blocking acquire succeeds
+        assert sem.acquire(blocking=False)
+        grabbed.append(True)  # track so finally releases it
+        # Zero slots remain — non-blocking acquire fails
+        assert not sem.acquire(blocking=False)
+    finally:
+        for _ in grabbed:
+            sem.release()
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff timeout
+# ---------------------------------------------------------------------------
+
+def test_timeout_retries_all_attempts_then_error():
+    from agency.agskill import _LLMIdleTimeout as _IdleTimeout
+    s = make_skill()
+    call_count = 0
+
+    def _timeout_iter(iterable, idle_timeout=None):
+        nonlocal call_count
+        call_count += 1
+        raise _IdleTimeout("no chunk received")
+        yield
+
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _timeout_iter):
+        MockClient.return_value.chat.completions.create.return_value = []
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert result.error is not None
+    assert "error" in result.error.lower()
+    assert call_count == 5  # one attempt per entry in _TIMEOUT_SEQUENCE
+
+
+def test_timeout_values_increase_on_retry():
+    from agency.agskill import _LLMIdleTimeout as _IdleTimeout
+    captured_timeouts = []
+
+    def _capture_iter(iterable, idle_timeout=None):
+        captured_timeouts.append(idle_timeout)
+        raise _IdleTimeout("no chunk received")
+        yield
+
+    s = make_skill()
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _capture_iter):
+        MockClient.return_value.chat.completions.create.return_value = []
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert captured_timeouts == [60.0, 120.0, 240.0, 480.0, 960.0]
+
+
+def test_timeout_succeeds_after_retry():
+    """If a later attempt succeeds, result is returned normally."""
+    from agency.agskill import _LLMIdleTimeout as _IdleTimeout, _iter_batched as _real_iter_batched
+    call_count = 0
+
+    def _maybe_timeout(iterable, idle_timeout=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise _IdleTimeout("no chunk received")
+            yield  # makes this a generator function
+        else:
+            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout)
+
+    s = make_skill()
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _maybe_timeout):
+        MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert getattr(result, "error", None) is None
+    assert result.answer == "ok"
+    assert call_count == 3
