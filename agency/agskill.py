@@ -12,6 +12,7 @@ import openai
 _T = TypeVar("_T")
 _BATCH_INTERVAL_S: float = 0.1   # main thread drains stream every 100 ms
 _IDLE_CHECK_INTERVAL_S: float = 1.0  # how often to check idle timeout
+_TOOL_OUTPUT_OFFLOAD_CHARS: int = 20_000  # tool results longer than this are saved to a file
 
 
 class _LLMIdleTimeout(Exception):
@@ -317,8 +318,19 @@ class agskill:
                 messages=[{k: v for k, v in m.items() if not k.startswith("_")}
                           for m in messages],
             )
-            if "extra_body" in llm_config:
-                kwargs["extra_body"] = llm_config["extra_body"]
+            # Forward standard OpenAI generation parameters from llm_config.
+            _OPENAI_GEN_PARAMS = {"temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
+            for _p in _OPENAI_GEN_PARAMS:
+                if _p in llm_config:
+                    kwargs[_p] = llm_config[_p]
+            # Merge vLLM-specific parameters (not in the OpenAI spec) into extra_body.
+            _EXTRA_BODY_GEN_PARAMS = {"top_k", "repetition_penalty", "min_p", "min_tokens", "guided_json", "guided_regex"}
+            _extra_body: dict = dict(llm_config.get("extra_body") or {})
+            for _p in _EXTRA_BODY_GEN_PARAMS:
+                if _p in llm_config:
+                    _extra_body[_p] = llm_config[_p]
+            if _extra_body:
+                kwargs["extra_body"] = _extra_body
             if openai_tools:
                 kwargs["tools"] = openai_tools
 
@@ -568,6 +580,16 @@ class agskill:
                             if _state_fn:
                                 _state_fn("skill", skill=self.name)
                             result_content = json.dumps({"error": str(e)})
+                    if sandbox is not None and len(result_content) > _TOOL_OUTPUT_OFFLOAD_CHARS:
+                        safe_id = tc_id.replace("-", "")[:12]
+                        offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
+                        try:
+                            sandbox.write_file(offload_path, result_content)
+                            result_content = json.dumps({
+                                "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
+                            })
+                        except Exception:
+                            pass
                     tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
                     messages.append(tool_msg)
                     if _live_messages_fn:
