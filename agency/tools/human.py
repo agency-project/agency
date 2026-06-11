@@ -1,9 +1,14 @@
 from __future__ import annotations
+import queue
+import threading
 from ..agtool import agtool
 from ..agdata import agdata
 
+_TIMEOUT_REPLY = "[no human available — timed out]"
+_DEFAULT_TIMEOUT_S = 300  # 5 minutes
 
-def make_ask_human(agname: str) -> agtool:
+
+def make_ask_human(agname: str, timeout_s: float = _DEFAULT_TIMEOUT_S) -> agtool:
     """Return an ask_human tool bound to the given agent's agname."""
 
     def fn(arg: agdata) -> agdata:
@@ -26,7 +31,20 @@ def make_ask_human(agname: str) -> agtool:
             reply = agui._active.ask_human(agname, question)
         else:
             print(f"\n[{agname}] asks: {question}")
-            reply = input("> ")
+            q: queue.SimpleQueue[str] = queue.SimpleQueue()
+
+            def _read() -> None:
+                try:
+                    q.put(input("> "))
+                except EOFError:
+                    q.put(_TIMEOUT_REPLY)
+
+            threading.Thread(target=_read, daemon=True).start()
+            try:
+                reply = q.get(timeout=timeout_s)
+            except queue.Empty:
+                print(f"[{agname}] ask_human timed out after {timeout_s:.0f}s")
+                reply = _TIMEOUT_REPLY
 
         if a:
             a._set_ui_state(
