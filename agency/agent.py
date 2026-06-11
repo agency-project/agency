@@ -25,6 +25,21 @@ _DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
 # WeakSet entries disappear automatically when agents are garbage-collected.
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
+# Round-robin counter for multi-server llm_config lists.
+_llm_config_counter: int = 0
+_llm_config_lock: threading.Lock = threading.Lock()
+
+
+def _pick_llm_config(llm_config: "dict | list[dict]") -> dict:
+    """Return a single config dict, round-robining across a list."""
+    if not isinstance(llm_config, list):
+        return llm_config
+    global _llm_config_counter
+    with _llm_config_lock:
+        idx = _llm_config_counter % len(llm_config)
+        _llm_config_counter += 1
+    return llm_config[idx]
+
 from .agdata import agdata
 from .agtype import agtype
 from .agskill import agskill
@@ -288,6 +303,9 @@ class agent:
                 llm_config = _t.llm_config
             else:
                 raise TypeError("agent() requires llm_config when called outside an agteam context")
+
+        # Resolve a list of configs to a single one via round-robin.
+        llm_config = _pick_llm_config(llm_config)
 
         self.agname = _generate_agname() if agname is None else _allocate_agname(agname)
         pool = agent.agresource_pool

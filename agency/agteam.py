@@ -54,7 +54,7 @@ class agteam:
         at construction time.
     """
 
-    llm_config: dict = {}
+    llm_config: "dict | list[dict]" = {}
 
     # Global weak registry of all live agteam instances.
     _live_teams: "weakref.WeakSet[agteam]" = weakref.WeakSet()
@@ -64,9 +64,9 @@ class agteam:
         if "run" in cls.__dict__:
             _wrap_run(cls)
 
-    def __init__(self, llm_config: dict | None = None, **config) -> None:
+    def __init__(self, llm_config: "dict | list[dict] | None" = None, **config) -> None:
         # Instance-level llm_config: explicit arg > class attribute
-        self.llm_config: dict = llm_config if llm_config is not None else type(self).llm_config
+        self.llm_config: "dict | list[dict]" = llm_config if llm_config is not None else type(self).llm_config
         # Expose every config kwarg as a plain attribute
         for k, v in config.items():
             setattr(self, k, v)

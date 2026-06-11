@@ -36,9 +36,9 @@ def _make_run_dir(name: str) -> Path:
 
 
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
+    "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:18000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   "google/gemma-4-E4B-it"),
+    "model":    os.environ.get("VLLM_MODEL",   "google/gemma-4-E2B-it"),
 }
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "6"))
 

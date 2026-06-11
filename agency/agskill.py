@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from typing import TYPE_CHECKING, Callable, Generator, Iterable, TypeVar
+import httpx
 import openai
 
 _T = TypeVar("_T")
@@ -254,6 +255,7 @@ class agskill:
         client = openai.OpenAI(
             api_key=llm_config.get("api_key", "") or "EMPTY",
             base_url=llm_config.get("base_url", None),
+            timeout=httpx.Timeout(connect=30.0, read=15000.0, write=180.0, pool=30.0),
         )
 
         history_msgs: list[dict] = list(history._data.get("messages", []))
@@ -332,7 +334,7 @@ class agskill:
                         _live_messages_fn(messages[1:])
 
             if term:
-                term.log("LLM      ", f"model={llm_config.get('model','?')}  messages={len(messages)}")
+                term.log("LLM ▶    ", f"model={llm_config.get('model','?')}  messages={len(messages)}")
             if _state_fn:
                 _state_fn("llm", skill=self.name)
 
@@ -344,6 +346,7 @@ class agskill:
             reasoning_parts: list[str] = []
             tool_calls_raw: dict[int, dict] = {}
             prompt_tokens: int | None = None
+            _llm_t0 = time.monotonic()
 
             # Partial placeholder so live UI shows tokens as they arrive
             partial_msg: dict = {"role": "assistant", "content": ""}
@@ -411,6 +414,9 @@ class agskill:
                                     slot["function"]["arguments"] += tc_delta.function.arguments
 
             messages.pop()  # remove partial placeholder
+            _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
+            if term:
+                term.log("LLM ✓    ", f"model={llm_config.get('model','?')}  ({_llm_elapsed_ms}ms)")
 
             if _state_fn:
                 _state_fn("skill", skill=self.name)
@@ -471,6 +477,14 @@ class agskill:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"]["arguments"]
                     tc_id   = tc["id"]
+                    # Ensure arguments is valid JSON before it goes back into history.
+                    # A malformed string (truncated generation, Python repr, etc.) causes
+                    # vLLM to crash on the next request when it re-parses the history.
+                    try:
+                        json.loads(fn_args)
+                    except (json.JSONDecodeError, TypeError):
+                        fn_args = "{}"
+                        tc["function"]["arguments"] = fn_args
                     t = tool_map.get(fn_name)
                     if t is None:
                         if term:

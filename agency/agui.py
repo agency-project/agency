@@ -191,7 +191,7 @@ class _AgencyApp(App):
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="left"):
-                yield RichLog(id="shared-log", highlight=False, markup=True)
+                yield RichLog(id="shared-log", highlight=False, markup=True, max_lines=2000)
                 with Vertical(id="interaction"):
                     yield ScrollableContainer(id="agent-history")
                     yield Input(placeholder="type reply, then Enter…", id="agent-input")

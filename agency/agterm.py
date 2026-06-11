@@ -15,7 +15,7 @@ import random as _random
 import sys
 import inspect
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Colour palette — ~54 visually distinct xterm-256 colours, randomised once
@@ -52,7 +52,8 @@ _EVENT_STYLES: dict[str, str] = {
     "SKILL ▶  ": "\033[1m",    # bold
     "SKILL ✓  ": "\033[0m",    # normal
     "SKILL ✗  ": "\033[7m",    # reverse video  (visible without colour)
-    "LLM      ": "\033[0m",    # normal
+    "LLM ▶    ": "\033[0m",    # normal
+    "LLM ✓    ": "\033[0m",    # normal
     "TOOL     ": "\033[0m",    # normal
 }
 
@@ -113,7 +114,7 @@ class agterm:
                     if frame is not None else "?")
         lineno   = frame.f_lineno if frame is not None else 0
 
-        ts        = f"{_DIM}{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}{_RESET}"
+        ts        = f"{_DIM}{datetime.now().strftime('%H:%M:%S.%f')[:-3]}{_RESET}"
         agent_tag = f"{self._color}{_BOLD}[{self._id}]{_RESET}"
         ev_key    = event.ljust(9)[:9]
         ev_style  = _EVENT_STYLES.get(ev_key, "")
