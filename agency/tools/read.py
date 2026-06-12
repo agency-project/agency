@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shlex
 from typing import TYPE_CHECKING
-from ..agdata import agdata
+from ..agdata import agdata, _fmt_exc
 from ..agtool import agtool
 
 if TYPE_CHECKING:
@@ -93,7 +93,7 @@ def make_read(sandbox: "agSandbox") -> agtool:
         except FileNotFoundError:
             return agdata(error=f"Not found: {file_path}")
         except Exception as e:
-            return agdata(error=str(e))
+            return agdata(error=_fmt_exc(e))
 
         result = _paginate_text(content, offset, limit)
         return agdata(path=file_path, **result._data)

@@ -6,7 +6,7 @@ import html2text
 import httpx
 
 from ..agskill import agskill
-from ..agdata import agdata
+from ..agdata import agdata, _fmt_exc
 from ..agtool import agtool
 
 _MAX_CHARS = 32_000
@@ -123,7 +123,7 @@ class SummarisePaperSkill(agskill):
             resp = httpx.get(html_url, timeout=30, follow_redirects=True)
             resp.raise_for_status()
         except Exception as e:
-            return agdata(error=str(e), text="", url=html_url)
+            return agdata(error=_fmt_exc(e), text="", url=html_url)
 
         converter = html2text.HTML2Text()
         converter.ignore_links = True

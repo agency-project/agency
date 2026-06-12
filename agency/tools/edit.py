@@ -6,7 +6,7 @@ Edit tool: port of opencode's edit.ts replacer pipeline.
 Tries 9 replacement strategies in order, raising on not-found or ambiguity.
 """
 from typing import TYPE_CHECKING, Generator
-from ..agdata import agdata
+from ..agdata import agdata, _fmt_exc
 from ..agtool import agtool
 
 if TYPE_CHECKING:
@@ -274,14 +274,14 @@ def make_edit(sandbox: "agSandbox") -> agtool:
         except FileNotFoundError:
             return agdata(error=f"File not found: {file_path}")
         except Exception as e:
-            return agdata(error=str(e))
+            return agdata(error=_fmt_exc(e))
 
         try:
             updated = _replace(content, old_string, new_string, replace_all)
             sandbox.write_file(file_path, updated)
             return agdata(path=file_path, success=True)
         except (ValueError, OSError) as e:
-            return agdata(error=str(e))
+            return agdata(error=_fmt_exc(e))
 
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:

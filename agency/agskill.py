@@ -102,7 +102,7 @@ def _strip_thinking(content: str) -> str:
 def _extract_thinking(content: str) -> str:
     """Return the concatenated text of all thinking blocks, or empty string if none."""
     return "\n\n".join(m.group(1).strip() for m in _THINKING_RE.finditer(content))
-from .agdata import agdata
+from .agdata import agdata, _fmt_exc
 from .agtype import agtype
 from .agtool import agtool
 from .agcompaction import compact, should_compact, count_messages_tokens
@@ -184,8 +184,17 @@ class agskill:
             parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}")
         if self.output_schema is not None:
             parts.append(
-                f"\nOutput JSON format (respond ONLY with this JSON):\n"
-                f"{self.output_schema.to_json()}"
+                f"\nOutput JSON format (respond ONLY with this JSON, no other text):\n"
+                f"{self.output_schema.to_json()}\n\n"
+                "JSON formatting rules — common failure modes to avoid:\n"
+                "- Do NOT wrap the JSON in markdown code fences (``` or ```json).\n"
+                "- Do NOT add any explanation, preamble, or trailing text outside the JSON object.\n"
+                "- All string values must use double quotes. Escape special characters inside strings:\n"
+                '  use \\" for a literal quote, \\\\ for a backslash, \\n for a newline.\n'
+                "  Never use raw newlines or unescaped quotes inside a string value.\n"
+                "- Every key must be a double-quoted string. Trailing commas are not allowed.\n"
+                "- The response must be a single JSON object {{ }} — not an array, not multiple objects.\n"
+                "- Include every required field exactly once. Do not nest the output inside an extra wrapper key."
             )
         return "\n".join(parts)
 
@@ -573,13 +582,45 @@ class agskill:
                         try:
                             if _state_fn:
                                 _state_fn("tool", skill=self.name, tool=fn_name)
-                            result_content = t(agdata.from_json(fn_args)).to_json()
+                            _ckpt_tag: str | None = None
+                            if t.need_sandbox and sandbox is not None:
+                                _ckpt_tag = f"agency/pretool-{sandbox._name}-{tc_id.replace('-','')[:8]}"
+                                try:
+                                    sandbox.commit(_ckpt_tag)
+                                except Exception:
+                                    _ckpt_tag = None
+                            # Let the agent specify a custom timeout (seconds) via a
+                            # "timeout" key in the tool arguments.
+                            _tool_timeout: int | None = None
+                            try:
+                                _parsed = json.loads(fn_args)
+                                if isinstance(_parsed.get("timeout"), int):
+                                    _tool_timeout = _parsed["timeout"]
+                            except (json.JSONDecodeError, TypeError, AttributeError):
+                                pass
+                            result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
                             if _state_fn:
                                 _state_fn("skill", skill=self.name)
                         except Exception as e:
                             if _state_fn:
                                 _state_fn("skill", skill=self.name)
-                            result_content = json.dumps({"error": str(e)})
+                            result_content = json.dumps({"error": _fmt_exc(e)})
+                        # On tool failure, revert the sandbox to the pre-call checkpoint
+                        # and tell the agent the workspace was restored.
+                        try:
+                            _result_obj = json.loads(result_content)
+                            if "error" in _result_obj and _ckpt_tag and sandbox is not None:
+                                try:
+                                    sandbox.restore(_ckpt_tag)
+                                    _result_obj["workspace_reverted"] = (
+                                        "The workspace has been reverted to the state "
+                                        "before this tool call."
+                                    )
+                                    result_content = json.dumps(_result_obj)
+                                except Exception:
+                                    pass
+                        except (json.JSONDecodeError, TypeError):
+                            pass
                     if sandbox is not None and len(result_content) > _TOOL_OUTPUT_OFFLOAD_CHARS:
                         safe_id = tc_id.replace("-", "")[:12]
                         offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
@@ -615,9 +656,11 @@ class agskill:
                     if stripped.endswith("```"):
                         stripped = stripped[:-3]
                     content = stripped.strip()
+                _parse_error: str = ""
                 try:
                     result = agdata.from_json(content)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as _e:
+                    _parse_error = str(_e)
                     result = agdata(result=content)
 
                 # --- Output validation + retry --------------------------------
@@ -625,14 +668,20 @@ class agskill:
                     errors = self._check_schema(result, self.output_schema)
                     if not errors and self.output_validator is not None:
                         errors = self.output_validator(result)
+                    if _parse_error and "invalid json" not in " ".join(errors).lower():
+                        errors = [f"JSON parse error: {_parse_error}"] + errors
                     if errors:
                         if retries_left > 0:
                             retries_left -= 1
                             messages.append({
                                 "role": "user",
                                 "content": (
-                                    f"Output schema errors: {errors}. "
-                                    f"Respond ONLY with valid JSON matching exactly: "
+                                    f"Your previous response could not be parsed. Errors: {errors}.\n"
+                                    "Common causes: unescaped quotes or backslashes inside a string value, "
+                                    "raw newlines inside a string (use \\n instead), trailing comma after "
+                                    "the last key, extra text or explanation outside the JSON object, "
+                                    "or markdown code fences around the JSON.\n"
+                                    "Respond ONLY with a single valid JSON object matching exactly: "
                                     f"{self.output_schema.to_json()}"
                                 ),
                             })

@@ -1,6 +1,6 @@
 import httpx
 import html2text
-from ..agdata import agdata
+from ..agdata import agdata, _fmt_exc
 from ..agtool import agtool
 
 _MAX_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -25,9 +25,9 @@ def _run(arg: agdata) -> agdata:
         resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
-        return agdata(error=f"HTTP {e.response.status_code}: {url}")
+        return agdata(error=f"HTTP {e.response.status_code}: {url}\n{_fmt_exc(e)}")
     except Exception as e:
-        return agdata(error=str(e))
+        return agdata(error=_fmt_exc(e))
 
     if len(resp.content) > _MAX_BYTES:
         return agdata(error="Response too large (>5 MB)")

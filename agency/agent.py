@@ -40,7 +40,7 @@ def _pick_llm_config(llm_config: "dict | list[dict]") -> dict:
         _llm_config_counter += 1
     return llm_config[idx]
 
-from .agdata import agdata
+from .agdata import agdata, _fmt_exc
 from .agtype import agtype
 from .agskill import agskill
 from .agtool import agtool
@@ -622,7 +622,7 @@ class agent:
                     )
 
             except Exception as exc:
-                outer_result  = agdata(error=str(exc))
+                outer_result  = agdata(error=_fmt_exc(exc))
                 outer_history = prev_history
                 outer_delta   = []
                 history_before = list(prev_history._data.get("messages", []))

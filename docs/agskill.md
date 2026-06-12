@@ -82,7 +82,12 @@ Each call to `agskill.run()` executes a standard ReAct loop:
 3. Drain user inbox (injected mid-conversation messages from `agUI` or `agent._inbox`)
 4. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below)
 5. Check token usage — compact context if over threshold (see [compaction.md](compaction.md))
-6. If response contains tool calls → execute each tool (offloaded to a worker process), append results, go to 3
+6. If response contains tool calls → for each tool:
+   a. If `need_sandbox=True`, commit the sandbox to a pre-call checkpoint image
+   b. Execute the tool (offloaded to a worker process)
+   c. If the result contains `"error"`, restore the sandbox from the checkpoint and append `workspace_reverted` to the error message (see [Tool failure and checkpoint revert](#tool-failure-and-checkpoint-revert))
+   d. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
+   e. Append the tool result message and go to 3
 7. If response is a final answer → parse JSON, validate against `output_schema`
 8. If validation fails and retries remain → inject correction message, go to 3
 9. Delete offloaded input files, return `(result, updated_history, history_delta)`
@@ -95,7 +100,9 @@ Each LLM call is protected by an idle watchdog that doubles its deadline on ever
 
 The watchdog runs in the main thread: it polls a queue fed by the streaming drain thread and raises `_LLMIdleTimeout` if no chunk arrives within the deadline. Unlike `httpx.ReadTimeout` (which is a per-chunk idle timer enforced inside httpcore), this approach works even when the underlying `ssl.read()` is blocked indefinitely — for example when the server closes the TCP connection without sending an SSL `close_notify` (CLOSE-WAIT state). On timeout, `client.close()` is called best-effort to unblock the drain thread.
 
-A timeout on attempt *N* logs a `LLM ✗` line and retries with the next deadline. If all 5 attempts time out, the skill returns `agdata(error="LLM timeout after 5 attempts")` without raising.
+`ssl.SSLError` and `OSError` raised during streaming (e.g. `[SSL] record layer failure` when vLLM drops the TCP connection mid-stream) are caught by the same retry block and follow the same exponential backoff sequence.
+
+A connection failure on attempt *N* logs a `LLM ✗` line and retries with the next deadline. If all 5 attempts fail, the skill returns `agdata(error="LLM connection error after 5 attempts: ...")` without raising.
 
 The connect, write, and pool timeouts are fixed at 30 s, 180 s, and 30 s respectively.
 
@@ -115,6 +122,97 @@ The LLM call uses `stream=True`. Without batching, each SSE token chunk would ac
 - On wake, the main thread drains everything buffered during the sleep in one burst
 
 This means threads running other agents get 100 ms of uncontested GIL time for every batch of streamed tokens, dramatically improving throughput under concurrent load.
+
+### Generation parameters
+
+Standard OpenAI generation parameters set in `llm_config` are forwarded directly to every API call. vLLM-specific parameters that are not part of the OpenAI spec are merged into `extra_body` automatically.
+
+**Standard OpenAI parameters** (forwarded directly):
+
+| Key | Example |
+|---|---|
+| `temperature` | `0.6` |
+| `max_tokens` | `16000` |
+| `top_p` | `0.95` |
+| `frequency_penalty` | `0.1` |
+| `presence_penalty` | `0.3` |
+| `n`, `stop`, `logprobs`, `seed` | — |
+
+**vLLM-specific parameters** (merged into `extra_body`):
+
+| Key | Example |
+|---|---|
+| `top_k` | `50` |
+| `repetition_penalty` | `1.1` |
+| `min_p`, `min_tokens` | — |
+| `guided_json`, `guided_regex` | — |
+
+Any value already in `llm_config["extra_body"]` is preserved; vLLM-specific keys are added on top.
+
+```python
+LLM_CONFIG = {
+    "base_url": "http://localhost:8000/v1",
+    "model": "Qwen/Qwen3-30B",
+    "temperature": 0.6,
+    "max_tokens": 16000,
+    "top_p": 0.95,
+    "top_k": 50,
+    "repetition_penalty": 1.1,
+}
+```
+
+### Tool output offloading
+
+Tool results longer than `_TOOL_OUTPUT_OFFLOAD_CHARS` (default 20 000 characters) are automatically saved to a file inside the agent's sandbox instead of being inlined into the message history. The tool message is replaced with a short JSON note:
+
+```json
+{"note": "Output was too large and has been saved to /workspace/long_tool_call_outputs/webfetch_abc123.txt. Use the read tool to access it."}
+```
+
+Files are written to `/workspace/long_tool_call_outputs/<tool_name>_<call_id>.txt`. The agent can read the content at any point using its `read` tool.
+
+This guard prevents a single oversized tool result (e.g. a raw PDF fetched via `webfetch`) from filling the entire context window. If no sandbox is available the result is kept inline unchanged.
+
+### Tool failure and checkpoint revert
+
+Before every `need_sandbox=True` tool call, the framework commits the sandbox container to a lightweight checkpoint image:
+
+```
+agency/pretool-<container_name>-<call_id[:8]>
+```
+
+If the tool returns an `agdata(error=...)`, the framework automatically:
+
+1. Calls `sandbox.restore(checkpoint_tag)` — stops the running container and restarts it from the checkpoint image, so any partial filesystem changes made by the tool are rolled back.
+2. Appends `"workspace_reverted": "The workspace has been reverted to the state before this tool call."` to the tool result JSON.
+
+The LLM sees both the error and the revert notice, so it knows the filesystem is clean and can try a different approach.
+
+```json
+{
+  "error": "...",
+  "workspace_reverted": "The workspace has been reverted to the state before this tool call."
+}
+```
+
+**When revert does NOT happen:**
+
+- `need_sandbox=False` — no checkpoint is taken, so no revert is possible.
+- `sandbox` is `None` — no container exists.
+- `sandbox.commit()` raised — checkpoint tag is discarded; the error is still forwarded to the LLM unchanged.
+- The tool succeeded — restore is never called on success.
+
+Checkpoint images are named with the container name, so they are scoped to a single sandbox lifetime. All `agency/pretool-<container_name>-*` images are deleted when `sandbox.destroy()` is called.
+
+#### Agent-controlled timeout
+
+Every tool call accepts an optional `"timeout"` key in its arguments (an integer, in seconds). The framework extracts it before calling the tool and passes it to `agtool.__call__(timeout=...)`, which uses it as the `ProcessPoolExecutor.result()` deadline instead of the default `TOOL_TIMEOUT_S` (30 s). Use this when a tool is expected to take longer than the default:
+
+```
+LLM calls: bash({"command": "python train.py", "timeout": 600})
+```
+
+Non-integer or missing `"timeout"` values are silently ignored and the default applies.
 
 ## Typed field values (`agtype` and `agfile`)
 

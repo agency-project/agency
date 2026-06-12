@@ -1,11 +1,25 @@
 from __future__ import annotations
 import json
+import traceback as _traceback
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
 from .agtype import agtype, agfile
+
+
+def _fmt_exc(e: BaseException) -> str:
+    """Format an exception with its full traceback for error emission.
+
+    Must be called from inside an except block so traceback.format_exc()
+    captures the live stack.  Returns a single string containing the
+    traceback lines followed by the exception type and message.
+    """
+    tb = _traceback.format_exc()
+    if tb and not tb.startswith("NoneType"):
+        return tb.rstrip()
+    return f"{type(e).__name__}: {e}"
 
 
 class AgError(RuntimeError):
@@ -140,7 +154,10 @@ class agdata:
             raise AgError(data["error"])
         if name in data:
             return data[name]
-        raise AttributeError(name)
+        available = list(data.keys())
+        raise AttributeError(
+            f"agdata has no field {name!r}. Available fields: {available}"
+        )
 
     def __setattr__(self, name: str, value):
         object.__getattribute__(self, "_data")[name] = value

@@ -2,13 +2,17 @@ from __future__ import annotations
 import threading
 import time
 import multiprocessing as _mp
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as _FutureTimeoutError, BrokenExecutor
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata
 
 if TYPE_CHECKING:
     from .aglog import aglog
     from .agterm import agterm
+
+# Hard ceiling on tool execution time. Prevents a crashed or hung worker
+# process from blocking an agent thread forever via future.result().
+TOOL_TIMEOUT_S: int = 30
 
 # ---------------------------------------------------------------------------
 # Process pool — workers are created lazily on first tool call and scale up
@@ -131,15 +135,32 @@ class agtool:
     # Invocation
     # ------------------------------------------------------------------
 
-    def __call__(self, arg: agdata) -> agdata:
+    def __call__(self, arg: agdata, timeout: int | None = None) -> agdata:
         import cloudpickle
         import pickle
         self.log_start(arg)
-        t0           = time.monotonic()
-        fn_bytes     = cloudpickle.dumps(self.fn)
-        arg_bytes    = pickle.dumps(arg)
-        result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result()
-        result       = pickle.loads(result_bytes)
+        t0               = time.monotonic()
+        fn_bytes         = cloudpickle.dumps(self.fn)
+        arg_bytes        = pickle.dumps(arg)
+        effective_timeout = timeout if timeout is not None else TOOL_TIMEOUT_S
+        try:
+            result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result(timeout=effective_timeout)
+        except _FutureTimeoutError:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            result = agdata(error=f"tool timed out after {effective_timeout}s")
+            self.log(arg, result, elapsed)
+            return result
+        except BrokenExecutor:
+            # Worker process died (OOM kill, crash). Reset the pool so future
+            # calls get fresh workers, then report the error.
+            global _pool
+            with _pool_lock:
+                _pool = None
+            elapsed = int((time.monotonic() - t0) * 1000)
+            result = agdata(error="tool worker process died unexpectedly")
+            self.log(arg, result, elapsed)
+            return result
+        result = pickle.loads(result_bytes)
         self.log(arg, result, int((time.monotonic() - t0) * 1000))
         return result
 

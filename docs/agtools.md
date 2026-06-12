@@ -173,9 +173,44 @@ skill = agskill("classify", "Classify this text.", replace_tools=[])
 
 `add_tools` extends the defaults; `replace_tools` overrides them entirely.
 
+## Tool failure, checkpoint revert, and timeout
+
+### Checkpoint revert on failure
+
+Before every `need_sandbox=True` tool call the framework snapshots the sandbox container:
+
+```
+agency/pretool-<container_name>-<call_id[:8]>
+```
+
+If the tool returns `agdata(error=...)`, the sandbox is automatically rolled back to that snapshot and the tool result gains a `workspace_reverted` field:
+
+```json
+{
+  "error": "command exited with code 1: ...",
+  "workspace_reverted": "The workspace has been reverted to the state before this tool call."
+}
+```
+
+The LLM sees both the error and the revert notice so it can retry with a corrected approach on a clean filesystem. Revert does not happen when `need_sandbox=False`, when `sandbox` is `None`, when `commit()` failed, or when the tool succeeded.
+
+### Agent-controlled timeout
+
+The default tool watchdog deadline is `TOOL_TIMEOUT_S = 30` seconds. An agent can override this per-call by passing a `"timeout"` integer (seconds) in the tool arguments:
+
+```
+LLM calls: bash({"command": "python train.py", "timeout": 600})
+```
+
+The framework strips the key before passing args to the tool function and forwards it to `agtool.__call__(timeout=600)`. Non-integer or absent values fall back to the default.
+
 ## Tool output
 
 Tool functions receive an `agdata` and must return an `agdata`. The return value is serialized to JSON and injected into the LLM's message history as a `tool` role message. Errors should be returned as `agdata(error="...")` rather than raised — the LLM will see the error and can decide how to proceed.
+
+### Large output offloading
+
+If the serialized result exceeds `_TOOL_OUTPUT_OFFLOAD_CHARS` (default 20 000 characters) and a sandbox is available, the framework automatically writes the content to `/workspace/long_tool_call_outputs/<tool_name>_<call_id>.txt` and replaces the tool message with a short note pointing to that path. The agent reads the file using its `read` tool. This prevents a single large tool result (e.g. a raw PDF or a lengthy webpage) from consuming the entire context window. See [agskill.md — Tool output offloading](agskill.md#tool-output-offloading) for details.
 
 ## bash process tracking
 

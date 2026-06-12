@@ -368,6 +368,35 @@ class agSandbox:
         )
         return True
 
+    def restore(self, tag: str) -> None:
+        """Restore the sandbox to a previously committed image snapshot.
+
+        Stops the running container (killing watched pids first), then restarts
+        from *tag*.  The image is kept so it can be reused on subsequent
+        failures during the same skill run.
+        """
+        if self._started:
+            if self._watched_pids:
+                pids = " ".join(str(p) for p in self._watched_pids)
+                try:
+                    self._container_exec(
+                        f"kill {pids} 2>/dev/null; true", timeout=5, shell="sh"
+                    )
+                except Exception:
+                    pass
+            try:
+                self._run(
+                    [self._runtime, "rm", "-f", self._container_name()],
+                    timeout=30,
+                )
+            except Exception:
+                pass
+            self._started = False
+            self._watched_pids = {}
+            self._baseline_pids = set()
+        self._restore_image = tag
+        self._ensure_started()
+
     def release_daemon(self, pid: int) -> None:
         """Move *pid* out of the monitored set into the daemon set.
 
@@ -481,6 +510,20 @@ class agSandbox:
                 [self._runtime, "rm", "-f", self._container_name()],
                 timeout=30,
             )
+        except Exception:
+            pass
+
+        # Remove pre-tool checkpoint images created during this sandbox's lifetime.
+        try:
+            result = self._run(
+                [self._runtime, "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                timeout=15,
+            )
+            prefix = f"agency/pretool-{self._name}-"
+            for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+                tag = line.strip()
+                if tag.startswith(prefix):
+                    self._run([self._runtime, "rmi", "-f", tag], timeout=15, check=False)
         except Exception:
             pass
 

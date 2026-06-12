@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from ..agdata import agdata
+from ..agdata import agdata, _fmt_exc
 from ..agtool import agtool
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             sandbox._gpu_id = gpu_id
             return agdata(gpu_id=gpu_id, message=f"GPU {gpu_id} acquired")
         except TimeoutError as e:
-            return agdata(error=str(e))
+            return agdata(error=_fmt_exc(e))
 
     return agtool(
         name="gpu_acquire",
@@ -87,7 +87,7 @@ def make_cpu_acquire(sandbox: "agSandbox") -> agtool:
                 memory=memory,
             )
         except Exception as e:
-            return agdata(error=str(e))
+            return agdata(error=_fmt_exc(e))
 
     return agtool(
         name="cpu_acquire",
@@ -121,7 +121,7 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 message=f"CPU/memory reset to idle: cpus={pool.idle_cpus}, memory={pool.idle_memory}"
             )
         except Exception as e:
-            return agdata(error=str(e))
+            return agdata(error=_fmt_exc(e))
 
     return agtool(
         name="cpu_release",

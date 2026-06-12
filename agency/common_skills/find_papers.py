@@ -1,7 +1,7 @@
 import httpx
 
 from ..agskill import agskill
-from ..agdata import agdata
+from ..agdata import agdata, _fmt_exc
 from ..agtool import agtool
 
 
@@ -58,12 +58,12 @@ class FindPapersSkill(agskill):
             )
             resp.raise_for_status()
         except Exception as e:
-            return agdata(error=str(e), papers=[])
+            return agdata(error=_fmt_exc(e), papers=[])
 
         try:
             data = resp.json()
         except Exception as e:
-            return agdata(error=f"JSON parse error: {e}", papers=[])
+            return agdata(error=_fmt_exc(e), papers=[])
 
         papers = []
         for item in data:

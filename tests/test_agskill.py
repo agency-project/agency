@@ -368,7 +368,7 @@ def test_correction_message_appended_on_retry():
     # Second call should have a correction user message near the end
     assert len(call_messages) == 2
     last_msgs = call_messages[1]
-    assert any("Output schema errors" in m.get("content", "") for m in last_msgs if m["role"] == "user")
+    assert any("could not be parsed" in m.get("content", "") or "Errors:" in m.get("content", "") for m in last_msgs if m["role"] == "user")
 
 
 def test_schemas_appended_to_system_prompt():
@@ -510,3 +510,349 @@ def test_timeout_succeeds_after_retry():
     assert getattr(result, "error", None) is None
     assert result.answer == "ok"
     assert call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# SSL / OSError connection error retries
+# ---------------------------------------------------------------------------
+
+def test_ssl_error_retries_all_attempts_then_error():
+    import ssl
+    s = make_skill()
+    call_count = 0
+
+    def _ssl_error_iter(iterable, idle_timeout=None):
+        nonlocal call_count
+        call_count += 1
+        raise ssl.SSLError("record layer failure")
+        yield
+
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _ssl_error_iter):
+        MockClient.return_value.chat.completions.create.return_value = []
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert result.error is not None
+    assert "error" in result.error.lower()
+    assert call_count == 5
+
+
+def test_oserror_retries_all_attempts_then_error():
+    s = make_skill()
+    call_count = 0
+
+    def _oserror_iter(iterable, idle_timeout=None):
+        nonlocal call_count
+        call_count += 1
+        raise OSError("connection reset by peer")
+        yield
+
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _oserror_iter):
+        MockClient.return_value.chat.completions.create.return_value = []
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert result.error is not None
+    assert "error" in result.error.lower()
+    assert call_count == 5
+
+
+def test_ssl_error_releases_semaphore():
+    import ssl
+    s = make_skill()
+    before = _sem._value
+
+    def _ssl_error_iter(iterable, idle_timeout=None):
+        raise ssl.SSLError("record layer failure")
+        yield
+
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _ssl_error_iter):
+        MockClient.return_value.chat.completions.create.return_value = []
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert _sem._value == before
+
+
+def test_ssl_error_succeeds_after_retry():
+    import ssl
+    from agency.agskill import _iter_batched as _real_iter_batched
+    call_count = 0
+
+    def _maybe_ssl(iterable, idle_timeout=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise ssl.SSLError("record layer failure")
+            yield
+        else:
+            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout)
+
+    s = make_skill()
+    with patch("openai.OpenAI") as MockClient, \
+         patch("agency.agskill._iter_batched", _maybe_ssl):
+        MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
+        result, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert getattr(result, "error", None) is None
+    assert result.answer == "ok"
+    assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Long tool output offloading
+# ---------------------------------------------------------------------------
+
+def _make_sandbox(written=None):
+    """Return a mock sandbox that records write_file calls."""
+    sandbox = MagicMock()
+    if written is not None:
+        sandbox.write_file.side_effect = lambda path, content: written.update({path: content})
+    return sandbox
+
+
+def test_short_tool_output_not_offloaded():
+    written = {}
+    sandbox = _make_sandbox(written)
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(result="short")
+
+    t = agtool(name="mytool", description="", fn=fn)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("mytool", {}, "call-001"), _direct('{"ok": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+
+    assert not written
+
+
+def test_long_tool_output_offloaded_to_file():
+    from agency.agskill import _TOOL_OUTPUT_OFFLOAD_CHARS
+    written = {}
+    sandbox = _make_sandbox(written)
+
+    big_output = "x" * (_TOOL_OUTPUT_OFFLOAD_CHARS + 1)
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(data=big_output)
+
+    t = agtool(name="fetcher", description="", fn=fn)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("fetcher", {}, "abc-123-xyz"), _direct('{"ok": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+
+    # File was written to the sandbox
+    assert len(written) == 1
+    path = next(iter(written))
+    assert path.startswith("/workspace/long_tool_call_outputs/fetcher_")
+    assert path.endswith(".txt")
+    assert big_output in next(iter(written.values()))
+
+    # Tool message in history has the note, not the raw content
+    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    note = json.loads(tool_msgs[0]["content"])
+    assert "note" in note
+    assert path in note["note"]
+
+
+def test_long_tool_output_not_offloaded_without_sandbox():
+    from agency.agskill import _TOOL_OUTPUT_OFFLOAD_CHARS
+
+    big_output = "y" * (_TOOL_OUTPUT_OFFLOAD_CHARS + 1)
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(data=big_output)
+
+    t = agtool(name="fetcher", description="", fn=fn)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("fetcher", {}, "call-999"), _direct('{"ok": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    # Without a sandbox, raw content must still be in the message (no offloading)
+    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert big_output in tool_msgs[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Tool call failure handling and checkpoint revert
+# ---------------------------------------------------------------------------
+
+def _make_sandbox_with_tracking():
+    """Return a sandbox mock that records commit/restore calls."""
+    sandbox = MagicMock()
+    sandbox._name = "testbox"
+    sandbox.commit.return_value = True
+    sandbox.restore.return_value = None
+    return sandbox
+
+
+def test_tool_success_no_restore():
+    """A successful tool call must NOT trigger sandbox.restore()."""
+    sandbox = _make_sandbox_with_tracking()
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(result="ok")
+
+    t = agtool(name="mytool", description="", fn=fn, need_sandbox=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("mytool", {}, "c1"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+
+    sandbox.restore.assert_not_called()
+
+
+def test_tool_failure_triggers_restore():
+    """When a need_sandbox tool returns an error, sandbox.restore() is called with the checkpoint tag."""
+    sandbox = _make_sandbox_with_tracking()
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(error="boom")
+
+    t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("badtool", {}, "c2"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+
+    sandbox.restore.assert_called_once()
+    tag = sandbox.restore.call_args[0][0]
+    assert tag.startswith("agency/pretool-testbox-")
+
+
+def test_tool_failure_adds_workspace_reverted_note():
+    """Tool error message must include workspace_reverted when sandbox.restore() succeeds."""
+    sandbox = _make_sandbox_with_tracking()
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(error="disk full")
+
+    t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("badtool", {}, "c3"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+
+    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    content = json.loads(tool_msgs[0]["content"])
+    assert "error" in content
+    assert "workspace_reverted" in content
+    assert "reverted" in content["workspace_reverted"].lower()
+
+
+def test_tool_failure_no_restore_without_sandbox():
+    """When sandbox=None, a tool error is passed through as-is with no restore attempt."""
+    def fn(arg: agdata) -> agdata:
+        return agdata(error="nope")
+
+    t = agtool(name="badtool", description="", fn=fn, need_sandbox=False)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("badtool", {}, "c4"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    content = json.loads(tool_msgs[0]["content"])
+    assert content["error"] == "nope"
+    assert "workspace_reverted" not in content
+
+
+def test_need_sandbox_false_no_checkpoint():
+    """Tools with need_sandbox=False must not trigger sandbox.commit() or sandbox.restore()."""
+    sandbox = _make_sandbox_with_tracking()
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(error="oops")
+
+    t = agtool(name="hosttool", description="", fn=fn, need_sandbox=False)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("hosttool", {}, "c5"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+
+    sandbox.commit.assert_not_called()
+    sandbox.restore.assert_not_called()
+
+
+def test_tool_failure_no_restore_if_no_checkpoint():
+    """If sandbox.commit() raises, no checkpoint tag is stored, so restore is never called."""
+    sandbox = _make_sandbox_with_tracking()
+    sandbox.commit.side_effect = RuntimeError("commit failed")
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(error="fail")
+
+    t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("badtool", {}, "c6"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, hist, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+
+    sandbox.restore.assert_not_called()
+    # Error is still passed through to the LLM unchanged
+    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    assert "error" in json.loads(tool_msgs[0]["content"])
+
+
+def test_tool_timeout_uses_agent_provided_value():
+    """When fn_args includes a 'timeout' int, agtool.__call__ receives it as keyword arg."""
+    received_timeout = {}
+
+    original_call = agtool.__call__
+
+    def patched_call(self, arg, timeout=None):
+        received_timeout["timeout"] = timeout
+        return original_call(self, arg, timeout=timeout)
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(result="ok")
+
+    t = agtool(name="slow", description="", fn=fn, need_sandbox=False,
+               params={"type": "object", "properties": {"timeout": {"type": "integer"}}})
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("slow", {"timeout": 120}, "c7"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient, \
+         patch.object(agtool, "__call__", patched_call):
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert received_timeout.get("timeout") == 120
+
+
+def test_tool_timeout_ignored_if_not_int():
+    """Non-integer 'timeout' in fn_args is silently ignored; agtool uses default."""
+    received_timeout = {}
+
+    original_call = agtool.__call__
+
+    def patched_call(self, arg, timeout=None):
+        received_timeout["timeout"] = timeout
+        return original_call(self, arg, timeout=timeout)
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(result="ok")
+
+    t = agtool(name="slow", description="", fn=fn, need_sandbox=False)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("slow", {"timeout": "forever"}, "c8"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient, \
+         patch.object(agtool, "__call__", patched_call):
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert received_timeout.get("timeout") is None

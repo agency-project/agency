@@ -12,6 +12,11 @@ LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:18000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
     "model":    os.environ.get("VLLM_MODEL",   "google/gemma-4-E2B-it"),
+    "temperature":       0.6,
+    "max_tokens":        16000,
+    "top_p":             0.95,
+    "top_k":             50,
+    "repetition_penalty": 1.1,
 }
 
 generator_skill = agskill(
