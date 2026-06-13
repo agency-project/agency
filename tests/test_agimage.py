@@ -84,11 +84,10 @@ def test_agimage_prepare_local_png_uses_correct_mime(tmp_path):
 
     assert val.startswith("data:image/png;base64,")
 
-def test_agimage_prepare_missing_file_returns_path_unchanged(tmp_path):
+def test_agimage_prepare_missing_file_raises(tmp_path):
     missing = str(tmp_path / "no_such_file.jpg")
-    val, paths = agimage.prepare(missing, None, "sk", "photo")
-    assert val == missing
-    assert paths == []
+    with pytest.raises(FileNotFoundError):
+        agimage.prepare(missing, None, "sk", "photo")
 
 
 # ---------------------------------------------------------------------------

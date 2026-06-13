@@ -146,6 +146,7 @@ INPUT_OFFLOAD_CHARS: int = 2000
 
 def _offload_large_fields(
     inp: agdata, sandbox: "agSandbox", skill_name: str,
+    schema: "agdata | None" = None,
 ) -> tuple[list[str], list[str]]:
     """Write oversized string fields to /workspace/inputs/ in the sandbox.
 
@@ -154,22 +155,56 @@ def _offload_large_fields(
     exceeds INPUT_OFFLOAD_CHARS is replaced in-place with a short reference.
     Returns (paths_written, field_names) so the caller can delete files and
     build an auto-offload note for the system prompt.
+
+    Fields already managed by an agtype subclass (e.g. agimage data URLs) are
+    skipped so their prepared values are not replaced by sandbox file references.
     """
+    from .agtype import agtype
+    agtype_keys: set[str] = set()
+    if schema is not None:
+        for key, hint in schema._data.items():
+            if isinstance(hint, type) and issubclass(hint, agtype):
+                agtype_keys.add(key)
+            elif get_origin(hint) is list:
+                args = get_args(hint)
+                if args and isinstance(args[0], type) and issubclass(args[0], agtype):
+                    agtype_keys.add(key)
+
     paths: list[str] = []
     fields: list[str] = []
     for key, val in list(inp._data.items()):
-        if not isinstance(val, str) or len(val) <= INPUT_OFFLOAD_CHARS:
+        if key in agtype_keys:
             continue
-        path = f"/workspace/inputs/{skill_name}_{key}.txt"
-        try:
-            sandbox.write_file(path, val)
-            inp._data[key] = (
-                f"(content saved to {path} — use the read tool to access it)"
-            )
-            paths.append(path)
-            fields.append(key)
-        except Exception:
-            pass  # leave the field unchanged if the write fails
+        if isinstance(val, str):
+            if len(val) <= INPUT_OFFLOAD_CHARS:
+                continue
+            path = f"/workspace/inputs/{skill_name}_{key}.txt"
+            try:
+                sandbox.write_file(path, val)
+                inp._data[key] = (
+                    f"(content saved to {path} — use the read tool to access it)"
+                )
+                paths.append(path)
+                fields.append(key)
+            except Exception:
+                pass  # leave the field unchanged if the write fails
+        elif isinstance(val, list):
+            new_vals = list(val)
+            offloaded_any = False
+            for i, item in enumerate(val):
+                if not isinstance(item, str) or len(item) <= INPUT_OFFLOAD_CHARS:
+                    continue
+                path = f"/workspace/inputs/{skill_name}_{key}_{i}.txt"
+                try:
+                    sandbox.write_file(path, item)
+                    new_vals[i] = path
+                    paths.append(path)
+                    offloaded_any = True
+                except Exception:
+                    pass
+            if offloaded_any:
+                inp._data[key] = new_vals
+                fields.append(key)
     return paths, fields
 
 
@@ -529,7 +564,7 @@ class agent:
                     _prepare_agtype_inputs(current_input, af.input_schema, self.sandbox, skill_name)
                 )
                 auto_paths, auto_fields = _offload_large_fields(
-                    current_input, self.sandbox, skill_name
+                    current_input, self.sandbox, skill_name, schema=af.input_schema
                 )
                 _offloaded_paths.extend(auto_paths)
 

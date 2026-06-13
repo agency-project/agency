@@ -229,14 +229,11 @@ class agimage(agtype):
         if value.startswith(("http://", "https://", "data:")):
             return value, []
         # Local file path — read and base64-encode.
-        try:
-            path = Path(value)
-            raw = path.read_bytes()
-            mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
-            b64 = base64.b64encode(raw).decode()
-            return f"data:{mime};base64,{b64}", []
-        except Exception:
-            return value, []
+        path = Path(value)
+        raw = path.read_bytes()
+        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        b64 = base64.b64encode(raw).decode()
+        return f"data:{mime};base64,{b64}", []
 
     @classmethod
     def extra_input_prompt(cls, field_name: str) -> str:

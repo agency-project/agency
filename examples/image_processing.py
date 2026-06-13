@@ -171,8 +171,12 @@ if __name__ == "__main__":
 
         agsync(*[t for t, _, _ in teams])
 
+        from agency import AgError
         for _, result, field in teams:
-            val = getattr(result, field, None) or getattr(result, "error", "no output")
+            try:
+                val = getattr(result, field)
+            except AgError as e:
+                val = f"ERROR: {e}"
             print(f"\n[{field}]\n{val}")
 
     _script()
