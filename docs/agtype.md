@@ -4,7 +4,7 @@
 
 ## Why it exists
 
-Some skill fields are too large or too structured to inline in the LLM context window.  The `agfile` subclass is the built-in example: its content lives in a sandbox file, and the LLM receives only a path.  `agtype` makes this pattern extensible — future field types (encrypted blobs, binary data, remote-fetched content, etc.) follow the same interface without touching the core framework.
+Some skill fields are too large or too structured to inline in the LLM context window.  The `agfile` subclass is the built-in example: its content lives in a sandbox file, and the LLM receives only a path.  `agimage` is the multimodal example: the image is injected directly into the message content array so the LLM sees it visually.  `agtype` makes this pattern extensible — future field types (encrypted blobs, binary data, remote-fetched content, etc.) follow the same interface without touching the core framework.
 
 ## Interface
 
@@ -27,6 +27,7 @@ Human-readable type label shown in the JSON format hint appended to the system p
 |---|---|
 | `agtype` (base) | `"str"` |
 | `agfile` | `"file"` |
+| `agimage` | `"image"` |
 
 ### `needs_sandbox() -> bool`
 
@@ -94,6 +95,72 @@ The framework:
 5. Deletes both sandbox files in `finally`.
 
 The caller always passes and receives plain strings — file paths are an internal detail.
+
+## Built-in subclass: `agimage`
+
+`agimage` is the multimodal image field type. The image is injected into the OpenAI-compatible message content array so the model receives it as a visual input rather than text.
+
+```python
+from agency import agimage
+```
+
+| Method | Behaviour |
+|---|---|
+| `schema_type()` | `"image"` |
+| `needs_sandbox()` | `False` |
+| `prepare(value, ...)` | Local file paths are base64-encoded into a data URL. HTTP/HTTPS URLs and existing data URLs pass through unchanged. |
+| `recover(value, ...)` | No-op — images are input-only. |
+| `extra_input_prompt` | Tells the agent the field is an image attached to the message. |
+
+### Single image
+
+```python
+from agency import agskill, agdata, agimage
+
+describe_skill = agskill(
+    name="describe",
+    system_prompt="Describe what you see in the image.",
+    input_schema=agdata(question=str, photo=agimage),
+)
+
+# Local file, URL, or data URL all work
+result = agent.run(describe_skill, agdata(
+    question="What is in this diagram?",
+    photo="/tmp/architecture.png",         # encoded to data URL automatically
+))
+```
+
+### List of images
+
+```python
+compare_skill = agskill(
+    name="compare",
+    system_prompt="Compare these frames and describe what changed.",
+    input_schema=agdata(question=str, frames=list[agimage]),
+)
+
+result = agent.run(compare_skill, agdata(
+    question="What changed between frames?",
+    frames=["https://example.com/before.png", "https://example.com/after.png"],
+))
+```
+
+### What the LLM receives
+
+The user message content becomes a multimodal array. Image field values are replaced with a short placeholder in the text portion so no raw base64 appears in the JSON:
+
+```json
+[
+  {"type": "text",      "text": "{\"question\": \"What is this?\", \"photo\": \"[image attached]\"}"},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+]
+```
+
+For `list[agimage]` with N images, the placeholder reads `"[N image(s) attached]"` and N `image_url` entries follow in the array.
+
+### Requirements
+
+The model in `llm_config` must support multimodal input (vision). Passing `agimage` fields to a text-only model will produce a provider-side error or silently ignored images depending on the backend.
 
 ## Writing a custom agtype
 

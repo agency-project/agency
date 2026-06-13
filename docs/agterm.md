@@ -64,3 +64,7 @@ Agent names appearing inside log messages from *other* agents are automatically 
 ## agUI integration
 
 When `agUI.run()` is active, `agterm.log()` routes output to the shared log pane in the TUI instead of stderr. The line format is identical; only the destination changes. See [agui.md](agui.md).
+
+## agwebui integration
+
+When `agwebui.run()` is active, `agterm.log()` routes output to the web UI emitter instead of stderr (checked before the agUI path). The emitter appends a `{"type": "log", "line": ...}` event to `ui_events.jsonl`; the standalone server broadcasts it to all connected browsers. Additionally, `agterm.__init__()` emits an `agent_registered` event with the agent's hex color so the browser can display the agent in its assigned color. See [agwebui.md](agwebui.md).

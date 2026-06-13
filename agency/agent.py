@@ -13,7 +13,7 @@ import weakref
 from concurrent.futures import Future
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, get_args, get_origin
 
 # Single run-level ID for the default log directory.
 # Created once at import time so all agents in one process share it.
@@ -178,23 +178,39 @@ def _prepare_agtype_inputs(
 ) -> list[str]:
     """Prepare agtype input fields before the skill runs.
 
-    For each schema field whose hint is an agtype subclass, calls
-    ``hint.prepare()`` which may transform the value and write sandbox files.
-    Returns all paths written for cleanup.
+    For each schema field whose hint is an agtype subclass (or list[agtype]),
+    calls ``hint.prepare()`` which may transform the value and write sandbox
+    files.  Returns all paths written for cleanup.
     """
     if schema is None:
         return []
     paths: list[str] = []
     for key, hint in schema._data.items():
-        if not (isinstance(hint, type) and issubclass(hint, agtype)):
-            continue
-        val = inp._data.get(key)
-        try:
-            new_val, written = hint.prepare(val, sandbox, skill_name, key)
-            inp._data[key] = new_val
-            paths.extend(written)
-        except Exception:
-            pass
+        # Direct agtype subclass
+        if isinstance(hint, type) and issubclass(hint, agtype):
+            val = inp._data.get(key)
+            try:
+                new_val, written = hint.prepare(val, sandbox, skill_name, key)
+                inp._data[key] = new_val
+                paths.extend(written)
+            except Exception:
+                pass
+        # list[agtype subclass]
+        elif get_origin(hint) is list:
+            args = get_args(hint)
+            if args and isinstance(args[0], type) and issubclass(args[0], agtype):
+                inner = args[0]
+                vals = inp._data.get(key)
+                if isinstance(vals, list):
+                    new_vals = []
+                    for v in vals:
+                        try:
+                            new_v, written = inner.prepare(v, sandbox, skill_name, key)
+                            paths.extend(written)
+                        except Exception:
+                            new_v = v
+                        new_vals.append(new_v)
+                    inp._data[key] = new_vals
     return paths
 
 
@@ -438,9 +454,21 @@ class agent:
     def _set_ui_state(self, state: str, skill: str | None = None,
                       tool: str | None = None) -> None:
         self._ui_state = {"state": state, "skill": skill, "tool": tool}
+        try:
+            from . import agwebui as _agwebui
+            if _agwebui._active is not None:
+                _agwebui._active.emitter.agent_state(self.agname, state, skill, tool)
+        except Exception:
+            pass
 
     def _push_live_messages(self, messages: list) -> None:
         self._snapshot_messages = list(messages)
+        try:
+            from . import agwebui as _agwebui
+            if _agwebui._active is not None:
+                _agwebui._active.emitter.push_messages(self.agname, list(messages))
+        except Exception:
+            pass
         try:
             from . import agui as _agui
             if _agui._active is not None:

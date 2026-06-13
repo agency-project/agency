@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 
-def agsync(targets) -> None:
+def agsync(*targets) -> None:
     """Block until every in-flight agent task in *targets* has finished.
 
-    *targets* may be any of:
+    *targets* may be any combination of:
 
     * a single ``agent``
     * a single ``agteam``
@@ -23,21 +23,27 @@ def agsync(targets) -> None:
         agsync(my_agent)
         agsync(my_team)
 
-        # List — any mix of agents and teams
-        teams   = [ResearchTeam(topic=t) for t in topics]
-        pending = [t.run() for t in teams]
-        agsync(teams)                   # barrier: wait for all to finish
-        for r in pending:
-            print(r.report_path)        # all resolved, no blocking
+        # Variadic — any mix of agents and teams
+        agsync(agent_a, team_b, agent_c)
 
-        # Mix agents and teams
-        agsync([my_agent, my_team])
+        # List still works
+        teams = [ResearchTeam(topic=t) for t in topics]
+        agsync(teams)
+
+        # Mix of variadic and lists
+        agsync(my_agent, teams)
     """
     from .agent import agent as _agent_cls
     from .agteam import agteam as _agteam_cls
 
-    if not isinstance(targets, list):
-        targets = [targets]
+    # Flatten: each positional arg may itself be a list
+    flat: list = []
+    for t in targets:
+        if isinstance(t, list):
+            flat.extend(t)
+        else:
+            flat.append(t)
+    targets = flat
 
     solo_agents: list = []
     teams: list = []

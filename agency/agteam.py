@@ -103,6 +103,16 @@ class agteam:
         finally:
             _active_team.reset(token)
 
+        try:
+            from . import agwebui as _agwebui
+            if _agwebui._active is not None:
+                _agwebui._active.emitter.team_registered(
+                    self.team_name,
+                    [a.agname for a in self._agents],
+                )
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Override points
     # ------------------------------------------------------------------

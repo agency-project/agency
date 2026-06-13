@@ -1,0 +1,227 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:               #1a1a1a;
+  --bg2:              #222;
+  --bg3:              #2a2a2a;
+  --border:           #3a3a3a;
+  --border-log:       #4a9eff;
+  --border-interact:  #e87d0d;
+  --text:             #d4d4d4;
+  --dim:              rgba(212,212,212,0.45);
+  --cyan:             #5fd7ff;
+  --yellow:           #ffaf00;
+  --green:            #5fd75f;
+  --red:              #ff5555;
+  --font: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
+  --fs:               12.5px;
+}
+
+html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); }
+
+#app {
+  display: flex;
+  height: 100vh;
+  font-family: var(--font);
+  font-size: var(--fs);
+  line-height: 1.45;
+}
+
+/* ------------------------------------------------------------------ Left */
+
+#left {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Shared log — upper 5 parts */
+#shared-log-container {
+  flex: 5;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-log);
+  overflow: hidden;
+}
+
+#shared-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Interaction pane — lower 7 parts */
+#interaction {
+  flex: 7;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-interact);
+  border-top: none;
+  overflow: hidden;
+}
+
+#agent-history {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+#nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+#nav-bar button {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  padding: 1px 7px;
+  font-family: var(--font);
+  font-size: var(--fs);
+  border-radius: 2px;
+}
+#nav-bar button:hover { border-color: var(--border-log); color: var(--cyan); }
+
+#nav-label { color: var(--dim); font-size: 11px; margin-left: auto; }
+
+#agent-input {
+  background: var(--bg2);
+  border: none;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--fs);
+  padding: 5px 10px;
+  outline: none;
+  flex-shrink: 0;
+}
+#agent-input::placeholder { color: var(--dim); }
+#agent-input:focus { border-top-color: var(--border-interact); }
+
+/* ----------------------------------------------------------------- Right */
+
+#right {
+  width: 270px;
+  min-width: 180px;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#agent-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 6px;
+}
+
+/* --------------------------------------------------------- Panel titles */
+
+.panel-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--border-log);
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  flex-shrink: 0;
+  letter-spacing: 0.5px;
+}
+
+.right-title { color: var(--text); border-bottom-color: var(--border); }
+
+/* ---------------------------------------------------------- Shared log */
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.log-line + .log-line { }
+
+.done-banner {
+  color: var(--green);
+  font-weight: bold;
+  padding: 4px 0;
+}
+
+.error-line { color: var(--red); }
+
+/* ---------------------------------------------------------- Agent list */
+
+.team-header {
+  font-weight: bold;
+  color: var(--text);
+  margin-top: 8px;
+  margin-bottom: 1px;
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+}
+
+.agent-entry {
+  padding: 3px 4px 3px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  margin-bottom: 1px;
+}
+.agent-entry:hover   { background: var(--bg3); }
+.agent-entry.focused { background: rgba(74,158,255,0.12); border-left: 2px solid var(--border-log); padding-left: 2px; }
+
+.agent-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-status {
+  font-size: 11px;
+  padding-left: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dim);
+}
+
+.dot-inactive { color: var(--dim); }
+.status-llm   { color: var(--cyan); }
+.status-tool  { color: var(--yellow); }
+.status-human { color: var(--yellow); }
+
+/* ------------------------------------------------------- History pane */
+
+.msg-system     { color: var(--dim); font-size: 11px; margin: 1px 0; }
+.msg-user       { margin: 3px 0; }
+.msg-thinking   { color: var(--dim); font-style: italic; margin: 3px 0; border-left: 2px solid var(--border); padding-left: 6px; }
+.msg-tool-call  { margin: 3px 0; }
+.msg-assistant  { margin: 3px 0; }
+.msg-tool-result{ color: var(--dim); margin: 2px 0; }
+.msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
+.msg-ask        { color: var(--yellow); margin: 4px 0; border-left: 3px solid var(--yellow); padding-left: 6px; }
+
+.role-user      { color: var(--cyan);   font-weight: bold; }
+.role-tool-call { color: var(--yellow); font-weight: bold; }
+.role-assistant { color: var(--green);  font-weight: bold; }
+.role-ask       { color: var(--yellow); font-weight: bold; }
+.dim            { opacity: 0.5; }
+
+/* --------------------------------------------------------- Scrollbars */
+
+::-webkit-scrollbar              { width: 5px; height: 5px; }
+::-webkit-scrollbar-track        { background: var(--bg); }
+::-webkit-scrollbar-thumb        { background: #444; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover  { background: #666; }

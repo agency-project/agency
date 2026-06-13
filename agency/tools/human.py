@@ -27,7 +27,12 @@ def make_ask_human(agname: str, timeout_s: float = _DEFAULT_TIMEOUT_S) -> agtool
             a._set_ui_state("human", skill=prev_state.get("skill"))
 
         from .. import agui
-        if agui._active is not None:
+        from .. import agwebui as _agwebui
+        if _agwebui._active is not None:
+            import uuid as _uuid
+            ask_id = _uuid.uuid4().hex[:12]
+            reply = _agwebui._active.emitter.ask_human(agname, ask_id, question)
+        elif agui._active is not None:
             reply = agui._active.ask_human(agname, question)
         else:
             print(f"\n[{agname}] asks: {question}")

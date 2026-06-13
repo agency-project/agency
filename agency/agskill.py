@@ -102,8 +102,9 @@ def _strip_thinking(content: str) -> str:
 def _extract_thinking(content: str) -> str:
     """Return the concatenated text of all thinking blocks, or empty string if none."""
     return "\n\n".join(m.group(1).strip() for m in _THINKING_RE.finditer(content))
+from typing import get_args, get_origin
 from .agdata import agdata, _fmt_exc
-from .agtype import agtype
+from .agtype import agtype, agimage
 from .agtool import agtool
 from .agcompaction import compact, should_compact, count_messages_tokens
 
@@ -153,6 +154,17 @@ class agskill:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _agtype_class(hint: object) -> type[agtype] | None:
+        """Return the agtype subclass for a hint, handling both T and list[T]."""
+        if isinstance(hint, type) and issubclass(hint, agtype):
+            return hint
+        if get_origin(hint) is list:
+            args = get_args(hint)
+            if args and isinstance(args[0], type) and issubclass(args[0], agtype):
+                return args[0]
+        return None
+
     def _build_system_prompt(self, extra: str | None = None) -> str:
         parts = [self.system_prompt]
 
@@ -160,13 +172,15 @@ class agskill:
         # them before the JSON format sections.
         extra_lines: list[str] = []
         for key, hint in (self.input_schema._data.items() if self.input_schema else []):
-            if isinstance(hint, type) and issubclass(hint, agtype):
-                line = hint.extra_input_prompt(key)
+            cls = self._agtype_class(hint)
+            if cls is not None:
+                line = cls.extra_input_prompt(key)
                 if line:
                     extra_lines.append(line)
         for key, hint in (self.output_schema._data.items() if self.output_schema else []):
-            if isinstance(hint, type) and issubclass(hint, agtype):
-                line = hint.extra_output_prompt(key, self.name)
+            cls = self._agtype_class(hint)
+            if cls is not None:
+                line = cls.extra_output_prompt(key, self.name)
                 if line:
                     extra_lines.append(line)
 
@@ -197,6 +211,57 @@ class agskill:
                 "- Include every required field exactly once. Do not nest the output inside an extra wrapper key."
             )
         return "\n".join(parts)
+
+    def _build_user_content(self, input: agdata) -> "str | list":
+        """Build the content value for the user message.
+
+        Returns a plain string when there are no image fields, or a multimodal
+        content array when agimage fields are present.  Image field values are
+        replaced with a short placeholder in the text portion so the LLM doesn't
+        see a raw base64 blob in the JSON.
+        """
+        schema = self.input_schema
+        image_urls: list[str] = []
+        image_keys: set[str] = set()
+
+        if schema is not None:
+            for key, hint in schema._data.items():
+                # Single agimage
+                if isinstance(hint, type) and issubclass(hint, agimage):
+                    image_keys.add(key)
+                    val = input._data.get(key)
+                    if isinstance(val, str):
+                        image_urls.append(val)
+                # list[agimage]
+                elif get_origin(hint) is list:
+                    args = get_args(hint)
+                    if args and isinstance(args[0], type) and issubclass(args[0], agimage):
+                        image_keys.add(key)
+                        vals = input._data.get(key, [])
+                        if isinstance(vals, list):
+                            image_urls.extend(v for v in vals if isinstance(v, str))
+
+        if not image_urls:
+            return input.to_json()
+
+        # Build a copy of the input dict with image fields replaced by placeholders
+        # so the text portion stays compact.
+        text_data = dict(input._data)
+        for key in image_keys:
+            if key in text_data:
+                hint = schema._data.get(key) if schema else None
+                if get_origin(hint) is list:
+                    count = len(text_data[key]) if isinstance(text_data[key], list) else 1
+                    text_data[key] = f"[{count} image(s) attached]"
+                else:
+                    text_data[key] = "[image attached]"
+
+        import json as _json
+        text = _json.dumps(text_data)
+        content: list = [{"type": "text", "text": text}]
+        for url in image_urls:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        return content
 
     def _check_schema(self, data: agdata, schema: agdata) -> list[str]:
         """Return a list of error strings; empty list means the data is valid."""
@@ -307,7 +372,7 @@ class agskill:
         messages: list[dict] = (
             [{"role": "system", "content": self._build_system_prompt(_extra_system)}]
             + history_msgs
-            + [{"role": "user", "content": input.to_json()}]
+            + [{"role": "user", "content": self._build_user_content(input)}]
         )
         if _live_messages_fn:
             _live_messages_fn(messages[1:])
@@ -477,7 +542,7 @@ class agskill:
                                     if tc_delta.function.arguments:
                                         slot["function"]["arguments"] += tc_delta.function.arguments
 
-            except (_LLMIdleTimeout, ssl.SSLError, OSError) as _conn_err:
+            except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError) as _conn_err:
                 try:
                     client.close()  # best-effort: unblock drain thread's ssl.read()
                 except Exception:

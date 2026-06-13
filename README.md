@@ -53,7 +53,7 @@ print(result.summary)   # blocks until done
 
 **`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. Fields are accessed as attributes (`result.summary`). Supports JSON serialisation and schema validation.
 
-**`agtype`** — base class for typed agdata field values. Subclass to control how a schema field is serialised, transferred to/from the sandbox filesystem, represented in the system prompt, and cleaned up. `agfile` is the built-in subclass for file-backed fields.
+**`agtype`** — base class for typed agdata field values. Subclass to control how a schema field is serialised, transferred to/from the sandbox filesystem, represented in the system prompt, and cleaned up. `agfile` is the built-in subclass for file-backed fields. `agimage` is the built-in subclass for multimodal image inputs — local files are base64-encoded automatically; the image is injected into the message content array so the model sees it visually.
 
 **`agskill`** — a named ReAct loop with its own system prompt, optional input/output schemas, and an optional tool list. The LLM calls tools, inspects results, and iterates until it produces a final JSON answer. Output is validated against the schema; failures inject a correction message and retry.
 
@@ -64,6 +64,8 @@ print(result.summary)   # blocks until done
 **`agteam`** — coordinates multiple agents or tasks. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow. Each `run()` call executes in its own daemon thread.
 
 **`agUI`** — a terminal UI (Textual) that shows all live agents, their current state, streaming token output, tool calls, and a human-in-the-loop interaction pane.
+
+**`agwebui`** — a browser-based dashboard that runs in a separate process. Writes structured events to a JSONL file; a standalone FastAPI server tails it and pushes updates to connected browsers over WebSocket. Drop-in replacement for agUI with no asyncio/spawn conflict. See [docs/agwebui.md](docs/agwebui.md).
 
 ## Parallelism model
 
@@ -116,6 +118,15 @@ MAX_PAPERS=6 uv run python examples/paper_crawler.py "flash attention"
 
 The report lands at `runs/<timestamp>_paper_crawler/agent_output/<agname>/report.md`.
 
+### image_processing — multimodal image input with `agimage`
+
+Demonstrates all three `agimage` patterns: single local file (auto base64-encoded), list of images compared side-by-side, and an image from a public URL. Requires a vision-capable model (e.g. `Qwen/Qwen2.5-VL-7B-Instruct`).
+
+```bash
+VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py photo.jpg
+VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py before.jpg after.jpg
+```
+
 ## Common skills
 
 `agency.common_skills` provides ready-made skill classes:
@@ -144,7 +155,7 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [agent.md](docs/agent.md) | Agent construction, `run()`, forking, history, UI callbacks |
 | [agdata.md](docs/agdata.md) | Data container — pending results, schema types, serialization, error handling |
 | [agskill.md](docs/agskill.md) | ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
-| [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, custom subclasses |
+| [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, `agimage` (multimodal), custom subclasses |
 | [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
 | [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
 | [agsandbox.md](docs/agsandbox.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |
@@ -155,5 +166,6 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [aglog.md](docs/aglog.md) | Structured JSONL log — skills, tools, lifecycle, compaction |
 | [compaction.md](docs/compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
 | [agui.md](docs/agui.md) | Terminal UI — layout, keyboard bindings, interaction pane |
+| [agwebui.md](docs/agwebui.md) | Web UI — browser dashboard, event stream, WebSocket, ask_human path |
 | [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
 | [deadlock.md](docs/deadlock.md) | Deadlock patterns — shared agents across parallel threads, diagnosis, and fixes |

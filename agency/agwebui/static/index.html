@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agency Web UI</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="left">
+      <div id="shared-log-container">
+        <div class="panel-title">Shared Log</div>
+        <div id="shared-log"></div>
+      </div>
+      <div id="interaction">
+        <div class="panel-title" id="interaction-title">No agents</div>
+        <div id="agent-history"></div>
+        <div id="nav-bar">
+          <button id="nav-prev" title="Previous agent ([ or Shift+Tab)">&#8592;</button>
+          <span id="nav-label"></span>
+          <button id="nav-next" title="Next agent (] or Tab)">&#8594;</button>
+        </div>
+        <input id="agent-input" type="text" placeholder="type reply, then Enter…"
+               autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div id="right">
+      <div class="panel-title right-title">Agents</div>
+      <div id="agent-list"></div>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

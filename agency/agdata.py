@@ -109,6 +109,14 @@ class agdata:
             return obj.schema_type()
         if isinstance(obj, type):
             return obj.__name__
+        # Handle generic aliases like list[agimage] → "list[image]"
+        import typing
+        origin = typing.get_origin(obj)
+        if origin is list:
+            args = typing.get_args(obj)
+            if args:
+                inner = agdata._to_serializable(args[0])
+                return f"list[{inner}]"
         if isinstance(obj, agdata):
             obj._resolve()
             return {k: agdata._to_serializable(v) for k, v in obj._data.items()}

@@ -1,4 +1,7 @@
 from __future__ import annotations
+import base64
+import mimetypes
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -172,5 +175,73 @@ class agfile(agtype):
             f"  - Output `{field_name}`: write your output to a file (e.g. "
             f"/workspace/outputs/{field_name}.txt) and return only "
             f"the file path as the field value. This output file is temporary and will be cleaned up automatically "
-            f"after the task completes."
+            f"after the task completes. "
+            f"If the output is long, write it in multiple smaller tool calls (e.g. write the first portion, "
+            f"then append subsequent portions) rather than generating it all in one response — "
+            f"this avoids hitting generation length limits."
+        )
+
+
+class agimage(agtype):
+    """Image input field for agskill schemas.
+
+    The caller supplies a local file path, an http/https URL, or an existing
+    data URL.  Local files are base64-encoded by the framework before the skill
+    runs.  The image is injected directly into the multimodal content array of
+    the user message — the LLM sees it as a visual input, not as text.
+
+    Single image::
+
+        skill = agskill(
+            name="describe",
+            system_prompt="Describe the image.",
+            input_schema=agdata(question=str, photo=agimage),
+        )
+
+    List of images::
+
+        skill = agskill(
+            name="compare",
+            system_prompt="Compare the images.",
+            input_schema=agdata(question=str, frames=list[agimage]),
+        )
+    """
+
+    @classmethod
+    def schema_type(cls) -> str:
+        return "image"
+
+    @classmethod
+    def needs_sandbox(cls) -> bool:
+        return False
+
+    @classmethod
+    def prepare(
+        cls,
+        value: object,
+        sandbox: "agSandbox",
+        skill_name: str,
+        field_name: str,
+    ) -> tuple[str, list[str]]:
+        if not isinstance(value, str):
+            return value, []
+        # Already a URL or data URL — pass through unchanged.
+        if value.startswith(("http://", "https://", "data:")):
+            return value, []
+        # Local file path — read and base64-encode.
+        try:
+            path = Path(value)
+            raw = path.read_bytes()
+            mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+            b64 = base64.b64encode(raw).decode()
+            return f"data:{mime};base64,{b64}", []
+        except Exception:
+            return value, []
+
+    @classmethod
+    def extra_input_prompt(cls, field_name: str) -> str:
+        return (
+            f"  - Input `{field_name}`: an image attached directly to this message "
+            f"as a visual input. The JSON field value is a placeholder — the actual "
+            f"image is visible to you in the message content."
         )

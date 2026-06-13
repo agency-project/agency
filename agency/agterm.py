@@ -81,6 +81,13 @@ class agterm:
         self._id = agname
         self._tokens: int | None = None
         agterm._agname_colors[self._id] = self._color  # register for cross-agent colorization
+        try:
+            from . import agwebui as _agwebui
+            if _agwebui._active is not None:
+                from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
+                _agwebui._active.emitter.agent_registered(self._id, _ansi_to_hex(self._color))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -128,6 +135,13 @@ class agterm:
                 from . import agui as _agui
                 if _agui._active is not None:
                     _agui._active.add_log(line)
+                    return
+            except Exception:
+                pass
+            try:
+                from . import agwebui as _agwebui
+                if _agwebui._active is not None:
+                    _agwebui._active.emitter.log(line)
                     return
             except Exception:
                 pass
