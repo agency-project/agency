@@ -691,7 +691,7 @@ class agent:
                 history_before = list(prev_history._data.get("messages", []))
                 self._term.log("SKILL ✗  ", f"{skill_name}  exception={exc}")
             finally:
-                self._set_ui_state("inactive")
+                self._set_ui_state("finished")
                 if self.sandbox is not None:
                     _remove_offloaded_fields(_offloaded_paths, self.sandbox)
                     if self.sandbox._gpu_id is not None:

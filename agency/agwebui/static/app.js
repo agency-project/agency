@@ -12,6 +12,14 @@ const state = {
   agentOrder: [],          // [agname] ordered for display / Tab cycling
   focusedIdx: 0,
   pendingAsk: null,        // { agname, ask_id, question } | null
+  activeTab:  'all',       // 'all' | 'live' | 'idle' | 'finished'
+  timeline: {
+    liveMode:  true,
+    indexLen:  0,
+    firstTs:   null,
+    lastTs:    null,
+    samples:   [],         // [[index_pos, ts], ...] downsampled
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +72,136 @@ function ansiToHtml(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Timeline
+// ---------------------------------------------------------------------------
+
+const $tlSlider  = document.getElementById('timeline-slider');
+const $tlFrom    = document.getElementById('timeline-from');
+const $tlTo      = document.getElementById('timeline-to');
+const $tlLiveBtn = document.getElementById('timeline-live-btn');
+
+function fmtTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+// Find the timestamp for a given index_pos using the samples array.
+function tsAtPos(pos) {
+  const s = state.timeline.samples;
+  if (!s.length) return null;
+  for (let i = s.length - 1; i >= 0; i--) {
+    if (s[i][0] <= pos) {
+      if (i === s.length - 1) return s[i][1];
+      // Linear interpolate between s[i] and s[i+1]
+      const t0 = s[i][1], t1 = s[i + 1][1];
+      const p0 = s[i][0], p1 = s[i + 1][0];
+      return t0 + (t1 - t0) * (pos - p0) / (p1 - p0);
+    }
+  }
+  return s[0][1];
+}
+
+function updateTimelineBar() {
+  const tl = state.timeline;
+  $tlSlider.max   = Math.max(0, tl.indexLen - 1);
+  $tlSlider.disabled = tl.indexLen === 0;
+
+  if (tl.liveMode) {
+    $tlSlider.value = $tlSlider.max;
+    $tlFrom.textContent = tl.firstTs ? fmtTs(tl.firstTs) : '';
+    $tlTo.textContent   = '';
+    $tlLiveBtn.classList.add('active');
+  } else {
+    const pos = parseInt($tlSlider.value, 10);
+    const ts  = tsAtPos(pos);
+    $tlFrom.textContent = ts ? fmtTs(ts) : '';
+    $tlTo.textContent   = tl.lastTs ? fmtTs(tl.lastTs) : '';
+    $tlLiveBtn.classList.remove('active');
+  }
+}
+
+function applyTimelineSync(ev) {
+  const tl = state.timeline;
+  tl.indexLen = ev.index_len || 0;
+  tl.firstTs  = ev.first_ts  || null;
+  tl.lastTs   = ev.last_ts   || null;
+  tl.liveMode = true;
+  updateTimelineBar();
+  // Fetch samples for hover timestamps.
+  fetch('/api/timeline').then(r => r.json()).then(j => {
+    tl.samples = j.samples || [];
+  }).catch(() => {});
+}
+
+// Poll /api/timeline every 10s in live mode to keep slider max current.
+setInterval(async () => {
+  if (!state.timeline.liveMode) return;
+  try {
+    const r  = await fetch('/api/timeline');
+    const j  = await r.json();
+    const tl = state.timeline;
+    tl.indexLen = j.index_len || 0;
+    tl.firstTs  = j.first_ts  || tl.firstTs;
+    tl.lastTs   = j.last_ts   || tl.lastTs;
+    tl.samples  = j.samples   || tl.samples;
+    updateTimelineBar();
+  } catch {}
+}, 10_000);
+
+// Reset all agent/log state before replaying a historical window.
+function clearAgentState() {
+  state.agents.clear();
+  state.teams.clear();
+  state.histories.clear();
+  state.agentOrder = [];
+  state.focusedIdx = 0;
+  state.pendingAsk = null;
+  $sharedLog.innerHTML = '';
+  renderAgentList();
+  renderHistory();
+}
+
+async function enterHistoricalMode(indexPos) {
+  state.timeline.liveMode = false;
+  updateTimelineBar();
+  clearAgentState();
+  appendLog('\x1b[33m[timeline] loading historical events…\x1b[0m');
+  try {
+    const r  = await fetch(`/api/events?index_pos=${indexPos}&window=10`);
+    const j  = await r.json();
+    clearAgentState();
+    for (const line of (j.events || [])) {
+      try { handleEvent(JSON.parse(line)); } catch {}
+    }
+    if (j.from_ts) {
+      $tlFrom.textContent = fmtTs(j.from_ts);
+      $tlTo.textContent   = j.to_ts ? fmtTs(j.to_ts) : '';
+    }
+  } catch (e) {
+    appendLog(`\x1b[31m[timeline] fetch failed: ${e}\x1b[0m`);
+  }
+}
+
+$tlSlider.addEventListener('input', () => {
+  const pos = parseInt($tlSlider.value, 10);
+  const max = parseInt($tlSlider.max,   10);
+  if (pos >= max) {
+    // Snap back to live — reload for clean state.
+    window.location.reload();
+  } else {
+    enterHistoricalMode(pos);
+  }
+});
+
+$tlLiveBtn.addEventListener('click', () => {
+  if (!state.timeline.liveMode) window.location.reload();
+});
+
+// ---------------------------------------------------------------------------
 // DOM references
 // ---------------------------------------------------------------------------
 
@@ -73,6 +211,10 @@ const $agentList        = document.getElementById('agent-list');
 const $interactionTitle = document.getElementById('interaction-title');
 const $agentInput       = document.getElementById('agent-input');
 const $navLabel         = document.getElementById('nav-label');
+const $countAll         = document.getElementById('count-all');
+const $countLive        = document.getElementById('count-live');
+const $countIdle        = document.getElementById('count-idle');
+const $countFinished    = document.getElementById('count-finished');
 
 // ---------------------------------------------------------------------------
 // Shared log
@@ -98,23 +240,59 @@ function appendLog(line) {
 // Agent list (right panel)
 // ---------------------------------------------------------------------------
 
+function isLive(st)      { return st !== 'inactive' && st !== 'finished' && st !== 'skill'; }
+function isIdle(st)      { return st === 'inactive'; }
+function isFinished(st)  { return st === 'finished'; }
+
+function tabVisible(st) {
+  if (state.activeTab === 'all')      return true;
+  if (state.activeTab === 'live')     return isLive(st);
+  if (state.activeTab === 'idle')     return isIdle(st);
+  if (state.activeTab === 'finished') return isFinished(st);
+  return true;
+}
+
+function updateCounts() {
+  let live = 0, idle = 0, finished = 0;
+  for (const ag of state.agents.values()) {
+    if (isLive(ag.state))     live++;
+    else if (isFinished(ag.state)) finished++;
+    else                      idle++;
+  }
+  $countAll.textContent      = state.agents.size;
+  $countLive.textContent     = live;
+  $countIdle.textContent     = idle;
+  $countFinished.textContent = finished;
+}
+
 function currentAgent() {
-  if (!state.agentOrder.length) return null;
-  return state.agentOrder[state.focusedIdx % state.agentOrder.length];
+  const visible = visibleOrder();
+  if (!visible.length) return null;
+  return visible[state.focusedIdx % visible.length];
+}
+
+function visibleOrder() {
+  return state.agentOrder.filter(agname => {
+    const ag = state.agents.get(agname);
+    return ag ? tabVisible(ag.state) : state.activeTab === 'all';
+  });
 }
 
 function renderAgentList() {
+  updateCounts();
+
   // Build agname → team_name reverse map
   const agentTeam = new Map();
   for (const [tname, agents] of state.teams) {
     for (const ag of agents) agentTeam.set(ag, tname);
   }
 
+  const visible = visibleOrder();
   const frags = [];
   const emittedTeams = new Set();
   const focused = currentAgent();
 
-  for (const agname of state.agentOrder) {
+  for (const agname of visible) {
     const tname = agentTeam.get(agname);
 
     if (tname && !emittedTeams.has(tname)) {
@@ -137,7 +315,10 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
   const { state: st, skill, tool } = ag;
   let dot, statusHtml;
 
-  if (st === 'inactive') {
+  if (st === 'finished') {
+    dot = `<span class="dot-finished">✓</span>`;
+    statusHtml = `<span class="status-finished">finished</span>`;
+  } else if (st === 'inactive') {
     dot = `<span class="dot-inactive">○</span>`;
     statusHtml = `<span class="dim">idle</span>`;
   } else if (st === 'llm') {
@@ -175,7 +356,8 @@ $agentHistory.addEventListener('scroll', () => {
 
 function renderHistory() {
   const agname = currentAgent();
-  const n   = state.agentOrder.length;
+  const visible = visibleOrder();
+  const n   = visible.length;
   const idx = n ? state.focusedIdx % n : 0;
 
   if (!agname) {
@@ -239,7 +421,7 @@ function renderHistory() {
 
   // Running indicator
   const ag = state.agents.get(agname);
-  if (ag && ag.state !== 'inactive') {
+  if (ag && ag.state !== 'inactive' && ag.state !== 'finished') {
     const st = ag.state;
     let label;
     if      (st === 'llm')       label = 'LLM Thinking…';
@@ -267,6 +449,10 @@ function renderHistory() {
 
 function handleEvent(ev) {
   switch (ev.type) {
+
+    case 'timeline_sync':
+      applyTimelineSync(ev);
+      break;
 
     case 'log':
       appendLog(ev.line);
@@ -349,6 +535,17 @@ function reorderAgents() {
 document.getElementById('nav-prev').addEventListener('click', cyclePrev);
 document.getElementById('nav-next').addEventListener('click', cycleNext);
 
+document.getElementById('agent-tabs').addEventListener('click', e => {
+  const btn = e.target.closest('.tab-btn');
+  if (!btn) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  state.activeTab  = btn.dataset.tab;
+  state.focusedIdx = 0;
+  renderAgentList();
+  renderHistory();
+});
+
 document.addEventListener('keydown', e => {
   if (document.activeElement === $agentInput) return;
   if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); cycleNext(); }
@@ -358,15 +555,17 @@ document.addEventListener('keydown', e => {
 });
 
 function cycleNext() {
-  if (!state.agentOrder.length) return;
-  state.focusedIdx = (state.focusedIdx + 1) % state.agentOrder.length;
+  const n = visibleOrder().length;
+  if (!n) return;
+  state.focusedIdx = (state.focusedIdx + 1) % n;
   renderAgentList();
   renderHistory();
 }
 
 function cyclePrev() {
-  if (!state.agentOrder.length) return;
-  state.focusedIdx = (state.focusedIdx - 1 + state.agentOrder.length) % state.agentOrder.length;
+  const n = visibleOrder().length;
+  if (!n) return;
+  state.focusedIdx = (state.focusedIdx - 1 + n) % n;
   renderAgentList();
   renderHistory();
 }
@@ -376,7 +575,7 @@ $agentList.addEventListener('click', e => {
   const entry = e.target.closest('.agent-entry');
   if (!entry) return;
   const agname = entry.dataset.agname;
-  const idx = state.agentOrder.indexOf(agname);
+  const idx = visibleOrder().indexOf(agname);
   if (idx >= 0) {
     state.focusedIdx = idx;
     renderAgentList();
@@ -414,7 +613,12 @@ $agentInput.addEventListener('keydown', e => {
 const ws = new WebSocket(`ws://${location.host}/ws`);
 
 ws.onmessage = e => {
-  try { handleEvent(JSON.parse(e.data)); } catch {}
+  try {
+    const ev = JSON.parse(e.data);
+    // In historical mode, only accept timeline_sync and ignore live events.
+    if (!state.timeline.liveMode && ev.type !== 'timeline_sync') return;
+    handleEvent(ev);
+  } catch {}
 };
 
 ws.onclose = () => {

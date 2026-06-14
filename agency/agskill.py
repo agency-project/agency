@@ -104,7 +104,7 @@ def _extract_thinking(content: str) -> str:
     return "\n\n".join(m.group(1).strip() for m in _THINKING_RE.finditer(content))
 from typing import get_args, get_origin
 from .agdata import agdata, _fmt_exc
-from .agtype import agtype, agimage
+from .agtype import agtype, agimage, agrawstring
 from .agtool import agtool
 from .agcompaction import compact, should_compact, count_messages_tokens
 
@@ -165,6 +165,28 @@ class agskill:
                 return args[0]
         return None
 
+    def _raw_input_key(self) -> "str | None":
+        """Return the field key if input_schema is a single agrawstring field."""
+        if self.input_schema is None:
+            return None
+        items = list(self.input_schema._data.items())
+        if len(items) == 1:
+            key, hint = items[0]
+            if isinstance(hint, type) and issubclass(hint, agrawstring):
+                return key
+        return None
+
+    def _raw_output_key(self) -> "str | None":
+        """Return the field key if output_schema is a single agrawstring field."""
+        if self.output_schema is None:
+            return None
+        items = list(self.output_schema._data.items())
+        if len(items) == 1:
+            key, hint = items[0]
+            if isinstance(hint, type) and issubclass(hint, agrawstring):
+                return key
+        return None
+
     def _build_system_prompt(self, extra: str | None = None) -> str:
         parts = [self.system_prompt]
 
@@ -194,22 +216,25 @@ class agskill:
         if extra:
             parts.append(extra)
 
-        if self.input_schema is not None:
+        if self.input_schema is not None and self._raw_input_key() is None:
             parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}")
         if self.output_schema is not None:
-            parts.append(
-                f"\nOutput JSON format (respond ONLY with this JSON, no other text):\n"
-                f"{self.output_schema.to_json()}\n\n"
-                "JSON formatting rules — common failure modes to avoid:\n"
-                "- Do NOT wrap the JSON in markdown code fences (``` or ```json).\n"
-                "- Do NOT add any explanation, preamble, or trailing text outside the JSON object.\n"
-                "- All string values must use double quotes. Escape special characters inside strings:\n"
-                '  use \\" for a literal quote, \\\\ for a backslash, \\n for a newline.\n'
-                "  Never use raw newlines or unescaped quotes inside a string value.\n"
-                "- Every key must be a double-quoted string. Trailing commas are not allowed.\n"
-                "- The response must be a single JSON object {{ }} — not an array, not multiple objects.\n"
-                "- Include every required field exactly once. Do not nest the output inside an extra wrapper key."
-            )
+            if self._raw_output_key() is not None:
+                parts.append("\nRespond with plain text only — no JSON wrapping, no markdown code fences.")
+            else:
+                parts.append(
+                    f"\nOutput JSON format (respond ONLY with this JSON, no other text):\n"
+                    f"{self.output_schema.to_json()}\n\n"
+                    "JSON formatting rules — common failure modes to avoid:\n"
+                    "- Do NOT wrap the JSON in markdown code fences (``` or ```json).\n"
+                    "- Do NOT add any explanation, preamble, or trailing text outside the JSON object.\n"
+                    "- All string values must use double quotes. Escape special characters inside strings:\n"
+                    '  use \\" for a literal quote, \\\\ for a backslash, \\n for a newline.\n'
+                    "  Never use raw newlines or unescaped quotes inside a string value.\n"
+                    "- Every key must be a double-quoted string. Trailing commas are not allowed.\n"
+                    "- The response must be a single JSON object {{ }} — not an array, not multiple objects.\n"
+                    "- Include every required field exactly once. Do not nest the output inside an extra wrapper key."
+                )
         return "\n".join(parts)
 
     def _build_user_content(self, input: agdata) -> "str | list":
@@ -220,6 +245,12 @@ class agskill:
         replaced with a short placeholder in the text portion so the LLM doesn't
         see a raw base64 blob in the JSON.
         """
+        # agrawstring input — send the value directly, no JSON wrapping.
+        raw_key = self._raw_input_key()
+        if raw_key is not None:
+            val = input._data.get(raw_key, "")
+            return val if isinstance(val, str) else str(val)
+
         schema = self.input_schema
         image_urls: list[str] = []
         image_keys: set[str] = set()
@@ -713,6 +744,18 @@ class agskill:
                 # --- Parse final answer --------------------------------------
                 # full_content is already thinking-stripped via msg_dict["content"];
                 # use msg_dict.get() so we don't re-process.
+
+                # agrawstring output — capture the raw text and return immediately.
+                raw_out_key = self._raw_output_key()
+                if raw_out_key is not None:
+                    raw_content = msg_dict.get("content") or ""
+                    updated_history = agdata(messages=messages[1:])
+                    return (
+                        agdata(**{raw_out_key: raw_content}),
+                        updated_history,
+                        [messages[0]] + messages[1:][n_before:],
+                    )
+
                 content = msg_dict.get("content") or "{}"
                 # Strip markdown code fences that some models add despite instructions
                 stripped = content.strip()
@@ -724,7 +767,22 @@ class agskill:
                 _parse_error: str = ""
                 try:
                     result = agdata.from_json(content)
-                except (json.JSONDecodeError, TypeError) as _e:
+                except json.JSONDecodeError as _e:
+                    # If there is trailing garbage after a valid JSON object
+                    # (e.g. a stray `"` the model appended), try extracting
+                    # just the first complete JSON value via raw_decode.
+                    if "Extra data" in str(_e):
+                        try:
+                            _obj, _ = json.JSONDecoder().raw_decode(content.lstrip())
+                            result = agdata(**_obj) if isinstance(_obj, dict) else agdata(result=content)
+                            _parse_error = ""  # recovered
+                        except (json.JSONDecodeError, TypeError):
+                            _parse_error = str(_e)
+                            result = agdata(result=content)
+                    else:
+                        _parse_error = str(_e)
+                        result = agdata(result=content)
+                except TypeError as _e:
                     _parse_error = str(_e)
                     result = agdata(result=content)
 

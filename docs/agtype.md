@@ -4,7 +4,7 @@
 
 ## Why it exists
 
-Some skill fields are too large or too structured to inline in the LLM context window.  The `agfile` subclass is the built-in example: its content lives in a sandbox file, and the LLM receives only a path.  `agimage` is the multimodal example: the image is injected directly into the message content array so the LLM sees it visually.  `agtype` makes this pattern extensible — future field types (encrypted blobs, binary data, remote-fetched content, etc.) follow the same interface without touching the core framework.
+Some skill fields are too large or too structured to inline in the LLM context window.  The `agfile` subclass is the built-in example: its content lives in a sandbox file, and the LLM receives only a path.  `agimage` is the multimodal example: the image is injected directly into the message content array so the LLM sees it visually.  `agrawstring` is the escape-hatch example: it bypasses JSON formatting entirely so the model receives and returns raw text.  `agtype` makes this pattern extensible — custom field types (encrypted blobs, binary data, remote-fetched content, etc.) follow the same interface without touching the core framework.
 
 ## Interface
 
@@ -28,6 +28,7 @@ Human-readable type label shown in the JSON format hint appended to the system p
 | `agtype` (base) | `"str"` |
 | `agfile` | `"file"` |
 | `agimage` | `"image"` |
+| `agrawstring` | `"str"` |
 
 ### `needs_sandbox() -> bool`
 
@@ -161,6 +162,81 @@ For `list[agimage]` with N images, the placeholder reads `"[N image(s) attached]
 ### Requirements
 
 The model in `llm_config` must support multimodal input (vision). Passing `agimage` fields to a text-only model will produce a provider-side error or silently ignored images depending on the backend.
+
+## Built-in subclass: `agrawstring`
+
+`agrawstring` bypasses the JSON input/output contract entirely. The caller's string is sent as the raw user message; the model's full text response is captured as-is, with no JSON parsing or retry loop.
+
+```python
+from agency import agrawstring
+```
+
+| Method | Behaviour |
+|---|---|
+| `schema_type()` | `"str"` |
+| `needs_sandbox()` | `False` |
+| `prepare(value, ...)` | No-op — value passes through unchanged. |
+| `recover(value, ...)` | No-op — output is captured at the skill level, not via recover. |
+| `extra_input_prompt` | None — JSON format hint is suppressed entirely. |
+| `extra_output_prompt` | None — replaced by "Respond with plain text only." |
+
+### Constraint
+
+`agrawstring` must be the **only** field in its input or output schema. If multiple fields are present, the framework falls back to normal JSON mode silently.
+
+### Input
+
+```python
+from agency import agskill, agdata, agrawstring
+
+write_skill = agskill(
+    name="write_chapter",
+    system_prompt="You are a novelist. Write the chapter as requested.",
+    input_schema=agdata(prompt=agrawstring),
+    output_schema=agdata(chapter=agrawstring),
+)
+
+result = ag.run(write_skill, agdata(prompt="Write a dark opening scene set on a space station."))
+print(result.chapter)   # the model's prose, unmodified
+```
+
+The user message sent to the model is `"Write a dark opening scene set on a space station."` — no JSON wrapping, no schema hint.
+
+### Output
+
+When the output schema is a single `agrawstring` field, the model's complete text response (including newlines, quotes, and any markdown) is stored verbatim under that field. The JSON parsing step and retry loop are both skipped.
+
+### Input-only or output-only
+
+`agrawstring` can appear on either side independently:
+
+```python
+# Raw input, structured output
+extract_skill = agskill(
+    name="extract",
+    system_prompt="Extract the key facts from the text.",
+    input_schema=agdata(text=agrawstring),
+    output_schema=agdata(facts=str, confidence=float),
+)
+
+# Structured input, raw output
+prose_skill = agskill(
+    name="prose",
+    system_prompt="Write prose based on the outline.",
+    input_schema=agdata(outline=str, tone=str),
+    output_schema=agdata(prose=agrawstring),
+)
+```
+
+### When to use
+
+Use `agrawstring` when:
+
+- The input is a long freeform prompt that should reach the model as-is (no JSON quoting artifacts).
+- The output is long prose, code, or markdown that the model cannot reliably produce inside a JSON string (escaping issues, generation-length pressure).
+- You want to avoid the JSON retry loop for generative tasks where any response is acceptable.
+
+Avoid it when the output needs structured fields that downstream code will inspect — use `agfile` or plain schema fields instead.
 
 ## Writing a custom agtype
 

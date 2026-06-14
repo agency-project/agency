@@ -11,6 +11,12 @@
     <div id="left">
       <div id="shared-log-container">
         <div class="panel-title">Shared Log</div>
+        <div id="timeline-bar">
+          <span id="timeline-from"></span>
+          <input id="timeline-slider" type="range" min="0" max="0" value="0" step="1" disabled>
+          <span id="timeline-to"></span>
+          <button id="timeline-live-btn" class="tl-live active">LIVE</button>
+        </div>
         <div id="shared-log"></div>
       </div>
       <div id="interaction">
@@ -26,7 +32,12 @@
       </div>
     </div>
     <div id="right">
-      <div class="panel-title right-title">Agents</div>
+      <div id="agent-tabs">
+        <button class="tab-btn active" data-tab="all">All <span class="tab-count" id="count-all">0</span></button>
+        <button class="tab-btn" data-tab="live">Live <span class="tab-count" id="count-live">0</span></button>
+        <button class="tab-btn" data-tab="idle">Idle <span class="tab-count" id="count-idle">0</span></button>
+        <button class="tab-btn" data-tab="finished">Done <span class="tab-count" id="count-finished">0</span></button>
+      </div>
       <div id="agent-list"></div>
     </div>
   </div>

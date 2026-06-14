@@ -180,7 +180,8 @@ def test_agsync_reraises_exception_from_submitted_team():
         agsync(team)
 
 
-def test_agsync_reraises_first_exception_in_list():
+def test_agsync_reraises_single_exception_directly():
+    """One failing team → original exception type raised, not ExceptionGroup."""
     class _Good(agteam):
         def setup(self): pass
         def run(self): return agdata(ok=True)
@@ -193,6 +194,43 @@ def test_agsync_reraises_first_exception_in_list():
     [t.run() for t in teams]
     with pytest.raises(RuntimeError, match="bad team"):
         agsync(teams)
+
+
+def test_agsync_raises_exception_group_for_multiple_failures():
+    """Multiple failing teams → ExceptionGroup containing all their exceptions."""
+    class _Bad(agteam):
+        def setup(self): pass
+        def run(self): raise ValueError("failed")
+
+    teams = [_Bad(), _Bad(), _Bad()]
+    [t.run() for t in teams]
+    with pytest.raises(ExceptionGroup) as exc_info:
+        agsync(teams)
+    assert len(exc_info.value.exceptions) == 3
+    assert all(isinstance(e, ValueError) for e in exc_info.value.exceptions)
+
+
+def test_agsync_joins_all_teams_before_raising():
+    """A fast-failing team must not cause slow teams to be abandoned."""
+    finished = []
+
+    class _Fast(agteam):
+        def setup(self): pass
+        def run(self): raise RuntimeError("fast failure")
+
+    class _Slow(agteam):
+        def setup(self): pass
+        def run(self):
+            time.sleep(0.15)
+            finished.append(1)
+            return agdata(ok=True)
+
+    teams = [_Fast(), _Slow(), _Slow()]
+    [t.run() for t in teams]
+    with pytest.raises(RuntimeError):
+        agsync(teams)
+    # Both slow teams must have completed despite the fast failure.
+    assert len(finished) == 2
 
 
 def test_agsync_does_not_raise_for_idle_team_that_had_no_error():

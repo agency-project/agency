@@ -197,10 +197,43 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   color: var(--dim);
 }
 
-.dot-inactive { color: var(--dim); }
-.status-llm   { color: var(--cyan); }
-.status-tool  { color: var(--yellow); }
-.status-human { color: var(--yellow); }
+.dot-inactive  { color: var(--dim); }
+.dot-finished  { color: var(--green); opacity: 0.6; }
+.status-llm    { color: var(--cyan); }
+.status-tool   { color: var(--yellow); }
+.status-human  { color: var(--yellow); }
+.status-finished { color: var(--green); opacity: 0.6; }
+
+/* ------------------------------------------------------------ Tabs */
+
+#agent-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg2);
+}
+
+.tab-btn {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 10.5px;
+  padding: 4px 2px;
+  white-space: nowrap;
+  transition: color 0.1s;
+}
+.tab-btn:hover  { color: var(--text); }
+.tab-btn.active { color: var(--border-log); border-bottom-color: var(--border-log); }
+
+.tab-count {
+  font-size: 9.5px;
+  opacity: 0.7;
+  margin-left: 2px;
+}
 
 /* ------------------------------------------------------- History pane */
 
@@ -218,6 +251,50 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .role-assistant { color: var(--green);  font-weight: bold; }
 .role-ask       { color: var(--yellow); font-weight: bold; }
 .dim            { opacity: 0.5; }
+
+/* ----------------------------------------------------------- Timeline */
+
+#timeline-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+#timeline-slider {
+  flex: 1;
+  height: 4px;
+  cursor: pointer;
+  accent-color: var(--border-log);
+  min-width: 0;
+}
+#timeline-slider:disabled { opacity: 0.3; cursor: default; }
+
+#timeline-from, #timeline-to {
+  font-size: 10px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+#timeline-live-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-family: var(--font);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#timeline-live-btn.active {
+  border-color: var(--green);
+  color: var(--green);
+}
+#timeline-live-btn:hover { border-color: var(--text); color: var(--text); }
 
 /* --------------------------------------------------------- Scrollbars */
 

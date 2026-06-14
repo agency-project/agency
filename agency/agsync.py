@@ -58,14 +58,25 @@ def agsync(*targets) -> None:
                 f"agsync: expected agent or agteam, got {type(t).__name__!r}"
             )
 
-    # Join submit() threads first — fork agents registered by the background
-    # thread must be fully visible in the WeakSet before we snapshot it.
+    # Join ALL team threads before raising any exception, so that no team is
+    # abandoned mid-run. Collect exceptions and re-raise after everything joins.
+    errors: list[BaseException] = []
     for team in teams:
         if team._run_future is not None:
-            team._run_future.result()
+            try:
+                team._run_future.result()
+            except Exception as exc:
+                errors.append(exc)
 
     # Snapshot WeakSet now; dead entries are skipped automatically.
     team_agents = [ag for team in teams for ag in team._agents]
 
     for ag in solo_agents + team_agents:
         ag._history._resolve()
+
+    if errors:
+        if len(errors) == 1:
+            raise errors[0]
+        raise ExceptionGroup(
+            f"agsync: {len(errors)} team(s) failed", errors
+        )

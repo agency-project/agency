@@ -43,6 +43,7 @@ class agwebui:
         self._run_dir = run_dir
         self._port    = port
         self._server_proc: subprocess.Popen | None = None
+        self._server_log = None
 
     @classmethod
     def run(
@@ -69,14 +70,16 @@ class agwebui:
 
         ui = cls(run_dir=run_dir, port=port)
 
+        server_log = open(run_dir / "server.log", "w")
+        ui._server_log = server_log
         ui._server_proc = subprocess.Popen(
             [
                 sys.executable, "-m", "agency.agwebui.server",
                 "--run-dir", str(run_dir),
                 "--port",    str(port),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=server_log,
+            stderr=server_log,
         )
 
         # Wait up to 10 s for the server to be ready.
@@ -119,3 +122,5 @@ class agwebui:
                     ui._server_proc.wait(timeout=5)
                 except Exception:
                     pass
+                if ui._server_log is not None:
+                    ui._server_log.close()

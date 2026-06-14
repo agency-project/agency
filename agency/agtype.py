@@ -242,3 +242,42 @@ class agimage(agtype):
             f"as a visual input. The JSON field value is a placeholder — the actual "
             f"image is visible to you in the message content."
         )
+
+
+class agrawstring(agtype):
+    """Raw string field — bypasses JSON input/output formatting entirely.
+
+    Input
+    -----
+    When used as the sole input field, the string value is sent directly as
+    the user message content.  No JSON wrapping, no schema hint.
+
+    Output
+    ------
+    When used as the sole output field, the model's complete text response is
+    captured as-is.  No JSON parsing, no retry loop.
+
+    Constraint
+    ----------
+    Must be the only field in its input or output schema.
+
+    Example::
+
+        write_skill = agskill(
+            name="write_chapter",
+            system_prompt="You are a novelist. Write the chapter as requested.",
+            input_schema=agdata(prompt=agrawstring),
+            output_schema=agdata(chapter=agrawstring),
+        )
+
+        result = ag.run(write_skill, agdata(prompt="Write a dark opening scene."))
+        print(result.chapter)   # the model's prose, unmodified
+    """
+
+    @classmethod
+    def schema_type(cls) -> str:
+        return "str"
+
+    @classmethod
+    def needs_sandbox(cls) -> bool:
+        return False
