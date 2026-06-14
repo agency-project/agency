@@ -68,6 +68,16 @@ class agwebui:
             run_dir = Path("runs") / f"webui_{ts}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        # Fail fast if the port is already occupied.
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if _s.connect_ex(("127.0.0.1", port)) == 0:
+                raise RuntimeError(
+                    f"[agwebui] Port {port} is already in use. "
+                    f"Stop the existing server before starting a new run."
+                )
+
         ui = cls(run_dir=run_dir, port=port)
 
         server_log = open(run_dir / "server.log", "w")
