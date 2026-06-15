@@ -153,10 +153,37 @@ my_tool = agtool(
 
 ### `need_sandbox` flag
 
-Every `agtool` has a `need_sandbox` flag (default `True`). When an agent calls a tool with `need_sandbox=True`, the sandbox container is started on that first call if it has not been started yet. Tools with `need_sandbox=False` run without ever touching the container.
+Every `agtool` has a `need_sandbox` flag (default `True`). It controls **two** things simultaneously:
 
-- **Default `True`** — the safe default for custom tools; guarantees a container is available before the tool runs.
-- **Set `False`** explicitly for tools that are entirely host-side: HTTP requests, reading host files, spawning sub-agents, etc.
+| | `need_sandbox=True` | `need_sandbox=False` |
+|---|---|---|
+| **Execution context** | Worker subprocess via `ProcessPoolExecutor` | Calling thread, in-process |
+| **Sandbox container** | Started on first call if not yet running | Never touched |
+| **Process isolation** | Full — own GIL, own memory space | None — shares caller's state |
+| **Timeout enforced** | Yes (`TOOL_TIMEOUT_S`, default 30 s) | No — caller controls blocking |
+
+**Default `True`** is the safe default for custom tools. The subprocess isolation prevents a CPU-heavy or crashing tool from blocking LLM streaming or corrupting agent state.
+
+**Set `False`** for any tool that must access host-process state — module-level singletons, UI handles, queues, or anything that lives only in the main process and would be `None` or missing in a subprocess worker:
+
+```python
+# Wrong: _agwebui._active is a singleton in the main process;
+# it is None in every subprocess worker — the tool silently fails.
+my_tool = agtool(name="notify_ui", ..., fn=_notify_fn)          # need_sandbox=True default
+
+# Correct:
+my_tool = agtool(name="notify_ui", ..., fn=_notify_fn, need_sandbox=False)
+```
+
+Common cases that require `need_sandbox=False`:
+
+- **`ask_human` and any human-interaction tool** — they read `_agwebui._active` / `agui._active` to route questions to the live UI, then block-poll for a reply. In a subprocess, those singletons are `None` and stdin is an EOF pipe, so the tool either hangs or returns a timeout reply immediately.
+- **Tools that write to shared in-process state** — progress queues, event emitters, result caches.
+- **Tools that perform outbound I/O only** — HTTP requests, host file reads — where no container is needed and running in-process is simpler.
+
+> **Rule of thumb:** if the tool's function body imports or reads anything from `agency` (agents, UI handles, queues) rather than just transforming its input, set `need_sandbox=False`.
+
+Exceptions thrown by `need_sandbox=False` tools are caught by `agtool.__call__` and returned as `agdata(error=...)`, exactly like sandboxed tools. The LLM sees the error and can decide how to proceed.
 
 Tools belong to skills, not agents. Pass custom tools when defining the skill:
 

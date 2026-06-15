@@ -382,19 +382,17 @@ function renderHistory() {
     const content = msg.content || '';
 
     if (role === 'system') {
-      const first = content.split('\n')[0].slice(0, 120);
-      frags.push(`<div class="msg-system">─── sys: ${esc(first)}</div>`);
+      frags.push(`<div class="msg-system">─── sys: ${esc(content)}</div>`);
 
     } else if (role === 'user') {
-      const preview = content.slice(0, 300).replace(/\n/g, ' ');
-      frags.push(`<div class="msg-user"><span class="role-user">▶ user</span>  ${esc(preview)}</div>`);
+      frags.push(`<div class="msg-user"><span class="role-user">▶ user</span>  ${esc(content)}</div>`);
 
     } else if (role === 'assistant') {
       const thinking   = msg._thinking || '';
       const toolCalls  = msg.tool_calls || [];
 
       if (thinking) {
-        frags.push(`<div class="msg-thinking">💭 thinking\n${esc(thinking.slice(0, 800))}</div>`);
+        frags.push(`<div class="msg-thinking">💭 thinking\n${esc(thinking)}</div>`);
       }
       for (const tc of toolCalls) {
         const fn    = tc.function || {};
@@ -403,10 +401,10 @@ function renderHistory() {
         try {
           const raw = JSON.parse(fn.arguments || '{}');
           argsText = Object.entries(raw)
-            .map(([k, v]) => `  ${esc(k)}: ${esc(String(v).slice(0, 120))}`)
+            .map(([k, v]) => `  ${esc(k)}: ${esc(String(v))}`)
             .join('\n');
         } catch {
-          argsText = esc((fn.arguments || '').slice(0, 200));
+          argsText = esc(fn.arguments || '');
         }
         frags.push(
           `<div class="msg-tool-call"><span class="role-tool-call">⚙ ${esc(fname)}</span>\n` +
@@ -418,7 +416,7 @@ function renderHistory() {
       }
 
     } else if (role === 'tool') {
-      frags.push(`<div class="msg-tool-result"><span class="dim">← ${esc(content.slice(0, 600))}</span></div>`);
+      frags.push(`<div class="msg-tool-result"><span class="dim">← ${esc(content)}</span></div>`);
     }
   }
 

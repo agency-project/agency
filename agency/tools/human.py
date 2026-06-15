@@ -8,8 +8,11 @@ _TIMEOUT_REPLY = "[no human available — timed out]"
 _DEFAULT_TIMEOUT_S = 300  # 5 minutes
 
 
-def make_ask_human(agname: str, timeout_s: float = _DEFAULT_TIMEOUT_S) -> agtool:
-    """Return an ask_human tool bound to the given agent's agname."""
+def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) -> agtool:
+    """Return an ask_human tool bound to the given agent's agname.
+
+    Pass ``timeout_s=None`` to wait indefinitely for a human reply.
+    """
 
     def fn(arg: agdata) -> agdata:
         question = str(arg._data.get("question", ""))
@@ -50,6 +53,7 @@ def make_ask_human(agname: str, timeout_s: float = _DEFAULT_TIMEOUT_S) -> agtool
             except queue.Empty:
                 print(f"[{agname}] ask_human timed out after {timeout_s:.0f}s")
                 reply = _TIMEOUT_REPLY
+            # timeout_s=None blocks forever — Empty is never raised
 
         if a:
             a._set_ui_state(

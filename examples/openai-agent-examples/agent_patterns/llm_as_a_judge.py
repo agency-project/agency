@@ -11,7 +11,7 @@ from agency import agent, agskill, agdata
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:18000/v1"),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   "google/gemma-4-E2B-it"),
+    "model":    os.environ.get("VLLM_MODEL",   ""),
     "temperature":       0.6,
     "max_tokens":        16000,
     "top_p":             0.95,

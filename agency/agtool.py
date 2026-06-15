@@ -136,10 +136,22 @@ class agtool:
     # ------------------------------------------------------------------
 
     def __call__(self, arg: agdata, timeout: int | None = None) -> agdata:
+        self.log_start(arg)
+        t0 = time.monotonic()
+
+        if not self.need_sandbox:
+            # Run directly in the calling thread — no subprocess isolation or
+            # timeout needed (caller controls blocking behaviour, e.g. ask_human).
+            try:
+                result = self.fn(arg)
+            except Exception as e:
+                from .agdata import _fmt_exc
+                result = agdata(error=_fmt_exc(e))
+            self.log(arg, result, int((time.monotonic() - t0) * 1000))
+            return result
+
         import cloudpickle
         import pickle
-        self.log_start(arg)
-        t0               = time.monotonic()
         fn_bytes         = cloudpickle.dumps(self.fn)
         arg_bytes        = pickle.dumps(arg)
         effective_timeout = timeout if timeout is not None else TOOL_TIMEOUT_S
