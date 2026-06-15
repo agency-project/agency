@@ -16,6 +16,7 @@ Usage::
 """
 from __future__ import annotations
 
+import atexit
 import subprocess
 import sys
 import time
@@ -63,12 +64,7 @@ class agwebui:
         """
         global _active
 
-        if run_dir is None:
-            ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = Path("runs") / f"webui_{ts}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        # Fail fast if the port is already occupied.
+        # Fail fast if the port is already occupied (before creating any dirs).
         import socket
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
             _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -77,6 +73,11 @@ class agwebui:
                     f"[agwebui] Port {port} is already in use. "
                     f"Stop the existing server before starting a new run."
                 )
+
+        if run_dir is None:
+            ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = Path("runs") / f"webui_{ts}"
+        run_dir.mkdir(parents=True, exist_ok=True)
 
         ui = cls(run_dir=run_dir, port=port)
 
@@ -105,6 +106,17 @@ class agwebui:
 
         _active = ui
         print(f"[agwebui] Web UI: http://localhost:{port}", flush=True)
+
+        def _kill_server() -> None:
+            proc = ui._server_proc
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+
+        atexit.register(_kill_server)
 
         try:
             fn(*args, **kwargs)

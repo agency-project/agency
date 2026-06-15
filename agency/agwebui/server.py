@@ -260,12 +260,17 @@ async def _tail_events() -> None:
             batch_start = _file_offset
             with open(event_file, "rb") as f:
                 f.seek(_file_offset)
-                raw = f.read(256 * 1024)   # up to 256 KB per tick
+                raw = f.read(16 * 1024 * 1024)   # up to 16 MB per tick
 
             if raw:
-                parts          = raw.split(b"\n")
-                complete_lines = parts[:-1]          # last chunk may be incomplete
-                consumed       = sum(len(l) + 1 for l in complete_lines)
+                # Find the last complete line — handles events larger than buffer.
+                last_nl = raw.rfind(b"\n")
+                if last_nl < 0:
+                    complete_lines = []
+                    consumed       = 0
+                else:
+                    complete_lines = [l for l in raw[:last_nl].split(b"\n") if l.strip()]
+                    consumed       = last_nl + 1
 
                 if complete_lines:
                     now = _time.time()

@@ -235,6 +235,28 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   margin-left: 2px;
 }
 
+#agent-search-bar {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+#agent-search {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 3px 6px;
+  outline: none;
+}
+
+#agent-search:focus {
+  border-color: var(--border-log);
+}
+
 /* ------------------------------------------------------- History pane */
 
 .msg-system     { color: var(--dim); font-size: 11px; margin: 1px 0; }

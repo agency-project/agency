@@ -72,16 +72,18 @@ class agwebui_emitter:
     def log(self, line: str) -> None:
         self.emit({"type": "log", "line": line, "ts": time.time()})
 
-    def agent_registered(self, agname: str, hex_color: str) -> None:
+    def agent_registered(self, agname: str, hex_color: str, team: str | None = None) -> None:
         self.emit({
             "type": "agent_registered",
             "agname": agname,
             "color": hex_color,
+            "team": team,
             "ts": time.time(),
         })
 
     def agent_state(
-        self, agname: str, state: str, skill: str | None, tool: str | None
+        self, agname: str, state: str, skill: str | None, tool: str | None,
+        color: str | None = None, team: str | None = None,
     ) -> None:
         self.emit({
             "type": "agent_state",
@@ -89,6 +91,8 @@ class agwebui_emitter:
             "state": state,
             "skill": skill,
             "tool": tool,
+            "color": color,
+            "team": team,
             "ts": time.time(),
         })
 

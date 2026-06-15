@@ -492,7 +492,14 @@ class agent:
         try:
             from . import agwebui as _agwebui
             if _agwebui._active is not None:
-                _agwebui._active.emitter.agent_state(self.agname, state, skill, tool)
+                from .agterm import agterm as _agterm
+                from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
+                from ._context import _active_team as _at
+                _ansi = _agterm._agname_colors.get(self.agname)
+                _color = _ansi_to_hex(_ansi) if _ansi else None
+                _team = _at.get(None)
+                _team_name = _team.team_name if _team is not None else None
+                _agwebui._active.emitter.agent_state(self.agname, state, skill, tool, color=_color, team=_team_name)
         except Exception:
             pass
 

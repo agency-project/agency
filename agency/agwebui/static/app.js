@@ -215,6 +215,7 @@ const $countAll         = document.getElementById('count-all');
 const $countLive        = document.getElementById('count-live');
 const $countIdle        = document.getElementById('count-idle');
 const $countFinished    = document.getElementById('count-finished');
+const $agentSearch      = document.getElementById('agent-search');
 
 // ---------------------------------------------------------------------------
 // Shared log
@@ -272,9 +273,11 @@ function currentAgent() {
 }
 
 function visibleOrder() {
+  const query = ($agentSearch ? $agentSearch.value : '').trim().toLowerCase();
   return state.agentOrder.filter(agname => {
     const ag = state.agents.get(agname);
-    return ag ? tabVisible(ag.state) : state.activeTab === 'all';
+    if (!(ag ? tabVisible(ag.state) : state.activeTab === 'all')) return false;
+    return !query || agname.toLowerCase().includes(query);
   });
 }
 
@@ -466,6 +469,11 @@ function handleEvent(ev) {
         });
         state.agentOrder.push(ev.agname);
       }
+      if (ev.team) {
+        if (!state.teams.has(ev.team)) state.teams.set(ev.team, new Set());
+        state.teams.get(ev.team).add(ev.agname);
+        reorderAgents();
+      }
       renderAgentList();
       break;
 
@@ -473,10 +481,19 @@ function handleEvent(ev) {
       const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
       state.agents.set(ev.agname, {
         ...existing,
+        color: ev.color || existing.color || '#d4d4d4',
         state: ev.state,
         skill: ev.skill,
         tool:  ev.tool,
       });
+      if (!state.agentOrder.includes(ev.agname)) {
+        state.agentOrder.push(ev.agname);
+      }
+      if (ev.team) {
+        if (!state.teams.has(ev.team)) state.teams.set(ev.team, new Set());
+        state.teams.get(ev.team).add(ev.agname);
+        reorderAgents();
+      }
       renderAgentList();
       if (ev.agname === currentAgent()) renderHistory();
       break;
@@ -545,6 +562,13 @@ document.getElementById('agent-tabs').addEventListener('click', e => {
   renderAgentList();
   renderHistory();
 });
+
+if ($agentSearch) {
+  $agentSearch.addEventListener('input', () => {
+    state.focusedIdx = 0;
+    renderAgentList();
+  });
+}
 
 document.addEventListener('keydown', e => {
   if (document.activeElement === $agentInput) return;

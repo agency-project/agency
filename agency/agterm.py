@@ -85,7 +85,10 @@ class agterm:
             from . import agwebui as _agwebui
             if _agwebui._active is not None:
                 from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
-                _agwebui._active.emitter.agent_registered(self._id, _ansi_to_hex(self._color))
+                from ._context import _active_team as _at
+                _team = _at.get(None)
+                _team_name = _team.team_name if _team is not None else None
+                _agwebui._active.emitter.agent_registered(self._id, _ansi_to_hex(self._color), team=_team_name)
         except Exception:
             pass
 
