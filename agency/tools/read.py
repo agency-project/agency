@@ -101,10 +101,16 @@ def make_read(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        path  = str(getattr(arg, "filePath", "?"))
-        kind  = getattr(result, "type", "file")
-        lines = getattr(result, "lines_shown", getattr(result, "total", "?"))
-        trunc = " [truncated]" if getattr(result, "truncated", False) else ""
+        path  = str(arg._data.get("filePath", "?"))
+        rdata = result._data
+        if "error" in rdata:
+            tool._term.log("TOOL ✗   ", f"read  {path}  error: {rdata['error']}  ({elapsed_ms}ms)")
+            if tool._aglog is not None:
+                tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)
+            return
+        kind  = rdata.get("type", "file")
+        lines = rdata.get("lines_shown", rdata.get("total", "?"))
+        trunc = " [truncated]" if rdata.get("truncated", False) else ""
         tool._term.log("TOOL ✓   ", f"read  {kind}  {path}  ({lines} lines{trunc})  ({elapsed_ms}ms)")
         if tool._aglog is not None:
             tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)

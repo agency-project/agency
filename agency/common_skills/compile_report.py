@@ -76,7 +76,7 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.return_value = \
                 _make_stream(f'{{"report_path": "{output_path}", "paper_count": {exp_count}}}')
-            result, hist, delta = s.run(
+            result, hist, delta, _ = s.run(
                 _LLM,
                 agdata(topic=topic, summaries=summaries, output_path=output_path),
                 agdata(messages=[]), sandbox=None,
@@ -88,13 +88,13 @@ try:
 
     def test_compile_report_skill_run_missing_required_fields():
         s = CompileReportSkill()
-        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
+        result, *_ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
-        result2, _, _ = s.run(_LLM, agdata(topic="x", summaries=["s"]), agdata(messages=[]), sandbox=None)
+        result2, *_ = s.run(_LLM, agdata(topic="x", summaries=["s"]), agdata(messages=[]), sandbox=None)
         assert result2._data.get("error") is not None
 
-        result3, _, _ = s.run(_LLM, agdata(topic="x", output_path="/tmp/r.md"),
+        result3, *_ = s.run(_LLM, agdata(topic="x", output_path="/tmp/r.md"),
                               agdata(messages=[]), sandbox=None)
         assert result3._data.get("error") is not None
 
@@ -106,7 +106,7 @@ try:
         ])
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: next(responses)
-            result, _, _ = s.run(
+            result, *_ = s.run(
                 _LLM,
                 agdata(topic="x", summaries=["a", "b"], output_path="/tmp/r.md"),
                 agdata(messages=[]), sandbox=None,
@@ -118,7 +118,7 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: \
                 _make_stream('{"wrong_field": "bad"}')
-            result, _, _ = s.run(
+            result, *_ = s.run(
                 _LLM,
                 agdata(topic="x", summaries=["s"], output_path="/tmp/r.md"),
                 agdata(messages=[]), sandbox=None,

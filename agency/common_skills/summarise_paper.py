@@ -296,13 +296,13 @@ try:
 
     def test_summarise_paper_skill_run_missing_required_fields():
         s = SummarisePaperSkill()
-        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
+        result, *_ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
-        result2, _, _ = s.run(_LLM, agdata(title="T", abstract="A"), agdata(messages=[]), sandbox=None)
+        result2, *_ = s.run(_LLM, agdata(title="T", abstract="A"), agdata(messages=[]), sandbox=None)
         assert result2._data.get("error") is not None
 
-        result3, _, _ = s.run(_LLM, agdata(url="https://arxiv.org/abs/1234.5678", abstract="A"),
+        result3, *_ = s.run(_LLM, agdata(url="https://arxiv.org/abs/1234.5678", abstract="A"),
                               agdata(messages=[]), sandbox=None)
         assert result3._data.get("error") is not None
 

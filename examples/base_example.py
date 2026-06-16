@@ -78,7 +78,6 @@ def main():
     # No tools= argument — uses the default sandboxed tool list
     ag = agent(llm_config=LLM_CONFIG)
 
-    print(f"Endpoint : {LLM_CONFIG['base_url']}")
     print(f"Model    : {LLM_CONFIG['model']}")
     print(f"Tools    : {[t.name for t in (file_skill.replace_tools or file_skill.add_tools or [])]}")
     print()
@@ -107,6 +106,6 @@ def main():
     print(f"Shared history : {len(ag.history.messages)} messages total")
 
 if __name__ == "__main__":
-    from agency import agUI
-    # agUI.run(main)
-    main()
+    from agency.agwebui import agwebui
+    agwebui.run(main)
+    # main()

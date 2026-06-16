@@ -15,6 +15,11 @@ if TYPE_CHECKING:
     from .agresources import agResourcePool
 
 _BGPIDS_MARKER = "__BGPIDS__:"
+
+
+class _ContainerAlreadyRunning(Exception):
+    """Raised by _run_with_conflict_retry when another process has already
+    started the same container — the caller should reuse it."""
 _RUNTIME: str | None = None
 
 # Per-process prefix so concurrent script invocations never share container names.
@@ -26,8 +31,10 @@ _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
 # Limit the number of containers starting simultaneously.  Each agSandbox.__init__
 # acquires one slot for the duration of its startup sequence (docker run + first exec).
 # Without this, a burst of hundreds of parallel agent tasks overwhelms the Docker
-# daemon, causing docker exec calls to queue indefinitely and hang the calling threads.
-_startup_semaphore = threading.Semaphore(32)
+# daemon.  With --gpus all, the NVIDIA runtime serializes GPU device initialization,
+# so more than ~8 concurrent docker-run calls increase contention and leave stale
+# "Created" containers without reducing wall-clock time.
+_startup_semaphore = threading.Semaphore(8)
 
 
 def _cleanup_all_sandboxes() -> None:
@@ -151,6 +158,14 @@ class agSandbox:
             output_dir.mkdir(parents=True, exist_ok=True)
             self._vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
 
+    def _container_running(self) -> bool:
+        """Return True if the named container is currently running in Docker/Podman."""
+        result = self._run(
+            [self._runtime, "inspect", "--format", "{{.State.Running}}", self._name],
+            check=False, timeout=10,
+        )
+        return result.returncode == 0 and result.stdout.strip() == b"true"
+
     def _ensure_started(self) -> None:
         """Start the Docker container on first use.
 
@@ -158,6 +173,11 @@ class agSandbox:
         an agent actually needs sandboxed execution (bash, file I/O, etc.).
         Tasks that complete using only host-side tools (webfetch, todowrite,
         find_papers, …) never start a container at all.
+
+        When tools run in worker processes the container is started there, not
+        in the main process.  On the next tool call (a fresh worker or the same
+        one) ``_started`` is False but the container may still be running — we
+        check with ``docker inspect`` and reuse it rather than destroying it.
         """
         if self._started:
             return
@@ -165,29 +185,80 @@ class agSandbox:
         with _startup_semaphore:
             if self._started:   # re-check after acquiring the semaphore
                 return
+            # Reuse a container that a previous worker process already started,
+            # but only when we are NOT restoring a specific checkpoint image.
+            if self._restore_image is None and self._container_running():
+                _live_sandboxes.add(self)
+                self._started = True
+                self._baseline_pids = self._snapshot_pids()
+                return
             self._run([self._runtime, "rm", "-f", name], check=False)
-            if self._restore_image is not None:
-                self._run(
-                    [self._runtime, "run", "-d", "--name", name]
-                    + self._gpu_flags + self._vol_flags
-                    + [self._restore_image, "tail", "-f", "/dev/null"],
-                    check=True,
-                )
-                self._run([self._runtime, "rmi", self._restore_image], check=False)
-            else:
-                self._run(
-                    [self._runtime, "run", "-d", "--name", name]
-                    + self._gpu_flags + self._vol_flags
-                    + [self._resolve_image(self.BASE_IMAGE), "tail", "-f", "/dev/null"],
-                    check=True,
-                )
-                self._run(
-                    [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
-                    check=False,
-                )
+            try:
+                if self._restore_image is not None:
+                    image = self._restore_image
+                    run_cmd = (
+                        [self._runtime, "run", "-d", "--name", name]
+                        + self._gpu_flags + self._vol_flags
+                        + [image, "tail", "-f", "/dev/null"]
+                    )
+                    self._run_with_conflict_retry(run_cmd, name)
+                    self._run([self._runtime, "rmi", self._restore_image], check=False)
+                else:
+                    image = self._resolve_image(self.BASE_IMAGE)
+                    run_cmd = (
+                        [self._runtime, "run", "-d", "--name", name]
+                        + self._gpu_flags + self._vol_flags
+                        + [image, "tail", "-f", "/dev/null"]
+                    )
+                    self._run_with_conflict_retry(run_cmd, name)
+                    self._run(
+                        [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
+                        check=False,
+                    )
+            except _ContainerAlreadyRunning:
+                # Another process started the container while we were retrying;
+                # reuse it just as we would in the fast-path above.
+                _live_sandboxes.add(self)
+                self._started = True
+                self._baseline_pids = self._snapshot_pids()
+                return
             _live_sandboxes.add(self)
             self._started = True  # set before _snapshot_pids() to prevent re-entry via _container_exec
             self._baseline_pids = self._snapshot_pids()
+
+    def _run_with_conflict_retry(self, run_cmd: list[str], name: str) -> None:
+        """Run a docker run command, retrying up to 3 times on name-conflict errors.
+
+        A "Conflict / already in use" error can arise when a previous docker run
+        call failed mid-way (e.g. GPU allocation timeout) and left a container
+        object in "Created" state without ever starting.  We force-remove the
+        stale entry and retry rather than surfacing an opaque error to the agent.
+        """
+        for attempt in range(3):
+            result = subprocess.run(run_cmd, capture_output=True, timeout=120)
+            if result.returncode == 0:
+                return
+            stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+            conflict = "already in use" in stderr or "Conflict" in stderr
+            if conflict:
+                # If another process just started the container and it is now
+                # running, reuse it instead (handled by caller's _container_running).
+                if self._container_running():
+                    # Signal to the caller that the container is ready.
+                    # We re-use the path: set _started + return from _ensure_started.
+                    raise _ContainerAlreadyRunning()
+                # Stale Created/Exited container; remove and retry.
+                self._run([self._runtime, "rm", "-f", name], check=False)
+                time.sleep(0.5 * (attempt + 1))
+            else:
+                msg = f"{' '.join(run_cmd[:3])} failed (exit {result.returncode})"
+                if stderr:
+                    msg += f": {stderr}"
+                raise RuntimeError(msg)
+        # Final attempt after retries exhausted.
+        raise RuntimeError(
+            f"docker run --name {name} failed after retries (container name conflict)"
+        )
 
     def _container_name(self) -> str:
         return self._name
@@ -356,10 +427,11 @@ class agSandbox:
     def commit(self, tag: str) -> bool:
         """Commit the container filesystem to a new image tag.
 
-        Returns True if the commit succeeded, False if the container was never
-        started (nothing to commit).
+        Returns True if the commit succeeded, False if no container is running
+        (nothing to commit).  Also works when the container was started by a
+        worker process and ``_started`` is still False in the main process.
         """
-        if not self._started:
+        if not self._started and not self._container_running():
             return False
         self._run(
             [self._runtime, "commit", self._container_name(), tag],
@@ -493,10 +565,13 @@ class agSandbox:
 
     def destroy(self) -> None:
         _live_sandboxes.discard(self)
-        if not self._started:
-            return
+        # _started is only set to True in the process that called _ensure_started.
+        # When tools run in worker processes the main process always has
+        # _started=False, even though a container may be running.  Always attempt
+        # cleanup — docker rm -f is a no-op when the container doesn't exist.
+        container_name = self._container_name()
 
-        if self._watched_pids:
+        if self._started and self._watched_pids:
             pids = " ".join(str(p) for p in self._watched_pids)
             try:
                 self._container_exec(
@@ -507,7 +582,7 @@ class agSandbox:
 
         try:
             self._run(
-                [self._runtime, "rm", "-f", self._container_name()],
+                [self._runtime, "rm", "-f", container_name],
                 timeout=30,
             )
         except Exception:

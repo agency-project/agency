@@ -235,6 +235,86 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
+    def test_commit_works_when_started_false(self):
+        """commit() must succeed on a sandbox whose _started=False but whose container
+        is already running (started by a worker process or another sandbox instance).
+
+        Simulated by creating two sandbox objects with the same agname: sb_worker starts
+        the container, sb_main (with _started=False) tries to commit it."""
+        from agency.agsandbox import agSandbox
+        agname = str(uuid.uuid4())
+        sb_worker = agSandbox(agname)   # "worker" — starts the container
+        sb_main   = agSandbox(agname)   # "main process" — same name, _started=False
+        tag = f"agency/test-commit-started-false-{agname[:8]}"
+        try:
+            # Worker starts container and writes a file.
+            sb_worker.write_file("/workspace/marker.txt", "worker-written\n")
+            # sb_main has _started=False but the container is already running.
+            assert sb_main._started is False
+            # commit() must detect the running container via docker inspect and succeed.
+            assert sb_main.commit(tag) is True
+            result = subprocess.run(
+                ["docker", "images", "-q", tag],
+                capture_output=True, text=True,
+            )
+            assert result.stdout.strip() != "", "image must exist even when _started was False"
+        finally:
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+            sb_worker.destroy()
+
+    @docker
+    def test_commit_returns_false_when_container_not_running(self):
+        """commit() must return False (not crash) if no container is running."""
+        sb = _make_sandbox()
+        tag = f"agency/test-commit-no-container-{sb._agname}"
+        # _started is False and no container was ever started — nothing to commit.
+        assert sb.commit(tag) is False
+        # No image should have been created.
+        result = subprocess.run(
+            ["docker", "images", "-q", tag],
+            capture_output=True, text=True,
+        )
+        assert result.stdout.strip() == ""
+
+    @docker
+    def test_ensure_started_reuses_running_container(self):
+        """_ensure_started() must reuse a container already running in Docker rather
+        than destroying it and starting fresh — the cross-worker-process file-persistence fix."""
+        sb = _make_sandbox()
+        # Start the container and write a sentinel file.
+        sb.write_file("/workspace/persist.txt", "still-here\n")
+        assert sb._started is True
+        # Simulate a fresh sandbox object (as deserialized in a new worker process):
+        # _started is False but the container is still running in Docker.
+        sb._started = False
+        # _ensure_started() must detect the running container and reuse it.
+        sb._ensure_started()
+        assert sb._started is True
+        # The file written before the reset must still be present.
+        content = sb.read_file("/workspace/persist.txt")
+        assert "still-here" in content
+        sb.destroy()
+
+    @docker
+    def test_files_persist_across_process_pool_tool_calls(self):
+        """Files written by the write tool in one worker process must be readable
+        by the read tool in a subsequent worker process call (regression test for
+        the cross-worker container-destruction bug)."""
+        sb = _make_sandbox()
+        from agency.tools import make_sandboxed_tools
+        tools = {t.name: t for t in make_sandboxed_tools(sb)}
+        try:
+            # write runs in a process-pool worker
+            w = tools["write"](agdata(filePath="/workspace/cross.txt", content="cross-worker\n"))
+            assert w.error is None, f"write failed: {w.error}"
+            # read also runs in a process-pool worker; must find the file
+            r = tools["read"](agdata(filePath="/workspace/cross.txt"))
+            assert r.error is None, f"read failed after cross-worker write: {r.error}"
+            assert "cross-worker" in r.content
+        finally:
+            sb.destroy()
+
+    @docker
     def test_checkpoint_restore_preserves_files(self):
         tag = f"agency/test-ckpt-restore-{__import__('uuid').uuid4().hex[:8]}"
         sb1 = _make_sandbox()

@@ -126,3 +126,84 @@ class TestTodowrite:
         result = self.tool(agdata(todos=todos))
         parsed = json.loads(result.output)
         assert isinstance(parsed, list)
+
+
+# ---------------------------------------------------------------------------
+# _log functions must not raise on error results
+#
+# getattr(agdata_with_error, "field", default) raises AgError instead of
+# returning the default, because agdata.__getattr__ raises AgError whenever
+# the data dict contains an "error" key.  All tool _log functions must use
+# result._data.get() instead so they survive error results gracefully.
+# ---------------------------------------------------------------------------
+
+class TestToolLogOnErrorResult:
+    """Verify that _log functions in sandboxed tools never raise when the
+    tool returns an error result (regression: AgError propagation in log)."""
+
+    def _make_term(self):
+        from unittest.mock import MagicMock
+        term = MagicMock()
+        term.log = MagicMock()
+        return term
+
+    def _make_tool_with_term(self, tool):
+        term = self._make_term()
+        tool._term = term
+        return tool, term
+
+    def test_read_log_does_not_raise_on_error(self):
+        from agency.tools.read import make_read
+        from unittest.mock import MagicMock
+        sb = MagicMock()
+        tool = make_read(sb)
+        tool, term = self._make_tool_with_term(tool)
+        error_result = agdata(error="Not found: /workspace/missing.txt")
+        # Must not raise AgError
+        tool._log_fn(tool, agdata(filePath="/workspace/missing.txt"), error_result, 42)
+        # Log was called with the error path, not the success path
+        assert term.log.called
+        logged = term.log.call_args[0]
+        assert "✗" in logged[0] or "error" in str(logged).lower()
+
+    def test_write_log_does_not_raise_on_error(self):
+        from agency.tools.write import make_write
+        from unittest.mock import MagicMock
+        sb = MagicMock()
+        tool = make_write(sb)
+        tool, term = self._make_tool_with_term(tool)
+        error_result = agdata(error="Permission denied")
+        tool._log_fn(tool, agdata(filePath="/workspace/out.txt"), error_result, 10)
+        assert term.log.called
+        logged = term.log.call_args[0]
+        assert "✗" in logged[0] or "error" in str(logged).lower()
+
+    def test_bash_log_does_not_raise_on_error(self):
+        from agency.tools.bash import make_bash
+        from unittest.mock import MagicMock
+        sb = MagicMock()
+        tool = make_bash(sb)
+        tool, term = self._make_tool_with_term(tool)
+        error_result = agdata(error="timed out")
+        tool._log_fn(tool, agdata(command="sleep 999"), error_result, 30000)
+        assert term.log.called
+
+    def test_glob_log_does_not_raise_on_error(self):
+        from agency.tools.glob import make_glob
+        from unittest.mock import MagicMock
+        sb = MagicMock()
+        tool = make_glob(sb)
+        tool, term = self._make_tool_with_term(tool)
+        error_result = agdata(error="pattern error")
+        tool._log_fn(tool, agdata(pattern="**/*.py"), error_result, 5)
+        assert term.log.called
+
+    def test_grep_log_does_not_raise_on_error(self):
+        from agency.tools.grep import make_grep
+        from unittest.mock import MagicMock
+        sb = MagicMock()
+        tool = make_grep(sb)
+        tool, term = self._make_tool_with_term(tool)
+        error_result = agdata(error="search failed")
+        tool._log_fn(tool, agdata(pattern="TODO"), error_result, 5)
+        assert term.log.called

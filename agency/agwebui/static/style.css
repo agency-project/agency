@@ -139,6 +139,18 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   overflow: hidden;
   flex-shrink: 0;
   letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.token-badge {
+  font-size: 10px;
+  font-weight: normal;
+  letter-spacing: 0;
+  opacity: 0.65;
+  margin-left: 8px;
+  white-space: nowrap;
 }
 
 .right-title { color: var(--text); border-bottom-color: var(--border); }

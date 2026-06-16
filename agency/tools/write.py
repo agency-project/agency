@@ -36,9 +36,13 @@ def make_write(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        path   = str(getattr(arg, "filePath", "?"))
-        nbytes = getattr(result, "bytes_written", "?")
-        tool._term.log("TOOL ✓   ", f"write  {path}  ({nbytes} bytes)  ({elapsed_ms}ms)")
+        path  = str(arg._data.get("filePath", "?"))
+        rdata = result._data
+        if "error" in rdata:
+            tool._term.log("TOOL ✗   ", f"write  {path}  error: {rdata['error']}  ({elapsed_ms}ms)")
+        else:
+            nbytes = rdata.get("bytes_written", "?")
+            tool._term.log("TOOL ✓   ", f"write  {path}  ({nbytes} bytes)  ({elapsed_ms}ms)")
         if tool._aglog is not None:
             tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)
 

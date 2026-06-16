@@ -39,9 +39,10 @@ def make_glob(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        pattern = str(getattr(arg, "pattern", "?"))
-        count   = getattr(result, "count", "?")
-        trunc   = " [truncated]" if getattr(result, "truncated", False) else ""
+        pattern = str(arg._data.get("pattern", "?"))
+        rdata   = result._data
+        count   = rdata.get("count", "?")
+        trunc   = " [truncated]" if rdata.get("truncated", False) else ""
         tool._term.log("TOOL ✓   ", f"glob  {pattern!r}  → {count} files{trunc}  ({elapsed_ms}ms)")
         if tool._aglog is not None:
             tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)

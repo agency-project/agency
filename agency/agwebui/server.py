@@ -28,7 +28,7 @@ _STATIC = Path(__file__).parent / "static"
 # Config
 # ---------------------------------------------------------------------------
 
-TAIL_BYTES     = 512 * 1024   # bytes replayed to new clients on connect
+TAIL_BYTES     = 2 * 1024 * 1024   # bytes replayed to new clients on connect
 INDEX_INTERVAL = 1_000        # build one index entry per N events
 
 # ---------------------------------------------------------------------------

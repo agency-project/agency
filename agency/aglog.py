@@ -58,6 +58,8 @@ class aglog:
         history_len: int,
         history_before: list[dict] | None = None,
         history_delta: list[dict] | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> None:
         entry = {
             "type":           "skill",
@@ -69,6 +71,8 @@ class aglog:
             "history_len":    history_len,
             "history_before": history_before if history_before is not None else [],
             "history_delta":  history_delta  if history_delta  is not None else [],
+            "input_tokens":   input_tokens,
+            "output_tokens":  output_tokens,
         }
         with self._lock:
             self._entries.append(entry)
@@ -119,6 +123,17 @@ class aglog:
             return list(self._entries)
 
     @property
+    def token_usage(self) -> dict:
+        """Cumulative token usage across all completed skill calls.
+
+        Returns {"input_tokens": int, "output_tokens": int, "total_tokens": int}.
+        """
+        with self._lock:
+            inp = sum(e.get("input_tokens",  0) for e in self._entries)
+            out = sum(e.get("output_tokens", 0) for e in self._entries)
+        return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+
+    @property
     def events(self) -> list[dict]:
         """Full event timeline: lifecycle events + skill calls in chronological order."""
         with self._lock:
@@ -162,10 +177,14 @@ class aglog:
                             f"      [{role}] {str(m.get('content',''))[:120]}"
                         )
                 delta_str = ("\n" + "\n".join(delta_lines)) if delta_lines else " (none)"
+                inp = e.get("input_tokens",  0)
+                out = e.get("output_tokens", 0)
+                tok_str = f"in={inp}  out={out}  total={inp+out}" if (inp or out) else "n/a"
                 lines.append(
                     f"[{i}] {e['skill']}  {e['ts_start']} → {e['ts_end']}\n"
                     f"    in      : {e['input']}\n"
                     f"    out     : {e['output']}\n"
+                    f"    tokens  : {tok_str}\n"
                     f"    hist    : {e['history_len']} messages total\n"
                     f"    delta   :{delta_str}"
                 )

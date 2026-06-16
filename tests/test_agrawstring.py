@@ -134,7 +134,7 @@ def _run_skill_with_mock_response(sk, inp, response_text):
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
         mock_client.chat.completions.create.return_value = iter(chunks)
-        result, _, _ = sk.run(
+        result, *_ = sk.run(
             llm_config={"base_url": "http://x", "api_key": "", "model": "m"},
             input=inp,
             history=agdata(messages=[]),

@@ -54,6 +54,8 @@ class agwebui_emitter:
         self._reply_dir  = run_dir / "ui_replies"
         self._reply_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # Latest cumulative token counts per agent; flushed again on done().
+        self._token_state: dict[str, tuple[int, int, int, int]] = {}
 
     # ------------------------------------------------------------------
     # Core emit
@@ -135,5 +137,41 @@ class agwebui_emitter:
             pass
         return text
 
+    def token_update(
+        self,
+        agname: str,
+        agent_input: int,
+        agent_output: int,
+        global_input: int,
+        global_output: int,
+    ) -> None:
+        """Emit cumulative token counts for one agent and the framework total."""
+        with self._lock:
+            self._token_state[agname] = (agent_input, agent_output, global_input, global_output)
+        self.emit({
+            "type":         "token_update",
+            "agname":       agname,
+            "agent_input":  agent_input,
+            "agent_output": agent_output,
+            "global_input": global_input,
+            "global_output": global_output,
+            "ts": time.time(),
+        })
+
     def done(self) -> None:
+        # Re-emit latest token state for all agents so it lands at the end of
+        # the events file, ensuring new browser connections (which only see the
+        # last 512 KB) always receive current token counts.
+        with self._lock:
+            snapshot = dict(self._token_state)
+        for agname, (ai, ao, gi, go) in snapshot.items():
+            self.emit({
+                "type":         "token_update",
+                "agname":       agname,
+                "agent_input":  ai,
+                "agent_output": ao,
+                "global_input": gi,
+                "global_output": go,
+                "ts": time.time(),
+            })
         self.emit({"type": "done", "ts": time.time()})

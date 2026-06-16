@@ -43,9 +43,10 @@ def make_bash(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        cmd = str(getattr(arg, "command", ""))[:100]
-        rc  = getattr(result, "exit_code", "?")
-        trunc = " [truncated]" if getattr(result, "truncated", False) else ""
+        cmd   = str(arg._data.get("command", ""))[:100]
+        rdata = result._data
+        rc    = rdata.get("exit_code", "?")
+        trunc = " [truncated]" if rdata.get("truncated", False) else ""
         tool._term.log("TOOL ✓   ", f"bash  rc={rc}  ({elapsed_ms}ms){trunc}  $ {cmd}")
         if tool._aglog is not None:
             tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)

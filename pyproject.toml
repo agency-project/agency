@@ -8,6 +8,7 @@ dependencies = [
     "html2text",
     "pymupdf",
     "cloudpickle",
+    "boto3",
     "podman>=5.8.0",
     "textual>=8.2.7",
     "fastapi>=0.100.0",

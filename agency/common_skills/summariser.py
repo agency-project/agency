@@ -71,14 +71,14 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.return_value = \
                 _make_stream(f'{{"summary": "{summary}"}}')
-            result, hist, delta = s.run(_LLM, agdata(text=text), agdata(messages=[]), sandbox=None)
+            result, hist, delta, _ = s.run(_LLM, agdata(text=text), agdata(messages=[]), sandbox=None)
         assert result.summary == summary
         assert isinstance(hist, agdata)
         assert isinstance(delta, list)
 
     def test_summariser_skill_run_missing_text_input():
         s = SummariserSkill()
-        result, _, _ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
+        result, *_ = s.run(_LLM, agdata(), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
     def test_summariser_skill_run_output_missing_summary_triggers_retry():
@@ -89,7 +89,7 @@ try:
         ])
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: next(responses)
-            result, _, _ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
+            result, *_ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
         assert result.summary == "Retried summary."
 
     def test_summariser_skill_run_exhausted_retries_returns_error():
@@ -97,7 +97,7 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: \
                 _make_stream('{"wrong_key": "value"}')
-            result, _, _ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
+            result, *_ = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
         assert result._data.get("error") is not None
 
     def test_summariser_skill_history_grows_after_run():
@@ -105,7 +105,7 @@ try:
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.return_value = \
                 _make_stream('{"summary": "Short."}')
-            _, hist, delta = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
+            _, hist, delta, _tok = s.run(_LLM, agdata(text="Some text."), agdata(messages=[]), sandbox=None)
         assert len(hist.messages) >= 2
         assert len(delta) >= 2
 

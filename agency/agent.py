@@ -341,6 +341,32 @@ class agent:
     poll_interval_s:  ClassVar[int]                  = 5
     max_outer_iters:  ClassVar[int]                  = 144
 
+    # Global token counter — accumulates across all agents and skill calls.
+    _global_input_tokens:  ClassVar[int]             = 0
+    _global_output_tokens: ClassVar[int]             = 0
+    _global_token_lock:    ClassVar[threading.Lock]  = threading.Lock()
+
+    @classmethod
+    def _add_global_tokens(cls, inp: int, out: int) -> None:
+        with cls._global_token_lock:
+            cls._global_input_tokens  += inp
+            cls._global_output_tokens += out
+
+    @classmethod
+    def global_token_usage(cls) -> dict:
+        """Framework-wide cumulative token usage across all agents and skill calls.
+
+        Returns {"input_tokens": int, "output_tokens": int, "total_tokens": int}.
+
+        Example::
+            usage = agent.global_token_usage()
+            print(usage["total_tokens"])
+        """
+        with cls._global_token_lock:
+            inp = cls._global_input_tokens
+            out = cls._global_output_tokens
+        return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+
     def __init__(
         self,
         llm_config: "dict | agent | None" = None,
@@ -461,6 +487,16 @@ class agent:
         return f"/agent_output/{self.agname}"
 
     @property
+    def token_usage(self) -> dict:
+        """Cumulative token usage for this agent across all completed skill calls.
+
+        Returns {"input_tokens": int, "output_tokens": int, "total_tokens": int}.
+
+        For framework-wide totals across all agents use ``agent.global_token_usage()``.
+        """
+        return self.log.token_usage
+
+    @property
     def history(self) -> agdata:
         """Return the current history, blocking until any in-flight task finishes."""
         self._history._resolve()
@@ -563,6 +599,8 @@ class agent:
                 outer_result:    agdata | None = None
                 outer_history:   agdata        = prev_history
                 outer_delta:     list[dict]    = []
+                outer_input_tokens:  int = 0
+                outer_output_tokens: int = 0
                 is_continuation  = False
 
                 # Prepare agtype fields first (agfile → file path), then offload
@@ -606,7 +644,7 @@ class agent:
                         "ts": ts_start,
                     })
 
-                    result, new_history, history_delta = af.run(
+                    result, new_history, history_delta, _tok = af.run(
                         self.llm_config, current_input, current_history,
                         self.sandbox, pool, max_steps, term=self._term, log=self.log,
                         _is_continuation=is_continuation,
@@ -621,6 +659,8 @@ class agent:
                     outer_result  = result
                     outer_history = new_history
                     outer_delta.extend(history_delta)
+                    outer_input_tokens  += _tok[0]
+                    outer_output_tokens += _tok[1]
 
                     # Snapshot which PIDs were outstanding when this ReAct
                     # iteration ended — used below to detect completion.
@@ -726,7 +766,24 @@ class agent:
                                  input_dict, result_dict,
                                  len(outer_history._data.get("messages", [])),
                                  history_before=history_before,
-                                 history_delta=outer_delta)
+                                 history_delta=outer_delta,
+                                 input_tokens=outer_input_tokens,
+                                 output_tokens=outer_output_tokens)
+                agent._add_global_tokens(outer_input_tokens, outer_output_tokens)
+                _ag_usage  = self.log.token_usage
+                _gl_usage  = agent.global_token_usage()
+                try:
+                    from . import agwebui as _agwebui
+                    if _agwebui._active is not None:
+                        _agwebui._active.emitter.token_update(
+                            self.agname,
+                            _ag_usage["input_tokens"],
+                            _ag_usage["output_tokens"],
+                            _gl_usage["input_tokens"],
+                            _gl_usage["output_tokens"],
+                        )
+                except Exception:
+                    pass
             except Exception as log_exc:
                 self._term.log("SKILL ✗  ", f"[log error] {log_exc}")
 

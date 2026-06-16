@@ -9,6 +9,101 @@ from typing import TYPE_CHECKING, Callable, Generator, Iterable, TypeVar
 import httpx
 import openai
 
+
+class _BedrockSigV4Auth(httpx.Auth):
+    """httpx auth handler that signs requests with AWS SigV4 for Amazon Bedrock."""
+
+    def __init__(self, region: str, api_key: str | None = None) -> None:
+        import boto3
+        from botocore.credentials import Credentials
+        self._region = region
+        if api_key:
+            # Accept "ACCESS_KEY_ID:SECRET_ACCESS_KEY" or
+            #        "ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN"
+            parts = api_key.split(":", 2)
+            if len(parts) < 2:
+                raise ValueError(
+                    "Bedrock api_key must be 'ACCESS_KEY_ID:SECRET_ACCESS_KEY' "
+                    "or 'ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN'."
+                )
+            self._frozen = Credentials(
+                access_key=parts[0],
+                secret_key=parts[1],
+                token=parts[2] if len(parts) == 3 else None,
+            )
+        else:
+            creds = boto3.Session(region_name=region).get_credentials()
+            if creds is None:
+                raise RuntimeError(
+                    "No AWS credentials found for Amazon Bedrock. "
+                    "Set api_key='ACCESS_KEY_ID:SECRET_ACCESS_KEY' in the llm_config, "
+                    "or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars, "
+                    "or run: aws configure"
+                )
+            self._frozen = creds.get_frozen_credentials()
+
+    def auth_flow(self, request: httpx.Request):
+        import botocore.auth
+        import botocore.awsrequest
+
+        aws_req = botocore.awsrequest.AWSRequest(
+            method=request.method,
+            url=str(request.url),
+            data=request.content or b"",
+            headers={k: v for k, v in request.headers.items()
+                     if k.lower() not in ("host", "content-length")},
+        )
+        botocore.auth.SigV4Auth(self._frozen, "bedrock", self._region).add_auth(aws_req)
+        for k, v in aws_req.headers.items():
+            request.headers[k] = v
+        yield request
+
+
+def _make_llm_client(llm_config: dict, timeout: httpx.Timeout) -> openai.OpenAI:
+    """Create an OpenAI-compatible client from llm_config.
+
+    Supports two providers:
+      - Default (OpenAI / vLLM / any OpenAI-compatible endpoint):
+          {"base_url": "...", "api_key": "...", ...}
+      - Amazon Bedrock (SigV4 auth, OpenAI-compatible endpoint):
+          {"provider": "bedrock", "region": "us-east-2", "model": "<bedrock-model-id>", ...}
+    """
+    if llm_config.get("provider") == "bedrock":
+        region  = llm_config.get("region", "us-east-1")
+        api_key = llm_config.get("api_key") or None
+        # Bedrock's OpenAI-compatible endpoint (Mantle) uses a different base URL
+        # than the raw bedrock-runtime endpoint.
+        mantle_url  = f"https://bedrock-mantle.{region}.api.aws/v1"
+        runtime_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+        if api_key and api_key.startswith("bedrock-api-key-"):
+            # Bedrock API key (bearer token) — use the Mantle endpoint.
+            return openai.OpenAI(api_key=api_key, base_url=mantle_url, timeout=timeout)
+        if not api_key:
+            # No pre-set key: generate a bearer token from the instance's IAM
+            # role.  AWS_DEFAULT_REGION is set here (not by the caller) so that
+            # botocore's internal credential-refresh client can resolve a region.
+            try:
+                import os as _os
+                from aws_bedrock_token_generator import provide_token as _provide_token
+                _os.environ.setdefault("AWS_DEFAULT_REGION", region)
+                token = _provide_token(region=region)
+                return openai.OpenAI(api_key=token, base_url=mantle_url, timeout=timeout)
+            except ImportError:
+                pass
+        # SigV4 auth — use the raw bedrock-runtime endpoint.
+        return openai.OpenAI(
+            api_key="bedrock",
+            base_url=runtime_url,
+            http_client=httpx.Client(
+                auth=_BedrockSigV4Auth(region, api_key=api_key), timeout=timeout
+            ),
+        )
+    return openai.OpenAI(
+        api_key=llm_config.get("api_key", "") or "EMPTY",
+        base_url=llm_config.get("base_url", None),
+        timeout=timeout,
+    )
+
 _T = TypeVar("_T")
 _BATCH_INTERVAL_S: float = 0.1   # main thread drains stream every 100 ms
 _IDLE_CHECK_INTERVAL_S: float = 1.0  # how often to check idle timeout
@@ -413,6 +508,8 @@ class agskill:
 
         retries_left = self.max_retries
         _compaction_summary: str | None = None
+        _total_input_tokens:  int = 0
+        _total_output_tokens: int = 0
 
         for _ in range(max_steps):
             had_inbox = False
@@ -486,10 +583,9 @@ class agskill:
 
             read_timeout = _TIMEOUT_SEQUENCE[min(_timeout_attempt, len(_TIMEOUT_SEQUENCE) - 1)]
             _skill_semaphore.acquire()
-            client = openai.OpenAI(
-                api_key=llm_config.get("api_key", "") or "EMPTY",
-                base_url=llm_config.get("base_url", None),
-                timeout=httpx.Timeout(connect=30.0, read=None, write=180.0, pool=30.0),
+            client = _make_llm_client(
+                llm_config,
+                httpx.Timeout(connect=30.0, read=None, write=180.0, pool=30.0),
             )
 
             if term:
@@ -523,7 +619,9 @@ class agskill:
                 for batch in _iter_batched(client.chat.completions.create(**kwargs), idle_timeout=float(read_timeout)):
                     for chunk in batch:
                         if chunk.usage is not None:
-                            prompt_tokens = chunk.usage.prompt_tokens
+                            prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                            _total_input_tokens  += prompt_tokens
+                            _total_output_tokens += getattr(chunk.usage, "completion_tokens", 0) or 0
                             if term is not None:
                                 term._tokens = prompt_tokens
                         if not chunk.choices:
@@ -682,7 +780,8 @@ class agskill:
                             if t.need_sandbox and sandbox is not None:
                                 _ckpt_tag = f"agency/pretool-{sandbox._name}-{tc_id.replace('-','')[:8]}"
                                 try:
-                                    sandbox.commit(_ckpt_tag)
+                                    if not sandbox.commit(_ckpt_tag):
+                                        _ckpt_tag = None  # nothing was committed, don't try to restore
                                 except Exception:
                                     _ckpt_tag = None
                             # Let the agent specify a custom timeout (seconds) via a
@@ -814,13 +913,14 @@ class agskill:
                             agdata(error=f"output schema error after retries: {errors}"),
                             updated_history,
                             [messages[0]] + messages[1:][n_before:],
+                            (_total_input_tokens, _total_output_tokens),
                         )
 
                 updated_history = agdata(messages=messages[1:])
-                return result, updated_history, [messages[0]] + messages[1:][n_before:]
+                return result, updated_history, [messages[0]] + messages[1:][n_before:], (_total_input_tokens, _total_output_tokens)
 
         updated_history = agdata(messages=messages[1:])
-        return agdata(error="max_steps exceeded"), updated_history, [messages[0]] + messages[1:][n_before:]
+        return agdata(error="max_steps exceeded"), updated_history, [messages[0]] + messages[1:][n_before:], (_total_input_tokens, _total_output_tokens)
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

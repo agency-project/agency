@@ -6,9 +6,11 @@
 // ---------------------------------------------------------------------------
 
 const state = {
-  agents:     new Map(),   // agname -> { color, state, skill, tool }
-  teams:      new Map(),   // team_name -> Set<agname>
-  histories:  new Map(),   // agname -> msg[]
+  agents:      new Map(),  // agname -> { color, state, skill, tool }
+  teams:       new Map(),  // team_name -> Set<agname>
+  histories:   new Map(),  // agname -> msg[]
+  tokenUsage:  new Map(),  // agname -> { inp, out, firstTs, lastTs }
+  globalTokens: { inp: 0, out: 0, firstTs: null, lastTs: null },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
   focusedIdx: 0,
   pendingAsk: null,        // { agname, ask_id, question } | null
@@ -216,6 +218,50 @@ const $countLive        = document.getElementById('count-live');
 const $countIdle        = document.getElementById('count-idle');
 const $countFinished    = document.getElementById('count-finished');
 const $agentSearch      = document.getElementById('agent-search');
+const $globalTokens     = document.getElementById('global-tokens');
+
+function fmtTokens(inp, out, firstTs, lastTs) {
+  function compact(n) {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
+    return String(n);
+  }
+  let s = `↑${compact(inp)} ↓${compact(out)}`;
+  if (firstTs && lastTs && lastTs > firstTs) {
+    const elapsed = lastTs - firstTs;
+    const inpS  = compact(Math.round(inp  / elapsed));
+    const outS  = compact(Math.round(out / elapsed));
+    s += `  (↑${inpS}/s ↓${outS}/s)`;
+  }
+  return s;
+}
+
+function updateGlobalTokenBadge() {
+  const { inp, out, firstTs, lastTs } = state.globalTokens;
+  $globalTokens.textContent = (inp || out) ? fmtTokens(inp, out, firstTs, lastTs) : '';
+}
+
+function updateInteractionTitle() {
+  const agname  = currentAgent();
+  const visible = visibleOrder();
+  const n   = visible.length;
+  const idx = n ? state.focusedIdx % n : 0;
+
+  if (!agname) {
+    $interactionTitle.innerHTML = 'No agents';
+    $navLabel.textContent = '';
+    return;
+  }
+
+  const waiting = (state.pendingAsk?.agname === agname) ? '  ?' : '';
+  const usage   = state.tokenUsage.get(agname);
+  const tokHtml = usage
+    ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.firstTs, usage.lastTs)}</span>`
+    : '';
+  $interactionTitle.innerHTML =
+    `${esc(agname)}  [${idx + 1}/${n}]  ← →${esc(waiting)}${tokHtml}`;
+  $navLabel.textContent = `${idx + 1} / ${n}`;
+}
 
 // ---------------------------------------------------------------------------
 // Shared log
@@ -364,15 +410,12 @@ function renderHistory() {
   const idx = n ? state.focusedIdx % n : 0;
 
   if (!agname) {
-    $interactionTitle.textContent = 'No agents';
-    $navLabel.textContent = '';
+    updateInteractionTitle();
     $agentHistory.innerHTML = '';
     return;
   }
 
-  const waiting = (state.pendingAsk?.agname === agname) ? '  ?' : '';
-  $interactionTitle.textContent = `${agname}  [${idx + 1}/${n}]  ← →${waiting}`;
-  $navLabel.textContent = `${idx + 1} / ${n}`;
+  updateInteractionTitle();
 
   const msgs  = state.histories.get(agname) || [];
   const frags = [];
@@ -523,6 +566,24 @@ function handleEvent(ev) {
       if (state.pendingAsk?.ask_id === ev.ask_id) state.pendingAsk = null;
       renderHistory();
       break;
+
+    case 'token_update': {
+      const prev = state.tokenUsage.get(ev.agname);
+      state.tokenUsage.set(ev.agname, {
+        inp: ev.agent_input, out: ev.agent_output,
+        firstTs: prev?.firstTs ?? ev.ts,
+        lastTs:  ev.ts,
+      });
+      const gPrev = state.globalTokens;
+      state.globalTokens = {
+        inp: ev.global_input, out: ev.global_output,
+        firstTs: gPrev.firstTs ?? ev.ts,
+        lastTs:  ev.ts,
+      };
+      updateGlobalTokenBadge();
+      if (ev.agname === currentAgent()) updateInteractionTitle();
+      break;
+    }
 
     case 'done':
       appendLog('\x1b[1;32m✓ All done\x1b[0m  —  press Ctrl+C in the terminal to exit');
