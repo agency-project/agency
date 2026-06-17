@@ -455,7 +455,7 @@ class agskill:
         _compact_log_fn: "Callable | None" = None,
         _full_history_fn: "Callable[[dict], None] | None" = None,
         _extra_system: "str | None" = None,
-    ) -> tuple[agdata, agdata, list[dict]]:
+    ) -> tuple[agdata, agdata, list[dict], tuple[int, int]]:
         """Run the ReAct loop.
 
         Returns (result_agdata, updated_history_agdata, history_delta).
@@ -473,7 +473,7 @@ class agskill:
             errors = self._check_schema(input, self.input_schema)
             if errors:
                 sys_msg = {"role": "system", "content": self._build_system_prompt(_extra_system)}
-                return agdata(error=f"input schema error: {errors}"), history, [sys_msg]
+                return agdata(error=f"input schema error: {errors}"), history, [sys_msg], (0, 0)
 
         from .tools import make_sandboxed_tools
         if self.replace_tools is not None:
@@ -692,7 +692,7 @@ class agskill:
                     continue
                 if term:
                     term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  {_err_desc}  all retries exhausted")
-                return agdata(error=f"LLM connection error after {len(_TIMEOUT_SEQUENCE)} attempts: {_conn_err}"), history, []
+                return agdata(error=f"LLM connection error after {len(_TIMEOUT_SEQUENCE)} attempts: {_conn_err}"), history, [], (0, 0)
 
             messages.pop()  # remove partial placeholder
             _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)

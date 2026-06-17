@@ -157,11 +157,14 @@ def _wrap_run(cls) -> None:
         future: Future = Future()
 
         def _task() -> None:
+            import sys, traceback
             token = _active_team.set(self)
             try:
                 result = original(self, *args, **kwargs)
                 future.set_result(result if isinstance(result, agdata) else agdata(result=result))
             except Exception as exc:
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
                 future.set_exception(exc)
             finally:
                 _active_team.reset(token)
