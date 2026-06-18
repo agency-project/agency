@@ -10,9 +10,11 @@ if TYPE_CHECKING:
     from .aglog import aglog
     from .agterm import agterm
 
-# Hard ceiling on tool execution time. Prevents a crashed or hung worker
+# Default ceiling on tool execution time. Prevents a crashed or hung worker
 # process from blocking an agent thread forever via future.result().
-TOOL_TIMEOUT_S: int = 30
+# Set to 1800s (30 min) to accommodate long-running bash commands; agents
+# can pass "timeout": <seconds> in tool arguments to override per-call.
+TOOL_TIMEOUT_S: int = 1800
 
 # ---------------------------------------------------------------------------
 # Process pool — workers are created lazily on first tool call and scale up

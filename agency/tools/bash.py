@@ -13,7 +13,7 @@ _BASH_PARAMS = {
     "type": "object",
     "properties": {
         "command": {"type": "string", "description": "The shell command to execute"},
-        "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
+        "timeout": {"type": "integer", "description": "Timeout in seconds (default 120). For long-running commands pass this here — do NOT use the shell timeout command, which has no effect on the tool watchdog."},
         "workdir": {"type": "string", "description": "Working directory (optional)"},
     },
     "required": ["command"],

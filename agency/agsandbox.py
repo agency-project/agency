@@ -92,11 +92,11 @@ def get_container_runtime() -> str:
 
 
 def _gpu_flags() -> list[str]:
-    """Return ``--gpus all`` when the host has NVIDIA GPUs, otherwise ``[]``.
+    """Return GPU passthrough flags for the container runtime.
 
-    Without ``--gpus all`` the NVIDIA device files are never mounted and
-    CUDA is inaccessible regardless of CUDA_VISIBLE_DEVICES.  We only add
-    the flag when GPUs are actually present so CPU-only hosts keep working.
+    NVIDIA: ``--gpus all`` (requires nvidia-container-toolkit).
+    AMD:    ``--device /dev/kfd --device /dev/dri`` (ROCm device files).
+    CPU-only hosts get no flags so they keep working without GPU drivers.
     """
     try:
         result = subprocess.run(
@@ -105,6 +105,15 @@ def _gpu_flags() -> list[str]:
         )
         if result.returncode == 0 and result.stdout.strip():
             return ["--gpus", "all"]
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showid", "--csv"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return ["--device", "/dev/kfd", "--device", "/dev/dri"]
     except Exception:
         pass
     return []
@@ -141,6 +150,8 @@ class agSandbox:
         self._agname   = agname
         self._runtime  = get_container_runtime()
         self._gpu_id:  int | None           = None
+        self._cpu_acquired: float           = 0.0
+        self._memory_acquired_mb: int       = 0
         self._watched_pids: dict[int, float] = {}
         self._baseline_pids: set[int]        = set()
         self._daemon_pids:   set[int]        = set()
@@ -206,7 +217,7 @@ class agSandbox:
                 else:
                     image = self._resolve_image(self.BASE_IMAGE)
                     run_cmd = (
-                        [self._runtime, "run", "-d", "--name", name]
+                        [self._runtime, "run", "-d", "--name", name, "--cpus=1"]
                         + self._gpu_flags + self._vol_flags
                         + [image, "tail", "-f", "/dev/null"]
                     )
@@ -336,11 +347,11 @@ class agSandbox:
         timeout: int = 120,
     ) -> tuple[str, int]:
         """Run a user command inside the container."""
-        # Always export CUDA_VISIBLE_DEVICES so the container cannot access
-        # GPUs that were not explicitly acquired via gpu_acquire, even if
-        # --gpus all was passed at container startup.
-        cuda_id = str(self._gpu_id) if self._gpu_id is not None else ""
-        env_export = f"export CUDA_VISIBLE_DEVICES={cuda_id}\n"
+        # Restrict GPU access to the acquired GPU ID. Set both CUDA_VISIBLE_DEVICES
+        # (NVIDIA/CUDA) and HIP_VISIBLE_DEVICES (AMD/ROCm) so only the leased
+        # device is accessible regardless of which runtime is present.
+        gpu_id = str(self._gpu_id) if self._gpu_id is not None else ""
+        env_export = f"export CUDA_VISIBLE_DEVICES={gpu_id}\nexport HIP_VISIBLE_DEVICES={gpu_id}\n"
 
         wrapped = (
             f"exec 2>&1\n"      # merge stderr into stdout so the BGPIDS marker is never split
@@ -557,6 +568,10 @@ class agSandbox:
         if self._gpu_id is not None and pool is not None:
             pool.release_gpu(self._gpu_id)
             self._gpu_id = None
+        if pool is not None and (self._cpu_acquired or self._memory_acquired_mb):
+            pool.notify_cpu_released(self._cpu_acquired, self._memory_acquired_mb)
+            self._cpu_acquired = 0.0
+            self._memory_acquired_mb = 0
         if pool is not None:
             try:
                 self.update_limits(cpus=pool.idle_cpus, memory=pool.idle_memory)

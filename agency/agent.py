@@ -602,6 +602,26 @@ class agent:
                 outer_input_tokens:  int = 0
                 outer_output_tokens: int = 0
                 is_continuation  = False
+                # Snapshot cumulative log usage before this skill so the live
+                # token callback can compute the correct agent-total mid-skill.
+                _log_usage_before = self.log.token_usage
+
+                def _live_token_update(skill_inp: int, skill_out: int) -> None:
+                    try:
+                        from . import agwebui as _agwebui
+                        if _agwebui._active is None:
+                            return
+                        _prev = _log_usage_before
+                        _gl   = agent.global_token_usage()
+                        _agwebui._active.emitter.token_update(
+                            self.agname,
+                            _prev["input_tokens"]  + skill_inp,
+                            _prev["output_tokens"] + skill_out,
+                            _gl["input_tokens"]    + skill_inp,
+                            _gl["output_tokens"]   + skill_out,
+                        )
+                    except Exception:
+                        pass
 
                 # Prepare agtype fields first (agfile → file path), then offload
                 # any remaining oversized plain-string fields.
@@ -655,6 +675,7 @@ class agent:
                         _compact_log_fn=_compact_log,
                         _full_history_fn=self._append_full_history,
                         _extra_system=_extra_system,
+                        _token_update_fn=_live_token_update,
                     )
                     outer_result  = result
                     outer_history = new_history

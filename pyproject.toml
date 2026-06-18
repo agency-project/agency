@@ -9,6 +9,8 @@ dependencies = [
     "pymupdf",
     "cloudpickle",
     "boto3",
+    "botocore[crt]",
+    "aws_bedrock_token_generator",
     "podman>=5.8.0",
     "textual>=8.2.7",
     "fastapi>=0.100.0",

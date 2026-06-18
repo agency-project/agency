@@ -158,6 +158,27 @@ class agwebui_emitter:
             "ts": time.time(),
         })
 
+    def resource_update(
+        self,
+        gpus_acquired: int,
+        gpus_total: int,
+        cpus_acquired: float,
+        cpus_total: int,
+        memory_acquired_mb: int,
+        memory_total_mb: int,
+    ) -> None:
+        """Emit current resource acquisition counts for the dashboard badge."""
+        self.emit({
+            "type":                "resource_update",
+            "gpus_acquired":       gpus_acquired,
+            "gpus_total":          gpus_total,
+            "cpus_acquired":       round(cpus_acquired, 1),
+            "cpus_total":          cpus_total,
+            "memory_acquired_mb":  memory_acquired_mb,
+            "memory_total_mb":     memory_total_mb,
+            "ts": time.time(),
+        })
+
     def done(self) -> None:
         # Re-emit latest token state for all agents so it lands at the end of
         # the events file, ensuring new browser connections (which only see the

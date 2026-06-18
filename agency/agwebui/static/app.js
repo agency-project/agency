@@ -11,6 +11,7 @@ const state = {
   histories:   new Map(),  // agname -> msg[]
   tokenUsage:  new Map(),  // agname -> { inp, out, firstTs, lastTs }
   globalTokens: { inp: 0, out: 0, firstTs: null, lastTs: null },
+  resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
   focusedIdx: 0,
   pendingAsk: null,        // { agname, ask_id, question } | null
@@ -219,6 +220,24 @@ const $countIdle        = document.getElementById('count-idle');
 const $countFinished    = document.getElementById('count-finished');
 const $agentSearch      = document.getElementById('agent-search');
 const $globalTokens     = document.getElementById('global-tokens');
+const $resourceStats    = document.getElementById('resource-stats');
+
+function updateResourceBadge() {
+  const r = state.resources;
+  const parts = [];
+  if (r.gpus_total > 0) {
+    parts.push(`GPU ${r.gpus_acquired}/${r.gpus_total}`);
+  }
+  if (r.cpus_acquired > 0) {
+    parts.push(`CPU ${r.cpus_acquired}/${r.cpus_total}`);
+  }
+  if (r.memory_acquired_mb > 0) {
+    const acqG = (r.memory_acquired_mb / 1024).toFixed(0);
+    const totG = (r.memory_total_mb / 1024).toFixed(0);
+    parts.push(`MEM ${acqG}/${totG}G`);
+  }
+  $resourceStats.textContent = parts.length ? parts.join('  ') : '';
+}
 
 function fmtTokens(inp, out, firstTs, lastTs) {
   function compact(n) {
@@ -585,6 +604,18 @@ function handleEvent(ev) {
       break;
     }
 
+    case 'resource_update':
+      state.resources = {
+        gpus_acquired:      ev.gpus_acquired      || 0,
+        gpus_total:         ev.gpus_total         || 0,
+        cpus_acquired:      ev.cpus_acquired      || 0,
+        cpus_total:         ev.cpus_total         || 0,
+        memory_acquired_mb: ev.memory_acquired_mb || 0,
+        memory_total_mb:    ev.memory_total_mb    || 0,
+      };
+      updateResourceBadge();
+      break;
+
     case 'done':
       appendLog('\x1b[1;32m✓ All done\x1b[0m  —  press Ctrl+C in the terminal to exit');
       break;
@@ -593,6 +624,7 @@ function handleEvent(ev) {
 
 // Keep team agents contiguous and before standalone agents
 function reorderAgents() {
+  const prevAgent = currentAgent();
   const inTeam = new Set();
   const teamFirst = [];
   for (const [, agents] of state.teams) {
@@ -602,6 +634,12 @@ function reorderAgents() {
   }
   const standalone = state.agentOrder.filter(a => !inTeam.has(a));
   state.agentOrder = [...teamFirst, ...standalone];
+  // Restore focus to the same agent by name so adding/reordering agents
+  // doesn't silently replace the user's selection.
+  if (prevAgent) {
+    const newIdx = visibleOrder().indexOf(prevAgent);
+    if (newIdx >= 0) state.focusedIdx = newIdx;
+  }
 }
 
 // ---------------------------------------------------------------------------

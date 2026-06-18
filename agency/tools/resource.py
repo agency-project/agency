@@ -9,6 +9,21 @@ if TYPE_CHECKING:
     from ..agresources import agResourcePool
 
 
+def _parse_memory_mb(mem: "str | None") -> int:
+    """Parse a Docker-style memory string to MB (e.g. '8g' → 8192, '512m' → 512)."""
+    if not mem:
+        return 0
+    s = str(mem).lower().strip()
+    try:
+        if s.endswith('g'):
+            return int(float(s[:-1]) * 1024)
+        if s.endswith('m'):
+            return int(float(s[:-1]))
+        return int(s) // (1024 * 1024)
+    except (ValueError, AttributeError):
+        return 0
+
+
 def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     """Return a tool that acquires exclusive GPU access for the sandbox."""
     def _run(arg: agdata) -> agdata:
@@ -44,7 +59,7 @@ def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 },
             },
         },
-        need_sandbox=True,
+        need_sandbox=False,
     )
 
 
@@ -65,11 +80,11 @@ def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             "Call this as soon as GPU-intensive work is complete."
         ),
         params={"type": "object", "properties": {}},
-        need_sandbox=True,
+        need_sandbox=False,
     )
 
 
-def make_cpu_acquire(sandbox: "agSandbox") -> agtool:
+def make_cpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
         cpus: float | None = getattr(arg, "cpus", None)
         memory: str | None = getattr(arg, "memory", None)
@@ -81,6 +96,11 @@ def make_cpu_acquire(sandbox: "agSandbox") -> agtool:
                 cpus=float(cpus) if cpus is not None else None,
                 memory=memory,
             )
+            acquired_cpus = float(cpus) if cpus is not None else 0.0
+            acquired_mb   = _parse_memory_mb(memory)
+            sandbox._cpu_acquired       += acquired_cpus
+            sandbox._memory_acquired_mb += acquired_mb
+            pool.notify_cpu_acquired(acquired_cpus, acquired_mb)
             return agdata(
                 message=f"Resource limits updated: cpus={cpus}, memory={memory}",
                 cpus=cpus,
@@ -109,14 +129,19 @@ def make_cpu_acquire(sandbox: "agSandbox") -> agtool:
                 },
             },
         },
-        need_sandbox=True,
+        need_sandbox=False,
     )
 
 
 def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
         try:
+            held_cpus = sandbox._cpu_acquired
+            held_mb   = sandbox._memory_acquired_mb
             sandbox.update_limits(cpus=pool.idle_cpus, memory=pool.idle_memory)
+            sandbox._cpu_acquired       = 0.0
+            sandbox._memory_acquired_mb = 0
+            pool.notify_cpu_released(held_cpus, held_mb)
             return agdata(
                 message=f"CPU/memory reset to idle: cpus={pool.idle_cpus}, memory={pool.idle_memory}"
             )
@@ -131,7 +156,7 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             f"(idle: {pool.idle_cpus} CPUs, {pool.idle_memory} memory)."
         ),
         params={"type": "object", "properties": {}},
-        need_sandbox=True,
+        need_sandbox=False,
     )
 
 
@@ -170,5 +195,5 @@ def make_daemon_release(sandbox: "agSandbox") -> agtool:
             },
             "required": ["pid"],
         },
-        need_sandbox=True,
+        need_sandbox=False,
     )

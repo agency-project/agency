@@ -9,6 +9,7 @@ Agents are non-blocking by default. `agent.run()` returns a pending `agdata` imm
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) — package manager
 - Docker or Podman
+- GPU (optional): NVIDIA (CUDA) or AMD (ROCm)
 
 ## Install
 
@@ -16,16 +17,24 @@ Agents are non-blocking by default. `agent.run()` returns a pending `agdata` imm
 git clone https://github.com/agency-project/agency
 cd agency
 
-# Build the sandbox base image (once)
-docker build -t agency-sandbox:latest images/
-# or Podman:
-podman build -t localhost/agency-sandbox:latest images/
+# Build the sandbox base image (once).
+# Auto-detects the host GPU (NVIDIA / AMD / CPU-only):
+./images/build.sh
+
+# Override GPU type explicitly:
+GPU_TYPE=rocm ./images/build.sh    # AMD ROCm 7.2
+GPU_TYPE=nvidia ./images/build.sh  # NVIDIA CUDA
+GPU_TYPE=cpu ./images/build.sh     # CPU only
 
 uv pip install -e .
 uv pip install -e ".[dev]"   # dev dependencies (pytest etc.)
 ```
 
+The sandbox image comes with `torch torchvision transformers datasets accelerate numpy scipy matplotlib` pre-installed, and the `Qwen/Qwen3.5-4B` model weights and `wikitext-2-raw-v1` dataset pre-cached. Run `python /opt/model_smoke.py` inside any container to verify the setup.
+
 ## Quick start
+
+**OpenAI-compatible endpoint (vLLM, local, etc.)**
 
 ```python
 from agency import agent, agskill, agdata
@@ -49,6 +58,22 @@ result = ag.run(summarise, agdata(text="The quick brown fox jumps over the lazy 
 print(result.summary)   # blocks until done
 ```
 
+**Amazon Bedrock**
+
+Credentials are picked up automatically from the environment (IAM role, `~/.aws/credentials`, SSO, etc.). `aws_bedrock_token_generator` (included in dependencies) exchanges them for a bearer token on each request.
+
+```python
+ag = agent(
+    llm_config={
+        "provider": "bedrock",
+        "region":   "us-east-2",
+        "model":    "nvidia.nemotron-super-3-120b",
+    },
+)
+```
+
+Pass `"api_key": "bedrock-api-key-..."` to use a static Bedrock API key instead of IAM credentials.
+
 ## Core concepts
 
 **`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. Fields are accessed as attributes (`result.summary`). Supports JSON serialisation and schema validation.
@@ -60,6 +85,8 @@ print(result.summary)   # blocks until done
 **`agtool`** — a named callable an LLM can invoke via function calling. Every tool call is offloaded to a `ProcessPoolExecutor` worker so CPU-bound tools don't block other agents. Tools are serialised with `cloudpickle`, so bound methods work without any extra machinery. Before each sandboxed tool call the container is checkpointed; on tool failure the sandbox is automatically rolled back to that checkpoint and the LLM is told the workspace was reverted. Agents can pass `"timeout": <seconds>` in any tool call's arguments to override the default 30 s watchdog.
 
 **`agent`** — holds an LLM config, sandboxed tools, and a conversation history. `agent.run(skill, input)` accepts an `agskill` object directly and is non-blocking; each call spawns a daemon thread and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the history and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
+
+**GPU support** — NVIDIA and AMD (ROCm) GPUs are both supported. `agResourcePool` auto-detects GPUs via `nvidia-smi` (NVIDIA) or `rocm-smi` (AMD) and issues leases to prevent two agents from sharing a device. The sandbox container receives `--gpus all` (NVIDIA) or `--device /dev/kfd --device /dev/dri` (AMD) at startup; `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES` are both set inside every `exec()` call to the leased device ID.
 
 **`agteam`** — coordinates multiple agents or tasks. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow. Each `run()` call executes in its own daemon thread.
 

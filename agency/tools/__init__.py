@@ -45,7 +45,7 @@ def make_sandboxed_tools(
         tools += [
             make_gpu_acquire(sandbox, pool),
             make_gpu_release(sandbox, pool),
-            make_cpu_acquire(sandbox),
+            make_cpu_acquire(sandbox, pool),
             make_cpu_release(sandbox, pool),
         ]
     return tools

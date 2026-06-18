@@ -7,14 +7,41 @@ import time
 
 
 def detect_gpus() -> list[int]:
-    """Return GPU IDs visible to nvidia-smi, or [] if none are found."""
+    """Return GPU IDs visible to nvidia-smi or rocm-smi, or [] if none are found."""
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0:
+        if result.returncode == 0 and result.stdout.strip():
             return [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showid", "--csv"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ids = []
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line or line.lower().startswith("device"):
+                    continue
+                # First column is "cardN" — extract the numeric suffix.
+                col = line.split(",")[0].strip().lower()
+                if col.startswith("card"):
+                    try:
+                        ids.append(int(col[4:]))
+                    except ValueError:
+                        pass
+                else:
+                    try:
+                        ids.append(int(col))
+                    except ValueError:
+                        pass
+            if ids:
+                return ids
     except Exception:
         pass
     return []
@@ -84,6 +111,10 @@ class agResourcePool:
         self._gpu_locks: dict[int, threading.Semaphore] = {
             gpu_id: threading.Semaphore(1) for gpu_id in self.gpus
         }
+        self._res_lock = threading.Lock()
+        self._gpus_acquired: int = 0
+        self.cpus_acquired: float = 0.0
+        self.memory_acquired_mb: int = 0
 
     def acquire_gpu(self, timeout: float | None = None) -> int:
         """Block until any GPU is free; return its id."""
@@ -93,6 +124,9 @@ class agResourcePool:
         while True:
             for gpu_id, sem in self._gpu_locks.items():
                 if sem.acquire(blocking=False):
+                    with self._res_lock:
+                        self._gpus_acquired += 1
+                    self._emit_resource()
                     return gpu_id
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -108,6 +142,38 @@ class agResourcePool:
                 sem.release()
             except ValueError:
                 pass
+            with self._res_lock:
+                self._gpus_acquired = max(0, self._gpus_acquired - 1)
+            self._emit_resource()
+
+    def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:
+        """Record that a sandbox boosted its CPU/memory limits."""
+        with self._res_lock:
+            self.cpus_acquired += cpus
+            self.memory_acquired_mb += memory_mb
+        self._emit_resource()
+
+    def notify_cpu_released(self, cpus: float, memory_mb: int) -> None:
+        """Record that a sandbox reset its CPU/memory limits to idle."""
+        with self._res_lock:
+            self.cpus_acquired = max(0.0, self.cpus_acquired - cpus)
+            self.memory_acquired_mb = max(0, self.memory_acquired_mb - memory_mb)
+        self._emit_resource()
+
+    def _emit_resource(self) -> None:
+        try:
+            from . import agwebui as _agwebui
+            if _agwebui._active is not None:
+                _agwebui._active.emitter.resource_update(
+                    gpus_acquired=self._gpus_acquired,
+                    gpus_total=len(self.gpus),
+                    cpus_acquired=self.cpus_acquired,
+                    cpus_total=self.total_cpus,
+                    memory_acquired_mb=self.memory_acquired_mb,
+                    memory_total_mb=self.total_memory_mb,
+                )
+        except Exception:
+            pass
 
     def __repr__(self) -> str:
         return (

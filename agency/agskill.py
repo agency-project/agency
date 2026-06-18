@@ -26,7 +26,7 @@ class _BedrockSigV4Auth(httpx.Auth):
                     "Bedrock api_key must be 'ACCESS_KEY_ID:SECRET_ACCESS_KEY' "
                     "or 'ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN'."
                 )
-            self._frozen = Credentials(
+            self._creds = Credentials(
                 access_key=parts[0],
                 secret_key=parts[1],
                 token=parts[2] if len(parts) == 3 else None,
@@ -40,7 +40,9 @@ class _BedrockSigV4Auth(httpx.Auth):
                     "or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars, "
                     "or run: aws configure"
                 )
-            self._frozen = creds.get_frozen_credentials()
+            # Store the live credentials object (not a frozen snapshot) so that
+            # boto3 can refresh SSO / assumed-role tokens automatically.
+            self._creds = creds
 
     def auth_flow(self, request: httpx.Request):
         import botocore.auth
@@ -53,7 +55,9 @@ class _BedrockSigV4Auth(httpx.Auth):
             headers={k: v for k, v in request.headers.items()
                      if k.lower() not in ("host", "content-length")},
         )
-        botocore.auth.SigV4Auth(self._frozen, "bedrock", self._region).add_auth(aws_req)
+        # Resolve fresh credentials on every request — handles token refresh
+        # for SSO, assumed-role, and other short-lived credential sources.
+        botocore.auth.SigV4Auth(self._creds.get_frozen_credentials(), "bedrock", self._region).add_auth(aws_req)
         for k, v in aws_req.headers.items():
             request.headers[k] = v
         yield request
@@ -107,7 +111,7 @@ def _make_llm_client(llm_config: dict, timeout: httpx.Timeout) -> openai.OpenAI:
 _T = TypeVar("_T")
 _BATCH_INTERVAL_S: float = 0.1   # main thread drains stream every 100 ms
 _IDLE_CHECK_INTERVAL_S: float = 1.0  # how often to check idle timeout
-_TOOL_OUTPUT_OFFLOAD_CHARS: int = 20_000  # tool results longer than this are saved to a file
+_TOOL_OUTPUT_OFFLOAD_CHARS: int = 80_000  # tool results longer than this are saved to a file
 
 
 class _LLMIdleTimeout(Exception):
@@ -455,6 +459,7 @@ class agskill:
         _compact_log_fn: "Callable | None" = None,
         _full_history_fn: "Callable[[dict], None] | None" = None,
         _extra_system: "str | None" = None,
+        _token_update_fn: "Callable[[int, int], None] | None" = None,
     ) -> tuple[agdata, agdata, list[dict], tuple[int, int]]:
         """Run the ReAct loop.
 
@@ -699,6 +704,11 @@ class agskill:
             _skill_semaphore.release()
             if term:
                 term.log("LLM ✓    ", f"model={llm_config.get('model','?')}  ({_llm_elapsed_ms}ms)")
+            if _token_update_fn is not None:
+                try:
+                    _token_update_fn(_total_input_tokens, _total_output_tokens)
+                except Exception:
+                    pass
 
             if _state_fn:
                 _state_fn("skill", skill=self.name)
@@ -820,7 +830,14 @@ class agskill:
                         safe_id = tc_id.replace("-", "")[:12]
                         offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
                         try:
-                            sandbox.write_file(offload_path, result_content)
+                            # Write the plain `content` field so the file has natural
+                            # line breaks and the read tool can paginate with offsets.
+                            # Fall back to the raw JSON string if parsing fails.
+                            try:
+                                file_body = json.loads(result_content).get("content", result_content)
+                            except (json.JSONDecodeError, AttributeError):
+                                file_body = result_content
+                            sandbox.write_file(offload_path, file_body)
                             result_content = json.dumps({
                                 "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
                             })

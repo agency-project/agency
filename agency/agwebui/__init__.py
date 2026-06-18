@@ -107,6 +107,16 @@ class agwebui:
         _active = ui
         print(f"[agwebui] Web UI: http://localhost:{port}", flush=True)
 
+        # Emit initial resource pool state so the dashboard shows GPU/CPU
+        # capacity immediately without waiting for the first acquire/release.
+        try:
+            from ..agent import agent as _agent_cls
+            _pool = _agent_cls.agresource_pool
+            if _pool is not None:
+                _pool._emit_resource()
+        except Exception:
+            pass
+
         def _kill_server() -> None:
             proc = ui._server_proc
             if proc is not None and proc.poll() is None:
