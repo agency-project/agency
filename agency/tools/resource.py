@@ -24,55 +24,52 @@ def _parse_memory_mb(mem: "str | None") -> int:
         return 0
 
 
-def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
-    """Return a tool that acquires exclusive GPU access for the sandbox."""
+def make_gpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
+    """Return a tool that reserves GPU access for the sandbox.
+
+    No physical GPU is claimed here. The physical allocation happens lazily
+    inside sandbox.exec() the moment a bash command is actually run, and is
+    released automatically once all spawned processes finish.
+    """
     def _run(arg: agdata) -> agdata:
-        timeout: float | None = getattr(arg, "timeout", None)
-        if timeout is not None:
-            timeout = float(timeout)
-        if sandbox._gpu_id is not None:
-            return agdata(gpu_id=sandbox._gpu_id, message="1 GPU already held — use cuda:0")
-        try:
-            gpu_id = pool.acquire_gpu(timeout=timeout)
-            sandbox._gpu_id = gpu_id
-            return agdata(gpu_id=gpu_id, message="1 GPU allocated — use cuda:0")
-        except TimeoutError as e:
-            return agdata(error=_fmt_exc(e))
+        if not pool.gpus:
+            return agdata(warning=(
+                "No GPUs are available on this machine. "
+                "Bash commands will run without GPU acceleration."
+            ))
+        if sandbox._gpu_virtual:
+            return agdata(message="GPU already acquired — use cuda:0 in your scripts")
+        sandbox._gpu_virtual = True
+        sandbox._gpu_acquire_fn = pool.acquire_gpu
+        sandbox._gpu_release_fn = pool.release_gpu
+        return agdata(message="GPU acquired — use cuda:0 in your scripts")
 
     return agtool(
-        name="gpu_acquire",
+        name="reserve_gpu",
         fn=_run,
         description=(
-            "Acquire exclusive access to a GPU before running commands with GPU acceleration. "
+            "Reserve GPU access before running commands with GPU acceleration. "
             "CUDA_VISIBLE_DEVICES is set automatically — always use cuda:0 inside your scripts. "
             "Always call gpu_release when finished."
         ),
-        params={
-            "type": "object",
-            "properties": {
-                "timeout": {
-                    "type": "number",
-                    "description": "Max seconds to wait for a free GPU (default: wait indefinitely)",
-                },
-            },
-        },
+        params={"type": "object", "properties": {}},
         need_sandbox=False,
     )
 
 
 def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
-        if sandbox._gpu_id is None:
-            return agdata(message="no GPU currently held")
-        pool.release_gpu(sandbox._gpu_id)
-        sandbox._gpu_id = None
+        sandbox._gpu_virtual = False
+        if sandbox._gpu_id is not None:
+            pool.release_gpu(sandbox._gpu_id)
+            sandbox._gpu_id = None
         return agdata(message="GPU released")
 
     return agtool(
         name="gpu_release",
         fn=_run,
         description=(
-            "Release the GPU acquired by gpu_acquire back to the shared pool. "
+            "Release the GPU reserved by reserve_gpu back to the shared pool. "
             "Call this as soon as GPU-intensive work is complete."
         ),
         params={"type": "object", "properties": {}},
@@ -80,7 +77,7 @@ def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     )
 
 
-def make_cpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
+def make_cpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
         cpus: float | None = getattr(arg, "cpus", None)
         memory: str | None = getattr(arg, "memory", None)
@@ -106,7 +103,7 @@ def make_cpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             return agdata(error=_fmt_exc(e))
 
     return agtool(
-        name="cpu_acquire",
+        name="reserve_cpu",
         fn=_run,
         description=(
             "Boost CPU and/or memory limits for the current sandbox container "

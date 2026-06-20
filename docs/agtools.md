@@ -16,9 +16,9 @@ Tools are the functions an LLM can call during a ReAct loop. Each tool is an `ag
 | `todowrite` | host | `False` | Persist a structured todo list to disk |
 | `ask_human` | host | `False` | Ask the user a question; blocks until a reply arrives (from UI or stdin) |
 | `daemon_release` | sandbox | `True` | Release a PID from monitoring so a long-lived service doesn't block skill completion |
-| `gpu_acquire` | sandbox | `True` | Acquire exclusive GPU access from the resource pool |
+| `reserve_gpu` | sandbox | `True` | Reserve GPU access (virtual); physical GPU assigned lazily when bash runs |
 | `gpu_release` | sandbox | `True` | Return the GPU to the pool |
-| `cpu_acquire` | sandbox | `True` | Boost container CPU/memory limits for compute-intensive work |
+| `reserve_cpu` | sandbox | `True` | Boost container CPU/memory limits for compute-intensive work |
 | `cpu_release` | sandbox | `True` | Reset CPU/memory limits back to idle defaults |
 
 All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker/podman exec`.
@@ -42,9 +42,9 @@ tools = [
 ]
 if pool is not None:
     tools += [
-        make_gpu_acquire(sandbox, pool),
+        make_gpu_reserve(sandbox, pool),
         make_gpu_release(sandbox, pool),
-        make_cpu_acquire(sandbox),
+        make_cpu_reserve(sandbox, pool),
         make_cpu_release(sandbox, pool),
     ]
 ```

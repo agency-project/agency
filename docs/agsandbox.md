@@ -33,7 +33,7 @@ The `images/Dockerfile` installs `ripgrep` on top of `python:3.12-slim`. Both ru
 
 `--gpus all` is passed to `run` when `nvidia-smi` detects GPUs on the host, mounting the NVIDIA device files into the container. On CPU-only hosts the flag is omitted.
 
-Even with `--gpus all`, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES=""`, making all GPUs invisible to CUDA. A GPU becomes visible only after the agent calls `gpu_acquire`, which sets `CUDA_VISIBLE_DEVICES=<id>` for subsequent exec calls.
+Even with `--gpus all`, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES=""` when no virtual reservation is active, making all GPUs invisible to CUDA. Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken. When `exec()` runs a bash command and the virtual flag is set, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected. After a foreground exec with no background processes, the physical GPU is returned to the pool immediately — freeing it for other agents while the LLM thinks. When background processes are alive, the GPU is held until `get_live_pids()` finds them all finished.
 
 ## Shared output directory
 
@@ -64,7 +64,7 @@ Every bash command is wrapped before being sent to the container shell:
 ```sh
 exec 2>&1           # merge stderr into stdout (keeps __BGPIDS__ marker intact)
 
-export CUDA_VISIBLE_DEVICES=<id or "">   # always set
+export CUDA_VISIBLE_DEVICES=<id or "">   # set to physical GPU ID if one was acquired at the start of exec(), or "" (NoDevFiles) if no virtual reservation is active
 
 # snapshot /proc before the command
 __AGENCY_BEFORE=$(for __d in /proc/[0-9]*; do

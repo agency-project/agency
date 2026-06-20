@@ -35,6 +35,20 @@ docker = pytest.mark.skipif(
 )
 
 
+def _nvidia_smi_available() -> bool:
+    try:
+        return subprocess.run(
+            ["nvidia-smi"], capture_output=True, timeout=10
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+nvidia_smi = pytest.mark.skipif(
+    not _nvidia_smi_available(), reason="nvidia-smi not available"
+)
+
+
 def _make_sandbox(**kwargs):
     from agency.agsandbox import agSandbox
     uid = str(uuid.uuid4())
@@ -74,6 +88,85 @@ class TestDetectGpus:
         mock.stdout = "0\n1\n2\n"
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock)
         assert detect_gpus() == [0, 1, 2]
+
+    def test_cvd_filter_applied_to_nvidia_smi_output(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from agency.agresources import detect_gpus
+        mock = MagicMock()
+        mock.returncode = 0
+        mock.stdout = "0\n1\n2\n3\n"
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,3")
+        assert detect_gpus() == [1, 3]
+
+    def test_cvd_unset_returns_all_from_nvidia_smi(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from agency.agresources import detect_gpus
+        mock = MagicMock()
+        mock.returncode = 0
+        mock.stdout = "0\n1\n2\n"
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock)
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        assert detect_gpus() == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# _cvd_filter
+# ---------------------------------------------------------------------------
+
+class TestCvdFilter:
+    def test_no_env_var_passes_all(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        assert _cvd_filter([0, 1, 2, 3]) == [0, 1, 2, 3]
+
+    def test_filters_to_allowed_subset(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,3,5,7")
+        assert _cvd_filter([0, 1, 2, 3, 4, 5, 6, 7]) == [0, 3, 5, 7]
+
+    def test_single_gpu(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+        assert _cvd_filter([0, 1, 2, 3]) == [3]
+
+    def test_empty_string_passes_all(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+        assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
+
+    def test_nodevfiles_passes_all(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "NoDevFiles")
+        assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
+
+    def test_none_string_passes_all(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "none")
+        assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
+
+    def test_cvd_id_not_in_pool_ignored(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        # CVD says GPU 9 is allowed but nvidia-smi only reported [0,1,2]
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,9")
+        assert _cvd_filter([0, 1, 2]) == [0]
+
+    def test_preserves_order_from_pool_list(self, monkeypatch):
+        from agency.agresources import _cvd_filter
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,3,1")
+        # Order follows the pool list, not CVD order
+        assert _cvd_filter([0, 1, 2, 3, 4, 5]) == [1, 3, 5]
+
+    def test_pool_auto_detect_respects_cvd(self, monkeypatch):
+        from unittest.mock import MagicMock
+        mock = MagicMock()
+        mock.returncode = 0
+        mock.stdout = "0\n1\n2\n3\n"
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,3,5,7")
+        pool = agResourcePool()
+        # Only GPUs 0 and 3 overlap between [0,1,2,3] and {0,3,5,7}
+        assert pool.gpus == [0, 3]
 
 
 class TestDetectCpus:
@@ -192,6 +285,133 @@ class TestAgResourcePool:
         assert "[0, 1]" in r
         assert "total_cpus" in r
         assert "total_memory_mb" in r
+
+
+# ---------------------------------------------------------------------------
+# GPU presence markers
+# ---------------------------------------------------------------------------
+
+class TestGpuMarkers:
+    def test_mark_gpus_false_starts_no_processes(self):
+        pool = agResourcePool(gpus=[0, 1], mark_gpus=False)
+        assert pool._marker_procs == []
+
+    def test_mark_gpus_true_empty_gpu_list_starts_no_processes(self):
+        pool = agResourcePool(gpus=[], mark_gpus=True)
+        assert pool._marker_procs == []
+
+    def test_mark_gpus_starts_one_process_per_gpu(self):
+        pool = agResourcePool(gpus=[0, 1], mark_gpus=True)
+        try:
+            assert len(pool._marker_procs) == 2
+        finally:
+            pool._stop_gpu_markers()
+
+    def test_marker_processes_have_distinct_pids(self):
+        pool = agResourcePool(gpus=[0, 1, 2], mark_gpus=True)
+        try:
+            pids = [p.pid for p in pool._marker_procs]
+            assert len(set(pids)) == 3
+        finally:
+            pool._stop_gpu_markers()
+
+    def test_stop_markers_terminates_all(self):
+        pool = agResourcePool(gpus=[0, 1], mark_gpus=True)
+        procs = list(pool._marker_procs)
+        pool._stop_gpu_markers()
+        time.sleep(0.5)
+        for proc in procs:
+            assert proc.poll() is not None, f"process {proc.pid} still running after stop"
+
+    def test_stop_markers_no_zombies(self):
+        # After stop, processes must be reaped (poll() returns exit code, not None).
+        # A zombie would show poll()=None because wait() was never called.
+        pool = agResourcePool(gpus=[0, 1], mark_gpus=True)
+        procs = list(pool._marker_procs)
+        pool._stop_gpu_markers()
+        time.sleep(0.2)
+        for proc in procs:
+            code = proc.poll()
+            assert code is not None, f"process {proc.pid} is a zombie (not reaped)"
+
+    def test_stop_markers_clears_list(self):
+        pool = agResourcePool(gpus=[0], mark_gpus=True)
+        pool._stop_gpu_markers()
+        assert pool._marker_procs == []
+
+    def test_marker_process_comm_name(self):
+        # prctl(PR_SET_NAME) runs before torch import, so the name is set
+        # even if CUDA is unavailable and the process exits immediately.
+        pool = agResourcePool(gpus=[0], mark_gpus=True)
+        try:
+            pid = pool._marker_procs[0].pid
+            comm_path = f"/proc/{pid}/comm"
+            # Poll until we see "agency-gpu" (prctl ran) or the process exits.
+            deadline = time.monotonic() + 2.0
+            comm = None
+            while time.monotonic() < deadline:
+                try:
+                    with open(comm_path) as f:
+                        value = f.read().strip()
+                    if value == "agency-gpu":
+                        comm = value
+                        break
+                    # Still "python" — prctl hasn't run yet; keep polling.
+                except FileNotFoundError:
+                    break  # process already exited
+                time.sleep(0.05)
+            if comm is None:
+                pytest.skip("marker process exited before prctl could be observed")
+            assert comm == "agency-gpu"
+        finally:
+            pool._stop_gpu_markers()
+
+    @nvidia_smi
+    def test_marker_appears_in_nvidia_smi(self):
+        """Marker process allocates ~128 MB of VRAM visible in nvidia-smi."""
+        # Marker subprocesses use libcuda.so.1 — skip if the driver isn't present.
+        import ctypes
+        try:
+            ctypes.CDLL('libcuda.so.1')
+        except OSError:
+            pytest.skip("libcuda.so.1 not available on this host")
+
+        from agency.agresources import detect_gpus
+        real_gpus = detect_gpus()
+        if not real_gpus:
+            pytest.skip("no GPUs detected by nvidia-smi")
+
+        pool = agResourcePool(gpus=[real_gpus[0]], mark_gpus=True)
+        try:
+            # Allow torch to load and finish the VRAM allocation.
+            time.sleep(5)
+            marker_proc = pool._marker_procs[0]
+            if marker_proc.poll() is not None:
+                pytest.skip("marker process exited (torch or CUDA unavailable on this GPU)")
+
+            result = subprocess.run(
+                ["nvidia-smi",
+                 "--query-compute-apps=pid,used_gpu_memory",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert result.returncode == 0, f"nvidia-smi failed: {result.stderr}"
+
+            reported_pids = set()
+            for line in result.stdout.splitlines():
+                parts = line.split(",")
+                if parts:
+                    try:
+                        reported_pids.add(int(parts[0].strip()))
+                    except ValueError:
+                        pass
+
+            assert marker_proc.pid in reported_pids, (
+                f"Marker PID {marker_proc.pid} not found in nvidia-smi output:\n"
+                f"{result.stdout}"
+            )
+        finally:
+            pool._stop_gpu_markers()
 
 
 # ---------------------------------------------------------------------------
@@ -577,8 +797,12 @@ class TestAgSandboxResourceLimits:
         pool = agResourcePool(gpus=[0])
         gpu_id = pool.acquire_gpu()
         self.sb._gpu_id = gpu_id
+        self.sb._gpu_virtual = True
+        self.sb._gpu_release_fn = pool.release_gpu
         self.sb.release_resources(pool)
         assert self.sb._gpu_id is None
+        assert self.sb._gpu_virtual is False
+        assert pool._gpus_acquired == 0
 
     def test_release_resources_none_pool(self):
         # Should not raise even without a pool
@@ -664,45 +888,209 @@ class TestResourceTools:
     def teardown_method(self, _):
         self.sb.destroy()
 
-    def test_gpu_acquire_sets_gpu_id(self):
-        result = self.tools["gpu_acquire"].fn(agdata())
-        assert result.gpu_id in (0, 1)
-        assert self.sb._gpu_id == result.gpu_id
+    # ── reserve_gpu — virtual reservation only ─────────────────────────────
 
-    def test_gpu_acquire_idempotent(self):
-        self.tools["gpu_acquire"].fn(agdata())
-        first_id = self.sb._gpu_id
-        result = self.tools["gpu_acquire"].fn(agdata())
-        assert result.gpu_id == first_id   # same GPU returned
+    def test_reserve_gpu_sets_virtual_flag_no_physical(self):
+        """reserve_gpu sets _gpu_virtual=True but takes no physical GPU from the pool."""
+        result = self.tools["reserve_gpu"].fn(agdata())
+        assert getattr(result, "warning", None) is None
+        assert self.sb._gpu_virtual is True
+        assert self.sb._gpu_id is None
+        assert self.pool._gpus_acquired == 0
 
-    def test_gpu_release_clears_gpu_id(self):
-        self.tools["gpu_acquire"].fn(agdata())
+    def test_reserve_gpu_idempotent(self):
+        """Calling reserve_gpu twice returns an 'already acquired' message; flag unchanged."""
+        self.tools["reserve_gpu"].fn(agdata())
+        result = self.tools["reserve_gpu"].fn(agdata())
+        assert self.sb._gpu_virtual is True
+        assert "already" in result.message
+        assert self.pool._gpus_acquired == 0
+
+    def test_reserve_gpu_no_gpus_warns_and_does_not_set_flag(self):
+        """reserve_gpu returns a warning and leaves _gpu_virtual False when pool has no GPUs."""
+        from agency.tools.resource import make_gpu_reserve
+        pool_empty = agResourcePool(gpus=[])
+        tool = make_gpu_reserve(self.sb, pool_empty)
+        result = tool.fn(agdata())
+        assert result.warning is not None
+        assert self.sb._gpu_virtual is False
+
+    # ── physical GPU acquisition on bash exec ──────────────────────────────
+
+    def test_exec_acquires_physical_gpu_when_virtual_flag_set(self):
+        """exec() claims a physical GPU from the pool when _gpu_virtual is True."""
+        self.tools["reserve_gpu"].fn(agdata())
+        assert self.pool._gpus_acquired == 0
+        # During the command a GPU is held; after a foreground exec it is released.
+        self.sb.exec("echo hello")
+        # Foreground exec with no background processes releases immediately.
+        assert self.pool._gpus_acquired == 0
+
+    def test_exec_sets_cuda_visible_devices(self):
+        """CUDA_VISIBLE_DEVICES is set to a digit (the physical GPU ID) during exec()."""
+        self.tools["reserve_gpu"].fn(agdata())
+        out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
+        assert rc == 0
+        assert out.strip().isdigit()
+
+    def test_exec_without_reserve_hides_all_gpus(self):
+        """Without reserve_gpu, CUDA_VISIBLE_DEVICES is 'NoDevFiles'."""
+        out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
+        assert rc == 0
+        assert "NoDevFiles" in out.strip()
+
+    # ── physical GPU release after foreground exec ─────────────────────────
+
+    def test_foreground_exec_releases_physical_gpu_immediately(self):
+        """Physical GPU is released at the end of exec() when no background processes remain."""
+        self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("echo hello")
+        assert self.sb._gpu_id is None
+        assert self.pool._gpus_acquired == 0
+        assert self.sb._gpu_virtual is True  # virtual reservation persists
+
+    def test_consecutive_foreground_execs_each_acquire_and_release(self):
+        """Each foreground exec() acquires a physical GPU then releases it; pool stays free."""
+        self.tools["reserve_gpu"].fn(agdata())
+        for _ in range(3):
+            self.sb.exec("echo iteration")
+            assert self.sb._gpu_id is None
+            assert self.pool._gpus_acquired == 0
+
+    def test_virtual_reservation_persists_after_physical_release(self):
+        """_gpu_virtual stays True after a foreground exec so the next bash call can re-acquire."""
+        self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("echo first")
+        assert self.sb._gpu_virtual is True
+        # Second exec() should re-acquire a physical GPU and set CUDA_VISIBLE_DEVICES.
+        out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
+        assert rc == 0
+        assert out.strip().isdigit()
+
+    # ── physical GPU held while background process runs ────────────────────
+
+    def test_physical_gpu_held_while_background_process_running(self):
+        """Physical GPU stays held while a background process is alive."""
+        self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("sleep 30 &")
+        live = self.sb.get_live_pids()
+        assert len(live) > 0
+        assert self.sb._gpu_id is not None
+        assert self.pool._gpus_acquired == 1
+        self.sb.exec("kill %1 2>/dev/null || true")
+
+    def test_same_physical_gpu_used_for_subsequent_exec_during_background_process(self):
+        """While a background process holds the GPU, subsequent exec() calls use the same GPU."""
+        self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("sleep 30 &")
+        self.sb.get_live_pids()
+        first_gpu_id = self.sb._gpu_id
+        assert first_gpu_id is not None
+        self.sb.exec("echo checking")
+        assert self.sb._gpu_id == first_gpu_id  # same physical GPU, not re-acquired
+        self.sb.exec("kill %1 2>/dev/null || true")
+
+    def test_physical_gpu_released_after_background_process_finishes(self):
+        """Physical GPU is released by get_live_pids() once the background process exits."""
+        self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("sleep 0.1 &")
+        time.sleep(0.5)
+        self.sb.get_live_pids()   # triggers release since alive set is now empty
+        assert self.sb._gpu_id is None
+        assert self.pool._gpus_acquired == 0
+        assert self.sb._gpu_virtual is True  # virtual reservation persists
+
+    # ── waiting for physical GPU when pool is exhausted ────────────────────
+
+    def test_exec_blocks_until_pool_gpu_is_freed(self):
+        """exec() waits indefinitely for a physical GPU and unblocks once one is released."""
+        from agency.tools.resource import make_gpu_reserve
+        pool1 = agResourcePool(gpus=[0])
+        pool1.acquire_gpu()   # exhaust the only GPU
+
+        sb2 = _make_sandbox()
+        tool = make_gpu_reserve(sb2, pool1)
+        tool.fn(agdata())     # virtual reservation
+
+        exec_started = threading.Event()
+        exec_done    = threading.Event()
+
+        def _run():
+            exec_started.set()
+            sb2.exec("echo hello")   # blocks inside exec() until GPU freed
+            exec_done.set()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        exec_started.wait()
+        time.sleep(0.2)
+        assert not exec_done.is_set()   # still waiting
+        pool1.release_gpu(0)            # free the GPU
+        exec_done.wait(timeout=5)
+        assert exec_done.is_set()
+        sb2.destroy()
+
+    # ── gpu_release ────────────────────────────────────────────────────────
+
+    def test_gpu_release_clears_virtual_flag(self):
+        """gpu_release clears _gpu_virtual even when no physical GPU is currently held."""
+        self.tools["reserve_gpu"].fn(agdata())
         self.tools["gpu_release"].fn(agdata())
+        assert self.sb._gpu_virtual is False
         assert self.sb._gpu_id is None
 
-    def test_gpu_release_without_acquire(self):
+    def test_gpu_release_also_frees_physical_gpu_held_by_background_process(self):
+        """gpu_release forcibly releases a physical GPU even while a background process runs."""
+        self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("sleep 30 &")
+        self.sb.get_live_pids()
+        assert self.sb._gpu_id is not None
+        self.tools["gpu_release"].fn(agdata())
+        assert self.sb._gpu_virtual is False
+        assert self.sb._gpu_id is None
+        assert self.pool._gpus_acquired == 0
+        self.sb.exec("kill %1 2>/dev/null || true")
+
+    def test_gpu_release_without_reserve_is_safe(self):
+        """gpu_release is a no-op when nothing is reserved."""
         result = self.tools["gpu_release"].fn(agdata())
-        assert "no GPU" in result.message
+        assert result.message is not None
+        assert self.sb._gpu_virtual is False
+        assert self.sb._gpu_id is None
 
-    def test_gpu_acquire_timeout_with_exhausted_pool(self):
-        pool = agResourcePool(gpus=[0])
-        pool.acquire_gpu()             # exhaust the single GPU
-        from agency.tools.resource import make_gpu_acquire
-        tool = make_gpu_acquire(self.sb, pool)
-        result = tool.fn(agdata(timeout=0.2))
-        assert result.error is not None
+    # ── release_resources ─────────────────────────────────────────────────
 
-    def test_cpu_acquire_applies_limits(self):
-        result = self.tools["cpu_acquire"].fn(agdata(cpus=2.0, memory="256m"))
+    def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self):
+        """release_resources() clears _gpu_virtual and returns any held physical GPU."""
+        self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("sleep 30 &")
+        self.sb.get_live_pids()
+        assert self.sb._gpu_id is not None
+        self.sb.release_resources(self.pool)
+        assert self.sb._gpu_virtual is False
+        assert self.sb._gpu_id is None
+        assert self.pool._gpus_acquired == 0
+        self.sb.exec("kill %1 2>/dev/null || true")
+
+    def test_release_resources_without_reserve_does_not_raise(self):
+        """release_resources() is safe when no GPU was ever reserved."""
+        self.sb.release_resources(self.pool)
+        assert self.sb._gpu_virtual is False
+        assert self.sb._gpu_id is None
+
+    # ── reserve_cpu / cpu_release ─────────────────────────────────────────
+
+    def test_reserve_cpu_applies_limits(self):
+        result = self.tools["reserve_cpu"].fn(agdata(cpus=2.0, memory="256m"))
         assert result.error is None
 
-    def test_cpu_acquire_requires_at_least_one_param(self):
-        result = self.tools["cpu_acquire"].fn(agdata())
+    def test_reserve_cpu_requires_at_least_one_param(self):
+        result = self.tools["reserve_cpu"].fn(agdata())
         assert result.error is not None
 
     def test_cpu_release_resets_to_idle(self):
-        self.tools["cpu_acquire"].fn(agdata(cpus=4.0, memory="2g"))
+        self.tools["reserve_cpu"].fn(agdata(cpus=4.0, memory="2g"))
         result = self.tools["cpu_release"].fn(agdata())
         assert result.error is None
-        assert "0.5" in result.message     # idle_cpus
-        assert "512m" in result.message    # idle_memory
+        assert "0.5" in result.message
+        assert "512m" in result.message

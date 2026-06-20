@@ -150,6 +150,9 @@ class agSandbox:
         self._agname   = agname
         self._runtime  = get_container_runtime()
         self._gpu_id:  int | None           = None
+        self._gpu_virtual: bool             = False   # LLM has called reserve_gpu
+        self._gpu_acquire_fn                = None    # pool.acquire_gpu, set by make_gpu_reserve
+        self._gpu_release_fn                = None    # pool.release_gpu, set by make_gpu_reserve
         self._cpu_acquired: float           = 0.0
         self._memory_acquired_mb: int       = 0
         self._watched_pids: dict[int, float] = {}
@@ -354,6 +357,11 @@ class agSandbox:
         timeout: int = 120,
     ) -> tuple[str, int]:
         """Run a user command inside the container."""
+        # Lazily acquire a physical GPU now that we have a bash call to run.
+        # Blocks (polling every 0.25 s) until any GPU in the pool is free.
+        if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
+            self._gpu_id = self._gpu_acquire_fn()
+
         # Restrict GPU access to the acquired GPU ID. Set both CUDA_VISIBLE_DEVICES
         # (NVIDIA/CUDA) and HIP_VISIBLE_DEVICES (AMD/ROCm) so only the leased
         # device is accessible regardless of which runtime is present.
@@ -403,6 +411,14 @@ class agSandbox:
                         pass
         else:
             clean_output = output
+
+        # No background processes were spawned: release the physical GPU now so
+        # other agents can use it while this agent waits for the next LLM turn.
+        # When background processes ARE running, get_live_pids() releases the GPU
+        # once the alive set becomes empty.
+        if not self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
+            self._gpu_release_fn(self._gpu_id)
+            self._gpu_id = None
 
         return clean_output, rc
 
@@ -506,8 +522,8 @@ class agSandbox:
         if not self._watched_pids:
             return set()
 
-        # Read pid, ppid, and state for every entry in /proc, excluding the
-        # monitoring shell itself so it is never mistaken for a user process.
+        # Read pid, ppid, state, and comm name for every entry in /proc,
+        # excluding the monitoring shell itself.
         script = (
             "__SELF=$$\n"
             "for __d in /proc/[0-9]*; do\n"
@@ -516,12 +532,13 @@ class agSandbox:
             "  [ \"$__p\" = \"$__SELF\" ] && continue\n"
             "  __ppid=$(awk '/^PPid:/{print $2}' $__d/status 2>/dev/null)\n"
             "  __st=$(awk '/^State:/{print $2}' $__d/status 2>/dev/null)\n"
-            "  echo \"$__p $__ppid $__st\"\n"
+            "  __nm=$(awk '/^Name:/{print $2}' $__d/status 2>/dev/null)\n"
+            "  echo \"$__p $__ppid $__st $__nm\"\n"
             "done"
         )
         output, _ = self._container_exec(script, timeout=10, shell="sh")
 
-        proc_info: dict[int, tuple[int, str]] = {}   # pid → (ppid, state)
+        proc_info: dict[int, tuple[int, str, str]] = {}   # pid → (ppid, state, name)
         for line in output.splitlines():
             parts = line.split()
             if len(parts) < 2:
@@ -530,9 +547,34 @@ class agSandbox:
                 pid  = int(parts[0])
                 ppid = int(parts[1])
                 state = parts[2] if len(parts) > 2 else "?"
+                name  = parts[3] if len(parts) > 3 else ""
             except ValueError:
                 continue
-            proc_info[pid] = (ppid, state)
+            proc_info[pid] = (ppid, state, name)
+
+        # Mark NVIDIA container-runtime helper processes as system PIDs and
+        # propagate that status to their children.  The NVIDIA toolkit entrypoint
+        # (comm = "nvidia_entrypoi") periodically spawns short-lived GPU check
+        # processes (cudaCheck, deviceQuery, …) that are not user processes and
+        # must not be counted as live background work.
+        #
+        # Baseline PIDs are always excluded — PID 1 in GPU containers IS named
+        # "nvidia_entrypoi" (it is the init process), so we must not add it to
+        # system_pids or every process reparented to it after its parent exits
+        # would be incorrectly filtered.
+        system_pids: set[int] = {
+            pid for pid, (_, _, name) in proc_info.items()
+            if name == "nvidia_entrypoi" and pid not in self._baseline_pids
+        }
+        changed = True
+        while changed:
+            changed = False
+            for pid, (ppid, _, _) in proc_info.items():
+                if (pid not in system_pids
+                        and pid not in self._baseline_pids
+                        and ppid in system_pids):
+                    system_pids.add(pid)
+                    changed = True
 
         # Propagate daemon status down the tree: if a process's parent is a
         # daemon, the child inherits that status and is also excluded from
@@ -540,19 +582,21 @@ class agSandbox:
         changed = True
         while changed:
             changed = False
-            for pid, (ppid, _) in proc_info.items():
+            for pid, (ppid, _, _) in proc_info.items():
                 if pid not in self._daemon_pids and ppid in self._daemon_pids:
                     self._daemon_pids.add(pid)
                     self._watched_pids.pop(pid, None)
                     changed = True
 
-        # A PID is alive if it exists in /proc, is not baseline, not a daemon,
-        # and not a zombie.  Any newly discovered non-baseline PID is added to
-        # _watched_pids so the outer loop waits for it.
+        # A PID is alive if it exists in /proc, is not baseline, not a system
+        # process (NVIDIA runtime helper), not a daemon, and not a zombie.  Any
+        # newly discovered non-baseline PID is added to _watched_pids so the
+        # outer loop waits for it.
         alive: set[int] = set()
         now = time.monotonic()
-        for pid, (_, state) in proc_info.items():
-            if pid in self._baseline_pids or pid in self._daemon_pids or state == "Z":
+        for pid, (_, state, _) in proc_info.items():
+            if (pid in self._baseline_pids or pid in system_pids
+                    or pid in self._daemon_pids or state == "Z"):
                 continue
             alive.add(pid)
             if pid not in self._watched_pids:
@@ -562,6 +606,11 @@ class agSandbox:
         for pid in set(self._watched_pids):
             if pid not in alive:
                 del self._watched_pids[pid]
+
+        # Release the physical GPU once all watched processes have finished.
+        if not alive and self._gpu_virtual and self._gpu_id is not None:
+            self._gpu_release_fn(self._gpu_id)
+            self._gpu_id = None
 
         return alive
 
@@ -578,8 +627,12 @@ class agSandbox:
         return ", ".join(parts)
 
     def release_resources(self, pool: "agResourcePool | None" = None) -> None:
-        if self._gpu_id is not None and pool is not None:
-            pool.release_gpu(self._gpu_id)
+        self._gpu_virtual = False
+        if self._gpu_id is not None:
+            if pool is not None:
+                pool.release_gpu(self._gpu_id)
+            elif self._gpu_release_fn is not None:
+                self._gpu_release_fn(self._gpu_id)
             self._gpu_id = None
         if pool is not None and (self._cpu_acquired or self._memory_acquired_mb):
             pool.notify_cpu_released(self._cpu_acquired, self._memory_acquired_mb)

@@ -6,6 +6,26 @@ _agskill_module = sys.modules["agency.agskill"]
 from agency.agent import agent, _allocated_agnames, _noun_counters, _live_agents
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _stop_gpu_markers_for_tests():
+    """Stop GPU marker processes before any test runs.
+
+    conftest.py imports agency.agent at module level, which triggers
+    agresource_pool = agResourcePool(mark_gpus=True) and starts one marker
+    subprocess per GPU.  The markers call cuCtxCreate via libcuda.so.1; the
+    NVIDIA container runtime then spawns helper processes inside any Docker
+    container that uses --gpus all.  Those helpers appear in /proc but are not
+    captured in _baseline_pids (they start after the snapshot), causing
+    get_live_pids() to report phantom live PIDs and breaking PID-tracking tests.
+
+    Stopping the markers before the first container is created prevents those
+    helpers from appearing.  TestGpuMarkers creates its own short-lived pools
+    (mark_gpus=True) that are stopped within each test.
+    """
+    agent.agresource_pool._stop_gpu_markers()
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _test_env(monkeypatch):
     """Set stream-batch delay to zero so tests don't sleep 100 ms per LLM call."""
