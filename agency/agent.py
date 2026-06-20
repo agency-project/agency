@@ -335,7 +335,7 @@ class agent:
 
     log_dir:          ClassVar[Path | None]          = None
     output_dir:       ClassVar[Path | None]          = None
-    agresource_pool:  ClassVar[agResourcePool]       = agResourcePool(mark_gpus=True)
+    agresource_pool:  ClassVar[agResourcePool]       = agResourcePool(mark_gpus=False)
     ping_interval_s:  ClassVar[int]                  = 300
     poll_interval_s:  ClassVar[int]                  = 5
     max_outer_iters:  ClassVar[int]                  = 144

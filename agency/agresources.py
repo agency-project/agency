@@ -165,7 +165,13 @@ class agResourcePool:
         self.memory_acquired_mb: int = 0
         self._marker_procs: list[subprocess.Popen] = []
         if mark_gpus and self.gpus:
-            self._start_gpu_markers()
+            # Only run markers in the main process.  agtool uses a
+            # ProcessPoolExecutor whose workers also import agent.py, which
+            # re-evaluates the class-level agresource_pool and would otherwise
+            # spawn a full set of marker subprocesses in every worker.
+            import multiprocessing
+            if multiprocessing.current_process().name == "MainProcess":
+                self._start_gpu_markers()
 
     def _start_gpu_markers(self) -> None:
         """Launch one background process per GPU that holds _MARKER_MB of VRAM.

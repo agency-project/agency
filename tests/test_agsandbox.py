@@ -5,7 +5,9 @@ and skipped automatically when Docker/Podman is unavailable.
 """
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -14,6 +16,13 @@ import pytest
 
 from agency.agdata import agdata
 from agency.agresources import agResourcePool
+
+
+def _worker_import_agent():
+    """Top-level so ProcessPoolExecutor can pickle it."""
+    from agency.agent import agent  # noqa: F401
+    import multiprocessing
+    return multiprocessing.current_process().name
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +418,89 @@ class TestGpuMarkers:
             assert marker_proc.pid in reported_pids, (
                 f"Marker PID {marker_proc.pid} not found in nvidia-smi output:\n"
                 f"{result.stdout}"
+            )
+        finally:
+            pool._stop_gpu_markers()
+
+    def test_subprocess_import_does_not_add_markers(self):
+        """Importing agent in a child process must not spawn additional markers.
+
+        The class-level agresource_pool = agResourcePool(mark_gpus=False) default
+        means child processes that import agent get a no-marker pool.  This test
+        would have caught the bug where mark_gpus=True was the class default,
+        causing the agwebui server and ProcessPoolExecutor workers to each start
+        their own full set of markers.
+        """
+        def _count_agency_gpu() -> int:
+            count = 0
+            for entry in os.scandir("/proc"):
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry.name}/comm") as f:
+                        if f.read().strip() == "agency-gpu":
+                            count += 1
+                except OSError:
+                    pass
+            return count
+
+        pool = agResourcePool(gpus=[0], mark_gpus=True)
+        try:
+            time.sleep(0.5)  # let marker start
+            before = _count_agency_gpu()
+            assert before >= 1, "marker did not start"
+
+            child = subprocess.run(
+                [sys.executable, "-c", "from agency.agent import agent"],
+                capture_output=True, timeout=15,
+            )
+            assert child.returncode == 0, child.stderr.decode()
+
+            after = _count_agency_gpu()
+            assert after == before, (
+                f"subprocess import added {after - before} marker(s); "
+                "check mark_gpus default in agent.py class definition"
+            )
+        finally:
+            pool._stop_gpu_markers()
+
+    def test_process_pool_worker_does_not_add_markers(self):
+        """ProcessPoolExecutor workers must not start markers when importing agent.
+
+        Workers are named something other than 'MainProcess', so the
+        multiprocessing.current_process().name guard in agResourcePool.__init__
+        must prevent them from starting markers even if mark_gpus=True were
+        somehow the default.
+        """
+        import concurrent.futures
+
+        def _count_agency_gpu() -> int:
+            count = 0
+            for entry in os.scandir("/proc"):
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry.name}/comm") as f:
+                        if f.read().strip() == "agency-gpu":
+                            count += 1
+                except OSError:
+                    pass
+            return count
+
+        pool = agResourcePool(gpus=[0], mark_gpus=True)
+        try:
+            time.sleep(0.5)
+            before = _count_agency_gpu()
+            assert before >= 1
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=1) as ex:
+                worker_name = ex.submit(_worker_import_agent).result(timeout=15)
+
+            assert worker_name != "MainProcess", "worker should not be MainProcess"
+            after = _count_agency_gpu()
+            assert after == before, (
+                f"worker import added {after - before} marker(s); "
+                "check the MainProcess guard in agResourcePool.__init__"
             )
         finally:
             pool._stop_gpu_markers()
