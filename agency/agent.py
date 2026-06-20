@@ -7,7 +7,6 @@ import shlex
 import subprocess
 import tarfile
 import threading
-import time
 import uuid as _uuid_mod
 import weakref
 from concurrent.futures import Future
@@ -42,7 +41,7 @@ def _pick_llm_config(llm_config: "dict | list[dict]") -> dict:
 
 from .agdata import agdata, _fmt_exc
 from .agtype import agtype
-from .agskill import agskill
+from .agskill import agskill, AGSKILL_REACT_MAX_STEPS
 from .agtool import agtool
 from .aglog import aglog, _ts
 from .agterm import agterm
@@ -554,7 +553,7 @@ class agent:
         except Exception:
             pass
 
-    def run(self, skill: "agskill", input: agdata, max_steps: int = 100) -> agdata:
+    def run(self, skill: "agskill", input: agdata, max_steps: int = AGSKILL_REACT_MAX_STEPS) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
         The future resolves only after:
@@ -588,20 +587,6 @@ class agent:
                 self._term.log("SKILL ▶  ", f"{skill_name}  input={list(input._data.keys())}")
                 self._set_ui_state("skill", skill=skill_name)
 
-                # ----------------------------------------------------------
-                # Outer monitoring loop
-                # Runs the ReAct loop, then waits for any background PIDs.
-                # If long-running PIDs remain after min_wait_s, re-enters the
-                # ReAct loop with a status ping so the agent can respond.
-                # ----------------------------------------------------------
-                current_input   = input
-                current_history = prev_history
-                outer_result:    agdata | None = None
-                outer_history:   agdata        = prev_history
-                outer_delta:     list[dict]    = []
-                outer_input_tokens:  int = 0
-                outer_output_tokens: int = 0
-                is_continuation  = False
                 # Snapshot cumulative log usage before this skill so the live
                 # token callback can compute the correct agent-total mid-skill.
                 _log_usage_before = self.log.token_usage
@@ -626,10 +611,10 @@ class agent:
                 # Prepare agtype fields first (agfile → file path), then offload
                 # any remaining oversized plain-string fields.
                 _offloaded_paths.extend(
-                    _prepare_agtype_inputs(current_input, af.input_schema, self.sandbox, skill_name)
+                    _prepare_agtype_inputs(input, af.input_schema, self.sandbox, skill_name)
                 )
                 auto_paths, auto_fields = _offload_large_fields(
-                    current_input, self.sandbox, skill_name, schema=af.input_schema
+                    input, self.sandbox, skill_name, schema=af.input_schema
                 )
                 _offloaded_paths.extend(auto_paths)
 
@@ -647,104 +632,39 @@ class agent:
                         f"automatically deleted after this task ends."
                     )
 
-                for _outer_iter in range(agent.max_outer_iters):
-                    def _drain_inbox() -> str | None:
-                        try:
-                            return self._inbox.get_nowait()
-                        except queue.Empty:
-                            return None
+                def _drain_inbox() -> str | None:
+                    try:
+                        return self._inbox.get_nowait()
+                    except queue.Empty:
+                        return None
 
-                    def _compact_log(**kw) -> None:
-                        self.log._lifecycle("compacted", agname=self.agname, **kw)
+                def _compact_log(**kw) -> None:
+                    self.log._lifecycle("compacted", agname=self.agname, **kw)
 
-                    # Skill-start marker in full history
-                    self._append_full_history({
-                        "type": "skill_start",
-                        "skill": skill_name,
-                        "ts": ts_start,
-                    })
+                # Skill-start marker in full history
+                self._append_full_history({
+                    "type": "skill_start",
+                    "skill": skill_name,
+                    "ts": ts_start,
+                })
 
-                    result, new_history, history_delta, _tok = af.run(
-                        self.llm_config, current_input, current_history,
-                        self.sandbox, pool, max_steps, term=self._term, log=self.log,
-                        _is_continuation=is_continuation,
-                        _state_fn=self._set_ui_state,
-                        _live_messages_fn=self._push_live_messages,
-                        _inbox_fn=_drain_inbox,
-                        _context_limit=self._context_limit,
-                        _compact_log_fn=_compact_log,
-                        _full_history_fn=self._append_full_history,
-                        _extra_system=_extra_system,
-                        _token_update_fn=_live_token_update,
-                    )
-                    outer_result  = result
-                    outer_history = new_history
-                    outer_delta.extend(history_delta)
-                    outer_input_tokens  += _tok[0]
-                    outer_output_tokens += _tok[1]
-
-                    # Snapshot which PIDs were outstanding when this ReAct
-                    # iteration ended — used below to detect completion.
-                    pids_at_end = set(self.sandbox._watched_pids)
-
-                    if not pids_at_end:
-                        break  # no background work — skill is done
-
-                    # Background processes detected — log the start of the wait.
-                    summary = self.sandbox.pid_status_summary()
-                    self._set_ui_state("proc_wait", skill=skill_name)
-                    self._term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
-                    self.log._lifecycle("procs_started", agname=self.agname,
-                                        skill=skill_name, pids=list(pids_at_end),
-                                        summary=summary)
-
-                    # Poll liveness at poll_interval_s granularity for up to
-                    # ping_interval_s total.  Break as soon as all PIDs are
-                    # gone — whether that takes 2 seconds or 5 minutes.
-                    deadline = time.monotonic() + agent.ping_interval_s
-                    while time.monotonic() < deadline:
-                        time.sleep(agent.poll_interval_s)
-                        if not self.sandbox.get_live_pids():
-                            break
-
-                    live_now = self.sandbox.get_live_pids()
-
-                    if not live_now:
-                        # All background processes finished — re-enter so the
-                        # agent can read their output and act on the results.
-                        self._term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
-                        self.log._lifecycle("procs_completed", agname=self.agname,
-                                            skill=skill_name)
-                        current_input = agdata(
-                            _event="process_completed",
-                            message=(
-                                "Background processes have completed. "
-                                "Read their output and act on the results."
-                            ),
-                        )
-                        current_history = new_history
-                        is_continuation = True
-                        continue
-
-                    # Processes still running after ping_interval_s — ping agent.
-                    summary = self.sandbox.pid_status_summary()
-                    self._term.log("PROCS ⏳  ", f"{skill_name}  still running: {summary}")
-                    self.log._lifecycle("procs_ping", agname=self.agname,
-                                        skill=skill_name, pids=list(live_now),
-                                        summary=summary)
-                    current_input   = agdata(
-                        _event="process_update",
-                        message=(
-                            f"Background processes are still running: {summary}. "
-                            f"You may check their output, wait, or proceed if appropriate. "
-                            f"If any of these processes are intentional long-running services "
-                            f"(daemons, servers, monitors) that should not block completion, "
-                            f"call daemon_release(pid) for each such PID to release it from "
-                            f"monitoring."
-                        ),
-                    )
-                    current_history = new_history
-                    is_continuation = True
+                outer_result, outer_history, outer_delta, _tok = af.run(
+                    self.llm_config, input, prev_history,
+                    self.sandbox, pool, max_steps, term=self._term, log=self.log,
+                    _state_fn=self._set_ui_state,
+                    _live_messages_fn=self._push_live_messages,
+                    _inbox_fn=_drain_inbox,
+                    _context_limit=self._context_limit,
+                    _compact_log_fn=_compact_log,
+                    _full_history_fn=self._append_full_history,
+                    _extra_system=_extra_system,
+                    _token_update_fn=_live_token_update,
+                    _ping_interval_s=agent.ping_interval_s,
+                    _poll_interval_s=agent.poll_interval_s,
+                    _agname=self.agname,
+                )
+                outer_input_tokens  = _tok[0]
+                outer_output_tokens = _tok[1]
 
                 # Recover agtype output fields from sandbox into the result agdata.
                 if outer_result is not None:
@@ -867,7 +787,7 @@ class agent:
         self,
         skill: "agskill",
         input: "agdata",
-        max_steps: int = 100,
+        max_steps: int = AGSKILL_REACT_MAX_STEPS,
     ) -> "agdata":
         """Async wrapper around ``run()`` for use in asyncio event loops.
 

@@ -60,9 +60,9 @@ try:
         assert "write tool" in s.system_prompt.lower()
         assert "markdown" in s.system_prompt.lower()
 
-    @pytest.mark.parametrize("max_retries", [0, 1, 3, 5, 10])
-    def test_compile_report_skill_max_retries_kwarg(max_retries):
-        assert CompileReportSkill(max_retries=max_retries).max_retries == max_retries
+    @pytest.mark.parametrize("max_output_schema_retries", [0, 1, 3, 5, 10])
+    def test_compile_report_skill_max_retries_kwarg(max_output_schema_retries):
+        assert CompileReportSkill(max_output_schema_retries=max_output_schema_retries).max_output_schema_retries == max_output_schema_retries
 
     @pytest.mark.parametrize("topic,summaries,output_path,exp_count", [
         ("attention",          ["s1"],                        "/out/report.md",   1),
@@ -99,7 +99,7 @@ try:
         assert result3._data.get("error") is not None
 
     def test_compile_report_skill_run_output_missing_field_triggers_retry():
-        s = CompileReportSkill(max_retries=1)
+        s = CompileReportSkill(max_output_schema_retries=1)
         responses = iter([
             _make_stream('{"report_path": "/tmp/r.md"}'),
             _make_stream('{"report_path": "/tmp/r.md", "paper_count": 2}'),
@@ -114,7 +114,7 @@ try:
         assert result.paper_count == 2
 
     def test_compile_report_skill_run_exhausted_retries_returns_error():
-        s = CompileReportSkill(max_retries=2)
+        s = CompileReportSkill(max_output_schema_retries=2)
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: \
                 _make_stream('{"wrong_field": "bad"}')

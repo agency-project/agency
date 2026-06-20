@@ -296,7 +296,7 @@ def test_output_schema_missing_field_triggers_retry():
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(summary=str),
-        max_retries=2,
+        max_output_schema_retries=2,
     )
     responses = [
         _direct('{"wrong_key": "oops"}'),   # fails validation → retry injected
@@ -312,7 +312,7 @@ def test_output_schema_retry_exhausted_returns_error():
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(answer=str),
-        max_retries=2,
+        max_output_schema_retries=2,
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"wrong": 1}')
@@ -325,7 +325,7 @@ def test_output_schema_type_mismatch_triggers_retry():
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(count=int),
-        max_retries=1,
+        max_output_schema_retries=1,
     )
     responses = [
         _direct('{"count": "should-be-int"}'),   # type mismatch
@@ -342,7 +342,7 @@ def test_correction_message_appended_on_retry():
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(answer=str),
-        max_retries=1,
+        max_output_schema_retries=1,
     )
     call_messages: list[list[dict]] = []
     def capture(**kwargs):
@@ -395,7 +395,7 @@ def test_no_schemas_system_prompt_unchanged():
 # Concurrency semaphore
 # ---------------------------------------------------------------------------
 
-from agency.agskill import _skill_semaphore as _sem
+from agency.agskill import _llm_call_semaphore as _sem
 
 
 def test_semaphore_released_after_success():
@@ -881,3 +881,558 @@ def test_tool_timeout_ignored_if_not_int():
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
 
     assert received_timeout.get("timeout") is None
+
+
+# ---------------------------------------------------------------------------
+# _strip_thinking / _extract_thinking
+# ---------------------------------------------------------------------------
+
+from agency.agskill import _strip_thinking, _extract_thinking
+
+
+def test_strip_thinking_removes_think_tag():
+    assert _strip_thinking("<think>reasoning</think>answer") == "answer"
+
+
+def test_strip_thinking_removes_thinking_tag():
+    assert _strip_thinking("<thinking>deep thought</thinking>result") == "result"
+
+
+def test_strip_thinking_no_tag_unchanged():
+    assert _strip_thinking("plain answer") == "plain answer"
+
+
+def test_extract_thinking_returns_content():
+    assert _extract_thinking("<think>my reasoning</think>answer") == "my reasoning"
+
+
+def test_extract_thinking_no_tag_returns_empty():
+    assert _extract_thinking("no thinking here") == ""
+
+
+def test_extract_thinking_multiple_blocks():
+    text = "<think>first</think>middle<think>second</think>end"
+    result = _extract_thinking(text)
+    assert "first" in result and "second" in result
+
+
+# ---------------------------------------------------------------------------
+# _build_llm_kwargs
+# ---------------------------------------------------------------------------
+
+from agency.agskill import _build_llm_kwargs
+
+
+def test_build_llm_kwargs_model_and_messages():
+    msgs = [{"role": "user", "content": "hi"}]
+    kw = _build_llm_kwargs({"model": "gpt-4o"}, msgs, None)
+    assert kw["model"] == "gpt-4o"
+    assert kw["messages"] == msgs
+
+
+def test_build_llm_kwargs_strips_private_keys():
+    msgs = [{"role": "assistant", "content": "ok", "_thinking": "secret"}]
+    kw = _build_llm_kwargs({"model": "m"}, msgs, None)
+    assert "_thinking" not in kw["messages"][0]
+    assert "content" in kw["messages"][0]
+
+
+def test_build_llm_kwargs_openai_gen_params():
+    kw = _build_llm_kwargs({"model": "m", "temperature": 0.7, "max_tokens": 100}, [], None)
+    assert kw["temperature"] == 0.7
+    assert kw["max_tokens"] == 100
+
+
+def test_build_llm_kwargs_extra_body_vllm_params():
+    kw = _build_llm_kwargs({"model": "m", "top_k": 50, "repetition_penalty": 1.1}, [], None)
+    assert kw["extra_body"]["top_k"] == 50
+    assert kw["extra_body"]["repetition_penalty"] == 1.1
+
+
+def test_build_llm_kwargs_tools_included_when_provided():
+    tools = [{"type": "function", "function": {"name": "f"}}]
+    kw = _build_llm_kwargs({"model": "m"}, [], tools)
+    assert kw["tools"] == tools
+
+
+def test_build_llm_kwargs_no_tools_key_when_none():
+    kw = _build_llm_kwargs({"model": "m"}, [], None)
+    assert "tools" not in kw
+
+
+# ---------------------------------------------------------------------------
+# _build_assistant_msg
+# ---------------------------------------------------------------------------
+
+from agency.agskill import _build_assistant_msg
+
+
+def test_build_assistant_msg_plain_content():
+    msg = _build_assistant_msg(["hello", " world"], [], {})
+    assert msg["role"] == "assistant"
+    assert msg["content"] == "hello world"
+
+
+def test_build_assistant_msg_reasoning_parts():
+    msg = _build_assistant_msg(["answer"], ["think ", "harder"], {})
+    assert msg["_thinking"] == "think harder"
+    assert msg["content"] == "answer"
+
+
+def test_build_assistant_msg_think_tag_stripped():
+    msg = _build_assistant_msg(["<think>reasoning</think>answer"], [], {})
+    assert msg.get("_thinking") == "reasoning"
+    assert msg["content"] == "answer"
+
+
+def test_build_assistant_msg_tool_calls_included():
+    tc = {0: {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}}
+    msg = _build_assistant_msg([], [], tc)
+    assert len(msg["tool_calls"]) == 1
+    assert msg["tool_calls"][0]["function"]["name"] == "f"
+
+
+def test_build_assistant_msg_tool_calls_sorted_by_index():
+    tc = {
+        1: {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+        0: {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+    }
+    msg = _build_assistant_msg([], [], tc)
+    assert msg["tool_calls"][0]["function"]["name"] == "a"
+    assert msg["tool_calls"][1]["function"]["name"] == "b"
+
+
+# ---------------------------------------------------------------------------
+# _drain_inbox
+# ---------------------------------------------------------------------------
+
+from agency.agskill import _drain_inbox
+
+
+def test_drain_inbox_no_inbox_fn_returns_false():
+    messages = []
+    assert _drain_inbox(messages, None, None, None) is False
+    assert messages == []
+
+
+def test_drain_inbox_empty_queue_returns_false():
+    messages = []
+    calls = iter([None])
+    assert _drain_inbox(messages, lambda: next(calls), None, None) is False
+    assert messages == []
+
+
+def test_drain_inbox_single_message_appended():
+    messages = [{"role": "system", "content": "sys"}]
+    calls = iter(["hello", None])
+    had = _drain_inbox(messages, lambda: next(calls), None, None)
+    assert had is True
+    assert messages[-1] == {"role": "user", "content": "hello"}
+
+
+def test_drain_inbox_multiple_messages_all_appended():
+    messages = []
+    calls = iter(["msg1", "msg2", None])
+    _drain_inbox(messages, lambda: next(calls), None, None)
+    assert len(messages) == 2
+    assert messages[0]["content"] == "msg1"
+    assert messages[1]["content"] == "msg2"
+
+
+def test_drain_inbox_calls_live_fn():
+    messages = [{"role": "system", "content": "sys"}]
+    live_calls = []
+    calls = iter(["hi", None])
+    _drain_inbox(messages, lambda: next(calls), lambda m: live_calls.append(len(m)), None)
+    assert len(live_calls) == 1
+
+
+def test_drain_inbox_calls_full_history_fn():
+    messages = []
+    history_calls = []
+    calls = iter(["hi", None])
+    _drain_inbox(messages, lambda: next(calls), None, lambda m: history_calls.append(m))
+    assert len(history_calls) == 1
+    assert history_calls[0]["content"] == "hi"
+
+
+# ---------------------------------------------------------------------------
+# _wait_for_processes
+# ---------------------------------------------------------------------------
+
+from agency.agskill import _wait_for_processes
+
+
+def _make_real_sandbox(watched_pids=None):
+    """Minimal sandbox stub with real _watched_pids dict for process monitoring tests."""
+    class _FakeSandbox:
+        def __init__(self):
+            self._watched_pids = dict(watched_pids or {})
+
+        def get_live_pids(self):
+            return set(self._watched_pids.keys())
+
+        def pid_status_summary(self):
+            return ", ".join(f"PID {p}" for p in self._watched_pids)
+    return _FakeSandbox()
+
+
+def test_wait_for_processes_clean_sandbox_returns_none():
+    sb = _make_real_sandbox()
+    assert _wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
+
+
+def test_wait_for_processes_no_watched_pids_attr_returns_none():
+    class NoPids: pass
+    assert _wait_for_processes(NoPids(), "skill", None, None, "", 300, 5) is None
+
+
+def test_wait_for_processes_mock_sandbox_returns_none():
+    from unittest.mock import MagicMock
+    sb = MagicMock()
+    assert _wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
+
+
+def test_wait_for_processes_completes_quickly_returns_completed_msg():
+    class _FakeSandbox:
+        def __init__(self):
+            self._watched_pids = {1234: 0.0}
+            self._call_count = 0
+
+        def get_live_pids(self):
+            self._call_count += 1
+            # return empty on second poll → processes done
+            if self._call_count >= 2:
+                self._watched_pids.clear()
+                return set()
+            return {1234}
+
+        def pid_status_summary(self):
+            return "PID 1234"
+
+    sb = _FakeSandbox()
+    result = _wait_for_processes(sb, "skill", None, None, "", ping_interval_s=30, poll_interval_s=0.01)
+    assert result is not None
+    assert "completed" in result.lower() or "Background processes have completed" in result
+
+
+def test_wait_for_processes_still_running_returns_update_msg():
+    class _FakeSandbox:
+        def __init__(self):
+            self._watched_pids = {1234: 0.0}
+
+        def get_live_pids(self):
+            return {1234}
+
+        def pid_status_summary(self):
+            return "PID 1234"
+
+    sb = _FakeSandbox()
+    result = _wait_for_processes(sb, "skill", None, None, "", ping_interval_s=0.02, poll_interval_s=0.01)
+    assert result is not None
+    assert "still running" in result.lower() or "Background processes are still running" in result
+
+
+def test_wait_for_processes_calls_state_fn():
+    class _FakeSandbox:
+        def __init__(self):
+            self._watched_pids = {1: 0.0}
+            self._call_count = 0
+
+        def get_live_pids(self):
+            # First call returns live pids (triggers monitoring), second returns empty.
+            self._call_count += 1
+            if self._call_count >= 2:
+                return set()
+            return {1}
+
+        def pid_status_summary(self): return "PID 1"
+
+    states = []
+    _wait_for_processes(_FakeSandbox(), "myskill", None, None, "", 30, 0.01,
+                        _state_fn=lambda state, **kw: states.append(state))
+    assert "proc_wait" in states
+
+
+# ---------------------------------------------------------------------------
+# agskill._validate_input
+# ---------------------------------------------------------------------------
+
+from agency.agtype import agrawstring
+
+
+def test_validate_input_no_schema_returns_none():
+    s = make_skill()
+    assert s._validate_input(agdata(x=1), False, None) is None
+
+
+def test_validate_input_continuation_skips_check():
+    s = agskill("s", "p", input_schema=agdata(x=agrawstring))
+    assert s._validate_input(agdata(), True, None) is None
+
+
+def test_validate_input_schema_mismatch_returns_error():
+    s = agskill("s", "p", input_schema=agdata(x=agrawstring))
+    error = s._validate_input(agdata(), False, None)
+    assert error is not None
+    assert "x" in error
+
+
+# ---------------------------------------------------------------------------
+# agskill._build_initial_messages
+# ---------------------------------------------------------------------------
+
+def test_build_initial_messages_structure():
+    s = make_skill()
+    history = agdata(messages=[{"role": "user", "content": "prior"}])
+    msgs, n_before = s._build_initial_messages(agdata(q="hi"), history, None, None, None)
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["content"] == "prior"
+    assert msgs[-1]["role"] == "user"
+    assert n_before == 1
+
+
+def test_build_initial_messages_fires_live_fn():
+    s = make_skill()
+    live_calls = []
+    s._build_initial_messages(agdata(), agdata(messages=[]), None,
+                              lambda m: live_calls.append(m), None)
+    assert len(live_calls) == 1
+
+
+def test_build_initial_messages_fires_full_history_fn():
+    s = make_skill()
+    history_items = []
+    s._build_initial_messages(agdata(q="test"), agdata(messages=[]), None, None,
+                              lambda m: history_items.append(m["role"]))
+    assert "system" in history_items
+    assert "user" in history_items
+
+
+# ---------------------------------------------------------------------------
+# agskill._parse_final_answer
+# ---------------------------------------------------------------------------
+
+def test_parse_final_answer_valid_json_returns_result():
+    s = make_skill()
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    msg_dict = {"role": "assistant", "content": '{"answer": "42"}'}
+    far = s._parse_final_answer(msg_dict, msgs, 1, 3, (0, 0))
+    assert far.kind == "return"
+    assert far.return_tuple[0].answer == "42"
+
+
+def test_parse_final_answer_invalid_json_with_retries_returns_retry():
+    # Use a str (not agrawstring) field so the JSON parse path is taken.
+    s = agskill("s", "p", output_schema=agdata(answer=str))
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    msg_dict = {"role": "assistant", "content": "not json at all !!!"}
+    far = s._parse_final_answer(msg_dict, msgs, 1, 2, (0, 0))
+    assert far.kind == "retry"
+    assert far.correction_msg is not None
+
+
+def test_parse_final_answer_invalid_json_no_retries_returns_error():
+    # Use a str (not agrawstring) field so the JSON parse path is taken.
+    s = agskill("s", "p", output_schema=agdata(answer=str))
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    msg_dict = {"role": "assistant", "content": "not json at all !!!"}
+    far = s._parse_final_answer(msg_dict, msgs, 1, 0, (0, 0))
+    assert far.kind == "error"
+
+
+def test_parse_final_answer_rawstring_output_bypasses_json():
+    s = agskill("s", "p", output_schema=agdata(text=agrawstring))
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    msg_dict = {"role": "assistant", "content": "plain text response"}
+    far = s._parse_final_answer(msg_dict, msgs, 1, 3, (0, 0))
+    assert far.kind == "return"
+    assert far.return_tuple[0].text == "plain text response"
+
+
+def test_parse_final_answer_strips_markdown_fences():
+    s = make_skill()
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    msg_dict = {"role": "assistant", "content": '```json\n{"val": 1}\n```'}
+    far = s._parse_final_answer(msg_dict, msgs, 1, 3, (0, 0))
+    assert far.kind == "return"
+    assert far.return_tuple[0].val == 1
+
+
+# ---------------------------------------------------------------------------
+# run() — sandbox process monitoring
+# ---------------------------------------------------------------------------
+
+def test_run_continues_loop_when_sandbox_has_live_pids():
+    """When sandbox has live PIDs after final answer, loop re-enters."""
+    call_count = [0]
+
+    class _TrackedSandbox:
+        def __init__(self):
+            self._watched_pids = {9999: 0.0}
+            self._cleared = False
+
+        def get_live_pids(self):
+            if self._cleared:
+                return set()
+            return {9999}
+
+        def pid_status_summary(self):
+            return "PID 9999"
+
+        def commit(self, *a): return False
+
+        def restore(self, *a): pass
+
+        def write_file(self, *a): pass
+
+    sb = _TrackedSandbox()
+
+    def create_side_effect(**kw):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return _direct('{"done": true}')
+        # On second entry, clear pids so loop exits
+        sb._watched_pids.clear()
+        sb._cleared = True
+        return _direct('{"done": true}')
+
+    # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
+    s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = create_side_effect
+        result, _, _, _ = s.run(
+            LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sb,
+            _ping_interval_s=0.05, _poll_interval_s=0.01,
+        )
+
+    assert call_count[0] == 2   # loop re-entered once
+    assert result.done is True
+
+
+def test_run_injects_process_completed_message():
+    """The continuation message injected when processes complete contains expected text."""
+    # The sandbox starts with live PIDs. After the first LLM response, _wait_for_processes
+    # polls and sees them finish, then injects the "Background processes have completed"
+    # message. The second LLM call then receives that message and returns the final answer.
+    class _TrackedSandbox:
+        def __init__(self):
+            self._watched_pids = {1: 0.0}
+            self._pid_call_count = 0
+
+        def get_live_pids(self):
+            self._pid_call_count += 1
+            # First call (pre-check inside _wait_for_processes): still alive.
+            # Second call (during poll loop): clear and report done.
+            if self._pid_call_count >= 2:
+                self._watched_pids.clear()
+                return set()
+            return {1}
+
+        def pid_status_summary(self): return "PID 1"
+
+        def commit(self, *a): return False
+
+        def restore(self, *a): pass
+
+        def write_file(self, *a): pass
+
+    sb = _TrackedSandbox()
+    all_messages_per_call: list[list[dict]] = []
+
+    def create_side_effect(**kw):
+        all_messages_per_call.append(list(kw["messages"]))
+        return _direct('{"ok": 1}')
+
+    # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
+    s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = create_side_effect
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sb,
+              _ping_interval_s=30, _poll_interval_s=0.01)
+
+    # The second LLM call should have the injected proc message in its user messages
+    assert len(all_messages_per_call) == 2
+    second_call_contents = [m.get("content", "") for m in all_messages_per_call[1] if m.get("role") == "user"]
+    assert any("Background processes" in c or "completed" in c.lower() for c in second_call_contents)
+
+
+def test_run_clean_sandbox_returns_immediately():
+    """Sandbox with no PIDs does not delay return at all."""
+    class _CleanSandbox:
+        _watched_pids: dict = {}
+
+        def get_live_pids(self): return set()
+
+        def pid_status_summary(self): return ""
+
+        def commit(self, *a): return False
+
+        def restore(self, *a): pass
+
+        def write_file(self, *a): pass
+
+    # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
+    s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": 1}')
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]),
+                                sandbox=_CleanSandbox(), _ping_interval_s=0.01, _poll_interval_s=0.001)
+    assert result.ok == 1
+
+
+# ---------------------------------------------------------------------------
+# run() — _is_continuation skips input schema validation
+# ---------------------------------------------------------------------------
+
+def test_is_continuation_bypasses_input_schema():
+    s = agskill("s", "p", input_schema=agdata(required_field=agrawstring))
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
+        # Missing required_field — would fail schema without _is_continuation
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(), agdata(messages=[]),
+                                sandbox=None, _is_continuation=True)
+    assert result.error is None or "input schema" not in str(result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# run() — thinking extraction from stream
+# ---------------------------------------------------------------------------
+
+def test_run_extracts_thinking_from_think_tag():
+    s = make_skill()
+
+    class _ThinkChunk:
+        usage = None
+        choices = [type("C", (), {"delta": type("D", (), {
+            "content": "<think>internal reasoning</think>final answer",
+            "tool_calls": None,
+            "model_extra": {},
+            "reasoning_content": None,
+        })()})()]
+
+    class _UsageChunk:
+        usage = _Usage()
+        choices = []
+
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = [_ThinkChunk(), _UsageChunk()]
+        _, hist, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assistant_msgs = [m for m in hist.messages if m.get("role") == "assistant"]
+    assert any("_thinking" in m for m in assistant_msgs)
+
+
+# ---------------------------------------------------------------------------
+# run() — token accumulation
+# ---------------------------------------------------------------------------
+
+def test_run_returns_token_counts():
+    s = make_skill()
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = _direct('{}')
+        _, _, _, tokens = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert isinstance(tokens, tuple)
+    assert len(tokens) == 2
+    # _Usage stub reports prompt_tokens=5
+    assert tokens[0] == 5

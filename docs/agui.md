@@ -74,7 +74,7 @@ The bottom-left pane shows the live `_snapshot_messages` list of the selected ag
 | `◆ asst` | LLM text response |
 | `▶ LLM Thinking...` | Agent is waiting for LLM (cycling dots) |
 | `▶ Tool Running: bash...` | Agent is executing a tool (cycling dots) |
-| `▶ Waiting for processes...` | Agent is in the outer monitoring loop (cycling dots) |
+| `▶ Waiting for processes...` | Agent is inside `_wait_for_processes` polling for sandbox PIDs (cycling dots) |
 
 ### Sending messages to an agent
 

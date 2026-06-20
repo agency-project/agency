@@ -36,6 +36,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 timeout = 120
+tmp_path_retention_count = 1
+tmp_path_retention_policy = "failed"
+addopts = "--basetemp=/data/js_park/tmp"
 filterwarnings = [
     # ProcessPoolExecutor uses fork() on Linux. The deprecation warning fires
     # once per worker process creation and is noise in test output — the fork

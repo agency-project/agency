@@ -31,14 +31,11 @@ def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
         if timeout is not None:
             timeout = float(timeout)
         if sandbox._gpu_id is not None:
-            return agdata(
-                gpu_id=sandbox._gpu_id,
-                message=f"GPU {sandbox._gpu_id} already held",
-            )
+            return agdata(gpu_id=sandbox._gpu_id, message="1 GPU already held — use cuda:0")
         try:
             gpu_id = pool.acquire_gpu(timeout=timeout)
             sandbox._gpu_id = gpu_id
-            return agdata(gpu_id=gpu_id, message=f"GPU {gpu_id} acquired")
+            return agdata(gpu_id=gpu_id, message="1 GPU allocated — use cuda:0")
         except TimeoutError as e:
             return agdata(error=_fmt_exc(e))
 
@@ -47,8 +44,8 @@ def make_gpu_acquire(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
         fn=_run,
         description=(
             "Acquire exclusive access to a GPU before running commands with GPU acceleration. "
-            "Returns the assigned GPU ID. CUDA_VISIBLE_DEVICES is set automatically for "
-            "all subsequent bash calls. Always call gpu_release when finished."
+            "CUDA_VISIBLE_DEVICES is set automatically — always use cuda:0 inside your scripts. "
+            "Always call gpu_release when finished."
         ),
         params={
             "type": "object",
@@ -67,10 +64,9 @@ def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
         if sandbox._gpu_id is None:
             return agdata(message="no GPU currently held")
-        released = sandbox._gpu_id
-        pool.release_gpu(released)
+        pool.release_gpu(sandbox._gpu_id)
         sandbox._gpu_id = None
-        return agdata(message=f"GPU {released} released")
+        return agdata(message="GPU released")
 
     return agtool(
         name="gpu_release",

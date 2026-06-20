@@ -216,9 +216,10 @@ class agSandbox:
                     self._run([self._runtime, "rmi", self._restore_image], check=False)
                 else:
                     image = self._resolve_image(self.BASE_IMAGE)
+                    cpu_flags = ["--cpus=1"] if self._cfs_supported() else []
                     run_cmd = (
-                        [self._runtime, "run", "-d", "--name", name, "--cpus=1"]
-                        + self._gpu_flags + self._vol_flags
+                        [self._runtime, "run", "-d", "--name", name]
+                        + cpu_flags + self._gpu_flags + self._vol_flags
                         + [image, "tail", "-f", "/dev/null"]
                     )
                     self._run_with_conflict_retry(run_cmd, name)
@@ -273,6 +274,12 @@ class agSandbox:
 
     def _container_name(self) -> str:
         return self._name
+
+    @staticmethod
+    def _cfs_supported() -> bool:
+        """Return True if the kernel supports CFS CPU quota enforcement."""
+        import os
+        return os.path.exists("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
 
     def _snapshot_pids(self) -> set[int]:
         """Return the set of all live PIDs currently in the container, excluding
@@ -350,8 +357,12 @@ class agSandbox:
         # Restrict GPU access to the acquired GPU ID. Set both CUDA_VISIBLE_DEVICES
         # (NVIDIA/CUDA) and HIP_VISIBLE_DEVICES (AMD/ROCm) so only the leased
         # device is accessible regardless of which runtime is present.
-        gpu_id = str(self._gpu_id) if self._gpu_id is not None else ""
-        env_export = f"export CUDA_VISIBLE_DEVICES={gpu_id}\nexport HIP_VISIBLE_DEVICES={gpu_id}\n"
+        # "NoDevFiles" hides all GPUs when no GPU has been acquired.
+        # An empty string would leave CUDA_VISIBLE_DEVICES unset, making all GPUs visible.
+        gpu_id = str(self._gpu_id) if self._gpu_id is not None else "NoDevFiles"
+        hf_token = os.environ.get("HF_TOKEN", "")
+        hf_export = f"export HF_TOKEN={hf_token}\n" if hf_token else ""
+        env_export = f"export CUDA_VISIBLE_DEVICES={gpu_id}\nexport HIP_VISIBLE_DEVICES={gpu_id}\n{hf_export}"
 
         wrapped = (
             f"exec 2>&1\n"      # merge stderr into stdout so the BGPIDS marker is never split
@@ -428,10 +439,12 @@ class agSandbox:
         if not self._started:
             return
         cmd = [self._runtime, "update"]
-        if cpus is not None:
+        if cpus is not None and self._cfs_supported():
             cmd.append(f"--cpus={cpus}")
         if memory is not None:
             cmd.append(f"--memory={memory}")
+        if len(cmd) == 2:
+            return  # nothing to update
         cmd.append(self._container_name())
         self._run(cmd, timeout=10)
 

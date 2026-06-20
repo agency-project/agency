@@ -55,11 +55,11 @@ try:
         assert "write tool" in s.system_prompt.lower()
         assert "sandbox" in s.system_prompt.lower()
 
-    @pytest.mark.parametrize("max_retries,expected", [
+    @pytest.mark.parametrize("max_output_schema_retries,expected", [
         (0, 0), (1, 1), (3, 3), (5, 5), (10, 10),
     ])
-    def test_writer_skill_max_retries_kwarg(max_retries, expected):
-        assert WriterSkill(max_retries=max_retries).max_retries == expected
+    def test_writer_skill_max_retries_kwarg(max_output_schema_retries, expected):
+        assert WriterSkill(max_output_schema_retries=max_output_schema_retries).max_output_schema_retries == expected
 
     @pytest.mark.parametrize("file_path,content,exp_path,exp_status", [
         ("/workspace/out.txt",    "hello world",      "/workspace/out.txt",    "ok"),
@@ -90,7 +90,7 @@ try:
         assert result3._data.get("error") is not None
 
     def test_writer_skill_run_output_missing_field_triggers_retry():
-        s = WriterSkill(max_retries=1)
+        s = WriterSkill(max_output_schema_retries=1)
         responses = iter([
             _make_stream('{"path": "/tmp/f.txt"}'),
             _make_stream('{"path": "/tmp/f.txt", "status": "ok"}'),

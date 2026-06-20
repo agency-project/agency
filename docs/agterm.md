@@ -37,9 +37,9 @@ Example output from a running agent:
 | `SKILL ✗  ` | reverse | Skill failed (exception or schema error) |
 | `LLM      ` | normal | LLM call dispatched |
 | `TOOL ✓   ` | normal | Tool call completed |
-| `PROCS ▶  ` | — | Background processes detected; outer loop started |
-| `PROCS ⏳  ` | — | Outer loop ping; processes still running |
-| `PROCS ✓  ` | — | All processes completed; re-entering agent |
+| `PROCS ▶  ` | — | Background processes detected; `_wait_for_processes` polling started |
+| `PROCS ⏳  ` | — | Ping timeout elapsed; processes still running — injecting status message |
+| `PROCS ✓  ` | — | All processes completed; injecting completion message |
 | `COMPACT  ` | — | Context window compacted |
 | `PRUNE    ` | — | History pruned |
 | `CKPT     ` | — | Checkpoint saved or loaded |

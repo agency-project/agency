@@ -56,12 +56,16 @@ The agent calls these tools itself during a skill, just like any other tool. `da
 
 ```python
 try:
-    # outer monitoring loop ...
+    outer_result, outer_history, outer_delta, _tok = af.run(...)
+    ...
 finally:
-    self.sandbox.release_resources(pool)
+    if self.sandbox is not None:
+        if self.sandbox._gpu_id is not None:
+            pool.release_gpu(self.sandbox._gpu_id)
+        self.sandbox.destroy()
 ```
 
-GPU semaphores and CPU/memory limits are returned even if the skill raises an exception or hits `max_outer_iters`.
+GPU semaphores and CPU/memory limits are returned even if the skill raises an exception or `max_steps` is exceeded.
 
 ## `agResourcePool` API
 

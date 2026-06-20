@@ -241,7 +241,7 @@ If the serialized result exceeds `_TOOL_OUTPUT_OFFLOAD_CHARS` (default 20 000 ch
 
 ## bash process tracking
 
-The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by the outer loop. See [agsandbox.md](agsandbox.md) for exec wrapper details and [execution_loop.md](execution_loop.md) for the outer monitoring loop.
+The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by `_wait_for_processes` inside `agskill.run()`. See [agsandbox.md](agsandbox.md) for exec wrapper details and [execution_process_control.md](execution_process_control.md) for per-scenario process monitoring traces.
 
 ## `daemon_release` tool
 
@@ -251,7 +251,7 @@ Use this when a process is intentionally long-lived (a server, monitor, or backg
 LLM calls: daemon_release({"pid": 1234})
 ```
 
-This moves PID 1234 (and all its future descendants) from `_watched_pids` to `_daemon_pids`. The outer loop no longer waits for it, and the skill resolves normally. The process keeps running in the container until the container is destroyed.
+This moves PID 1234 (and all its future descendants) from `_watched_pids` to `_daemon_pids`. `_wait_for_processes` no longer sees it as a live process, and the skill resolves normally. The process keeps running in the container until the container is destroyed.
 
 ## `ask_human` tool
 

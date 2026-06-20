@@ -17,19 +17,42 @@ def server(tmp_path):
     import agency.agwebui.server as srv
     from fastapi.testclient import TestClient
 
-    # Snapshot and override module-level globals before the app starts
-    old = (srv._run_dir, srv._reply_dir, srv._all_events, srv._clients)
-    srv._run_dir    = tmp_path
-    srv._reply_dir  = tmp_path / "ui_replies"
+    # Snapshot all module-level globals before the app starts
+    old_run_dir   = srv._run_dir
+    old_reply_dir = srv._reply_dir
+    old_clients   = srv._clients
+    old_index     = srv._sparse_index
+    old_since_idx = srv._events_since_index
+    old_offset    = srv._file_offset
+    old_size      = srv._file_size
+    old_first_ts  = srv._first_ts
+    old_last_ts   = srv._last_ts
+
+    # Point the server at a fresh temp directory
+    srv._run_dir            = tmp_path
+    srv._reply_dir          = tmp_path / "ui_replies"
     srv._reply_dir.mkdir()
-    srv._all_events = []
-    srv._clients    = set()
+    srv._clients            = set()
+    srv._sparse_index       = []
+    srv._events_since_index = 0
+    srv._file_offset        = 0
+    srv._file_size          = 0
+    srv._first_ts           = None
+    srv._last_ts            = None
 
     with TestClient(srv.app) as client:
         yield client, tmp_path, srv
 
-    # Restore so other tests see a clean state
-    srv._run_dir, srv._reply_dir, srv._all_events, srv._clients = old
+    # Restore so subsequent tests see a clean state
+    srv._run_dir            = old_run_dir
+    srv._reply_dir          = old_reply_dir
+    srv._clients            = old_clients
+    srv._sparse_index       = old_index
+    srv._events_since_index = old_since_idx
+    srv._file_offset        = old_offset
+    srv._file_size          = old_size
+    srv._first_ts           = old_first_ts
+    srv._last_ts            = old_last_ts
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +84,7 @@ def test_static_js_served(server):
 
 
 # ---------------------------------------------------------------------------
-# Tail task — populates _all_events from the event file
+# Tail task — reads ui_events.jsonl and updates file-offset globals
 # ---------------------------------------------------------------------------
 
 def _wait_for(condition, timeout=3.0, interval=0.05):
@@ -74,8 +97,8 @@ def _wait_for(condition, timeout=3.0, interval=0.05):
     return False
 
 
-def test_tail_task_populates_all_events(server):
-    """Tail task must read ui_events.jsonl and add lines to _all_events."""
+def test_tail_task_reads_events_file(server):
+    """Tail task must read ui_events.jsonl and advance _file_offset."""
     client, run_dir, srv = server
     event_file = run_dir / "ui_events.jsonl"
 
@@ -83,9 +106,8 @@ def test_tail_task_populates_all_events(server):
         json.dumps({"type": "log", "line": "hello", "ts": 1.0}) + "\n"
     )
 
-    assert _wait_for(lambda: len(srv._all_events) >= 1), \
-        "tail task did not populate _all_events within 3 s"
-    assert json.loads(srv._all_events[0])["line"] == "hello"
+    assert _wait_for(lambda: srv._file_offset > 0), \
+        "tail task did not process ui_events.jsonl within 3 s"
 
 
 def test_tail_task_appends_new_events(server):
@@ -94,20 +116,19 @@ def test_tail_task_appends_new_events(server):
     event_file = run_dir / "ui_events.jsonl"
 
     event_file.write_text(json.dumps({"type": "log", "line": "first", "ts": 1.0}) + "\n")
-    assert _wait_for(lambda: len(srv._all_events) >= 1)
+    assert _wait_for(lambda: srv._file_offset > 0), \
+        "tail task did not pick up first event"
+    first_offset = srv._file_offset
 
-    # Append a second event
     with open(event_file, "a") as f:
         f.write(json.dumps({"type": "done", "ts": 2.0}) + "\n")
 
-    assert _wait_for(lambda: len(srv._all_events) >= 2), \
+    assert _wait_for(lambda: srv._file_offset > first_offset), \
         "tail task did not pick up appended event"
-    types = [json.loads(e)["type"] for e in srv._all_events]
-    assert types == ["log", "done"]
 
 
 # ---------------------------------------------------------------------------
-# WebSocket — historical replay
+# WebSocket helpers
 # ---------------------------------------------------------------------------
 
 def _recv_n(ws, n, timeout=5.0):
@@ -127,19 +148,59 @@ def _recv_n(ws, n, timeout=5.0):
     return results
 
 
+def _recv_skipping_sync(ws, n, timeout=5.0):
+    """Receive n non-timeline_sync messages, discarding the initial sync packet."""
+    results = []
+
+    def _reader():
+        try:
+            while len(results) < n:
+                msg = json.loads(ws.receive_text())
+                if msg.get("type") != "timeline_sync":
+                    results.append(msg)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — initial timeline_sync on connect
+# ---------------------------------------------------------------------------
+
+def test_websocket_sends_timeline_sync_on_connect(server):
+    """First message on every WebSocket connection must be timeline_sync."""
+    client, _, _ = server
+    with client.websocket_connect("/ws") as ws:
+        received = _recv_n(ws, 1, timeout=3.0)
+    assert received, "no message received"
+    assert received[0]["type"] == "timeline_sync"
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — historical replay
+# ---------------------------------------------------------------------------
+
 def test_websocket_replays_history_on_connect(server):
     """Client connecting after events exist should receive full replay."""
     client, run_dir, srv = server
+    event_file = run_dir / "ui_events.jsonl"
 
-    # Directly populate _all_events (decoupled from tail-task timing)
     lines = [
         json.dumps({"type": "log",              "line": "line one", "ts": 1.0}),
         json.dumps({"type": "agent_registered", "agname": "Bot", "color": "#f00", "ts": 2.0}),
     ]
-    srv._all_events.extend(lines)
+    event_file.write_text("\n".join(lines) + "\n")
+
+    # Wait for tail task to index the file so the WebSocket can replay it
+    assert _wait_for(lambda: srv._file_offset > 0), \
+        "tail task did not process file before WebSocket connect"
 
     with client.websocket_connect("/ws") as ws:
-        received = _recv_n(ws, 2)
+        received = _recv_skipping_sync(ws, 2)
 
     assert len(received) == 2
     assert received[0]["type"] == "log"
@@ -150,12 +211,18 @@ def test_websocket_replays_history_on_connect(server):
 def test_websocket_new_client_sees_all_history(server):
     """A client that connects late gets every event emitted so far."""
     client, run_dir, srv = server
+    event_file = run_dir / "ui_events.jsonl"
 
-    for i in range(3):
-        srv._all_events.append(json.dumps({"type": "log", "line": f"msg{i}", "ts": float(i)}))
+    lines = "\n".join(
+        json.dumps({"type": "log", "line": f"msg{i}", "ts": float(i)})
+        for i in range(3)
+    ) + "\n"
+    event_file.write_text(lines)
+    assert _wait_for(lambda: srv._file_offset > 0), \
+        "tail task did not process file"
 
     with client.websocket_connect("/ws") as ws:
-        received = _recv_n(ws, 3)
+        received = _recv_skipping_sync(ws, 3)
 
     assert [e["line"] for e in received] == ["msg0", "msg1", "msg2"]
 
@@ -169,17 +236,14 @@ def test_websocket_receives_live_events(server):
     client, run_dir, srv = server
     event_file = run_dir / "ui_events.jsonl"
 
-    received = []
-
     with client.websocket_connect("/ws") as ws:
+        # Consume the initial timeline_sync (sent for the empty file on connect)
+        sync = json.loads(ws.receive_text())
+        assert sync["type"] == "timeline_sync"
+
         # Write event AFTER connecting — tail task will broadcast it
         event_file.write_text(json.dumps({"type": "done", "ts": 9.0}) + "\n")
 
-        # Wait for _all_events to be populated by the tail task
-        assert _wait_for(lambda: len(srv._all_events) >= 1), \
-            "tail task did not broadcast live event"
-
-        # Receive the broadcast message with a thread+timeout
         received = _recv_n(ws, 1, timeout=3.0)
 
     assert received, "no live event received"
@@ -199,7 +263,6 @@ def test_websocket_human_reply_writes_file(server):
             "ask_id": "testask01",
             "text": "my answer",
         }))
-        # Give the server a moment to write the file
         assert _wait_for(
             lambda: (run_dir / "ui_replies" / "testask01.txt").exists()
         ), "reply file was not written"
@@ -227,6 +290,5 @@ def test_websocket_malformed_json_ignored(server):
         ws.send_text("not json {{")
         time.sleep(0.1)
 
-    # Server should still be alive
     resp = client.get("/health")
     assert resp.status_code == 200

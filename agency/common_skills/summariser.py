@@ -54,9 +54,9 @@ try:
         assert "summary" in s.output_schema._data
         assert "one sentence" in s.system_prompt.lower()
 
-    @pytest.mark.parametrize("max_retries", [0, 1, 2, 5, 10])
-    def test_summariser_skill_max_retries_kwarg(max_retries):
-        assert SummariserSkill(max_retries=max_retries).max_retries == max_retries
+    @pytest.mark.parametrize("max_output_schema_retries", [0, 1, 2, 5, 10])
+    def test_summariser_skill_max_retries_kwarg(max_output_schema_retries):
+        assert SummariserSkill(max_output_schema_retries=max_output_schema_retries).max_output_schema_retries == max_output_schema_retries
 
     @pytest.mark.parametrize("text,summary", [
         ("The quick brown fox jumps over the lazy dog.", "A fox jumped over a dog."),
@@ -82,7 +82,7 @@ try:
         assert result._data.get("error") is not None
 
     def test_summariser_skill_run_output_missing_summary_triggers_retry():
-        s = SummariserSkill(max_retries=1)
+        s = SummariserSkill(max_output_schema_retries=1)
         responses = iter([
             _make_stream('{"result": "no summary key here"}'),  # wrong field → retry
             _make_stream('{"summary": "Retried summary."}'),
@@ -93,7 +93,7 @@ try:
         assert result.summary == "Retried summary."
 
     def test_summariser_skill_run_exhausted_retries_returns_error():
-        s = SummariserSkill(max_retries=2)
+        s = SummariserSkill(max_output_schema_retries=2)
         with patch("openai.OpenAI") as M:
             M.return_value.chat.completions.create.side_effect = lambda **_: \
                 _make_stream('{"wrong_key": "value"}')

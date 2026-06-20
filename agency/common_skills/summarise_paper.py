@@ -290,9 +290,9 @@ try:
         assert "abstract" in s.input_schema._data
         assert "summary" in s.output_schema._data
 
-    @pytest.mark.parametrize("max_retries", [0, 1, 2, 5, 10])
-    def test_summarise_paper_skill_max_retries_kwarg(max_retries):
-        assert SummarisePaperSkill(max_retries=max_retries).max_retries == max_retries
+    @pytest.mark.parametrize("max_output_schema_retries", [0, 1, 2, 5, 10])
+    def test_summarise_paper_skill_max_retries_kwarg(max_output_schema_retries):
+        assert SummarisePaperSkill(max_output_schema_retries=max_output_schema_retries).max_output_schema_retries == max_output_schema_retries
 
     def test_summarise_paper_skill_run_missing_required_fields():
         s = SummarisePaperSkill()

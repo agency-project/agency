@@ -175,7 +175,7 @@ def test_system_prompt_agfile_type_shown_as_file():
 # ---------------------------------------------------------------------------
 
 def test_skill_with_agfile_output_schema_validates_path_string():
-    sk = agskill("write", "", output_schema=agdata(doc=agfile), max_retries=0)
+    sk = agskill("write", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = (
             _direct('{"doc": "/workspace/outputs/write_doc.txt"}')

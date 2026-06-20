@@ -123,9 +123,9 @@ try:
         desc = s.replace_tools[0].params["properties"]["max_results"]["description"]
         assert str(max_papers) in desc
 
-    @pytest.mark.parametrize("max_retries", [0, 1, 3, 5, 10])
-    def test_find_papers_max_retries_kwarg(max_retries):
-        assert FindPapersSkill(max_retries=max_retries).max_retries == max_retries
+    @pytest.mark.parametrize("max_output_schema_retries", [0, 1, 3, 5, 10])
+    def test_find_papers_max_retries_kwarg(max_output_schema_retries):
+        assert FindPapersSkill(max_output_schema_retries=max_output_schema_retries).max_output_schema_retries == max_output_schema_retries
 
     @pytest.mark.parametrize("papers,expect_errors", [
         ([], True),

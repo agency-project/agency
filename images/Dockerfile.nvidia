@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:25.03-py3
+FROM nvcr.io/nvidia/pytorch:26.05-py3
 
 RUN apt-get update -qq \
  && apt-get install -y -qq ripgrep \
@@ -24,7 +24,7 @@ token = os.environ.get("HF_TOKEN") or None
 print("Downloading Qwen/Qwen3.5-0.8B …")
 snapshot_download("Qwen/Qwen3.5-0.8B", token=token)
 print("Downloading wikitext-2-raw-v1 …")
-load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test", token=token)
+load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test", token=token, trust_remote_code=True)
 print("Pre-cache complete.")
 EOF
 

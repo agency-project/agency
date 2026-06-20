@@ -28,7 +28,7 @@ Both schemas are serialized and appended to the system prompt so the LLM knows t
 | `input_schema` | `agdata \| None` | Required input fields and their types |
 | `output_schema` | `agdata \| None` | Required output fields; enforced with retries |
 | `output_validator` | `Callable \| None` | Custom validation function, called after schema check |
-| `max_retries` | `int` | Times to retry on output schema failure (default `3`) |
+| `max_output_schema_retries` | `int` | Times to retry on output schema failure (default `10`) |
 
 ## Schema field types
 
@@ -80,19 +80,22 @@ Each call to `agskill.run()` executes a standard ReAct loop:
 1. Offload oversized input fields to files in the agent's sandbox (see below)
 2. Build messages: `[system] + history + [user: input.to_json()]`
 3. Drain user inbox (injected mid-conversation messages from `agUI` or `agent._inbox`)
-4. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below)
-5. Check token usage — compact context if over threshold (see [compaction.md](compaction.md))
-6. If response contains tool calls → for each tool:
-   a. If `need_sandbox=True`, commit the sandbox to a pre-call checkpoint image
-   b. Execute the tool (offloaded to a worker process)
-   c. If the result contains `"error"`, restore the sandbox from the checkpoint and append `workspace_reverted` to the error message (see [Tool failure and checkpoint revert](#tool-failure-and-checkpoint-revert))
-   d. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
-   e. Append the tool result message and go to 3
-7. If response is a final answer → parse JSON, validate against `output_schema`
-8. If validation fails and retries remain → inject correction message, go to 3
-9. Delete offloaded input files, return `(result, updated_history, history_delta)`
+4. Pre-call compaction — check character-based token estimate; compact if over threshold (see [compaction.md](compaction.md))
+5. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below); retry on connection failure with exponential backoff
+6. Post-call compaction — check actual `prompt_tokens` from API usage; compact again if needed
+7. If response contains tool calls → for each tool:
+   a. Coerce malformed JSON arguments to `"{}"` so history replay never crashes
+   b. If `need_sandbox=True`, commit the sandbox to a pre-call checkpoint image
+   c. Execute the tool (offloaded to a worker process)
+   d. If the result contains `"error"`, restore the sandbox from the checkpoint and append `workspace_reverted` to the error message (see [Tool failure and checkpoint revert](#tool-failure-and-checkpoint-revert))
+   e. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
+   f. Append the tool result message and go to 3
+8. If response is a final answer → parse JSON, validate against `output_schema`
+9. If validation fails and retries remain → inject correction message, go to 3
+10. If sandbox has live background processes → `_wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
+11. Delete offloaded input files, return `(result, updated_history, history_delta, token_counts)`
 
-The loop exits early on `max_steps` (default `10`) exceeded.
+The loop exits early when `max_steps` (default `AGSKILL_REACT_MAX_STEPS = 4096`) is exceeded.
 
 ### LLM timeout and exponential backoff
 
@@ -108,7 +111,7 @@ The connect, write, and pool timeouts are fixed at 30 s, 180 s, and 30 s respect
 
 ### Concurrency semaphore
 
-A process-wide semaphore (`_skill_semaphore`, size 128) limits how many skills can be in an active LLM call simultaneously. The semaphore is acquired just before the OpenAI client is constructed and released immediately after the streaming call finishes — whether it succeeds, times out, or retries. Skills waiting for input validation, tool execution, or output validation do not hold a slot.
+A process-wide semaphore (`_llm_call_semaphore`, size 128) limits how many skills can be in an active LLM call simultaneously. The semaphore is acquired just before the OpenAI client is constructed and released immediately after the streaming call finishes — whether it succeeds, times out, or retries. Skills waiting for input validation, tool execution, or output validation do not hold a slot.
 
 This prevents runaway parallelism from exhausting vLLM server connections when hundreds of agents are spawned concurrently.
 
@@ -293,7 +296,7 @@ Only top-level string fields are auto-offloaded. Non-string values (integers, bo
 
 Input is validated against `input_schema` before the loop starts. Validation checks that all required fields are present and have the correct Python type. If validation fails, the skill returns immediately with an `agdata(error=...)` without calling the LLM.
 
-Input validation is **skipped** on outer-loop re-entries (`_is_continuation=True`) so that process-status ping messages can flow through without matching the skill's declared input schema.
+Input validation is **skipped** when `_is_continuation=True` so that process-status messages injected by `_wait_for_processes` can flow through without matching the skill's declared input schema.
 
 ## Output validation and retries
 
@@ -306,6 +309,25 @@ After a non-tool-call LLM response:
 5. If errors persist after all retries: return `agdata(error="output schema error after retries: ...")`
 
 Output validation is skipped when the LLM response is answering a mid-conversation user message injected via the inbox (`had_inbox=True`), because the LLM is engaged in dialogue rather than producing a final structured answer.
+
+## Process monitoring
+
+After output validation passes (and the result is not an error), the loop checks for live sandbox background processes before returning:
+
+```
+if sandbox has live processes:
+    _wait_for_processes() polls every poll_interval_s for up to ping_interval_s
+    → returns "Background processes have completed." or "still running: ..."
+    → message appended as user turn; loop continues
+else:
+    return result
+```
+
+The LLM receives the status message, can read log files or call more tools, then produces another final answer — which triggers another `_wait_for_processes` check. The skill only exits when `_wait_for_processes` returns `None` (no live watched PIDs).
+
+`ping_interval_s` and `poll_interval_s` are class-level attributes on `agent` (defaults 300 s and 5 s) passed through to `agskill.run()` at call time. The total number of monitoring continuations is bounded by `max_steps`.
+
+See [execution_process_control.md](execution_process_control.md) for per-scenario traces.
 
 ## History
 
@@ -334,7 +356,7 @@ skill = agskill(name="classify", system_prompt="Classify this text.", replace_to
 
 ## Common skills (`agency.common_skills`)
 
-`agency.common_skills` provides ready-made skill classes for common tasks. Each is a thin subclass of `agskill` with a fixed name, system prompt, and schemas. All accept `**kwargs` forwarded to `agskill.__init__` (e.g. `max_retries=1`).
+`agency.common_skills` provides ready-made skill classes for common tasks. Each is a thin subclass of `agskill` with a fixed name, system prompt, and schemas. All accept `**kwargs` forwarded to `agskill.__init__` (e.g. `max_output_schema_retries=1`).
 
 ### `WriterSkill`
 

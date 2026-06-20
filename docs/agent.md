@@ -64,9 +64,9 @@ Set once before creating agents:
 | `agent.log_dir` | `None` | Directory for per-agent JSONL logs |
 | `agent.output_dir` | `None` | Shared output directory mounted into every container |
 | `agent.agresource_pool` | auto-detected | Shared GPU/CPU/memory pool |
-| `agent.ping_interval_s` | `300` | Max seconds between process-status re-entries |
-| `agent.poll_interval_s` | `5` | Liveness poll granularity within each ping window |
-| `agent.max_outer_iters` | `144` | Safety cap on outer loop iterations (~12 hours at 5-min intervals) |
+| `agent.ping_interval_s` | `300` | Max seconds `_wait_for_processes` waits before injecting a status ping |
+| `agent.poll_interval_s` | `5` | `get_live_pids()` poll granularity inside each ping window |
+| `agent.max_outer_iters` | `144` | **Unused** — kept for backwards compatibility; process monitoring is now bounded by `AGSKILL_REACT_MAX_STEPS` inside `agskill.run()` |
 
 ## Shared output directory
 
