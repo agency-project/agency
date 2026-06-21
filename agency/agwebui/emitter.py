@@ -1,13 +1,14 @@
-"""agwebui_emitter — writes structured UI events to a JSONL file.
+"""agwebui_emitter — writes structured UI events to a SQLite database.
 
-The execution process calls these methods; the standalone web server tails
-the file and pushes events to connected browsers.  No agency imports here so
-this module can be imported from both sides if needed.
+The execution process calls these methods; the standalone web server polls
+the database and pushes events to connected browsers.  No agency imports here
+so this module can be imported from both sides if needed.
 """
 from __future__ import annotations
 
 import json
 import re as _re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -47,11 +48,11 @@ def ansi_to_hex(ansi: str) -> str:
 # ---------------------------------------------------------------------------
 
 class agwebui_emitter:
-    """Thread-safe JSONL event writer for the web UI."""
+    """Thread-safe SQLite event writer for the web UI."""
 
     def __init__(self, run_dir: Path) -> None:
-        self._event_file = run_dir / "ui_events.jsonl"
-        self._reply_dir  = run_dir / "ui_replies"
+        self._db_path   = run_dir / "ui_events.db"
+        self._reply_dir = run_dir / "ui_replies"
         self._reply_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         # Latest cumulative token counts per agent; flushed again on done().
@@ -59,16 +60,100 @@ class agwebui_emitter:
         # Registration state re-emitted in done() for late-joining clients.
         self._agent_registry: dict[str, dict] = {}   # agname -> event dict
         self._team_registry:  dict[str, dict] = {}   # team_name -> event dict
+        self._init_db()
+
+    # High-frequency event types that are upserted into state tables AND
+    # pruned from the append log to keep the database small.
+    _STATE_TYPES  = frozenset({"token_update", "messages_snapshot", "resource_update"})
+    _PRUNE_EVERY  = 500   # prune after this many inserts into events
+    # Time-bucket size for downsampling: keep the last event per
+    # (type, agname, floor(ts / bucket)) so scrubbing always finds a sample
+    # within one bucket of any position.
+    _PRUNE_BUCKET_S: float = 60.0   # seconds
+
+    def _init_db(self) -> None:
+        con = sqlite3.connect(str(self._db_path))
+        con.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            CREATE TABLE IF NOT EXISTS events (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                type   TEXT    NOT NULL,
+                agname TEXT,
+                ts     REAL    NOT NULL,
+                data   TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_ts     ON events(ts);
+            CREATE INDEX IF NOT EXISTS idx_events_type   ON events(type);
+            CREATE INDEX IF NOT EXISTS idx_events_agname ON events(agname);
+            CREATE TABLE IF NOT EXISTS agent_state (
+                agname   TEXT PRIMARY KEY,
+                tokens   TEXT,
+                messages TEXT
+            );
+            CREATE TABLE IF NOT EXISTS resource_state (
+                id   INTEGER PRIMARY KEY CHECK (id = 1),
+                data TEXT NOT NULL
+            );
+        """)
+        con.commit()
+        con.close()
+        self._insert_count = 0
 
     # ------------------------------------------------------------------
     # Core emit
     # ------------------------------------------------------------------
 
     def emit(self, event: dict) -> None:
-        line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        data  = json.dumps(event, ensure_ascii=False, default=str)
+        ts    = float(event.get("ts") or time.time())
+        etype = event.get("type", "")
+        agname = event.get("agname")
         with self._lock:
-            with open(self._event_file, "a", encoding="utf-8") as f:
-                f.write(line)
+            con = sqlite3.connect(str(self._db_path))
+            con.execute(
+                "INSERT INTO events(type, agname, ts, data) VALUES(?,?,?,?)",
+                (etype, agname, ts, data),
+            )
+            # Upsert into state tables for cold-start preamble on reconnect.
+            if etype == "token_update" and agname:
+                con.execute(
+                    "INSERT INTO agent_state(agname, tokens) VALUES(?,?)"
+                    " ON CONFLICT(agname) DO UPDATE SET tokens=excluded.tokens",
+                    (agname, data),
+                )
+            elif etype == "messages_snapshot" and agname:
+                con.execute(
+                    "INSERT INTO agent_state(agname, messages) VALUES(?,?)"
+                    " ON CONFLICT(agname) DO UPDATE SET messages=excluded.messages",
+                    (agname, data),
+                )
+            elif etype == "resource_update":
+                con.execute(
+                    "INSERT INTO resource_state(id, data) VALUES(1,?)"
+                    " ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                    (data,),
+                )
+            self._insert_count += 1
+            if self._insert_count % self._PRUNE_EVERY == 0:
+                # Keep the last event per (type, agname, time-bucket).
+                # This guarantees at most one sample per bucket per agent,
+                # so timeline scrubbing always finds a sample within
+                # _PRUNE_BUCKET_S seconds of any scrub position.
+                con.execute(
+                    """
+                    DELETE FROM events
+                    WHERE type IN ('token_update','messages_snapshot','resource_update')
+                      AND id NOT IN (
+                        SELECT MAX(id) FROM events
+                        WHERE type IN ('token_update','messages_snapshot','resource_update')
+                        GROUP BY type, agname, CAST(ts / ? AS INTEGER)
+                      )
+                    """,
+                    (self._PRUNE_BUCKET_S,),
+                )
+            con.commit()
+            con.close()
 
     # ------------------------------------------------------------------
     # Typed emitters
@@ -200,9 +285,8 @@ class agwebui_emitter:
         })
 
     def done(self) -> None:
-        # Re-emit registration and token state at the end of the file so that
-        # late-joining clients (which only see the last TAIL_BYTES) always
-        # receive a complete roster and current token counts.
+        # Re-emit registration and token state so that late-joining clients
+        # always receive a complete roster and current token counts.
         with self._lock:
             agents  = list(self._agent_registry.values())
             teams   = list(self._team_registry.values())

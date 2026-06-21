@@ -94,6 +94,16 @@ class agtype:
     def extra_output_prompt(cls, field_name: str, skill_name: str) -> str:
         return ""
 
+    @classmethod
+    def return_tool_description(cls, field_name: str) -> str:
+        """Description for the return_<field> tool itself."""
+        return f"Register the '{field_name}' output field."
+
+    @classmethod
+    def return_value_description(cls, field_name: str) -> str:
+        """Description for the `value` parameter of return_<field>."""
+        return f"Value for '{field_name}'"
+
 
 class agfile(agtype):
     """File-backed agskill schema field.
@@ -181,6 +191,21 @@ class agfile(agtype):
             f"this avoids hitting generation length limits."
         )
 
+    @classmethod
+    def return_tool_description(cls, field_name: str) -> str:
+        return (
+            f"Register the '{field_name}' output file. "
+            f"Write your output to a sandbox file first (e.g. /workspace/outputs/{field_name}.txt), "
+            f"then call this tool with that file path as the value."
+        )
+
+    @classmethod
+    def return_value_description(cls, field_name: str) -> str:
+        return (
+            f"Absolute path to the file you wrote in the sandbox "
+            f"(e.g. /workspace/outputs/{field_name}.txt). Do NOT pass the file content — pass the path."
+        )
+
 
 class agimage(agtype):
     """Image input field for agskill schemas.
@@ -242,6 +267,14 @@ class agimage(agtype):
             f"as a visual input. The JSON field value is a placeholder — the actual "
             f"image is visible to you in the message content."
         )
+
+    @classmethod
+    def return_tool_description(cls, field_name: str) -> str:
+        return f"Register the '{field_name}' image output as a file path or data URL."
+
+    @classmethod
+    def return_value_description(cls, field_name: str) -> str:
+        return f"File path, http/https URL, or data: URL of the image for '{field_name}'."
 
 
 class agrawstring(agtype):

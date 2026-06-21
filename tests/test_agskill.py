@@ -389,7 +389,8 @@ def test_schemas_appended_to_system_prompt():
     assert "Input JSON format" in prompt
     assert '"text"' in prompt
     assert "return_summary" in prompt
-    assert '"summary"' in prompt
+    assert "summary" in prompt
+    assert "string" in prompt   # per-field description for str output
 
 
 def test_no_schemas_system_prompt_unchanged():

@@ -174,7 +174,9 @@ async function enterHistoricalMode(indexPos) {
   clearAgentState();
   appendLog('\x1b[33m[timeline] loading historical events…\x1b[0m');
   try {
-    const r  = await fetch(`/api/events?index_pos=${indexPos}&window=10`);
+    const endTs   = tsAtPos(indexPos) || state.timeline.lastTs || 0;
+    const startTs = state.timeline.firstTs || 0;
+    const r  = await fetch(`/api/events?start_ts=${startTs}&end_ts=${endTs}`);
     const j  = await r.json();
     clearAgentState();
     for (const line of (j.events || [])) {
@@ -226,7 +228,7 @@ function updateResourceBadge() {
   const r = state.resources;
   const parts = [];
   if (r.gpus_total > 0) {
-    parts.push(`GPU ${r.gpus_acquired}/${r.gpus_total}`);
+    parts.push(`GPU ${r.gpus_acquired}/${r.gpus_total} (Used/Total)`);
   }
   if (r.cpus_acquired > 0) {
     parts.push(`CPU ${r.cpus_acquired}/${r.cpus_total}`);

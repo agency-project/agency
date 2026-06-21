@@ -1,5 +1,6 @@
 """Tests for agwebui_emitter — the execution-side event writer."""
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -14,10 +15,40 @@ from agency.agwebui.emitter import agwebui_emitter, ansi_to_hex, _xterm256_hex
 # ---------------------------------------------------------------------------
 
 def read_events(run_dir: Path) -> list[dict]:
-    f = run_dir / "ui_events.jsonl"
-    if not f.exists():
+    db = run_dir / "ui_events.db"
+    if not db.exists():
         return []
-    return [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+    con = sqlite3.connect(str(db))
+    rows = con.execute("SELECT data FROM events ORDER BY id").fetchall()
+    con.close()
+    return [json.loads(r[0]) for r in rows]
+
+
+def read_agent_state(run_dir: Path) -> dict:
+    """Return {agname: {tokens: dict|None, messages: dict|None}}."""
+    db = run_dir / "ui_events.db"
+    if not db.exists():
+        return {}
+    con = sqlite3.connect(str(db))
+    rows = con.execute("SELECT agname, tokens, messages FROM agent_state").fetchall()
+    con.close()
+    result = {}
+    for agname, tokens, messages in rows:
+        result[agname] = {
+            "tokens":   json.loads(tokens)   if tokens   else None,
+            "messages": json.loads(messages) if messages else None,
+        }
+    return result
+
+
+def read_resource_state(run_dir: Path) -> dict | None:
+    db = run_dir / "ui_events.db"
+    if not db.exists():
+        return None
+    con = sqlite3.connect(str(db))
+    row = con.execute("SELECT data FROM resource_state WHERE id=1").fetchone()
+    con.close()
+    return json.loads(row[0]) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -194,3 +225,119 @@ def test_ask_human_removes_reply_file(tmp_path):
     threading.Thread(target=_write_reply, daemon=True).start()
     em.ask_human("Bot", "del42", "Delete test?")
     assert not reply_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# State tables — upsert and pruning
+# ---------------------------------------------------------------------------
+
+def test_token_update_upserts_agent_state(tmp_path):
+    em = agwebui_emitter(tmp_path)
+    em.token_update("AgX", 10, 5, 100, 50)
+    em.token_update("AgX", 20, 8, 200, 80)  # should overwrite
+    state = read_agent_state(tmp_path)
+    assert "AgX" in state
+    assert state["AgX"]["tokens"]["agent_input"] == 20
+
+
+def test_messages_snapshot_upserts_agent_state(tmp_path):
+    em = agwebui_emitter(tmp_path)
+    em.push_messages("AgY", [{"role": "user", "content": "v1"}])
+    em.push_messages("AgY", [{"role": "user", "content": "v2"}])
+    state = read_agent_state(tmp_path)
+    assert state["AgY"]["messages"]["messages"][0]["content"] == "v2"
+
+
+def test_resource_update_upserts_resource_state(tmp_path):
+    em = agwebui_emitter(tmp_path)
+    em.resource_update(1, 4, 2.0, 8, 1024, 16384)
+    em.resource_update(2, 4, 3.0, 8, 2048, 16384)
+    rs = read_resource_state(tmp_path)
+    assert rs is not None
+    assert rs["gpus_acquired"] == 2
+    # Only one row in resource_state
+    db = tmp_path / "ui_events.db"
+    import sqlite3 as _sq
+    con = _sq.connect(str(db))
+    count = con.execute("SELECT COUNT(*) FROM resource_state").fetchone()[0]
+    con.close()
+    assert count == 1
+
+
+def test_pruning_removes_old_high_freq_events(tmp_path):
+    em = agwebui_emitter(tmp_path)
+    orig_every  = agwebui_emitter._PRUNE_EVERY
+    orig_bucket = agwebui_emitter._PRUNE_BUCKET_S
+    agwebui_emitter._PRUNE_EVERY    = 10
+    agwebui_emitter._PRUNE_BUCKET_S = 1.0   # 1-second buckets
+    try:
+        # All 10 token_updates have the same ts (within the same second bucket)
+        # → prune collapses them to 1 row (the last one).
+        for i in range(10):
+            em.token_update("AgZ", i, 0, i, 0)
+        events = read_events(tmp_path)
+        token_rows = [e for e in events if e["type"] == "token_update"]
+        assert len(token_rows) == 1, f"expected 1 after prune, got {len(token_rows)}"
+        assert token_rows[0]["agent_input"] == 9   # last value kept
+    finally:
+        agwebui_emitter._PRUNE_EVERY    = orig_every
+        agwebui_emitter._PRUNE_BUCKET_S = orig_bucket
+
+
+def test_pruning_preserves_separate_time_buckets(tmp_path):
+    import sqlite3 as _sq
+    em = agwebui_emitter(tmp_path)
+    orig_every  = agwebui_emitter._PRUNE_EVERY
+    orig_bucket = agwebui_emitter._PRUNE_BUCKET_S
+    agwebui_emitter._PRUNE_EVERY    = 10
+    agwebui_emitter._PRUNE_BUCKET_S = 60.0
+    try:
+        # Insert 5 events in bucket 0 (ts 0-59) and 5 in bucket 1 (ts 60-119).
+        # Prune should keep 1 per bucket = 2 rows total.
+        db = tmp_path / "ui_events.db"
+        for i in range(5):
+            con = _sq.connect(str(db))
+            con.execute("INSERT INTO events(type,agname,ts,data) VALUES(?,?,?,?)",
+                        ("token_update","AgZ", float(i),
+                         f'{{"type":"token_update","agname":"AgZ","agent_input":{i}}}'))
+            con.commit(); con.close()
+        for i in range(5):
+            con = _sq.connect(str(db))
+            con.execute("INSERT INTO events(type,agname,ts,data) VALUES(?,?,?,?)",
+                        ("token_update","AgZ", float(60 + i),
+                         f'{{"type":"token_update","agname":"AgZ","agent_input":{10+i}}}'))
+            con.commit(); con.close()
+        # Trigger prune by emitting via emitter (its insert_count wraps at _PRUNE_EVERY)
+        em._insert_count = em._PRUNE_EVERY - 1
+        em.log("trigger")   # this is the Nth insert → prune fires
+        events = read_events(tmp_path)
+        token_rows = [e for e in events if e["type"] == "token_update"]
+        # One per 60s bucket: bucket 0 keeps agent_input=4, bucket 1 keeps agent_input=14
+        assert len(token_rows) == 2, f"expected 2 (one per bucket), got {len(token_rows)}"
+        inputs = sorted(e["agent_input"] for e in token_rows)
+        assert inputs == [4, 14]
+    finally:
+        agwebui_emitter._PRUNE_EVERY    = orig_every
+        agwebui_emitter._PRUNE_BUCKET_S = orig_bucket
+
+
+def test_pruning_preserves_log_events(tmp_path):
+    em = agwebui_emitter(tmp_path)
+    orig_every  = agwebui_emitter._PRUNE_EVERY
+    orig_bucket = agwebui_emitter._PRUNE_BUCKET_S
+    agwebui_emitter._PRUNE_EVERY    = 10
+    agwebui_emitter._PRUNE_BUCKET_S = 1.0
+    try:
+        # 5 logs + 5 token_updates = 10 inserts → prune fires; logs must survive
+        for i in range(5):
+            em.log(f"line{i}")
+        for i in range(5):
+            em.token_update("AgZ", i, 0, i, 0)
+        events = read_events(tmp_path)
+        log_rows   = [e for e in events if e["type"] == "log"]
+        token_rows = [e for e in events if e["type"] == "token_update"]
+        assert len(log_rows) == 5
+        assert len(token_rows) == 1
+    finally:
+        agwebui_emitter._PRUNE_EVERY    = orig_every
+        agwebui_emitter._PRUNE_BUCKET_S = orig_bucket

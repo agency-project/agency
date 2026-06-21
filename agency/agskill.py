@@ -304,6 +304,52 @@ def _hint_to_json_type(hint) -> str:
     return "string"
 
 
+def _return_tool_descriptions(field: str, hint) -> tuple[str, str]:
+    """Return (tool_description, value_description) for a return_<field> tool."""
+    # agtype subclass — delegate to its classmethods
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        return hint.return_tool_description(field), hint.return_value_description(field)
+    # list[agtype] — delegate to the inner type
+    if get_origin(hint) is list:
+        args = get_args(hint)
+        if args and isinstance(args[0], type) and issubclass(args[0], agtype):
+            inner = args[0]
+            return (
+                inner.return_tool_description(field) + " (as a JSON array)",
+                inner.return_value_description(field) + " Provide as a JSON array.",
+            )
+    # Built-in types
+    if hint is str:
+        return (
+            f"Register the '{field}' output field.",
+            f"The complete string value for '{field}'. Pass the full content directly — not a file path.",
+        )
+    if hint is int:
+        return (
+            f"Register the '{field}' output field.",
+            f"Integer value for '{field}'.",
+        )
+    if hint is float:
+        return (
+            f"Register the '{field}' output field.",
+            f"Numeric (float) value for '{field}'.",
+        )
+    if hint is bool:
+        return (
+            f"Register the '{field}' output field.",
+            f"Boolean value for '{field}' (true or false).",
+        )
+    if get_origin(hint) is list or hint is list:
+        return (
+            f"Register the '{field}' output field.",
+            f"JSON array value for '{field}'.",
+        )
+    return (
+        f"Register the '{field}' output field.",
+        f"Value for '{field}'.",
+    )
+
+
 def _make_return_output_tools(schema: "agdata") -> list[dict]:
     """Build one typed tool per output field from the schema.
 
@@ -314,14 +360,13 @@ def _make_return_output_tools(schema: "agdata") -> list[dict]:
     tools = []
     for field, hint in schema._data.items():
         json_type = _hint_to_json_type(hint)
-        value_schema: dict = {"type": json_type, "description": f"Value for '{field}'"}
-        if json_type == "array":
-            value_schema["description"] += " (JSON array)"
+        tool_desc, value_desc = _return_tool_descriptions(field, hint)
+        value_schema: dict = {"type": json_type, "description": value_desc}
         tools.append({
             "type": "function",
             "function": {
                 "name": f"return_{field}",
-                "description": f"Register the '{field}' output field.",
+                "description": tool_desc,
                 "parameters": {
                     "type": "object",
                     "properties": {"value": value_schema},
@@ -852,6 +897,27 @@ class agskill:
                 return args[0]
         return None
 
+    @staticmethod
+    def _output_field_desc(hint: object) -> str:
+        """Return a human-readable type description with usage guidance for an output field."""
+        if isinstance(hint, type) and issubclass(hint, agtype):
+            return hint.schema_type()
+        if hint is str:
+            return "string — pass the complete text content as the value (not a file path)"
+        if hint is int:
+            return "integer — pass the numeric value directly"
+        if hint is float:
+            return "float — pass the numeric value directly"
+        if hint is bool:
+            return "boolean — pass true or false"
+        if hint is list or hint is dict:
+            return hint.__name__
+        if get_origin(hint) is list:
+            args = get_args(hint)
+            inner = agskill._output_field_desc(args[0]) if args else "any"
+            return f"array of {inner}"
+        return str(hint)
+
     def _raw_input_key(self) -> "str | None":
         """Return the field key if input_schema is a single agrawstring field."""
         if self.input_schema is None:
@@ -912,11 +978,15 @@ class agskill:
                 field_tools = ", ".join(
                     f"return_{f}" for f in self.output_schema._data
                 )
+                field_lines = "\n".join(
+                    f"  - {f}: {self._output_field_desc(h)}"
+                    for f, h in self.output_schema._data.items()
+                )
                 parts.append(
                     f"\nTo return your results, call the appropriate return_<field> tool "
                     f"once for each required output field ({field_tools}). "
-                    f"Required fields and their types:\n"
-                    f"{self.output_schema.to_json()}\n\n"
+                    f"Required fields:\n"
+                    f"{field_lines}\n\n"
                     "- Call each return_<field> tool separately — one field per call.\n"
                     "- Only call a return_<field> tool when you have the final value for that field.\n"
                     "- You may continue using other tools after registering outputs if needed."

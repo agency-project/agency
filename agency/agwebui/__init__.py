@@ -2,8 +2,9 @@
 
 Starts a standalone FastAPI server in a separate process and serves a
 browser dashboard.  The execution process writes structured events to a
-JSONL file; the server tails it and pushes updates over WebSocket.  The
-execution script runs directly in the main thread — no asyncio conflicts.
+SQLite database (ui_events.db); the server polls it and pushes updates
+over WebSocket.  The execution script runs directly in the main thread —
+no asyncio conflicts.
 
 Usage::
 

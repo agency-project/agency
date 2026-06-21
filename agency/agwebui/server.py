@@ -1,8 +1,8 @@
 """Standalone web server for agwebui.
 
 No agency imports — this process is completely isolated from the execution
-process.  It tails ui_events.jsonl and pushes events to browsers over
-WebSocket.  Run via:
+process.  It polls ui_events.db and pushes events to browsers over WebSocket.
+Run via:
 
     python -m agency.agwebui.server --run-dir <path> --port 7860
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 import time as _time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,8 +29,8 @@ _STATIC = Path(__file__).parent / "static"
 # Config
 # ---------------------------------------------------------------------------
 
-TAIL_BYTES     = 2 * 1024 * 1024   # bytes replayed to new clients on connect
-INDEX_INTERVAL = 1_000        # build one index entry per N events
+TAIL_EVENTS    = 500          # events replayed to new clients on connect
+INDEX_INTERVAL = 1_000        # events between sample points in the timeline index
 
 # ---------------------------------------------------------------------------
 # Mutable globals — set in __main__ before uvicorn starts
@@ -38,24 +39,171 @@ INDEX_INTERVAL = 1_000        # build one index entry per N events
 _run_dir:   Path = Path(".")
 _reply_dir: Path = Path(".")
 
-# Event index: list of (server_timestamp, byte_offset_of_batch_start)
-# Gives O(1) seek to any position in the log without storing events in RAM.
-_sparse_index:       list[tuple[float, int]] = []
-_events_since_index: int   = 0
-_file_offset:        int   = 0   # current tail read cursor (bytes)
-_file_size:          int   = 0   # last known file size (bytes)
-_first_ts:           float | None = None
-_last_ts:            float | None = None
+# Highest event id seen so far; 0 means nothing read yet.
+_last_event_id:  int   = 0
+_event_count:    int   = 0
+_first_ts:       float | None = None
+_last_ts:        float | None = None
 
 _clients: set[WebSocket] = set()
 _lock:    asyncio.Lock | None = None   # created at startup
 
-# In-memory registry rebuilt from the event stream as new events arrive.
-# Used to inject a "state preamble" for clients that connect mid-run,
-# so they always see the full agent/team roster even if those events have
-# scrolled past the TAIL_BYTES window.
-_agent_registry: dict[str, str] = {}   # agname -> raw JSON line
-_team_registry:  dict[str, str] = {}   # team_name -> raw JSON line
+# In-memory registry rebuilt from the database on startup and updated live.
+# Used to inject a "state preamble" for clients that connect mid-run.
+_agent_registry: dict[str, str] = {}   # agname -> raw JSON string
+_team_registry:  dict[str, str] = {}   # team_name -> raw JSON string
+
+
+# ---------------------------------------------------------------------------
+# SQLite helpers (synchronous — called via asyncio.to_thread)
+# ---------------------------------------------------------------------------
+
+def _db_path() -> Path:
+    return _run_dir / "ui_events.db"
+
+
+def _open_db(path: Path):
+    con = sqlite3.connect(str(path))
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
+def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None, dict, dict]:
+    """Read initial state from an existing database.
+
+    Returns (last_event_id, event_count, first_ts, last_ts, agent_reg, team_reg).
+    """
+    agent_reg: dict[str, str] = {}
+    team_reg:  dict[str, str] = {}
+    if not path.exists():
+        return 0, 0, None, None, agent_reg, team_reg
+    try:
+        con = _open_db(path)
+        for (data,) in con.execute(
+            "SELECT data FROM events WHERE type IN ('agent_registered','team_registered') ORDER BY ts"
+        ):
+            try:
+                ev = json.loads(data)
+                t  = ev.get("type")
+                if t == "agent_registered":
+                    agn = ev.get("agname")
+                    if agn:
+                        agent_reg[agn] = data
+                elif t == "team_registered":
+                    tn = ev.get("team_name")
+                    if tn:
+                        team_reg[tn] = data
+            except Exception:
+                pass
+        row = con.execute(
+            "SELECT MAX(id), COUNT(*), MIN(ts), MAX(ts) FROM events"
+        ).fetchone()
+        con.close()
+        if row and row[0] is not None:
+            return row[0], row[1], row[2], row[3], agent_reg, team_reg
+    except Exception:
+        pass
+    return 0, 0, None, None, agent_reg, team_reg
+
+
+def _fetch_state_preamble(path: Path) -> list[str]:
+    """Return current token/messages/resource state for cold-start clients."""
+    if not path.exists():
+        return []
+    rows: list[str] = []
+    try:
+        con = _open_db(path)
+        for (tokens, messages) in con.execute(
+            "SELECT tokens, messages FROM agent_state"
+        ):
+            if tokens:
+                rows.append(tokens)
+            if messages:
+                rows.append(messages)
+        row = con.execute("SELECT data FROM resource_state WHERE id=1").fetchone()
+        if row:
+            rows.append(row[0])
+        con.close()
+    except Exception:
+        pass
+    return rows
+
+
+def _fetch_new_events(path: Path, after_id: int) -> list[tuple[int, str]]:
+    """Return all (id, data) rows with id > after_id, ordered by id."""
+    if not path.exists():
+        return []
+    try:
+        con = _open_db(path)
+        rows = con.execute(
+            "SELECT id, data FROM events WHERE id > ? ORDER BY id", (after_id,)
+        ).fetchall()
+        con.close()
+        return rows
+    except Exception:
+        return []
+
+
+def _fetch_tail_events(path: Path, n: int = TAIL_EVENTS) -> list[str]:
+    """Return the last n events (in chronological order) for new-client replay."""
+    if not path.exists():
+        return []
+    try:
+        con = _open_db(path)
+        rows = con.execute(
+            "SELECT data FROM (SELECT id, data FROM events ORDER BY id DESC LIMIT ?) "
+            "ORDER BY id", (n,)
+        ).fetchall()
+        con.close()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
+def _fetch_timeline(path: Path) -> dict:
+    """Build timeline metadata and sample points from the database."""
+    if not path.exists():
+        return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
+    try:
+        con = _open_db(path)
+        row = con.execute(
+            "SELECT MIN(ts), MAX(ts), COUNT(*) FROM events"
+        ).fetchone()
+        first_ts, last_ts, count = row if row else (None, None, 0)
+        if not count:
+            con.close()
+            return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
+        # Sample up to 500 evenly spaced points across the event stream.
+        step = max(1, count // 500)
+        raw_samples = con.execute(
+            f"SELECT ts FROM events WHERE (id % ?) = 1 ORDER BY id", (step,)
+        ).fetchall()
+        con.close()
+        samples = [[i, r[0]] for i, r in enumerate(raw_samples)]
+        return {
+            "index_len": len(samples),
+            "first_ts":  first_ts,
+            "last_ts":   last_ts,
+            "samples":   samples,
+        }
+    except Exception:
+        return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
+
+
+def _fetch_events_range(path: Path, start_ts: float, end_ts: float) -> list[str]:
+    """Return all event JSON strings with ts BETWEEN start_ts AND end_ts."""
+    if not path.exists():
+        return []
+    try:
+        con = _open_db(path)
+        rows = con.execute(
+            "SELECT data FROM events WHERE ts BETWEEN ? AND ? ORDER BY ts",
+            (start_ts, end_ts),
+        ).fetchall()
+        con.close()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +212,12 @@ _team_registry:  dict[str, str] = {}   # team_name -> raw JSON line
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _lock
+    global _lock, _last_event_id, _event_count, _first_ts, _last_ts
+    global _agent_registry, _team_registry
     _lock = asyncio.Lock()
+    # Seed state from an existing database (e.g. server restart mid-run).
+    seed = await asyncio.to_thread(_seed_from_db, _db_path())
+    _last_event_id, _event_count, _first_ts, _last_ts, _agent_registry, _team_registry = seed
     task = asyncio.create_task(_tail_events())
     yield
     task.cancel()
@@ -91,56 +243,18 @@ async def health():
 
 @app.get("/api/timeline")
 async def api_timeline():
-    """Return sparse index metadata for the timeline scrubber."""
-    assert _lock is not None
-    async with _lock:
-        total = len(_sparse_index)
-        if total == 0:
-            return JSONResponse({"index_len": 0, "first_ts": None, "last_ts": None,
-                                 "file_size": _file_size, "samples": []})
-        # Downsample to ≤500 entries for the client
-        step    = max(1, total // 500)
-        samples = [[i, _sparse_index[i][0]] for i in range(0, total, step)]
-        if samples[-1][0] != total - 1:
-            samples.append([total - 1, _sparse_index[-1][0]])
-        return JSONResponse({
-            "index_len": total,
-            "first_ts":  _sparse_index[0][0],
-            "last_ts":   _sparse_index[-1][0],
-            "file_size": _file_size,
-            "samples":   samples,   # [[index_pos, timestamp], ...]
-        })
+    """Return sample points and metadata for the timeline scrubber."""
+    tl = await asyncio.to_thread(_fetch_timeline, _db_path())
+    return JSONResponse(tl)
 
 
 @app.get("/api/events")
-async def api_events(index_pos: int = 0, window: int = 10):
-    """Return up to window*INDEX_INTERVAL events starting from index_pos."""
-    assert _lock is not None
-    async with _lock:
-        if not _sparse_index:
-            return JSONResponse({"events": [], "from_ts": None, "to_ts": None})
-        pos     = max(0, min(index_pos, len(_sparse_index) - 1))
-        end_pos = min(pos + window, len(_sparse_index))
-        start_off = _sparse_index[pos][1]
-        from_ts   = _sparse_index[pos][0]
-        end_off   = _sparse_index[end_pos][1] if end_pos < len(_sparse_index) else _file_size
-        to_ts     = _sparse_index[end_pos - 1][0] if end_pos > 0 else from_ts
-        event_file = _run_dir / "ui_events.jsonl"
-        cur_size   = _file_size
-
-    events: list[str] = []
-    if event_file.exists() and cur_size > 0:
-        max_read = max(0, min(end_off - start_off, 4 * 1024 * 1024))
-        if max_read:
-            with open(event_file, "rb") as f:
-                f.seek(start_off)
-                raw = f.read(max_read)
-            for bline in raw.split(b"\n"):
-                s = bline.strip()
-                if s:
-                    events.append(s.decode("utf-8", errors="replace"))
-
-    return JSONResponse({"events": events, "from_ts": from_ts, "to_ts": to_ts})
+async def api_events(start_ts: float = 0.0, end_ts: float = 0.0):
+    """Return all events with ts BETWEEN start_ts AND end_ts."""
+    if end_ts <= start_ts:
+        return JSONResponse({"events": [], "from_ts": start_ts, "to_ts": end_ts})
+    events = await asyncio.to_thread(_fetch_events_range, _db_path(), start_ts, end_ts)
+    return JSONResponse({"events": events, "from_ts": start_ts, "to_ts": end_ts})
 
 
 # ---------------------------------------------------------------------------
@@ -152,43 +266,29 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     assert _lock is not None
 
-    # Snapshot index state, then read tail from file (outside lock).
-    async with _lock:
-        event_file  = _run_dir / "ui_events.jsonl"
-        cur_size    = _file_size
-        index_len   = len(_sparse_index)
-        first_ts    = _first_ts
-        last_ts     = _last_ts
-        tail_offset = max(0, cur_size - TAIL_BYTES)
+    # Fetch tail and state outside lock — read-only DB queries.
+    tail_lines    = await asyncio.to_thread(_fetch_tail_events, _db_path())
+    state_preamble = await asyncio.to_thread(_fetch_state_preamble, _db_path())
 
-    tail_lines: list[bytes] = []
-    if event_file.exists() and cur_size > 0:
-        with open(event_file, "rb") as f:
-            f.seek(tail_offset)
-            raw = f.read(cur_size - tail_offset)
-        tail_lines = [l for l in raw.split(b"\n") if l.strip()]
-
-    # Atomically send timeline_sync + registry preamble + tail, then register for live updates.
     async with _lock:
         sync = json.dumps({
-            "type":       "timeline_sync",
-            "index_len":  index_len,
-            "first_ts":   first_ts,
-            "last_ts":    last_ts,
-            "file_size":  cur_size,
-            "tail_offset": tail_offset,
-            "tz_offset":  _TZ_OFFSET,
+            "type":      "timeline_sync",
+            "index_len": max(0, _event_count // INDEX_INTERVAL),
+            "first_ts":  _first_ts,
+            "last_ts":   _last_ts,
+            "tz_offset": _TZ_OFFSET,
         })
-        preamble = list(_agent_registry.values()) + list(_team_registry.values())
+        reg_preamble = list(_agent_registry.values()) + list(_team_registry.values())
         try:
             await ws.send_text(sync)
-            for bline in tail_lines:
-                await ws.send_text(bline.decode("utf-8", errors="replace"))
-            # Send registration state after the tail so late-joining clients
-            # always learn about every agent/team even if the original events
-            # have scrolled past the TAIL_BYTES window.  Duplicates are
-            # harmless — the frontend updates by agname/team_name key.
-            for line in preamble:
+            for line in tail_lines:
+                await ws.send_text(line)
+            # Registration preamble: agent/team roster.
+            for line in reg_preamble:
+                await ws.send_text(line)
+            # State preamble: latest token counts, message snapshots, resource state.
+            # Sent last so they overwrite any stale values from the tail replay.
+            for line in state_preamble:
                 await ws.send_text(line)
         except Exception:
             return
@@ -212,148 +312,49 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# Tail loop
+# Poll loop
 # ---------------------------------------------------------------------------
 
-def _scan_registries_from_file(event_file: Path) -> None:
-    """Sequential full-file scan to seed _agent_registry and _team_registry."""
-    global _agent_registry, _team_registry
-    with open(event_file, "rb") as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                text = raw.decode("utf-8", errors="replace")
-                ev = json.loads(text)
-                t  = ev.get("type")
-                if t == "agent_registered":
-                    agn = ev.get("agname")
-                    if agn:
-                        _agent_registry[agn] = text
-                elif t == "team_registered":
-                    tn = ev.get("team_name")
-                    if tn:
-                        _team_registry[tn] = text
-            except Exception:
-                pass
-
-
-def _build_index_from_file(event_file: Path, n_points: int = 1000) -> None:
-    """Scan the existing log file and populate _sparse_index at startup."""
-    global _file_offset, _file_size, _first_ts, _last_ts, _sparse_index
-    size = event_file.stat().st_size
-    if size == 0:
-        return
-    _file_size   = size
-    _file_offset = size   # tail from end
-
-    step = max(1, size // n_points)
-    with open(event_file, "rb") as f:
-        for i in range(n_points + 1):
-            seek_to = min(i * step, size - 1)
-            f.seek(seek_to)
-            # Skip to the next complete line boundary.
-            if seek_to > 0:
-                f.readline()   # discard partial line
-            line_offset = f.tell()
-            if line_offset >= size:
-                break
-            raw = f.readline()
-            if not raw:
-                break
-            try:
-                ev = json.loads(raw.decode("utf-8", errors="replace"))
-                ts = ev.get("ts")
-                if ts:
-                    _sparse_index.append((float(ts), line_offset))
-                    if _first_ts is None or ts < _first_ts:
-                        _first_ts = float(ts)
-                    if _last_ts is None or ts > _last_ts:
-                        _last_ts = float(ts)
-            except Exception:
-                pass
-
-    # Deduplicate and sort by offset (multiple seeks may land on same line).
-    seen_offsets: set[int] = set()
-    deduped = []
-    for ts, off in sorted(_sparse_index, key=lambda x: x[1]):
-        if off not in seen_offsets:
-            seen_offsets.add(off)
-            deduped.append((ts, off))
-    _sparse_index = deduped
-
-
 async def _tail_events() -> None:
-    global _file_offset, _file_size, _first_ts, _last_ts, _events_since_index
-    event_file = _run_dir / "ui_events.jsonl"
-
-    # Build index and seed registries from existing file before tailing new events.
-    if event_file.exists():
-        await asyncio.to_thread(_scan_registries_from_file, event_file)
-        await asyncio.to_thread(_build_index_from_file, event_file)
+    global _last_event_id, _event_count, _first_ts, _last_ts
 
     while True:
-        if event_file.exists():
-            # Read new bytes outside the lock.
-            batch_start = _file_offset
-            with open(event_file, "rb") as f:
-                f.seek(_file_offset)
-                raw = f.read(16 * 1024 * 1024)   # up to 16 MB per tick
+        path = _db_path()
+        if path.exists():
+            rows = await asyncio.to_thread(_fetch_new_events, path, _last_event_id)
+            if rows:
+                now = _time.time()
+                if _first_ts is None:
+                    _first_ts = now
+                _last_ts = now
 
-            if raw:
-                # Find the last complete line — handles events larger than buffer.
-                last_nl = raw.rfind(b"\n")
-                if last_nl < 0:
-                    complete_lines = []
-                    consumed       = 0
-                else:
-                    complete_lines = [l for l in raw[:last_nl].split(b"\n") if l.strip()]
-                    consumed       = last_nl + 1
+                assert _lock is not None
+                async with _lock:
+                    for event_id, data in rows:
+                        _last_event_id = event_id
+                        _event_count  += 1
+                        try:
+                            ev = json.loads(data)
+                            t  = ev.get("type")
+                            if t == "agent_registered":
+                                agn = ev.get("agname")
+                                if agn:
+                                    _agent_registry[agn] = data
+                            elif t == "team_registered":
+                                tn = ev.get("team_name")
+                                if tn:
+                                    _team_registry[tn] = data
+                        except Exception:
+                            pass
 
-                if complete_lines:
-                    now = _time.time()
-                    if _first_ts is None:
-                        _first_ts = now
-                    _last_ts       = now
-                    _file_offset  += consumed
-                    _file_size     = _file_offset
-
-                    assert _lock is not None
-                    async with _lock:
-                        _events_since_index += len(complete_lines)
-                        if not _sparse_index or _events_since_index >= INDEX_INTERVAL:
-                            _sparse_index.append((now, batch_start))
-                            _events_since_index = 0
-
-                        # Update in-memory registry for mid-run client connects.
-                        for bline in complete_lines:
+                    dead: set[WebSocket] = set()
+                    for _, data in rows:
+                        for ws in list(_clients):
                             try:
-                                ev = json.loads(bline.decode("utf-8", errors="replace"))
-                                t  = ev.get("type")
-                                if t == "agent_registered":
-                                    agn = ev.get("agname")
-                                    if agn:
-                                        _agent_registry[agn] = bline.decode("utf-8", errors="replace")
-                                elif t == "team_registered":
-                                    tn = ev.get("team_name")
-                                    if tn:
-                                        _team_registry[tn] = bline.decode("utf-8", errors="replace")
+                                await ws.send_text(data)
                             except Exception:
-                                pass
-
-                        dead: set[WebSocket] = set()
-                        for bline in complete_lines:
-                            line = bline.strip()
-                            if not line:
-                                continue
-                            text = line.decode("utf-8", errors="replace")
-                            for ws in list(_clients):
-                                try:
-                                    await ws.send_text(text)
-                                except Exception:
-                                    dead.add(ws)
-                        _clients.difference_update(dead)
+                                dead.add(ws)
+                    _clients.difference_update(dead)
 
         await asyncio.sleep(0.05)
 
@@ -366,7 +367,7 @@ if __name__ == "__main__":
     import uvicorn
 
     parser = argparse.ArgumentParser(description="agwebui standalone server")
-    parser.add_argument("--run-dir", required=True, help="Directory containing ui_events.jsonl")
+    parser.add_argument("--run-dir", required=True, help="Directory containing ui_events.db")
     parser.add_argument("--port",    type=int, default=7860)
     parsed = parser.parse_args()
 

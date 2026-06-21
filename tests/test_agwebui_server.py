@@ -1,10 +1,38 @@
 """Tests for agwebui server — FastAPI endpoints and WebSocket streaming."""
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _write_events(db_path: Path, events: list[dict]) -> None:
+    """Insert events directly into the SQLite database."""
+    con = sqlite3.connect(str(db_path))
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            type   TEXT    NOT NULL,
+            agname TEXT,
+            ts     REAL    NOT NULL,
+            data   TEXT    NOT NULL
+        )
+    """)
+    for ev in events:
+        data = json.dumps(ev)
+        con.execute(
+            "INSERT INTO events(type, agname, ts, data) VALUES(?,?,?,?)",
+            (ev.get("type", ""), ev.get("agname"), float(ev.get("ts", 0)), data),
+        )
+    con.commit()
+    con.close()
 
 
 # ---------------------------------------------------------------------------
@@ -21,44 +49,48 @@ def server(tmp_path):
     old_run_dir      = srv._run_dir
     old_reply_dir    = srv._reply_dir
     old_clients      = srv._clients
-    old_index        = srv._sparse_index
-    old_since_idx    = srv._events_since_index
-    old_offset       = srv._file_offset
-    old_size         = srv._file_size
+    old_last_id      = srv._last_event_id
+    old_event_count  = srv._event_count
     old_first_ts     = srv._first_ts
     old_last_ts      = srv._last_ts
     old_agent_reg    = srv._agent_registry
     old_team_reg     = srv._team_registry
 
     # Point the server at a fresh temp directory
-    srv._run_dir            = tmp_path
-    srv._reply_dir          = tmp_path / "ui_replies"
+    srv._run_dir        = tmp_path
+    srv._reply_dir      = tmp_path / "ui_replies"
     srv._reply_dir.mkdir()
-    srv._clients            = set()
-    srv._sparse_index       = []
-    srv._events_since_index = 0
-    srv._file_offset        = 0
-    srv._file_size          = 0
-    srv._first_ts           = None
-    srv._last_ts            = None
-    srv._agent_registry     = {}
-    srv._team_registry      = {}
+    srv._clients        = set()
+    srv._last_event_id  = 0
+    srv._event_count    = 0
+    srv._first_ts       = None
+    srv._last_ts        = None
+    srv._agent_registry = {}
+    srv._team_registry  = {}
 
     with TestClient(srv.app) as client:
         yield client, tmp_path, srv
 
     # Restore so subsequent tests see a clean state
-    srv._run_dir            = old_run_dir
-    srv._reply_dir          = old_reply_dir
-    srv._clients            = old_clients
-    srv._sparse_index       = old_index
-    srv._events_since_index = old_since_idx
-    srv._file_offset        = old_offset
-    srv._file_size          = old_size
-    srv._first_ts           = old_first_ts
-    srv._last_ts            = old_last_ts
-    srv._agent_registry     = old_agent_reg
-    srv._team_registry      = old_team_reg
+    srv._run_dir        = old_run_dir
+    srv._reply_dir      = old_reply_dir
+    srv._clients        = old_clients
+    srv._last_event_id  = old_last_id
+    srv._event_count    = old_event_count
+    srv._first_ts       = old_first_ts
+    srv._last_ts        = old_last_ts
+    srv._agent_registry = old_agent_reg
+    srv._team_registry  = old_team_reg
+
+
+def _wait_for(condition, timeout=3.0, interval=0.05):
+    """Return True if condition() becomes true within timeout seconds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(interval)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -90,47 +122,33 @@ def test_static_js_served(server):
 
 
 # ---------------------------------------------------------------------------
-# Tail task — reads ui_events.jsonl and updates file-offset globals
+# Tail task — reads ui_events.db and updates globals
 # ---------------------------------------------------------------------------
 
-def _wait_for(condition, timeout=3.0, interval=0.05):
-    """Return True if condition() becomes true within timeout seconds."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if condition():
-            return True
-        time.sleep(interval)
-    return False
-
-
-def test_tail_task_reads_events_file(server):
-    """Tail task must read ui_events.jsonl and advance _file_offset."""
+def test_tail_task_reads_events_db(server):
+    """Tail task must read ui_events.db and advance _last_event_id."""
     client, run_dir, srv = server
-    event_file = run_dir / "ui_events.jsonl"
+    db_path = run_dir / "ui_events.db"
+    _write_events(db_path, [{"type": "log", "line": "hello", "ts": 1.0}])
 
-    event_file.write_text(
-        json.dumps({"type": "log", "line": "hello", "ts": 1.0}) + "\n"
-    )
-
-    assert _wait_for(lambda: srv._file_offset > 0), \
-        "tail task did not process ui_events.jsonl within 3 s"
+    assert _wait_for(lambda: srv._last_event_id > 0), \
+        "tail task did not process ui_events.db within 3 s"
 
 
 def test_tail_task_appends_new_events(server):
-    """Events appended to the file after startup are also picked up."""
+    """Events inserted into the DB after startup are also picked up."""
     client, run_dir, srv = server
-    event_file = run_dir / "ui_events.jsonl"
+    db_path = run_dir / "ui_events.db"
 
-    event_file.write_text(json.dumps({"type": "log", "line": "first", "ts": 1.0}) + "\n")
-    assert _wait_for(lambda: srv._file_offset > 0), \
+    _write_events(db_path, [{"type": "log", "line": "first", "ts": 1.0}])
+    assert _wait_for(lambda: srv._last_event_id > 0), \
         "tail task did not pick up first event"
-    first_offset = srv._file_offset
+    first_id = srv._last_event_id
 
-    with open(event_file, "a") as f:
-        f.write(json.dumps({"type": "done", "ts": 2.0}) + "\n")
+    _write_events(db_path, [{"type": "done", "ts": 2.0}])
 
-    assert _wait_for(lambda: srv._file_offset > first_offset), \
-        "tail task did not pick up appended event"
+    assert _wait_for(lambda: srv._last_event_id > first_id), \
+        "tail task did not pick up second event"
 
 
 # ---------------------------------------------------------------------------
@@ -193,17 +211,16 @@ def test_websocket_sends_timeline_sync_on_connect(server):
 def test_websocket_replays_history_on_connect(server):
     """Client connecting after events exist should receive full replay."""
     client, run_dir, srv = server
-    event_file = run_dir / "ui_events.jsonl"
+    db_path = run_dir / "ui_events.db"
 
-    lines = [
-        json.dumps({"type": "log",              "line": "line one", "ts": 1.0}),
-        json.dumps({"type": "agent_registered", "agname": "Bot", "color": "#f00", "ts": 2.0}),
-    ]
-    event_file.write_text("\n".join(lines) + "\n")
+    _write_events(db_path, [
+        {"type": "log",              "line": "line one", "ts": 1.0},
+        {"type": "agent_registered", "agname": "Bot", "color": "#f00", "ts": 2.0},
+    ])
 
-    # Wait for tail task to index the file so the WebSocket can replay it
-    assert _wait_for(lambda: srv._file_offset > 0), \
-        "tail task did not process file before WebSocket connect"
+    # Wait for tail task to index the DB so the WebSocket can replay it
+    assert _wait_for(lambda: srv._last_event_id > 0), \
+        "tail task did not process DB before WebSocket connect"
 
     with client.websocket_connect("/ws") as ws:
         received = _recv_skipping_sync(ws, 2)
@@ -217,15 +234,14 @@ def test_websocket_replays_history_on_connect(server):
 def test_websocket_new_client_sees_all_history(server):
     """A client that connects late gets every event emitted so far."""
     client, run_dir, srv = server
-    event_file = run_dir / "ui_events.jsonl"
+    db_path = run_dir / "ui_events.db"
 
-    lines = "\n".join(
-        json.dumps({"type": "log", "line": f"msg{i}", "ts": float(i)})
+    _write_events(db_path, [
+        {"type": "log", "line": f"msg{i}", "ts": float(i)}
         for i in range(3)
-    ) + "\n"
-    event_file.write_text(lines)
-    assert _wait_for(lambda: srv._file_offset > 0), \
-        "tail task did not process file"
+    ])
+    assert _wait_for(lambda: srv._last_event_id > 0), \
+        "tail task did not process DB"
 
     with client.websocket_connect("/ws") as ws:
         received = _recv_skipping_sync(ws, 3)
@@ -238,17 +254,17 @@ def test_websocket_new_client_sees_all_history(server):
 # ---------------------------------------------------------------------------
 
 def test_websocket_receives_live_events(server):
-    """Events written to the file after a client connects are pushed live."""
+    """Events written to the DB after a client connects are pushed live."""
     client, run_dir, srv = server
-    event_file = run_dir / "ui_events.jsonl"
+    db_path = run_dir / "ui_events.db"
 
     with client.websocket_connect("/ws") as ws:
-        # Consume the initial timeline_sync (sent for the empty file on connect)
+        # Consume the initial timeline_sync (sent for the empty DB on connect)
         sync = json.loads(ws.receive_text())
         assert sync["type"] == "timeline_sync"
 
-        # Write event AFTER connecting — tail task will broadcast it
-        event_file.write_text(json.dumps({"type": "done", "ts": 9.0}) + "\n")
+        # Insert event AFTER connecting — tail task will broadcast it
+        _write_events(db_path, [{"type": "done", "ts": 9.0}])
 
         received = _recv_n(ws, 1, timeout=3.0)
 
@@ -298,3 +314,61 @@ def test_websocket_malformed_json_ignored(server):
 
     resp = client.get("/health")
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /api/timeline endpoint
+# ---------------------------------------------------------------------------
+
+def test_api_timeline_empty(server):
+    """Timeline endpoint returns empty metadata when no DB exists."""
+    client, _, _ = server
+    resp = client.get("/api/timeline")
+    assert resp.status_code == 200
+    j = resp.json()
+    assert j["index_len"] == 0
+    assert j["first_ts"] is None
+    assert j["last_ts"] is None
+
+
+def test_api_timeline_with_events(server):
+    """Timeline endpoint returns event count and timestamp range."""
+    client, run_dir, _ = server
+    db_path = run_dir / "ui_events.db"
+    _write_events(db_path, [
+        {"type": "log", "line": "a", "ts": 10.0},
+        {"type": "log", "line": "b", "ts": 20.0},
+    ])
+    resp = client.get("/api/timeline")
+    assert resp.status_code == 200
+    j = resp.json()
+    assert j["first_ts"] == pytest.approx(10.0)
+    assert j["last_ts"]  == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
+# /api/events endpoint
+# ---------------------------------------------------------------------------
+
+def test_api_events_range(server):
+    """Events endpoint returns events in the requested time range."""
+    client, run_dir, _ = server
+    db_path = run_dir / "ui_events.db"
+    _write_events(db_path, [
+        {"type": "log", "line": "early", "ts": 1.0},
+        {"type": "log", "line": "mid",   "ts": 5.0},
+        {"type": "log", "line": "late",  "ts": 9.0},
+    ])
+    resp = client.get("/api/events?start_ts=3.0&end_ts=7.0")
+    assert resp.status_code == 200
+    j = resp.json()
+    lines = [json.loads(e)["line"] for e in j["events"]]
+    assert lines == ["mid"]
+
+
+def test_api_events_invalid_range_returns_empty(server):
+    """end_ts <= start_ts returns empty events list."""
+    client, _, _ = server
+    resp = client.get("/api/events?start_ts=10.0&end_ts=5.0")
+    assert resp.status_code == 200
+    assert resp.json()["events"] == []
