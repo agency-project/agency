@@ -100,7 +100,7 @@ Pass `"api_key": "bedrock-api-key-..."` to use a static Bedrock API key instead 
 | LLM streaming | Background drain thread + 100 ms batch queue | Reduces GIL acquisitions from O(tokens) to O(tokens/batch) |
 | Tool execution | `ProcessPoolExecutor` (256 workers) | Each tool call gets its own GIL |
 
-See [docs/parallelization.md](docs/parallelization.md) for the full design.
+See [docs/Design_parallelization.md](docs/Design_parallelization.md) for the full design.
 
 ## Examples
 
@@ -152,17 +152,50 @@ VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.p
 VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py before.jpg after.jpg
 ```
 
+### interactive_story — human-in-the-loop collaborative writing
+
+A creative writing loop where the human acts as director, approving or revising every step from Python — the LLM never decides when to stop. Demonstrates `ask_human` with no timeout and the plan-then-write pattern.
+
+1. Python asks what scene to write next.
+2. Planner agent generates a paragraph-by-paragraph scene plan.
+3. Python presents the plan and asks for approval; loops with feedback until approved.
+4. Writer agent generates the full scene prose from the approved plan.
+5. Python presents the scene; loops (re-plan → re-write) until approved.
+6. Approved scenes are saved to `plans.md` and `story.txt` in the run directory.
+
+```bash
+uv run python examples/interactive_story.py
+```
+
 ## Common skills
 
-`agency.common_skills` provides ready-made skill classes:
+`agency.common_skills` provides two base skill subclasses for structured agent workflows:
 
-| Class | What it does |
-|---|---|
-| `SummariserSkill` | One-sentence summary, no tools |
-| `WriterSkill` | Writes content to a file path in the sandbox |
-| `FindPapersSkill` | Searches Hugging Face Papers; returns title, URL, abstract |
-| `SummarisePaperSkill` | Fetches full arxiv HTML and writes a technical summary |
-| `CompileReportSkill` | Writes a structured markdown report to the sandbox |
+| Class | Mode | Tools available | Workflow |
+|---|---|---|---|
+| `agplan` | Plan | `read`, `grep`, `glob`, `webfetch` (read-only; no bash or write) | UNDERSTAND → DESIGN → REVIEW → OUTPUT |
+| `agbuild` | Build | Full sandbox tool set (bash, read, write, grep, glob, …) | UNDERSTAND → PLAN → IMPLEMENT → VERIFY → OUTPUT |
+
+Both classes prepend a structured workflow prompt to the skill's system prompt and override `_build_tools()` to enforce the correct tool set. Subclass them the same way as `agskill`:
+
+```python
+from agency.common_skills import agplan, agbuild
+
+analysis = agplan(
+    name="analyse_codebase",
+    system_prompt="Analyse the repository structure and identify the main entry points.",
+    output_schema=agdata(summary=str, entry_points=list),
+)
+
+implementation = agbuild(
+    name="add_feature",
+    system_prompt="Implement the feature described in the plan.",
+    input_schema=agdata(plan=str),
+    output_schema=agdata(files_changed=list, tests_passed=bool),
+)
+```
+
+`agplan` skills are well-suited to research, code review, gap analysis, and structured report generation. `agbuild` skills are suited to code generation, refactoring, running experiments, and any task that requires writing files or executing commands.
 
 ## Running tests
 
@@ -174,9 +207,10 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 
 ## Docs
 
+### Implementation
+
 | File | Topic |
 |---|---|
-| [parallelization.md](docs/parallelization.md) | Parallelism design — threads, processes, GIL, limitations |
 | [agent.md](docs/agent.md) | Agent construction, `run()`, forking, history, UI callbacks |
 | [agdata.md](docs/agdata.md) | Data container — pending results, schema types, serialization, error handling |
 | [agskill.md](docs/agskill.md) | ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
@@ -184,14 +218,19 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
 | [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
 | [agsandbox.md](docs/agsandbox.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |
-| [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, webui routing |
-| [Design_execution_loop.md](docs/Design_execution_loop.md) | Outer monitoring loop, inner ReAct loop, inbox drain, compaction |
-| [Design_sandbox_lifecycle.md](docs/Design_sandbox_lifecycle.md) | Trace: background job, foreground job, daemon |
 | [agresources.md](docs/agresources.md) | GPU/CPU/memory resource pool |
 | [aglog.md](docs/aglog.md) | Structured JSONL log — skills, tools, lifecycle, compaction |
-| [Design_compaction.md](docs/Design_compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
+| [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, webui routing |
 | [agwebui.md](docs/agwebui.md) | Web UI — browser dashboard, event stream, WebSocket, ask_human path |
 | [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
+
+### Design
+
+| File | Topic |
+|---|---|
+| [Design_execution_loop.md](docs/Design_execution_loop.md) | Outer monitoring loop, inner ReAct loop, inbox drain, compaction |
+| [Design_sandbox_lifecycle.md](docs/Design_sandbox_lifecycle.md) | Trace: background job, foreground job, daemon |
+| [Design_compaction.md](docs/Design_compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
 | [Design_deadlock.md](docs/Design_deadlock.md) | Deadlock patterns — shared agents across parallel threads, diagnosis, and fixes |
 | [Design_parallelization.md](docs/Design_parallelization.md) | Parallelism model — threads, GIL, process pool, LLM streaming |
 | [Design_resource_control.md](docs/Design_resource_control.md) | All semaphores and locks — what each guards and how it is acquired |
