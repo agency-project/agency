@@ -34,7 +34,8 @@ def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) ->
         if _agwebui._active is not None:
             import uuid as _uuid
             ask_id = _uuid.uuid4().hex[:12]
-            reply = _agwebui._active.emitter.ask_human(agname, ask_id, question)
+            reply = _agwebui._active.emitter.ask_human(agname, ask_id, question,
+                                                       timeout_s=timeout_s)
         elif agui._active is not None:
             reply = agui._active.ask_human(agname, question)
         else:

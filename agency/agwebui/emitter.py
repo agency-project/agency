@@ -56,6 +56,9 @@ class agwebui_emitter:
         self._lock = threading.Lock()
         # Latest cumulative token counts per agent; flushed again on done().
         self._token_state: dict[str, tuple[int, int, int, int]] = {}
+        # Registration state re-emitted in done() for late-joining clients.
+        self._agent_registry: dict[str, dict] = {}   # agname -> event dict
+        self._team_registry:  dict[str, dict] = {}   # team_name -> event dict
 
     # ------------------------------------------------------------------
     # Core emit
@@ -75,13 +78,16 @@ class agwebui_emitter:
         self.emit({"type": "log", "line": line, "ts": time.time()})
 
     def agent_registered(self, agname: str, hex_color: str, team: str | None = None) -> None:
-        self.emit({
+        ev = {
             "type": "agent_registered",
             "agname": agname,
             "color": hex_color,
             "team": team,
             "ts": time.time(),
-        })
+        }
+        with self._lock:
+            self._agent_registry[agname] = ev
+        self.emit(ev)
 
     def agent_state(
         self, agname: str, state: str, skill: str | None, tool: str | None,
@@ -99,12 +105,15 @@ class agwebui_emitter:
         })
 
     def team_registered(self, team_name: str, agent_names: list[str]) -> None:
-        self.emit({
+        ev = {
             "type": "team_registered",
             "team_name": team_name,
             "agents": agent_names,
             "ts": time.time(),
-        })
+        }
+        with self._lock:
+            self._team_registry[team_name] = ev
+        self.emit(ev)
 
     def push_messages(self, agname: str, messages: list[dict]) -> None:
         try:
@@ -118,8 +127,14 @@ class agwebui_emitter:
             "ts": time.time(),
         })
 
-    def ask_human(self, agname: str, ask_id: str, question: str) -> str:
-        """Emit ask event then block-poll until the web UI delivers a reply."""
+    _ASK_TIMEOUT_REPLY = "[no human available — timed out]"
+
+    def ask_human(self, agname: str, ask_id: str, question: str,
+                  timeout_s: float | None = 300) -> str:
+        """Emit ask event then block-poll until the web UI delivers a reply or timeout.
+
+        Pass ``timeout_s=None`` to wait indefinitely (for interactive use cases).
+        """
         self.emit({
             "type": "ask_human",
             "agname": agname,
@@ -128,7 +143,12 @@ class agwebui_emitter:
             "ts": time.time(),
         })
         reply_file = self._reply_dir / f"{ask_id}.txt"
+        deadline = (time.time() + timeout_s) if timeout_s is not None else None
         while not reply_file.exists():
+            if deadline is not None and time.time() >= deadline:
+                self.emit({"type": "human_reply", "ask_id": ask_id,
+                           "agname": agname, "reply": self._ASK_TIMEOUT_REPLY})
+                return self._ASK_TIMEOUT_REPLY
             time.sleep(0.2)
         text = reply_file.read_text(encoding="utf-8").strip()
         try:
@@ -180,12 +200,19 @@ class agwebui_emitter:
         })
 
     def done(self) -> None:
-        # Re-emit latest token state for all agents so it lands at the end of
-        # the events file, ensuring new browser connections (which only see the
-        # last 512 KB) always receive current token counts.
+        # Re-emit registration and token state at the end of the file so that
+        # late-joining clients (which only see the last TAIL_BYTES) always
+        # receive a complete roster and current token counts.
         with self._lock:
-            snapshot = dict(self._token_state)
-        for agname, (ai, ao, gi, go) in snapshot.items():
+            agents  = list(self._agent_registry.values())
+            teams   = list(self._team_registry.values())
+            tokens  = dict(self._token_state)
+        now = time.time()
+        for ev in agents:
+            self.emit({**ev, "ts": now})
+        for ev in teams:
+            self.emit({**ev, "ts": now})
+        for agname, (ai, ao, gi, go) in tokens.items():
             self.emit({
                 "type":         "token_update",
                 "agname":       agname,
@@ -193,6 +220,6 @@ class agwebui_emitter:
                 "agent_output": ao,
                 "global_input": gi,
                 "global_output": go,
-                "ts": time.time(),
+                "ts": now,
             })
-        self.emit({"type": "done", "ts": time.time()})
+        self.emit({"type": "done", "ts": now})

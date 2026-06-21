@@ -50,6 +50,13 @@ _last_ts:            float | None = None
 _clients: set[WebSocket] = set()
 _lock:    asyncio.Lock | None = None   # created at startup
 
+# In-memory registry rebuilt from the event stream as new events arrive.
+# Used to inject a "state preamble" for clients that connect mid-run,
+# so they always see the full agent/team roster even if those events have
+# scrolled past the TAIL_BYTES window.
+_agent_registry: dict[str, str] = {}   # agname -> raw JSON line
+_team_registry:  dict[str, str] = {}   # team_name -> raw JSON line
+
 
 # ---------------------------------------------------------------------------
 # App
@@ -161,7 +168,7 @@ async def websocket_endpoint(ws: WebSocket):
             raw = f.read(cur_size - tail_offset)
         tail_lines = [l for l in raw.split(b"\n") if l.strip()]
 
-    # Atomically send timeline_sync + tail, then register for live updates.
+    # Atomically send timeline_sync + registry preamble + tail, then register for live updates.
     async with _lock:
         sync = json.dumps({
             "type":       "timeline_sync",
@@ -172,10 +179,17 @@ async def websocket_endpoint(ws: WebSocket):
             "tail_offset": tail_offset,
             "tz_offset":  _TZ_OFFSET,
         })
+        preamble = list(_agent_registry.values()) + list(_team_registry.values())
         try:
             await ws.send_text(sync)
             for bline in tail_lines:
                 await ws.send_text(bline.decode("utf-8", errors="replace"))
+            # Send registration state after the tail so late-joining clients
+            # always learn about every agent/team even if the original events
+            # have scrolled past the TAIL_BYTES window.  Duplicates are
+            # harmless — the frontend updates by agname/team_name key.
+            for line in preamble:
+                await ws.send_text(line)
         except Exception:
             return
         _clients.add(ws)
@@ -200,6 +214,30 @@ async def websocket_endpoint(ws: WebSocket):
 # ---------------------------------------------------------------------------
 # Tail loop
 # ---------------------------------------------------------------------------
+
+def _scan_registries_from_file(event_file: Path) -> None:
+    """Sequential full-file scan to seed _agent_registry and _team_registry."""
+    global _agent_registry, _team_registry
+    with open(event_file, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                text = raw.decode("utf-8", errors="replace")
+                ev = json.loads(text)
+                t  = ev.get("type")
+                if t == "agent_registered":
+                    agn = ev.get("agname")
+                    if agn:
+                        _agent_registry[agn] = text
+                elif t == "team_registered":
+                    tn = ev.get("team_name")
+                    if tn:
+                        _team_registry[tn] = text
+            except Exception:
+                pass
+
 
 def _build_index_from_file(event_file: Path, n_points: int = 1000) -> None:
     """Scan the existing log file and populate _sparse_index at startup."""
@@ -250,8 +288,9 @@ async def _tail_events() -> None:
     global _file_offset, _file_size, _first_ts, _last_ts, _events_since_index
     event_file = _run_dir / "ui_events.jsonl"
 
-    # Build index from existing file before tailing new events.
+    # Build index and seed registries from existing file before tailing new events.
     if event_file.exists():
+        await asyncio.to_thread(_scan_registries_from_file, event_file)
         await asyncio.to_thread(_build_index_from_file, event_file)
 
     while True:
@@ -286,6 +325,22 @@ async def _tail_events() -> None:
                         if not _sparse_index or _events_since_index >= INDEX_INTERVAL:
                             _sparse_index.append((now, batch_start))
                             _events_since_index = 0
+
+                        # Update in-memory registry for mid-run client connects.
+                        for bline in complete_lines:
+                            try:
+                                ev = json.loads(bline.decode("utf-8", errors="replace"))
+                                t  = ev.get("type")
+                                if t == "agent_registered":
+                                    agn = ev.get("agname")
+                                    if agn:
+                                        _agent_registry[agn] = bline.decode("utf-8", errors="replace")
+                                elif t == "team_registered":
+                                    tn = ev.get("team_name")
+                                    if tn:
+                                        _team_registry[tn] = bline.decode("utf-8", errors="replace")
+                            except Exception:
+                                pass
 
                         dead: set[WebSocket] = set()
                         for bline in complete_lines:

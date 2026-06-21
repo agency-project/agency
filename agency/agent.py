@@ -511,11 +511,28 @@ class agent:
         thinking blocks. Never compacted or pruned."""
         return list(self._full_history)
 
+    def set_llm_config(self, llm_config: dict) -> None:
+        """Replace the agent's LLM config and refresh the context limit."""
+        self.llm_config = dict(llm_config)
+        self._context_limit = fetch_context_limit(self.llm_config)
+
+    def set_full_history(self, history: list[dict]) -> None:
+        """Replace the agent's full history with a deep copy of *history*."""
+        self._full_history = copy.deepcopy(history)
+
+    def reset_full_history(self) -> None:
+        """Clear the agent's full history."""
+        self._full_history = []
+
     def _append_full_history(self, msg: dict) -> None:
         """Append one message to the append-only full history (thread-safe write)."""
         self._full_history.append(msg)
         with self._full_history_path.open("a") as f:
             f.write(json.dumps(msg) + "\n")
+        if "role" not in msg:
+            # Event entry (skill_error, llm_retry, etc.) — push immediately so it
+            # appears in the webui history panel without waiting for the next LLM turn.
+            self._push_live_messages(self._snapshot_messages)
 
     # ------------------------------------------------------------------
     # Execution
@@ -543,7 +560,12 @@ class agent:
         try:
             from . import agwebui as _agwebui
             if _agwebui._active is not None:
-                _agwebui._active.emitter.push_messages(self.agname, list(messages))
+                # Append event entries (skill_error, llm_retry, etc.) to the snapshot
+                # so they appear in the webui history panel alongside conversation messages.
+                event_entries = [e for e in getattr(self, "_full_history", []) if "role" not in e]
+                _agwebui._active.emitter.push_messages(
+                    self.agname, list(messages) + event_entries
+                )
         except Exception:
             pass
         try:
@@ -648,6 +670,8 @@ class agent:
                     "ts": ts_start,
                 })
 
+                outer_input_tokens  = 0
+                outer_output_tokens = 0
                 outer_result, outer_history, outer_delta, _tok = af.run(
                     self.llm_config, input, prev_history,
                     self.sandbox, pool, max_steps, term=self._term, log=self.log,
@@ -679,7 +703,8 @@ class agent:
                 history_before = list(prev_history._data.get("messages", []))
                 self._term.log("SKILL ✗  ", f"{skill_name}  exception={exc}")
             finally:
-                self._set_ui_state("finished")
+                _had_error = outer_result is not None and bool(outer_result._data.get("error"))
+                self._set_ui_state("error" if _had_error else "finished")
                 if self.sandbox is not None:
                     _remove_offloaded_fields(_offloaded_paths, self.sandbox)
                     if self.sandbox._gpu_id is not None:
@@ -700,6 +725,8 @@ class agent:
             result_dict = outer_result.to_dict()
             if result_dict.get("error"):
                 self._term.log("SKILL ✗  ", f"{skill_name}  error={str(result_dict['error'])[:80]}")
+                self._append_full_history({"type": "skill_error", "skill": skill_name,
+                                           "error": str(result_dict["error"])})
             else:
                 self._term.log("SKILL ✓  ", f"{skill_name}  output={list(result_dict.keys())}")
             try:

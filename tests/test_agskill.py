@@ -1436,3 +1436,43 @@ def test_run_returns_token_counts():
     assert len(tokens) == 2
     # _Usage stub reports prompt_tokens=5
     assert tokens[0] == 5
+
+
+# ---------------------------------------------------------------------------
+# plan_mode
+# ---------------------------------------------------------------------------
+
+def test_plan_mode_sets_replace_tools_empty():
+    """plan_mode=True sets replace_tools to [] regardless of default."""
+    s = agskill(name="s", system_prompt="", plan_mode=True)
+    assert s.replace_tools == []
+
+
+def test_plan_mode_overrides_replace_tools_kwarg():
+    """plan_mode=True takes precedence over an explicit replace_tools argument."""
+    t = agtool(name="mt", description="my tool", fn=_noop_r1)
+    s = agskill(name="s", system_prompt="", plan_mode=True, replace_tools=[t])
+    assert s.replace_tools == []
+
+
+def test_plan_mode_false_leaves_replace_tools_untouched():
+    """plan_mode=False (default) does not modify replace_tools."""
+    t = agtool(name="mt", description="my tool", fn=_noop_r1)
+    s = agskill(name="s", system_prompt="", plan_mode=False, replace_tools=[t])
+    assert s.replace_tools == [t]
+
+
+def test_plan_mode_no_tools_sent_to_llm():
+    """When plan_mode=True, the LLM call receives no tools key."""
+    s = agskill(name="s", system_prompt="", plan_mode=True)
+    captured = {}
+
+    def capture(**kwargs):
+        captured["has_tools"] = "tools" in kwargs
+        return _direct("{}")
+
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = capture
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    assert captured["has_tools"] is False

@@ -598,3 +598,49 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="already in use"):
         agent.load(ckpt, llm_config={"api_key": "k", "model": "m"})
     _allocated_agnames.discard(ag.agname)
+
+
+# ---------------------------------------------------------------------------
+# UI state transitions
+# ---------------------------------------------------------------------------
+
+def test_ui_state_error_when_skill_returns_error():
+    """_ui_state is set to 'error' when the skill returns agdata(error=...)."""
+    skill = agskill(name="s", system_prompt="")
+
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
+        return agdata(error="something went wrong"), agdata(messages=[]), [], (0, 0)
+
+    skill.run = fake_run
+    ag = make_agent()
+    result = ag.run(skill, agdata())
+    _ = result.error   # resolve
+    assert ag._ui_state["state"] == "error"
+
+
+def test_ui_state_finished_on_success():
+    """_ui_state is set to 'finished' when the skill returns without error."""
+    skill = agskill(name="s", system_prompt="")
+
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
+        return agdata(answer="ok"), agdata(messages=[]), [], (0, 0)
+
+    skill.run = fake_run
+    ag = make_agent()
+    result = ag.run(skill, agdata())
+    _ = result.answer   # resolve
+    assert ag._ui_state["state"] == "finished"
+
+
+def test_ui_state_error_on_skill_exception():
+    """_ui_state is set to 'error' when the skill raises an unexpected exception."""
+    skill = agskill(name="s", system_prompt="")
+
+    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
+        raise RuntimeError("unexpected crash")
+
+    skill.run = fake_run
+    ag = make_agent()
+    result = ag.run(skill, agdata())
+    _ = result.error   # resolve (will contain the formatted exception)
+    assert ag._ui_state["state"] == "error"

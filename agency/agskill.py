@@ -719,11 +719,12 @@ class agskill:
         output_schema: agdata | None = None,
         output_validator: "Callable[[agdata], list[str]] | None" = None,
         max_output_schema_retries: int = 10,
+        plan_mode: bool = False,
     ):
         self.name = name
         self.system_prompt = system_prompt
         self.add_tools = add_tools
-        self.replace_tools = replace_tools
+        self.replace_tools = [] if plan_mode else replace_tools
         self.input_schema = input_schema
         self.output_schema = output_schema
         self.output_validator = output_validator   # extra check beyond type schema
@@ -1152,9 +1153,16 @@ class agskill:
             )
             if llm_result.should_retry:
                 _timeout_attempt = llm_result.next_timeout_attempt
+                if _full_history_fn:
+                    _full_history_fn({"type": "llm_retry",
+                                      "error": str(llm_result.conn_error),
+                                      "attempt": _timeout_attempt})
                 continue
             if not llm_result.ok:
-                return agdata(error=f"LLM connection error after 5 attempts: {llm_result.conn_error}"), history, [], (0, 0)
+                _err_msg = f"LLM connection error after 5 attempts: {llm_result.conn_error}"
+                if _full_history_fn:
+                    _full_history_fn({"type": "llm_error", "error": _err_msg})
+                return agdata(error=_err_msg), history, [], (0, 0)
             _timeout_attempt = 0
             _total_input_tokens  = llm_result.total_input_tokens
             _total_output_tokens = llm_result.total_output_tokens

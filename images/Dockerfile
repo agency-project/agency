@@ -31,4 +31,7 @@ load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test", token=tok
 print("Pre-cache complete.")
 EOF
 
-COPY images/model_smoke.py /opt/model_smoke.py
+# Ensure a clean, empty workspace.
+RUN rm -rf /workspace && mkdir -p /workspace
+
+COPY images/model_smoke.py /workspace/model_smoke.py

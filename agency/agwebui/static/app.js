@@ -479,6 +479,27 @@ function renderHistory() {
 
     } else if (role === 'tool') {
       frags.push(`<div class="msg-tool-result"><span class="dim">← ${esc(content)}</span></div>`);
+
+    } else if (msg.type === 'skill_start') {
+      frags.push(`<div class="msg-event">── skill: ${esc(msg.skill || '')} ──</div>`);
+
+    } else if (msg.type === 'skill_error') {
+      frags.push(
+        `<div class="msg-error"><span class="role-error">✗ skill error</span>` +
+        ` [${esc(msg.skill || '')}]\n${esc(msg.error || '')}</div>`
+      );
+
+    } else if (msg.type === 'llm_retry') {
+      frags.push(
+        `<div class="msg-warning"><span class="role-warning">⟳ LLM retry</span>` +
+        ` attempt ${esc(String(msg.attempt || ''))}: ${esc(msg.error || '')}</div>`
+      );
+
+    } else if (msg.type === 'llm_error') {
+      frags.push(
+        `<div class="msg-error"><span class="role-error">✗ LLM error</span>` +
+        `\n${esc(msg.error || '')}</div>`
+      );
     }
   }
 

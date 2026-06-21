@@ -33,4 +33,7 @@ EOF
 COPY images/nvidia-smi-shim-rocm.sh /usr/local/bin/nvidia-smi
 RUN chmod +x /usr/local/bin/nvidia-smi
 
-COPY images/model_smoke.py /opt/model_smoke.py
+# Ensure a clean, empty workspace.
+RUN rm -rf /workspace && mkdir -p /workspace
+
+COPY images/model_smoke.py /workspace/model_smoke.py

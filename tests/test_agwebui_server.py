@@ -18,15 +18,17 @@ def server(tmp_path):
     from fastapi.testclient import TestClient
 
     # Snapshot all module-level globals before the app starts
-    old_run_dir   = srv._run_dir
-    old_reply_dir = srv._reply_dir
-    old_clients   = srv._clients
-    old_index     = srv._sparse_index
-    old_since_idx = srv._events_since_index
-    old_offset    = srv._file_offset
-    old_size      = srv._file_size
-    old_first_ts  = srv._first_ts
-    old_last_ts   = srv._last_ts
+    old_run_dir      = srv._run_dir
+    old_reply_dir    = srv._reply_dir
+    old_clients      = srv._clients
+    old_index        = srv._sparse_index
+    old_since_idx    = srv._events_since_index
+    old_offset       = srv._file_offset
+    old_size         = srv._file_size
+    old_first_ts     = srv._first_ts
+    old_last_ts      = srv._last_ts
+    old_agent_reg    = srv._agent_registry
+    old_team_reg     = srv._team_registry
 
     # Point the server at a fresh temp directory
     srv._run_dir            = tmp_path
@@ -39,6 +41,8 @@ def server(tmp_path):
     srv._file_size          = 0
     srv._first_ts           = None
     srv._last_ts            = None
+    srv._agent_registry     = {}
+    srv._team_registry      = {}
 
     with TestClient(srv.app) as client:
         yield client, tmp_path, srv
@@ -53,6 +57,8 @@ def server(tmp_path):
     srv._file_size          = old_size
     srv._first_ts           = old_first_ts
     srv._last_ts            = old_last_ts
+    srv._agent_registry     = old_agent_reg
+    srv._team_registry      = old_team_reg
 
 
 # ---------------------------------------------------------------------------

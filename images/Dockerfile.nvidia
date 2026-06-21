@@ -28,4 +28,7 @@ load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test", token=tok
 print("Pre-cache complete.")
 EOF
 
-COPY images/model_smoke.py /opt/model_smoke.py
+# Clean the pre-populated workspace that ships with the NVIDIA base image.
+RUN rm -rf /workspace && mkdir -p /workspace
+
+COPY images/model_smoke.py /workspace/model_smoke.py
