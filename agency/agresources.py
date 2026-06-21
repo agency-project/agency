@@ -1,41 +1,55 @@
 from __future__ import annotations
 
-import atexit
+import ctypes
 import os
 import subprocess
-import sys
 import threading
 import time
+
 
 # VRAM held per GPU as a framework presence marker (visible in nvidia-smi).
 _MARKER_MB = 128
 _MARKER_BYTES = _MARKER_MB * 1024 * 1024
 
-# Inline script run as a subprocess per GPU.  Sets its own process name to
-# "agency-gpu" so it is identifiable in nvidia-smi and ps.  Uses the CUDA
-# driver API (libcuda.so.1) directly — no torch dependency required.
-_MARKER_SCRIPT = f"""\
-import ctypes, time, sys
 
-try:
-    ctypes.CDLL(None).prctl(15, b'agency-gpu', 0, 0, 0)
-except Exception:
-    pass
+def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
+    """Allocate _MARKER_MB of VRAM on each GPU directly in the calling process.
 
-try:
-    cuda = ctypes.CDLL('libcuda.so.1')
-    ctx  = ctypes.c_void_p()
-    ptr  = ctypes.c_void_p()
+    Uses the CUDA driver API via ctypes — no torch dependency required.
+    Allocations live for the process lifetime, which is fine: the memory is
+    tiny (128 MB per GPU) and there is no need to release it mid-run.
+    Runs silently if CUDA is unavailable.
+    """
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return
     if cuda.cuInit(0) != 0:
-        sys.exit(0)
-    if cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, 0) != 0:
-        sys.exit(0)
-    if cuda.cuMemAlloc_v2(ctypes.byref(ptr), {_MARKER_BYTES}) != 0:
-        sys.exit(0)
-    time.sleep(1e9)
-except Exception:
-    sys.exit(0)
-"""
+        return
+
+    # When CUDA_VISIBLE_DEVICES is set (e.g. "0,3,5,7"), the CUDA driver
+    # remaps physical GPUs to indices 0..N-1.  gpu_ids are physical IDs, so
+    # we must convert to the remapped index before calling CUDA APIs.
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    cuda_index: dict[int, int] = {}
+    if cvd and cvd.lower() not in ("nodevfiles", "none"):
+        try:
+            cvd_list = [int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()]
+            cuda_index = {phys: idx for idx, phys in enumerate(cvd_list)}
+        except Exception:
+            pass
+
+    for gpu_id in gpu_ids:
+        try:
+            dev = cuda_index.get(gpu_id, gpu_id)
+            ctx = ctypes.c_void_p()
+            ptr = ctypes.c_void_p()
+            if cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) != 0:
+                continue
+            cuda.cuMemAlloc_v2(ctypes.byref(ptr), _MARKER_BYTES)
+            # Leave context current; allocation persists for the process lifetime.
+        except Exception:
+            pass
 
 
 def _cvd_filter(gpu_ids: list[int]) -> list[int]:
@@ -163,53 +177,10 @@ class agResourcePool:
         self._gpus_acquired: int = 0
         self.cpus_acquired: float = 0.0
         self.memory_acquired_mb: int = 0
-        self._marker_procs: list[subprocess.Popen] = []
         if mark_gpus and self.gpus:
-            # Only run markers in the main process.  agtool uses a
-            # ProcessPoolExecutor whose workers also import agent.py, which
-            # re-evaluates the class-level agresource_pool and would otherwise
-            # spawn a full set of marker subprocesses in every worker.
             import multiprocessing
             if multiprocessing.current_process().name == "MainProcess":
-                self._start_gpu_markers()
-
-    def _start_gpu_markers(self) -> None:
-        """Launch one background process per GPU that holds _MARKER_MB of VRAM.
-
-        Each process names itself 'agency-gpu' via prctl so it appears clearly
-        in nvidia-smi and ps.  Processes exit silently if torch or CUDA is
-        unavailable.  All markers are terminated when the pool is garbage-
-        collected or the process exits.
-        """
-        for gpu_id in self.gpus:
-            try:
-                env = os.environ.copy()
-                env["CUDA_VISIBLE_DEVICES"]  = str(gpu_id)
-                env["HIP_VISIBLE_DEVICES"]   = str(gpu_id)
-                proc = subprocess.Popen(
-                    [sys.executable, "-c", _MARKER_SCRIPT],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                self._marker_procs.append(proc)
-            except Exception:
-                pass
-        atexit.register(self._stop_gpu_markers)
-
-    def _stop_gpu_markers(self) -> None:
-        """Terminate all GPU marker processes and reap them to avoid zombies."""
-        for proc in self._marker_procs:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        for proc in self._marker_procs:
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                pass
-        self._marker_procs.clear()
+                _allocate_gpu_markers(self.gpus)
 
     def acquire_gpu(self, timeout: float | None = None) -> int:
         """Block until any GPU is free; return its id."""

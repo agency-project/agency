@@ -13,6 +13,7 @@ import time
 import uuid
 
 import pytest
+from unittest.mock import MagicMock, patch
 
 from agency.agdata import agdata
 from agency.agresources import agResourcePool
@@ -301,209 +302,105 @@ class TestAgResourcePool:
 # ---------------------------------------------------------------------------
 
 class TestGpuMarkers:
-    def test_mark_gpus_false_starts_no_processes(self):
-        pool = agResourcePool(gpus=[0, 1], mark_gpus=False)
-        assert pool._marker_procs == []
+    """GPU markers are now allocated in-process via ctypes (no subprocesses)."""
 
-    def test_mark_gpus_true_empty_gpu_list_starts_no_processes(self):
-        pool = agResourcePool(gpus=[], mark_gpus=True)
-        assert pool._marker_procs == []
+    def test_mark_gpus_false_does_not_call_allocate(self):
+        from agency import agresources
+        with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
+            agResourcePool(gpus=[0, 1], mark_gpus=False)
+        mock_alloc.assert_not_called()
 
-    def test_mark_gpus_starts_one_process_per_gpu(self):
-        pool = agResourcePool(gpus=[0, 1], mark_gpus=True)
-        try:
-            assert len(pool._marker_procs) == 2
-        finally:
-            pool._stop_gpu_markers()
+    def test_mark_gpus_true_empty_gpu_list_does_not_call_allocate(self):
+        from agency import agresources
+        with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
+            agResourcePool(gpus=[], mark_gpus=True)
+        mock_alloc.assert_not_called()
 
-    def test_marker_processes_have_distinct_pids(self):
-        pool = agResourcePool(gpus=[0, 1, 2], mark_gpus=True)
-        try:
-            pids = [p.pid for p in pool._marker_procs]
-            assert len(set(pids)) == 3
-        finally:
-            pool._stop_gpu_markers()
+    def test_mark_gpus_true_calls_allocate_with_gpu_list(self):
+        from agency import agresources
+        with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
+            agResourcePool(gpus=[0, 1], mark_gpus=True)
+        mock_alloc.assert_called_once_with([0, 1])
 
-    def test_stop_markers_terminates_all(self):
-        pool = agResourcePool(gpus=[0, 1], mark_gpus=True)
-        procs = list(pool._marker_procs)
-        pool._stop_gpu_markers()
-        time.sleep(0.5)
-        for proc in procs:
-            assert proc.poll() is not None, f"process {proc.pid} still running after stop"
+    def test_mark_gpus_true_single_gpu_calls_allocate(self):
+        from agency import agresources
+        with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
+            agResourcePool(gpus=[2], mark_gpus=True)
+        mock_alloc.assert_called_once_with([2])
 
-    def test_stop_markers_no_zombies(self):
-        # After stop, processes must be reaped (poll() returns exit code, not None).
-        # A zombie would show poll()=None because wait() was never called.
-        pool = agResourcePool(gpus=[0, 1], mark_gpus=True)
-        procs = list(pool._marker_procs)
-        pool._stop_gpu_markers()
-        time.sleep(0.2)
-        for proc in procs:
-            code = proc.poll()
-            assert code is not None, f"process {proc.pid} is a zombie (not reaped)"
+    def test_no_marker_procs_attribute(self):
+        pool = agResourcePool(gpus=[0], mark_gpus=False)
+        assert not hasattr(pool, "_marker_procs")
 
-    def test_stop_markers_clears_list(self):
-        pool = agResourcePool(gpus=[0], mark_gpus=True)
-        pool._stop_gpu_markers()
-        assert pool._marker_procs == []
+    def test_no_stop_gpu_markers_method(self):
+        pool = agResourcePool(gpus=[0], mark_gpus=False)
+        assert not hasattr(pool, "_stop_gpu_markers")
 
-    def test_marker_process_comm_name(self):
-        # prctl(PR_SET_NAME) runs before torch import, so the name is set
-        # even if CUDA is unavailable and the process exits immediately.
-        pool = agResourcePool(gpus=[0], mark_gpus=True)
-        try:
-            pid = pool._marker_procs[0].pid
-            comm_path = f"/proc/{pid}/comm"
-            # Poll until we see "agency-gpu" (prctl ran) or the process exits.
-            deadline = time.monotonic() + 2.0
-            comm = None
-            while time.monotonic() < deadline:
-                try:
-                    with open(comm_path) as f:
-                        value = f.read().strip()
-                    if value == "agency-gpu":
-                        comm = value
-                        break
-                    # Still "python" — prctl hasn't run yet; keep polling.
-                except FileNotFoundError:
-                    break  # process already exited
-                time.sleep(0.05)
-            if comm is None:
-                pytest.skip("marker process exited before prctl could be observed")
-            assert comm == "agency-gpu"
-        finally:
-            pool._stop_gpu_markers()
-
-    @nvidia_smi
-    def test_marker_appears_in_nvidia_smi(self):
-        """Marker process allocates ~128 MB of VRAM visible in nvidia-smi."""
-        # Marker subprocesses use libcuda.so.1 — skip if the driver isn't present.
+    def test_allocate_gpu_markers_skips_on_no_libcuda(self):
+        from agency.agresources import _allocate_gpu_markers
         import ctypes
-        try:
-            ctypes.CDLL('libcuda.so.1')
-        except OSError:
-            pytest.skip("libcuda.so.1 not available on this host")
+        with patch.object(ctypes, "CDLL", side_effect=OSError("libcuda.so.1 not found")):
+            _allocate_gpu_markers([0, 1])  # must not raise
 
-        from agency.agresources import detect_gpus
-        real_gpus = detect_gpus()
-        if not real_gpus:
-            pytest.skip("no GPUs detected by nvidia-smi")
+    def test_allocate_gpu_markers_skips_on_cuinit_failure(self):
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+        mock_cuda = MagicMock()
+        mock_cuda.cuInit.return_value = 1  # CUDA_ERROR_NOT_INITIALIZED
+        with patch.object(ctypes, "CDLL", return_value=mock_cuda):
+            _allocate_gpu_markers([0])  # must not raise
+        mock_cuda.cuCtxCreate_v2.assert_not_called()
 
-        pool = agResourcePool(gpus=[real_gpus[0]], mark_gpus=True)
-        try:
-            # Allow torch to load and finish the VRAM allocation.
-            time.sleep(5)
-            marker_proc = pool._marker_procs[0]
-            if marker_proc.poll() is not None:
-                pytest.skip("marker process exited (torch or CUDA unavailable on this GPU)")
+    def test_allocate_gpu_markers_remaps_cuda_device_indices_with_cvd(self):
+        """When CUDA_VISIBLE_DEVICES=0,3,5,7, physical IDs must be remapped to
+        CUDA device indices 0-3 before calling cuCtxCreate_v2.  This is the
+        exact bug that caused markers to be missing on GPUs 3 and 5."""
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+        mock_cuda = MagicMock()
+        mock_cuda.cuInit.return_value = 0       # success
+        mock_cuda.cuCtxCreate_v2.return_value = 0
+        mock_cuda.cuMemAlloc_v2.return_value = 0
+        with patch.object(ctypes, "CDLL", return_value=mock_cuda):
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,3,5,7"}):
+                _allocate_gpu_markers([0, 3, 5, 7])
+        # Extract the device argument (3rd positional arg) from each call
+        called_devs = [
+            call.args[2] for call in mock_cuda.cuCtxCreate_v2.call_args_list
+        ]
+        assert called_devs == [0, 1, 2, 3], (
+            f"Expected CUDA device indices [0,1,2,3], got {called_devs}. "
+            "Physical GPU IDs were passed directly instead of being remapped."
+        )
 
-            result = subprocess.run(
-                ["nvidia-smi",
-                 "--query-compute-apps=pid,used_gpu_memory",
-                 "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=10,
-            )
-            assert result.returncode == 0, f"nvidia-smi failed: {result.stderr}"
+    def test_non_main_process_name_blocks_allocation(self):
+        """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
+        import multiprocessing
+        from agency import agresources
+        mock_proc = MagicMock()
+        mock_proc.name = "ForkPoolWorker-1"
+        with patch("multiprocessing.current_process", return_value=mock_proc):
+            with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
+                agResourcePool(gpus=[0], mark_gpus=True)
+        mock_alloc.assert_not_called()
 
-            reported_pids = set()
-            for line in result.stdout.splitlines():
-                parts = line.split(",")
-                if parts:
-                    try:
-                        reported_pids.add(int(parts[0].strip()))
-                    except ValueError:
-                        pass
-
-            assert marker_proc.pid in reported_pids, (
-                f"Marker PID {marker_proc.pid} not found in nvidia-smi output:\n"
-                f"{result.stdout}"
-            )
-        finally:
-            pool._stop_gpu_markers()
-
-    def test_subprocess_import_does_not_add_markers(self):
-        """Importing agent in a child process must not spawn additional markers.
-
-        The class-level agresource_pool = agResourcePool(mark_gpus=False) default
-        means child processes that import agent get a no-marker pool.  This test
-        would have caught the bug where mark_gpus=True was the class default,
-        causing the agwebui server and ProcessPoolExecutor workers to each start
-        their own full set of markers.
-        """
-        def _count_agency_gpu() -> int:
-            count = 0
-            for entry in os.scandir("/proc"):
-                if not entry.name.isdigit():
-                    continue
-                try:
-                    with open(f"/proc/{entry.name}/comm") as f:
-                        if f.read().strip() == "agency-gpu":
-                            count += 1
-                except OSError:
-                    pass
-            return count
-
-        pool = agResourcePool(gpus=[0], mark_gpus=True)
-        try:
-            time.sleep(0.5)  # let marker start
-            before = _count_agency_gpu()
-            assert before >= 1, "marker did not start"
-
-            child = subprocess.run(
-                [sys.executable, "-c", "from agency.agent import agent"],
-                capture_output=True, timeout=15,
-            )
-            assert child.returncode == 0, child.stderr.decode()
-
-            after = _count_agency_gpu()
-            assert after == before, (
-                f"subprocess import added {after - before} marker(s); "
-                "check mark_gpus default in agent.py class definition"
-            )
-        finally:
-            pool._stop_gpu_markers()
-
-    def test_process_pool_worker_does_not_add_markers(self):
-        """ProcessPoolExecutor workers must not start markers when importing agent.
-
-        Workers are named something other than 'MainProcess', so the
-        multiprocessing.current_process().name guard in agResourcePool.__init__
-        must prevent them from starting markers even if mark_gpus=True were
-        somehow the default.
-        """
-        import concurrent.futures
-
-        def _count_agency_gpu() -> int:
-            count = 0
-            for entry in os.scandir("/proc"):
-                if not entry.name.isdigit():
-                    continue
-                try:
-                    with open(f"/proc/{entry.name}/comm") as f:
-                        if f.read().strip() == "agency-gpu":
-                            count += 1
-                except OSError:
-                    pass
-            return count
-
-        pool = agResourcePool(gpus=[0], mark_gpus=True)
-        try:
-            time.sleep(0.5)
-            before = _count_agency_gpu()
-            assert before >= 1
-
-            with concurrent.futures.ProcessPoolExecutor(max_workers=1) as ex:
-                worker_name = ex.submit(_worker_import_agent).result(timeout=15)
-
-            assert worker_name != "MainProcess", "worker should not be MainProcess"
-            after = _count_agency_gpu()
-            assert after == before, (
-                f"worker import added {after - before} marker(s); "
-                "check the MainProcess guard in agResourcePool.__init__"
-            )
-        finally:
-            pool._stop_gpu_markers()
+    def test_subprocess_import_does_not_call_allocate(self):
+        """Importing agent in a subprocess must not call _allocate_gpu_markers."""
+        script = (
+            "import sys; "
+            "from unittest.mock import patch; "
+            "from agency import agresources; "
+            "calls = []; "
+            "original = agresources._allocate_gpu_markers; "
+            "agresources._allocate_gpu_markers = lambda ids: calls.append(ids) or original(ids); "
+            "from agency.agent import agent; "
+            "assert calls == [], f'allocate called: {calls}'"
+        )
+        child = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, timeout=15,
+        )
+        assert child.returncode == 0, child.stderr.decode()
 
 
 # ---------------------------------------------------------------------------

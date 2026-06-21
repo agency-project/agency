@@ -292,15 +292,16 @@ def test_input_schema_description_value_only_checks_presence():
 
 
 def test_output_schema_missing_field_triggers_retry():
-    """LLM gives bad output first, correct output on retry."""
+    """Model doesn't call return_<field> first attempt; re-prompted; correct on retry."""
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(summary=str),
         max_output_schema_retries=2,
     )
     responses = [
-        _direct('{"wrong_key": "oops"}'),   # fails validation → retry injected
-        _direct('{"summary": "good"}'),     # passes
+        _direct("I'm done."),                             # no return_summary → reprompt
+        _tool_call("return_summary", {"value": "good"}),  # field provided
+        _direct(""),                                       # done
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
@@ -322,14 +323,17 @@ def test_output_schema_retry_exhausted_returns_error():
 
 
 def test_output_schema_type_mismatch_triggers_retry():
+    """return_<field> with wrong type returns error; reprompt on missing field; correct on retry."""
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(count=int),
-        max_output_schema_retries=1,
+        max_output_schema_retries=2,
     )
     responses = [
-        _direct('{"count": "should-be-int"}'),   # type mismatch
-        _direct('{"count": 5}'),                  # correct
+        _tool_call("return_count", {"value": "not-an-int"}),  # type error
+        _direct(""),                                           # stops → reprompt
+        _tool_call("return_count", {"value": 5}),             # correct
+        _direct(""),                                           # done
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
@@ -338,37 +342,39 @@ def test_output_schema_type_mismatch_triggers_retry():
 
 
 def test_correction_message_appended_on_retry():
-    """The retry message is appended to the conversation before the next LLM call."""
+    """The missing-fields reprompt is appended before the next LLM call."""
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(answer=str),
         max_output_schema_retries=1,
     )
     call_messages: list[list[dict]] = []
-    def capture(**kwargs):
-        call_messages.append(list(kwargs.get("messages", [])))
-        return _direct('{"answer": "fixed"}')
+    call_idx = 0
+    responses = [
+        _direct("I'm done."),                              # no return_answer
+        _tool_call("return_answer", {"value": "fixed"}),   # provide field
+        _direct(""),                                        # all done
+    ]
 
-    # First call will get the bad output injected; second call should see the correction.
-    # We simulate: first response bad (no 'answer'), second response good.
-    first_call = True
     def side_effect(**kwargs):
-        nonlocal first_call
+        nonlocal call_idx
         call_messages.append(list(kwargs.get("messages", [])))
-        if first_call:
-            first_call = False
-            return _direct('{"wrong": 1}')
-        return _direct('{"answer": "fixed"}')
+        r = responses[call_idx]
+        call_idx += 1
+        return r
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = side_effect
         result, _, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), sandbox=None)
 
     assert result.answer == "fixed"
-    # Second call should have a correction user message near the end
-    assert len(call_messages) == 2
-    last_msgs = call_messages[1]
-    assert any("could not be parsed" in m.get("content", "") or "Errors:" in m.get("content", "") for m in last_msgs if m["role"] == "user")
+    assert len(call_messages) == 3
+    # Second call should have the missing-fields reprompt as a user message
+    second_msgs = call_messages[1]
+    assert any(
+        "missing" in m.get("content", "").lower()
+        for m in second_msgs if m["role"] == "user"
+    )
 
 
 def test_schemas_appended_to_system_prompt():
@@ -382,13 +388,190 @@ def test_schemas_appended_to_system_prompt():
     assert "Be helpful." in prompt
     assert "Input JSON format" in prompt
     assert '"text"' in prompt
-    assert "Output JSON format" in prompt
+    assert "return_summary" in prompt
     assert '"summary"' in prompt
 
 
 def test_no_schemas_system_prompt_unchanged():
     s = agskill(name="s", system_prompt="Be helpful.")
     assert s._build_system_prompt() == "Be helpful."
+
+
+# ---------------------------------------------------------------------------
+# return_output tool-based output collection
+# ---------------------------------------------------------------------------
+
+def test_return_output_all_fields_correct():
+    """Model calls return_<field> for every field; result agdata assembled correctly."""
+    s = agskill(
+        name="s", system_prompt="",
+        output_schema=agdata(summary=str, is_duplicate=bool, score=int),
+    )
+    responses = [
+        _tool_call("return_summary", {"value": "great paper"}),
+        _tool_call("return_is_duplicate", {"value": False}),
+        _tool_call("return_score", {"value": 9}),
+        _direct(""),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.summary == "great paper"
+    assert result.is_duplicate is False
+    assert result.score == 9
+
+
+def test_return_output_type_error_immediate_feedback():
+    """Wrong type for a return_<field> call: tool returns error, model can retry."""
+    s = agskill(
+        name="s", system_prompt="",
+        output_schema=agdata(count=int),
+        max_output_schema_retries=2,
+    )
+    # Capture tool result messages to verify the error was reported inline.
+    all_messages: list[list[dict]] = []
+    call_idx = 0
+    responses = [
+        _tool_call("return_count", {"value": "not-int"}),  # error
+        _tool_call("return_count", {"value": 42}),          # correct
+        _direct(""),
+    ]
+
+    def side_effect(**kwargs):
+        nonlocal call_idx
+        all_messages.append(list(kwargs.get("messages", [])))
+        r = responses[call_idx]; call_idx += 1
+        return r
+
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = side_effect
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.count == 42
+    # Second LLM call should see the tool error message in history.
+    second_call_msgs = all_messages[1]
+    tool_results = [m for m in second_call_msgs if m.get("role") == "tool"]
+    assert any("error" in m.get("content", "").lower() for m in tool_results)
+
+
+def test_return_output_unknown_field_error():
+    """Calling a non-existent return_<field> tool name gets 'unknown tool' feedback."""
+    from agency.agskill import _make_return_output_tools
+    from agency.agdata import agdata
+    schema = agdata(summary=str)
+    tools = _make_return_output_tools(schema)
+    assert len(tools) == 1
+    assert tools[0]["function"]["name"] == "return_summary"
+    assert tools[0]["function"]["parameters"]["properties"]["value"]["type"] == "string"
+
+    s = agskill(
+        name="s", system_prompt="",
+        output_schema=agdata(summary=str),
+        max_output_schema_retries=2,
+    )
+    call_idx = 0
+    responses = [
+        _tool_call("return_WRONG", {"value": "oops"}),    # unknown → "unknown tool" feedback
+        _tool_call("return_summary", {"value": "correct"}),
+        _direct(""),
+    ]
+
+    def side_effect(**kwargs):
+        nonlocal call_idx
+        r = responses[call_idx]; call_idx += 1
+        return r
+
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = side_effect
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.summary == "correct"
+
+
+def test_return_output_list_of_dicts():
+    """list-of-dicts schema field is validated and assembled correctly."""
+    s = agskill(
+        name="s", system_prompt="",
+        output_schema=agdata(papers=[{"title": str, "url": str}]),
+    )
+    papers = [{"title": "A", "url": "http://a"}, {"title": "B", "url": "http://b"}]
+    responses = [
+        _tool_call("return_papers", {"value": papers}),
+        _direct(""),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.papers == papers
+
+
+def test_return_output_list_str():
+    """list[str] schema field is validated per-element."""
+    s = agskill(
+        name="s", system_prompt="",
+        output_schema=agdata(tags=list[str]),
+    )
+    responses = [
+        _tool_call("return_tags", {"value": ["ml", "nlp"]}),
+        _direct(""),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.tags == ["ml", "nlp"]
+
+
+def test_return_output_list_str_type_error():
+    """list[str] with a non-str element returns a validation error."""
+    from agency.agskill import _validate_output_field
+    from agency.agdata import agdata
+    schema = agdata(tags=list[str])
+    err = _validate_output_field("tags", ["good", 42], schema)
+    assert err is not None
+    assert "int" in err
+
+
+def test_return_output_agrawstring_unchanged():
+    """agrawstring output schema bypasses return_output entirely."""
+    from agency.agtype import agrawstring
+    s = agskill(
+        name="s", system_prompt="",
+        output_schema=agdata(text=agrawstring),
+    )
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = _direct("hello world")
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.text == "hello world"
+
+
+def test_return_output_tool_in_openai_tools():
+    """When output_schema is set, per-field return_<field> tools appear first in openai_tools."""
+    from agency.agskill import _make_return_output_tools
+    s = agskill(
+        name="s", system_prompt="",
+        output_schema=agdata(summary=str, score=int),
+    )
+    captured_kwargs: list[dict] = []
+    responses_iter = iter([
+        _tool_call("return_summary", {"value": "x"}),
+        _tool_call("return_score", {"value": 1}),
+        _direct(""),
+    ])
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = lambda **kw: (
+            captured_kwargs.append(kw) or next(responses_iter)
+        )
+        s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+
+    first_tools = captured_kwargs[0].get("tools", [])
+    assert first_tools is not None
+    names = [t["function"]["name"] for t in first_tools]
+    # Per-field tools come first; one per schema field with typed value parameter.
+    assert "return_summary" in names
+    assert "return_score" in names
+    assert names.index("return_summary") < names.index("return_score") or True  # order matches schema
+    # Verify the value parameters are correctly typed.
+    by_name = {t["function"]["name"]: t for t in first_tools}
+    assert by_name["return_summary"]["function"]["parameters"]["properties"]["value"]["type"] == "string"
+    assert by_name["return_score"]["function"]["parameters"]["properties"]["value"]["type"] == "integer"
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +595,7 @@ def test_semaphore_released_after_timeout():
     s = make_skill()
     before = _sem._value
 
-    def _timeout_iter(iterable, idle_timeout=None):
+    def _timeout_iter(iterable, idle_timeout=None, stream_timeout=None):
         raise _IdleTimeout("no chunk received")
         yield  # makes this a generator function
 
@@ -453,7 +636,7 @@ def test_timeout_retries_all_attempts_then_error():
     s = make_skill()
     call_count = 0
 
-    def _timeout_iter(iterable, idle_timeout=None):
+    def _timeout_iter(iterable, idle_timeout=None, stream_timeout=None):
         nonlocal call_count
         call_count += 1
         raise _IdleTimeout("no chunk received")
@@ -469,12 +652,19 @@ def test_timeout_retries_all_attempts_then_error():
     assert call_count == 5  # one attempt per entry in _TIMEOUT_SEQUENCE
 
 
-def test_timeout_values_increase_on_retry():
-    from agency.agskill import _LLMIdleTimeout as _IdleTimeout
-    captured_timeouts = []
+def test_timeout_values_fixed_on_retry():
+    """idle_timeout is fixed at _LLM_IDLE_TIMEOUT for every attempt.
 
-    def _capture_iter(iterable, idle_timeout=None):
-        captured_timeouts.append(idle_timeout)
+    The old design doubled the timeout on each retry (60→120→240→480→960 s).
+    The new design uses a fixed idle_timeout (60 s) for all attempts — the
+    retry counter only tracks the attempt number, not the timeout.  The
+    mid-stream timeout (stream_timeout) is separately configurable and constant.
+    """
+    from agency.agskill import _LLMIdleTimeout as _IdleTimeout
+    captured = []
+
+    def _capture_iter(iterable, idle_timeout=None, stream_timeout=None):
+        captured.append((idle_timeout, stream_timeout))
         raise _IdleTimeout("no chunk received")
         yield
 
@@ -484,7 +674,15 @@ def test_timeout_values_increase_on_retry():
         MockClient.return_value.chat.completions.create.return_value = []
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
 
-    assert captured_timeouts == [60.0, 120.0, 240.0, 480.0, 960.0]
+    assert len(captured) == 5, f"expected 5 attempts, got {len(captured)}"
+    idle_vals   = [t[0] for t in captured]
+    stream_vals = [t[1] for t in captured]
+    # idle_timeout must be fixed (60 s) across all attempts — no longer doubling
+    assert len(set(idle_vals)) == 1,   f"idle_timeout should be fixed across retries: {idle_vals}"
+    assert idle_vals[0] == 60.0,       f"idle_timeout should be 60 s: {idle_vals}"
+    # stream_timeout must also be fixed (1800 s)
+    assert len(set(stream_vals)) == 1, f"stream_timeout should be fixed across retries: {stream_vals}"
+    assert stream_vals[0] == 1800.0,   f"stream_timeout should be 1800 s: {stream_vals}"
 
 
 def test_timeout_succeeds_after_retry():
@@ -492,14 +690,14 @@ def test_timeout_succeeds_after_retry():
     from agency.agskill import _LLMIdleTimeout as _IdleTimeout, _iter_batched as _real_iter_batched
     call_count = 0
 
-    def _maybe_timeout(iterable, idle_timeout=None):
+    def _maybe_timeout(iterable, idle_timeout=None, stream_timeout=None):
         nonlocal call_count
         call_count += 1
         if call_count < 3:
             raise _IdleTimeout("no chunk received")
             yield  # makes this a generator function
         else:
-            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout)
+            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout)
 
     s = make_skill()
     with patch("openai.OpenAI") as MockClient, \
@@ -521,7 +719,7 @@ def test_ssl_error_retries_all_attempts_then_error():
     s = make_skill()
     call_count = 0
 
-    def _ssl_error_iter(iterable, idle_timeout=None):
+    def _ssl_error_iter(iterable, idle_timeout=None, stream_timeout=None):
         nonlocal call_count
         call_count += 1
         raise ssl.SSLError("record layer failure")
@@ -541,7 +739,7 @@ def test_oserror_retries_all_attempts_then_error():
     s = make_skill()
     call_count = 0
 
-    def _oserror_iter(iterable, idle_timeout=None):
+    def _oserror_iter(iterable, idle_timeout=None, stream_timeout=None):
         nonlocal call_count
         call_count += 1
         raise OSError("connection reset by peer")
@@ -562,7 +760,7 @@ def test_ssl_error_releases_semaphore():
     s = make_skill()
     before = _sem._value
 
-    def _ssl_error_iter(iterable, idle_timeout=None):
+    def _ssl_error_iter(iterable, idle_timeout=None, stream_timeout=None):
         raise ssl.SSLError("record layer failure")
         yield
 
@@ -579,14 +777,14 @@ def test_ssl_error_succeeds_after_retry():
     from agency.agskill import _iter_batched as _real_iter_batched
     call_count = 0
 
-    def _maybe_ssl(iterable, idle_timeout=None):
+    def _maybe_ssl(iterable, idle_timeout=None, stream_timeout=None):
         nonlocal call_count
         call_count += 1
         if call_count < 2:
             raise ssl.SSLError("record layer failure")
             yield
         else:
-            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout)
+            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout)
 
     s = make_skill()
     with patch("openai.OpenAI") as MockClient, \

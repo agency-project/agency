@@ -5,6 +5,8 @@ live in test_agsandbox.py::TestSandboxedTools which runs against a real
 container.
 """
 import json
+import os
+import threading
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -207,3 +209,145 @@ class TestToolLogOnErrorResult:
         error_result = agdata(error="search failed")
         tool._log_fn(tool, agdata(pattern="TODO"), error_result, 5)
         assert term.log.called
+
+
+# ---------------------------------------------------------------------------
+# Sandbox tools must have need_sandbox=False so they run in the calling thread.
+#
+# Background: sandbox tools (bash, read, write, edit, glob, grep) close over
+# an agSandbox instance. After reserve_gpu is called, the sandbox holds
+# references to pool.acquire_gpu / pool.release_gpu — bound methods on an
+# agResourcePool which contains threading.Semaphore objects. threading.Semaphore
+# wraps _thread.lock, which cloudpickle cannot serialise. If any sandbox tool
+# had need_sandbox=True, cloudpickle.dumps(t.fn) would raise
+# "TypeError: cannot pickle '_thread.lock' object" the moment the LLM tried
+# to call bash after calling reserve_gpu.
+#
+# The fix: all sandbox tools use need_sandbox=False, running in the calling
+# thread (subprocess calls inside them already release the GIL, so no process
+# pool is needed for GIL relief). GPU acquisition inside exec() also runs on
+# the real agResourcePool in the calling thread, not a deserialized copy in a
+# worker process.
+# ---------------------------------------------------------------------------
+
+class TestSandboxToolsNeedSandboxFalse:
+    """Regression tests for the need_sandbox=False requirement on all sandbox tools."""
+
+    SANDBOX_TOOL_FACTORIES = [
+        ("bash",   "make_bash",   ("bash.py",   "make_bash")),
+        ("read",   "make_read",   ("read.py",   "make_read")),
+        ("write",  "make_write",  ("write.py",  "make_write")),
+        ("edit",   "make_edit",   ("edit.py",   "make_edit")),
+        ("glob",   "make_glob",   ("glob.py",   "make_glob")),
+        ("grep",   "make_grep",   ("grep.py",   "make_grep")),
+    ]
+
+    def _make_sandbox_mock(self):
+        return MagicMock()
+
+    def _make_pool_with_semaphore(self):
+        """Return a mock pool whose acquire_gpu attribute holds a real threading.Semaphore,
+        reproducing the exact unpicklable structure that triggered the bug."""
+        pool = MagicMock()
+        real_sem = threading.Semaphore(1)
+        pool._gpu_semaphore = real_sem
+        # Bind acquire_gpu to a method that uses the real semaphore so that
+        # cloudpickle would have to serialise it.
+        def _acquire():
+            real_sem.acquire()
+            return 0
+        pool.acquire_gpu = _acquire
+        pool.release_gpu = MagicMock()
+        pool.gpus = [0]
+        return pool
+
+    @pytest.mark.parametrize("tool_name,factory_name,_", SANDBOX_TOOL_FACTORIES)
+    def test_need_sandbox_is_false(self, tool_name, factory_name, _):
+        """Every sandbox tool must have need_sandbox=False."""
+        import importlib
+        mod = importlib.import_module(f"agency.tools.{tool_name}")
+        factory = getattr(mod, factory_name)
+        tool = factory(self._make_sandbox_mock())
+        assert tool.need_sandbox is False, (
+            f"{factory_name} has need_sandbox=True — it will fail cloudpickle "
+            f"serialisation after reserve_gpu is called (see test docstring)."
+        )
+
+    def test_bash_callable_after_reserve_gpu(self):
+        """Calling bash after reserve_gpu must not raise a pickle error.
+
+        Reproduces the exact sequence that failed:
+          1. reserve_gpu sets sandbox._gpu_acquire_fn = pool.acquire_gpu
+          2. LLM calls bash → agtool.__call__ → must NOT attempt cloudpickle.dumps
+        """
+        from agency.tools.bash import make_bash
+        from agency.tools.resource import make_gpu_reserve
+
+        pool = self._make_pool_with_semaphore()
+        sb = MagicMock()
+        sb._gpu_virtual = False
+        sb._gpu_acquire_fn = None
+        sb._gpu_release_fn = None
+        sb.exec.return_value = ("hello\n", 0)
+
+        reserve_gpu = make_gpu_reserve(sb, pool)
+        bash = make_bash(sb)
+
+        # Step 1: call reserve_gpu — sets _gpu_acquire_fn on the sandbox mock
+        reserve_result = reserve_gpu(agdata())
+        assert getattr(reserve_result, "error", None) is None
+
+        # Step 2: call bash — must not raise TypeError about _thread.lock
+        bash_result = bash(agdata(command="echo hello"))
+        assert getattr(bash_result, "error", None) is None
+
+    def test_make_sandboxed_tools_all_need_sandbox_false(self):
+        """make_sandboxed_tools must return only need_sandbox=False tools.
+
+        This is the integration check: even after reserve_gpu has been called and
+        sandbox._gpu_acquire_fn points to an unpicklable pool method, no tool in
+        the list should attempt to pickle its fn.
+        """
+        from agency.tools import make_sandboxed_tools
+        from agency.agresources import agResourcePool
+
+        pool = agResourcePool()
+        sb = MagicMock()
+        # Simulate post-reserve_gpu state: sandbox now holds pool method references.
+        sb._gpu_virtual = True
+        sb._gpu_acquire_fn = pool.acquire_gpu
+        sb._gpu_release_fn = pool.release_gpu
+
+        tools = make_sandboxed_tools(sb, pool)
+        sandbox_true = [t.name for t in tools if t.need_sandbox]
+        assert sandbox_true == [], (
+            f"These tools have need_sandbox=True and will fail cloudpickle after "
+            f"reserve_gpu is called: {sandbox_true}"
+        )
+
+    def test_sandbox_tools_run_in_calling_thread(self):
+        """need_sandbox=False tools run in the calling thread, not a worker process.
+
+        This is required for GPU acquisition to update the real agResourcePool
+        (a worker process would acquire against a deserialized copy and the
+        main process pool semaphore would never be decremented).
+        """
+        from agency.tools.bash import make_bash
+
+        caller_tid = threading.get_ident()
+        tool_tid_box: list[int] = []
+
+        sb = MagicMock()
+        def _exec_capture(cmd, workdir="/workspace", timeout=120):
+            tool_tid_box.append(threading.get_ident())
+            return ("ok\n", 0)
+        sb.exec.side_effect = _exec_capture
+
+        bash = make_bash(sb)
+        bash(agdata(command="echo ok"))
+
+        assert tool_tid_box, "bash fn was never called"
+        assert tool_tid_box[0] == caller_tid, (
+            "bash ran in a different thread — GPU pool updates would affect a copy, "
+            "not the real pool."
+        )

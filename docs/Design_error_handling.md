@@ -43,18 +43,27 @@ Errors almost never propagate as Python exceptions between threads. The canonica
 
 ### LLM connection retry
 
-**Location:** `_llm_call()` (line ~424–509) and the ReAct loop (line ~1148–1165)
+**Location:** `_llm_call()` and the ReAct loop in `agskill.run()`
 
 **What is caught:** `_LLMIdleTimeout`, `ssl.SSLError`, `OSError`, `httpx.TransportError` — all transient network failures during streaming.
 
-**Backoff sequence:** `_TIMEOUT_SEQUENCE = [60, 120, 240, 480, 960]` seconds — five attempts with doubling read timeouts.
+**Timeout constants** (defined at the top of `_llm_call()`):
+
+| Constant | Value | Role |
+|---|---|---|
+| `_LLM_MAX_RETRIES` | 5 | Total attempts before giving up |
+| `_LLM_IDLE_TIMEOUT` | 60 s | Max wait for the **first chunk** — detects a dead server |
+| `_LLM_STREAM_TIMEOUT` | 1800 s | Max gap between chunks **mid-stream** — detects a frozen server after streaming started |
+
+`_LLM_IDLE_TIMEOUT` and `_LLM_STREAM_TIMEOUT` are passed as separate parameters to `_iter_batched()`. The distinction matters: a pre-first-chunk timeout means the server never acknowledged the request (retry makes sense); a mid-stream timeout means the model was actively generating and then stalled (also retried, but much rarer in practice — 1800 s gives generous headroom for long reasoning chains on large models).
 
 **Handler:**
 1. `_llm_call()` catches the exception and returns `_LLMCallResult(should_retry=True, conn_error=exc)`.
 2. The ReAct loop in `agskill.run()` checks `llm_result.should_retry`:
    - Emits `{"type": "llm_retry", "error": str(exc), "attempt": N}` via `_full_history_fn`.
-   - Continues to next iteration (no sleep — the next timeout is longer to give the server time).
-3. After five consecutive failures, returns `_LLMCallResult(ok=False)`.
+   - Sleeps 2 s (allows SSL teardown to complete before reconnecting — see Known failure modes).
+   - Continues to the next attempt.
+3. After `_LLM_MAX_RETRIES` consecutive failures, returns `_LLMCallResult(ok=False)`.
 4. The ReAct loop emits `{"type": "llm_error", "error": "LLM connection error after 5 attempts: ..."}` and returns `agdata(error=...)` to `agent._task()`.
 
 **Propagation:** `agdata(error=...)` → `agent._task()` → `result_future.set_result(error_agdata)` → caller's `agdata._resolve()`.
@@ -286,11 +295,52 @@ All tool errors return `agdata(error=...)`. This is appended to the conversation
 
 ---
 
+## Known failure modes
+
+### `ssl.SSLError: [SSL: WRONG_VERSION_NUMBER]` on LLM retry
+
+**Root cause:** A race between the LLM drain thread and `client.close()` corrupts process-wide OpenSSL state.
+
+`_iter_batched()` spawns a daemon thread that blocks inside `ssl.read()` consuming the streaming response. When `_LLMIdleTimeout` fires in the main thread, `client.close()` is called to unblock the drain thread. This sends a TLS `close_notify` alert and tears down the socket while the drain thread is still mid-`ssl.read()`. The result is an abrupt SSL teardown while the underlying connection is in active use. OpenSSL's internal session state is corrupted — not just for that connection but process-wide. Any new `ssl.create_default_context()` call in the same process immediately after this may fail with `[X509] PEM lib` (unable to load the CA bundle from the already-corrupted context), and new connections to the server fail with `WRONG_VERSION_NUMBER` (the server's SSL stack receives garbled data and expects a different protocol version).
+
+**Reproduced** with direct vLLM+SSL (no proxy, no nginx):
+```
+delay=0.0s → ok=2  WRONG_VERSION=0  [X509] PEM lib=3   (5 concurrent abort→retry)
+delay=1.0s → ok=5  all clean
+delay=2.0s → ok=5  all clean
+```
+
+**Fix:** `agskill.py` adds `time.sleep(2)` in the retry loop after returning `should_retry=True`, giving the drain thread time to fully exit and the server's SSL layer time to complete teardown before the next connection is attempted. A 1 s delay is sufficient; 2 s is used for margin.
+
+**Symptom pattern:**
+- Error appears on the *second* LLM call in a retry sequence, not the first.
+- First call times out (idle timeout) → first `client.close()` → second call gets `WRONG_VERSION_NUMBER` or `[X509] PEM lib`.
+- The error is transient: a longer delay between retries eliminates it entirely.
+
+**What it is NOT:**
+- Not an nginx/proxy timeout (reproduced without any proxy).
+- Not a server-side SSL misconfiguration (valid certificate; clean connections succeed).
+- Not a stale keep-alive (httpx recovers from stale connections silently).
+
+### `_LLMIdleTimeout` firing mid-stream on large models
+
+**Root cause:** The idle timer was previously a single value applied both before and after the first chunk. On a 122B parameter model, generation of a complex response can take 280 s+ end-to-end, and inter-chunk gaps of several seconds are normal under concurrent load. With the old uniform 60 s timeout, any quiet period longer than 60 s mid-stream fired the timeout, discarded all tokens received so far, and restarted the entire LLM call from scratch.
+
+**Fix:** `_iter_batched()` now takes two separate timeouts (`idle_timeout` for pre-first-chunk, `stream_timeout` for mid-stream). `_LLM_IDLE_TIMEOUT = 60 s` remains tight to detect dead servers quickly. `_LLM_STREAM_TIMEOUT = 1800 s` gives long-running generations generous headroom. A mid-stream timeout discards partial output and retries the full call, same as before — but this is now far less likely to fire spuriously.
+
+**Diagnosed via mitmproxy:** All flows showed `TTFB ≈ 0 s` (vLLM returns `200 OK` headers immediately before streaming chunks). The timeouts were not caused by network drops or SSL issues — the server was simply generating and the inter-chunk gap exceeded the old threshold.
+
+### `peer closed connection without sending a complete message body` / `incomplete chunked read`
+
+Could not be reproduced with direct vLLM+SSL under normal conditions. This error is distinct from the SSL corruption above. The most likely cause is a vLLM server-side crash during generation (OOM, CUDA error, or process killed), which closes the connection abruptly mid-stream. The client receives an incomplete chunked response and raises the error. No keep-alive or SSL mechanism is involved. Diagnosing further requires server-side logs from a live failure.
+
+---
+
 ## Retry Budget Summary
 
 | Site | File | Max retries | Backoff |
 |---|---|---|---|
-| LLM connection | agskill.py:389 | 5 | Doubling timeout: 60→120→240→480→960 s |
+| LLM connection | agskill.py | 5 | Fixed 60 s idle (pre-first-chunk) + 1800 s stream (mid-stream) + 2 s sleep before retry |
 | Output schema validation | agskill.py:721 | 10 (configurable) | None — immediate correction message |
 | Docker name conflict | agsandbox.py:252 | 3 | Linear: 0.5 s × (attempt+1) |
 | Tool execution | agtool.py:160 | 0 (single attempt) | Pool reset on `BrokenProcessPool` |

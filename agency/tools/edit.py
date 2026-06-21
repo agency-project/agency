@@ -299,5 +299,5 @@ def make_edit(sandbox: "agSandbox") -> agtool:
         description="Replace a string in a file inside the sandbox. Uses fuzzy matching as fallback.",
         params=_EDIT_PARAMS,
         log_fn=_log,
-        need_sandbox=True,
+        need_sandbox=False,
     )

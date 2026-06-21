@@ -119,12 +119,13 @@ _TOOL_OUTPUT_OFFLOAD_CHARS: int = 80_000  # tool results longer than this are sa
 
 
 class _LLMIdleTimeout(Exception):
-    """Raised by _iter_batched when no chunk arrives within idle_timeout seconds."""
+    """Raised by _iter_batched when no chunk arrives within the applicable timeout."""
 
 
 def _iter_batched(
     iterable: Iterable[_T],
     idle_timeout: float | None = None,
+    stream_timeout: float | None = None,
 ) -> Generator[list[_T], None, None]:
     """Drain *iterable* in a background thread; yield batches to the caller.
 
@@ -133,9 +134,13 @@ def _iter_batched(
     the GIL for that entire interval so other threads run unimpeded.
     GIL acquisitions drop from O(items) to O(items / avg_batch_size).
 
-    If *idle_timeout* is given, raises _LLMIdleTimeout when no item arrives
-    for that many seconds.  The drain thread is left as a daemon (it will die
-    when the process exits or when the underlying socket is eventually closed).
+    *idle_timeout*   — seconds to wait for the **first** chunk before giving up
+                       and treating the connection as dead (triggers a retry).
+    *stream_timeout* — seconds to wait between chunks **after** streaming has
+                       started.  A gap here means the model stalled mid-generation;
+                       the partial response is discarded and the call retried.
+                       Defaults to None (no mid-stream timeout — wait indefinitely
+                       once tokens are flowing).
     """
     _SENTINEL = object()
     q: queue.SimpleQueue = queue.SimpleQueue()
@@ -154,22 +159,26 @@ def _iter_batched(
     threading.Thread(target=_drain, daemon=True).start()
 
     _last_item = time.monotonic()
+    _streaming = False  # True once the first chunk has been received
 
     while True:
-        # Block until the first item of the next batch arrives (GIL released).
-        # When idle_timeout is set, poll every _IDLE_CHECK_INTERVAL_S so we
-        # can detect dead connections (e.g. CLOSE-WAIT / stuck ssl.read()).
+        # Pick the applicable timeout: pre-first-chunk uses idle_timeout (tight,
+        # detects dead servers); post-first-chunk uses stream_timeout (loose or
+        # None, tolerates model thinking gaps without discarding partial output).
+        _current_timeout = stream_timeout if _streaming else idle_timeout
         try:
-            if idle_timeout is not None:
+            if _current_timeout is not None:
                 item = q.get(timeout=_IDLE_CHECK_INTERVAL_S)
             else:
                 item = q.get()
         except queue.Empty:
-            if time.monotonic() - _last_item >= idle_timeout:  # type: ignore[operator]
-                raise _LLMIdleTimeout(f"no chunk received for {idle_timeout:.0f}s")
+            if _current_timeout is not None and time.monotonic() - _last_item >= _current_timeout:
+                label = "mid-stream" if _streaming else "pre-first-chunk"
+                raise _LLMIdleTimeout(f"no chunk received for {_current_timeout:.0f}s ({label})")
             continue
 
         _last_item = time.monotonic()
+        _streaming = True
 
         if item is _SENTINEL:
             if exc_box:
@@ -279,6 +288,90 @@ from .agtype import agtype, agimage, agrawstring
 from .agtool import agtool
 from .agcompaction import compact, should_compact, count_messages_tokens
 
+
+def _hint_to_json_type(hint) -> str:
+    """Map a schema hint to a JSON Schema type string for tool parameter specs."""
+    if isinstance(hint, type):
+        if issubclass(hint, bool):   return "boolean"   # bool before int (bool is subclass of int)
+        if issubclass(hint, int):    return "integer"
+        if issubclass(hint, float):  return "number"
+        if issubclass(hint, agtype): return "string"
+        return "string"
+    if get_origin(hint) is list:
+        return "array"
+    if isinstance(hint, list):       # [{"key": type, ...}] literal
+        return "array"
+    return "string"
+
+
+def _make_return_output_tools(schema: "agdata") -> list[dict]:
+    """Build one typed tool per output field from the schema.
+
+    Each tool is named `return_<field>` and has a single `value` parameter
+    with the correct JSON Schema type.  This avoids an untyped `value`
+    parameter which confuses some model/parser combinations (e.g. qwen3_xml).
+    """
+    tools = []
+    for field, hint in schema._data.items():
+        json_type = _hint_to_json_type(hint)
+        value_schema: dict = {"type": json_type, "description": f"Value for '{field}'"}
+        if json_type == "array":
+            value_schema["description"] += " (JSON array)"
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": f"return_{field}",
+                "description": f"Register the '{field}' output field.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": value_schema},
+                    "required": ["value"],
+                },
+            },
+        })
+    return tools
+
+
+def _make_return_output_tool(schema: "agdata") -> list[dict]:
+    """Alias kept for test compatibility — returns the full per-field tool list."""
+    return _make_return_output_tools(schema)
+
+
+def _validate_output_field(field: str, value, schema: "agdata") -> "str | None":
+    """Validate a single (field, value) pair against the output schema hint.
+
+    Returns an error string, or None if valid.
+    """
+    hint = schema._data[field]
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        if not isinstance(value, str):
+            return f"expected str, got {type(value).__name__}"
+    elif get_origin(hint) is list:
+        if not isinstance(value, list):
+            return f"expected list, got {type(value).__name__}"
+        args = get_args(hint)
+        if args and isinstance(args[0], type):
+            inner = args[0]
+            for i, item in enumerate(value):
+                if not isinstance(item, inner):
+                    return f"item {i}: expected {inner.__name__}, got {type(item).__name__}"
+    elif isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+        if not isinstance(value, list):
+            return f"expected list, got {type(value).__name__}"
+        template = hint[0]
+        for i, item in enumerate(value):
+            if not isinstance(item, dict):
+                return f"item {i}: expected dict, got {type(item).__name__}"
+            for k, t in template.items():
+                if k not in item:
+                    return f"item {i}: missing key '{k}'"
+                if isinstance(t, type) and not isinstance(item[k], t):
+                    return f"item {i}.{k}: expected {t.__name__}, got {type(item[k]).__name__}"
+    elif isinstance(hint, type):
+        if not isinstance(value, hint):
+            return f"expected {hint.__name__}, got {type(value).__name__}"
+    return None
+
 if TYPE_CHECKING:
     from .agterm import agterm
     from .aglog import aglog
@@ -386,8 +479,9 @@ def _llm_call(
 
     Returns an _LLMCallResult. Caller checks .ok, .should_retry, .conn_error.
     """
-    _TIMEOUT_SEQUENCE = [60, 120, 240, 480, 960]
-    read_timeout = _TIMEOUT_SEQUENCE[min(_timeout_attempt, len(_TIMEOUT_SEQUENCE) - 1)]
+    _LLM_MAX_RETRIES = 5
+    _LLM_IDLE_TIMEOUT = 60.0    # seconds to wait for first chunk (server dead?)
+    _LLM_STREAM_TIMEOUT = 1800.0  # seconds to wait between chunks mid-stream
 
     kwargs = dict(kwargs)  # shallow copy so we don't mutate caller's dict
     kwargs["stream"] = True
@@ -409,7 +503,7 @@ def _llm_call(
         )
 
         if term:
-            term.log("LLM ▶    ", f"model={llm_config.get('model','?')}  messages={len(messages)}  timeout={read_timeout}s")
+            term.log("LLM ▶    ", f"model={llm_config.get('model','?')}  messages={len(messages)}  idle_timeout={_LLM_IDLE_TIMEOUT:.0f}s  stream_timeout={_LLM_STREAM_TIMEOUT:.0f}s")
         if _state_fn:
             _state_fn("llm", skill=skill_name)
 
@@ -422,7 +516,7 @@ def _llm_call(
         _live_chars = 0
 
         try:
-            for batch in _iter_batched(client.chat.completions.create(**kwargs), idle_timeout=float(read_timeout)):
+            for batch in _iter_batched(client.chat.completions.create(**kwargs), idle_timeout=_LLM_IDLE_TIMEOUT, stream_timeout=_LLM_STREAM_TIMEOUT):
                 for chunk in batch:
                     if chunk.usage is not None:
                         prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
@@ -484,16 +578,11 @@ def _llm_call(
                 pass
             messages.pop()  # remove partial placeholder
             _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-            _err_desc = (
-                f"timeout after {read_timeout}s"
-                if isinstance(_conn_err, _LLMIdleTimeout)
-                else f"connection error: {_conn_err}"
-            )
-            if _timeout_attempt < len(_TIMEOUT_SEQUENCE) - 1:
+            _err_desc = str(_conn_err) if not isinstance(_conn_err, _LLMIdleTimeout) else str(_conn_err)
+            if _timeout_attempt < _LLM_MAX_RETRIES - 1:
                 next_attempt = _timeout_attempt + 1
-                next_timeout = _TIMEOUT_SEQUENCE[next_attempt]
                 if term:
-                    term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  {_err_desc}  retrying with {next_timeout}s")
+                    term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  {_err_desc}  retry {next_attempt}/{_LLM_MAX_RETRIES - 1}")
                 return _LLMCallResult(
                     conn_error=_conn_err,
                     should_retry=True,
@@ -539,6 +628,7 @@ def _dispatch_tools(
     _live_messages_fn: "Callable | None",
     _full_history_fn: "Callable | None",
     term: "agterm | None",
+    _intercept: "dict[str, Callable[[dict], str]] | None" = None,
 ) -> None:
     """Execute all tool calls from one LLM response, appending results to messages."""
     for tc in tool_calls:
@@ -553,6 +643,23 @@ def _dispatch_tools(
         except (json.JSONDecodeError, TypeError):
             fn_args = "{}"
             tc["function"]["arguments"] = fn_args
+
+        # Framework-internal tools (e.g. return_output) are handled in the
+        # calling thread before normal tool dispatch.
+        if _intercept and fn_name in _intercept:
+            try:
+                args = json.loads(fn_args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            result_content = _intercept[fn_name](args)
+            tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
+            messages.append(tool_msg)
+            if _live_messages_fn:
+                _live_messages_fn(messages[1:])
+            if _full_history_fn:
+                _full_history_fn(tool_msg)
+            continue
+
         t = tool_map.get(fn_name)
         if t is None:
             if term:
@@ -802,18 +909,17 @@ class agskill:
             if self._raw_output_key() is not None:
                 parts.append("\nRespond with plain text only — no JSON wrapping, no markdown code fences.")
             else:
+                field_tools = ", ".join(
+                    f"return_{f}" for f in self.output_schema._data
+                )
                 parts.append(
-                    f"\nOutput JSON format (respond ONLY with this JSON, no other text):\n"
+                    f"\nTo return your results, call the appropriate return_<field> tool "
+                    f"once for each required output field ({field_tools}). "
+                    f"Required fields and their types:\n"
                     f"{self.output_schema.to_json()}\n\n"
-                    "JSON formatting rules — common failure modes to avoid:\n"
-                    "- Do NOT wrap the JSON in markdown code fences (``` or ```json).\n"
-                    "- Do NOT add any explanation, preamble, or trailing text outside the JSON object.\n"
-                    "- All string values must use double quotes. Escape special characters inside strings:\n"
-                    '  use \\" for a literal quote, \\\\ for a backslash, \\n for a newline.\n'
-                    "  Never use raw newlines or unescaped quotes inside a string value.\n"
-                    "- Every key must be a double-quoted string. Trailing commas are not allowed.\n"
-                    "- The response must be a single JSON object {{ }} — not an array, not multiple objects.\n"
-                    "- Include every required field exactly once. Do not nest the output inside an extra wrapper key."
+                    "- Call each return_<field> tool separately — one field per call.\n"
+                    "- Only call a return_<field> tool when you have the final value for that field.\n"
+                    "- You may continue using other tools after registering outputs if needed."
                 )
         return "\n".join(parts)
 
@@ -1125,6 +1231,34 @@ class agskill:
 
         _active_tools, tool_map, openai_tools = self._build_tools(sandbox, pool, term, log)
 
+        # Tool-based output collection (return_output tool).
+        # Used for all output schemas except agrawstring (raw text).
+        _use_return_output = (
+            self.output_schema is not None and self._raw_output_key() is None
+        )
+        _collected_outputs: dict = {}
+        _required_fields: set[str] = set()
+        _intercept: "dict[str, Callable[[dict], str]] | None" = None
+        if _use_return_output:
+            _required_fields = set(self.output_schema._data.keys())
+            _return_tools = _make_return_output_tools(self.output_schema)
+            openai_tools = _return_tools + (openai_tools or [])
+
+            def _make_field_handler(field: str):
+                def _handle(args: dict) -> str:
+                    value = args.get("value")
+                    err = _validate_output_field(field, value, self.output_schema)
+                    if err is not None:
+                        return json.dumps({"error": f"field '{field}': {err}"})
+                    _collected_outputs[field] = value
+                    remaining = _required_fields - set(_collected_outputs)
+                    if remaining:
+                        return json.dumps({"result": f"✓ '{field}' registered. Still needed: {sorted(remaining)}"})
+                    return json.dumps({"result": f"✓ '{field}' registered. All required fields complete."})
+                return _handle
+
+            _intercept = {f"return_{f}": _make_field_handler(f) for f in _required_fields}
+
         _timeout_attempt = 0
         messages, n_before = self._build_initial_messages(
             input, history, _extra_system, _live_messages_fn, _full_history_fn,
@@ -1157,6 +1291,12 @@ class agskill:
                     _full_history_fn({"type": "llm_retry",
                                       "error": str(llm_result.conn_error),
                                       "attempt": _timeout_attempt})
+                # Sleep before reconnecting: closing the client while the drain
+                # thread is mid-ssl.read() corrupts process-wide OpenSSL state.
+                # A 2 s gap lets the drain thread exit and the server's SSL
+                # teardown complete before the next connection is attempted.
+                # (Reproduced: 0 s → 3/5 SSL failures; 1 s+ → 5/5 clean.)
+                time.sleep(2)
                 continue
             if not llm_result.ok:
                 _err_msg = f"LLM connection error after 5 attempts: {llm_result.conn_error}"
@@ -1188,6 +1328,7 @@ class agskill:
                 _dispatch_tools(
                     msg_dict["tool_calls"], tool_map, messages, sandbox, self.name,
                     _state_fn, _live_messages_fn, _full_history_fn, term,
+                    _intercept=_intercept,
                 )
 
             else:
@@ -1196,6 +1337,82 @@ class agskill:
                 # loop so the exchange can complete before output validation runs.
                 if had_inbox:
                     continue
+
+                if _use_return_output:
+                    # Tool-based output path: check that all required fields were
+                    # registered via return_output before the model stopped.
+                    missing = _required_fields - set(_collected_outputs)
+                    if missing:
+                        if output_schema_retries_left > 0:
+                            output_schema_retries_left -= 1
+                            reprompt = {
+                                "role": "user",
+                                "content": (
+                                    f"You have not yet provided all required output fields. "
+                                    f"Still missing: {sorted(missing)}. "
+                                    f"Call return_output for each missing field."
+                                ),
+                            }
+                            messages.append(reprompt)
+                            if _live_messages_fn:
+                                _live_messages_fn(messages[1:])
+                            if _full_history_fn:
+                                _full_history_fn(reprompt)
+                            continue
+                        updated_history = agdata(messages=messages[1:])
+                        return (
+                            agdata(error=f"output schema error: missing fields after retries: {sorted(missing)}"),
+                            updated_history,
+                            [messages[0]] + messages[1:][n_before:],
+                            (_total_input_tokens, _total_output_tokens),
+                        )
+                    # All fields collected — run optional validator.
+                    result = agdata(**_collected_outputs)
+                    if self.output_validator is not None:
+                        val_errors = self.output_validator(result)
+                        if val_errors:
+                            if output_schema_retries_left > 0:
+                                output_schema_retries_left -= 1
+                                reprompt = {
+                                    "role": "user",
+                                    "content": (
+                                        f"Output validation failed: {val_errors}. "
+                                        f"Please correct your answers using return_output."
+                                    ),
+                                }
+                                messages.append(reprompt)
+                                if _live_messages_fn:
+                                    _live_messages_fn(messages[1:])
+                                if _full_history_fn:
+                                    _full_history_fn(reprompt)
+                                continue
+                            updated_history = agdata(messages=messages[1:])
+                            return (
+                                agdata(error=f"output validation error: {val_errors}"),
+                                updated_history,
+                                [messages[0]] + messages[1:][n_before:],
+                                (_total_input_tokens, _total_output_tokens),
+                            )
+                    if sandbox is not None:
+                        proc_msg = _wait_for_processes(
+                            sandbox, self.name, term, log, _agname,
+                            _ping_interval_s, _poll_interval_s, _state_fn,
+                        )
+                        if proc_msg is not None:
+                            messages.append({"role": "user", "content": proc_msg})
+                            if _live_messages_fn:
+                                _live_messages_fn(messages[1:])
+                            if _full_history_fn:
+                                _full_history_fn(messages[-1])
+                            continue
+                    updated_history = agdata(messages=messages[1:])
+                    return (
+                        result,
+                        updated_history,
+                        [messages[0]] + messages[1:][n_before:],
+                        (_total_input_tokens, _total_output_tokens),
+                    )
+
                 far = self._parse_final_answer(
                     msg_dict, messages, n_before, output_schema_retries_left,
                     (_total_input_tokens, _total_output_tokens),

@@ -302,7 +302,8 @@ class PaperCrawlerTeam(agteam):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from agency import AgError, agUI
+    from agency import AgError
+    import sys
 
     topic   = " ".join(sys.argv[1:]) or "KV cache quantization"
     run_dir = _make_run_dir("paper_crawler")
@@ -328,5 +329,4 @@ if __name__ == "__main__":
         except AgError as e:
             print(f"\nERROR: {e}")
 
-    agUI.run(_script)
-    
+    _script()

@@ -9,13 +9,13 @@ from agency import agskill, agdata
 
 skill = agskill(
     name="summarize",
-    system_prompt="You are a concise summarizer. Return only valid JSON.",
+    system_prompt="You are a concise summarizer.",
     input_schema=agdata(text=str),
     output_schema=agdata(summary=str, word_count=int),
 )
 ```
 
-Both schemas are serialized and appended to the system prompt so the LLM knows the expected format.
+The input schema is serialized and appended to the system prompt. The output schema is used to generate one typed tool per output field (see [Output collection via tools](#output-collection-via-tools)).
 
 ## Parameters
 
@@ -34,17 +34,17 @@ Both schemas are serialized and appended to the system prompt so the LLM knows t
 
 Schema fields in `agdata` are plain Python type objects:
 
-| Type | JSON hint sent to LLM | Notes |
+| Type | Tool `value` type | Validation |
 |---|---|---|
-| `str` | `"str"` | Plain text |
-| `int` | `"int"` | |
-| `float` | `"float"` | |
-| `bool` | `"bool"` | |
-| `list` | `"list"` | Untyped list — no item validation |
-| `dict` | `"dict"` | |
-| `agfile` | `"file"` | File-backed field — see [Typed field values](#typed-field-values-agtype-and-agfile) |
+| `str` | `string` | `isinstance(v, str)` |
+| `int` | `integer` | `isinstance(v, int)` |
+| `float` | `number` | `isinstance(v, float)` |
+| `bool` | `boolean` | `isinstance(v, bool)` |
+| `list[str]` / `list[int]` etc. | `array` | each element checked against inner type |
+| `[{"key": type, ...}]` | `array` | each item dict validated against template |
+| `agfile` | `string` | must be str (file path); framework reads content after skill ends |
 
-Any `agtype` subclass is also valid; its `schema_type()` classmethod provides the JSON hint.
+Any `agtype` subclass is also valid; its `schema_type()` classmethod provides the display hint.
 
 ```python
 # All built-in Python types work directly:
@@ -52,6 +52,9 @@ output_schema=agdata(summary=str, word_count=int, passed=bool)
 
 # agfile for large text outputs:
 output_schema=agdata(report=agfile)
+
+# Typed list:
+output_schema=agdata(tags=list[str])
 ```
 
 ### Typed list fields
@@ -65,13 +68,13 @@ output_schema = agdata(
 )
 ```
 
-The serialized hint shown to the LLM is:
+The hint shown to the LLM in the system prompt is:
 
 ```json
 {"papers": [{"title": "str", "url": "str", "abstract": "str"}], "count": "int"}
 ```
 
-The framework validates every element against the template during output schema checking: each item must be a `dict` containing the declared keys with the declared Python types. A failure triggers an automatic retry with a message identifying the exact index and key that failed. Use this form instead of bare `list` whenever item structure matters.
+The framework validates every element against the template: each item must be a `dict` containing the declared keys with the declared Python types. A type mismatch is caught immediately when the model calls the field's tool, which lets it correct only that field without restarting. Use this form instead of bare `list` whenever item structure matters.
 
 ## ReAct loop
 
@@ -85,15 +88,17 @@ Each call to `agskill.run()` executes a standard ReAct loop:
 6. Post-call compaction — check actual `prompt_tokens` from API usage; compact again if needed
 7. If response contains tool calls → for each tool:
    a. Coerce malformed JSON arguments to `"{}"` so history replay never crashes
-   b. If `need_sandbox=True`, commit the sandbox to a pre-call checkpoint image
-   c. Execute the tool (offloaded to a worker process)
-   d. If the result contains `"error"`, restore the sandbox from the checkpoint and append `workspace_reverted` to the error message (see [Tool failure and checkpoint revert](#tool-failure-and-checkpoint-revert))
-   e. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
-   f. Append the tool result message and go to 3
-8. If response is a final answer → parse JSON, validate against `output_schema`
-9. If validation fails and retries remain → inject correction message, go to 3
-10. If sandbox has live background processes → `_wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
-11. Delete offloaded input files, return `(result, updated_history, history_delta, token_counts)`
+   b. If the tool is a `return_<field>` output tool → validate and store the value (see [Output collection via tools](#output-collection-via-tools)); skip normal dispatch
+   c. If `need_sandbox=True`, commit the sandbox to a pre-call checkpoint image
+   d. Execute the tool (in the calling thread for sandbox tools, or offloaded to a worker process)
+   e. If the result contains `"error"`, restore the sandbox from the checkpoint and append `workspace_reverted` to the error message (see [Tool failure and checkpoint revert](#tool-failure-and-checkpoint-revert))
+   f. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
+   g. Append the tool result message and go to 3
+8. If response has no tool calls → check if all required output fields have been registered
+9. If fields are missing and retries remain → inject reprompt message listing missing fields, go to 3
+10. If all fields present and `output_validator` is set → run validator; if it fails and retries remain → inject correction message, go to 3
+11. If sandbox has live background processes → `_wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
+12. Delete offloaded input files, return `(result, updated_history, history_delta, token_counts)`
 
 The loop exits early when `max_steps` (default `AGSKILL_REACT_MAX_STEPS = 4096`) is exceeded.
 
@@ -298,17 +303,34 @@ Input is validated against `input_schema` before the loop starts. Validation che
 
 Input validation is **skipped** when `_is_continuation=True` so that process-status messages injected by `_wait_for_processes` can flow through without matching the skill's declared input schema.
 
-## Output validation and retries
+## Output collection via tools
 
-After a non-tool-call LLM response:
+When an `output_schema` is declared (and it is not an `agrawstring` schema), the framework generates one typed tool per output field and adds them to the tool list at the start of the skill run:
 
-1. Parse the response content as JSON (markdown code fences are stripped)
-2. Check all fields in `output_schema` are present with the correct type
-3. Run `output_validator(result)` if provided — returns a list of error strings
-4. If errors exist and `retries_left > 0`: inject a correction message and loop
-5. If errors persist after all retries: return `agdata(error="output schema error after retries: ...")`
+```
+return_summary(value: string)
+return_word_count(value: integer)
+return_passed(value: boolean)
+```
 
-Output validation is skipped when the LLM response is answering a mid-conversation user message injected via the inbox (`had_inbox=True`), because the LLM is engaged in dialogue rather than producing a final structured answer.
+The system prompt instructs the model to call each `return_<field>` tool once it has the final value for that field. The model may interleave these calls freely with other tool use (bash, read, write, etc.) — it is not required to call them all at once or last.
+
+### Per-field validation
+
+Each `return_<field>` call is validated immediately against the schema hint:
+
+- **Type mismatch** → the tool returns `{"error": "field 'X': expected bool, got str"}` inline. The model sees the error in the same response turn and can retry just that field without losing any other already-registered outputs.
+- **Success** → the tool returns `{"result": "✓ 'X' registered. Still needed: [...]"}` (or `"All required fields complete."` on the last one).
+
+### Completeness check and reprompt
+
+When the model produces a response with no tool calls at all, the framework checks whether all required fields have been registered:
+
+- **All fields present** → assemble `agdata(**collected)`, run `output_validator` if set, then return (or inject background-process status if needed).
+- **Fields missing** → inject a reprompt: `"You have not yet provided all required output fields. Still missing: ['X', 'Y']. Call return_<field> for each missing field."` and continue the loop. This consumes one retry from `max_output_schema_retries`.
+- **No retries left** → return `agdata(error="output schema error: missing fields after retries: ...")`.
+
+Output collection is skipped when the LLM response is answering a mid-conversation user message injected via the inbox (`had_inbox=True`), because the LLM is engaged in dialogue rather than producing a final structured answer.
 
 ## Process monitoring
 

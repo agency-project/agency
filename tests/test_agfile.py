@@ -28,11 +28,24 @@ class _Usage:
 
 class _Chunk:
     def __init__(self, content=None, tool_calls=None, usage=None):
-        self.choices = [_Choice(_Delta(content, tool_calls))] if content or tool_calls else []
+        self.choices = [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
         self.usage = usage
+
+class _TCDelta:
+    def __init__(self, name, args_json, call_id):
+        self.id = call_id
+        self.index = 0
+        self.function = _TCFnDelta(name, args_json)
+
+class _TCFnDelta:
+    def __init__(self, name, args): self.name = name; self.arguments = args
 
 def _direct(content: str):
     return [_Chunk(content=content), _Chunk(usage=_Usage())]
+
+def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
+    tc = _TCDelta(name, json.dumps(args), call_id)
+    return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +189,12 @@ def test_system_prompt_agfile_type_shown_as_file():
 
 def test_skill_with_agfile_output_schema_validates_path_string():
     sk = agskill("write", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_doc", {"value": "/workspace/outputs/write_doc.txt"}),
+        _direct(""),
+    ]
     with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = (
-            _direct('{"doc": "/workspace/outputs/write_doc.txt"}')
-        )
+        MockClient.return_value.chat.completions.create.side_effect = responses
         result, *_ = sk.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=None)
     assert result.doc == "/workspace/outputs/write_doc.txt"
 

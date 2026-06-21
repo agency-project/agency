@@ -142,7 +142,7 @@ class ForkFanoutTeam(agteam):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from agency import AgError, agUI, agsync
+    from agency import AgError, agsync
 
     run_dir = _make_run_dir("parallel_exec")
     agent.log_dir    = run_dir / "logs"
@@ -162,4 +162,4 @@ if __name__ == "__main__":
         except AgError as e:
             print(f"\nERROR: {e}")
 
-    agUI.run(_script)
+    _script()
