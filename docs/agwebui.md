@@ -1,6 +1,6 @@
 # agwebui — web-based UI for agency runs
 
-`agwebui` is a browser-based monitoring dashboard for agency runs. It is a drop-in replacement for `agUI` that eliminates the asyncio/multiprocessing conflict by running in a completely separate process.
+`agwebui` is a browser-based monitoring dashboard for agency runs. It runs in a completely separate process, avoiding any asyncio/multiprocessing conflict with the execution process.
 
 ## Architecture
 
@@ -159,20 +159,6 @@ This path is entirely file-based — no shared memory between the execution proc
 | `agent._push_live_messages()` | `messages_snapshot` |
 | `agteam.__init__()` (after `setup()`) | `team_registered` |
 | `ask_human` tool `fn()` | `ask_human`, file-based reply |
-
-## Migrating from agUI
-
-```python
-# Before
-from agency import agUI
-agUI.run(_script)
-
-# After
-from agency.agwebui import agwebui
-agwebui.run(_script)
-```
-
-`agUI` is unchanged and continues to work. Both can coexist in the same codebase; only the active one (`agUI` or `agwebui`) receives events for a given run.
 
 ## Dependencies
 

@@ -135,13 +135,6 @@ class agterm:
         line = f"{ts}  {agent_tag}  {ev_tag}  {agterm._colorize_agnames(msg)}{tok_tag}  {src}"
         with agterm._lock:
             try:
-                from . import agui as _agui
-                if _agui._active is not None:
-                    _agui._active.add_log(line)
-                    return
-            except Exception:
-                pass
-            try:
                 from . import agwebui as _agwebui
                 if _agwebui._active is not None:
                     _agwebui._active.emitter.log(line)

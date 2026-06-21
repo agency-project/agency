@@ -1,6 +1,11 @@
-"""Re-export inline tests from agency/common_skills/ so that `pytest tests/` picks them up."""
-from agency.common_skills.summariser import *       # noqa: F401, F403
-from agency.common_skills.writer import *           # noqa: F401, F403
-from agency.common_skills.find_papers import *      # noqa: F401, F403
-from agency.common_skills.summarise_paper import *  # noqa: F401, F403
-from agency.common_skills.compile_report import *   # noqa: F401, F403
+"""Tests for agency/common_skills/ (agplan and agbuild)."""
+from agency.common_skills.agplan import agplan
+from agency.common_skills.agbuild import agbuild
+
+
+def test_agplan_is_importable():
+    assert agplan is not None
+
+
+def test_agbuild_is_importable():
+    assert agbuild is not None

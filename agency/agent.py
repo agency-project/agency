@@ -568,13 +568,6 @@ class agent:
                 )
         except Exception:
             pass
-        try:
-            from . import agui as _agui
-            if _agui._active is not None:
-                _agui._active._app.call_from_thread(_agui._active._app._render_history)
-        except Exception:
-            pass
-
     def run(self, skill: "agskill", input: agdata, max_steps: int = AGSKILL_REACT_MAX_STEPS) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 

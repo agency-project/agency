@@ -79,7 +79,7 @@ Each call to `agskill.run()` executes a standard ReAct loop:
 
 1. Offload oversized input fields to files in the agent's sandbox (see below)
 2. Build messages: `[system] + history + [user: input.to_json()]`
-3. Drain user inbox (injected mid-conversation messages from `agUI` or `agent._inbox`)
+3. Drain user inbox (injected mid-conversation messages via `agent._inbox`)
 4. Pre-call compaction — check character-based token estimate; compact if over threshold (see [compaction.md](compaction.md))
 5. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below); retry on connection failure with exponential backoff
 6. Post-call compaction — check actual `prompt_tokens` from API usage; compact again if needed

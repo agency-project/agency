@@ -114,18 +114,6 @@ Every concurrency primitive in the framework — semaphores, locks, events, and 
 
 ---
 
-## Synchronization Events
-
-### `ready` / `done` — TUI startup and shutdown
-| | |
-|---|---|
-| **File** | `agency/agui.py:547–548` |
-| **Type** | `threading.Event` |
-| **Resource** | Ordering between the main Textual UI thread and the worker thread that runs user code |
-| **Protocol** | `ready.set()` in `_AgencyApp.on_mount()`; worker calls `ready.wait(timeout=10)` before starting. `done.set()` in `on_unmount()` to signal shutdown. |
-
----
-
 ## Queues (communication buffers, not rate limiters)
 
 These are unbounded — they do not throttle resource usage but provide thread-safe message passing.
@@ -133,7 +121,6 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 | Variable | File | Type | Purpose |
 |---|---|---|---|
 | `q` (SimpleQueue) | `agency/tools/human.py:43` | `queue.SimpleQueue[str]` | Shuttles console `input()` reply from reader thread to tool function |
-| `reply_q` | `agency/agui.py:613` | `queue.Queue[str]` | Shuttles TUI human-reply from UI event handler to blocking tool call |
 | `self._inbox` | `agency/agent.py:426` | `queue.Queue[str]` | Per-agent inbox for `agent.send()` mid-skill messages |
 
 ---
@@ -154,5 +141,4 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 | `aglog._lock` | aglog.py:42 | `Lock` per instance | — | Log file I/O |
 | `emitter._lock` | agwebui/emitter.py:56 | `Lock` per instance | — | Event file + registries |
 | `server._lock` | agwebui/server.py:51 | `asyncio.Lock` | — | Web server event index |
-| `ready` / `done` | agui.py:547 | `threading.Event` | — | TUI startup/shutdown sync |
 | `self._inbox` | agent.py:426 | `Queue` (unbounded) | ∞ | Mid-skill agent inbox |

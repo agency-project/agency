@@ -1,6 +1,6 @@
 # agterm
 
-`agterm` is the per-agent color-coded real-time terminal logger. Every agent is automatically assigned a distinct ANSI color at creation. All output goes to stderr (or the `agUI` shared log pane when the TUI is active) so it never interferes with structured stdout output.
+`agterm` is the per-agent color-coded real-time terminal logger. Every agent is automatically assigned a distinct ANSI color at creation. All output goes to stderr (or the `agwebui` log panel when the web UI is active) so it never interferes with structured stdout output.
 
 ## Output format
 
@@ -61,10 +61,6 @@ This is a class-level flag; it affects all agents in the process.
 
 Agent names appearing inside log messages from *other* agents are automatically colorized with their own color, making cross-agent references easy to follow in multi-agent runs.
 
-## agUI integration
-
-When `agUI.run()` is active, `agterm.log()` routes output to the shared log pane in the TUI instead of stderr. The line format is identical; only the destination changes. See [agui.md](agui.md).
-
 ## agwebui integration
 
-When `agwebui.run()` is active, `agterm.log()` routes output to the web UI emitter instead of stderr (checked before the agUI path). The emitter appends a `{"type": "log", "line": ...}` event to `ui_events.jsonl`; the standalone server broadcasts it to all connected browsers. Additionally, `agterm.__init__()` emits an `agent_registered` event with the agent's hex color so the browser can display the agent in its assigned color. See [agwebui.md](agwebui.md).
+When `agwebui.run()` is active, `agterm.log()` routes output to the web UI emitter instead of stderr. The emitter appends a `{"type": "log", "line": ...}` event to `ui_events.jsonl`; the standalone server broadcasts it to all connected browsers. Additionally, `agterm.__init__()` emits an `agent_registered` event with the agent's hex color so the browser can display the agent in its assigned color. See [agwebui.md](agwebui.md).

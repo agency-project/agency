@@ -121,11 +121,11 @@ finally:
 
 **Handler:** Logged as `PRUNE ✗`; `history_future` still resolves with the un-pruned history.
 
-### WebUI / agui push errors
+### WebUI push errors
 
 **Location:** `_push_live_messages()` (line ~547–563)
 
-**What is caught:** Any exception from WebUI or TUI state updates.
+**What is caught:** Any exception from WebUI state updates.
 
 **Handler:** Swallowed silently — UI sync failures never affect execution.
 
@@ -283,16 +283,6 @@ All tool errors return `agdata(error=...)`. This is appended to the conversation
 **What is caught:** Any `Exception` from writing/reading oversized fields to the sandbox.
 
 **Handler:** Swallowed; returns the original value unchanged. The LLM receives the full string inline instead of a file path.
-
----
-
-## `agency/agui.py` — TUI
-
-**Location:** Worker thread (line ~562–581), main app loop (line ~587–590), various rendering helpers
-
-**What is caught:** `Exception` from user function → traceback printed via `ui.add_log()`; `KeyboardInterrupt` in main loop → worker thread joined with 10 s timeout.
-
-**Propagation:** Exceptions in user code are printed and swallowed; the TUI exits cleanly.
 
 ---
 

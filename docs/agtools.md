@@ -37,7 +37,7 @@ tools = [
     make_grep(sandbox),
     webfetch,                         # host-side singleton
     todowrite,                        # host-side singleton
-    make_ask_human(sandbox._agname),  # host-side, routes to agUI or stdin
+    make_ask_human(sandbox._agname),  # host-side, routes to agwebui or stdin
     make_daemon_release(sandbox),
 ]
 if pool is not None:
@@ -177,7 +177,7 @@ my_tool = agtool(name="notify_ui", ..., fn=_notify_fn, need_sandbox=False)
 
 Common cases that require `need_sandbox=False`:
 
-- **`ask_human` and any human-interaction tool** — they read `_agwebui._active` / `agui._active` to route questions to the live UI, then block-poll for a reply. In a subprocess, those singletons are `None` and stdin is an EOF pipe, so the tool either hangs or returns a timeout reply immediately.
+- **`ask_human` and any human-interaction tool** — they read `_agwebui._active` to route questions to the live UI, then block-poll for a reply. In a subprocess, that singleton is `None` and stdin is an EOF pipe, so the tool either hangs or returns a timeout reply immediately.
 - **Tools that write to shared in-process state** — progress queues, event emitters, result caches.
 - **Tools that perform outbound I/O only** — HTTP requests, host file reads — where no container is needed and running in-process is simpler.
 
@@ -261,4 +261,4 @@ The agent calls `ask_human` when it needs information it cannot determine on its
 LLM calls: ask_human({"question": "Which dataset should I use?"})
 ```
 
-When `agUI` is active, the question is displayed in the interaction pane and the UI blocks until the user types a reply. Without `agUI`, the question is printed to stdout and the agent reads from stdin. The reply is returned as `agdata(reply="...")` and injected into the ReAct loop. The agent's state is set to `"human"` while waiting.
+When `agwebui` is active, the question is emitted as an `ask_human` event and the tool blocks until the browser UI delivers a reply (or the timeout elapses). Without `agwebui`, the question is printed to stdout and the agent reads from stdin. The reply is returned as `agdata(reply="...")` and injected into the ReAct loop. The agent's state is set to `"human"` while waiting.

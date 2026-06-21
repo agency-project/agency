@@ -90,9 +90,7 @@ Pass `"api_key": "bedrock-api-key-..."` to use a static Bedrock API key instead 
 
 **`agteam`** — coordinates multiple agents or tasks. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow. Each `run()` call executes in its own daemon thread.
 
-**`agUI`** — a terminal UI (Textual) that shows all live agents, their current state, streaming token output, tool calls, and a human-in-the-loop interaction pane.
-
-**`agwebui`** — a browser-based dashboard that runs in a separate process. Writes structured events to a JSONL file; a standalone FastAPI server tails it and pushes updates to connected browsers over WebSocket. Drop-in replacement for agUI with no asyncio/spawn conflict. See [docs/agwebui.md](docs/agwebui.md).
+**`agwebui`** — a browser-based dashboard that runs in a separate process. Writes structured events to a JSONL file; a standalone FastAPI server tails it and pushes updates to connected browsers over WebSocket. See [docs/agwebui.md](docs/agwebui.md).
 
 ## Parallelism model
 
@@ -186,13 +184,15 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
 | [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
 | [agsandbox.md](docs/agsandbox.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |
-| [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, agUI routing |
-| [execution_loop.md](docs/execution_loop.md) | Outer monitoring loop, inner ReAct loop, inbox drain, compaction |
-| [execution_process_control.md](docs/execution_process_control.md) | Trace: background job, foreground job, daemon |
+| [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, webui routing |
+| [Design_execution_loop.md](docs/Design_execution_loop.md) | Outer monitoring loop, inner ReAct loop, inbox drain, compaction |
+| [Design_sandbox_lifecycle.md](docs/Design_sandbox_lifecycle.md) | Trace: background job, foreground job, daemon |
 | [agresources.md](docs/agresources.md) | GPU/CPU/memory resource pool |
 | [aglog.md](docs/aglog.md) | Structured JSONL log — skills, tools, lifecycle, compaction |
-| [compaction.md](docs/compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
-| [agui.md](docs/agui.md) | Terminal UI — layout, keyboard bindings, interaction pane |
+| [Design_compaction.md](docs/Design_compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
 | [agwebui.md](docs/agwebui.md) | Web UI — browser dashboard, event stream, WebSocket, ask_human path |
 | [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
-| [deadlock.md](docs/deadlock.md) | Deadlock patterns — shared agents across parallel threads, diagnosis, and fixes |
+| [Design_deadlock.md](docs/Design_deadlock.md) | Deadlock patterns — shared agents across parallel threads, diagnosis, and fixes |
+| [Design_parallelization.md](docs/Design_parallelization.md) | Parallelism model — threads, GIL, process pool, LLM streaming |
+| [Design_resource_control.md](docs/Design_resource_control.md) | All semaphores and locks — what each guards and how it is acquired |
+| [Design_error_handling.md](docs/Design_error_handling.md) | All try/except blocks, retry loops, error emissions, and propagation paths |

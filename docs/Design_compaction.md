@@ -135,7 +135,7 @@ The task input always appears before the summary so the LLM sees the original go
 
 Compaction modifies the **in-flight `messages` list** inside `agskill.run()`. `agent.history` (the shared cross-skill history) is not affected mid-run. When the skill finishes, `updated_history = agdata(messages=messages[1:])` persists the compacted list (with the summary injection) as the new history for future skill calls.
 
-`agUI`'s interaction pane reflects the compacted list immediately via `_live_messages_fn`.
+The web UI reflects the compacted list immediately via `_live_messages_fn`.
 
 Note: unlike opencode, which keeps old messages hidden behind a filtered view, agency replaces them in-place. Pre-compaction messages are not recoverable from the running state, but they are preserved in the JSONL log via the `history_before` field of the skill entry.
 

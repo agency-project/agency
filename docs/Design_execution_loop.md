@@ -156,7 +156,7 @@ The system message is prepended on every call but never stored — `updated_hist
 
 ### 3d. Per-step: inbox drain
 
-At the top of each step, the agent drains `agent._inbox` — a `queue.Queue[str]` that `agUI` (or any external caller) can push messages into:
+At the top of each step, the agent drains `agent._inbox` — a `queue.Queue[str]` that any external caller can push messages into:
 
 ```python
 if _inbox_fn:

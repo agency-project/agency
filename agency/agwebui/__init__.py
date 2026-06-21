@@ -1,10 +1,9 @@
 """agwebui — web-based UI for monitoring agency runs.
 
-Drop-in replacement for agUI.  Starts a standalone FastAPI server in a
-separate process and serves a browser dashboard.  The execution process
-writes structured events to a JSONL file; the server tails it and pushes
-updates over WebSocket.  The execution script runs directly in the main
-thread — no asyncio, no Textual, no spawn conflict.
+Starts a standalone FastAPI server in a separate process and serves a
+browser dashboard.  The execution process writes structured events to a
+JSONL file; the server tails it and pushes updates over WebSocket.  The
+execution script runs directly in the main thread — no asyncio conflicts.
 
 Usage::
 

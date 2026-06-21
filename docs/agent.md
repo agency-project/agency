@@ -103,7 +103,7 @@ Containers are created lazily — only when a task calls a tool with `need_sandb
 
 ## UI callbacks
 
-Three internal callbacks are used by `agUI` but are also available for custom monitoring:
+Three internal callbacks are available for custom monitoring:
 
 | Attribute | Type | Updated |
 |---|---|---|

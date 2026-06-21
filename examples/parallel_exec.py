@@ -17,8 +17,33 @@ import os
 import time
 from pathlib import Path
 
-from agency import agent, agdata, agteam
-from agency.common_skills import WriterSkill, SummariserSkill
+from agency import agent, agdata, agskill, agteam
+
+
+class SummariserSkill(agskill):
+    def __init__(self, **kwargs):
+        super().__init__(
+            name="summarise",
+            system_prompt="Summarise the given text in one sentence.",
+            input_schema=agdata(text=str),
+            output_schema=agdata(summary=str),
+            replace_tools=[],
+            **kwargs,
+        )
+
+
+class WriterSkill(agskill):
+    def __init__(self, **kwargs):
+        super().__init__(
+            name="writer",
+            system_prompt=(
+                "Write the given content to the given file path using the write tool. "
+                "The path is inside the sandbox container."
+            ),
+            input_schema=agdata(file_path=str, content=str),
+            output_schema=agdata(path=str, status=str),
+            **kwargs,
+        )
 
 
 def _make_run_dir(name: str) -> Path:
