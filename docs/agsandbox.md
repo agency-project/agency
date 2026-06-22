@@ -104,7 +104,20 @@ The `__BGPIDS__` annotation is stripped before output is returned to the LLM. PI
 ## File I/O
 
 - **`write_file`** pipes content over stdin (`exec -i`) to avoid shell-quoting issues with arbitrary content.
-- **`read_file`** runs `cat <path>` inside the container; raises `FileNotFoundError` on a non-zero exit.
+- **`read_file`** reads raw bytes via `base64 <path>` in the container, then decodes strictly as UTF-8. This gives three distinct, actionable exceptions:
+
+  | Exception | Cause | Detection |
+  |---|---|---|
+  | `IsADirectoryError` | Path is a directory | `base64` fails; `test -d` confirms |
+  | `UnicodeDecodeError` | File contains non-UTF-8 bytes (binary) | Strict `bytes.decode("utf-8")` fails |
+  | `FileNotFoundError` | Path does not exist | `base64` fails; `test -d` returns non-zero |
+
+  The base64 approach avoids `errors="replace"` (which would silently corrupt binary detection). Callers that only need to catch "file not readable for any reason" can catch `Exception`; callers that need to distinguish directory from missing from binary should catch each type individually.
+
+- **`read_file_bytes`** reads raw bytes via the same base64 round-trip as `read_file`, but skips the UTF-8 decode. Returns `bytes`. Raises `IsADirectoryError` or `FileNotFoundError` the same way; never raises `UnicodeDecodeError`. Use for binary files (images, audio, compiled artifacts) where text decoding is incorrect.
+
+- **`write_file_bytes`** base64-encodes the `bytes` on the host and decodes inside the container (`printf '%s' <b64> | base64 -d > <path>`), avoiding shell-quoting issues with arbitrary byte sequences.
+
 - Pagination, fuzzy-replace logic, and directory listing all run in Python on the host; only raw bytes travel through the container boundary.
 
 ## `agSandbox` API
@@ -118,8 +131,10 @@ sb = agSandbox(agname, restore_image="agency/ckpt-p1234-myagent")
 sb._ensure_started()    # called automatically on first exec(); idempotent
 
 sb.exec(cmd, workdir="/workspace", timeout=120) -> (str, int)
-sb.read_file(path) -> str
-sb.write_file(path, content)
+sb.read_file(path) -> str           # UTF-8 text; raises UnicodeDecodeError for binary
+sb.read_file_bytes(path) -> bytes   # raw bytes; no decode attempt
+sb.write_file(path, content)        # UTF-8 text via stdin pipe
+sb.write_file_bytes(path, data)     # raw bytes via base64 round-trip
 sb.commit(tag) -> bool  # False if container never started; True after docker commit
 sb.update_limits(cpus=4.0, memory="8g")
 sb.get_live_pids() -> set[int]

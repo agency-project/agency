@@ -423,12 +423,73 @@ class agSandbox:
         return clean_output, rc
 
     def read_file(self, path: str) -> str:
-        output, rc = self._container_exec(
-            f"cat {shlex.quote(path)}", timeout=30, shell="sh"
+        """Read a text file from the container.
+
+        Raises:
+            IsADirectoryError: if the path exists but is a directory.
+            UnicodeDecodeError: if the file exists but is not valid UTF-8.
+            FileNotFoundError: if the path does not exist.
+        """
+        import base64
+        b64, rc = self._container_exec(
+            f"base64 {shlex.quote(path)}", timeout=30, shell="sh"
         )
         if rc != 0:
+            _, dir_rc = self._container_exec(
+                f"test -d {shlex.quote(path)}", timeout=5, shell="sh"
+            )
+            if dir_rc == 0:
+                raise IsADirectoryError(f"Path is a directory, not a file: {path}")
             raise FileNotFoundError(f"Not found in container: {path}")
-        return output
+        raw = base64.b64decode(b64.strip())
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise UnicodeDecodeError(
+                exc.encoding, exc.object, exc.start, exc.end,
+                f"File {path} contains binary data and is not UTF-8 text",
+            ) from None
+
+    def read_file_bytes(self, path: str) -> bytes:
+        """Read raw bytes from a file in the container.
+
+        Like read_file but returns bytes without any UTF-8 decode attempt.
+        Use for binary files (images, audio, compiled artifacts, etc.).
+
+        Raises:
+            IsADirectoryError: if the path exists but is a directory.
+            FileNotFoundError: if the path does not exist.
+        """
+        import base64
+        b64, rc = self._container_exec(
+            f"base64 {shlex.quote(path)}", timeout=30, shell="sh"
+        )
+        if rc != 0:
+            _, dir_rc = self._container_exec(
+                f"test -d {shlex.quote(path)}", timeout=5, shell="sh"
+            )
+            if dir_rc == 0:
+                raise IsADirectoryError(f"Path is a directory, not a file: {path}")
+            raise FileNotFoundError(f"Not found in container: {path}")
+        return base64.b64decode(b64.strip())
+
+    def write_file_bytes(self, path: str, data: bytes) -> None:
+        """Write raw bytes to a file in the container.
+
+        Use for binary files. The data is base64-encoded on the host and
+        decoded inside the container, avoiding any shell-quoting issues with
+        arbitrary byte sequences.
+        """
+        import base64
+        b64 = base64.b64encode(data).decode("ascii")
+        quoted = shlex.quote(path)
+        sh_cmd = (
+            f"mkdir -p $(dirname {quoted}) && "
+            f"printf '%s' {shlex.quote(b64)} | base64 -d > {quoted}"
+        )
+        _, rc = self._container_exec(sh_cmd, timeout=30, shell="sh")
+        if rc != 0:
+            raise OSError(f"Failed to write binary file {path} in container")
 
     def write_file(self, path: str, content: str) -> None:
         quoted = shlex.quote(path)
@@ -438,12 +499,6 @@ class agSandbox:
         )
         if rc != 0:
             raise OSError(f"Failed to write {path} in container")
-
-    def read_file(self, path: str) -> str:
-        out, rc = self._container_exec(f"cat {shlex.quote(path)}", shell="sh")
-        if rc != 0:
-            raise FileNotFoundError(f"Failed to read {path} from container")
-        return out
 
     def update_limits(
         self,

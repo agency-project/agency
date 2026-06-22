@@ -637,6 +637,70 @@ class TestAgSandboxFileIO:
         with pytest.raises(FileNotFoundError):
             self.sb.read_file("/workspace/does_not_exist.txt")
 
+    @docker
+    def test_read_directory_raises_is_a_directory_error(self):
+        with pytest.raises(IsADirectoryError):
+            self.sb.read_file("/workspace")
+
+    @docker
+    def test_read_binary_file_raises_unicode_decode_error(self):
+        # Write 4 null bytes — not valid UTF-8 in isolation
+        import base64
+        raw = bytes([0x89, 0x50, 0x4E, 0x47])  # PNG magic
+        self.sb._container_exec(
+            f"printf '\\x89\\x50\\x4e\\x47' > /workspace/binary.bin", shell="sh"
+        )
+        with pytest.raises(UnicodeDecodeError):
+            self.sb.read_file("/workspace/binary.bin")
+
+
+class TestAgSandboxReadFileUnit:
+    """Unit tests for read_file error cases — no Docker required."""
+
+    def _make_sb(self):
+        from agency.agsandbox import agSandbox
+        sb = agSandbox.__new__(agSandbox)
+        sb._started = True
+        return sb
+
+    def test_read_file_returns_text_content(self):
+        import base64
+        sb = self._make_sb()
+        b64 = base64.b64encode(b"hello world\n").decode()
+        with patch.object(sb, "_container_exec", return_value=(b64, 0)):
+            assert sb.read_file("/workspace/hello.txt") == "hello world\n"
+
+    def test_read_file_missing_path_raises_file_not_found(self):
+        sb = self._make_sb()
+        # base64 fails (rc=1), test -d also fails (rc=1) → not a directory
+        sb._container_exec = MagicMock(side_effect=[("", 1), ("", 1)])
+        with pytest.raises(FileNotFoundError):
+            sb.read_file("/workspace/missing.txt")
+
+    def test_read_file_directory_raises_is_a_directory_error(self):
+        sb = self._make_sb()
+        # base64 fails (rc=1), test -d succeeds (rc=0) → it's a directory
+        sb._container_exec = MagicMock(side_effect=[("", 1), ("", 0)])
+        with pytest.raises(IsADirectoryError):
+            sb.read_file("/workspace/outputs")
+
+    def test_read_file_binary_raises_unicode_decode_error(self):
+        import base64
+        sb = self._make_sb()
+        raw = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])  # PNG header
+        b64 = base64.b64encode(raw).decode()
+        with patch.object(sb, "_container_exec", return_value=(b64, 0)):
+            with pytest.raises(UnicodeDecodeError):
+                sb.read_file("/workspace/image.png")
+
+    def test_read_file_valid_utf8_succeeds(self):
+        import base64
+        sb = self._make_sb()
+        content = "def main():\n    pass\n"
+        b64 = base64.b64encode(content.encode("utf-8")).decode()
+        with patch.object(sb, "_container_exec", return_value=(b64, 0)):
+            assert sb.read_file("/workspace/core.py") == content
+
 
 # ---------------------------------------------------------------------------
 # agSandbox — PID tracking

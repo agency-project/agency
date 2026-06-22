@@ -42,7 +42,8 @@ Schema fields in `agdata` are plain Python type objects:
 | `bool` | `boolean` | `isinstance(v, bool)` |
 | `list[str]` / `list[int]` etc. | `array` | each element checked against inner type |
 | `[{"key": type, ...}]` | `array` | each item dict validated against template |
-| `agfile` | `string` | must be str (file path); framework reads content after skill ends |
+| `agfile` | `string` | must be str (file path); framework reads UTF-8 content after skill ends |
+| `agbinary` | `string` | must be str (file path); framework reads raw bytes after skill ends; caller receives `bytes` |
 
 Any `agtype` subclass is also valid; its `schema_type()` classmethod provides the display hint.
 
@@ -52,6 +53,9 @@ output_schema=agdata(summary=str, word_count=int, passed=bool)
 
 # agfile for large text outputs:
 output_schema=agdata(report=agfile)
+
+# agbinary for raw binary outputs (audio, images, compiled artifacts):
+output_schema=agdata(trimmed=agbinary)
 
 # Typed list:
 output_schema=agdata(tags=list[str])
@@ -253,18 +257,46 @@ From Python, the caller always passes and receives plain string content — the 
 
 ### Output `agfile` fields
 
-For each output field declared as `agfile`, the system prompt instructs the agent to write the content to a file (e.g. `/workspace/outputs/<skill_name>_<field>.txt`) and return the path as the field value. After the skill completes, the framework reads the file content from the sandbox and stores it as a plain string in the result agdata. The caller receives content, not a path.
+For each output field declared as `agfile`, the system prompt instructs the agent to write the content to a file (e.g. `/workspace/outputs/<skill_name>_<field>.txt`) and return the path as the field value. The `return_<field>` tool description also explicitly tells the agent to pass a file path, not raw content.
+
+**Live validation during the tool call** — when the agent calls `return_<field>` for an `agfile` field, the framework immediately reads the file from the sandbox while the agent is still alive. This lets it catch problems early and reprompt the agent rather than silently failing. The following checks are applied in order:
+
+| Condition | Error returned to agent |
+|---|---|
+| Path is a directory (`IsADirectoryError`) | `"'<path>' is a directory, not a file. Pass the path to a specific output file (e.g. <path>/<field>.txt)."` |
+| File is not UTF-8 text (`UnicodeDecodeError`) | `"file at '<path>' contains binary data and cannot be read as text. Write a UTF-8 text file instead."` |
+| Path not found (`FileNotFoundError`) | `"no file found at path '<path>'. Write your output to a file first, then call this tool with that file's path."` |
+| File is empty | `"file at '<path>' is empty. Write the actual content to the file before registering the path."` |
+| File contains only another path | `"file at '<path>' contains only a path reference ('<inner>'), not real content. Write the actual content to a file and return that file's path."` |
+
+If the sandbox raises an `IsADirectoryError`, the framework checks whether the sandbox path is a directory using `test -d` in the container rather than relying on file-extension heuristics. If it raises a `UnicodeDecodeError`, it means the file's raw bytes could not be decoded as strict UTF-8 — the agent must write a text file. Any other exception from `read_file` is treated as a missing-file error.
+
+On a successful validation the path is stored in the collected outputs. After the skill completes, `agfile.recover()` re-reads the file content from the sandbox and stores it as a plain string in the result agdata. The caller always receives content, not a path.
 
 ### Cleanup
 
 All `agfile` files — both input and output — are deleted from the sandbox in the `finally` block after the skill ends, whether it succeeded or raised. They never persist between skill invocations on the same agent.
 
+### Output `agbinary` fields
+
+`agbinary` follows the same file-path contract as `agfile`, but for raw binary data (audio, images, compiled artifacts, etc.) that must not be decoded as text.
+
+**Live validation** uses lightweight shell tests — no content read — since binary files may be large:
+
+| Check | Shell command | Error sent to agent |
+|---|---|---|
+| Is a directory | `test -d <path>` | Points to a specific binary output file |
+| Does not exist | `test -e <path>` fails | Write the file first |
+| Exists but empty | `test -s <path>` fails, `test -e` passes | Write actual binary content |
+
+After the skill completes, `agbinary.recover()` reads the raw bytes via `sandbox.read_file_bytes()` (no UTF-8 decode) and the caller receives `bytes`.
+
 ### Schema display
 
-In the JSON format sections appended to the system prompt, `agfile` fields are shown with the type hint `"file"` (from `agfile.schema_type()`):
+In the JSON format sections appended to the system prompt, `agfile` fields are shown as `"file"` and `agbinary` fields as `"binary_file"`:
 
 ```json
-{"background": "file", "theme": "string"}
+{"background": "file", "audio": "binary_file", "theme": "string"}
 ```
 
 ---
@@ -320,6 +352,8 @@ The system prompt instructs the model to call each `return_<field>` tool once it
 Each `return_<field>` call is validated immediately against the schema hint:
 
 - **Type mismatch** → the tool returns `{"error": "field 'X': expected bool, got str"}` inline. The model sees the error in the same response turn and can retry just that field without losing any other already-registered outputs.
+- **`agfile` field** → file is read from the sandbox immediately; see [Output `agfile` fields](#output-agfile-fields) for the full set of checks and error messages.
+- **`str` field with a sandbox path value** → if the value looks like a sandbox path (starts with `/`, only word characters, dots, and hyphens per segment), the framework silently reads the file at that path and substitutes its content. If the file is unreadable or its content is itself a path, the original value is kept. This handles the common case where the agent writes a `str` output to a file and returns the path instead of the content.
 - **Success** → the tool returns `{"result": "✓ 'X' registered. Still needed: [...]"}` (or `"All required fields complete."` on the last one).
 
 ### Completeness check and reprompt

@@ -277,6 +277,131 @@ class agimage(agtype):
         return f"File path, http/https URL, or data: URL of the image for '{field_name}'."
 
 
+class agbinary(agtype):
+    """Binary file-backed agskill schema field.
+
+    Carries raw bytes through the skill boundary via the sandbox filesystem.
+    The LLM never sees the binary content — it only sees a file path and is
+    told to use shell tools (``file``, ``xxd``, domain-specific CLIs) to
+    inspect or produce binary output.
+
+    Caller value types
+    ------------------
+    Input  (``prepare``): ``bytes``, a local host file path (``str``), or a
+    base64 data URL (``str`` starting with ``data:``).
+
+    Output (``recover``): always ``bytes``.
+
+    Example::
+
+        process_skill = agskill(
+            name="process_audio",
+            system_prompt="Trim the audio to the first 10 seconds using ffmpeg.",
+            input_schema=agdata(audio=agbinary),
+            output_schema=agdata(trimmed=agbinary),
+        )
+
+        result = ag.run(process_skill, agdata(audio=Path("clip.wav").read_bytes()))
+        Path("trimmed.wav").write_bytes(result.trimmed)
+
+    Note: the agent's sandbox image must include whatever CLI tools are needed
+    to process the binary format (e.g. ``ffmpeg``, ``imagemagick``, ``sox``).
+    """
+
+    @classmethod
+    def schema_type(cls) -> str:
+        return "binary_file"
+
+    @classmethod
+    def needs_sandbox(cls) -> bool:
+        return True
+
+    @classmethod
+    def prepare(
+        cls,
+        value: object,
+        sandbox: "agSandbox",
+        skill_name: str,
+        field_name: str,
+    ) -> tuple[str, list[str]]:
+        path = f"/workspace/inputs/{field_name}.bin"
+        try:
+            raw = cls._to_bytes(value)
+        except (TypeError, ValueError):
+            return value, []
+        try:
+            sandbox.write_file_bytes(path, raw)
+            return path, [path]
+        except Exception:
+            return value, []
+
+    @classmethod
+    def recover(
+        cls,
+        value: object,
+        sandbox: "agSandbox",
+    ) -> tuple[bytes, list[str]]:
+        if not isinstance(value, str):
+            return value, []
+        try:
+            raw = sandbox.read_file_bytes(value)
+            return raw, [value]
+        except Exception:
+            return value, []
+
+    @classmethod
+    def extra_input_prompt(cls, field_name: str) -> str:
+        return (
+            f"  - Input `{field_name}`: a binary file at the path shown in the JSON. "
+            f"Do NOT read it as text — use shell tools (e.g. `file`, `xxd`, or "
+            f"domain-specific CLIs) to inspect or process it. "
+            f"This file is temporary and will be deleted after the task completes."
+        )
+
+    @classmethod
+    def extra_output_prompt(cls, field_name: str, skill_name: str) -> str:
+        return (
+            f"  - Output `{field_name}`: write your binary output to a file "
+            f"(e.g. /workspace/outputs/{field_name}.bin) using shell tools, "
+            f"then return only the file path as the field value. "
+            f"Do NOT encode the content as text or base64 — write the raw binary file."
+        )
+
+    @classmethod
+    def return_tool_description(cls, field_name: str) -> str:
+        return (
+            f"Register the '{field_name}' binary output file. "
+            f"Write your output as a binary file first "
+            f"(e.g. /workspace/outputs/{field_name}.bin), "
+            f"then call this tool with that file path as the value."
+        )
+
+    @classmethod
+    def return_value_description(cls, field_name: str) -> str:
+        return (
+            f"Absolute path to the binary file you wrote in the sandbox "
+            f"(e.g. /workspace/outputs/{field_name}.bin). "
+            f"Pass the path — do NOT pass encoded content."
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _to_bytes(cls, value: object) -> bytes:
+        """Normalise caller input to raw bytes."""
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            if value.startswith("data:") and ";base64," in value:
+                _, b64 = value.split(";base64,", 1)
+                return base64.b64decode(b64)
+            # Treat as a local host file path.
+            return Path(value).read_bytes()
+        raise TypeError(f"agbinary.prepare: unsupported value type {type(value).__name__!r}")
+
+
 class agrawstring(agtype):
     """Raw string field — bypasses JSON input/output formatting entirely.
 

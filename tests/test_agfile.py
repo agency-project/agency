@@ -250,3 +250,202 @@ def test_recover_agtype_outputs_no_schema_returns_empty():
     paths = _recover_agtype_outputs(result, None, sandbox)
     assert paths == []
     sandbox.read_file.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# return_<field> tool — agfile validation during the tool call
+# ---------------------------------------------------------------------------
+
+def _run_skill_with_sandbox(skill, responses, sandbox):
+    """Helper: run skill with mocked LLM and a provided sandbox."""
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, *_ = skill.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=sandbox)
+    return result
+
+
+def test_return_agfile_directory_path_returns_error():
+    """return_doc pointing at a directory should give an IsADirectoryError message."""
+    sandbox = MagicMock()
+    sandbox.read_file.side_effect = IsADirectoryError("/workspace/outputs is a directory")
+    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_doc", {"value": "/workspace/outputs"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.is_error() or result._data.get("doc") is None
+
+
+def test_return_agfile_binary_file_returns_error():
+    """return_doc pointing at a binary file should give a UnicodeDecodeError message."""
+    sandbox = MagicMock()
+    raw = b"\x89PNG\r\n\x1a\n"  # PNG magic bytes
+    sandbox.read_file.side_effect = UnicodeDecodeError(
+        "utf-8", raw, 0, 1, "File /workspace/image.bin contains binary data"
+    )
+    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_doc", {"value": "/workspace/image.bin"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.is_error() or result._data.get("doc") is None
+
+
+def test_return_agfile_missing_file_returns_error_and_reprompts():
+    """return_doc with a path to a non-existent file should return an error to the agent."""
+    sandbox = MagicMock()
+    sandbox.read_file.side_effect = FileNotFoundError("no such file")
+    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    # Response 1: agent calls return_doc → sandbox raises → error returned to agent.
+    # Response 2: agent produces direct text (gives up) → field still missing → skill errors.
+    responses = [
+        _tool_call("return_doc", {"value": "/workspace/outputs/missing.txt"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.is_error() or result._data.get("doc") is None
+
+
+def test_return_agfile_empty_file_returns_error():
+    """return_doc with a path to an empty file should return an error."""
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = ""
+    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_doc", {"value": "/workspace/outputs/empty.txt"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.is_error() or result._data.get("doc") is None
+
+
+def test_return_agfile_content_is_another_path_returns_error():
+    """return_doc where the file contains only a path should be rejected."""
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "/workspace/turn_specula.py"
+    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_doc", {"value": "/workspace/outputs/doc.txt"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.is_error() or result._data.get("doc") is None
+
+
+def test_return_agfile_valid_content_is_accepted():
+    """return_doc where the file has real content should be accepted."""
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "def main():\n    pass\n"
+    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_doc", {"value": "/workspace/outputs/code.py"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.doc == "/workspace/outputs/code.py"
+
+
+# ---------------------------------------------------------------------------
+# return_<field> tool — str auto-resolution of path values
+# ---------------------------------------------------------------------------
+
+def test_return_str_with_path_auto_resolves_to_content():
+    """return_code called with a file path should silently resolve to file content."""
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "def main():\n    pass\n"
+    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_code", {"value": "/workspace/core.py"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.code == "def main():\n    pass\n"
+    sandbox.read_file.assert_called_with("/workspace/core.py")
+
+
+def test_return_str_with_path_that_is_unreadable_keeps_original():
+    """If sandbox.read_file raises, the original path value is kept as-is."""
+    sandbox = MagicMock()
+    sandbox.read_file.side_effect = FileNotFoundError("no file")
+    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_code", {"value": "/workspace/core.py"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.code == "/workspace/core.py"
+
+
+def test_return_str_with_real_content_not_resolved():
+    """return_code with multiline content should never trigger path resolution."""
+    sandbox = MagicMock()
+    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
+    code = "import os\n\ndef main():\n    print('hello')\n"
+    responses = [
+        _tool_call("return_code", {"value": code}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    assert result.code == code
+    sandbox.read_file.assert_not_called()
+
+
+def test_return_str_resolved_content_that_is_itself_a_path_is_not_substituted():
+    """If the resolved file content is also a path, keep original to avoid chaining."""
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "/workspace/another.py"
+    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
+    responses = [
+        _tool_call("return_code", {"value": "/workspace/core.py"}),
+        _direct(""),
+    ]
+    result = _run_skill_with_sandbox(sk, responses, sandbox)
+    # Content itself looks like a path → not substituted → original path kept
+    assert result.code == "/workspace/core.py"
+
+
+# ---------------------------------------------------------------------------
+# _looks_like_path
+# ---------------------------------------------------------------------------
+
+def test_looks_like_path_detects_workspace_paths():
+    from agency.agskill import _looks_like_path
+    assert _looks_like_path("/workspace/core.py")
+    assert _looks_like_path("/workspace/outputs/report.txt")
+    assert _looks_like_path("/tmp/scratch.py")
+    assert _looks_like_path("/workspace/turn_specula.py")
+    assert _looks_like_path("/workspace/outputs/harness_code_i1.py")
+
+
+def test_looks_like_path_rejects_multiline():
+    from agency.agskill import _looks_like_path
+    assert not _looks_like_path("def main():\n    pass\n")
+    assert not _looks_like_path("/workspace/file.py\nextra content")
+
+
+def test_looks_like_path_rejects_non_absolute():
+    from agency.agskill import _looks_like_path
+    assert not _looks_like_path("relative/path.py")
+    assert not _looks_like_path("just some text")
+    assert not _looks_like_path("")
+
+
+def test_looks_like_path_rejects_paths_with_spaces():
+    from agency.agskill import _looks_like_path
+    # Old heuristic would accept these; new regex rejects them
+    assert not _looks_like_path("/this is not a path")
+    assert not _looks_like_path("/workspace/file.py extra text")
+    assert not _looks_like_path("/workspace/some file.py")
+
+
+def test_looks_like_path_single_segment():
+    from agency.agskill import _looks_like_path
+    assert _looks_like_path("/bin")
+    assert _looks_like_path("/a")
+    assert _looks_like_path("/tmp")
+    assert _looks_like_path("/tmp/file.txt")
+    assert _looks_like_path("/a/b/c")
+
+

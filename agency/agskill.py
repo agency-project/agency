@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import queue
 import re
+import shlex
 import ssl
 import threading
 import time
@@ -287,6 +288,14 @@ from .agdata import agdata, _fmt_exc
 from .agtype import agtype, agimage, agrawstring
 from .agtool import agtool
 from .agcompaction import compact, should_compact, count_messages_tokens
+
+
+_PATH_RE = re.compile(r"^(/[\w.\-]+)+$")
+
+
+def _looks_like_path(s: str) -> bool:
+    """Return True if s looks like a sandbox path (file or directory)."""
+    return bool(_PATH_RE.match(s.strip())) if isinstance(s, str) else False
 
 
 def _hint_to_json_type(hint) -> str:
@@ -1315,11 +1324,98 @@ class agskill:
             openai_tools = _return_tools + (openai_tools or [])
 
             def _make_field_handler(field: str):
+                from .agtype import agfile as _agfile, agbinary as _agbinary
+                hint = self.output_schema._data[field]
+                _is_agfile   = isinstance(hint, type) and issubclass(hint, _agfile)
+                _is_agbinary = isinstance(hint, type) and issubclass(hint, _agbinary)
+                _is_str      = hint is str
+
                 def _handle(args: dict) -> str:
                     value = args.get("value")
                     err = _validate_output_field(field, value, self.output_schema)
                     if err is not None:
                         return json.dumps({"error": f"field '{field}': {err}"})
+
+                    # agfile: validate file exists, is a regular file, is non-empty,
+                    # is UTF-8 text, and contains real content (not another path).
+                    if _is_agfile and sandbox is not None and isinstance(value, str):
+                        try:
+                            content = sandbox.read_file(value)
+                        except IsADirectoryError:
+                            return json.dumps({"error": (
+                                f"field '{field}': '{value}' is a directory, not a file. "
+                                f"Pass the path to a specific output file "
+                                f"(e.g. {value}/{field}.txt)."
+                            )})
+                        except UnicodeDecodeError:
+                            return json.dumps({"error": (
+                                f"field '{field}': file at '{value}' contains binary data "
+                                f"and cannot be read as text. Write a UTF-8 text file instead."
+                            )})
+                        except Exception:
+                            return json.dumps({"error": (
+                                f"field '{field}': no file found at path '{value}'. "
+                                f"Write your output to a file first, then call this "
+                                f"tool with that file's path."
+                            )})
+                        if not content or not content.strip():
+                            return json.dumps({"error": (
+                                f"field '{field}': file at '{value}' is empty. "
+                                f"Write the actual content to the file before "
+                                f"registering the path."
+                            )})
+                        if _looks_like_path(content.strip()):
+                            return json.dumps({"error": (
+                                f"field '{field}': file at '{value}' contains only a "
+                                f"path reference ('{content.strip()}'), not real content. "
+                                f"Write the actual content to a file and return that "
+                                f"file's path."
+                            )})
+
+                    # agbinary: check the file exists and is non-empty using a
+                    # lightweight shell test — no content read needed.
+                    if _is_agbinary and sandbox is not None and isinstance(value, str):
+                        _, dir_rc = sandbox._container_exec(
+                            f"test -d {shlex.quote(value)}", timeout=5, shell="sh"
+                        )
+                        if dir_rc == 0:
+                            return json.dumps({"error": (
+                                f"field '{field}': '{value}' is a directory, not a file. "
+                                f"Pass the path to a specific binary output file "
+                                f"(e.g. {value}/{field}.bin)."
+                            )})
+                        _, exist_rc = sandbox._container_exec(
+                            f"test -s {shlex.quote(value)}", timeout=5, shell="sh"
+                        )
+                        if exist_rc != 0:
+                            # -s fails for both missing and zero-byte files; distinguish them.
+                            _, found_rc = sandbox._container_exec(
+                                f"test -e {shlex.quote(value)}", timeout=5, shell="sh"
+                            )
+                            if found_rc != 0:
+                                return json.dumps({"error": (
+                                    f"field '{field}': no file found at path '{value}'. "
+                                    f"Write your binary output to a file first, then call "
+                                    f"this tool with that file's path."
+                                )})
+                            return json.dumps({"error": (
+                                f"field '{field}': file at '{value}' is empty. "
+                                f"Write the actual binary content to the file before "
+                                f"registering the path."
+                            )})
+
+                    # str: if the agent returned a file path instead of content,
+                    # silently resolve it to the file's content.
+                    if _is_str and isinstance(value, str) and _looks_like_path(value) \
+                            and sandbox is not None:
+                        try:
+                            resolved = sandbox.read_file(value)
+                            if resolved and resolved.strip() \
+                                    and not _looks_like_path(resolved.strip()):
+                                value = resolved
+                        except Exception:
+                            pass  # leave value as-is; schema validation already passed
+
                     _collected_outputs[field] = value
                     remaining = _required_fields - set(_collected_outputs)
                     if remaining:

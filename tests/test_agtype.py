@@ -76,10 +76,11 @@ def test_system_prompt_type_names_shown_correctly():
         output_schema=agdata(result=float),
     )
     prompt = sk._build_system_prompt()
-    assert '"n": "int"' in prompt
+    assert '"n": "int"' in prompt       # input schema still uses to_json()
     assert '"s": "str"' in prompt
     assert '"doc": "file"' in prompt
-    assert '"result": "float"' in prompt
+    assert "result" in prompt            # output field listed by name
+    assert "float" in prompt             # output field type shown as "float"
 
 
 # ---------------------------------------------------------------------------

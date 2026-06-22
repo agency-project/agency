@@ -1,5 +1,6 @@
 """Tests for agwebui framework hooks — agterm, agent, agteam, ask_human."""
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -34,10 +35,13 @@ def active_webui(tmp_path):
 
 
 def _events(run_dir: Path) -> list[dict]:
-    f = run_dir / "ui_events.jsonl"
-    if not f.exists():
+    db = run_dir / "ui_events.db"
+    if not db.exists():
         return []
-    return [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+    con = sqlite3.connect(str(db))
+    rows = con.execute("SELECT data FROM events ORDER BY id").fetchall()
+    con.close()
+    return [json.loads(r[0]) for r in rows]
 
 
 def _events_of(run_dir: Path, etype: str) -> list[dict]:
