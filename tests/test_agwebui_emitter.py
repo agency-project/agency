@@ -275,6 +275,7 @@ def test_pruning_removes_old_high_freq_events(tmp_path):
         # → prune collapses them to 1 row (the last one).
         for i in range(10):
             em.token_update("AgZ", i, 0, i, 0)
+        em._flush_prune()
         events = read_events(tmp_path)
         token_rows = [e for e in events if e["type"] == "token_update"]
         assert len(token_rows) == 1, f"expected 1 after prune, got {len(token_rows)}"
@@ -310,6 +311,7 @@ def test_pruning_preserves_separate_time_buckets(tmp_path):
         # Trigger prune by emitting via emitter (its insert_count wraps at _PRUNE_EVERY)
         em._insert_count = em._PRUNE_EVERY - 1
         em.log("trigger")   # this is the Nth insert → prune fires
+        em._flush_prune()
         events = read_events(tmp_path)
         token_rows = [e for e in events if e["type"] == "token_update"]
         # One per 60s bucket: bucket 0 keeps agent_input=4, bucket 1 keeps agent_input=14
@@ -333,6 +335,7 @@ def test_pruning_preserves_log_events(tmp_path):
             em.log(f"line{i}")
         for i in range(5):
             em.token_update("AgZ", i, 0, i, 0)
+        em._flush_prune()
         events = read_events(tmp_path)
         log_rows   = [e for e in events if e["type"] == "log"]
         token_rows = [e for e in events if e["type"] == "token_update"]

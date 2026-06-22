@@ -434,6 +434,10 @@ if TYPE_CHECKING:
 
 _llm_call_semaphore = threading.Semaphore(128)
 
+LLM_MAX_RETRIES    = 10
+LLM_IDLE_TIMEOUT   = 300.0   # seconds to wait for first chunk (server dead?)
+LLM_STREAM_TIMEOUT = 1800.0  # seconds to wait between chunks mid-stream
+
 
 @contextmanager
 def _llm_call_semaphore_slot():
@@ -533,9 +537,9 @@ def _llm_call(
 
     Returns an _LLMCallResult. Caller checks .ok, .should_retry, .conn_error.
     """
-    _LLM_MAX_RETRIES = 5
-    _LLM_IDLE_TIMEOUT = 60.0    # seconds to wait for first chunk (server dead?)
-    _LLM_STREAM_TIMEOUT = 1800.0  # seconds to wait between chunks mid-stream
+    _LLM_MAX_RETRIES    = LLM_MAX_RETRIES
+    _LLM_IDLE_TIMEOUT   = LLM_IDLE_TIMEOUT
+    _LLM_STREAM_TIMEOUT = LLM_STREAM_TIMEOUT
 
     kwargs = dict(kwargs)  # shallow copy so we don't mutate caller's dict
     kwargs["stream"] = True
@@ -553,7 +557,7 @@ def _llm_call(
     with _llm_call_semaphore_slot():
         client = _make_llm_client(
             llm_config,
-            httpx.Timeout(connect=30.0, read=None, write=180.0, pool=30.0),
+            httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0),
         )
 
         if term:

@@ -3,7 +3,7 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 from agency.agdata import agdata
-from agency.agskill import agskill
+from agency.agskill import agskill, LLM_MAX_RETRIES, LLM_IDLE_TIMEOUT, LLM_STREAM_TIMEOUT
 from agency.agtool import agtool
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
@@ -650,7 +650,7 @@ def test_timeout_retries_all_attempts_then_error():
 
     assert result.error is not None
     assert "error" in result.error.lower()
-    assert call_count == 5  # one attempt per entry in _TIMEOUT_SEQUENCE
+    assert call_count == LLM_MAX_RETRIES
 
 
 def test_timeout_values_fixed_on_retry():
@@ -675,15 +675,15 @@ def test_timeout_values_fixed_on_retry():
         MockClient.return_value.chat.completions.create.return_value = []
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
 
-    assert len(captured) == 5, f"expected 5 attempts, got {len(captured)}"
+    assert len(captured) == LLM_MAX_RETRIES, f"expected {LLM_MAX_RETRIES} attempts, got {len(captured)}"
     idle_vals   = [t[0] for t in captured]
     stream_vals = [t[1] for t in captured]
-    # idle_timeout must be fixed (60 s) across all attempts — no longer doubling
+    # idle_timeout must be fixed across all attempts — no longer doubling
     assert len(set(idle_vals)) == 1,   f"idle_timeout should be fixed across retries: {idle_vals}"
-    assert idle_vals[0] == 60.0,       f"idle_timeout should be 60 s: {idle_vals}"
-    # stream_timeout must also be fixed (1800 s)
+    assert idle_vals[0] == LLM_IDLE_TIMEOUT, f"idle_timeout should be {LLM_IDLE_TIMEOUT} s: {idle_vals}"
+    # stream_timeout must also be fixed
     assert len(set(stream_vals)) == 1, f"stream_timeout should be fixed across retries: {stream_vals}"
-    assert stream_vals[0] == 1800.0,   f"stream_timeout should be 1800 s: {stream_vals}"
+    assert stream_vals[0] == LLM_STREAM_TIMEOUT, f"stream_timeout should be {LLM_STREAM_TIMEOUT} s: {stream_vals}"
 
 
 def test_timeout_succeeds_after_retry():
@@ -733,7 +733,7 @@ def test_ssl_error_retries_all_attempts_then_error():
 
     assert result.error is not None
     assert "error" in result.error.lower()
-    assert call_count == 5
+    assert call_count == LLM_MAX_RETRIES
 
 
 def test_oserror_retries_all_attempts_then_error():
@@ -753,7 +753,7 @@ def test_oserror_retries_all_attempts_then_error():
 
     assert result.error is not None
     assert "error" in result.error.lower()
-    assert call_count == 5
+    assert call_count == LLM_MAX_RETRIES
 
 
 def test_ssl_error_releases_semaphore():

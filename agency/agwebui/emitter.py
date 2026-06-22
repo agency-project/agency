@@ -145,6 +145,11 @@ class agwebui_emitter:
             threading.Thread(target=self._run_prune, daemon=True,
                              name="emitter-prune").start()
 
+    def _flush_prune(self) -> None:
+        """Block until any in-flight background prune has completed. For tests only."""
+        with self._prune_lock:
+            pass
+
     def _run_prune(self) -> None:
         """Background worker: delete old high-frequency events outside the emit lock.
 
