@@ -58,7 +58,10 @@ def make_bash(sandbox: "agSandbox") -> agtool:
             "Run a shell command inside the agent's sandbox container and return its output. "
             "The default working directory is /workspace. "
             "All spawned processes are tracked; the skill will not finish until they exit "
-            "or are released via daemon_release."
+            "or are released via daemon_release. "
+            "IMPORTANT: if the command uses a GPU (PyTorch, CUDA, model loading, etc.), "
+            "you MUST call reserve_gpu first — otherwise CUDA will not be visible and the "
+            "command will fail. Call gpu_release when GPU work is complete."
         ),
         params=_BASH_PARAMS,
         log_fn=_log,

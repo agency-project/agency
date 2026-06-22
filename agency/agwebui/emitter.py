@@ -55,6 +55,8 @@ class agwebui_emitter:
         self._reply_dir = run_dir / "ui_replies"
         self._reply_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # Prevents concurrent prune threads from piling up.
+        self._prune_lock = threading.Lock()
         # Latest cumulative token counts per agent; flushed again on done().
         self._token_state: dict[str, tuple[int, int, int, int]] = {}
         # Registration state re-emitted in done() for late-joining clients.
@@ -135,25 +137,47 @@ class agwebui_emitter:
                     (data,),
                 )
             self._insert_count += 1
-            if self._insert_count % self._PRUNE_EVERY == 0:
-                # Keep the last event per (type, agname, time-bucket).
-                # This guarantees at most one sample per bucket per agent,
-                # so timeline scrubbing always finds a sample within
-                # _PRUNE_BUCKET_S seconds of any scrub position.
-                con.execute(
-                    """
-                    DELETE FROM events
-                    WHERE type IN ('token_update','messages_snapshot','resource_update')
-                      AND id NOT IN (
-                        SELECT MAX(id) FROM events
-                        WHERE type IN ('token_update','messages_snapshot','resource_update')
-                        GROUP BY type, agname, CAST(ts / ? AS INTEGER)
-                      )
-                    """,
-                    (self._PRUNE_BUCKET_S,),
-                )
+            should_prune = self._insert_count % self._PRUNE_EVERY == 0
             con.commit()
             con.close()
+        # Run pruning outside the emit lock so it never blocks concurrent emit() callers.
+        if should_prune:
+            threading.Thread(target=self._run_prune, daemon=True,
+                             name="emitter-prune").start()
+
+    def _run_prune(self) -> None:
+        """Background worker: delete old high-frequency events outside the emit lock.
+
+        Uses a try-lock so at most one prune runs at a time; excess triggers are
+        dropped rather than queued, which is fine because the next scheduled prune
+        will clean up any remaining rows.
+        """
+        if not self._prune_lock.acquire(blocking=False):
+            return
+        try:
+            # Keep the last event per (type, agname, time-bucket).
+            # This guarantees at most one sample per bucket per agent,
+            # so timeline scrubbing always finds a sample within
+            # _PRUNE_BUCKET_S seconds of any scrub position.
+            con = sqlite3.connect(str(self._db_path), timeout=120)
+            con.execute(
+                """
+                DELETE FROM events
+                WHERE type IN ('token_update','messages_snapshot','resource_update')
+                  AND id NOT IN (
+                    SELECT MAX(id) FROM events
+                    WHERE type IN ('token_update','messages_snapshot','resource_update')
+                    GROUP BY type, agname, CAST(ts / ? AS INTEGER)
+                  )
+                """,
+                (self._PRUNE_BUCKET_S,),
+            )
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+        finally:
+            self._prune_lock.release()
 
     # ------------------------------------------------------------------
     # Typed emitters
