@@ -727,14 +727,6 @@ def _dispatch_tools(
             try:
                 if _state_fn:
                     _state_fn("tool", skill=skill_name, tool=fn_name)
-                _ckpt_tag: str | None = None
-                if t.need_sandbox and sandbox is not None:
-                    _ckpt_tag = f"agency/pretool-{sandbox._name}-{tc_id.replace('-','')[:8]}"
-                    try:
-                        if not sandbox.commit(_ckpt_tag):
-                            _ckpt_tag = None  # nothing was committed, don't try to restore
-                    except Exception:
-                        _ckpt_tag = None
                 # Let the agent specify a custom timeout (seconds) via a
                 # "timeout" key in the tool arguments.
                 _tool_timeout: int | None = None
@@ -747,43 +739,61 @@ def _dispatch_tools(
                 result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)
+                if t.need_sandbox and sandbox is not None:
+                    # A tool may signal failure via agdata(error=...) without raising —
+                    # treat that the same as an exception: discard dirty state.
+                    _result_errored = False
+                    try:
+                        if "error" in json.loads(result_content):
+                            _result_errored = True
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    if _result_errored:
+                        sandbox.stop(commit=False)
+                        try:
+                            _result_obj = json.loads(result_content)
+                            _result_obj["workspace_reverted"] = (
+                                "The workspace has been reverted to the state "
+                                "before this tool call."
+                            )
+                            result_content = json.dumps(_result_obj)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    else:
+                        # Offload large outputs to /workspace before committing so
+                        # the file is captured in the lifecycle snapshot.
+                        if len(result_content) > _TOOL_OUTPUT_OFFLOAD_CHARS:
+                            safe_id = tc_id.replace("-", "")[:12]
+                            offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
+                            try:
+                                try:
+                                    file_body = json.loads(result_content).get("content", result_content)
+                                except (json.JSONDecodeError, AttributeError):
+                                    file_body = result_content
+                                sandbox.write_file(offload_path, file_body)
+                                result_content = json.dumps({
+                                    "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
+                                })
+                            except Exception:
+                                pass
+                        sandbox.stop(commit=True)
             except Exception as e:
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)
                 result_content = json.dumps({"error": _fmt_exc(e)})
-            # On tool failure, revert the sandbox to the pre-call checkpoint
-            # and tell the agent the workspace was restored.
-            try:
-                _result_obj = json.loads(result_content)
-                if "error" in _result_obj and _ckpt_tag and sandbox is not None:
+                # On failure: remove without committing to discard dirty state.
+                # The next tool call restores from the last successful checkpoint.
+                if t.need_sandbox and sandbox is not None:
+                    sandbox.stop(commit=False)
                     try:
-                        sandbox.restore(_ckpt_tag)
+                        _result_obj = json.loads(result_content)
                         _result_obj["workspace_reverted"] = (
                             "The workspace has been reverted to the state "
                             "before this tool call."
                         )
                         result_content = json.dumps(_result_obj)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         pass
-            except (json.JSONDecodeError, TypeError):
-                pass
-        if sandbox is not None and len(result_content) > _TOOL_OUTPUT_OFFLOAD_CHARS:
-            safe_id = tc_id.replace("-", "")[:12]
-            offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
-            try:
-                # Write the plain `content` field so the file has natural
-                # line breaks and the read tool can paginate with offsets.
-                # Fall back to the raw JSON string if parsing fails.
-                try:
-                    file_body = json.loads(result_content).get("content", result_content)
-                except (json.JSONDecodeError, AttributeError):
-                    file_body = result_content
-                sandbox.write_file(offload_path, file_body)
-                result_content = json.dumps({
-                    "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
-                })
-            except Exception:
-                pass
         tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
         messages.append(tool_msg)
         if _live_messages_fn:

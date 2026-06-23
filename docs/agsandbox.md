@@ -1,6 +1,6 @@
 # Container Sandboxing
 
-All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `need_sandbox=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. When a container is started it is committed to a checkpoint image at the end of the task and destroyed, with state persisted between tasks via those images.
+All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `need_sandbox=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
 
 ## Runtime detection
 
@@ -20,14 +20,20 @@ The `images/Dockerfile` installs `ripgrep` on top of `python:3.12-slim`. Both ru
 
 ## Container lifecycle
 
+The container exists only during active tool execution. Between tool calls the container is removed, releasing the Linux session keyring and any held GPU so concurrent agents can use those resources.
+
 | Event | What happens |
 |---|---|
-| `agent.__init__` | No container created — `agSandbox` object is created cheaply; `_checkpoint=None` |
-| First `need_sandbox=True` tool call | Any stale container removed; `docker run` from `_checkpoint` image (or `BASE_IMAGE` on first task); `_ensure_started()` is called at most once per task |
-| `agent.run()` task end (container started) | `docker commit container → agency/ckpt-<pid>-<agname>` (returns `True`); container destroyed; `_checkpoint` updated |
-| `agent.run()` task end (no container started) | `commit()` returns `False`; `_checkpoint` unchanged; no Docker calls |
-| `agent.__del__` | Checkpoint image removed via `docker rmi` |
-| `atexit` | All live containers removed (guards against hard-killed processes) |
+| `agSandbox.__init__` | No container created — cheap object; `_lifecycle_image=None` |
+| First `need_sandbox=True` tool call | `_ensure_started()` runs: `docker run` from `_lifecycle_image` (or `restore_image`, or `BASE_IMAGE` on first use) |
+| Subsequent tool calls | `_ensure_started()` sees `_lifecycle_image` set → `docker run` from it (picks up `/workspace` state) |
+| After **successful** sandbox tool call | `sandbox.stop(commit=True)`: `docker commit → agency/lifecycle-<name>`; `docker rm -f`; `_lifecycle_image` updated |
+| After **failed** sandbox tool call | `sandbox.stop(commit=False)`: `docker rm -f` without commit; dirty state discarded; next start restores from previous `_lifecycle_image` |
+| Exited (stopped, not removed) container detected | `_ensure_started()` fast-path: `docker start` instead of `docker run` (~0.5 s); used when a container is stopped externally |
+| `sandbox.destroy()` | `docker rm -f` (no-op if already removed); `docker rmi agency/lifecycle-<name>`; any `pretool-*` images cleaned up |
+| `atexit` | All live containers removed (guard against hard-killed processes) |
+
+**Failure revert**: when a tool errors, `stop(commit=False)` discards the container with its partial state. The next tool call recreates from the last successful `_lifecycle_image`, so the agent's workspace is automatically rolled back to the last known-good state. The agent receives `workspace_reverted` in the error response to know this happened.
 
 ## GPU device access
 
@@ -135,13 +141,14 @@ sb.read_file(path) -> str           # UTF-8 text; raises UnicodeDecodeError for 
 sb.read_file_bytes(path) -> bytes   # raw bytes; no decode attempt
 sb.write_file(path, content)        # UTF-8 text via stdin pipe
 sb.write_file_bytes(path, data)     # raw bytes via base64 round-trip
-sb.commit(tag) -> bool  # False if container never started; True after docker commit
+sb.commit(tag) -> bool  # False if container doesn't exist; True after docker commit (works on running or stopped containers)
+sb.stop(commit=False)   # remove container; if commit=True, snapshot to agency/lifecycle-<name> first
 sb.update_limits(cpus=4.0, memory="8g")
 sb.get_live_pids() -> set[int]
 sb.pid_status_summary() -> str
 sb.release_daemon(pid)
 sb.release_resources(pool)
-sb.destroy()
+sb.destroy()            # rm container + rmi lifecycle image + rmi any pretool images
 ```
 
 ## Custom base image

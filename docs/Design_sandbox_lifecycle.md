@@ -51,6 +51,41 @@ The tool then logs the call via `agtool.log()` (terminal + file) and returns the
 
 ---
 
+## Per-tool-call container lifecycle
+
+After every tool dispatch in `_dispatch_tools()`, the container is stopped:
+
+```
+tool returns result
+  ├─ success (no "error" key in result)
+  │    sandbox.stop(commit=True)
+  │      docker commit → agency/lifecycle-<agname>   # snapshot /workspace
+  │      docker rm -f <container>                    # release session keyring + GPU
+  │      _lifecycle_image = "agency/lifecycle-<agname>"
+  │
+  └─ failure ("error" key in result, or exception raised)
+       sandbox.stop(commit=False)
+         docker rm -f <container>                    # discard dirty state, no commit
+         # next start restores from previous _lifecycle_image
+       result gains "workspace_reverted" note
+```
+
+Before the next tool call `_ensure_started()` recreates the container:
+
+```
+_ensure_started() (called lazily from exec())
+  ├─ container running?     → reuse (fast path, no-op)
+  ├─ container exited?      → docker start (0.5 s, keeps overlay)
+  └─ container absent?
+       ├─ _restore_image set   → docker run from restore_image (fork/checkpoint)
+       ├─ _lifecycle_image set → docker run from lifecycle image (last good state)
+       └─ neither              → docker run from BASE_IMAGE (first tool call)
+```
+
+This keeps at most one container alive per agent during active tool execution. All session keyrings and GPU slots are freed between tool calls while the LLM thinks, preventing the kernel keyring quota from being exhausted under high agent concurrency.
+
+---
+
 ## Process monitoring inside agskill
 
 Background process monitoring is embedded directly in `agskill.run()`'s ReAct loop (not in an outer caller loop). Each time the LLM produces a valid final answer, the framework calls `_wait_for_processes()` before returning:
@@ -94,53 +129,45 @@ The `&` means the shell starts `train.py` and continues without waiting.
 3. `/proc` after-diff — `train.py` is still alive → added to `__BGPIDS__`
 4. `_watched_pids[train_pid] = now`
 5. `exec()` returns `("", 0)` — the LLM sees empty output
-6. LLM produces its final answer; output schema validation passes
+6. **`sandbox.stop(commit=True)`** — container committed and removed; `train.py` dies with it (background processes do not survive across tool-call boundaries)
+7. LLM produces its final answer; output schema validation passes
 
 ### Process monitoring (inside agskill)
 
 ```
 _wait_for_processes() called — train_pid is in _watched_pids
-
-log: PROCS ▶  monitoring: PID <train_pid> (running 0m 0s)
-log: procs_started  (lifecycle event)
-
-poll get_live_pids() every poll_interval_s (5s) for up to ping_interval_s (5min)
-  → train_pid alive each check, full window elapses
-
-live_now = {train_pid}      ← still running after ping_interval_s
-
-log: PROCS ⏳  still running: PID <train_pid> (running 5m 0s)
-log: procs_ping  (lifecycle event)
-
-proc_msg = "Background processes are still running: PID <train_pid>..."
-→ appended as user message, loop continues
-
-─── LLM re-entry ─────────────────────────────────────────────────────────────
-LLM receives: "Background processes are still running: PID <train_pid>..."
-LLM calls: bash({"command": "tail -20 train.log"})
-LLM produces final answer
-
-_wait_for_processes() called again
-poll get_live_pids() ... train_pid exits mid-poll → break immediately
-
-log: PROCS ✓  all processes completed, re-entering agent
-log: procs_completed  (lifecycle event)
-
-proc_msg = "Background processes have completed. Read their output..."
-→ appended as user message, loop continues
-
-─── LLM re-entry ─────────────────────────────────────────────────────────────
-LLM receives: "Background processes have completed."
-LLM calls: bash({"command": "cat results.json"})
-LLM reads output, produces final result
-
-_wait_for_processes() called — _watched_pids is empty → returns None
+  ↳ _ensure_started() recreates container from lifecycle image
+  ↳ get_live_pids() reads /proc — train_pid absent (container is fresh) → returns {}
+  ↳ _watched_pids cleared → returns None immediately
 → far.return_tuple returned
 
-sandbox commit + destroy
+sandbox.destroy()   # removes agency/lifecycle-<agname> image; container already gone
 aglog._record()
 result_future.set_result()   ← caller unblocks
 ```
+
+> **Note**: background processes spawned inside a single tool call do not survive to the next tool call. The commit+remove cycle after each tool call terminates all container processes. Agents that need long-running background work (training, servers) should use a foreground exec per monitoring checkpoint, or launch the work via a daemon-release pattern scoped within a single tool call.
+
+---
+
+## Case 1b: Multi-tool background job (monitoring within one agent turn)
+
+When the agent uses multiple bash tool calls to monitor a long-running background process, each call gets a fresh container from the lifecycle image, which does **not** preserve live processes from prior calls.
+
+```
+Tool call 1: bash("python train.py &; echo started")
+  → exec(): train_pid added to _watched_pids
+  → stop(commit=True): container committed (train.py killed); lifecycle image updated
+  → LLM sees "started"
+
+Tool call 2: bash("cat train.log")   # agent polls the file instead of the PID
+  → _ensure_started(): docker run from lifecycle image (train.log absent — train never ran)
+  → exec(): reads file
+  → stop(commit=True)
+  ...
+```
+
+The practical pattern for persistent work across tool calls is to write results to `/workspace` files during a **single** foreground exec, then read them in subsequent execs. Live processes do not persist.
 
 ---
 
@@ -155,7 +182,8 @@ No `&` — the wrapper shell blocks on `python eval.py` until it exits.
 3. `/proc` after-diff — eval.py is already gone from `/proc`; diff is empty
 4. `_watched_pids` unchanged
 5. `exec()` returns `(full_stdout_of_eval, rc)` — LLM sees the output inline
-6. LLM reads the result, produces final answer
+6. **`sandbox.stop(commit=True)`** — container committed and removed; `/workspace` state preserved in lifecycle image
+7. LLM reads the result, produces final answer
 
 ### Process monitoring (inside agskill)
 
@@ -163,7 +191,7 @@ No `&` — the wrapper shell blocks on `python eval.py` until it exits.
 _wait_for_processes() called — _watched_pids is empty → returns None immediately
 → far.return_tuple returned
 
-sandbox commit + destroy
+sandbox.destroy()   # removes agency/lifecycle-<agname> image; container already gone
 result_future.set_result()   ← caller unblocks
 ```
 
@@ -182,25 +210,41 @@ Example: `python launcher.py`, where launcher.py does `subprocess.Popen(['python
 3. `/proc` after-diff — launcher.py is gone, but `train.py` is still alive → added to `__BGPIDS__`
 4. `_watched_pids[train_pid] = now`
 5. `exec()` returns `(launcher_stdout, rc)` — LLM sees whatever launcher printed
-6. LLM produces final answer
+6. **`sandbox.stop(commit=True)`** — container committed and removed; `train.py` killed by `docker rm -f`
+7. LLM produces final answer
 
 ### Process monitoring (inside agskill)
 
-Identical to Case 1 from this point. `_wait_for_processes` detects `train_pid` in `_watched_pids`, polls, pings the LLM with status messages, and re-enters until the process exits.
+```
+_wait_for_processes() called — train_pid is in _watched_pids
+  ↳ _ensure_started(): docker run from lifecycle image (fresh container, train.py absent)
+  ↳ get_live_pids() → {} (process does not exist in new container)
+  ↳ _watched_pids cleared → returns None immediately
+→ far.return_tuple returned
 
-The LLM never explicitly launched `train.py` — it called a foreground script. The `/proc` diff is what captures the orphaned child.
+sandbox.destroy()
+result_future.set_result()
+```
+
+The orphaned child does not survive the commit+remove cycle. The LLM never explicitly launched `train.py` — the `/proc` diff is what detected it — but it is terminated with the container at tool-call boundary.
 
 ---
 
 ## Case 4: Daemon job (`python server.py &`, then `daemon_release(pid)`)
 
-### Tool call 1 — start the server
+`daemon_release` is only meaningful when both the start and the release happen **within the same tool call** (i.e., inside a single `bash(...)` invocation), because the container is committed and removed at tool-call boundary regardless.
 
-Same path as Case 1. Server PID added to `_watched_pids`. LLM sees empty output.
+### Tool call — start the server and immediately release it
 
-### Tool call 2 — `daemon_release(pid)`
+The LLM issues a single bash command that starts the server and calls `daemon_release`:
 
-LLM calls `daemon_release({"pid": <server_pid>})`:
+```
+bash({"command": "python server.py &\ndaemon_release " + server_pid})
+```
+
+Or more commonly, the LLM uses two tool calls in a single dispatch batch:
+1. `bash({"command": "python server.py &"})` — server_pid added to `_watched_pids`
+2. `daemon_release({"pid": server_pid})`:
 
 ```
 make_daemon_release._run(arg)
@@ -209,21 +253,20 @@ make_daemon_release._run(arg)
        └─ _watched_pids.pop(server_pid)
 ```
 
-Returns `agdata(message="PID X released as daemon — will not block skill completion")`. LLM produces final answer.
+After both tools complete: **`sandbox.stop(commit=True)`** — container committed and removed; the server is killed by `docker rm -f`.
 
 ### Process monitoring (inside agskill)
 
 ```
-_wait_for_processes() called — _watched_pids is empty (server_pid moved to _daemon_pids)
+_wait_for_processes() called — _watched_pids is empty (server_pid was in _daemon_pids,
+  which is cleared when container is removed)
 → returns None immediately
 
-sandbox commit + destroy
+sandbox.destroy()   # removes lifecycle image
 result_future.set_result()   ← caller unblocks
 ```
 
-The server keeps running. If it later spawns worker processes, `get_live_pids()` reads their PPid from `/proc/status`, finds it traces to `_daemon_pids`, and propagates daemon status — workers are also excluded from monitoring.
-
-The server and all its descendants are killed when `sandbox.destroy()` is called from the `finally` block in `_task`.
+> **Note**: because the container is removed after each tool call, the server does not actually remain running across tool-call boundaries. The `daemon_release` tool is useful for suppressing the process-monitoring ping within a single ReAct iteration — it tells the framework "this PID is intentional and should not block the final answer" — but the process is terminated at tool-call boundary just like all others.
 
 ---
 
@@ -240,9 +283,10 @@ Any newly discovered non-baseline PID is added to `_watched_pids` with the curre
 
 ## Summary
 
-| Scenario | `docker exec` blocks? | `/proc` diff finds PIDs? | `_watched_pids` after exec | `_wait_for_processes` result |
-|---|---|---|---|---|
-| Background job (`&`) | No | Yes — background process | non-empty | procs_ping message(s) → procs_completed message → `None` |
-| Foreground job | Yes | No — process already exited | empty | `None` immediately |
-| Foreground spawns child | Yes | Yes — orphaned child | non-empty | Same as background job |
-| Daemon + `daemon_release` | No | Yes — server PID | moved to `_daemon_pids` | `None` immediately |
+| Scenario | `docker exec` blocks? | `/proc` diff finds PIDs? | `_watched_pids` after exec | After tool call | `_wait_for_processes` result |
+|---|---|---|---|---|---|
+| Background job (`&`) | No | Yes — background process | non-empty | `stop(commit=True)` — process killed | `None` immediately (process gone in fresh container) |
+| Foreground job | Yes | No — process already exited | empty | `stop(commit=True)` | `None` immediately |
+| Foreground spawns child | Yes | Yes — orphaned child | non-empty | `stop(commit=True)` — child killed | `None` immediately (child gone in fresh container) |
+| Daemon + `daemon_release` | No | Yes — server PID | moved to `_daemon_pids` | `stop(commit=True)` — server killed | `None` immediately |
+| Failed tool (error result or exception) | — | — | — | `stop(commit=False)` — dirty state discarded; next start restores previous lifecycle image | — |

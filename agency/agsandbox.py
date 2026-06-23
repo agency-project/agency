@@ -159,6 +159,7 @@ class agSandbox:
         self._baseline_pids: set[int]        = set()
         self._daemon_pids:   set[int]        = set()
         self._started  = False
+        self._lifecycle_image: str | None    = None   # last committed image from stop(commit=True)
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
@@ -180,6 +181,16 @@ class agSandbox:
         )
         return result.returncode == 0 and result.stdout.strip() == b"true"
 
+    def _container_status(self) -> str:
+        """Return the container state string: 'running', 'exited', 'created', etc., or '' if not found."""
+        result = self._run(
+            [self._runtime, "inspect", "--format", "{{.State.Status}}", self._name],
+            check=False, timeout=10,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout.decode("utf-8", errors="replace").strip()
+
     def _ensure_started(self) -> None:
         """Start the Docker container on first use.
 
@@ -199,29 +210,52 @@ class agSandbox:
         with _startup_semaphore:
             if self._started:   # re-check after acquiring the semaphore
                 return
-            # Reuse a container that a previous worker process already started,
-            # but only when we are NOT restoring a specific checkpoint image.
-            if self._restore_image is None and self._container_running():
-                _live_sandboxes.add(self)
-                self._started = True
-                self._baseline_pids = self._snapshot_pids()
-                return
+            # Reuse or restart a container that a previous worker process (or a
+            # prior tool-dispatch batch) already started.  Only applies when we
+            # are NOT restoring from a specific checkpoint image.
+            if self._restore_image is None:
+                status = self._container_status()
+                if status == "running":
+                    _live_sandboxes.add(self)
+                    self._started = True
+                    self._baseline_pids = self._snapshot_pids()
+                    return
+                if status == "exited":
+                    # Container was stopped (keyring released) but overlay is intact.
+                    # docker start is ~0.5–1 s vs 2–5 s for docker run.
+                    self._run([self._runtime, "start", name], check=True, timeout=30)
+                    _live_sandboxes.add(self)
+                    self._started = True
+                    self._baseline_pids = self._snapshot_pids()
+                    return
             self._run([self._runtime, "rm", "-f", name], check=False)
             try:
+                # Priority: explicit restore image > lifecycle checkpoint > base image
                 if self._restore_image is not None:
                     image = self._restore_image
                     run_cmd = (
-                        [self._runtime, "run", "-d", "--name", name]
+                        [self._runtime, "run", "-d", "--init", "--name", name]
                         + self._gpu_flags + self._vol_flags
                         + [image, "tail", "-f", "/dev/null"]
                     )
                     self._run_with_conflict_retry(run_cmd, name)
                     self._run([self._runtime, "rmi", self._restore_image], check=False)
+                elif self._lifecycle_image is not None:
+                    # Restart from last committed checkpoint (set by stop(commit=True)).
+                    # /workspace and all state from the previous tool call are preserved.
+                    image = self._lifecycle_image
+                    run_cmd = (
+                        [self._runtime, "run", "-d", "--init", "--name", name]
+                        + self._gpu_flags + self._vol_flags
+                        + [image, "tail", "-f", "/dev/null"]
+                    )
+                    self._run_with_conflict_retry(run_cmd, name)
+                    # Keep _lifecycle_image — not a one-shot restore, needed for future restarts.
                 else:
                     image = self._resolve_image(self.BASE_IMAGE)
                     cpu_flags = ["--cpus=1"] if self._cfs_supported() else []
                     run_cmd = (
-                        [self._runtime, "run", "-d", "--name", name]
+                        [self._runtime, "run", "-d", "--init", "--name", name]
                         + cpu_flags + self._gpu_flags + self._vol_flags
                         + [image, "tail", "-f", "/dev/null"]
                     )
@@ -249,13 +283,21 @@ class agSandbox:
         object in "Created" state without ever starting.  We force-remove the
         stale entry and retry rather than surfacing an opaque error to the agent.
         """
-        for attempt in range(3):
+        for attempt in range(8):
             result = subprocess.run(run_cmd, capture_output=True, timeout=120)
             if result.returncode == 0:
                 return
             stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
             conflict = "already in use" in stderr or "Conflict" in stderr
-            if conflict:
+            keyring = "session key" in stderr or (
+                "disk quota exceeded" in stderr and "keyring" in stderr
+            )
+            if keyring:
+                # Linux session keyring quota exhausted; slots free up as other
+                # containers finish. Wait and retry — up to ~60 s total.
+                wait = min(5.0 * (attempt + 1), 30.0)
+                time.sleep(wait)
+            elif conflict:
                 # If another process just started the container and it is now
                 # running, reuse it instead (handled by caller's _container_running).
                 if self._container_running():
@@ -272,7 +314,7 @@ class agSandbox:
                 raise RuntimeError(msg)
         # Final attempt after retries exhausted.
         raise RuntimeError(
-            f"docker run --name {name} failed after retries (container name conflict)"
+            f"docker run --name {name} failed after retries (container name conflict or keyring quota)"
         )
 
     def _container_name(self) -> str:
@@ -412,11 +454,14 @@ class agSandbox:
         else:
             clean_output = output
 
-        # No background processes were spawned: release the physical GPU now so
-        # other agents can use it while this agent waits for the next LLM turn.
-        # When background processes ARE running, get_live_pids() releases the GPU
-        # once the alive set becomes empty.
-        if not self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
+        # Release the physical GPU if no background processes remain.  The
+        # /proc diff can catch transient PIDs that already exited by the time
+        # we parse __BGPIDS__, so re-verify liveness when _watched_pids is
+        # non-empty — get_live_pids() prunes dead entries and releases the GPU
+        # if none survive the check.
+        if self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
+            self.get_live_pids()
+        elif not self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
             self._gpu_release_fn(self._gpu_id)
             self._gpu_id = None
 
@@ -522,18 +567,61 @@ class agSandbox:
     def commit(self, tag: str) -> bool:
         """Commit the container filesystem to a new image tag.
 
-        Returns True if the commit succeeded, False if no container is running
-        (nothing to commit).  Also works when the container was started by a
-        worker process and ``_started`` is still False in the main process.
+        Returns True if the commit succeeded, False if the container doesn't
+        exist.  Works on both running and stopped containers (docker commit
+        does not require the container to be running).  Also handles the case
+        where the container was started by a worker process and ``_started``
+        is still False in the main process.
         """
-        if not self._started and not self._container_running():
-            return False
+        if not self._started:
+            status = self._container_status()
+            if status not in ("running", "exited"):
+                return False
         self._run(
             [self._runtime, "commit", self._container_name(), tag],
             check=True,
             timeout=120,
         )
         return True
+
+    def stop(self, *, commit: bool = False) -> None:
+        """Stop and remove the container, releasing its session keyring and GPU.
+
+        If commit=True, the container filesystem is committed to an image first
+        so _ensure_started() can recreate from it on the next tool call.  Pass
+        commit=True after a successful sandbox tool call; commit=False after a
+        failure to discard the dirty state and revert to the last checkpoint.
+        """
+        if not self._started:
+            # Worker-process scenario: _started is False in the calling process
+            # even though a worker may have started the container.
+            if not self._container_running():
+                return
+        # Release GPU so other agents can use it while the container is gone.
+        if self._gpu_virtual and self._gpu_id is not None:
+            self._gpu_release_fn(self._gpu_id)
+            self._gpu_id = None
+        # Clear PID tracking — remove kills all processes.
+        self._watched_pids = {}
+        self._baseline_pids = set()
+        if commit:
+            tag = f"agency/lifecycle-{self._name}"
+            try:
+                self._run(
+                    [self._runtime, "commit", self._container_name(), tag],
+                    check=True, timeout=120,
+                )
+                self._lifecycle_image = tag
+            except Exception:
+                pass  # commit failure is non-fatal; next start uses previous checkpoint
+        try:
+            self._run(
+                [self._runtime, "rm", "-f", self._container_name()],
+                check=False, timeout=30,
+            )
+        except Exception:
+            pass
+        self._started = False
 
     def restore(self, tag: str) -> None:
         """Restore the sandbox to a previously committed image snapshot.
@@ -731,9 +819,13 @@ class agSandbox:
                 timeout=15,
             )
             prefix = f"agency/pretool-{self._name}-"
+            lifecycle = f"agency/lifecycle-{self._name}"
             for line in result.stdout.decode("utf-8", errors="replace").splitlines():
                 tag = line.strip()
-                if tag.startswith(prefix):
+                # docker images --format {{.Repository}}:{{.Tag}} includes the ":latest"
+                # suffix when no explicit tag was given (e.g. "agency/lifecycle-x:latest").
+                tag_repo = tag.rsplit(":", 1)[0] if ":" in tag else tag
+                if tag.startswith(prefix) or tag_repo == lifecycle:
                     self._run([self._runtime, "rmi", "-f", tag], timeout=15, check=False)
         except Exception:
             pass

@@ -617,8 +617,13 @@ class agent:
                             self.agname,
                             _prev["input_tokens"]  + skill_inp,
                             _prev["output_tokens"] + skill_out,
-                            _gl["input_tokens"]    + skill_inp,
-                            _gl["output_tokens"]   + skill_out,
+                            # Use the committed global total as-is. Adding
+                            # skill_inp here would race with concurrent agents
+                            # doing the same, producing out-of-order values.
+                            # The committed global is locked and monotonically
+                            # increasing, so it never produces negative rates.
+                            _gl["input_tokens"],
+                            _gl["output_tokens"],
                         )
                     except Exception:
                         pass

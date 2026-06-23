@@ -9,8 +9,8 @@ const state = {
   agents:      new Map(),  // agname -> { color, state, skill, tool }
   teams:       new Map(),  // team_name -> Set<agname>
   histories:   new Map(),  // agname -> msg[]
-  tokenUsage:  new Map(),  // agname -> { inp, out, firstTs, lastTs }
-  globalTokens: { inp: 0, out: 0, firstTs: null, lastTs: null },
+  tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
+  globalTokens: { inp: 0, out: 0, history: [] },
   resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
   focusedIdx: 0,
@@ -228,7 +228,7 @@ function updateResourceBadge() {
   const r = state.resources;
   const parts = [];
   if (r.gpus_total > 0) {
-    parts.push(`GPU ${r.gpus_acquired}/${r.gpus_total} (Used/Total)`);
+    parts.push(`GPU ${r.gpus_acquired}/${r.gpus_total}`);
   }
   if (r.cpus_acquired > 0) {
     parts.push(`CPU ${r.cpus_acquired}/${r.cpus_total}`);
@@ -238,28 +238,34 @@ function updateResourceBadge() {
     const totG = (r.memory_total_mb / 1024).toFixed(0);
     parts.push(`MEM ${acqG}/${totG}G`);
   }
-  $resourceStats.textContent = parts.length ? parts.join('  ') : '';
+  $resourceStats.textContent = parts.length ? parts.join('  ') + '  (Used/Total)' : '';
 }
 
-function fmtTokens(inp, out, firstTs, lastTs) {
+const RATE_WINDOW_S = 60;
+
+function fmtTokens(inp, out, history) {
   function compact(n) {
     if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
     if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
     return String(n);
   }
   let s = `↑${compact(inp)} ↓${compact(out)}`;
-  if (firstTs && lastTs && lastTs > firstTs) {
-    const elapsed = lastTs - firstTs;
-    const inpS  = compact(Math.round(inp  / elapsed));
-    const outS  = compact(Math.round(out / elapsed));
-    s += `  (↑${inpS}/s ↓${outS}/s)`;
+  if (history && history.length >= 2) {
+    const oldest  = history[0];
+    const newest  = history[history.length - 1];
+    const elapsed = (Date.now() / 1000) - oldest.ts;
+    if (elapsed > 0) {
+      const inpS = compact(Math.round((newest.inp - oldest.inp) / elapsed));
+      const outS = compact(Math.round((newest.out - oldest.out) / elapsed));
+      s += `  (↑${inpS}/s ↓${outS}/s)`;
+    }
   }
   return s;
 }
 
 function updateGlobalTokenBadge() {
-  const { inp, out, firstTs, lastTs } = state.globalTokens;
-  $globalTokens.textContent = (inp || out) ? fmtTokens(inp, out, firstTs, lastTs) : '';
+  const { inp, out, history } = state.globalTokens;
+  $globalTokens.textContent = (inp || out) ? fmtTokens(inp, out, history) : '';
 }
 
 function updateInteractionTitle() {
@@ -277,7 +283,7 @@ function updateInteractionTitle() {
   const waiting = (state.pendingAsk?.agname === agname) ? '  ?' : '';
   const usage   = state.tokenUsage.get(agname);
   const tokHtml = usage
-    ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.firstTs, usage.lastTs)}</span>`
+    ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.history)}</span>`
     : '';
   $interactionTitle.innerHTML =
     `${esc(agname)}  [${idx + 1}/${n}]  ← →${esc(waiting)}${tokHtml}`;
@@ -610,18 +616,26 @@ function handleEvent(ev) {
       break;
 
     case 'token_update': {
-      const prev = state.tokenUsage.get(ev.agname);
-      state.tokenUsage.set(ev.agname, {
-        inp: ev.agent_input, out: ev.agent_output,
-        firstTs: prev?.firstTs ?? ev.ts,
-        lastTs:  ev.ts,
-      });
-      const gPrev = state.globalTokens;
-      state.globalTokens = {
-        inp: ev.global_input, out: ev.global_output,
-        firstTs: gPrev.firstTs ?? ev.ts,
-        lastTs:  ev.ts,
-      };
+      const prev    = state.tokenUsage.get(ev.agname) || { inp: 0, out: 0, history: [] };
+      const history = prev.history;
+      history.push({ ts: ev.ts, inp: ev.agent_input, out: ev.agent_output });
+      const cutoff  = ev.ts - RATE_WINDOW_S;
+      while (history.length > 1 && history[0].ts < cutoff) history.shift();
+      state.tokenUsage.set(ev.agname, { inp: ev.agent_input, out: ev.agent_output, history });
+
+      // Global token values from concurrent agents race: each agent reports
+      // global_base + its_own_live_progress, so values can arrive out of order.
+      // Track the running maximum as the displayed total and only append to
+      // history when the value is a new high-water mark, ensuring the rate
+      // window is always monotonically increasing (no negative rates).
+      const gInp = Math.max(state.globalTokens.inp, ev.global_input);
+      const gOut = Math.max(state.globalTokens.out, ev.global_output);
+      const gHistory = state.globalTokens.history;
+      if (ev.global_input >= state.globalTokens.inp) {
+        gHistory.push({ ts: ev.ts, inp: ev.global_input, out: ev.global_output });
+        while (gHistory.length > 1 && gHistory[0].ts < cutoff) gHistory.shift();
+      }
+      state.globalTokens = { inp: gInp, out: gOut, history: gHistory };
       updateGlobalTokenBadge();
       if (ev.agname === currentAgent()) updateInteractionTitle();
       break;

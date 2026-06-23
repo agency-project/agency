@@ -564,6 +564,140 @@ class TestAgSandboxLifecycle:
         sb1.destroy()
         sb2.destroy()
 
+    @docker
+    def test_stop_commit_true_creates_lifecycle_image_and_removes_container(self):
+        """stop(commit=True) commits state to agency/lifecycle-<name> and removes the container."""
+        sb = _make_sandbox()
+        name = sb._container_name()
+        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        try:
+            sb.write_file("/workspace/marker.txt", "lifecycle\n")
+            sb.stop(commit=True)
+            # Container must be gone
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
+                capture_output=True, text=True,
+            )
+            assert name not in result.stdout, "container must be removed after stop()"
+            # Lifecycle image must exist
+            img = subprocess.run(
+                ["docker", "images", "-q", lifecycle_tag],
+                capture_output=True, text=True,
+            )
+            assert img.stdout.strip() != "", "lifecycle image must exist after stop(commit=True)"
+            # _lifecycle_image must be set
+            assert sb._lifecycle_image == lifecycle_tag
+        finally:
+            subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
+            sb.destroy()
+
+    @docker
+    def test_stop_commit_false_removes_container_without_image(self):
+        """stop(commit=False) removes the container but does not create a lifecycle image."""
+        sb = _make_sandbox()
+        name = sb._container_name()
+        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        try:
+            sb.write_file("/workspace/dirty.txt", "dirty\n")
+            previous_lifecycle = sb._lifecycle_image  # None on first call
+            sb.stop(commit=False)
+            # Container must be gone
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
+                capture_output=True, text=True,
+            )
+            assert name not in result.stdout, "container must be removed after stop()"
+            # _lifecycle_image must not have changed
+            assert sb._lifecycle_image == previous_lifecycle
+            # No lifecycle image should have been created
+            img = subprocess.run(
+                ["docker", "images", "-q", lifecycle_tag],
+                capture_output=True, text=True,
+            )
+            assert img.stdout.strip() == "", "stop(commit=False) must not create a lifecycle image"
+        finally:
+            subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
+            sb.destroy()
+
+    @docker
+    def test_lifecycle_image_restores_workspace_on_next_start(self):
+        """After stop(commit=True), _ensure_started() restores /workspace from the lifecycle image."""
+        sb = _make_sandbox()
+        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        try:
+            sb.write_file("/workspace/persistent.txt", "saved\n")
+            sb.stop(commit=True)
+            assert sb._started is False
+            # Next exec triggers _ensure_started() which runs docker run from lifecycle image.
+            out, rc = sb.exec("cat /workspace/persistent.txt")
+            assert rc == 0
+            assert "saved" in out
+        finally:
+            subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
+            sb.destroy()
+
+    @docker
+    def test_stop_commit_false_reverts_to_last_checkpoint(self):
+        """stop(commit=False) discards dirty state; next start restores from last lifecycle image."""
+        sb = _make_sandbox()
+        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        try:
+            # First successful tool call: write file and commit.
+            sb.write_file("/workspace/good.txt", "good\n")
+            sb.stop(commit=True)
+            # Second tool call that fails: write a dirty file without committing.
+            sb.exec("true")  # restarts from lifecycle image
+            sb.write_file("/workspace/dirty.txt", "dirty\n")
+            sb.stop(commit=False)
+            # Next start must restore from lifecycle image — dirty.txt must not exist.
+            sb.exec("true")
+            content = sb.read_file("/workspace/good.txt")
+            assert "good" in content
+            _, dirty_rc = sb.exec("test -f /workspace/dirty.txt")
+            assert dirty_rc != 0, "dirty file must not exist after stop(commit=False)"
+        finally:
+            subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
+            sb.destroy()
+
+    @docker
+    def test_destroy_removes_lifecycle_image(self):
+        """destroy() cleans up the lifecycle image created by stop(commit=True)."""
+        sb = _make_sandbox()
+        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        sb.write_file("/workspace/x.txt", "x\n")
+        sb.stop(commit=True)
+        # Confirm image exists before destroy
+        img = subprocess.run(
+            ["docker", "images", "-q", lifecycle_tag],
+            capture_output=True, text=True,
+        )
+        assert img.stdout.strip() != "", "lifecycle image must exist before destroy()"
+        sb.destroy()
+        # Image must be gone
+        img2 = subprocess.run(
+            ["docker", "images", "-q", lifecycle_tag],
+            capture_output=True, text=True,
+        )
+        assert img2.stdout.strip() == "", "destroy() must remove the lifecycle image"
+
+    @docker
+    def test_ensure_started_detects_exited_container(self):
+        """_ensure_started() fast-path: restart a stopped (exited) container without docker run."""
+        sb = _make_sandbox()
+        name = sb._container_name()
+        try:
+            sb.write_file("/workspace/exited.txt", "still-here\n")
+            # Externally stop (not remove) the container to put it in exited state.
+            subprocess.run(["docker", "stop", "-t", "0", name], capture_output=True)
+            sb._started = False
+            # _ensure_started() must detect exited state and use docker start.
+            sb._ensure_started()
+            assert sb._started is True
+            content = sb.read_file("/workspace/exited.txt")
+            assert "still-here" in content
+        finally:
+            sb.destroy()
+
 
 # ---------------------------------------------------------------------------
 # agSandbox — exec

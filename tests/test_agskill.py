@@ -885,16 +885,15 @@ def test_long_tool_output_not_offloaded_without_sandbox():
 # ---------------------------------------------------------------------------
 
 def _make_sandbox_with_tracking():
-    """Return a sandbox mock that records commit/restore calls."""
+    """Return a sandbox mock that records stop() calls."""
     sandbox = MagicMock()
     sandbox._name = "testbox"
-    sandbox.commit.return_value = True
-    sandbox.restore.return_value = None
+    sandbox.stop.return_value = None
     return sandbox
 
 
-def test_tool_success_no_restore():
-    """A successful tool call must NOT trigger sandbox.restore()."""
+def test_tool_success_commits_and_stops():
+    """A successful tool call must trigger sandbox.stop(commit=True)."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
@@ -907,11 +906,11 @@ def test_tool_success_no_restore():
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
 
-    sandbox.restore.assert_not_called()
+    sandbox.stop.assert_called_once_with(commit=True)
 
 
-def test_tool_failure_triggers_restore():
-    """When a need_sandbox tool returns an error, sandbox.restore() is called with the checkpoint tag."""
+def test_tool_failure_triggers_stop_without_commit():
+    """When a need_sandbox tool returns an error, sandbox.stop(commit=False) is called."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
@@ -924,13 +923,11 @@ def test_tool_failure_triggers_restore():
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
 
-    sandbox.restore.assert_called_once()
-    tag = sandbox.restore.call_args[0][0]
-    assert tag.startswith("agency/pretool-testbox-")
+    sandbox.stop.assert_called_once_with(commit=False)
 
 
 def test_tool_failure_adds_workspace_reverted_note():
-    """Tool error message must include workspace_reverted when sandbox.restore() succeeds."""
+    """Tool error response must include workspace_reverted when the tool returns agdata(error=...)."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
@@ -952,7 +949,7 @@ def test_tool_failure_adds_workspace_reverted_note():
 
 
 def test_tool_failure_no_restore_without_sandbox():
-    """When sandbox=None, a tool error is passed through as-is with no restore attempt."""
+    """When sandbox=None, a tool error is passed through as-is with no stop attempt."""
     def fn(arg: agdata) -> agdata:
         return agdata(error="nope")
 
@@ -969,8 +966,8 @@ def test_tool_failure_no_restore_without_sandbox():
     assert "workspace_reverted" not in content
 
 
-def test_need_sandbox_false_no_checkpoint():
-    """Tools with need_sandbox=False must not trigger sandbox.commit() or sandbox.restore()."""
+def test_need_sandbox_false_no_stop():
+    """Tools with need_sandbox=False must not trigger sandbox.stop()."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
@@ -983,17 +980,15 @@ def test_need_sandbox_false_no_checkpoint():
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
 
-    sandbox.commit.assert_not_called()
-    sandbox.restore.assert_not_called()
+    sandbox.stop.assert_not_called()
 
 
-def test_tool_failure_no_restore_if_no_checkpoint():
-    """If sandbox.commit() raises, no checkpoint tag is stored, so restore is never called."""
+def test_tool_exception_triggers_stop_without_commit():
+    """When a need_sandbox tool raises an exception, sandbox.stop(commit=False) is called."""
     sandbox = _make_sandbox_with_tracking()
-    sandbox.commit.side_effect = RuntimeError("commit failed")
 
     def fn(arg: agdata) -> agdata:
-        return agdata(error="fail")
+        raise RuntimeError("exploded")
 
     t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
     s = make_skill(replace_tools=[t])
@@ -1002,33 +997,7 @@ def test_tool_failure_no_restore_if_no_checkpoint():
         MockClient.return_value.chat.completions.create.side_effect = responses
         _, hist, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
 
-    sandbox.restore.assert_not_called()
-    # Error is still passed through to the LLM unchanged
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
-    assert "error" in json.loads(tool_msgs[0]["content"])
-
-
-def test_tool_failure_no_restore_if_commit_returns_false():
-    """If sandbox.commit() returns False (container not running), _ckpt_tag must be
-    cleared so sandbox.restore() is never called with a non-existent image.
-
-    Regression: previously the tag was left set even when commit() returned False,
-    causing restore() to attempt docker run with a non-existent image."""
-    sandbox = _make_sandbox_with_tracking()
-    sandbox.commit.return_value = False   # container not running — nothing committed
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(error="fail")
-
-    t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c7"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
-
-    sandbox.restore.assert_not_called()
-    # Error is still passed through to the LLM unchanged
+    sandbox.stop.assert_called_once_with(commit=False)
     tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
     assert "error" in json.loads(tool_msgs[0]["content"])
 
