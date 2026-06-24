@@ -1,10 +1,10 @@
 """
 Example: bug-fixing workflow that copies the vllm codebase into the agent's
-sandbox at /workspace/vllm, runs one of the test cases (full version would run
-the entire test suite), and reports results.
+sandbox at /workspace/vllm, fixes a specific bug by calling a model up to N times, 
+runs one of the test cases (full version would run the entire test suite), and reports results.
 
 Run:
-    VLLM_BASE_URL=url VLLM_MODEL=model uv run python examples/fix_bugs.py
+    VLLM_BASE_URL=url VLLM_MODEL=model uv run python examples/fix_bugs.py --max-attempts N
 """
 import argparse
 import os
@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 from agency import agent, agskill, agdata
-from agency.agsandbox import agSandbox
+from agency.agsandbox import agSandbox, _RUN_ID
 
 
 def _make_run_dir(name: str):
@@ -57,7 +57,7 @@ def main(max_attempts: int = 5):
     )
     # Commit the container as the agent's checkpoint so subsequent skills
     # pick up the pre-populated /workspace/vllm.
-    ckpt_tag = f"agency/ckpt-{_PID_PREFIX}-{ag.agname}"
+    ckpt_tag = f"agency/ckpt-{_RUN_ID}-{ag.agname}"
     sandbox.commit(ckpt_tag)
     sandbox.destroy()
     ag._checkpoint = ckpt_tag
