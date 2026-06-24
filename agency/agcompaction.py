@@ -2,6 +2,18 @@ from __future__ import annotations
 import httpx
 import openai
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+TOKENIZE_TIMEOUT_SECONDS = 5.0       # HTTP request timeout for the vLLM /tokenize endpoint call
+CHARS_PER_TOKEN = 4                  # Rough characters-per-token ratio used for the fallback token estimate
+DEFAULT_CONTEXT_LIMIT = 128_000      # Fallback context window size (tokens) when none is provided to compact()
+SUMMARY_TASK_INPUT_MAX_CHARS = 400   # Max characters of the task-input message included in the summarisation prompt
+SUMMARY_ASSISTANT_CONTENT_MAX_CHARS = 400  # Max characters of assistant message content included in the summarisation prompt
+SUMMARY_ROLE_CONTENT_MAX_CHARS = 600       # Max characters of non-assistant/non-tool message content included in the summarisation prompt
+SUMMARY_MAX_TOKENS = 1024            # Maximum tokens allowed in the LLM's generated conversation summary
+
 # --- Constants matching opencode's design -----------------------------------
 
 # Fire when prompt is within this many tokens of the context limit.
@@ -74,8 +86,8 @@ def fetch_context_limit(llm_config: dict) -> int | None:
         extra = getattr(info, "model_extra", None) or {}
         if "max_model_len" in extra:
             return int(extra["max_model_len"])
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[agcompaction] WARNING: failed to retrieve max_model_len from API: {_e}")
     return None
 
 
@@ -115,7 +127,7 @@ def count_messages_tokens(messages: list[dict], llm_config: dict) -> int:
                     "messages": [{k: v for k, v in m.items() if not k.startswith("_")}
                                  for m in messages],
                 },
-                timeout=5.0,
+                timeout=TOKENIZE_TIMEOUT_SECONDS,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -138,7 +150,7 @@ def _estimate_tokens(msg: dict) -> int:
     chars = len(msg.get("content") or "")
     for tc in (msg.get("tool_calls") or []):
         chars += len(tc.get("function", {}).get("arguments", ""))
-    return max(1, chars // 4)
+    return max(1, chars // CHARS_PER_TOKEN)
 
 
 def _tail_start(conv: list[dict], context_limit: int,
@@ -238,7 +250,7 @@ def compact(
 
     Returns ``(new_messages, summary_text)``.
     """
-    cl = context_limit if context_limit is not None else 128_000
+    cl = context_limit if context_limit is not None else DEFAULT_CONTEXT_LIMIT
 
     if messages and messages[0]["role"] == "system":
         sys_msg: list[dict] = [messages[0]]
@@ -273,7 +285,7 @@ def compact(
 
     # Include the task input so the summariser knows the original goal
     if task_input:
-        lines.append(f"[task input]: {(task_input[0].get('content') or '')[:400]}")
+        lines.append(f"[task input]: {(task_input[0].get('content') or '')[:SUMMARY_TASK_INPUT_MAX_CHARS]}")
 
     for m in head:
         role = m.get("role", "?")
@@ -283,11 +295,11 @@ def compact(
             names = ", ".join(tc["function"]["name"] for tc in tool_calls)
             lines.append(f"[assistant → tools: {names}]")
             if content:
-                lines.append(f"  {content[:400]}")
+                lines.append(f"  {content[:SUMMARY_ASSISTANT_CONTENT_MAX_CHARS]}")
         elif role == "tool":
             lines.append(f"[tool result]: {content[:_TOOL_OUTPUT_MAX_CHARS]}")
         elif content:
-            lines.append(f"[{role}]: {content[:600]}")
+            lines.append(f"[{role}]: {content[:SUMMARY_ROLE_CONTENT_MAX_CHARS]}")
 
     client = openai.OpenAI(
         api_key=llm_config.get("api_key", ""),
@@ -299,7 +311,7 @@ def compact(
             {"role": "system", "content": _SUMMARY_SYSTEM},
             {"role": "user",   "content": "\n".join(lines)},
         ],
-        max_tokens=1024,
+        max_tokens=SUMMARY_MAX_TOKENS,
     )
     if "extra_body" in llm_config:
         compact_kwargs["extra_body"] = llm_config["extra_body"]

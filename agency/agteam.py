@@ -110,8 +110,8 @@ class agteam:
                     self.team_name,
                     [a.agname for a in self._agents],
                 )
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agteam] WARNING: team_registered push failed for {self.team_name}: {_e}")
 
     # ------------------------------------------------------------------
     # Override points

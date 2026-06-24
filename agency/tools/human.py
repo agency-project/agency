@@ -4,6 +4,11 @@ import threading
 from ..agtool import agtool
 from ..agdata import agdata
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ASK_ID_HEX_LENGTH = 12  # Number of hex characters taken from a UUID4 to form a unique ask_human request ID sent to the web UI emitter.
+
 _TIMEOUT_REPLY = "[no human available — timed out]"
 _DEFAULT_TIMEOUT_S = 300  # 5 minutes
 
@@ -32,7 +37,7 @@ def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) ->
         from .. import agwebui as _agwebui
         if _agwebui._active is not None:
             import uuid as _uuid
-            ask_id = _uuid.uuid4().hex[:12]
+            ask_id = _uuid.uuid4().hex[:ASK_ID_HEX_LENGTH]
             reply = _agwebui._active.emitter.ask_human(agname, ask_id, question,
                                                        timeout_s=timeout_s)
         else:

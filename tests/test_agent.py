@@ -534,11 +534,19 @@ def test_save_all_and_load_all(tmp_path, monkeypatch):
     _allocated_agnames.difference_update(saved_names)
 
     restored = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
-    assert len(restored) == 2
-    assert {a.agname for a in restored} == saved_names
-    # Container filesystem round-trip (read_file after load) requires real docker
-    # save/load which exports GB-sized images; covered by manual integration test.
-    _allocated_agnames.difference_update(saved_names)
+    try:
+        assert len(restored) == 2
+        assert {a.agname for a in restored} == saved_names
+        # Container filesystem round-trip (read_file after load) requires real docker
+        # save/load which exports GB-sized images; covered by manual integration test.
+    finally:
+        for a in restored:
+            try:
+                if a.sandbox:
+                    a.sandbox.destroy()
+            except Exception:
+                pass
+        _allocated_agnames.difference_update(saved_names)
 
 
 @_docker_ok
@@ -570,12 +578,20 @@ def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
     _allocated_agnames.discard(ag2_name[0])
 
     result = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
-    assert len(result) == 2
-    assert ag1 in result
-    restored_ag2 = next(a for a in result if a.agname == ag2_name[0])
-    assert restored_ag2 is not None
-    _allocated_agnames.discard(ag2_name[0])
-    _allocated_agnames.discard(ag1_name)
+    try:
+        assert len(result) == 2
+        assert ag1 in result
+        restored_ag2 = next(a for a in result if a.agname == ag2_name[0])
+        assert restored_ag2 is not None
+    finally:
+        for a in [ag1] + [a for a in result if a is not ag1]:
+            try:
+                if a.sandbox:
+                    a.sandbox.destroy()
+            except Exception:
+                pass
+        _allocated_agnames.discard(ag2_name[0])
+        _allocated_agnames.discard(ag1_name)
 
 
 @_docker_ok

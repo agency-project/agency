@@ -9,6 +9,12 @@ if TYPE_CHECKING:
 
 _MAX_BYTES = 50 * 1024
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+BASH_DEFAULT_TIMEOUT_SECONDS = 120  # Default timeout (seconds) for a bash tool invocation when the caller does not supply one
+BASH_LOG_CMD_MAX_CHARS = 100  # Maximum characters of the shell command shown in the log line to avoid flooding the terminal
+
 _BASH_PARAMS = {
     "type": "object",
     "properties": {
@@ -29,7 +35,7 @@ def make_bash(sandbox: "agSandbox") -> agtool:
     """
     def _run_sandboxed(arg: agdata) -> agdata:
         command: str = arg.command  # type: ignore[assignment]
-        timeout: int = getattr(arg, "timeout", 120)
+        timeout: int = getattr(arg, "timeout", BASH_DEFAULT_TIMEOUT_SECONDS)
         workdir: str = getattr(arg, "workdir", "/workspace") or "/workspace"
 
         output, rc = sandbox.exec(command, workdir=workdir, timeout=timeout)
@@ -43,7 +49,7 @@ def make_bash(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        cmd   = str(arg._data.get("command", ""))[:100]
+        cmd   = str(arg._data.get("command", ""))[:BASH_LOG_CMD_MAX_CHARS]
         rdata = result._data
         rc    = rdata.get("exit_code", "?")
         trunc = " [truncated]" if rdata.get("truncated", False) else ""

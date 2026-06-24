@@ -74,14 +74,58 @@ Before the next tool call `_ensure_started()` recreates the container:
 
 ```
 _ensure_started() (called lazily from exec())
-  ├─ container running?     → reuse (fast path, no-op)
-  ├─ container exited?      → docker start (0.5 s, keeps overlay)
-  └─ container absent?
-       ├─ _lifecycle_image set → docker run from lifecycle image (fork/checkpoint or last good state)
-       └─ not set              → docker run from BASE_IMAGE (first tool call)
+  ├─ container running?  → reuse (worker-reuse fast path; does NOT acquire semaphore)
+  └─ container absent (or stuck in any non-running state)?
+       ├─ docker rm -f <name>   (no-op if absent; clears any "Created"/"Exited" zombie)
+       ├─ _container_semaphore.acquire()   (blocks until a keyring slot is free)
+       ├─ _lifecycle_image set → docker run from lifecycle image
+       └─ not set              → docker run from BASE_IMAGE (first tool call ever)
 ```
 
+**Two states only.** The "exited" fast-path (`docker start`) was removed. Any container that is not running is treated as a zombie and force-removed before a fresh `docker run`. State is preserved exclusively through `_lifecycle_image` commits, not through the container's overlay filesystem. This eliminates a class of zombie containers that accumulated when `docker stop` succeeded but `docker rm` later failed.
+
+**"Created" state cleanup.** When the Linux session keyring is full, `docker run` can partially succeed — allocating the container object (name reserved, overlay created) but failing before starting any processes. This leaves the container in `"created"` state. `_ensure_started()` removes it with `docker rm -f` before retrying, preventing a spurious name-conflict error on the next attempt.
+
 This keeps at most one container alive per agent during active tool execution. All session keyrings and GPU slots are freed between tool calls while the LLM thinks, preventing the kernel keyring quota from being exhausted under high agent concurrency.
+
+---
+
+## Container naming and run isolation
+
+Each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a UUID prefix generated once at module import time (e.g. `r4a7f9c21`). This scopes all containers to the current process run:
+
+- Two agents with the same `agname` in different runs get different container names — no cross-run collision even if a previous run crashed without cleanup.
+- `_lifecycle_image` tags follow the same pattern: `agency/lifecycle-sandbox-{RUN_ID}-{agname}`.
+- Worker processes (spawned by `ProcessPoolExecutor`) inherit the parent's `_RUN_ID` because it is set at import time in the parent, so they use the same container names.
+
+---
+
+## Concurrency controls
+
+Two semaphores gate Docker daemon calls:
+
+| Semaphore | Limit | Guards |
+|---|---|---|
+| `_startup_semaphore` | 8 | Concurrent `docker run` calls. The NVIDIA runtime serialises GPU device initialisation; more than ~8 concurrent `docker run` calls increase contention without reducing wall-clock time. |
+| `_shutdown_semaphore` | 8 | Concurrent `docker rm -f` calls. The daemon serialises container teardown; flooding it makes individual removals slower and more likely to time out. |
+| `_commit_semaphore` | 8 | Concurrent `docker commit` calls. Committing snapshots large overlay filesystems; the daemon serialises the diff computation, so more than ~8 concurrent commits increase I/O contention without reducing wall-clock time. |
+| `_container_semaphore` | `maxkeys − 5` | Total simultaneously running containers, derived from `/proc/sys/kernel/keys/maxkeys`. Each running container holds one Linux session keyring; hitting the limit causes `docker run` to fail with "disk quota exceeded". |
+
+The startup and shutdown semaphores limit *throughput*; the container semaphore limits *capacity*.
+
+---
+
+## `stop()` reliability
+
+`docker rm -f` is not always instantaneous: the Docker daemon can be slow under load, an overlay filesystem may have open file handles, or container namespaces may not have been fully released by the kernel. The original implementation swallowed all failures silently, causing zombie containers to accumulate.
+
+The current `stop()` implementation:
+
+1. Acquires `_shutdown_semaphore` before issuing `docker rm -f` to bound concurrent teardown.
+2. Retries `docker rm -f` up to 3 times with a 1-second delay between attempts.
+3. Emits a `WARNING` to stderr after all retries are exhausted, then continues — `_started` is cleared and `_container_semaphore` released regardless, so the framework can keep running even if a zombie remains.
+
+The warning makes accumulation visible rather than silent, and the retries handle transient daemon overload.
 
 ---
 

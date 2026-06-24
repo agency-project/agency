@@ -12,6 +12,12 @@ _DEFAULT_LIMIT = 2000
 _MAX_BYTES = 50 * 1024
 _MAX_LINE_LEN = 2000
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+READ_CHECK_TIMEOUT_S = 5   # Timeout in seconds for the shell command that checks whether a path is a file, directory, or missing.
+READ_LS_TIMEOUT_S = 10     # Timeout in seconds for the ls command used to list a directory's entries inside the sandbox container.
+
 _READ_PARAMS = {
     "type": "object",
     "properties": {
@@ -66,7 +72,7 @@ def make_read(sandbox: "agSandbox") -> agtool:
             f"if [ -d {shlex.quote(file_path)} ]; then echo dir; "
             f"elif [ -f {shlex.quote(file_path)} ]; then echo file; "
             f"else echo notfound; fi",
-            timeout=5, shell="sh",
+            timeout=READ_CHECK_TIMEOUT_S, shell="sh",
         )
         kind = check_out.strip()
 
@@ -75,7 +81,7 @@ def make_read(sandbox: "agSandbox") -> agtool:
 
         if kind == "dir":
             ls_out, _ = sandbox._container_exec(
-                f"ls -1p {shlex.quote(file_path)}", timeout=10, shell="sh"
+                f"ls -1p {shlex.quote(file_path)}", timeout=READ_LS_TIMEOUT_S, shell="sh"
             )
             entries = sorted(ls_out.splitlines())
             start = offset - 1

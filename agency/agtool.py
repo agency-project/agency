@@ -17,6 +17,11 @@ if TYPE_CHECKING:
 TOOL_TIMEOUT_S: int = 1800
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+TOOL_POOL_MAX_WORKERS = 256  # Maximum number of worker processes in the tool executor pool; one worker per in-flight tool call.
+
+# ---------------------------------------------------------------------------
 # Process pool — workers are created lazily on first tool call and scale up
 # to match concurrent demand (one worker per in-flight tool call, up to 256).
 # Uses "spawn" start method to avoid fork-in-multithreaded-process deadlocks.
@@ -30,7 +35,7 @@ def _get_pool() -> ProcessPoolExecutor:
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ProcessPoolExecutor(max_workers=256, mp_context=_mp.get_context("spawn"))
+                _pool = ProcessPoolExecutor(max_workers=TOOL_POOL_MAX_WORKERS, mp_context=_mp.get_context("spawn"))
     return _pool
 
 

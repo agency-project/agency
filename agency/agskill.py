@@ -14,6 +14,17 @@ import openai
 
 AGSKILL_REACT_MAX_STEPS = 4096
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+LLM_CALL_MAX_CONCURRENCY     = 128   # Maximum number of simultaneous in-flight LLM streaming calls allowed across all skills.
+LLM_HTTP_CONNECT_TIMEOUT     = 10.0  # Seconds for httpx to establish a TCP/TLS connection to the LLM endpoint before giving up.
+LLM_HTTP_WRITE_TIMEOUT       = 10.0  # Seconds for httpx to finish writing the request body to the LLM endpoint.
+LLM_HTTP_POOL_TIMEOUT        = 10.0  # Seconds httpx waits to acquire a connection from the pool before raising a timeout error.
+LIVE_REDRAW_CHAR_THRESHOLD   = 100   # Minimum number of new combined content+thinking characters before pushing a UI redraw during streaming.
+LLM_RETRY_SLEEP_S            = 2     # Seconds to wait after a connection/SSL error before retrying the LLM call, allowing drain thread exit and SSL teardown to complete.
+AGBINARY_VALIDATE_EXEC_TIMEOUT = 5   # Seconds allowed for each container exec call when validating agbinary output file existence and size.
+
 
 class _BedrockSigV4Auth(httpx.Auth):
     """httpx auth handler that signs requests with AWS SigV4 for Amazon Bedrock."""
@@ -432,7 +443,7 @@ if TYPE_CHECKING:
     from .agsandbox import agSandbox
     from .agresources import agResourcePool
 
-_llm_call_semaphore = threading.Semaphore(128)
+_llm_call_semaphore = threading.Semaphore(LLM_CALL_MAX_CONCURRENCY)
 
 LLM_MAX_RETRIES    = 10
 LLM_IDLE_TIMEOUT   = 300.0   # seconds to wait for first chunk (server dead?)
@@ -557,7 +568,7 @@ def _llm_call(
     with _llm_call_semaphore_slot():
         client = _make_llm_client(
             llm_config,
-            httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0),
+            httpx.Timeout(connect=LLM_HTTP_CONNECT_TIMEOUT, read=None, write=LLM_HTTP_WRITE_TIMEOUT, pool=LLM_HTTP_POOL_TIMEOUT),
         )
 
         if term:
@@ -612,7 +623,7 @@ def _llm_call(
 
                     # Throttle UI redraws: push every ~100 new combined chars
                     new_chars = len(partial_msg.get("content", "")) + len(partial_msg.get("_thinking", ""))
-                    if _live_messages_fn and new_chars - _live_chars >= 100:
+                    if _live_messages_fn and new_chars - _live_chars >= LIVE_REDRAW_CHAR_THRESHOLD:
                         _live_messages_fn(messages[1:])
                         _live_chars = new_chars
                     if delta.tool_calls:
@@ -662,8 +673,8 @@ def _llm_call(
     if _token_update_fn is not None:
         try:
             _token_update_fn(_total_input_tokens, _total_output_tokens)
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agskill] WARNING: token_update_fn raised: {_e}")
 
     return _LLMCallResult(
         content_parts=content_parts,
@@ -774,8 +785,8 @@ def _dispatch_tools(
                                 result_content = json.dumps({
                                     "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
                                 })
-                            except Exception:
-                                pass
+                            except Exception as _e:
+                                print(f"[agskill] WARNING: failed to offload large tool output to {offload_path}: {_e}")
                         sandbox.stop(commit=True)
             except Exception as e:
                 if _state_fn:
@@ -1390,7 +1401,7 @@ class agskill:
                     # lightweight shell test — no content read needed.
                     if _is_agbinary and sandbox is not None and isinstance(value, str):
                         _, dir_rc = sandbox._container_exec(
-                            f"test -d {shlex.quote(value)}", timeout=5, shell="sh"
+                            f"test -d {shlex.quote(value)}", timeout=AGBINARY_VALIDATE_EXEC_TIMEOUT, shell="sh"
                         )
                         if dir_rc == 0:
                             return json.dumps({"error": (
@@ -1399,12 +1410,12 @@ class agskill:
                                 f"(e.g. {value}/{field}.bin)."
                             )})
                         _, exist_rc = sandbox._container_exec(
-                            f"test -s {shlex.quote(value)}", timeout=5, shell="sh"
+                            f"test -s {shlex.quote(value)}", timeout=AGBINARY_VALIDATE_EXEC_TIMEOUT, shell="sh"
                         )
                         if exist_rc != 0:
                             # -s fails for both missing and zero-byte files; distinguish them.
                             _, found_rc = sandbox._container_exec(
-                                f"test -e {shlex.quote(value)}", timeout=5, shell="sh"
+                                f"test -e {shlex.quote(value)}", timeout=AGBINARY_VALIDATE_EXEC_TIMEOUT, shell="sh"
                             )
                             if found_rc != 0:
                                 return json.dumps({"error": (
@@ -1483,7 +1494,7 @@ class agskill:
                 # A 2 s gap lets the drain thread exit and the server's SSL
                 # teardown complete before the next connection is attempted.
                 # (Reproduced: 0 s → 3/5 SSL failures; 1 s+ → 5/5 clean.)
-                time.sleep(2)
+                time.sleep(LLM_RETRY_SLEEP_S)
                 continue
             if not llm_result.ok:
                 _err_msg = f"LLM connection error after 5 attempts: {llm_result.conn_error}"

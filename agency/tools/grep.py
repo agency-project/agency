@@ -9,6 +9,11 @@ from ..agtool import agtool
 if TYPE_CHECKING:
     from ..agsandbox import agSandbox
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+GREP_EXEC_TIMEOUT_SECS = 30  # Maximum seconds to wait for the rg command to complete inside the sandbox container.
+
 _LIMIT = 100
 _MAX_LINE_LEN = 2000
 
@@ -35,7 +40,7 @@ def make_grep(sandbox: "agSandbox") -> agtool:
             cmd += f" --glob {shlex.quote(include)}"
         cmd += " 2>/dev/null || true"
 
-        output, _ = sandbox.exec(cmd, timeout=30)
+        output, _ = sandbox.exec(cmd, timeout=GREP_EXEC_TIMEOUT_SECS)
 
         matches: list[dict] = []
         for line in output.splitlines():

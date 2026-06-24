@@ -6,6 +6,13 @@ import subprocess
 import threading
 import time
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+GPU_DETECT_TIMEOUT_S = 10        # Seconds to wait for nvidia-smi or rocm-smi to respond before giving up
+SYSCTL_DETECT_TIMEOUT_S = 5      # Seconds to wait for sysctl hw.memsize to respond on macOS
+MEMORY_DETECT_FALLBACK_MB = 4096  # Safe fallback total RAM in MB when detection fails on both Linux and macOS
+GPU_ACQUIRE_POLL_INTERVAL_S = 0.25  # Seconds between polling attempts when waiting for a free GPU semaphore
 
 # VRAM held per GPU as a framework presence marker (visible in nvidia-smi).
 _MARKER_MB = 128
@@ -71,7 +78,7 @@ def detect_gpus() -> list[int]:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=GPU_DETECT_TIMEOUT_S,
         )
         if result.returncode == 0 and result.stdout.strip():
             ids = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
@@ -81,7 +88,7 @@ def detect_gpus() -> list[int]:
     try:
         result = subprocess.run(
             ["rocm-smi", "--showid", "--csv"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=GPU_DETECT_TIMEOUT_S,
         )
         if result.returncode == 0 and result.stdout.strip():
             ids = []
@@ -125,13 +132,13 @@ def detect_memory_mb() -> int:
     try:
         result = subprocess.run(
             ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=SYSCTL_DETECT_TIMEOUT_S,
         )
         if result.returncode == 0:
             return int(result.stdout.strip()) // (1024 * 1024)
     except Exception:
         pass
-    return 4096  # safe fallback
+    return MEMORY_DETECT_FALLBACK_MB  # safe fallback
 
 
 class agResourcePool:
@@ -185,7 +192,7 @@ class agResourcePool:
     def acquire_gpu(self, timeout: float | None = None) -> int:
         """Block until any GPU is free; return its id."""
         deadline = None if timeout is None else time.monotonic() + timeout
-        poll = 0.25
+        poll = GPU_ACQUIRE_POLL_INTERVAL_S
 
         while True:
             for gpu_id, sem in self._gpu_locks.items():
@@ -206,8 +213,8 @@ class agResourcePool:
         if sem is not None:
             try:
                 sem.release()
-            except ValueError:
-                pass
+            except ValueError as _e:
+                print(f"[agresources] WARNING: GPU semaphore double-release for gpu_id={gpu_id}: {_e}")
             with self._res_lock:
                 self._gpus_acquired = max(0, self._gpus_acquired - 1)
             self._emit_resource()
@@ -238,8 +245,8 @@ class agResourcePool:
                     memory_acquired_mb=self.memory_acquired_mb,
                     memory_total_mb=self.total_memory_mb,
                 )
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agresources] WARNING: resource_update push failed: {_e}")
 
     def __repr__(self) -> str:
         return (

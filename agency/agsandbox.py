@@ -38,7 +38,33 @@ _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
 # daemon.  With --gpus all, the NVIDIA runtime serializes GPU device initialization,
 # so more than ~8 concurrent docker-run calls increase contention and leave stale
 # "Created" containers without reducing wall-clock time.
-_startup_semaphore = threading.Semaphore(8)
+_startup_semaphore  = threading.Semaphore(8)
+# Limit concurrent docker-rm-f calls for the same reason: the daemon serialises
+# container teardown internally, so flooding it only increases contention and
+# makes individual rm -f operations slower and more likely to time out.
+_shutdown_semaphore = threading.Semaphore(8)
+# Limit concurrent docker-commit calls: committing snapshots large overlay
+# filesystems and the daemon serialises the diff computation, so more than ~8
+# concurrent commits increase I/O contention without reducing wall-clock time.
+_commit_semaphore   = threading.Semaphore(8)
+
+# ---------------------------------------------------------------------------
+# Timeout constants (seconds)
+# ---------------------------------------------------------------------------
+# Fast metadata queries: docker inspect, docker ps, nvidia-smi, docker update.
+_TIMEOUT_INSPECT   = 10
+# Quick in-container exec calls: kill <pids>, test -d, and similar fast commands.
+_TIMEOUT_EXEC_QUICK = 5
+# Container lifecycle operations: docker run, docker rm -f.
+_TIMEOUT_CONTAINER = 30
+# In-container file I/O routed through docker exec (base64 read/write, mkdir).
+_TIMEOUT_FILE_IO   = 30
+# Image management: docker images list, docker rmi.
+_TIMEOUT_IMAGE     = 15
+# docker commit writes a full image layer — allow extra time for large filesystems.
+_TIMEOUT_COMMIT    = 120
+# How long to wait for a keyring slot to free before giving up on a docker run.
+_TIMEOUT_KEYRING_WAIT = 120
 
 # Hard cap on the number of simultaneously running Docker containers, derived from
 # the Linux kernel session-keyring quota.  Each running Docker container holds one
@@ -80,13 +106,31 @@ def keyring_quota() -> dict[str, int]:
     return {"used": used, "max": maxkeys, "free": free}
 
 
+def _semaphore_held_count() -> str:
+    """Return 'held/limit' for _container_semaphore, or '?/limit' if unreadable.
+
+    Uses sem_getvalue() via the internal _semlock on POSIX (Linux).  The count
+    reflects this process's view only — other unrelated processes are not
+    tracked by our semaphore but do consume system keyring slots, so comparing
+    this number with keyring_quota()['used'] reveals how many slots belong to
+    external processes.
+    """
+    limit = _docker_container_limit()
+    try:
+        available = _container_semaphore._semlock._get_value()
+        held = limit - available
+    except Exception:
+        held = "?"
+    return f"{held}/{limit}"
+
+
 def _cleanup_all_sandboxes() -> None:
     """Destroy all live sandbox containers on process exit."""
     for sandbox in list(_live_sandboxes):
         try:
             sandbox.destroy()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agsandbox] WARNING: atexit destroy failed for {sandbox._name}: {_e}")
 
 
 atexit.register(_cleanup_all_sandboxes)
@@ -97,7 +141,7 @@ def _runtime_works(runtime: str) -> bool:
         proc = subprocess.run(
             [runtime, "info"],
             capture_output=True,
-            timeout=10,
+            timeout=_TIMEOUT_INSPECT,
         )
         return proc.returncode == 0
     except Exception:
@@ -144,7 +188,7 @@ def _gpu_flags() -> list[str]:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=_TIMEOUT_INSPECT,
         )
         if result.returncode == 0 and result.stdout.strip():
             return ["--gpus", "all"]
@@ -153,7 +197,7 @@ def _gpu_flags() -> list[str]:
     try:
         result = subprocess.run(
             ["rocm-smi", "--showid", "--csv"],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=_TIMEOUT_INSPECT,
         )
         if result.returncode == 0 and result.stdout.strip():
             return ["--device", "/dev/kfd", "--device", "/dev/dri"]
@@ -219,7 +263,7 @@ class agSandbox:
         """Return True if the named container is currently running in Docker/Podman."""
         result = self._run(
             [self._runtime, "inspect", "--format", "{{.State.Running}}", self._name],
-            check=False, timeout=10,
+            check=False, timeout=_TIMEOUT_INSPECT,
         )
         return result.returncode == 0 and result.stdout.strip() == b"true"
 
@@ -227,7 +271,7 @@ class agSandbox:
         """Return the container state string: 'running', 'exited', 'created', etc., or '' if not found."""
         result = self._run(
             [self._runtime, "inspect", "--format", "{{.State.Status}}", self._name],
-            check=False, timeout=10,
+            check=False, timeout=_TIMEOUT_INSPECT,
         )
         if result.returncode != 0:
             return ""
@@ -241,10 +285,11 @@ class agSandbox:
         Tasks that complete using only host-side tools (webfetch, todowrite,
         find_papers, …) never start a container at all.
 
-        When tools run in worker processes the container is started there, not
-        in the main process.  On the next tool call (a fresh worker or the same
-        one) ``_started`` is False but the container may still be running — we
-        check with ``docker inspect`` and reuse it rather than destroying it.
+        Invariant: after stop() the container does not exist.  The only two
+        states we handle here are therefore:
+          - running  → reuse (worker-reuse path, does NOT acquire the semaphore)
+          - absent   → docker run (acquires semaphore)
+        Any leftover container in another state is force-removed first.
         """
         if self._started:
             return
@@ -252,31 +297,15 @@ class agSandbox:
         with _startup_semaphore:
             if self._started:   # re-check after acquiring the semaphore
                 return
-            # Reuse or restart a container that a previous worker process (or a
-            # prior tool-dispatch batch) already started.
-            status = self._container_status()
-            if status == "running":
+            if self._container_running():
                 # Reuse an already-running container — it already holds a
                 # keyring slot so we must NOT acquire _container_semaphore here.
                 _live_sandboxes.add(self)
                 self._started = True
                 self._baseline_pids = self._snapshot_pids()
                 return
-            if status == "exited":
-                # Container was stopped (keyring released) but overlay is intact.
-                # docker start is ~0.5–1 s vs 2–5 s for docker run.
-                if self._runtime == "docker":
-                    _container_semaphore.acquire()
-                try:
-                    self._run([self._runtime, "start", name], check=True, timeout=30)
-                except Exception:
-                    if self._runtime == "docker":
-                        _container_semaphore.release()
-                    raise
-                _live_sandboxes.add(self)
-                self._started = True
-                self._baseline_pids = self._snapshot_pids()
-                return
+            # Remove any leftover container in a non-running state (created,
+            # exited, dead, …) that stop() failed to clean up.
             self._run([self._runtime, "rm", "-f", name], check=False)
             if self._runtime == "docker":
                 _container_semaphore.acquire()
@@ -330,29 +359,66 @@ class agSandbox:
         object in "Created" state without ever starting.  We force-remove the
         stale entry and retry rather than surfacing an opaque error to the agent.
         """
+        _last_stderr = ""
         for attempt in range(8):
-            result = subprocess.run(run_cmd, capture_output=True, timeout=120)
+            result = subprocess.run(run_cmd, capture_output=True, timeout=_TIMEOUT_CONTAINER)
             if result.returncode == 0:
                 return
             stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+            _last_stderr = stderr
             conflict = "already in use" in stderr or "Conflict" in stderr
             keyring = "session key" in stderr or (
                 "disk quota exceeded" in stderr and "keyring" in stderr
             )
             if keyring:
-                # Linux session keyring quota exhausted; slots free up as other
-                # containers finish. Wait and retry — up to ~60 s total.
-                wait = min(5.0 * (attempt + 1), 30.0)
-                time.sleep(wait)
+                # Linux session keyring quota exhausted.  The _container_semaphore
+                # is fork-local so it does not account for containers started by
+                # other independent processes.  Poll the actual running count from
+                # the Docker daemon and wait until a slot is free before retrying.
+                limit = _docker_container_limit()
+                deadline = time.monotonic() + _TIMEOUT_KEYRING_WAIT
+                while time.monotonic() < deadline:
+                    try:
+                        r = subprocess.run(
+                            [self._runtime, "ps", "-q"],
+                            capture_output=True, timeout=_TIMEOUT_INSPECT,
+                        )
+                        running = len(r.stdout.decode().splitlines())
+                    except Exception as _e:
+                        print(f"[agsandbox] WARNING: docker ps query failed in keyring wait: {_e}")
+                        running = limit  # assume full; keep waiting
+                    if running < limit:
+                        break
+                    time.sleep(5)
             elif conflict:
-                # If another process just started the container and it is now
-                # running, reuse it instead (handled by caller's _container_running).
                 if self._container_running():
-                    # Signal to the caller that the container is ready.
-                    # We re-use the path: set _started + return from _ensure_started.
                     raise _ContainerAlreadyRunning()
-                # Stale Created/Exited container; remove and retry.
+                # Leftover container in a non-running state — remove it.
+                # Wait until it's actually gone before retrying docker run.
                 self._run([self._runtime, "rm", "-f", name], check=False)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if not self._container_status():
+                        break
+                    time.sleep(0.5)
+                # If keyring is also full (docker created the object then hit
+                # the limit), wait for a slot before retrying — otherwise we'll
+                # create another "Created" container and loop on conflicts.
+                limit = _docker_container_limit()
+                deadline = time.monotonic() + _TIMEOUT_KEYRING_WAIT
+                while time.monotonic() < deadline:
+                    try:
+                        r = subprocess.run(
+                            [self._runtime, "ps", "-q"],
+                            capture_output=True, timeout=_TIMEOUT_INSPECT,
+                        )
+                        running = len(r.stdout.decode().splitlines())
+                    except Exception as _e:
+                        print(f"[agsandbox] WARNING: docker ps query failed in conflict keyring wait: {_e}")
+                        running = limit
+                    if running < limit:
+                        break
+                    time.sleep(5)
                 time.sleep(0.5 * (attempt + 1))
             else:
                 msg = f"{' '.join(run_cmd[:3])} failed (exit {result.returncode})"
@@ -360,9 +426,16 @@ class agSandbox:
                     msg += f": {stderr}"
                 raise RuntimeError(msg)
         # Final attempt after retries exhausted.
-        raise RuntimeError(
-            f"docker run --name {name} failed after retries (container name conflict or keyring quota)"
+        quota = keyring_quota()
+        msg = (
+            f"docker run --name {name} failed after retries "
+            f"(container name conflict or keyring quota) "
+            f"[keyring: {quota['used']}/{quota['max']} used, "
+            f"framework semaphore: {_semaphore_held_count()} held]"
         )
+        if _last_stderr:
+            msg += f": {_last_stderr}"
+        raise RuntimeError(msg)
 
     def _container_name(self) -> str:
         return self._name
@@ -384,7 +457,7 @@ class agSandbox:
             "  __p=${__d##*/}\n"
             "  [ \"$__p\" != \"$__SELF\" ] && echo \"$__p\"\n"
             "done",
-            timeout=10, shell="sh",
+            timeout=_TIMEOUT_INSPECT, shell="sh",
         )
         pids: set[int] = set()
         for line in out.splitlines():
@@ -524,11 +597,11 @@ class agSandbox:
         """
         import base64
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=30, shell="sh"
+            f"base64 {shlex.quote(path)}", timeout=_TIMEOUT_FILE_IO, shell="sh"
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
-                f"test -d {shlex.quote(path)}", timeout=5, shell="sh"
+                f"test -d {shlex.quote(path)}", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
             )
             if dir_rc == 0:
                 raise IsADirectoryError(f"Path is a directory, not a file: {path}")
@@ -554,11 +627,11 @@ class agSandbox:
         """
         import base64
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=30, shell="sh"
+            f"base64 {shlex.quote(path)}", timeout=_TIMEOUT_FILE_IO, shell="sh"
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
-                f"test -d {shlex.quote(path)}", timeout=5, shell="sh"
+                f"test -d {shlex.quote(path)}", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
             )
             if dir_rc == 0:
                 raise IsADirectoryError(f"Path is a directory, not a file: {path}")
@@ -579,7 +652,7 @@ class agSandbox:
             f"mkdir -p $(dirname {quoted}) && "
             f"printf '%s' {shlex.quote(b64)} | base64 -d > {quoted}"
         )
-        _, rc = self._container_exec(sh_cmd, timeout=30, shell="sh")
+        _, rc = self._container_exec(sh_cmd, timeout=_TIMEOUT_FILE_IO, shell="sh")
         if rc != 0:
             raise OSError(f"Failed to write binary file {path} in container")
 
@@ -587,7 +660,7 @@ class agSandbox:
         quoted = shlex.quote(path)
         sh_cmd = f"mkdir -p $(dirname {quoted}) && cat > {quoted}"
         _, rc = self._container_exec(
-            sh_cmd, stdin=content.encode("utf-8"), timeout=30, shell="sh"
+            sh_cmd, stdin=content.encode("utf-8"), timeout=_TIMEOUT_FILE_IO, shell="sh"
         )
         if rc != 0:
             raise OSError(f"Failed to write {path} in container")
@@ -609,7 +682,7 @@ class agSandbox:
         if len(cmd) == 2:
             return  # nothing to update
         cmd.append(self._container_name())
-        self._run(cmd, timeout=10)
+        self._run(cmd, timeout=_TIMEOUT_INSPECT)
 
     def commit(self, tag: str) -> bool:
         """Commit the container filesystem to a new image tag.
@@ -621,13 +694,12 @@ class agSandbox:
         is still False in the main process.
         """
         if not self._started:
-            status = self._container_status()
-            if status not in ("running", "exited"):
+            if not self._container_running():
                 return False
         self._run(
             [self._runtime, "commit", self._container_name(), tag],
             check=True,
-            timeout=120,
+            timeout=_TIMEOUT_COMMIT,
         )
         return True
 
@@ -653,21 +725,42 @@ class agSandbox:
         self._baseline_pids = set()
         if commit:
             tag = f"agency/lifecycle-{self._name}"
-            try:
-                self._run(
-                    [self._runtime, "commit", self._container_name(), tag],
-                    check=True, timeout=120,
-                )
-                self._lifecycle_image = tag
-            except Exception:
-                pass  # commit failure is non-fatal; next start uses previous checkpoint
-        try:
-            self._run(
-                [self._runtime, "rm", "-f", self._container_name()],
-                check=False, timeout=30,
-            )
-        except Exception:
-            pass
+            with _commit_semaphore:
+                for _attempt in range(3):
+                    try:
+                        self._run(
+                            [self._runtime, "commit", self._container_name(), tag],
+                            check=True, timeout=_TIMEOUT_COMMIT,
+                        )
+                        self._lifecycle_image = tag
+                        break
+                    except Exception as _e:
+                        if _attempt == 2:
+                            print(
+                                f"[agsandbox] WARNING: docker commit {self._container_name()} → {tag} "
+                                f"failed after 3 attempts: {_e}",
+                                file=__import__("sys").stderr, flush=True,
+                            )
+                        else:
+                            time.sleep(1)
+        name = self._container_name()
+        with _shutdown_semaphore:
+            for _attempt in range(3):
+                try:
+                    self._run([self._runtime, "rm", "-f", name], check=True, timeout=_TIMEOUT_CONTAINER)
+                    break
+                except Exception:
+                    if _attempt == 2:
+                        # Last attempt failed — log and continue so the semaphore
+                        # is still released and _started is cleared.
+                        import traceback as _tb
+                        print(
+                            f"[agsandbox] WARNING: docker rm -f {name} failed after 3 attempts:\n"
+                            f"{_tb.format_exc()}",
+                            file=__import__("sys").stderr, flush=True,
+                        )
+                    else:
+                        time.sleep(1)
         if self._runtime == "docker":
             _container_semaphore.release()
         self._started = False
@@ -684,17 +777,18 @@ class agSandbox:
                 pids = " ".join(str(p) for p in self._watched_pids)
                 try:
                     self._container_exec(
-                        f"kill {pids} 2>/dev/null; true", timeout=5, shell="sh"
+                        f"kill {pids} 2>/dev/null; true", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
                     )
-                except Exception:
-                    pass
-            try:
-                self._run(
-                    [self._runtime, "rm", "-f", self._container_name()],
-                    timeout=30,
-                )
-            except Exception:
-                pass
+                except Exception as _e:
+                    print(f"[agsandbox] WARNING: failed to kill PIDs {pids} in {self._name} during restore: {_e}")
+            with _shutdown_semaphore:
+                try:
+                    self._run(
+                        [self._runtime, "rm", "-f", self._container_name()],
+                        timeout=_TIMEOUT_CONTAINER,
+                    )
+                except Exception as _e:
+                    print(f"[agsandbox] WARNING: docker rm -f {self._container_name()} failed during restore: {_e}")
             self._started = False
             self._watched_pids = {}
             self._baseline_pids = set()
@@ -728,7 +822,7 @@ class agSandbox:
             "  echo \"$__p $__ppid $__st $__nm\"\n"
             "done"
         )
-        output, _ = self._container_exec(script, timeout=10, shell="sh")
+        output, _ = self._container_exec(script, timeout=_TIMEOUT_INSPECT, shell="sh")
 
         proc_info: dict[int, tuple[int, str, str]] = {}   # pid → (ppid, state, name)
         for line in output.splitlines():
@@ -833,8 +927,8 @@ class agSandbox:
         if pool is not None:
             try:
                 self.update_limits(cpus=pool.idle_cpus, memory=pool.idle_memory)
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"[agsandbox] WARNING: update_limits failed for {self._name}: {_e}")
 
     def destroy(self) -> None:
         _live_sandboxes.discard(self)
@@ -848,23 +942,24 @@ class agSandbox:
             pids = " ".join(str(p) for p in self._watched_pids)
             try:
                 self._container_exec(
-                    f"kill {pids} 2>/dev/null; true", timeout=5, shell="sh"
+                    f"kill {pids} 2>/dev/null; true", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
                 )
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"[agsandbox] WARNING: failed to kill PIDs {pids} in {container_name}: {_e}")
 
         # Check before rm so we know whether a keyring slot must be released.
         had_container = self._runtime == "docker" and bool(
-            self._started or self._container_status() in ("running", "exited")
+            self._started or self._container_running()
         )
 
-        try:
-            self._run(
-                [self._runtime, "rm", "-f", container_name],
-                timeout=30,
-            )
-        except Exception:
-            pass
+        with _shutdown_semaphore:
+            try:
+                self._run(
+                    [self._runtime, "rm", "-f", container_name],
+                    timeout=_TIMEOUT_CONTAINER,
+                )
+            except Exception as _e:
+                print(f"[agsandbox] WARNING: docker rm -f {container_name} failed during destroy: {_e}")
         if had_container:
             _container_semaphore.release()
 
@@ -872,7 +967,7 @@ class agSandbox:
         try:
             result = self._run(
                 [self._runtime, "images", "--format", "{{.Repository}}:{{.Tag}}"],
-                timeout=15,
+                timeout=_TIMEOUT_IMAGE,
             )
             prefix = f"agency/pretool-{self._name}-"
             lifecycle = f"agency/lifecycle-{self._name}"
@@ -882,7 +977,7 @@ class agSandbox:
                 # suffix when no explicit tag was given (e.g. "agency/lifecycle-x:latest").
                 tag_repo = tag.rsplit(":", 1)[0] if ":" in tag else tag
                 if tag.startswith(prefix) or tag_repo == lifecycle:
-                    self._run([self._runtime, "rmi", "-f", tag], timeout=15, check=False)
-        except Exception:
-            pass
+                    self._run([self._runtime, "rmi", "-f", tag], timeout=_TIMEOUT_IMAGE, check=False)
+        except Exception as _e:
+            print(f"[agsandbox] WARNING: image cleanup failed for {container_name}: {_e}")
 

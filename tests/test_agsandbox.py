@@ -681,20 +681,264 @@ class TestAgSandboxLifecycle:
         assert img2.stdout.strip() == "", "destroy() must remove the lifecycle image"
 
     @docker
-    def test_ensure_started_detects_exited_container(self):
-        """_ensure_started() fast-path: restart a stopped (exited) container without docker run."""
+    def test_stop_retries_rm_on_first_failure(self):
+        """stop() retries docker rm -f up to 3 times; succeeds if a later attempt works."""
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+        name = sb._container_name()
+
+        call_count = [0]
+        real_run = sb._run
+
+        def flaky_run(cmd, **kwargs):
+            if "rm" in cmd and "-f" in cmd and name in cmd:
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise RuntimeError("simulated rm -f failure")
+            return real_run(cmd, **kwargs)
+
+        sb._run = flaky_run
+        sb.stop(commit=False)
+
+        assert call_count[0] == 2, "expected one failure then one success"
+        assert sb._started is False
+        # Container must actually be gone after the successful retry
+        result = subprocess.run(
+            ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
+            capture_output=True, text=True,
+        )
+        assert name not in result.stdout
+
+    @docker
+    def test_stop_emits_warning_after_all_retries_fail(self):
+        """stop() emits a WARNING to stderr when rm -f fails all 3 attempts."""
+        import io, sys
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+
+        real_run = sb._run
+
+        def always_fail_rm(cmd, **kwargs):
+            if "rm" in cmd and "-f" in cmd:
+                raise RuntimeError("simulated persistent failure")
+            return real_run(cmd, **kwargs)
+
+        sb._run = always_fail_rm
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            sb.stop(commit=False)
+        finally:
+            sys.stderr = old_stderr
+            # Force cleanup bypassing our mock
+            sb._run = real_run
+            sb.destroy()
+
+        assert "WARNING" in captured.getvalue()
+        assert sb._started is False  # _started cleared even on failure
+
+    @docker
+    def test_concurrent_stops_gated_by_shutdown_semaphore(self):
+        """Multiple concurrent stop() calls are limited by _shutdown_semaphore."""
+        from agency.agsandbox import _shutdown_semaphore
+        import threading
+
+        sandboxes = [_make_sandbox() for _ in range(4)]
+        for sb in sandboxes:
+            sb.write_file("/workspace/x.txt", "x\n")
+
+        # Patch _shutdown_semaphore to track max concurrent acquisitions.
+        concurrent = [0]
+        peak = [0]
+        lock = threading.Lock()
+        real_acquire = _shutdown_semaphore.acquire
+        real_release = _shutdown_semaphore.release
+
+        def counting_acquire(*a, **kw):
+            real_acquire(*a, **kw)
+            with lock:
+                concurrent[0] += 1
+                peak[0] = max(peak[0], concurrent[0])
+
+        def counting_release(*a, **kw):
+            with lock:
+                concurrent[0] -= 1
+            real_release(*a, **kw)
+
+        _shutdown_semaphore.acquire = counting_acquire
+        _shutdown_semaphore.release = counting_release
+        try:
+            threads = [threading.Thread(target=sb.stop, kwargs={"commit": False})
+                       for sb in sandboxes]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            _shutdown_semaphore.acquire = real_acquire
+            _shutdown_semaphore.release = real_release
+            for sb in sandboxes:
+                sb.destroy()
+
+        assert peak[0] <= 8, f"peak concurrent shutdowns {peak[0]} exceeded semaphore limit of 8"
+
+    @docker
+    def test_ensure_started_removes_created_state_container(self):
+        """_ensure_started() force-removes a container stuck in 'Created' state before docker run."""
+        sb = _make_sandbox()
+        name = sb._container_name()
+        try:
+            # Manually create a container in 'Created' state (no --detach run, just create).
+            subprocess.run(
+                ["docker", "create", "--name", name, sb.BASE_IMAGE, "tail", "-f", "/dev/null"],
+                capture_output=True, check=True,
+            )
+            status = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Status}}", name],
+                capture_output=True, text=True,
+            )
+            assert status.stdout.strip() == "created"
+            # _ensure_started() must remove the stuck container and start fresh.
+            sb._ensure_started()
+            assert sb._started is True
+            out, rc = sb.exec("echo ok")
+            assert rc == 0 and "ok" in out
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_stop_retries_commit_on_first_failure(self):
+        """stop(commit=True) retries docker commit up to 3 times; succeeds if a later attempt works."""
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+
+        call_count = [0]
+        real_run = sb._run
+
+        def flaky_run(cmd, **kwargs):
+            if "commit" in cmd:
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise RuntimeError("simulated commit failure")
+            return real_run(cmd, **kwargs)
+
+        sb._run = flaky_run
+        try:
+            sb.stop(commit=True)
+            assert call_count[0] == 2, "expected one failure then one success"
+            assert sb._lifecycle_image == lifecycle_tag
+            assert sb._started is False
+            img = subprocess.run(
+                ["docker", "images", "-q", lifecycle_tag],
+                capture_output=True, text=True,
+            )
+            assert img.stdout.strip() != "", "lifecycle image must exist after successful retry"
+        finally:
+            subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
+            sb.destroy()
+
+    @docker
+    def test_stop_emits_warning_after_all_commit_retries_fail(self):
+        """stop(commit=True) emits a WARNING to stderr when all 3 commit attempts fail;
+        _lifecycle_image is not updated so the next start restores from the prior checkpoint."""
+        import io
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+        previous_lifecycle = sb._lifecycle_image
+
+        real_run = sb._run
+
+        def always_fail_commit(cmd, **kwargs):
+            if "commit" in cmd:
+                raise RuntimeError("simulated persistent commit failure")
+            return real_run(cmd, **kwargs)
+
+        sb._run = always_fail_commit
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            sb.stop(commit=True)
+        finally:
+            sys.stderr = old_stderr
+            sb._run = real_run
+            sb.destroy()
+
+        assert "WARNING" in captured.getvalue()
+        assert sb._lifecycle_image == previous_lifecycle  # not updated on all-retry failure
+        assert sb._started is False
+
+    @docker
+    def test_concurrent_stops_gated_by_commit_semaphore(self):
+        """Multiple concurrent stop(commit=True) calls are limited by _commit_semaphore."""
+        from agency.agsandbox import _commit_semaphore
+
+        sandboxes = [_make_sandbox() for _ in range(4)]
+        lifecycle_tags = [f"agency/lifecycle-{sb._name}" for sb in sandboxes]
+        for sb in sandboxes:
+            sb.write_file("/workspace/x.txt", "x\n")
+
+        concurrent = [0]
+        peak = [0]
+        lock = threading.Lock()
+        real_acquire = _commit_semaphore.acquire
+        real_release = _commit_semaphore.release
+
+        def counting_acquire(*a, **kw):
+            real_acquire(*a, **kw)
+            with lock:
+                concurrent[0] += 1
+                peak[0] = max(peak[0], concurrent[0])
+
+        def counting_release(*a, **kw):
+            with lock:
+                concurrent[0] -= 1
+            real_release(*a, **kw)
+
+        _commit_semaphore.acquire = counting_acquire
+        _commit_semaphore.release = counting_release
+        try:
+            threads = [threading.Thread(target=sb.stop, kwargs={"commit": True})
+                       for sb in sandboxes]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            _commit_semaphore.acquire = real_acquire
+            _commit_semaphore.release = real_release
+            for tag in lifecycle_tags:
+                subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+            for sb in sandboxes:
+                sb.destroy()
+
+        assert peak[0] <= 8, f"peak concurrent commits {peak[0]} exceeded semaphore limit of 8"
+
+    @docker
+    def test_ensure_started_removes_exited_container(self):
+        """Exited containers are force-removed and recreated (no docker start fast-path).
+
+        State is preserved across stop()/start() cycles via lifecycle_image commits,
+        not via docker stop/start.  An exited container is treated as a zombie and
+        removed so the name is free for a fresh docker run.
+        """
         sb = _make_sandbox()
         name = sb._container_name()
         try:
             sb.write_file("/workspace/exited.txt", "still-here\n")
-            # Externally stop (not remove) the container to put it in exited state.
+            # Externally stop (not remove) the container — puts it in exited state.
             subprocess.run(["docker", "stop", "-t", "0", name], capture_output=True)
             sb._started = False
-            # _ensure_started() must detect exited state and use docker start.
+            # _ensure_started() must remove the exited container and do a fresh docker run.
             sb._ensure_started()
             assert sb._started is True
-            content = sb.read_file("/workspace/exited.txt")
-            assert "still-here" in content
+            # The fresh container has no /workspace/exited.txt — the exited container
+            # was force-removed.  State would only survive if stop(commit=True) had been
+            # called before the stop to commit a lifecycle_image.
+            with pytest.raises(FileNotFoundError):
+                sb.read_file("/workspace/exited.txt")
         finally:
             sb.destroy()
 

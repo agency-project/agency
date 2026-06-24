@@ -14,6 +14,23 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Minimum number of lines a search block must have for anchor-based fuzzy
+# matching to apply (needs a first, last, and at least one middle line)
+BLOCK_ANCHOR_MIN_LINES = 3
+
+# Minimum similarity score (0–1) for accepting the best fuzzy block-anchor
+# candidate when multiple anchor pairs exist
+BLOCK_ANCHOR_SCORE_THRESHOLD = 0.3
+
+# Minimum fraction of non-empty middle lines that must match exactly for a
+# context-aware block candidate to be accepted
+CONTEXT_AWARE_MATCH_RATIO = 0.5
+
+
+# ---------------------------------------------------------------------------
 # Replacer strategies (each yields candidate substrings from `content` that
 # match `find`; the first strategy to produce a unique match wins)
 # ---------------------------------------------------------------------------
@@ -57,7 +74,7 @@ def _block_anchor(content: str, find: str) -> Generator[str, None, None]:
     search = find.split("\n")
     if len(search) and search[-1] == "":
         search.pop()
-    if len(search) < 3:
+    if len(search) < BLOCK_ANCHOR_MIN_LINES:
         return
     first, last = search[0].strip(), search[-1].strip()
 
@@ -94,7 +111,7 @@ def _block_anchor(content: str, find: str) -> Generator[str, None, None]:
             sc = _score(s, e)
             if sc > best_score:
                 best_score, best = sc, (s, e)
-        if best and best_score >= 0.3:
+        if best and best_score >= BLOCK_ANCHOR_SCORE_THRESHOLD:
             s, e = best
             start = sum(len(orig[k]) + 1 for k in range(s))
             end = start + sum(len(orig[s + k]) + 1 for k in range(e - s + 1)) - 1
@@ -177,7 +194,7 @@ def _context_aware(content: str, find: str) -> Generator[str, None, None]:
     find_lines = find.split("\n")
     if len(find_lines) and find_lines[-1] == "":
         find_lines.pop()
-    if len(find_lines) < 3:
+    if len(find_lines) < BLOCK_ANCHOR_MIN_LINES:
         return
     first, last = find_lines[0].strip(), find_lines[-1].strip()
     for i, line in enumerate(orig):
@@ -189,7 +206,7 @@ def _context_aware(content: str, find: str) -> Generator[str, None, None]:
                 if len(block) == len(find_lines):
                     mid_non_empty = [(block[k].strip(), find_lines[k].strip()) for k in range(1, len(block) - 1)
                                      if block[k].strip() or find_lines[k].strip()]
-                    if not mid_non_empty or sum(a == b for a, b in mid_non_empty) / len(mid_non_empty) >= 0.5:
+                    if not mid_non_empty or sum(a == b for a, b in mid_non_empty) / len(mid_non_empty) >= CONTEXT_AWARE_MATCH_RATIO:
                         yield "\n".join(block)
                 break
 

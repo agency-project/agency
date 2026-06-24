@@ -39,6 +39,13 @@ def _pick_llm_config(llm_config: "dict | list[dict]") -> dict:
         _llm_config_counter += 1
     return llm_config[idx]
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+CHECKPOINT_SAVE_TIMEOUT_S = 600  # Timeout in seconds for `subprocess.run` when exporting a container image during agent.save().
+CHECKPOINT_LOAD_TIMEOUT_S = 600  # Timeout in seconds for `subprocess.run` when loading a container image during agent.load().
+SKILL_ERROR_LOG_TRUNCATE = 80  # Maximum characters of an error string shown in the terminal log line after a skill failure.
+
 from .agdata import agdata, _fmt_exc
 from .agtype import agtype
 from .agskill import agskill, AGSKILL_REACT_MAX_STEPS
@@ -185,8 +192,8 @@ def _offload_large_fields(
                 )
                 paths.append(path)
                 fields.append(key)
-            except Exception:
-                pass  # leave the field unchanged if the write fails
+            except Exception as _e:
+                print(f"[agent] WARNING: failed to offload input field '{key}' to {path}: {_e}")
         elif isinstance(val, list):
             new_vals = list(val)
             offloaded_any = False
@@ -199,8 +206,8 @@ def _offload_large_fields(
                     new_vals[i] = path
                     paths.append(path)
                     offloaded_any = True
-                except Exception:
-                    pass
+                except Exception as _e:
+                    print(f"[agent] WARNING: failed to offload input list field '{key}[{i}]' to {path}: {_e}")
             if offloaded_any:
                 inp._data[key] = new_vals
                 fields.append(key)
@@ -227,8 +234,8 @@ def _prepare_agtype_inputs(
                 new_val, written = hint.prepare(val, sandbox, skill_name, key)
                 inp._data[key] = new_val
                 paths.extend(written)
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"[agent] WARNING: {hint.__name__}.prepare failed for field '{key}': {_e}")
         # list[agtype subclass]
         elif get_origin(hint) is list:
             args = get_args(hint)
@@ -241,7 +248,8 @@ def _prepare_agtype_inputs(
                         try:
                             new_v, written = inner.prepare(v, sandbox, skill_name, key)
                             paths.extend(written)
-                        except Exception:
+                        except Exception as _e:
+                            print(f"[agent] WARNING: {inner.__name__}.prepare failed for list field '{key}': {_e}")
                             new_v = v
                         new_vals.append(new_v)
                     inp._data[key] = new_vals
@@ -268,8 +276,8 @@ def _recover_agtype_outputs(
             new_val, written = hint.recover(val, sandbox)
             result._data[key] = new_val
             paths.extend(written)
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agent] WARNING: {hint.__name__}.recover failed for field '{key}': {_e}")
     return paths
 
 
@@ -278,8 +286,8 @@ def _remove_offloaded_fields(paths: list[str], sandbox: "agSandbox") -> None:
     for path in paths:
         try:
             sandbox._container_exec(f"rm -f {shlex.quote(path)}", shell="sh")
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agent] WARNING: failed to remove offloaded file {path}: {_e}")
 
 
 def _resolve_input(inp: agdata) -> None:
@@ -552,8 +560,8 @@ class agent:
                 _team = _at.get(None)
                 _team_name = _team.team_name if _team is not None else None
                 _agwebui._active.emitter.agent_state(self.agname, state, skill, tool, color=_color, team=_team_name)
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agent] WARNING: agent_state push failed for {self.agname}: {_e}")
 
     def _push_live_messages(self, messages: list) -> None:
         self._snapshot_messages = list(messages)
@@ -566,8 +574,8 @@ class agent:
                 _agwebui._active.emitter.push_messages(
                     self.agname, list(messages) + event_entries
                 )
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agent] WARNING: push_messages failed for {self.agname}: {_e}")
     def run(self, skill: "agskill", input: agdata, max_steps: int = AGSKILL_REACT_MAX_STEPS) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
@@ -625,8 +633,8 @@ class agent:
                             _gl["input_tokens"],
                             _gl["output_tokens"],
                         )
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        print(f"[agent] WARNING: live token_update push failed for {self.agname}: {_e}")
 
                 # Prepare agtype fields first (agfile → file path), then offload
                 # any remaining oversized plain-string fields.
@@ -718,7 +726,7 @@ class agent:
             input_dict  = input.to_dict()
             result_dict = outer_result.to_dict()
             if result_dict.get("error"):
-                self._term.log("SKILL ✗  ", f"{skill_name}  error={str(result_dict['error'])[:80]}")
+                self._term.log("SKILL ✗  ", f"{skill_name}  error={str(result_dict['error'])[:SKILL_ERROR_LOG_TRUNCATE]}")
                 self._append_full_history({"type": "skill_error", "skill": skill_name,
                                            "error": str(result_dict["error"])})
             else:
@@ -744,8 +752,8 @@ class agent:
                             _gl_usage["input_tokens"],
                             _gl_usage["output_tokens"],
                         )
-                except Exception:
-                    pass
+                except Exception as _e:
+                    print(f"[agent] WARNING: post-skill token_update push failed for {self.agname}: {_e}")
             except Exception as log_exc:
                 self._term.log("SKILL ✗  ", f"[log error] {log_exc}")
 
@@ -784,21 +792,21 @@ class agent:
         try:
             self._term.log("DESTROYED", "")
             self.log._lifecycle("destroyed", agname=self.agname)
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agent] WARNING: __del__ log failed for {getattr(self, 'agname', '?')}: {_e}")
         try:
             if self.sandbox is not None:
                 self.sandbox.destroy()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agent] WARNING: sandbox.destroy() failed in __del__ for {getattr(self, 'agname', '?')}: {_e}")
         try:
             if self._checkpoint:
                 subprocess.run(
                     [get_container_runtime(), "rmi", "-f", self._checkpoint],
                     capture_output=True,
                 )
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agent] WARNING: checkpoint rmi failed in __del__ for {getattr(self, 'agname', '?')}: {_e}")
 
     def fork(self) -> "agent":
         """Return an independent copy of this agent (same as agent(self))."""
@@ -944,7 +952,7 @@ class agent:
             try:
                 result = subprocess.run(
                     [runtime, "save", image_tag],
-                    capture_output=True, check=True, timeout=600,
+                    capture_output=True, check=True, timeout=CHECKPOINT_SAVE_TIMEOUT_S,
                 )
                 image_bytes = result.stdout
                 with tarfile.open(path, "w:gz") as tar:
@@ -997,7 +1005,7 @@ class agent:
             # Load image — docker restores the original tag (agency/ckpt-{agname})
             subprocess.run(
                 [runtime, "load"],
-                input=image_bytes, capture_output=True, check=True, timeout=600,
+                input=image_bytes, capture_output=True, check=True, timeout=CHECKPOINT_LOAD_TIMEOUT_S,
             )
             original_tag = f"agency/ckpt-{state['agname']}"
             # Re-tag to a unique name so concurrent restores don't collide,

@@ -5,6 +5,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .agdata import agdata
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DUMP_TOOL_ARGS_TRUNCATE_LEN = 60    # Max characters of tool call arguments shown in dump() human-readable summary
+DUMP_CONTENT_TRUNCATE_LEN = 120     # Max characters of message content shown per history delta line in dump() output
+DUMP_TOOL_CALL_ID_PREFIX_LEN = 8    # Number of leading characters of tool_call_id shown in dump() output
+
 
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -163,18 +170,18 @@ class aglog:
                     role = m.get("role", "?")
                     if m.get("tool_calls"):
                         calls = ", ".join(
-                            f"{tc['function']['name']}({tc['function']['arguments'][:60]})"
+                            f"{tc['function']['name']}({tc['function']['arguments'][:DUMP_TOOL_ARGS_TRUNCATE_LEN]})"
                             for tc in m["tool_calls"]
                         )
                         delta_lines.append(f"      [{role}] tool_calls: {calls}")
                     elif role == "tool":
                         delta_lines.append(
-                            f"      [tool/{m.get('tool_call_id','')[:8]}] "
-                            f"{str(m.get('content',''))[:120]}"
+                            f"      [tool/{m.get('tool_call_id','')[:DUMP_TOOL_CALL_ID_PREFIX_LEN]}] "
+                            f"{str(m.get('content',''))[:DUMP_CONTENT_TRUNCATE_LEN]}"
                         )
                     else:
                         delta_lines.append(
-                            f"      [{role}] {str(m.get('content',''))[:120]}"
+                            f"      [{role}] {str(m.get('content',''))[:DUMP_CONTENT_TRUNCATE_LEN]}"
                         )
                 delta_str = ("\n" + "\n".join(delta_lines)) if delta_lines else " (none)"
                 inp = e.get("input_tokens",  0)

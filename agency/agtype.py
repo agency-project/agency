@@ -153,7 +153,8 @@ class agfile(agtype):
         try:
             sandbox.write_file(path, value)
             return path, [path]
-        except Exception:
+        except Exception as _e:
+            print(f"[agtype] WARNING: agfile.prepare failed to write {path}: {_e}")
             return value, []
 
     @classmethod
@@ -167,7 +168,8 @@ class agfile(agtype):
         try:
             content = sandbox.read_file(value)
             return content, [value]
-        except Exception:
+        except Exception as _e:
+            print(f"[agtype] WARNING: agfile.recover failed to read {value}: {_e}")
             return value, []
 
     @classmethod
@@ -332,7 +334,8 @@ class agbinary(agtype):
         try:
             sandbox.write_file_bytes(path, raw)
             return path, [path]
-        except Exception:
+        except Exception as _e:
+            print(f"[agtype] WARNING: agbinary.prepare failed to write {path}: {_e}")
             return value, []
 
     @classmethod
@@ -346,7 +349,8 @@ class agbinary(agtype):
         try:
             raw = sandbox.read_file_bytes(value)
             return raw, [value]
-        except Exception:
+        except Exception as _e:
+            print(f"[agtype] WARNING: agbinary.recover failed to read {value}: {_e}")
             return value, []
 
     @classmethod

@@ -57,6 +57,11 @@ _EVENT_STYLES: dict[str, str] = {
     "TOOL     ": "\033[0m",    # normal
 }
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+EVENT_TAG_WIDTH = 9  # Fixed column width for event tag display in log lines (e.g. 'DESTROYED' is 9 chars)
+
 _RESET = "\033[0m"
 _BOLD  = "\033[1m"
 _DIM   = "\033[2m"
@@ -89,8 +94,8 @@ class agterm:
                 _team = _at.get(None)
                 _team_name = _team.team_name if _team is not None else None
                 _agwebui._active.emitter.agent_registered(self._id, _ansi_to_hex(self._color), team=_team_name)
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agterm] WARNING: agent_registered push failed for {self._id}: {_e}")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -126,7 +131,7 @@ class agterm:
 
         ts        = f"{_DIM}{datetime.now().strftime('%H:%M:%S.%f')[:-3]}{_RESET}"
         agent_tag = f"{self._color}{_BOLD}[{self._id}]{_RESET}"
-        ev_key    = event.ljust(9)[:9]
+        ev_key    = event.ljust(EVENT_TAG_WIDTH)[:EVENT_TAG_WIDTH]
         ev_style  = _EVENT_STYLES.get(ev_key, "")
         ev_tag    = f"{ev_style}[{ev_key}]{_RESET}"
         tok_tag   = f"  {_DIM}({self._tokens} toks){_RESET}" if self._tokens is not None else ""

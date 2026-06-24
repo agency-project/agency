@@ -25,15 +25,18 @@ The container exists only during active tool execution. Between tool calls the c
 | Event | What happens |
 |---|---|
 | `agSandbox.__init__` | No container created — cheap object; `_lifecycle_image=None` |
-| First `need_sandbox=True` tool call | `_ensure_started()` runs: `docker run` from `_lifecycle_image` (or `BASE_IMAGE` on first use) |
-| Subsequent tool calls | `_ensure_started()` sees `_lifecycle_image` set → `docker run` from it (picks up `/workspace` state) |
-| After **successful** sandbox tool call | `sandbox.stop(commit=True)`: `docker commit → agency/lifecycle-<name>`; `docker rm -f`; `_lifecycle_image` updated |
+| Any `need_sandbox=True` tool call | `_ensure_started()` runs lazily: if container is already running, reuse it; otherwise `docker rm -f` any leftover zombie, then `docker run` from `_lifecycle_image` (or `BASE_IMAGE` on first use) |
+| After **successful** sandbox tool call | `sandbox.stop(commit=True)`: `docker commit → agency/lifecycle-<name>`; `docker rm -f` (retried up to 3×); `_lifecycle_image` updated |
 | After **failed** sandbox tool call | `sandbox.stop(commit=False)`: `docker rm -f` without commit; dirty state discarded; next start restores from previous `_lifecycle_image` |
-| Exited (stopped, not removed) container detected | `_ensure_started()` fast-path: `docker start` instead of `docker run` (~0.5 s); used when a container is stopped externally |
+| Any non-running container detected at startup | Force-removed with `docker rm -f` before `docker run` — covers "Exited", "Created" (partial docker run), and "Dead" states |
 | `sandbox.destroy()` | `docker rm -f` (no-op if already removed); `docker rmi agency/lifecycle-<name>`; any `pretool-*` images cleaned up |
 | `atexit` | All live containers removed (guard against hard-killed processes) |
 
 **Failure revert**: when a tool errors, `stop(commit=False)` discards the container with its partial state. The next tool call recreates from the last successful `_lifecycle_image`, so the agent's workspace is automatically rolled back to the last known-good state. The agent receives `workspace_reverted` in the error response to know this happened.
+
+**Container naming**: each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a per-process UUID prefix. This prevents cross-run name collisions when an agent crashes without cleanup and is restarted with the same `agname`.
+
+**`stop()` reliability**: `docker rm -f` is retried up to 3 times under `_shutdown_semaphore` (which caps concurrent teardown at 8). If all retries fail, a `WARNING` is emitted to stderr and the framework continues — `_started` is cleared regardless so the next tool call can attempt a fresh container.
 
 ## GPU device access
 
