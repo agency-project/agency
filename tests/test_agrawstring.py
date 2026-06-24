@@ -109,7 +109,7 @@ def test_build_user_content_normal_input_still_json():
     inp = agdata(text="hello")
     content = sk._build_user_content(inp)
     assert isinstance(content, str)
-    parsed = json.loads(content)
+    parsed = json.loads(content.split("\n", 1)[1])
     assert parsed["text"] == "hello"
 
 

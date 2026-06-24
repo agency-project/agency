@@ -45,7 +45,7 @@ from .agskill import agskill, AGSKILL_REACT_MAX_STEPS
 from .agtool import agtool
 from .aglog import aglog, _ts
 from .agterm import agterm
-from .agsandbox import agSandbox, get_container_runtime, _PID_PREFIX
+from .agsandbox import agSandbox, get_container_runtime, _RUN_ID as _SANDBOX_RUN_ID
 from .agresources import agResourcePool
 from .agcompaction import fetch_context_limit, _prune_tool_outputs
 
@@ -396,7 +396,7 @@ class agent:
             # Copy parent's checkpoint as this fork's starting state — no docker run yet
             self._checkpoint: str | None = None
             if src._checkpoint:
-                fork_tag = f"agency/ckpt-{_PID_PREFIX}-{self.agname}"
+                fork_tag = f"agency/lifecycle-{_SANDBOX_RUN_ID}-{self.agname}"
                 subprocess.run(
                     [get_container_runtime(), "tag", src._checkpoint, fork_tag],
                     capture_output=True, check=True,
@@ -594,7 +594,7 @@ class agent:
             try:
                 prev_history._resolve()
                 _resolve_input(input)
-                self.sandbox = agSandbox(self.agname, restore_image=self._checkpoint, output_dir=_out)
+                self.sandbox = agSandbox(self.agname, lifecycle_image=self._checkpoint, output_dir=_out)
                 self._checkpoint = None
 
                 history_before = list(prev_history._data.get("messages", []))
@@ -707,12 +707,8 @@ class agent:
                     _remove_offloaded_fields(_offloaded_paths, self.sandbox)
                     if self.sandbox._gpu_id is not None:
                         pool.release_gpu(self.sandbox._gpu_id)
-                    _ckpt_tag = f"agency/ckpt-{_PID_PREFIX}-{self.agname}"
-                    try:
-                        if self.sandbox.commit(_ckpt_tag):
-                            self._checkpoint = _ckpt_tag
-                    except Exception:
-                        pass
+                    if self.sandbox._lifecycle_image:
+                        self._checkpoint = self.sandbox._lifecycle_image
                     self.sandbox.destroy()
                     self.sandbox = None
 

@@ -25,7 +25,7 @@ The container exists only during active tool execution. Between tool calls the c
 | Event | What happens |
 |---|---|
 | `agSandbox.__init__` | No container created — cheap object; `_lifecycle_image=None` |
-| First `need_sandbox=True` tool call | `_ensure_started()` runs: `docker run` from `_lifecycle_image` (or `restore_image`, or `BASE_IMAGE` on first use) |
+| First `need_sandbox=True` tool call | `_ensure_started()` runs: `docker run` from `_lifecycle_image` (or `BASE_IMAGE` on first use) |
 | Subsequent tool calls | `_ensure_started()` sees `_lifecycle_image` set → `docker run` from it (picks up `/workspace` state) |
 | After **successful** sandbox tool call | `sandbox.stop(commit=True)`: `docker commit → agency/lifecycle-<name>`; `docker rm -f`; `_lifecycle_image` updated |
 | After **failed** sandbox tool call | `sandbox.stop(commit=False)`: `docker rm -f` without commit; dirty state discarded; next start restores from previous `_lifecycle_image` |
@@ -131,7 +131,7 @@ The `__BGPIDS__` annotation is stripped before output is returned to the LLM. PI
 ```python
 sb = agSandbox(agname)
 sb = agSandbox(agname, output_dir=Path("runs/agent_output"))
-sb = agSandbox(agname, restore_image="agency/ckpt-p1234-myagent")
+sb = agSandbox(agname, lifecycle_image="agency/lifecycle-myagent")
 
 # Construction is cheap — no Docker calls until _ensure_started() runs.
 sb._ensure_started()    # called automatically on first exec(); idempotent

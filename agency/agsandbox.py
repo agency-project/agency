@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import multiprocessing
 import os
 import shlex
 import shutil
@@ -22,8 +23,11 @@ class _ContainerAlreadyRunning(Exception):
     started the same container — the caller should reuse it."""
 _RUNTIME: str | None = None
 
-# Per-process prefix so concurrent script invocations never share container names.
-_PID_PREFIX = f"p{os.getpid()}"
+# Per-run ID so concurrent and successive runs never share container/image names.
+# UUID avoids PID-reuse collisions and prevents stale lifecycle images from crashed
+# runs being accidentally picked up by a new run that happens to get the same PID.
+import uuid as _uuid
+_RUN_ID = f"r{_uuid.uuid4().hex[:8]}"
 
 # Global registry of live sandboxes for atexit cleanup.
 _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
@@ -35,6 +39,45 @@ _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
 # so more than ~8 concurrent docker-run calls increase contention and leave stale
 # "Created" containers without reducing wall-clock time.
 _startup_semaphore = threading.Semaphore(8)
+
+# Hard cap on the number of simultaneously running Docker containers, derived from
+# the Linux kernel session-keyring quota.  Each running Docker container holds one
+# session keyring against the user that ran `docker run`; when total keys reach
+# /proc/sys/kernel/keys/maxkeys the next docker run fails with
+# "unable to create session key: disk quota exceeded".
+# Podman is exempt: rootless Podman uses user namespaces with independent keyring
+# namespaces and is not subject to this quota.
+# multiprocessing.Semaphore is backed by a POSIX IPC semaphore so the limit is
+# enforced across all worker processes (which run _ensure_started) and the main
+# process (which calls stop/destroy).
+def _docker_container_limit() -> int:
+    """Return the concurrent-Docker-container cap derived from the kernel keyring quota."""
+    try:
+        return max(4, int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip()) - 5)
+    except OSError:
+        return 200 - 5
+
+_container_semaphore: multiprocessing.Semaphore = multiprocessing.Semaphore(
+    _docker_container_limit()
+)
+
+
+def keyring_quota() -> dict[str, int]:
+    """Return the current Linux session-keyring quota for diagnostics.
+
+    Returns a dict with ``used``, ``max``, and ``free`` key counts.
+    ``used`` is -1 when /proc/keys is not readable (non-root on some kernels).
+    """
+    try:
+        maxkeys = int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip())
+    except OSError:
+        maxkeys = -1
+    try:
+        used = sum(1 for ln in Path("/proc/keys").read_text().splitlines() if ln.strip())
+    except OSError:
+        used = -1
+    free = (maxkeys - used) if (maxkeys >= 0 and used >= 0) else -1
+    return {"used": used, "max": maxkeys, "free": free}
 
 
 def _cleanup_all_sandboxes() -> None:
@@ -145,7 +188,7 @@ class agSandbox:
         self,
         agname: str,
         output_dir: Path | None = None,
-        restore_image: str | None = None,
+        lifecycle_image: str | None = None,
     ) -> None:
         self._agname   = agname
         self._runtime  = get_container_runtime()
@@ -159,14 +202,13 @@ class agSandbox:
         self._baseline_pids: set[int]        = set()
         self._daemon_pids:   set[int]        = set()
         self._started  = False
-        self._lifecycle_image: str | None    = None   # last committed image from stop(commit=True)
+        self._lifecycle_image: str | None    = lifecycle_image
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
-        self._name = f"sandbox-{_PID_PREFIX}-{agname}"
+        self._name = f"sandbox-{_RUN_ID}-{agname}"
 
         # Store startup parameters for _ensure_started().
-        self._restore_image = restore_image
         self._gpu_flags     = _gpu_flags()
         self._vol_flags: list[str] = []
         if output_dir is not None:
@@ -211,36 +253,35 @@ class agSandbox:
             if self._started:   # re-check after acquiring the semaphore
                 return
             # Reuse or restart a container that a previous worker process (or a
-            # prior tool-dispatch batch) already started.  Only applies when we
-            # are NOT restoring from a specific checkpoint image.
-            if self._restore_image is None:
-                status = self._container_status()
-                if status == "running":
-                    _live_sandboxes.add(self)
-                    self._started = True
-                    self._baseline_pids = self._snapshot_pids()
-                    return
-                if status == "exited":
-                    # Container was stopped (keyring released) but overlay is intact.
-                    # docker start is ~0.5–1 s vs 2–5 s for docker run.
+            # prior tool-dispatch batch) already started.
+            status = self._container_status()
+            if status == "running":
+                # Reuse an already-running container — it already holds a
+                # keyring slot so we must NOT acquire _container_semaphore here.
+                _live_sandboxes.add(self)
+                self._started = True
+                self._baseline_pids = self._snapshot_pids()
+                return
+            if status == "exited":
+                # Container was stopped (keyring released) but overlay is intact.
+                # docker start is ~0.5–1 s vs 2–5 s for docker run.
+                if self._runtime == "docker":
+                    _container_semaphore.acquire()
+                try:
                     self._run([self._runtime, "start", name], check=True, timeout=30)
-                    _live_sandboxes.add(self)
-                    self._started = True
-                    self._baseline_pids = self._snapshot_pids()
-                    return
+                except Exception:
+                    if self._runtime == "docker":
+                        _container_semaphore.release()
+                    raise
+                _live_sandboxes.add(self)
+                self._started = True
+                self._baseline_pids = self._snapshot_pids()
+                return
             self._run([self._runtime, "rm", "-f", name], check=False)
+            if self._runtime == "docker":
+                _container_semaphore.acquire()
             try:
-                # Priority: explicit restore image > lifecycle checkpoint > base image
-                if self._restore_image is not None:
-                    image = self._restore_image
-                    run_cmd = (
-                        [self._runtime, "run", "-d", "--init", "--name", name]
-                        + self._gpu_flags + self._vol_flags
-                        + [image, "tail", "-f", "/dev/null"]
-                    )
-                    self._run_with_conflict_retry(run_cmd, name)
-                    self._run([self._runtime, "rmi", self._restore_image], check=False)
-                elif self._lifecycle_image is not None:
+                if self._lifecycle_image is not None:
                     # Restart from last committed checkpoint (set by stop(commit=True)).
                     # /workspace and all state from the previous tool call are preserved.
                     image = self._lifecycle_image
@@ -266,11 +307,17 @@ class agSandbox:
                     )
             except _ContainerAlreadyRunning:
                 # Another process started the container while we were retrying;
-                # reuse it just as we would in the fast-path above.
+                # that process owns the keyring slot — release ours.
+                if self._runtime == "docker":
+                    _container_semaphore.release()
                 _live_sandboxes.add(self)
                 self._started = True
                 self._baseline_pids = self._snapshot_pids()
                 return
+            except Exception:
+                if self._runtime == "docker":
+                    _container_semaphore.release()
+                raise
             _live_sandboxes.add(self)
             self._started = True  # set before _snapshot_pids() to prevent re-entry via _container_exec
             self._baseline_pids = self._snapshot_pids()
@@ -621,6 +668,8 @@ class agSandbox:
             )
         except Exception:
             pass
+        if self._runtime == "docker":
+            _container_semaphore.release()
         self._started = False
 
     def restore(self, tag: str) -> None:
@@ -649,7 +698,7 @@ class agSandbox:
             self._started = False
             self._watched_pids = {}
             self._baseline_pids = set()
-        self._restore_image = tag
+        self._lifecycle_image = tag
         self._ensure_started()
 
     def release_daemon(self, pid: int) -> None:
@@ -804,6 +853,11 @@ class agSandbox:
             except Exception:
                 pass
 
+        # Check before rm so we know whether a keyring slot must be released.
+        had_container = self._runtime == "docker" and bool(
+            self._started or self._container_status() in ("running", "exited")
+        )
+
         try:
             self._run(
                 [self._runtime, "rm", "-f", container_name],
@@ -811,6 +865,8 @@ class agSandbox:
             )
         except Exception:
             pass
+        if had_container:
+            _container_semaphore.release()
 
         # Remove pre-tool checkpoint images created during this sandbox's lifetime.
         try:

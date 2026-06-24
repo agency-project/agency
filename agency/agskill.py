@@ -1052,12 +1052,12 @@ class agskill:
                             image_urls.extend(v for v in vals if isinstance(v, str))
 
         if not image_urls:
-            return input.to_json()
+            return f"[HARNESS SYSTEM] New Skill Input:\n{input.to_json()}"
 
         # Build a copy of the input dict with image fields replaced by placeholders
         # so the text portion stays compact.
         text_data = dict(input._data)
-        for key in image_keys:
+        for key in image_keys:  
             if key in text_data:
                 hint = schema._data.get(key) if schema else None
                 if get_origin(hint) is list:
@@ -1068,7 +1068,7 @@ class agskill:
 
         import json as _json
         text = _json.dumps(text_data)
-        content: list = [{"type": "text", "text": text}]
+        content: list = [{"type": "text", "text": f"New Skill Input:\n{text}"}]
         for url in image_urls:
             content.append({"type": "image_url", "image_url": {"url": url}})
         return content
@@ -1186,7 +1186,7 @@ class agskill:
                         correction_msg={
                             "role": "user",
                             "content": (
-                                f"Your previous response could not be parsed. Errors: {errors}.\n"
+                                f"[HARNESS SYSTEM] Your previous response could not be parsed. Errors: {errors}.\n"
                                 "Common causes: unescaped quotes or backslashes inside a string value, "
                                 "raw newlines inside a string (use \\n instead), trailing comma after "
                                 "the last key, extra text or explanation outside the JSON object, "
@@ -1433,8 +1433,15 @@ class agskill:
                     _collected_outputs[field] = value
                     remaining = _required_fields - set(_collected_outputs)
                     if remaining:
-                        return json.dumps({"result": f"✓ '{field}' registered. Still needed: {sorted(remaining)}"})
-                    return json.dumps({"result": f"✓ '{field}' registered. All required fields complete."})
+                        _remaining_tools = ", ".join(f"return_{f}" for f in sorted(remaining))
+                        return json.dumps({"result": (
+                            f"[HARNESS SYSTEM] ✓ '{field}' registered. "
+                            f"Still needed: {sorted(remaining)}, call {_remaining_tools} tool(s)."
+                        )})
+                    return json.dumps({"result": (
+                        f"[HARNESS SYSTEM] ✓ '{field}' registered. "
+                        f"All required fields complete, please end your response now."
+                    )})
                 return _handle
 
             _intercept = {f"return_{f}": _make_field_handler(f) for f in _required_fields}
@@ -1510,27 +1517,69 @@ class agskill:
                     _state_fn, _live_messages_fn, _full_history_fn, term,
                     _intercept=_intercept,
                 )
+                # If all required output fields are now registered, skip the next
+                # LLM call and fall through directly to output validation and return.
+                # Otherwise keep looping so the model can do more work.
+                if not (_use_return_output and not (_required_fields - set(_collected_outputs))):
+                    continue
 
             else:
-                # If this step consumed inbox messages, the LLM is mid-conversation
-                # with the user — not producing a final answer yet. Continue the
-                # loop so the exchange can complete before output validation runs.
+                # Model stopped without tool calls.  If it was mid-inbox-exchange,
+                # let the conversation complete before validating output.
                 if had_inbox:
                     continue
 
-                if _use_return_output:
-                    # Tool-based output path: check that all required fields were
-                    # registered via return_output before the model stopped.
-                    missing = _required_fields - set(_collected_outputs)
-                    if missing:
+            # ── Output-ready path ─────────────────────────────────────────────
+            # Reached either when:
+            #   (a) the model stopped naturally with no tool calls, or
+            #   (b) all required return_<field> calls completed in the last batch.
+
+            if _use_return_output:
+                # Tool-based output path: check that all required fields were
+                # registered via return_<field> before reaching here.
+                missing = _required_fields - set(_collected_outputs)
+                if missing:
+                    if output_schema_retries_left > 0:
+                        output_schema_retries_left -= 1
+                        _missing_tools = " and ".join(
+                            f"return_{f}" for f in sorted(missing)
+                        )
+                        reprompt = {
+                            "role": "user",
+                            "content": (
+                                f"[HARNESS SYSTEM] You have not yet provided all required output fields. "
+                                f"Still missing: {sorted(missing)}. "
+                                f"Call {_missing_tools} tool(s) for each missing field."
+                            ),
+                        }
+                        messages.append(reprompt)
+                        if _live_messages_fn:
+                            _live_messages_fn(messages[1:])
+                        if _full_history_fn:
+                            _full_history_fn(reprompt)
+                        continue
+                    updated_history = agdata(messages=messages[1:])
+                    return (
+                        agdata(error=f"output schema error: missing fields after retries: {sorted(missing)}"),
+                        updated_history,
+                        [messages[0]] + messages[1:][n_before:],
+                        (_total_input_tokens, _total_output_tokens),
+                    )
+                # All fields collected — run optional validator.
+                result = agdata(**_collected_outputs)
+                if self.output_validator is not None:
+                    val_errors = self.output_validator(result)
+                    if val_errors:
                         if output_schema_retries_left > 0:
                             output_schema_retries_left -= 1
+                            _all_tools = " and ".join(
+                                f"return_{f}" for f in sorted(_required_fields)
+                            )
                             reprompt = {
                                 "role": "user",
                                 "content": (
-                                    f"You have not yet provided all required output fields. "
-                                    f"Still missing: {sorted(missing)}. "
-                                    f"Call return_output for each missing field."
+                                    f"[HARNESS SYSTEM] Output validation failed: {val_errors}. "
+                                    f"Please correct your answers using {_all_tools} tool(s)."
                                 ),
                             }
                             messages.append(reprompt)
@@ -1541,67 +1590,12 @@ class agskill:
                             continue
                         updated_history = agdata(messages=messages[1:])
                         return (
-                            agdata(error=f"output schema error: missing fields after retries: {sorted(missing)}"),
+                            agdata(error=f"output validation error: {val_errors}"),
                             updated_history,
                             [messages[0]] + messages[1:][n_before:],
                             (_total_input_tokens, _total_output_tokens),
                         )
-                    # All fields collected — run optional validator.
-                    result = agdata(**_collected_outputs)
-                    if self.output_validator is not None:
-                        val_errors = self.output_validator(result)
-                        if val_errors:
-                            if output_schema_retries_left > 0:
-                                output_schema_retries_left -= 1
-                                reprompt = {
-                                    "role": "user",
-                                    "content": (
-                                        f"Output validation failed: {val_errors}. "
-                                        f"Please correct your answers using return_output."
-                                    ),
-                                }
-                                messages.append(reprompt)
-                                if _live_messages_fn:
-                                    _live_messages_fn(messages[1:])
-                                if _full_history_fn:
-                                    _full_history_fn(reprompt)
-                                continue
-                            updated_history = agdata(messages=messages[1:])
-                            return (
-                                agdata(error=f"output validation error: {val_errors}"),
-                                updated_history,
-                                [messages[0]] + messages[1:][n_before:],
-                                (_total_input_tokens, _total_output_tokens),
-                            )
-                    if sandbox is not None:
-                        proc_msg = _wait_for_processes(
-                            sandbox, self.name, term, log, _agname,
-                            _ping_interval_s, _poll_interval_s, _state_fn,
-                        )
-                        if proc_msg is not None:
-                            messages.append({"role": "user", "content": proc_msg})
-                            if _live_messages_fn:
-                                _live_messages_fn(messages[1:])
-                            if _full_history_fn:
-                                _full_history_fn(messages[-1])
-                            continue
-                    updated_history = agdata(messages=messages[1:])
-                    return (
-                        result,
-                        updated_history,
-                        [messages[0]] + messages[1:][n_before:],
-                        (_total_input_tokens, _total_output_tokens),
-                    )
-
-                far = self._parse_final_answer(
-                    msg_dict, messages, n_before, output_schema_retries_left,
-                    (_total_input_tokens, _total_output_tokens),
-                )
-                if far.kind == "retry":
-                    output_schema_retries_left -= 1
-                    messages.append(far.correction_msg)
-                    continue
-                if far.kind != "error" and sandbox is not None:
+                if sandbox is not None:
                     proc_msg = _wait_for_processes(
                         sandbox, self.name, term, log, _agname,
                         _ping_interval_s, _poll_interval_s, _state_fn,
@@ -1613,7 +1607,35 @@ class agskill:
                         if _full_history_fn:
                             _full_history_fn(messages[-1])
                         continue
-                return far.return_tuple
+                updated_history = agdata(messages=messages[1:])
+                return (
+                    result,
+                    updated_history,
+                    [messages[0]] + messages[1:][n_before:],
+                    (_total_input_tokens, _total_output_tokens),
+                )
+
+            far = self._parse_final_answer(
+                msg_dict, messages, n_before, output_schema_retries_left,
+                (_total_input_tokens, _total_output_tokens),
+            )
+            if far.kind == "retry":
+                output_schema_retries_left -= 1
+                messages.append(far.correction_msg)
+                continue
+            if far.kind != "error" and sandbox is not None:
+                proc_msg = _wait_for_processes(
+                    sandbox, self.name, term, log, _agname,
+                    _ping_interval_s, _poll_interval_s, _state_fn,
+                )
+                if proc_msg is not None:
+                    messages.append({"role": "user", "content": proc_msg})
+                    if _live_messages_fn:
+                        _live_messages_fn(messages[1:])
+                    if _full_history_fn:
+                        _full_history_fn(messages[-1])
+                    continue
+            return far.return_tuple
 
         updated_history = agdata(messages=messages[1:])
         return agdata(error="max_steps exceeded"), updated_history, [messages[0]] + messages[1:][n_before:], (_total_input_tokens, _total_output_tokens)

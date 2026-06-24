@@ -177,7 +177,7 @@ def test_build_user_content_image_field_replaced_with_placeholder():
     inp = agdata(question="what?", photo="data:image/jpeg;base64,AAAA")
     content = sk._build_user_content(inp)
     text_part = next(p for p in content if p["type"] == "text")
-    parsed = json.loads(text_part["text"])
+    parsed = json.loads(text_part["text"].split("\n", 1)[1])
     assert parsed["photo"] == "[image attached]"
     assert parsed["question"] == "what?"
 
@@ -196,7 +196,7 @@ def test_build_user_content_list_images_placeholder_shows_count():
     inp = agdata(frames=["https://a.com/1.jpg", "https://a.com/2.jpg"])
     content = sk._build_user_content(inp)
     text_part = next(p for p in content if p["type"] == "text")
-    parsed = json.loads(text_part["text"])
+    parsed = json.loads(text_part["text"].split("\n", 1)[1])
     assert "2" in parsed["frames"]
 
 def test_build_user_content_mixed_fields_non_image_preserved():
@@ -204,7 +204,7 @@ def test_build_user_content_mixed_fields_non_image_preserved():
     inp = agdata(label="cat", photo="https://example.com/cat.jpg")
     content = sk._build_user_content(inp)
     text_part = next(p for p in content if p["type"] == "text")
-    parsed = json.loads(text_part["text"])
+    parsed = json.loads(text_part["text"].split("\n", 1)[1])
     assert parsed["label"] == "cat"
 
 

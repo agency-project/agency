@@ -26,6 +26,9 @@ GPU_TYPE=rocm ./images/build.sh    # AMD ROCm 7.2
 GPU_TYPE=nvidia ./images/build.sh  # NVIDIA CUDA
 GPU_TYPE=cpu ./images/build.sh     # CPU only
 
+uv venv
+source .venv/bin/activate
+
 uv pip install -e .
 uv pip install -e ".[dev]"   # dev dependencies (pytest etc.)
 ```

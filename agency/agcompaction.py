@@ -310,13 +310,13 @@ def compact(
         {
             "role": "user",
             "content": (
-                "[Conversation history summary — treat as established context, "
+                "[HARNESS SYSTEM] [Conversation history summary — treat as established context, "
                 "do not ask to re-confirm]\n" + summary
             ),
         },
         {
             "role": "assistant",
-            "content": "Understood. I'll continue from this context.",
+            "content": "[HARNESS SYSTEM] Understood. I'll continue from this context.",
         },
     ]
 

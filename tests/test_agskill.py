@@ -351,9 +351,8 @@ def test_correction_message_appended_on_retry():
     call_messages: list[list[dict]] = []
     call_idx = 0
     responses = [
-        _direct("I'm done."),                              # no return_answer
-        _tool_call("return_answer", {"value": "fixed"}),   # provide field
-        _direct(""),                                        # all done
+        _direct("I'm done."),                              # no return_answer → correction injected
+        _tool_call("return_answer", {"value": "fixed"}),   # provide field → done
     ]
 
     def side_effect(**kwargs):
@@ -368,7 +367,7 @@ def test_correction_message_appended_on_retry():
         result, _, _, _ = s.run(LLM_CONFIG, agdata(q="hi"), agdata(messages=[]), sandbox=None)
 
     assert result.answer == "fixed"
-    assert len(call_messages) == 3
+    assert len(call_messages) == 2
     # Second call should have the missing-fields reprompt as a user message
     second_msgs = call_messages[1]
     assert any(

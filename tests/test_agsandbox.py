@@ -531,7 +531,7 @@ class TestAgSandboxLifecycle:
             sb1.write_file("/workspace/data.txt", "restored\n")
             sb1.commit(tag)
             sb1.destroy()
-            sb2 = _make_sandbox(restore_image=tag)
+            sb2 = _make_sandbox(lifecycle_image=tag)
             content = sb2.read_file("/workspace/data.txt")
             assert content == "restored\n"
             sb2.destroy()

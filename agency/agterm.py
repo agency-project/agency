@@ -99,7 +99,7 @@ class agterm:
     @staticmethod
     def _colorize_agnames(msg: str) -> str:
         """Wrap every registered agent UUID appearing in msg with its color."""
-        for uid, color in agterm._agname_colors.items():
+        for uid, color in list(agterm._agname_colors.items()):
             if uid in msg:
                 msg = msg.replace(uid, f"{color}{_BOLD}{uid}{_RESET}")
         return msg

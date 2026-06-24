@@ -77,9 +77,8 @@ _ensure_started() (called lazily from exec())
   ├─ container running?     → reuse (fast path, no-op)
   ├─ container exited?      → docker start (0.5 s, keeps overlay)
   └─ container absent?
-       ├─ _restore_image set   → docker run from restore_image (fork/checkpoint)
-       ├─ _lifecycle_image set → docker run from lifecycle image (last good state)
-       └─ neither              → docker run from BASE_IMAGE (first tool call)
+       ├─ _lifecycle_image set → docker run from lifecycle image (fork/checkpoint or last good state)
+       └─ not set              → docker run from BASE_IMAGE (first tool call)
 ```
 
 This keeps at most one container alive per agent during active tool execution. All session keyrings and GPU slots are freed between tool calls while the LLM thinks, preventing the kernel keyring quota from being exhausted under high agent concurrency.
