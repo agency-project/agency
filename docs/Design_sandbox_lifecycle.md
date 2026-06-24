@@ -109,7 +109,7 @@ Two semaphores gate Docker daemon calls:
 | `_docker_semaphore` | 16 | All Docker/Podman daemon calls — held for the duration of each `_run()` invocation. The daemon serialises most operations internally (GPU init, overlay diff, container teardown), so more than ~16 concurrent calls increase contention without reducing wall-clock time. Replaces the former `_startup_semaphore` / `_commit_semaphore` / `_shutdown_semaphore` trio. |
 | `_container_semaphore` | `maxkeys − 5` | Total simultaneously running containers, derived from `/proc/sys/kernel/keys/maxkeys`. Each running container holds one Linux session keyring; hitting the limit causes `docker run` to fail with "disk quota exceeded". |
 
-The startup and shutdown semaphores limit *throughput*; the container semaphore limits *capacity*.
+`_docker_semaphore` limits *throughput* (concurrent daemon calls); `_container_semaphore` limits *capacity* (simultaneously running containers).
 
 ---
 
@@ -119,8 +119,8 @@ The startup and shutdown semaphores limit *throughput*; the container semaphore 
 
 The current `stop()` implementation:
 
-1. Acquires `_shutdown_semaphore` before issuing `docker rm -f` to bound concurrent teardown.
-2. Retries `docker rm -f` up to 3 times with a 1-second delay between attempts.
+1. Optionally commits the container state via `docker commit` (retried up to 3×) before removal.
+2. Retries `docker rm -f` up to 3 times with a 1-second delay between attempts. Each attempt goes through `_run()`, which holds `_docker_semaphore` for the duration of the subprocess call.
 3. Emits a `WARNING` to stderr after all retries are exhausted, then continues — `_started` is cleared and `_container_semaphore` released regardless, so the framework can keep running even if a zombie remains.
 
 The warning makes accumulation visible rather than silent, and the retries handle transient daemon overload.
