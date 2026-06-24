@@ -316,58 +316,114 @@ def _hint_to_json_type(hint) -> str:
         if issubclass(hint, int):    return "integer"
         if issubclass(hint, float):  return "number"
         if issubclass(hint, agtype): return "string"
+        if issubclass(hint, (list, tuple)): return "array"
+        if issubclass(hint, dict):   return "object"
         return "string"
-    if get_origin(hint) is list:
-        return "array"
-    if isinstance(hint, list):       # [{"key": type, ...}] literal
-        return "array"
+    origin = get_origin(hint)
+    if origin is list or origin is tuple: return "array"
+    if origin is dict:                    return "object"
+    if isinstance(hint, list):            return "array"   # [{"key": type, ...}] literal
     return "string"
+
+
+def _example_for_hint(hint) -> str:
+    """Return a short valid-JSON example for a type hint (used in tool descriptions/errors).
+
+    Every returned string is parseable by json.loads.
+    """
+    if hint is bool:  return "true"
+    if hint is int:   return "42"
+    if hint is float: return "3.14"
+    if hint is str:   return '"text"'
+    origin = get_origin(hint)
+    args   = get_args(hint)
+    if hint is list or origin is list:
+        return f"[{_example_for_hint(args[0])}]" if args else "[]"
+    if hint is dict or origin is dict:
+        if args and len(args) == 2:
+            return "{" + f"{_example_for_hint(args[0])}: {_example_for_hint(args[1])}" + "}"
+        return "{}"
+    if hint is tuple or origin is tuple:
+        return "[" + ", ".join(_example_for_hint(t) for t in args) + "]" if args else "[]"
+    if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+        obj = "{" + ", ".join(f'"{k}": {_example_for_hint(t)}' for k, t in hint[0].items()) + "}"
+        return f"[{obj}]"
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        return '"value"'
+    return "null"
+
+
+def _value_desc_for_hint(field: str, hint) -> str:
+    """Return a value description with a concrete format example and a 'pass directly' note."""
+    origin = get_origin(hint)
+    args   = get_args(hint)
+    ex     = _example_for_hint(hint)
+    direct = "Pass directly — do not JSON-encode into a string."
+
+    if hint is str:
+        return (
+            f"The complete string value for '{field}'. "
+            "Pass the full content directly — not a file path."
+        )
+    if hint is bool:
+        return f"Boolean for '{field}' (true or false)."
+    if hint is int:
+        return f"Integer for '{field}'. Example: {ex}."
+    if hint is float:
+        return f"Floating-point number for '{field}'. Example: {ex}."
+    if hint is list or origin is list:
+        if args:
+            elem_type = args[0]
+            elem_name = getattr(elem_type, "__name__", repr(elem_type))
+            return (
+                f"JSON array of {elem_name} values for '{field}'. "
+                f"Example: {ex}. {direct}"
+            )
+        return f"JSON array for '{field}'. Example: {ex}. {direct}"
+    if hint is dict or origin is dict:
+        if args and len(args) == 2:
+            kn = getattr(args[0], "__name__", repr(args[0]))
+            vn = getattr(args[1], "__name__", repr(args[1]))
+            return (
+                f"JSON object with {kn} keys and {vn} values for '{field}'. "
+                f"Example: {ex}. {direct}"
+            )
+        return f"JSON object for '{field}'. Example: {ex}. {direct}"
+    if hint is tuple or origin is tuple:
+        if args:
+            types_str = ", ".join(getattr(t, "__name__", repr(t)) for t in args)
+            return (
+                f"JSON array of {len(args)} element(s) ({types_str}) for '{field}'. "
+                f"Example: {ex}. {direct}"
+            )
+        return f"JSON array for '{field}'. Example: {ex}. {direct}"
+    if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+        keys = ", ".join(f'"{k}"' for k in hint[0])
+        obj_ex = "{" + ", ".join(f'"{k}": {_example_for_hint(t)}' for k, t in hint[0].items()) + "}"
+        return (
+            f"JSON array of objects for '{field}'. Each object must have keys: {keys}. "
+            f"Example: [{obj_ex}]. {direct}"
+        )
+    return f"Value for '{field}'."
 
 
 def _return_tool_descriptions(field: str, hint) -> tuple[str, str]:
     """Return (tool_description, value_description) for a return_<field> tool."""
+    tool_desc = f"Register the '{field}' output field."
     # agtype subclass — delegate to its classmethods
     if isinstance(hint, type) and issubclass(hint, agtype):
         return hint.return_tool_description(field), hint.return_value_description(field)
-    # list[agtype] — delegate to the inner type
+    # list[agtype] — delegate to the inner type, but include a JSON array example
     if get_origin(hint) is list:
         args = get_args(hint)
         if args and isinstance(args[0], type) and issubclass(args[0], agtype):
             inner = args[0]
+            ex = _example_for_hint(hint)
             return (
                 inner.return_tool_description(field) + " (as a JSON array)",
-                inner.return_value_description(field) + " Provide as a JSON array.",
+                inner.return_value_description(field) + f" Provide as a JSON array. Example: {ex}.",
             )
-    # Built-in types
-    if hint is str:
-        return (
-            f"Register the '{field}' output field.",
-            f"The complete string value for '{field}'. Pass the full content directly — not a file path.",
-        )
-    if hint is int:
-        return (
-            f"Register the '{field}' output field.",
-            f"Integer value for '{field}'.",
-        )
-    if hint is float:
-        return (
-            f"Register the '{field}' output field.",
-            f"Numeric (float) value for '{field}'.",
-        )
-    if hint is bool:
-        return (
-            f"Register the '{field}' output field.",
-            f"Boolean value for '{field}' (true or false).",
-        )
-    if get_origin(hint) is list or hint is list:
-        return (
-            f"Register the '{field}' output field.",
-            f"JSON array value for '{field}'.",
-        )
-    return (
-        f"Register the '{field}' output field.",
-        f"Value for '{field}'.",
-    )
+    return tool_desc, _value_desc_for_hint(field, hint)
 
 
 def _make_return_output_tools(schema: "agdata") -> list[dict]:
@@ -417,9 +473,18 @@ def _validate_output_field(field: str, value, schema: "agdata") -> "str | None":
         args = get_args(hint)
         if args and isinstance(args[0], type):
             inner = args[0]
+            # agtype subclasses are serialised as plain strings
+            check = str if issubclass(inner, agtype) else inner
             for i, item in enumerate(value):
-                if not isinstance(item, inner):
+                if not isinstance(item, check):
                     return f"item {i}: expected {inner.__name__}, got {type(item).__name__}"
+    elif get_origin(hint) is tuple:
+        # JSON arrays deserialize to lists, so accept both list and tuple
+        if not isinstance(value, (list, tuple)):
+            return f"expected array, got {type(value).__name__}"
+    elif get_origin(hint) is dict:
+        if not isinstance(value, dict):
+            return f"expected dict, got {type(value).__name__}"
     elif isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
         if not isinstance(value, list):
             return f"expected list, got {type(value).__name__}"
@@ -433,7 +498,11 @@ def _validate_output_field(field: str, value, schema: "agdata") -> "str | None":
                 if isinstance(t, type) and not isinstance(item[k], t):
                     return f"item {i}.{k}: expected {t.__name__}, got {type(item[k]).__name__}"
     elif isinstance(hint, type):
-        if not isinstance(value, hint):
+        # tuple is a JSON array; json.loads always gives back a list
+        if issubclass(hint, tuple):
+            if not isinstance(value, (list, tuple)):
+                return f"expected array, got {type(value).__name__}"
+        elif not isinstance(value, hint):
             return f"expected {hint.__name__}, got {type(value).__name__}"
     return None
 
@@ -1359,7 +1428,24 @@ class agskill:
                     value = args.get("value")
                     err = _validate_output_field(field, value, self.output_schema)
                     if err is not None:
-                        return json.dumps({"error": f"field '{field}': {err}"})
+                        hint    = self.output_schema._data[field]
+                        ex      = _example_for_hint(hint)
+                        got_str = isinstance(value, str)
+                        exp_arr = _hint_to_json_type(hint) == "array"
+                        exp_obj = _hint_to_json_type(hint) == "object"
+                        if got_str and exp_arr:
+                            fix = (
+                                f"You passed a JSON-encoded string; pass a JSON array directly. "
+                                f"Example: {ex}"
+                            )
+                        elif got_str and exp_obj:
+                            fix = (
+                                f"You passed a JSON-encoded string; pass a JSON object directly. "
+                                f"Example: {ex}"
+                            )
+                        else:
+                            fix = f"Expected format: {ex}"
+                        return json.dumps({"error": f"field '{field}': {err}. {fix}"})
 
                     # agfile: validate file exists, is a regular file, is non-empty,
                     # is UTF-8 text, and contains real content (not another path).

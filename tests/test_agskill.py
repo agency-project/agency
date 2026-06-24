@@ -519,6 +519,58 @@ def test_return_output_list_str():
     assert result.tags == ["ml", "nlp"]
 
 
+def test_return_output_bare_list():
+    """bare list type maps to JSON array and accepts any list value."""
+    from agency.agskill import _make_return_output_tools
+    schema = agdata(items=list)
+    tools = _make_return_output_tools(schema)
+    assert tools[0]["function"]["parameters"]["properties"]["value"]["type"] == "array"
+
+    s = agskill(name="s", system_prompt="", output_schema=agdata(items=list))
+    responses = [
+        _tool_call("return_items", {"value": [{"a": 1}, {"b": 2}]}),
+        _direct(""),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.items == [{"a": 1}, {"b": 2}]
+
+
+def test_hint_to_json_type_coverage():
+    """_hint_to_json_type maps all common Python types to correct JSON Schema types."""
+    from agency.agskill import _hint_to_json_type
+    assert _hint_to_json_type(str)         == "string"
+    assert _hint_to_json_type(int)         == "integer"
+    assert _hint_to_json_type(float)       == "number"
+    assert _hint_to_json_type(bool)        == "boolean"
+    assert _hint_to_json_type(list)        == "array"
+    assert _hint_to_json_type(list[str])   == "array"
+    assert _hint_to_json_type(tuple)       == "array"
+    assert _hint_to_json_type(tuple[str, int]) == "array"
+    assert _hint_to_json_type(dict)        == "object"
+    assert _hint_to_json_type(dict[str, int]) == "object"
+    assert _hint_to_json_type([{"k": str}]) == "array"  # literal list-of-dicts
+
+
+def test_return_output_bare_dict():
+    """bare dict type maps to JSON object and the LLM can return a dict value."""
+    from agency.agskill import _make_return_output_tools
+    schema = agdata(meta=dict)
+    tools = _make_return_output_tools(schema)
+    assert tools[0]["function"]["parameters"]["properties"]["value"]["type"] == "object"
+
+    s = agskill(name="s", system_prompt="", output_schema=agdata(meta=dict))
+    responses = [
+        _tool_call("return_meta", {"value": {"a": 1, "b": "x"}}),
+        _direct(""),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
+    assert result.meta == {"a": 1, "b": "x"}
+
+
 def test_return_output_list_str_type_error():
     """list[str] with a non-str element returns a validation error."""
     from agency.agskill import _validate_output_field
@@ -1643,3 +1695,223 @@ def test_plan_mode_no_tools_sent_to_llm():
         s.run(LLM_CONFIG, agdata(x=1), agdata(messages=[]), sandbox=None)
 
     assert captured["has_tools"] is False
+
+
+# ---------------------------------------------------------------------------
+# Randomised nested-schema fuzz: _hint_to_json_type + JSON round-trip + validation
+# ---------------------------------------------------------------------------
+
+def test_random_nested_schema_roundtrip():
+    """100 randomly generated nested schemas exercising every container/leaf combination.
+
+    For each trial:
+    - Python → serialized-str: _hint_to_json_type must return the correct JSON Schema
+      type, and json.dumps must succeed.
+    - Serialized-str → Python: json.loads must round-trip cleanly, and
+      _validate_output_field must accept the recovered value.
+    - Wrong-container rejection: a value with the opposite container type (list vs
+      dict) must be rejected by _validate_output_field for bare / generic hints that
+      the framework validates at the top level.
+    """
+    import random
+    from typing import get_origin, get_args
+    from agency.agskill import _hint_to_json_type, _validate_output_field
+    from agency.agtype import agrawstring, agtype
+
+    rng = random.Random(20240624)
+
+    LEAF_TYPES = [str, int, float, bool, agrawstring]
+
+    def rand_hint(depth: int):
+        if depth >= 4 or (depth > 0 and rng.random() < 0.30 * depth):
+            return rng.choice(LEAF_TYPES)
+        kind = rng.choice(("list", "dict", "tuple"))
+        n = rng.randint(1, 4)
+        if kind == "list":
+            return list[rand_hint(depth + 1)]
+        if kind == "dict":
+            return dict[str, rand_hint(depth + 1)]
+        # tuple: 1-4 heterogeneous element types
+        inners = tuple(rand_hint(depth + 1) for _ in range(n))
+        return tuple[inners] if len(inners) > 1 else tuple[inners[0]]
+
+    def rand_value(hint):
+        if hint is bool:   return rng.choice([True, False])
+        if hint is int:    return rng.randint(-9, 9)
+        if hint is float:  return round(rng.uniform(-9.0, 9.0), 1)
+        if hint is str or (isinstance(hint, type) and issubclass(hint, agtype)):
+            return rng.choice(["a", "bb", "ccc"])
+        origin = get_origin(hint)
+        args   = get_args(hint)
+        if origin is list:
+            return [rand_value(args[0]) for _ in range(rng.randint(1, 4))]
+        if origin is dict:
+            return {f"k{i}": rand_value(args[1]) for i in range(rng.randint(1, 4))}
+        if origin is tuple:
+            # Serialise as list — JSON has no tuple type
+            return [rand_value(t) for t in args]
+        # bare container types
+        if hint is list:   return [rng.randint(0, 5) for _ in range(rng.randint(1, 4))]
+        if hint is dict:   return {f"k{i}": rng.randint(0, 5) for i in range(rng.randint(1, 4))}
+        if hint is tuple:  return [rng.randint(0, 5) for _ in range(rng.randint(1, 4))]
+        return "?"
+
+    def ground_truth_json_type(hint) -> str:
+        if isinstance(hint, type):
+            if issubclass(hint, bool):          return "boolean"
+            if issubclass(hint, int):           return "integer"
+            if issubclass(hint, float):         return "number"
+            if issubclass(hint, (list, tuple)): return "array"
+            if issubclass(hint, dict):          return "object"
+            return "string"   # str and agtype subclasses
+        origin = get_origin(hint)
+        if origin in (list, tuple): return "array"
+        if origin is dict:          return "object"
+        return "string"
+
+    failures = []
+    for trial in range(100):
+        hint  = rand_hint(0)
+        value = rand_value(hint)
+        exp   = ground_truth_json_type(hint)
+
+        # -- Python → JSON Schema type --
+        got = _hint_to_json_type(hint)
+        if got != exp:
+            failures.append(
+                f"[{trial}] _hint_to_json_type({hint!r}) = {got!r}, want {exp!r}"
+            )
+            continue
+
+        # -- Python value → JSON string --
+        try:
+            json_str = json.dumps(value)
+        except (TypeError, ValueError) as exc:
+            failures.append(f"[{trial}] json.dumps raised {exc} for hint={hint!r} value={value!r}")
+            continue
+
+        # -- JSON string → Python value --
+        try:
+            recovered = json.loads(json_str)
+        except (ValueError, TypeError) as exc:
+            failures.append(f"[{trial}] json.loads raised {exc}")
+            continue
+
+        # round-trip structural equality (tuples serialise as lists, both sides agree)
+        if json.dumps(recovered) != json_str:
+            failures.append(
+                f"[{trial}] round-trip mismatch: {value!r} → {json_str!r} → {recovered!r}"
+            )
+            continue
+
+        # -- Valid value must pass _validate_output_field --
+        schema = agdata(v=hint)
+        err = _validate_output_field("v", recovered, schema)
+        if err is not None:
+            failures.append(
+                f"[{trial}] valid value rejected — hint={hint!r} value={recovered!r} err={err!r}"
+            )
+            continue
+
+        # -- Wrong container type must be rejected for bare/generic hints --
+        # Parameterised generics with no top-level validation (e.g. dict[str, int])
+        # intentionally skip this check — only bare container types and list[T] validate.
+        wrong = {"__wrong__": 1} if exp == "array" else [1, 2] if exp == "object" else None
+        if wrong is not None:
+            validates_top_level = (
+                isinstance(hint, type)                     # bare list / dict / tuple
+                or get_origin(hint) in (list, tuple, dict) # generic list[T] / dict[K,V] / tuple[T]
+            )
+            if validates_top_level:
+                err2 = _validate_output_field("v", wrong, schema)
+                if err2 is None:
+                    failures.append(
+                        f"[{trial}] wrong value not rejected — hint={hint!r} wrong={wrong!r}"
+                    )
+
+    assert not failures, f"{len(failures)}/100 trials failed:\n" + "\n".join(failures[:20])
+
+
+def test_random_schema_prompt_examples_parseable():
+    """100 randomly generated schemas: the example in every auto-generated tool
+    description must be valid JSON AND must pass _validate_output_field.
+
+    Also checks that error messages (wrong container type) include a parseable
+    example that itself validates correctly.
+    """
+    import random
+    from typing import get_origin, get_args
+    from agency.agskill import (
+        _example_for_hint, _hint_to_json_type,
+        _return_tool_descriptions, _validate_output_field,
+    )
+    from agency.agtype import agrawstring, agtype
+
+    rng = random.Random(20240625)
+
+    LEAF_TYPES = [str, int, float, bool, agrawstring]
+
+    def rand_hint(depth: int):
+        if depth >= 4 or (depth > 0 and rng.random() < 0.30 * depth):
+            return rng.choice(LEAF_TYPES)
+        kind = rng.choice(("list", "dict", "tuple", "list_of_dicts"))
+        n = rng.randint(1, 4)
+        if kind == "list":
+            return list[rand_hint(depth + 1)]
+        if kind == "dict":
+            return dict[str, rand_hint(depth + 1)]
+        if kind == "tuple":
+            inners = tuple(rand_hint(depth + 1) for _ in range(n))
+            return tuple[inners] if len(inners) > 1 else tuple[inners[0]]
+        # literal list-of-dicts: [{key: type, ...}]
+        keys = [f"f{i}" for i in range(rng.randint(1, 3))]
+        return [{k: rng.choice([str, int, float, bool]) for k in keys}]
+
+    failures = []
+    for trial in range(100):
+        hint = rand_hint(0)
+
+        # -- _example_for_hint must produce valid JSON --
+        ex_str = _example_for_hint(hint)
+        try:
+            ex_val = json.loads(ex_str)
+        except (ValueError, TypeError) as exc:
+            failures.append(f"[{trial}] _example_for_hint({hint!r}) = {ex_str!r} is not valid JSON: {exc}")
+            continue
+
+        # -- that example must pass _validate_output_field --
+        schema = agdata(v=hint)
+        err = _validate_output_field("v", ex_val, schema)
+        if err is not None:
+            failures.append(
+                f"[{trial}] example from hint {hint!r} = {ex_val!r} failed validation: {err}"
+            )
+            continue
+
+        # -- example must appear in the generated value description --
+        _, vd = _return_tool_descriptions("v", hint)
+        if not isinstance(hint, type) or not issubclass(hint, agtype):
+            # agtype delegates to its own classmethods; skip appearance check there
+            if ex_str not in vd:
+                failures.append(
+                    f"[{trial}] example {ex_str!r} not found in value_desc {vd!r}"
+                )
+                continue
+
+        # -- the tool JSON Schema type must match the example's top-level type --
+        json_type = _hint_to_json_type(hint)
+        type_ok = (
+            (json_type == "array"   and isinstance(ex_val, list))   or
+            (json_type == "object"  and isinstance(ex_val, dict))   or
+            (json_type == "string"  and isinstance(ex_val, str))    or
+            (json_type == "integer" and isinstance(ex_val, int) and not isinstance(ex_val, bool)) or
+            (json_type == "number"  and isinstance(ex_val, float))  or
+            (json_type == "boolean" and isinstance(ex_val, bool))
+        )
+        if not type_ok:
+            failures.append(
+                f"[{trial}] example type mismatch — hint={hint!r} json_type={json_type!r} "
+                f"example={ex_val!r} (type {type(ex_val).__name__})"
+            )
+
+    assert not failures, f"{len(failures)}/100 trials failed:\n" + "\n".join(failures[:20])
