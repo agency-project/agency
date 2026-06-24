@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 from agency import agent, agskill, agdata
-from agency.agsandbox import agSandbox, _PID_PREFIX
+from agency.agsandbox import agSandbox
 
 
 def _make_run_dir(name: str):
