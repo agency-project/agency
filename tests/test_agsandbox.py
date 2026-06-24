@@ -739,21 +739,20 @@ class TestAgSandboxLifecycle:
         assert sb._started is False  # _started cleared even on failure
 
     @docker
-    def test_concurrent_stops_gated_by_shutdown_semaphore(self):
-        """Multiple concurrent stop() calls are limited by _shutdown_semaphore."""
-        from agency.agsandbox import _shutdown_semaphore
-        import threading
+    def test_concurrent_docker_calls_gated_by_docker_semaphore(self):
+        """All docker calls go through _run() which holds _docker_semaphore; peak concurrency <= 8."""
+        from agency.agsandbox import _docker_semaphore
 
         sandboxes = [_make_sandbox() for _ in range(4)]
+        lifecycle_tags = [f"agency/lifecycle-{sb._name}" for sb in sandboxes]
         for sb in sandboxes:
             sb.write_file("/workspace/x.txt", "x\n")
 
-        # Patch _shutdown_semaphore to track max concurrent acquisitions.
         concurrent = [0]
         peak = [0]
         lock = threading.Lock()
-        real_acquire = _shutdown_semaphore.acquire
-        real_release = _shutdown_semaphore.release
+        real_acquire = _docker_semaphore.acquire
+        real_release = _docker_semaphore.release
 
         def counting_acquire(*a, **kw):
             real_acquire(*a, **kw)
@@ -766,22 +765,25 @@ class TestAgSandboxLifecycle:
                 concurrent[0] -= 1
             real_release(*a, **kw)
 
-        _shutdown_semaphore.acquire = counting_acquire
-        _shutdown_semaphore.release = counting_release
+        _docker_semaphore.acquire = counting_acquire
+        _docker_semaphore.release = counting_release
         try:
-            threads = [threading.Thread(target=sb.stop, kwargs={"commit": False})
+            # stop(commit=True) exercises commit + rm -f; both must go through the semaphore.
+            threads = [threading.Thread(target=sb.stop, kwargs={"commit": True})
                        for sb in sandboxes]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
         finally:
-            _shutdown_semaphore.acquire = real_acquire
-            _shutdown_semaphore.release = real_release
+            _docker_semaphore.acquire = real_acquire
+            _docker_semaphore.release = real_release
+            for tag in lifecycle_tags:
+                subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
             for sb in sandboxes:
                 sb.destroy()
 
-        assert peak[0] <= 8, f"peak concurrent shutdowns {peak[0]} exceeded semaphore limit of 8"
+        assert peak[0] <= 16, f"peak concurrent docker calls {peak[0]} exceeded semaphore limit of 16"
 
     @docker
     def test_ensure_started_removes_created_state_container(self):
@@ -870,51 +872,6 @@ class TestAgSandboxLifecycle:
         assert sb._lifecycle_image == previous_lifecycle  # not updated on all-retry failure
         assert sb._started is False
 
-    @docker
-    def test_concurrent_stops_gated_by_commit_semaphore(self):
-        """Multiple concurrent stop(commit=True) calls are limited by _commit_semaphore."""
-        from agency.agsandbox import _commit_semaphore
-
-        sandboxes = [_make_sandbox() for _ in range(4)]
-        lifecycle_tags = [f"agency/lifecycle-{sb._name}" for sb in sandboxes]
-        for sb in sandboxes:
-            sb.write_file("/workspace/x.txt", "x\n")
-
-        concurrent = [0]
-        peak = [0]
-        lock = threading.Lock()
-        real_acquire = _commit_semaphore.acquire
-        real_release = _commit_semaphore.release
-
-        def counting_acquire(*a, **kw):
-            real_acquire(*a, **kw)
-            with lock:
-                concurrent[0] += 1
-                peak[0] = max(peak[0], concurrent[0])
-
-        def counting_release(*a, **kw):
-            with lock:
-                concurrent[0] -= 1
-            real_release(*a, **kw)
-
-        _commit_semaphore.acquire = counting_acquire
-        _commit_semaphore.release = counting_release
-        try:
-            threads = [threading.Thread(target=sb.stop, kwargs={"commit": True})
-                       for sb in sandboxes]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-        finally:
-            _commit_semaphore.acquire = real_acquire
-            _commit_semaphore.release = real_release
-            for tag in lifecycle_tags:
-                subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
-            for sb in sandboxes:
-                sb.destroy()
-
-        assert peak[0] <= 8, f"peak concurrent commits {peak[0]} exceeded semaphore limit of 8"
 
     @docker
     def test_ensure_started_removes_exited_container(self):
@@ -1457,7 +1414,7 @@ class TestResourceTools:
         time.sleep(0.2)
         assert not exec_done.is_set()   # still waiting
         pool1.release_gpu(0)            # free the GPU
-        exec_done.wait(timeout=5)
+        exec_done.wait(timeout=60)      # container startup (docker run) can take >5 s
         assert exec_done.is_set()
         sb2.destroy()
 

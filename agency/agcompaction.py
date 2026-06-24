@@ -82,10 +82,18 @@ def fetch_context_limit(llm_config: dict) -> int | None:
             api_key=llm_config.get("api_key", ""),
             base_url=llm_config.get("base_url"),
         )
-        info = client.models.retrieve(llm_config.get("model", ""))
-        extra = getattr(info, "model_extra", None) or {}
-        if "max_model_len" in extra:
-            return int(extra["max_model_len"])
+        model_id = llm_config.get("model", "")
+        # vLLM exposes max_model_len on the model object.  Use retrieve() when
+        # the model name is known; fall back to list() for the first loaded
+        # model when no name is configured (bare vLLM with default settings).
+        if model_id:
+            candidates = [client.models.retrieve(model_id)]
+        else:
+            candidates = list(client.models.list())
+        for info in candidates:
+            extra = getattr(info, "model_extra", None) or {}
+            if "max_model_len" in extra:
+                return int(extra["max_model_len"])
     except Exception as _e:
         print(f"[agcompaction] WARNING: failed to retrieve max_model_len from API: {_e}")
     return None

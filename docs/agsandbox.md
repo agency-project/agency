@@ -36,7 +36,7 @@ The container exists only during active tool execution. Between tool calls the c
 
 **Container naming**: each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a per-process UUID prefix. This prevents cross-run name collisions when an agent crashes without cleanup and is restarted with the same `agname`.
 
-**`stop()` reliability**: `docker rm -f` is retried up to 3 times under `_shutdown_semaphore` (which caps concurrent teardown at 8). If all retries fail, a `WARNING` is emitted to stderr and the framework continues — `_started` is cleared regardless so the next tool call can attempt a fresh container.
+**`stop()` reliability**: `docker rm -f` is retried up to 3 times. Each attempt goes through `_run()`, which holds `_docker_semaphore` (caps all concurrent daemon calls at 16). If all retries fail, a `WARNING` is emitted to stderr and the framework continues — `_started` is cleared regardless so the next tool call can attempt a fresh container.
 
 ## GPU device access
 

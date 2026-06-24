@@ -106,9 +106,7 @@ Two semaphores gate Docker daemon calls:
 
 | Semaphore | Limit | Guards |
 |---|---|---|
-| `_startup_semaphore` | 8 | Concurrent `docker run` calls. The NVIDIA runtime serialises GPU device initialisation; more than ~8 concurrent `docker run` calls increase contention without reducing wall-clock time. |
-| `_shutdown_semaphore` | 8 | Concurrent `docker rm -f` calls. The daemon serialises container teardown; flooding it makes individual removals slower and more likely to time out. |
-| `_commit_semaphore` | 8 | Concurrent `docker commit` calls. Committing snapshots large overlay filesystems; the daemon serialises the diff computation, so more than ~8 concurrent commits increase I/O contention without reducing wall-clock time. |
+| `_docker_semaphore` | 16 | All Docker/Podman daemon calls — held for the duration of each `_run()` invocation. The daemon serialises most operations internally (GPU init, overlay diff, container teardown), so more than ~16 concurrent calls increase contention without reducing wall-clock time. Replaces the former `_startup_semaphore` / `_commit_semaphore` / `_shutdown_semaphore` trio. |
 | `_container_semaphore` | `maxkeys − 5` | Total simultaneously running containers, derived from `/proc/sys/kernel/keys/maxkeys`. Each running container holds one Linux session keyring; hitting the limit causes `docker run` to fail with "disk quota exceeded". |
 
 The startup and shutdown semaphores limit *throughput*; the container semaphore limits *capacity*.
