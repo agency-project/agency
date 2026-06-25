@@ -47,18 +47,18 @@ _docker_semaphore = threading.Semaphore(16)
 # Timeout constants (seconds)
 # ---------------------------------------------------------------------------
 # Fast metadata queries: docker inspect, docker ps, nvidia-smi, docker update.
-_TIMEOUT_INSPECT    = 10
+_TIMEOUT_INSPECT    = 120
 # Quick in-container exec calls: kill <pids>, test -d, and similar.
-_TIMEOUT_EXEC_QUICK = 5
+_TIMEOUT_EXEC_QUICK = 120
 # docker run: GPU initialisation via the NVIDIA container runtime serialises
 # across concurrent containers and can take 60+ s under load.
 _TIMEOUT_DOCKER_RUN = 120
 # docker rm -f: fast teardown; should complete in a few seconds.
-_TIMEOUT_DOCKER_RM  = 30
+_TIMEOUT_DOCKER_RM  = 120
 # In-container file I/O via docker exec (base64 read/write, mkdir).
-_TIMEOUT_FILE_IO    = 30
+_TIMEOUT_FILE_IO    = 120
 # docker images list / docker rmi.
-_TIMEOUT_IMAGE      = 15
+_TIMEOUT_IMAGE      = 120
 # docker commit: snapshots a full overlay layer; large workspaces need extra time.
 _TIMEOUT_COMMIT     = 120
 # Maximum time to wait for a keyring slot before abandoning a docker run retry.

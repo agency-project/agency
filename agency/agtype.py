@@ -146,10 +146,11 @@ class agfile(agtype):
         sandbox: "agSandbox",
         skill_name: str,
         field_name: str,
+        suffix: str = "",
     ) -> tuple[str, list[str]]:
         if not isinstance(value, str):
             return value, []
-        path = f"/workspace/inputs/{field_name}.txt"
+        path = f"/workspace/inputs/{field_name}{suffix}.txt"
         try:
             sandbox.write_file(path, value)
             return path, [path]
@@ -325,8 +326,9 @@ class agbinary(agtype):
         sandbox: "agSandbox",
         skill_name: str,
         field_name: str,
+        suffix: str = "",
     ) -> tuple[str, list[str]]:
-        path = f"/workspace/inputs/{field_name}.bin"
+        path = f"/workspace/inputs/{field_name}{suffix}.bin"
         try:
             raw = cls._to_bytes(value)
         except (TypeError, ValueError):

@@ -153,6 +153,7 @@ INPUT_OFFLOAD_CHARS: int = 2000
 def _offload_large_fields(
     inp: agdata, sandbox: "agSandbox", skill_name: str,
     schema: "agdata | None" = None,
+    suffix: str = "",
 ) -> tuple[list[str], list[str]]:
     """Write oversized string fields to /workspace/inputs/ in the sandbox.
 
@@ -184,7 +185,7 @@ def _offload_large_fields(
         if isinstance(val, str):
             if len(val) <= INPUT_OFFLOAD_CHARS:
                 continue
-            path = f"/workspace/inputs/{skill_name}_{key}.txt"
+            path = f"/workspace/inputs/{skill_name}_{key}{suffix}.txt"
             try:
                 sandbox.write_file(path, val)
                 inp._data[key] = (
@@ -200,7 +201,7 @@ def _offload_large_fields(
             for i, item in enumerate(val):
                 if not isinstance(item, str) or len(item) <= INPUT_OFFLOAD_CHARS:
                     continue
-                path = f"/workspace/inputs/{skill_name}_{key}_{i}.txt"
+                path = f"/workspace/inputs/{skill_name}_{key}_{i}{suffix}.txt"
                 try:
                     sandbox.write_file(path, item)
                     new_vals[i] = path
@@ -215,7 +216,8 @@ def _offload_large_fields(
 
 
 def _prepare_agtype_inputs(
-    inp: agdata, schema: "agdata | None", sandbox: "agSandbox", skill_name: str
+    inp: agdata, schema: "agdata | None", sandbox: "agSandbox", skill_name: str,
+    suffix: str = "",
 ) -> list[str]:
     """Prepare agtype input fields before the skill runs.
 
@@ -231,7 +233,7 @@ def _prepare_agtype_inputs(
         if isinstance(hint, type) and issubclass(hint, agtype):
             val = inp._data.get(key)
             try:
-                new_val, written = hint.prepare(val, sandbox, skill_name, key)
+                new_val, written = hint.prepare(val, sandbox, skill_name, key, suffix=suffix)
                 inp._data[key] = new_val
                 paths.extend(written)
             except Exception as _e:
@@ -246,7 +248,7 @@ def _prepare_agtype_inputs(
                     new_vals = []
                     for v in vals:
                         try:
-                            new_v, written = inner.prepare(v, sandbox, skill_name, key)
+                            new_v, written = inner.prepare(v, sandbox, skill_name, key, suffix=suffix)
                             paths.extend(written)
                         except Exception as _e:
                             print(f"[agent] WARNING: {inner.__name__}.prepare failed for list field '{key}': {_e}")
@@ -638,11 +640,17 @@ class agent:
 
                 # Prepare agtype fields first (agfile → file path), then offload
                 # any remaining oversized plain-string fields.
+                # Timestamp suffix ensures each invocation writes to a unique path
+                # so persistent agents always see new file names and re-read them.
+                import time as _time
+                _input_suffix = f"_{int(_time.time() * 1000)}"
                 _offloaded_paths.extend(
-                    _prepare_agtype_inputs(input, af.input_schema, self.sandbox, skill_name)
+                    _prepare_agtype_inputs(input, af.input_schema, self.sandbox, skill_name,
+                                           suffix=_input_suffix)
                 )
                 auto_paths, auto_fields = _offload_large_fields(
-                    input, self.sandbox, skill_name, schema=af.input_schema
+                    input, self.sandbox, skill_name, schema=af.input_schema,
+                    suffix=_input_suffix
                 )
                 _offloaded_paths.extend(auto_paths)
 
