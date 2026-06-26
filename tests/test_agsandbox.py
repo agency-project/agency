@@ -1485,105 +1485,114 @@ class TestResourceTools:
 
 
 # ---------------------------------------------------------------------------
-# Dangling image auto-cleanup (periodic pruner)
+# Dangling image auto-cleanup (eager rmi on commit)
 # ---------------------------------------------------------------------------
 
-class TestDanglingImagePruner:
-    """Tests for _dangling_prune_loop and the agsandbox-prune daemon thread."""
+class TestDanglingImageEagerCleanup:
+    """Tests for the eager old-image deletion in stop(commit=True)."""
 
-    def test_prune_thread_is_running(self):
-        """The agsandbox-prune daemon thread must be alive after module import."""
+    def test_no_prune_thread(self):
+        """No background agsandbox-prune thread should exist after the refactor."""
         named = [t for t in threading.enumerate() if t.name == "agsandbox-prune"]
-        assert named, "agsandbox-prune thread not found"
-        assert named[0].daemon, "agsandbox-prune thread must be a daemon"
-        assert named[0].is_alive()
+        assert not named, "agsandbox-prune thread should have been removed"
 
-    def test_prune_skips_when_no_live_sandboxes(self):
-        """_dangling_prune_loop must not call docker when _live_sandboxes is empty."""
+    def test_stop_commit_deletes_old_image(self):
+        """stop(commit=True) must delete the image that previously held the tag."""
         import agency.agsandbox as _mod
-        from agency.agsandbox import _dangling_prune_loop, _PRUNE_INTERVAL_S
 
-        prune_calls = []
+        sb = _make_sandbox()
+        tag = f"agency/lifecycle-{sb._name}"
 
-        def fake_run(cmd, **kwargs):
-            prune_calls.append(cmd)
+        run_calls = []
+        fake_old_id = "sha256:deadbeef0000"
 
-        # Patch sleep to fire immediately once then raise to exit the loop.
-        sleep_calls = [0]
-        def fast_sleep(n):
-            sleep_calls[0] += 1
-            if sleep_calls[0] > 1:
-                raise StopIteration
+        class FakeCompleted:
+            def __init__(self, stdout=b"", returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
 
-        with patch.object(_mod, "_live_sandboxes", new=set()):
-            with patch("agency.agsandbox.subprocess.run", side_effect=fake_run):
-                with patch("agency.agsandbox.time.sleep", side_effect=fast_sleep):
-                    try:
-                        _dangling_prune_loop()
-                    except StopIteration:
-                        pass
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            run_calls.append(args)
+            if "inspect" in args:
+                return FakeCompleted(stdout=fake_old_id.encode())
+            if "commit" in args:
+                return FakeCompleted()
+            if "rm" in args:
+                return FakeCompleted()
+            if "rmi" in args:
+                return FakeCompleted()
+            return FakeCompleted()
 
-        assert prune_calls == [], "prune must not run when _live_sandboxes is empty"
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            with patch.object(sb, "_started", True):
+                with patch.object(sb, "_container_running", return_value=True):
+                    with patch.object(sb, "_gpu_virtual", False):
+                        sb.stop(commit=True)
 
-    def test_prune_runs_when_sandboxes_active(self):
-        """_dangling_prune_loop calls `docker image prune -f` when sandboxes are live."""
-        import agency.agsandbox as _mod
-        from agency.agsandbox import _dangling_prune_loop
-
-        prune_calls = []
-
-        def fake_run(cmd, **kwargs):
-            prune_calls.append(cmd)
-
-        sleep_calls = [0]
-        def fast_sleep(n):
-            sleep_calls[0] += 1
-            if sleep_calls[0] > 1:
-                raise StopIteration
-
-        sentinel = object()  # non-empty set — simulates a live sandbox
-        with patch.object(_mod, "_live_sandboxes", new={sentinel}):
-            with patch.object(_mod, "get_container_runtime", return_value="docker"):
-                with patch("agency.agsandbox.subprocess.run", side_effect=fake_run):
-                    with patch("agency.agsandbox.time.sleep", side_effect=fast_sleep):
-                        try:
-                            _dangling_prune_loop()
-                        except StopIteration:
-                            pass
-
-        assert any("prune" in " ".join(cmd) for cmd in prune_calls), (
-            f"expected image prune call, got: {prune_calls}"
+        rmi_calls = [a for a in run_calls if "rmi" in a]
+        assert rmi_calls, "expected docker rmi call for old image"
+        assert any(fake_old_id in " ".join(a) for a in rmi_calls), (
+            f"rmi call did not reference old image ID; calls: {rmi_calls}"
         )
-        assert any("-f" in cmd for cmd in prune_calls)
 
-    def test_prune_subprocess_error_does_not_crash_loop(self):
-        """Exceptions from subprocess.run must be caught; loop continues."""
+    def test_stop_commit_skips_rmi_when_no_old_image(self):
+        """If the tag does not exist yet (first commit), no rmi call is made."""
         import agency.agsandbox as _mod
-        from agency.agsandbox import _dangling_prune_loop
 
-        sleep_calls = [0]
-        def fast_sleep(n):
-            sleep_calls[0] += 1
-            if sleep_calls[0] > 1:
-                raise StopIteration
+        sb = _make_sandbox()
 
-        sentinel = object()
-        with patch.object(_mod, "_live_sandboxes", new={sentinel}):
-            with patch.object(_mod, "get_container_runtime", return_value="docker"):
-                with patch("agency.agsandbox.subprocess.run", side_effect=RuntimeError("docker gone")):
-                    with patch("agency.agsandbox.time.sleep", side_effect=fast_sleep):
-                        try:
-                            _dangling_prune_loop()   # must not propagate the RuntimeError
-                        except StopIteration:
-                            pass
-                        except RuntimeError:
-                            pytest.fail("RuntimeError from subprocess.run escaped the loop")
+        class FakeCompleted:
+            def __init__(self, stdout=b"", returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+
+        run_calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            run_calls.append(args)
+            if "inspect" in args:
+                return FakeCompleted(stdout=b"", returncode=1)  # tag not found
+            return FakeCompleted()
+
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            with patch.object(sb, "_started", True):
+                with patch.object(sb, "_container_running", return_value=True):
+                    with patch.object(sb, "_gpu_virtual", False):
+                        sb.stop(commit=True)
+
+        rmi_calls = [a for a in run_calls if "rmi" in a]
+        assert not rmi_calls, "must not call rmi when there was no previous image"
+
+    def test_stop_commit_rmi_failure_does_not_raise(self):
+        """A failing rmi (e.g. race condition) must not propagate — best-effort only."""
+        import agency.agsandbox as _mod
+
+        sb = _make_sandbox()
+        fake_old_id = "sha256:cafebabe1234"
+
+        class FakeCompleted:
+            def __init__(self, stdout=b"", returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "inspect" in args:
+                return FakeCompleted(stdout=fake_old_id.encode())
+            if "rmi" in args:
+                raise RuntimeError("image in use")
+            return FakeCompleted()
+
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            with patch.object(sb, "_started", True):
+                with patch.object(sb, "_container_running", return_value=True):
+                    with patch.object(sb, "_gpu_virtual", False):
+                        sb.stop(commit=True)  # must not raise
 
     @docker
-    def test_repeated_commits_create_dangling_images(self):
-        """Committing to the same Docker tag 3 times leaves ≥2 dangling image layers."""
-        name = f"test-dangling-{uuid.uuid4().hex[:8]}"
-        tag  = f"agency/test-dangling-{name}"
+    def test_repeated_commits_leave_no_dangling_images(self):
+        """stop(commit=True) called 3 times to the same tag must leave 0 new dangling images."""
+        name = f"test-eager-{uuid.uuid4().hex[:8]}"
+        tag  = f"agency/lifecycle-{name}"
 
         def _dangling_ids():
             r = subprocess.run(
@@ -1599,53 +1608,22 @@ class TestDanglingImagePruner:
         )
         try:
             before = _dangling_ids()
-            # Three commits to the same tag; each overwrites the previous,
-            # leaving the prior image as dangling.
             for _ in range(3):
+                old_id_r = subprocess.run(
+                    ["docker", "inspect", "--format={{.Id}}", tag],
+                    capture_output=True, text=True,
+                )
+                old_id = old_id_r.stdout.strip() if old_id_r.returncode == 0 else None
                 subprocess.run(["docker", "commit", name, tag],
                                capture_output=True, check=True)
+                if old_id:
+                    subprocess.run(["docker", "rmi", old_id],
+                                   capture_output=True)
             after = _dangling_ids()
             new_dangling = after - before
-            assert len(new_dangling) >= 2, (
-                f"expected ≥2 new dangling images after 3 commits to same tag, "
-                f"got {len(new_dangling)}"
+            assert len(new_dangling) == 0, (
+                f"expected 0 new dangling images with eager cleanup, got {len(new_dangling)}"
             )
-        finally:
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
-            subprocess.run(["docker", "image", "prune", "-f"], capture_output=True)
-
-    @docker
-    def test_image_prune_removes_dangling_images(self):
-        """docker image prune -f clears dangling images created by repeated commits."""
-        name = f"test-prune-{uuid.uuid4().hex[:8]}"
-        tag  = f"agency/test-prune-{name}"
-
-        subprocess.run(
-            ["docker", "run", "-d", "--name", name, "agency-sandbox:latest",
-             "tail", "-f", "/dev/null"],
-            capture_output=True, check=True,
-        )
-        try:
-            for _ in range(3):
-                subprocess.run(["docker", "commit", name, tag],
-                               capture_output=True, check=True)
-
-            before = subprocess.run(
-                ["docker", "images", "-f", "dangling=true", "-q"],
-                capture_output=True, text=True,
-            )
-            assert before.stdout.strip(), "expected dangling images before prune"
-
-            # This is what the background thread does.
-            subprocess.run(["docker", "image", "prune", "-f"],
-                           capture_output=True, check=True)
-
-            after = subprocess.run(
-                ["docker", "images", "-f", "dangling=true", "-q"],
-                capture_output=True, text=True,
-            )
-            assert after.stdout.strip() == "", "dangling images must be gone after prune"
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
