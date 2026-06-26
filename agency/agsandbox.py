@@ -134,6 +134,7 @@ def _cleanup_all_sandboxes() -> None:
 atexit.register(_cleanup_all_sandboxes)
 
 
+
 def _runtime_works(runtime: str) -> bool:
     try:
         proc = subprocess.run(
@@ -706,6 +707,19 @@ class agSandbox:
         self._baseline_pids = set()
         if commit:
             tag = f"agency/lifecycle-{self._name}"
+            # Capture the current image ID before overwriting the tag so we
+            # can delete it afterward — committing to an existing tag leaves
+            # the old image dangling (untagged but still on disk).
+            old_image_id: str | None = None
+            try:
+                result = self._run(
+                    [self._runtime, "inspect", "--format={{.Id}}", tag],
+                    check=False, timeout=30,
+                )
+                if result and result.returncode == 0:
+                    old_image_id = result.stdout.decode("utf-8", errors="replace").strip() or None
+            except Exception:
+                pass
             for _attempt in range(3):
                 try:
                     self._run(
@@ -723,6 +737,15 @@ class agSandbox:
                         )
                     else:
                         time.sleep(1)
+            # Delete the previous image now that the tag points to the new one.
+            if old_image_id and self._lifecycle_image == tag:
+                try:
+                    self._run(
+                        [self._runtime, "rmi", old_image_id],
+                        check=False, timeout=30,
+                    )
+                except Exception:
+                    pass
         name = self._container_name()
         for _attempt in range(3):
             try:

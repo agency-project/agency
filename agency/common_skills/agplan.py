@@ -57,7 +57,7 @@ class agplan(agskill):
             max_output_schema_retries=max_output_schema_retries,
         )
 
-    def _build_tools(self, sandbox, pool, term, log):
+    def _build_tools(self, sandbox, pool, term, log, _ensure_read: bool = False):
         from ..tools import make_read, make_grep, make_glob, webfetch
         if sandbox is not None:
             active_tools: list[agtool] = [

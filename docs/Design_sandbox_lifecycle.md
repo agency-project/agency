@@ -113,6 +113,39 @@ Two semaphores gate Docker daemon calls:
 
 ---
 
+## Dangling image accumulation and eager cleanup
+
+Every successful tool call commits the container state with the same tag:
+
+```
+docker commit <container> agency/lifecycle-<agname>
+```
+
+When Docker retags an existing image, the old image loses its tag and becomes **dangling** — no name, not referenced by any container, but still occupying space in `/var/lib/docker/.../overlay2`. With `MAX_CONCURRENT=80` agents each making dozens of tool calls this can consume tens of GB during a long run.
+
+**Fix: delete old image immediately on commit**
+
+Before committing, `stop(commit=True)` inspects the tag to record the current image ID. After the new commit succeeds, it deletes the now-unreferenced old image with `docker rmi`:
+
+```python
+# capture old ID before overwriting the tag
+result = self._run([runtime, "inspect", "--format={{.Id}}", tag], check=False)
+old_image_id = result.stdout.decode().strip() or None
+
+# commit new snapshot
+self._run([runtime, "commit", container, tag], check=True)
+
+# delete the image that just lost its tag
+if old_image_id:
+    self._run([runtime, "rmi", old_image_id], check=False)
+```
+
+- **Eager, not deferred**: space is reclaimed at every tool-call boundary rather than on a periodic sweep.
+- **Best-effort**: the `rmi` uses `check=False` — if it fails (e.g. race with another agent's inspect) the image becomes dangling as before, which is no worse than the old behaviour.
+- **No background thread needed**: the prune thread and `_PRUNE_INTERVAL_S` constant have been removed.
+
+---
+
 ## `stop()` reliability
 
 `docker rm -f` is not always instantaneous: the Docker daemon can be slow under load, an overlay filesystem may have open file handles, or container namespaces may not have been fully released by the kernel. The original implementation swallowed all failures silently, causing zombie containers to accumulate.

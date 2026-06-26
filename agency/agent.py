@@ -700,6 +700,7 @@ class agent:
                     _ping_interval_s=agent.ping_interval_s,
                     _poll_interval_s=agent.poll_interval_s,
                     _agname=self.agname,
+                    _ensure_read=bool(_offloaded_paths),
                 )
                 outer_input_tokens  = _tok[0]
                 outer_output_tokens = _tok[1]

@@ -1313,9 +1313,10 @@ class agskill:
         pool: "agResourcePool | None",
         term: "agterm | None",
         log: "aglog | None",
+        _ensure_read: bool = False,
     ) -> "tuple[list, dict, list | None]":
         """Build and return (active_tools, tool_map, openai_tools)."""
-        from .tools import make_sandboxed_tools
+        from .tools import make_sandboxed_tools, make_read
         if self.replace_tools is not None:
             active_tools: list[agtool] = list(self.replace_tools)
         elif sandbox is not None:
@@ -1324,6 +1325,11 @@ class agskill:
                 active_tools.extend(self.add_tools)
         else:
             active_tools = list(self.add_tools or [])
+        # If input fields were offloaded to sandbox files, ensure the read tool
+        # is available even for skills that use replace_tools without it.
+        if _ensure_read and sandbox is not None:
+            if not any(getattr(t, "name", None) == "read" for t in active_tools):
+                active_tools.append(make_read(sandbox))
         for t in active_tools:
             t.attach_logger(term, log)
         tool_map = {t.name: t for t in active_tools}
@@ -1379,6 +1385,7 @@ class agskill:
         _ping_interval_s: float = 300,
         _poll_interval_s: float = 5,
         _agname: str = "",
+        _ensure_read: bool = False,
     ) -> tuple[agdata, agdata, list[dict], tuple[int, int]]:
         """Run the ReAct loop, including sandbox process monitoring.
 
@@ -1402,7 +1409,7 @@ class agskill:
             sys_msg = {"role": "system", "content": self._build_system_prompt(_extra_system)}
             return agdata(error=input_error), history, [sys_msg], (0, 0)
 
-        _active_tools, tool_map, openai_tools = self._build_tools(sandbox, pool, term, log)
+        _active_tools, tool_map, openai_tools = self._build_tools(sandbox, pool, term, log, _ensure_read=_ensure_read)
 
         # Tool-based output collection (return_output tool).
         # Used for all output schemas except agrawstring (raw text).

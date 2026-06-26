@@ -1482,3 +1482,170 @@ class TestResourceTools:
         assert result.error is None
         assert "0.5" in result.message
         assert "512m" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Dangling image auto-cleanup (periodic pruner)
+# ---------------------------------------------------------------------------
+
+class TestDanglingImagePruner:
+    """Tests for _dangling_prune_loop and the agsandbox-prune daemon thread."""
+
+    def test_prune_thread_is_running(self):
+        """The agsandbox-prune daemon thread must be alive after module import."""
+        named = [t for t in threading.enumerate() if t.name == "agsandbox-prune"]
+        assert named, "agsandbox-prune thread not found"
+        assert named[0].daemon, "agsandbox-prune thread must be a daemon"
+        assert named[0].is_alive()
+
+    def test_prune_skips_when_no_live_sandboxes(self):
+        """_dangling_prune_loop must not call docker when _live_sandboxes is empty."""
+        import agency.agsandbox as _mod
+        from agency.agsandbox import _dangling_prune_loop, _PRUNE_INTERVAL_S
+
+        prune_calls = []
+
+        def fake_run(cmd, **kwargs):
+            prune_calls.append(cmd)
+
+        # Patch sleep to fire immediately once then raise to exit the loop.
+        sleep_calls = [0]
+        def fast_sleep(n):
+            sleep_calls[0] += 1
+            if sleep_calls[0] > 1:
+                raise StopIteration
+
+        with patch.object(_mod, "_live_sandboxes", new=set()):
+            with patch("agency.agsandbox.subprocess.run", side_effect=fake_run):
+                with patch("agency.agsandbox.time.sleep", side_effect=fast_sleep):
+                    try:
+                        _dangling_prune_loop()
+                    except StopIteration:
+                        pass
+
+        assert prune_calls == [], "prune must not run when _live_sandboxes is empty"
+
+    def test_prune_runs_when_sandboxes_active(self):
+        """_dangling_prune_loop calls `docker image prune -f` when sandboxes are live."""
+        import agency.agsandbox as _mod
+        from agency.agsandbox import _dangling_prune_loop
+
+        prune_calls = []
+
+        def fake_run(cmd, **kwargs):
+            prune_calls.append(cmd)
+
+        sleep_calls = [0]
+        def fast_sleep(n):
+            sleep_calls[0] += 1
+            if sleep_calls[0] > 1:
+                raise StopIteration
+
+        sentinel = object()  # non-empty set — simulates a live sandbox
+        with patch.object(_mod, "_live_sandboxes", new={sentinel}):
+            with patch.object(_mod, "get_container_runtime", return_value="docker"):
+                with patch("agency.agsandbox.subprocess.run", side_effect=fake_run):
+                    with patch("agency.agsandbox.time.sleep", side_effect=fast_sleep):
+                        try:
+                            _dangling_prune_loop()
+                        except StopIteration:
+                            pass
+
+        assert any("prune" in " ".join(cmd) for cmd in prune_calls), (
+            f"expected image prune call, got: {prune_calls}"
+        )
+        assert any("-f" in cmd for cmd in prune_calls)
+
+    def test_prune_subprocess_error_does_not_crash_loop(self):
+        """Exceptions from subprocess.run must be caught; loop continues."""
+        import agency.agsandbox as _mod
+        from agency.agsandbox import _dangling_prune_loop
+
+        sleep_calls = [0]
+        def fast_sleep(n):
+            sleep_calls[0] += 1
+            if sleep_calls[0] > 1:
+                raise StopIteration
+
+        sentinel = object()
+        with patch.object(_mod, "_live_sandboxes", new={sentinel}):
+            with patch.object(_mod, "get_container_runtime", return_value="docker"):
+                with patch("agency.agsandbox.subprocess.run", side_effect=RuntimeError("docker gone")):
+                    with patch("agency.agsandbox.time.sleep", side_effect=fast_sleep):
+                        try:
+                            _dangling_prune_loop()   # must not propagate the RuntimeError
+                        except StopIteration:
+                            pass
+                        except RuntimeError:
+                            pytest.fail("RuntimeError from subprocess.run escaped the loop")
+
+    @docker
+    def test_repeated_commits_create_dangling_images(self):
+        """Committing to the same Docker tag 3 times leaves ≥2 dangling image layers."""
+        name = f"test-dangling-{uuid.uuid4().hex[:8]}"
+        tag  = f"agency/test-dangling-{name}"
+
+        def _dangling_ids():
+            r = subprocess.run(
+                ["docker", "images", "-f", "dangling=true", "-q"],
+                capture_output=True, text=True,
+            )
+            return set(ln.strip() for ln in r.stdout.splitlines() if ln.strip())
+
+        subprocess.run(
+            ["docker", "run", "-d", "--name", name, "agency-sandbox:latest",
+             "tail", "-f", "/dev/null"],
+            capture_output=True, check=True,
+        )
+        try:
+            before = _dangling_ids()
+            # Three commits to the same tag; each overwrites the previous,
+            # leaving the prior image as dangling.
+            for _ in range(3):
+                subprocess.run(["docker", "commit", name, tag],
+                               capture_output=True, check=True)
+            after = _dangling_ids()
+            new_dangling = after - before
+            assert len(new_dangling) >= 2, (
+                f"expected ≥2 new dangling images after 3 commits to same tag, "
+                f"got {len(new_dangling)}"
+            )
+        finally:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+            subprocess.run(["docker", "image", "prune", "-f"], capture_output=True)
+
+    @docker
+    def test_image_prune_removes_dangling_images(self):
+        """docker image prune -f clears dangling images created by repeated commits."""
+        name = f"test-prune-{uuid.uuid4().hex[:8]}"
+        tag  = f"agency/test-prune-{name}"
+
+        subprocess.run(
+            ["docker", "run", "-d", "--name", name, "agency-sandbox:latest",
+             "tail", "-f", "/dev/null"],
+            capture_output=True, check=True,
+        )
+        try:
+            for _ in range(3):
+                subprocess.run(["docker", "commit", name, tag],
+                               capture_output=True, check=True)
+
+            before = subprocess.run(
+                ["docker", "images", "-f", "dangling=true", "-q"],
+                capture_output=True, text=True,
+            )
+            assert before.stdout.strip(), "expected dangling images before prune"
+
+            # This is what the background thread does.
+            subprocess.run(["docker", "image", "prune", "-f"],
+                           capture_output=True, check=True)
+
+            after = subprocess.run(
+                ["docker", "images", "-f", "dangling=true", "-q"],
+                capture_output=True, text=True,
+            )
+            assert after.stdout.strip() == "", "dangling images must be gone after prune"
+        finally:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)

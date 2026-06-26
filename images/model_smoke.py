@@ -1,5 +1,5 @@
 """
-Smoke test: run Qwen/Qwen3.5-0.8B on the first 10 entries of Wikitext-2.
+Smoke test: run google/gemma-4-E2B-it on the first 4 entries of Wikitext-2.
 """
 
 import textwrap
@@ -7,18 +7,30 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = "Qwen/Qwen3.5-0.8B"
+MODEL_ID = "google/gemma-4-E2B-it"
 NUM_ENTRIES = 4
 MAX_NEW_TOKENS = 30
 
 
+def _pick_device() -> str:
+    if not torch.cuda.is_available():
+        return "cpu"
+    try:
+        torch.zeros(1, device="cuda")
+        return "cuda"
+    except RuntimeError:
+        print("WARNING: CUDA device unavailable, falling back to CPU.")
+        return "cpu"
+
+
 def main() -> None:
-    print(f"Loading tokenizer and model: {MODEL_ID}")
+    device = _pick_device()
+    print(f"Loading tokenizer and model: {MODEL_ID}  (device={device})")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map=device,
     )
     model.eval()
 
