@@ -979,12 +979,9 @@ class TestAgSandboxFileIO:
 
     @docker
     def test_read_binary_file_raises_unicode_decode_error(self):
-        # Write 4 null bytes — not valid UTF-8 in isolation
-        import base64
-        raw = bytes([0x89, 0x50, 0x4E, 0x47])  # PNG magic
-        self.sb._container_exec(
-            f"printf '\\x89\\x50\\x4e\\x47' > /workspace/binary.bin", shell="sh"
-        )
+        # PNG magic bytes — not valid UTF-8. Use write_file_bytes to guarantee
+        # binary content regardless of shell printf \x-escape support.
+        self.sb.write_file_bytes("/workspace/binary.bin", bytes([0x89, 0x50, 0x4E, 0x47]))
         with pytest.raises(UnicodeDecodeError):
             self.sb.read_file("/workspace/binary.bin")
 

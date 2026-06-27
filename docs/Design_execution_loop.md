@@ -204,7 +204,18 @@ For each tool call in `_dispatch_tools`:
 3. If `need_sandbox=True`, the sandbox is committed to a pre-call checkpoint image before the tool executes.
 4. The tool function runs in a `ProcessPoolExecutor` worker with a configurable timeout (default `TOOL_TIMEOUT_S = 30 s`, overridable per call via a `"timeout"` key in arguments).
 5. If the tool raises or returns an error and a pre-call checkpoint was taken, the sandbox is restored to the checkpoint image and `"workspace_reverted"` is appended to the error message.
-6. If the result exceeds `_TOOL_OUTPUT_OFFLOAD_CHARS` (80 000 chars), it is saved to a file inside the sandbox and replaced with a short reference note.
+6. **Large output offloading.** If the result exceeds the offload threshold (`max(40 000, context_limit × 0.1 × 4)` characters), the content is written to `/workspace/long_tool_call_outputs/<tool>_<id>.txt` inside the sandbox and the tool result is replaced with a short note:
+   ```json
+   {"note": "Output was too large and has been saved to /workspace/long_tool_call_outputs/.... Use the read tool to access it."}
+   ```
+   This applies to every tool regardless of `need_sandbox` — even host-side tools like `fetch_paper` or `arxiv_search` can return large content that would bloat the context.
+
+7. **Lazy read injection.** If the offload note tells the LLM to use `read` but `read` is not in the current tool schema (e.g. the skill uses `replace_tools=[fetch_paper]` with no sandbox tools), `_dispatch_tools` injects `read` into `tool_map` and returns `True`. The ReAct loop then appends the read tool's JSON schema to `openai_tools` before the next LLM call:
+   ```python
+   if _read_injected:
+       openai_tools = (openai_tools or []) + [tool_map["read"].to_openai_tool()]
+   ```
+   `openai_tools` is a local variable built once at skill start and reused every iteration — once `read` is appended it stays present for the remainder of the skill run. There is no per-iteration reset. If a second offload occurs on a later step, `_dispatch_tools` finds `"read"` already in `tool_map` and does not add a duplicate.
 
 After all tool calls in the response are dispatched, the loop goes back to step 3d.
 
@@ -331,6 +342,7 @@ caller.field ────────────── blocks ─────�
                                                                │        │   → sandbox.exec()
                                                                │        │   error? → restore checkpoint
                                                                │        │   large output? → offload to file
+                                                               │        │     read not in tools? → inject read into openai_tools
                                                                │        │   loop back
                                                                │        └─ final answer?
                                                                │            had_inbox? → continue

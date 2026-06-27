@@ -16,9 +16,8 @@ SUMMARY_MAX_TOKENS = 1024            # Maximum tokens allowed in the LLM's gener
 
 # --- Constants matching opencode's design -----------------------------------
 
-# Fire when prompt is within this many tokens of the context limit.
-# opencode default: 20 000.  Floor at 50% prevents nonsense on small models.
-_RESERVED = 20_000
+# Fire when the prompt exceeds this fraction of the context limit.
+_COMPACT_THRESHOLD = 0.70
 
 TAIL_TURNS = 2          # max recent assistant turns to keep verbatim
 _TAIL_FRACTION = 0.25   # fraction of usable context budgeted for the tail
@@ -68,12 +67,13 @@ that must be respected going forward>
 
 # --- Public helpers ----------------------------------------------------------
 
-def fetch_context_limit(llm_config: dict) -> int | None:
-    """Return the model's context window size, or None if unavailable.
+def fetch_context_limit(llm_config: dict) -> int:
+    """Return the model's context window size.
 
     Priority:
     1. ``llm_config["context_limit"]`` — explicit user override
     2. vLLM ``max_model_len`` from ``GET /v1/models/{model}``
+    3. ``DEFAULT_CONTEXT_LIMIT`` — safe fallback so compaction always runs
     """
     if "context_limit" in llm_config:
         return int(llm_config["context_limit"])
@@ -83,29 +83,25 @@ def fetch_context_limit(llm_config: dict) -> int | None:
             base_url=llm_config.get("base_url"),
         )
         model_id = llm_config.get("model", "")
-        # vLLM exposes max_model_len on the model object.  Use retrieve() when
-        # the model name is known; fall back to list() for the first loaded
-        # model when no name is configured (bare vLLM with default settings).
-        if model_id:
-            candidates = [client.models.retrieve(model_id)]
-        else:
-            candidates = list(client.models.list())
+        # vLLM exposes max_model_len on the model list response.  Always use
+        # list() — retrieve() breaks on model names containing "/" because the
+        # openai client constructs /v1/models/<name> without URL-encoding.
+        all_models = list(client.models.list())
+        # Prefer the model matching our configured name; fall back to the first.
+        candidates = [m for m in all_models if m.id == model_id] or all_models
         for info in candidates:
             extra = getattr(info, "model_extra", None) or {}
             if "max_model_len" in extra:
                 return int(extra["max_model_len"])
     except Exception as _e:
         print(f"[agcompaction] WARNING: failed to retrieve max_model_len from API: {_e}")
-    return None
+    print(f"[agcompaction] WARNING: context limit unknown, falling back to {DEFAULT_CONTEXT_LIMIT}")
+    return DEFAULT_CONTEXT_LIMIT
 
 
 def should_compact(prompt_tokens: int, context_limit: int) -> bool:
-    """Return True when the prompt is within _RESERVED tokens of the context limit.
-
-    A 50% floor prevents the threshold from going negative on small models.
-    """
-    threshold = max(context_limit - _RESERVED, context_limit // 2)
-    return prompt_tokens >= threshold
+    """Return True when the prompt exceeds _COMPACT_THRESHOLD of the context limit."""
+    return prompt_tokens >= int(context_limit * _COMPACT_THRESHOLD)
 
 
 # --- Internal helpers --------------------------------------------------------
@@ -175,7 +171,7 @@ def _tail_start(conv: list[dict], context_limit: int,
     if not conv:
         return 0
 
-    usable = max(context_limit - _RESERVED, context_limit // 2)
+    usable = int(context_limit * _COMPACT_THRESHOLD)
     tail_budget = max(_TAIL_MIN_TOKENS, min(_TAIL_MAX_TOKENS,
                                             int(usable * _TAIL_FRACTION)))
 

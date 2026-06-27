@@ -2,17 +2,60 @@
 
 Long-running skills accumulate tokens across many tool calls and ReAct iterations. Auto-compaction monitors token usage after each LLM response and — when consumption crosses a threshold — replaces old messages with an LLM-generated summary, freeing headroom for further work without interrupting the skill.
 
+## Pre-call token estimation
+
+Before each LLM call, `agskill` computes a prompt size estimate used for two purposes:
+
+1. **Web UI token display** — the running token count is updated immediately, so the UI shows growth even if the call fails.
+2. **`max_tokens` clamping** — `max_tokens` is reduced so that `prompt + max_tokens` never exceeds `context_limit`.
+
+The estimate uses the fast chars/4 heuristic (`estimate_messages_tokens`) over the full message list. No tokenize endpoint call is made pre-call.
+
+```python
+_pre_estimate = estimate_messages_tokens(messages)  # sum(len(content) // 4) for all messages
+```
+
+### `max_tokens` clamping
+
+```python
+_headroom = max(1, context_limit - _pre_estimate)
+if kwargs.get("max_tokens", _headroom) > _headroom:
+    kwargs["max_tokens"] = _headroom
+```
+
+The configured `max_tokens` is only ever reduced, never increased. If the chars/4 estimate is optimistic (underestimates token-dense content), the API may still return a 400 context-exceeded error — this is handled reactively (see below).
+
+## Reactive compaction on context-exceeded errors
+
+The chars/4 estimate can underestimate token-dense content (code, JSON, base64). When this causes the proactive compaction check to miss, the API returns a 400 `BadRequestError` with a context-length message. `agskill` detects this and triggers forced compaction before retrying:
+
+```python
+# In _llm_call:
+except openai.BadRequestError as e:
+    if "context length" in str(e).lower():
+        return _LLMCallResult(context_exceeded=True)
+
+# In the ReAct loop:
+if llm_result.context_exceeded:
+    messages, _compaction_summary = _maybe_compact(..., force=True)
+    continue  # retry the same step
+```
+
+`force=True` bypasses the `should_compact` threshold check so compaction always runs regardless of the estimated token count. The step counter is not incremented — the same ReAct iteration is retried after compaction.
+
+---
+
 ## Trigger
 
 After each LLM response in the ReAct loop, `agskill` checks:
 
 ```python
-threshold = max(context_limit - 20_000, context_limit // 2)
-if prompt_tokens >= threshold:
+# _COMPACT_THRESHOLD = 0.70
+if prompt_tokens >= int(context_limit * _COMPACT_THRESHOLD):
     compact(...)
 ```
 
-The trigger fires as late as possible — only when the prompt is within 20K tokens of the context limit. The `// 2` floor prevents nonsensical thresholds on small models (below 40K tokens). This matches opencode's approach of waiting until nearly full rather than compacting at an arbitrary percentage.
+The trigger fires when the prompt reaches 70% of the context limit, leaving 30% headroom for the summary injection and continued work.
 
 Compaction runs at most once per ReAct step (after the LLM fires, before tool dispatch or final-answer processing), so the messages list is always current before the next call.
 
@@ -21,8 +64,8 @@ Compaction runs at most once per ReAct step (after the LLM fires, before tool di
 The context limit is determined once at agent creation, in this order:
 
 1. `llm_config["context_limit"]` — explicit user override
-2. `GET /v1/models/{model}` → `max_model_len` — vLLM exposes this automatically
-3. `None` — compaction is silently disabled
+2. `GET /v1/models` → `max_model_len` — vLLM exposes this on the model list response. `list()` is always used instead of `retrieve()` because model names containing `/` would produce a malformed URL with `retrieve()`.
+3. `DEFAULT_CONTEXT_LIMIT` (128 000) — safe fallback so compaction always runs even when the API is unreachable at agent creation time.
 
 ```python
 # explicit override (useful for non-vLLM backends)
@@ -33,7 +76,6 @@ The detected limit is logged at agent creation:
 ```
 10:00:00  [agent_smith]  [CREATED  ]  ...  context=131072
 ```
-`context=unknown` means compaction is disabled for that agent.
 
 ## Algorithm
 
@@ -57,7 +99,7 @@ The most recent assistant turns are kept verbatim. The tail is sized by token bu
 
 ```
 tail_budget = clamp(usable * 0.25, min=2_000, max=8_000)   # tokens
-usable = max(context_limit - 20_000, context_limit // 2)
+usable = int(context_limit * 0.70)   # matches _COMPACT_THRESHOLD
 ```
 
 Working backwards, turns (one assistant message + its immediately following tool results) are added to the tail until either:
@@ -173,7 +215,6 @@ Constants in `agcompaction.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `_RESERVED` | `20_000` | Tokens before the limit at which compaction fires |
 | `TAIL_TURNS` | `2` | Max recent assistant turns to keep verbatim |
 | `_TAIL_FRACTION` | `0.25` | Fraction of usable context budgeted for the tail |
 | `_TAIL_MIN_TOKENS` | `2_000` | Lower bound on tail token budget |

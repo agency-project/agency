@@ -237,7 +237,7 @@ Tool functions receive an `agdata` and must return an `agdata`. The return value
 
 ### Large output offloading
 
-If the serialized result exceeds `_TOOL_OUTPUT_OFFLOAD_CHARS` (default 20 000 characters) and a sandbox is available, the framework automatically writes the content to `/workspace/long_tool_call_outputs/<tool_name>_<call_id>.txt` and replaces the tool message with a short note pointing to that path. The agent reads the file using its `read` tool. This prevents a single large tool result (e.g. a raw PDF or a lengthy webpage) from consuming the entire context window. See [agskill.md — Tool output offloading](agskill.md#tool-output-offloading) for details.
+If the serialized result exceeds the offload threshold and a sandbox is available, the framework automatically writes the content to `/workspace/long_tool_call_outputs/<tool_name>_<call_id>.txt` and replaces the tool message with a short note pointing to that path. The agent reads the file using its `read` tool. This prevents a single large tool result (e.g. a raw PDF or a lengthy webpage) from consuming the entire context window. See [agskill.md — Tool output offloading](agskill.md#tool-output-offloading) for details.
 
 ## bash process tracking
 

@@ -108,7 +108,7 @@ agtype
 |---|---|---|
 | `schema_type() → str` | Schema serialization | Human-readable label in the system prompt (e.g. `"file"`, `"image"`) |
 | `needs_sandbox() → bool` | Before skill starts | Whether the sandbox must be running before `prepare()` |
-| `prepare(value, sandbox, skill, field) → (new_value, paths)` | Before ReAct loop | Transform Python value → LLM-visible value; write sandbox files |
+| `prepare(value, sandbox, skill, field, suffix="") → (new_value, paths)` | Before ReAct loop | Transform Python value → LLM-visible value; write sandbox files |
 | `recover(value, sandbox) → (new_value, paths)` | After ReAct loop | Transform LLM-returned string → Python value; read sandbox files |
 | `extra_input_prompt(field) → str` | System prompt build | Extra instruction injected for this input field |
 | `extra_output_prompt(field, skill) → str` | System prompt build | Extra instruction injected for this output field |
@@ -118,6 +118,11 @@ agtype
 `prepare()` and `recover()` each return `(new_value, cleanup_paths)`.  The
 framework replaces the field value in `_data` with `new_value` and accumulates
 all `cleanup_paths` for deletion after the skill ends.
+
+`suffix` is a timestamp string appended to sandbox file paths so that repeated
+runs on the same persistent agent always write to distinct paths (e.g.
+`/workspace/inputs/field_1751234567890.txt`).  Subclasses that do not write
+files (e.g. `agimage`, `agrawstring`) accept and ignore it.
 
 ---
 
@@ -241,6 +246,20 @@ _build_user_content():
 **list[agimage].** Multiple images are all extracted and appended as separate
 `image_url` content parts.  The text placeholder becomes `"[N image(s) attached]"`.
 
+**Container nesting.** `agtype` subclasses can appear inside `list`, `dict`,
+and `tuple` containers at any nesting depth in both input and output schemas.
+`_prepare_agtype_inputs()` and `_recover_agtype_outputs()` recurse through the
+container structure and call `prepare()`/`recover()` at every agtype leaf.
+Plain Python values at non-agtype positions pass through unchanged.
+
+```python
+# All of these are valid schema hints:
+input_schema=agdata(frames=list[agimage])          # list of images
+input_schema=agdata(batches=list[list[agimage]])   # nested list of images
+output_schema=agdata(reports=dict[str, agfile])    # dict of file outputs
+output_schema=agdata(result=tuple[agfile, int])    # tuple with agtype position
+```
+
 **No recover step.** `agimage` has no output path — it is input-only. An agent
 that generates images would use `agbinary` or `agfile` for the output.
 
@@ -262,6 +281,19 @@ _build_user_content() → returns the string directly, no JSON wrapper.
 
 System prompt does NOT include the "Input JSON format:" section.
 ```
+
+**Large input offloading.** Unlike other `agtype` subclasses, `agrawstring` is
+**not** excluded from `_offload_large_fields`.  Because its `prepare()` is a
+no-op, the raw string arrives at the offload step at full length.  If it exceeds
+the offload threshold it is written to a sandbox file and replaced with a
+reference, exactly like a plain `str` field.  Other agtype subclasses are
+excluded from offloading because their `prepare()` has already transformed the
+value into a short sandbox path or data URL.
+
+The offload threshold is `max(40 000, context_limit × 0.1 × 4)` characters —
+10 % of the model context window expressed in characters (4 chars/token), with a
+40 000-character floor.  The same formula applies to both input field offloading
+(`_offload_large_fields`) and tool-output offloading in `_dispatch_tools`.
 
 **Output path** (`_raw_output_key()` detects this).
 
@@ -320,6 +352,8 @@ parameter whose JSON Schema type is derived from the field's type hint:
 | `dict`, `dict[K,V]` | `"object"` | `{}`, `{"text": 42}` |
 | `agtype` subclass | `"string"` | type-specific via `return_value_description` |
 | `list[agtype]` | `"array"` | `["value"]` |
+| `dict[K, agtype]` | `"object"` | `{"text": "value"}` |
+| `tuple[agtype, ...]` | `"array"` | `["value", ...]` |
 | `[{"k": T, ...}]` | `"array"` | `[{"k": "text"}]` |
 
 The description of the `value` parameter includes a concrete valid-JSON example
@@ -396,6 +430,8 @@ class agcsv(agtype):
         )
 ```
 
-The same `agtype` subclass works for both `field=agcsv` and `field=list[agcsv]`
-in a schema — `_prepare_agtype_inputs()` and `_recover_agtype_outputs()` both
-handle the `list[T]` generic form automatically.
+The same `agtype` subclass works for `field=agcsv`, `field=list[agcsv]`,
+`field=dict[str, agcsv]`, `field=tuple[agcsv, int]`, and any deeper nesting —
+`_prepare_agtype_inputs()` and `_recover_agtype_outputs()` recurse through
+`list`, `dict`, and `tuple` containers at any depth and call `prepare()`/`recover()`
+at every agtype leaf automatically.

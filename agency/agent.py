@@ -145,45 +145,121 @@ def _generate_agname() -> str:
     return name
 
 
-# String fields longer than this many characters are offloaded to a file in
-# the agent's sandbox instead of being inlined in the LLM context window.
-INPUT_OFFLOAD_CHARS: int = 2000
+# Minimum characters threshold for offloading string fields to sandbox files.
+# The effective threshold is max(INPUT_OFFLOAD_CHARS, context_limit * 0.1 * 4)
+# — 10% of the model context window expressed in characters (4 chars/token).
+INPUT_OFFLOAD_CHARS: int = 40_000
+
+
+def _offload_threshold(context_limit: "int | None") -> int:
+    """Return the effective offload threshold in characters.
+
+    10 % of the model context window expressed in characters (4 chars/token),
+    with INPUT_OFFLOAD_CHARS as the minimum floor.
+    """
+    if context_limit:
+        return max(INPUT_OFFLOAD_CHARS, int(context_limit * 0.1 * 4))
+    return INPUT_OFFLOAD_CHARS
+
+
+def _walk_agtype(hint, value, on_leaf):
+    """Recursively walk a type hint/value pair, calling ``on_leaf(hint, value)``
+    at every agtype leaf.  Returns ``(new_value, paths)``.
+
+    Handles arbitrary nesting of list, dict, and tuple containers around agtype
+    subclasses.  Plain Python values at non-agtype leaves pass through unchanged.
+    ``on_leaf`` must handle its own exceptions and always return ``(value, [])``.
+    """
+    origin = get_origin(hint)
+    args   = get_args(hint)
+
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        return on_leaf(hint, value)
+
+    if origin is list and args:
+        if not isinstance(value, list):
+            return value, []
+        new_vals, paths = [], []
+        for v in value:
+            nv, written = _walk_agtype(args[0], v, on_leaf)
+            new_vals.append(nv)
+            paths.extend(written)
+        return new_vals, paths
+
+    if origin is dict and len(args) == 2:
+        if not isinstance(value, dict):
+            return value, []
+        new_vals, paths = {}, []
+        for k, v in value.items():
+            nv, written = _walk_agtype(args[1], v, on_leaf)
+            new_vals[k] = nv
+            paths.extend(written)
+        return new_vals, paths
+
+    if origin is tuple and args:
+        if not isinstance(value, (list, tuple)):
+            return value, []
+        new_vals, paths = list(value), []
+        for i, (type_arg, v) in enumerate(zip(args, value)):
+            nv, written = _walk_agtype(type_arg, v, on_leaf)
+            new_vals[i] = nv
+            paths.extend(written)
+        return new_vals, paths
+
+    return value, []
+
+
+def _hint_contains_non_raw_agtype(hint) -> bool:
+    """Return True if hint contains any agtype subclass other than agrawstring,
+    at any nesting depth."""
+    from .agtype import agtype, agrawstring
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        return not issubclass(hint, agrawstring)
+    origin = get_origin(hint)
+    args   = get_args(hint)
+    if origin is list and args:
+        return _hint_contains_non_raw_agtype(args[0])
+    if origin is dict and len(args) == 2:
+        return _hint_contains_non_raw_agtype(args[1])
+    if origin is tuple and args:
+        return any(_hint_contains_non_raw_agtype(a) for a in args)
+    return False
 
 
 def _offload_large_fields(
     inp: agdata, sandbox: "agSandbox", skill_name: str,
     schema: "agdata | None" = None,
     suffix: str = "",
+    context_limit: "int | None" = None,
 ) -> tuple[list[str], list[str]]:
     """Write oversized string fields to /workspace/inputs/ in the sandbox.
 
     Called after agtype fields have already been prepared (so agfile inputs are
     already short file paths).  Each remaining field whose string value still
-    exceeds INPUT_OFFLOAD_CHARS is replaced in-place with a short reference.
-    Returns (paths_written, field_names) so the caller can delete files and
-    build an auto-offload note for the system prompt.
+    exceeds _offload_threshold(context_limit) is replaced in-place with a short
+    reference.  Returns (paths_written, field_names) so the caller can delete
+    files and build an auto-offload note for the system prompt.
 
-    Fields already managed by an agtype subclass (e.g. agimage data URLs) are
-    skipped so their prepared values are not replaced by sandbox file references.
+    Fields already managed by an agtype subclass (e.g. agimage data URLs,
+    agfile/agbinary paths) are skipped — their prepared values must not be
+    replaced by sandbox file references.  agrawstring is the exception: its
+    prepare() is a no-op, so a long value arrives here at full length and
+    should be offloaded like any plain string.
     """
-    from .agtype import agtype
     agtype_keys: set[str] = set()
     if schema is not None:
         for key, hint in schema._data.items():
-            if isinstance(hint, type) and issubclass(hint, agtype):
+            if _hint_contains_non_raw_agtype(hint):
                 agtype_keys.add(key)
-            elif get_origin(hint) is list:
-                args = get_args(hint)
-                if args and isinstance(args[0], type) and issubclass(args[0], agtype):
-                    agtype_keys.add(key)
 
+    _threshold = _offload_threshold(context_limit)
     paths: list[str] = []
     fields: list[str] = []
     for key, val in list(inp._data.items()):
         if key in agtype_keys:
             continue
         if isinstance(val, str):
-            if len(val) <= INPUT_OFFLOAD_CHARS:
+            if len(val) <= _threshold:
                 continue
             path = f"/workspace/inputs/{skill_name}_{key}{suffix}.txt"
             try:
@@ -199,7 +275,7 @@ def _offload_large_fields(
             new_vals = list(val)
             offloaded_any = False
             for i, item in enumerate(val):
-                if not isinstance(item, str) or len(item) <= INPUT_OFFLOAD_CHARS:
+                if not isinstance(item, str) or len(item) <= _threshold:
                     continue
                 path = f"/workspace/inputs/{skill_name}_{key}_{i}{suffix}.txt"
                 try:
@@ -221,40 +297,24 @@ def _prepare_agtype_inputs(
 ) -> list[str]:
     """Prepare agtype input fields before the skill runs.
 
-    For each schema field whose hint is an agtype subclass (or list[agtype]),
-    calls ``hint.prepare()`` which may transform the value and write sandbox
-    files.  Returns all paths written for cleanup.
+    Recursively handles agtype subclasses nested inside list, dict, and tuple
+    containers at any depth.  Calls ``hint.prepare()`` at each agtype leaf.
+    Returns all sandbox paths written for cleanup.
     """
     if schema is None:
         return []
     paths: list[str] = []
     for key, hint in schema._data.items():
-        # Direct agtype subclass
-        if isinstance(hint, type) and issubclass(hint, agtype):
-            val = inp._data.get(key)
+        def on_leaf(h, v, _key=key):
             try:
-                new_val, written = hint.prepare(val, sandbox, skill_name, key, suffix=suffix)
-                inp._data[key] = new_val
-                paths.extend(written)
+                return h.prepare(v, sandbox, skill_name, _key, suffix=suffix)
             except Exception as _e:
-                print(f"[agent] WARNING: {hint.__name__}.prepare failed for field '{key}': {_e}")
-        # list[agtype subclass]
-        elif get_origin(hint) is list:
-            args = get_args(hint)
-            if args and isinstance(args[0], type) and issubclass(args[0], agtype):
-                inner = args[0]
-                vals = inp._data.get(key)
-                if isinstance(vals, list):
-                    new_vals = []
-                    for v in vals:
-                        try:
-                            new_v, written = inner.prepare(v, sandbox, skill_name, key, suffix=suffix)
-                            paths.extend(written)
-                        except Exception as _e:
-                            print(f"[agent] WARNING: {inner.__name__}.prepare failed for list field '{key}': {_e}")
-                            new_v = v
-                        new_vals.append(new_v)
-                    inp._data[key] = new_vals
+                print(f"[agent] WARNING: {h.__name__}.prepare failed for field '{_key}': {_e}")
+                return v, []
+        new_val, written = _walk_agtype(hint, inp._data.get(key), on_leaf)
+        if written or new_val is not inp._data.get(key):
+            inp._data[key] = new_val
+        paths.extend(written)
     return paths
 
 
@@ -263,23 +323,24 @@ def _recover_agtype_outputs(
 ) -> list[str]:
     """Recover agtype output fields after the skill finishes.
 
-    For each schema field whose hint is an agtype subclass, calls
-    ``hint.recover()`` which may read sandbox files back into Python values.
-    Returns all paths written for cleanup.
+    Recursively handles agtype subclasses nested inside list, dict, and tuple
+    containers at any depth.  Calls ``hint.recover()`` at each agtype leaf.
+    Returns all sandbox paths for cleanup.
     """
     if schema is None or result.is_error():
         return []
     paths: list[str] = []
     for key, hint in schema._data.items():
-        if not (isinstance(hint, type) and issubclass(hint, agtype)):
-            continue
-        val = result._data.get(key)
-        try:
-            new_val, written = hint.recover(val, sandbox)
+        def on_leaf(h, v, _key=key):
+            try:
+                return h.recover(v, sandbox)
+            except Exception as _e:
+                print(f"[agent] WARNING: {h.__name__}.recover failed for field '{_key}': {_e}")
+                return v, []
+        new_val, written = _walk_agtype(hint, result._data.get(key), on_leaf)
+        if written or new_val is not result._data.get(key):
             result._data[key] = new_val
-            paths.extend(written)
-        except Exception as _e:
-            print(f"[agent] WARNING: {hint.__name__}.recover failed for field '{key}': {_e}")
+        paths.extend(written)
     return paths
 
 
@@ -399,7 +460,7 @@ class agent:
         if isinstance(llm_config, agent):
             src = llm_config
             self.llm_config    = src.llm_config
-            self._context_limit: int | None = src._context_limit
+            self._context_limit: int = src._context_limit
             # Block until source's in-flight task finishes, then deep-copy history
             src._history._resolve()
             self._history: agdata = copy.deepcopy(src._history)
@@ -650,7 +711,7 @@ class agent:
                 )
                 auto_paths, auto_fields = _offload_large_fields(
                     input, self.sandbox, skill_name, schema=af.input_schema,
-                    suffix=_input_suffix
+                    suffix=_input_suffix, context_limit=self._context_limit,
                 )
                 _offloaded_paths.extend(auto_paths)
 

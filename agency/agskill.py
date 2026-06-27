@@ -127,7 +127,7 @@ def _make_llm_client(llm_config: dict, timeout: httpx.Timeout) -> openai.OpenAI:
 _T = TypeVar("_T")
 _BATCH_INTERVAL_S: float = 0.1   # main thread drains stream every 100 ms
 _IDLE_CHECK_INTERVAL_S: float = 1.0  # how often to check idle timeout
-_TOOL_OUTPUT_OFFLOAD_CHARS: int = 80_000  # tool results longer than this are saved to a file
+_TOOL_OUTPUT_OFFLOAD_CHARS: int = 40_000  # minimum floor for tool-output offloading
 
 
 class _LLMIdleTimeout(Exception):
@@ -298,7 +298,7 @@ from typing import get_args, get_origin
 from .agdata import agdata, _fmt_exc
 from .agtype import agtype, agimage, agrawstring
 from .agtool import agtool
-from .agcompaction import compact, should_compact, count_messages_tokens
+from .agcompaction import compact, should_compact, estimate_messages_tokens
 
 
 _PATH_RE = re.compile(r"^(/[\w.\-]+)+$")
@@ -458,34 +458,57 @@ def _make_return_output_tool(schema: "agdata") -> list[dict]:
     return _make_return_output_tools(schema)
 
 
-def _validate_output_field(field: str, value, schema: "agdata") -> "str | None":
-    """Validate a single (field, value) pair against the output schema hint.
+def _validate_value(hint, value) -> "str | None":
+    """Recursively validate value against hint. Returns an error string or None."""
+    origin = get_origin(hint)
+    args   = get_args(hint)
 
-    Returns an error string, or None if valid.
-    """
-    hint = schema._data[field]
-    if isinstance(hint, type) and issubclass(hint, agtype):
-        if not isinstance(value, str):
-            return f"expected str, got {type(value).__name__}"
-    elif get_origin(hint) is list:
+    if isinstance(hint, type):
+        if issubclass(hint, agtype):
+            return None if isinstance(value, str) else f"expected str, got {type(value).__name__}"
+        if issubclass(hint, bool):
+            return None if isinstance(value, bool) else f"expected bool, got {type(value).__name__}"
+        if issubclass(hint, (int, float, str)):
+            return None if isinstance(value, hint) else f"expected {hint.__name__}, got {type(value).__name__}"
+        # bare list/tuple/dict without type args
+        if issubclass(hint, (list, tuple)):
+            return None if isinstance(value, (list, tuple)) else f"expected array, got {type(value).__name__}"
+        if issubclass(hint, dict):
+            return None if isinstance(value, dict) else f"expected dict, got {type(value).__name__}"
+        return None if isinstance(value, hint) else f"expected {hint.__name__}, got {type(value).__name__}"
+
+    if origin is list:
         if not isinstance(value, list):
             return f"expected list, got {type(value).__name__}"
-        args = get_args(hint)
-        if args and isinstance(args[0], type):
-            inner = args[0]
-            # agtype subclasses are serialised as plain strings
-            check = str if issubclass(inner, agtype) else inner
+        if args:
             for i, item in enumerate(value):
-                if not isinstance(item, check):
-                    return f"item {i}: expected {inner.__name__}, got {type(item).__name__}"
-    elif get_origin(hint) is tuple:
-        # JSON arrays deserialize to lists, so accept both list and tuple
+                err = _validate_value(args[0], item)
+                if err:
+                    return f"item {i}: {err}"
+        return None
+
+    if origin is tuple:
         if not isinstance(value, (list, tuple)):
             return f"expected array, got {type(value).__name__}"
-    elif get_origin(hint) is dict:
+        if args:
+            for i, (type_arg, item) in enumerate(zip(args, value)):
+                err = _validate_value(type_arg, item)
+                if err:
+                    return f"item {i}: {err}"
+        return None
+
+    if origin is dict:
         if not isinstance(value, dict):
             return f"expected dict, got {type(value).__name__}"
-    elif isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+        if len(args) == 2:
+            for k, v in value.items():
+                err = _validate_value(args[1], v)
+                if err:
+                    return f"key {k!r}: {err}"
+        return None
+
+    # [{"key": type, ...}] literal list-of-dicts schema
+    if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
         if not isinstance(value, list):
             return f"expected list, got {type(value).__name__}"
         template = hint[0]
@@ -497,14 +520,17 @@ def _validate_output_field(field: str, value, schema: "agdata") -> "str | None":
                     return f"item {i}: missing key '{k}'"
                 if isinstance(t, type) and not isinstance(item[k], t):
                     return f"item {i}.{k}: expected {t.__name__}, got {type(item[k]).__name__}"
-    elif isinstance(hint, type):
-        # tuple is a JSON array; json.loads always gives back a list
-        if issubclass(hint, tuple):
-            if not isinstance(value, (list, tuple)):
-                return f"expected array, got {type(value).__name__}"
-        elif not isinstance(value, hint):
-            return f"expected {hint.__name__}, got {type(value).__name__}"
+        return None
+
     return None
+
+
+def _validate_output_field(field: str, value, schema: "agdata") -> "str | None":
+    """Validate a single (field, value) pair against the output schema hint.
+
+    Returns an error string, or None if valid.
+    """
+    return _validate_value(schema._data[field], value)
 
 if TYPE_CHECKING:
     from .agterm import agterm
@@ -538,21 +564,23 @@ def _maybe_compact(
     _compact_log_fn: "Callable | None",
     _live_messages_fn: "Callable | None",
     skill_name: str,
+    force: bool = False,
 ) -> "tuple[list[dict], str | None]":
     """Run compaction if needed. Returns (messages, updated_compaction_summary).
 
-    prompt_tokens=None → pre-call path (uses character-based estimate, log label includes tilde).
+    prompt_tokens=None → pre-call path (uses chars/4 estimate, log label includes tilde).
     prompt_tokens=int  → post-call path (uses actual API-reported token count).
+    force=True         → skip the should_compact gate (used after a context-exceeded 400).
     """
     if _context_limit is None:
         return messages, _compaction_summary
     if prompt_tokens is None:
-        token_count = count_messages_tokens(messages, llm_config)
+        token_count = estimate_messages_tokens(messages)
         label = f"tokens~{token_count}/{_context_limit}  msgs={len(messages)}  (pre-call estimate)"
     else:
         token_count = prompt_tokens
         label = f"tokens={token_count}/{_context_limit}  msgs={len(messages)}"
-    if not should_compact(token_count, _context_limit):
+    if not force and not should_compact(token_count, _context_limit):
         return messages, _compaction_summary
     if term:
         term.log("COMPACT  ", f"skill={skill_name}  {label}")
@@ -579,6 +607,7 @@ def _maybe_compact(
 class _LLMCallResult:
     conn_error: "Exception | None" = None
     should_retry: bool = False
+    context_exceeded: bool = False
     next_timeout_attempt: int = 0
     content_parts: "list[str]" = field(default_factory=list)
     reasoning_parts: "list[str]" = field(default_factory=list)
@@ -590,7 +619,7 @@ class _LLMCallResult:
 
     @property
     def ok(self) -> bool:
-        return self.conn_error is None and not self.should_retry
+        return self.conn_error is None and not self.should_retry and not self.context_exceeded
 
 
 @dataclass
@@ -709,6 +738,23 @@ def _llm_call(
                                 if tc_delta.function.arguments:
                                     slot["function"]["arguments"] += tc_delta.function.arguments
 
+        except openai.BadRequestError as _bad_req:
+            try:
+                client.close()
+            except Exception:
+                pass
+            messages.pop()
+            _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
+            _err_str = str(_bad_req).lower()
+            if any(kw in _err_str for kw in ("context_length_exceeded", "maximum context length",
+                                              "context length", "too long", "reduce the length")):
+                if term:
+                    term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  context length exceeded — will compact and retry")
+                return _LLMCallResult(context_exceeded=True, elapsed_ms=_llm_elapsed_ms)
+            if term:
+                term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  bad request: {_bad_req}")
+            return _LLMCallResult(conn_error=_bad_req, should_retry=False, elapsed_ms=_llm_elapsed_ms)
+
         except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError) as _conn_err:
             try:
                 client.close()  # best-effort: unblock drain thread's ssl.read()
@@ -760,15 +806,23 @@ def _dispatch_tools(
     tool_calls: list[dict],
     tool_map: dict,
     messages: list[dict],
-    sandbox: "agSandbox | None",
+    sandbox: "agSandbox",
     skill_name: str,
     _state_fn: "Callable | None",
     _live_messages_fn: "Callable | None",
     _full_history_fn: "Callable | None",
     term: "agterm | None",
     _intercept: "dict[str, Callable[[dict], str]] | None" = None,
-) -> None:
-    """Execute all tool calls from one LLM response, appending results to messages."""
+    tool_offload_chars: int = _TOOL_OUTPUT_OFFLOAD_CHARS,
+) -> bool:
+    """Execute all tool calls from one LLM response, appending results to messages.
+
+    Returns True if the read tool was lazily injected into tool_map during this
+    dispatch (because a large output was offloaded and read was not already present).
+    The caller should then add the read tool's schema to openai_tools so the LLM
+    can use it on the next step.
+    """
+    _injected_read = False
     for tc in tool_calls:
         fn_name = tc["function"]["name"]
         fn_args = tc["function"]["arguments"]
@@ -819,7 +873,30 @@ def _dispatch_tools(
                 result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)
-                if t.need_sandbox and sandbox is not None:
+                # Offload large tool outputs regardless of whether the tool
+                # itself uses the sandbox — fetch_paper and other add_tools have
+                # need_sandbox=False but can still produce huge outputs that
+                # bloat the context.
+                if len(result_content) > tool_offload_chars:
+                    safe_id = tc_id.replace("-", "")[:12]
+                    offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
+                    try:
+                        try:
+                            file_body = json.loads(result_content).get("content", result_content)
+                        except (json.JSONDecodeError, AttributeError):
+                            file_body = result_content
+                        sandbox.write_file(offload_path, file_body)
+                        result_content = json.dumps({
+                            "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
+                        })
+                        if "read" not in tool_map:
+                            from .tools import make_read
+                            _read_tool = make_read(sandbox)
+                            tool_map["read"] = _read_tool
+                            _injected_read = True
+                    except Exception as _e:
+                        print(f"[agskill] WARNING: failed to offload large tool output to {offload_path}: {_e}")
+                if t.need_sandbox:
                     # A tool may signal failure via agdata(error=...) without raising —
                     # treat that the same as an exception: discard dirty state.
                     _result_errored = False
@@ -840,22 +917,6 @@ def _dispatch_tools(
                         except (json.JSONDecodeError, TypeError):
                             pass
                     else:
-                        # Offload large outputs to /workspace before committing so
-                        # the file is captured in the lifecycle snapshot.
-                        if len(result_content) > _TOOL_OUTPUT_OFFLOAD_CHARS:
-                            safe_id = tc_id.replace("-", "")[:12]
-                            offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
-                            try:
-                                try:
-                                    file_body = json.loads(result_content).get("content", result_content)
-                                except (json.JSONDecodeError, AttributeError):
-                                    file_body = result_content
-                                sandbox.write_file(offload_path, file_body)
-                                result_content = json.dumps({
-                                    "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
-                                })
-                            except Exception as _e:
-                                print(f"[agskill] WARNING: failed to offload large tool output to {offload_path}: {_e}")
                         sandbox.stop(commit=True)
             except Exception as e:
                 if _state_fn:
@@ -863,7 +924,7 @@ def _dispatch_tools(
                 result_content = json.dumps({"error": _fmt_exc(e)})
                 # On failure: remove without committing to discard dirty state.
                 # The next tool call restores from the last successful checkpoint.
-                if t.need_sandbox and sandbox is not None:
+                if t.need_sandbox:
                     sandbox.stop(commit=False)
                     try:
                         _result_obj = json.loads(result_content)
@@ -880,6 +941,7 @@ def _dispatch_tools(
             _live_messages_fn(messages[1:])
         if _full_history_fn:
             _full_history_fn(tool_msg)
+    return _injected_read
 
 
 def _wait_for_processes(
@@ -1309,7 +1371,7 @@ class agskill:
 
     def _build_tools(
         self,
-        sandbox: "agSandbox | None",
+        sandbox: "agSandbox",
         pool: "agResourcePool | None",
         term: "agterm | None",
         log: "aglog | None",
@@ -1319,15 +1381,13 @@ class agskill:
         from .tools import make_sandboxed_tools, make_read
         if self.replace_tools is not None:
             active_tools: list[agtool] = list(self.replace_tools)
-        elif sandbox is not None:
+        else:
             active_tools = make_sandboxed_tools(sandbox, pool)
             if self.add_tools:
                 active_tools.extend(self.add_tools)
-        else:
-            active_tools = list(self.add_tools or [])
         # If input fields were offloaded to sandbox files, ensure the read tool
         # is available even for skills that use replace_tools without it.
-        if _ensure_read and sandbox is not None:
+        if _ensure_read:
             if not any(getattr(t, "name", None) == "read" for t in active_tools):
                 active_tools.append(make_read(sandbox))
         for t in active_tools:
@@ -1456,7 +1516,7 @@ class agskill:
 
                     # agfile: validate file exists, is a regular file, is non-empty,
                     # is UTF-8 text, and contains real content (not another path).
-                    if _is_agfile and sandbox is not None and isinstance(value, str):
+                    if _is_agfile and isinstance(value, str):
                         try:
                             content = sandbox.read_file(value)
                         except IsADirectoryError:
@@ -1492,7 +1552,7 @@ class agskill:
 
                     # agbinary: check the file exists and is non-empty using a
                     # lightweight shell test — no content read needed.
-                    if _is_agbinary and sandbox is not None and isinstance(value, str):
+                    if _is_agbinary and isinstance(value, str):
                         _, dir_rc = sandbox._container_exec(
                             f"test -d {shlex.quote(value)}", timeout=AGBINARY_VALIDATE_EXEC_TIMEOUT, shell="sh"
                         )
@@ -1524,8 +1584,7 @@ class agskill:
 
                     # str: if the agent returned a file path instead of content,
                     # silently resolve it to the file's content.
-                    if _is_str and isinstance(value, str) and _looks_like_path(value) \
-                            and sandbox is not None:
+                    if _is_str and isinstance(value, str) and _looks_like_path(value):
                         try:
                             resolved = sandbox.read_file(value)
                             if resolved and resolved.strip() \
@@ -1558,7 +1617,6 @@ class agskill:
         _compaction_summary: str | None = None
         _total_input_tokens:  int = 0
         _total_output_tokens: int = 0
-
         for _ in range(max_steps):
             kwargs: dict = _build_llm_kwargs(llm_config, messages, openai_tools)
 
@@ -1570,12 +1628,34 @@ class agskill:
                 _compaction_summary, term, _compact_log_fn, _live_messages_fn, self.name,
             )
 
+            # Pre-call prompt size estimate (chars / 4).  Used for UI token display
+            # and max_tokens clamping; precise accuracy is not required here.
+            _pre_estimate = estimate_messages_tokens(messages)
+
+            if _token_update_fn is not None:
+                _token_update_fn(_total_input_tokens + _pre_estimate, _total_output_tokens)
+
+            if _context_limit is not None:
+                _headroom = max(1, _context_limit - _pre_estimate)
+                if kwargs.get("max_tokens", _headroom) > _headroom:
+                    kwargs = dict(kwargs)
+                    kwargs["max_tokens"] = _headroom
+
             # --- Streaming call ----------------------------------------------
             llm_result = _llm_call(
                 kwargs, llm_config, messages, _timeout_attempt,
                 term, _state_fn, _live_messages_fn, _token_update_fn,
                 _total_input_tokens, _total_output_tokens, self.name,
             )
+            if llm_result.context_exceeded:
+                if _full_history_fn:
+                    _full_history_fn({"type": "llm_context_exceeded"})
+                messages, _compaction_summary = _maybe_compact(
+                    messages, llm_config, _context_limit, None,
+                    _compaction_summary, term, _compact_log_fn, _live_messages_fn, self.name,
+                    force=True,
+                )
+                continue
             if llm_result.should_retry:
                 _timeout_attempt = llm_result.next_timeout_attempt
                 if _full_history_fn:
@@ -1598,7 +1678,9 @@ class agskill:
             _total_input_tokens  = llm_result.total_input_tokens
             _total_output_tokens = llm_result.total_output_tokens
             if term:
-                term.log("LLM ✓    ", f"model={llm_config.get('model','?')}  ({llm_result.elapsed_ms}ms)")
+                _ctx_str = f"/{_context_limit}" if _context_limit else ""
+                _tok_str = f"  tokens={llm_result.prompt_tokens}{_ctx_str}" if llm_result.prompt_tokens else ""
+                term.log("LLM ✓    ", f"model={llm_config.get('model','?')}  ({llm_result.elapsed_ms}ms){_tok_str}")
             if _state_fn:
                 _state_fn("skill", skill=self.name)
 
@@ -1616,11 +1698,17 @@ class agskill:
                 _full_history_fn(msg_dict)
 
             if msg_dict.get("tool_calls"):
-                _dispatch_tools(
+                _read_injected = _dispatch_tools(
                     msg_dict["tool_calls"], tool_map, messages, sandbox, self.name,
                     _state_fn, _live_messages_fn, _full_history_fn, term,
                     _intercept=_intercept,
+                    tool_offload_chars=(
+                        max(_TOOL_OUTPUT_OFFLOAD_CHARS, int(_context_limit * 0.1 * 4))
+                        if _context_limit else _TOOL_OUTPUT_OFFLOAD_CHARS
+                    ),
                 )
+                if _read_injected:
+                    openai_tools = (openai_tools or []) + [tool_map["read"].to_openai_tool()]
                 # If all required output fields are now registered, skip the next
                 # LLM call and fall through directly to output validation and return.
                 # Otherwise keep looping so the model can do more work.
@@ -1699,18 +1787,17 @@ class agskill:
                             [messages[0]] + messages[1:][n_before:],
                             (_total_input_tokens, _total_output_tokens),
                         )
-                if sandbox is not None:
-                    proc_msg = _wait_for_processes(
-                        sandbox, self.name, term, log, _agname,
-                        _ping_interval_s, _poll_interval_s, _state_fn,
-                    )
-                    if proc_msg is not None:
-                        messages.append({"role": "user", "content": proc_msg})
-                        if _live_messages_fn:
-                            _live_messages_fn(messages[1:])
-                        if _full_history_fn:
-                            _full_history_fn(messages[-1])
-                        continue
+                proc_msg = _wait_for_processes(
+                    sandbox, self.name, term, log, _agname,
+                    _ping_interval_s, _poll_interval_s, _state_fn,
+                )
+                if proc_msg is not None:
+                    messages.append({"role": "user", "content": proc_msg})
+                    if _live_messages_fn:
+                        _live_messages_fn(messages[1:])
+                    if _full_history_fn:
+                        _full_history_fn(messages[-1])
+                    continue
                 updated_history = agdata(messages=messages[1:])
                 return (
                     result,
@@ -1727,7 +1814,7 @@ class agskill:
                 output_schema_retries_left -= 1
                 messages.append(far.correction_msg)
                 continue
-            if far.kind != "error" and sandbox is not None:
+            if far.kind != "error":
                 proc_msg = _wait_for_processes(
                     sandbox, self.name, term, log, _agname,
                     _ping_interval_s, _poll_interval_s, _state_fn,

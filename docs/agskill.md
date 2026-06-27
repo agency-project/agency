@@ -40,10 +40,13 @@ Schema fields in `agdata` are plain Python type objects:
 | `int` | `integer` | `isinstance(v, int)` |
 | `float` | `number` | `isinstance(v, float)` |
 | `bool` | `boolean` | `isinstance(v, bool)` |
-| `list[str]` / `list[int]` etc. | `array` | each element checked against inner type |
+| `list[T]` | `array` | each element validated against `T` recursively |
+| `dict[K, V]` | `object` | each value validated against `V` recursively |
+| `tuple[T1, T2, ...]` | `array` | each position validated against its declared type |
 | `[{"key": type, ...}]` | `array` | each item dict validated against template |
 | `agfile` | `string` | must be str (file path); framework reads UTF-8 content after skill ends |
 | `agbinary` | `string` | must be str (file path); framework reads raw bytes after skill ends; caller receives `bytes` |
+| `agimage` | `string` | must be str (URL or data URL); injected as a multimodal image in the user message |
 
 Any `agtype` subclass is also valid; its `schema_type()` classmethod provides the display hint.
 
@@ -57,11 +60,38 @@ output_schema=agdata(report=agfile)
 # agbinary for raw binary outputs (audio, images, compiled artifacts):
 output_schema=agdata(trimmed=agbinary)
 
+# agimage as input (multimodal):
+input_schema=agdata(question=str, photo=agimage)
+
 # Typed list:
 output_schema=agdata(tags=list[str])
+
+# Dict output:
+output_schema=agdata(scores=dict[str, float])
+
+# Tuple output:
+output_schema=agdata(bounds=tuple[float, float, float, float])
 ```
 
-### Typed list fields
+### Container nesting
+
+`list`, `dict`, and `tuple` containers can be nested at any depth, and `agtype` subclasses can appear at any leaf position.  The framework recursively prepares inputs and recovers outputs at every agtype leaf; validation descends into containers to report the exact failing path.
+
+```python
+# nested list of images (input)
+input_schema=agdata(batches=list[list[agimage]])
+
+# dict of agfile outputs
+output_schema=agdata(reports=dict[str, agfile])
+
+# tuple with mixed leaf types
+output_schema=agdata(result=tuple[agfile, int])
+
+# deeply nested
+output_schema=agdata(matrix=list[list[float]])
+```
+
+### Typed list-of-dicts fields
 
 To express a list whose items have a known structure, pass a one-element list containing a plain `dict` that maps field names to types:
 
@@ -175,7 +205,7 @@ LLM_CONFIG = {
 
 ### Tool output offloading
 
-Tool results longer than `_TOOL_OUTPUT_OFFLOAD_CHARS` (default 20 000 characters) are automatically saved to a file inside the agent's sandbox instead of being inlined into the message history. The tool message is replaced with a short JSON note:
+Tool results longer than the offload threshold are automatically saved to a file inside the agent's sandbox instead of being inlined into the message history. The threshold is `max(40 000, context_limit × 0.1 × 4)` characters — 10 % of the model context window expressed in characters (4 chars/token), with a 40 000-character floor. The tool message is replaced with a short JSON note:
 
 ```json
 {"note": "Output was too large and has been saved to /workspace/long_tool_call_outputs/webfetch_abc123.txt. Use the read tool to access it."}
@@ -303,11 +333,13 @@ In the JSON format sections appended to the system prompt, `agfile` fields are s
 
 ## Automatic input offloading
 
-After `agfile` (and other `agtype`) fields have been prepared, the framework checks every remaining top-level string field. Any value that still exceeds `INPUT_OFFLOAD_CHARS` (default `2000`) is automatically written to a temporary file and the field value is replaced with a short reference:
+After `agfile` (and other `agtype`) fields have been prepared, the framework checks every remaining top-level string field. Any value that still exceeds the offload threshold is automatically written to a temporary file and the field value is replaced with a short reference:
 
 ```
 (content saved to /workspace/inputs/design_doc.txt — use the read tool to access it)
 ```
+
+The threshold is `max(40 000, context_limit × 0.1 × 4)` characters — 10 % of the model context window expressed in characters (4 chars/token), with a 40 000-character floor. `INPUT_OFFLOAD_CHARS` is the constant floor; the effective value is computed dynamically at runtime and passed to `_offload_large_fields`.
 
 Because `agfile` fields are already converted to short file paths before this check runs, they are never double-offloaded.
 
@@ -318,13 +350,6 @@ Note: The following input fields contain large content that has been automatical
 saved to temporary files in your sandbox: `design_doc`, `previous_chapter`. The
 file paths are shown in the input JSON. Use the read tool to access the full content.
 WARNING: these files are temporary and will be automatically deleted after this task ends.
-```
-
-The threshold can be adjusted at the module level:
-
-```python
-import agency.agent as _ag
-_ag.INPUT_OFFLOAD_CHARS = 4000
 ```
 
 Only top-level string fields are auto-offloaded. Non-string values (integers, booleans, lists, nested agdata) are always inlined. Auto-offloaded files are cleaned up in the same `finally` block as `agfile` files.

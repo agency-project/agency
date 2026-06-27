@@ -138,7 +138,7 @@ def _run_skill_with_mock_response(sk, inp, response_text):
             llm_config={"base_url": "http://x", "api_key": "", "model": "m"},
             input=inp,
             history=agdata(messages=[]),
-            sandbox=None,
+            sandbox=MagicMock(),
             pool=MagicMock(),
             max_steps=5,
         )

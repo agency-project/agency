@@ -75,6 +75,7 @@ class agtype:
         sandbox: "agSandbox",
         skill_name: str,
         field_name: str,
+        suffix: str = "",
     ) -> tuple[object, list[str]]:
         return value, []
 
@@ -250,6 +251,7 @@ class agimage(agtype):
         sandbox: "agSandbox",
         skill_name: str,
         field_name: str,
+        suffix: str = "",
     ) -> tuple[str, list[str]]:
         if not isinstance(value, str):
             return value, []

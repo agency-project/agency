@@ -195,7 +195,7 @@ def test_skill_with_agfile_output_schema_validates_path_string():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = sk.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=None)
+        result, *_ = sk.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=MagicMock())
     assert result.doc == "/workspace/outputs/write_doc.txt"
 
 

@@ -34,12 +34,14 @@ Human-readable type label shown in the JSON format hint appended to the system p
 
 Return `True` if `prepare` or `recover` require sandbox filesystem access.  The framework uses this for documentation; `prepare`/`recover` always receive the sandbox object regardless.
 
-### `prepare(value, sandbox, skill_name, field_name) -> tuple[transformed_value, paths]`
+### `prepare(value, sandbox, skill_name, field_name, suffix="") -> tuple[transformed_value, paths]`
 
 Called **before** the skill's ReAct loop on input fields.  `value` is the raw Python value from the caller's agdata.  Returns a `(transformed_value, paths_to_cleanup)` tuple:
 
 - `transformed_value` replaces the field in the JSON sent to the LLM.
 - `paths_to_cleanup` is a list of sandbox file paths that will be deleted in the `finally` block after the skill ends.
+
+`suffix` is a timestamp string appended to sandbox file paths so that repeated runs on the same persistent agent always write to distinct paths.  Subclasses that write sandbox files (e.g. `agfile`, `agbinary`) use it; subclasses that do not write files (e.g. `agimage`, `agrawstring`) accept and ignore it.
 
 Default: `(value, [])` — pass through unchanged.
 
@@ -48,6 +50,30 @@ Default: `(value, [])` — pass through unchanged.
 Called **after** the skill's ReAct loop on output fields.  `value` is whatever the LLM returned for this field (typically a file path or other reference).  Returns `(recovered_value, paths_to_cleanup)`.
 
 Default: `(value, [])` — pass through unchanged.
+
+## Container nesting
+
+`agtype` subclasses can be placed inside `list`, `dict`, and `tuple` container hints at any nesting depth.  The framework recursively walks the hint/value structure and calls `prepare` or `recover` at every agtype leaf.  Plain Python values at non-agtype positions pass through unchanged.
+
+```python
+# list of images — each element encoded before the skill runs
+input_schema=agdata(frames=list[agimage])
+
+# dict of file outputs — each value recovered after the skill ends
+output_schema=agdata(reports=dict[str, agfile])
+
+# nested list of images
+input_schema=agdata(batches=list[list[agimage]])
+
+# tuple with mixed types — only the agfile position is prepared/recovered
+output_schema=agdata(result=tuple[agfile, int])
+```
+
+The same recursive walk applies to `_offload_large_fields`: a field whose hint contains any non-`agrawstring` agtype at any depth is excluded from large-string offloading, so prepared values (data URLs, sandbox paths) are never replaced by file references.
+
+`agrawstring` is the only agtype subclass that is **not** excluded from offloading, because its `prepare` is a no-op — the raw string arrives at the offload step unchanged and is written to a sandbox file when it exceeds the offload threshold (`max(40 000, context_limit × 0.1 × 4)` characters).
+
+Output schema validation (`_validate_value`) is also recursive: it descends into `list`, `dict`, and `tuple` containers and checks each element against the corresponding inner type, reporting the exact path (e.g. `item 2: key 'x': expected str, got int`) on mismatch.
 
 ### `extra_input_prompt(field_name) -> str`
 
@@ -279,6 +305,12 @@ from agency import agrawstring
 | `recover(value, ...)` | No-op — output is captured at the skill level, not via recover. |
 | `extra_input_prompt` | None — JSON format hint is suppressed entirely. |
 | `extra_output_prompt` | None — replaced by "Respond with plain text only." |
+
+### Large input offloading
+
+Because `prepare` is a no-op, a long `agrawstring` value arrives at the offload step at full length. Unlike other `agtype` subclasses (whose `prepare` already transforms the value into a short path or data URL), `agrawstring` is **not** excluded from `_offload_large_fields`. If the value exceeds the offload threshold it is written to `/workspace/inputs/<skill>_<field>.txt` in the sandbox and replaced with a reference, exactly like a plain oversized `str` field.
+
+The threshold is `max(40 000, context_limit × 0.1 × 4)` characters — 10 % of the model context window in characters (4 chars/token), with a 40 000-character floor.
 
 ### Constraint
 

@@ -9,12 +9,13 @@ from agency.agdata import agdata as _agdata
 
 from agency.agcompaction import (
     TAIL_TURNS,
-    _RESERVED,
+    _COMPACT_THRESHOLD,
     _TAIL_MAX_TOKENS,
     _TAIL_MIN_TOKENS,
     _TAIL_FRACTION,
     _TOOL_OUTPUT_MAX_CHARS,
     _PRUNE_MIN_FREE_TOKENS,
+    DEFAULT_CONTEXT_LIMIT,
     _estimate_tokens,
     _prune_tool_outputs,
     _tail_start,
@@ -31,7 +32,7 @@ _LARGE_CONTENT = "x" * (400_000)  # ~100k tokens estimated (chars // 4)
 
 def _large_file_tool_fn(arg: _agdata) -> _agdata:
     return _agdata(output=_LARGE_CONTENT)
-# Use a large context so the threshold is clearly context_limit - _RESERVED.
+# Use a large context so the 70% threshold is well-defined.
 BIG_CTX = 100_000
 
 
@@ -173,25 +174,25 @@ def test_tail_start_respects_token_budget():
 # ---------------------------------------------------------------------------
 
 def test_should_compact_below_threshold():
-    # threshold = max(BIG_CTX - _RESERVED, BIG_CTX // 2) = max(80000, 50000) = 80000
-    assert not should_compact(79_999, BIG_CTX)
+    threshold = int(BIG_CTX * _COMPACT_THRESHOLD)
+    assert not should_compact(threshold - 1, BIG_CTX)
 
 
 def test_should_compact_above_threshold():
-    assert should_compact(80_001, BIG_CTX)
+    threshold = int(BIG_CTX * _COMPACT_THRESHOLD)
+    assert should_compact(threshold + 1, BIG_CTX)
 
 
 def test_should_compact_at_exact_threshold():
-    assert should_compact(80_000, BIG_CTX)
+    threshold = int(BIG_CTX * _COMPACT_THRESHOLD)
+    assert should_compact(threshold, BIG_CTX)
 
 
-def test_should_compact_floor_for_small_models():
-    # Model smaller than _RESERVED: threshold should be 50% floor, not negative
+def test_should_compact_small_model():
     small_ctx = 10_000
-    threshold = max(small_ctx - _RESERVED, small_ctx // 2)
-    assert threshold == 5_000
-    assert not should_compact(4_999, small_ctx)
-    assert should_compact(5_000, small_ctx)
+    threshold = int(small_ctx * _COMPACT_THRESHOLD)
+    assert not should_compact(threshold - 1, small_ctx)
+    assert should_compact(threshold, small_ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +208,26 @@ def test_fetch_context_limit_from_vllm():
     mock_info = MagicMock()
     mock_info.model_extra = {"max_model_len": 131072}
     mock_client = MagicMock()
-    mock_client.models.retrieve.return_value = mock_info
+    mock_client.models.list.return_value = [mock_info]
 
     with patch("agency.agcompaction.openai.OpenAI", return_value=mock_client):
         result = fetch_context_limit(LLM_CONFIG)
     assert result == 131072
+
+
+def test_fetch_context_limit_model_with_slash_in_name():
+    """Model names like 'nvidia/foo' must not trigger a 404 via retrieve()."""
+    cfg = {**LLM_CONFIG, "model": "nvidia/MiniMax-M2.7-NVFP4"}
+    mock_info = MagicMock()
+    mock_info.id = "nvidia/MiniMax-M2.7-NVFP4"
+    mock_info.model_extra = {"max_model_len": 196000}
+    mock_client = MagicMock()
+    mock_client.models.list.return_value = [mock_info]
+
+    with patch("agency.agcompaction.openai.OpenAI", return_value=mock_client):
+        result = fetch_context_limit(cfg)
+    assert result == 196000
+    mock_client.models.retrieve.assert_not_called()
 
 
 def test_fetch_context_limit_config_wins_over_vllm():
@@ -219,20 +235,21 @@ def test_fetch_context_limit_config_wins_over_vllm():
     mock_info = MagicMock()
     mock_info.model_extra = {"max_model_len": 131072}
     mock_client = MagicMock()
-    mock_client.models.retrieve.return_value = mock_info
+    mock_client.models.list.return_value = [mock_info]
 
     with patch("agency.agcompaction.openai.OpenAI", return_value=mock_client):
         result = fetch_context_limit(cfg)
     assert result == 8192
 
 
-def test_fetch_context_limit_none_when_unavailable():
+def test_fetch_context_limit_fallback_when_unavailable():
+    """When the API is unreachable, fall back to DEFAULT_CONTEXT_LIMIT (not None)."""
     mock_client = MagicMock()
-    mock_client.models.retrieve.side_effect = Exception("not found")
+    mock_client.models.list.side_effect = Exception("connection refused")
 
     with patch("agency.agcompaction.openai.OpenAI", return_value=mock_client):
         result = fetch_context_limit(LLM_CONFIG)
-    assert result is None
+    assert result == DEFAULT_CONTEXT_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +434,7 @@ def test_agskill_triggers_compaction_when_over_threshold():
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
     limit = BIG_CTX
-    over = max(limit - _RESERVED, limit // 2) + 1
+    over = int(limit * _COMPACT_THRESHOLD) + 1
 
     compact_calls = []
 
@@ -431,7 +448,7 @@ def test_agskill_triggers_compaction_when_over_threshold():
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "done"}', over)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
-                  sandbox=None, _context_limit=limit)
+                  sandbox=MagicMock(), _context_limit=limit)
 
     assert len(compact_calls) == 1
 
@@ -443,7 +460,7 @@ def test_agskill_skips_compaction_when_under_threshold():
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
     limit = BIG_CTX
-    under = max(limit - _RESERVED, limit // 2) - 1
+    under = int(limit * _COMPACT_THRESHOLD) - 1
 
     compact_calls = []
 
@@ -457,7 +474,7 @@ def test_agskill_skips_compaction_when_under_threshold():
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "ok"}', under)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
-                  sandbox=None, _context_limit=limit)
+                  sandbox=MagicMock(), _context_limit=limit)
 
     assert len(compact_calls) == 0
 
@@ -469,7 +486,7 @@ def test_agskill_passes_context_limit_to_compact():
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
     limit = BIG_CTX
-    over = max(limit - _RESERVED, limit // 2) + 1
+    over = int(limit * _COMPACT_THRESHOLD) + 1
 
     received_kwargs = {}
 
@@ -483,7 +500,7 @@ def test_agskill_passes_context_limit_to_compact():
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "done"}', over)
         skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
-                  sandbox=None, _context_limit=limit)
+                  sandbox=MagicMock(), _context_limit=limit)
 
     assert received_kwargs.get("context_limit") == limit
 
@@ -535,53 +552,131 @@ def _make_tool_call_stream(name: str, args: dict, call_id: str = "c1") -> list:
 
 
 # ---------------------------------------------------------------------------
-# Pre-call compaction: tool result overloads context
+# _maybe_compact force parameter
 # ---------------------------------------------------------------------------
 
-def test_agskill_compacts_before_llm_call_when_tool_result_overloads_context():
-    """A single tool call that returns a large blob should trigger pre-call
-    compaction before the next LLM request, even if the context was under the
-    threshold before the tool call ran."""
-    from agency.agskill import agskill
+def test_maybe_compact_force_bypasses_threshold():
+    """force=True must trigger compaction even when token estimate is below threshold."""
+    from agency.agskill import _maybe_compact
+
+    # Tiny messages — well below threshold
+    messages = [
+        {"role": "system",    "content": "sys"},
+        {"role": "user",      "content": "task"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    compact_calls = []
+
+    def fake_compact(msgs, cfg, **kw):
+        compact_calls.append(True)
+        return msgs, "summary"
+
+    with patch("agency.agskill.compact", side_effect=fake_compact):
+        _maybe_compact(messages, LLM_CONFIG, BIG_CTX, None, None, None, None, None, "test", force=True)
+
+    assert len(compact_calls) == 1
+
+
+def test_maybe_compact_no_force_below_threshold_does_nothing():
+    """Without force, _maybe_compact must not fire when estimate is below threshold."""
+    from agency.agskill import _maybe_compact
+
+    messages = [
+        {"role": "system",    "content": "sys"},
+        {"role": "user",      "content": "task"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    compact_calls = []
+
+    def fake_compact(msgs, cfg, **kw):
+        compact_calls.append(True)
+        return msgs, "summary"
+
+    with patch("agency.agskill.compact", side_effect=fake_compact):
+        _maybe_compact(messages, LLM_CONFIG, BIG_CTX, None, None, None, None, None, "test", force=False)
+
+    assert len(compact_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Reactive compaction: context-exceeded 400 error
+# ---------------------------------------------------------------------------
+
+def test_agskill_context_exceeded_triggers_forced_compaction():
+    """A context_exceeded result must call compact() (bypassing the threshold) and retry the LLM.
+
+    force=True is an _maybe_compact parameter, not forwarded to compact() itself.
+    We verify forced compaction fired by checking that compact() was called even
+    though the message estimate is far below the threshold (proactive path would
+    not fire on tiny messages).
+    """
+    from agency.agskill import agskill, _LLMCallResult
     from agency.agdata import agdata
-    from agency.agtool import agtool
 
-    limit = BIG_CTX  # 100_000
-    # threshold = max(100_000 - 20_000, 50_000) = 80_000
-    # _LARGE_CONTENT is 400_000 chars → ~100_000 estimated tokens → over threshold
-
-    read_tool = agtool(
-        name="read_file",
-        description="Read a file",
-        fn=_large_file_tool_fn,
-        params={"type": "object", "properties": {"path": {"type": "string"}},
-                "required": ["path"]},
-    )
-    skill = agskill(name="test", system_prompt="You are helpful.",
-                    replace_tools=[read_tool])
+    skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
     compact_calls: list[int] = []
 
     def fake_compact(messages, llm_config, **kw):
         compact_calls.append(len(messages))
-        # Return a drastically shorter list so the second LLM call succeeds
-        return messages[:3], "summary"
+        return messages, "summary"
 
-    responses = [
-        _make_tool_call_stream("read_file", {"path": "/workspace/big.txt"}),
-        _make_stream('{"result": "done"}', 100),
-    ]
-    response_iter = iter(responses)
+    call_count = 0
 
-    with patch("agency.agskill.openai.OpenAI") as MockClient, \
-         patch("agency.agskill.compact", side_effect=fake_compact), \
-         patch("agency.agcompaction.httpx.post", side_effect=ConnectionError("no vllm")):
-        MockClient.return_value = MagicMock()
-        MockClient.return_value.chat.completions.create.side_effect = \
-            lambda **kw: next(response_iter)
-        skill.run(LLM_CONFIG, agdata(task="read the file"), agdata(messages=[]),
-                  sandbox=None, _context_limit=limit)
+    def fake_llm_call(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _LLMCallResult(context_exceeded=True)
+        result = _LLMCallResult()
+        result.content_parts = ['{"result": "done"}']
+        result.prompt_tokens = 100
+        result.total_input_tokens = 100
+        result.total_output_tokens = 10
+        result.elapsed_ms = 50
+        return result
 
+    with patch("agency.agskill.compact", side_effect=fake_compact), \
+         patch("agency.agskill._llm_call", side_effect=fake_llm_call):
+        skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
+                  sandbox=MagicMock(), _context_limit=BIG_CTX)
+
+    # compact() must have been called — proactive path won't fire on tiny messages,
+    # so any call means the reactive (force=True) path triggered it.
     assert len(compact_calls) >= 1, \
-        "compact() should have been triggered before the second LLM call " \
-        "because the tool result pushed estimated tokens past the threshold"
+        "compact() must be called after context_exceeded (forced, bypassing threshold)"
+    assert call_count == 2, "LLM must be retried after forced compaction"
+
+
+def test_agskill_context_exceeded_does_not_count_as_retry():
+    """context_exceeded compaction must not consume a connection-retry slot."""
+    from agency.agskill import agskill, _LLMCallResult
+    from agency.agdata import agdata
+
+    skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
+
+    call_count = 0
+
+    def fake_llm_call(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _LLMCallResult(context_exceeded=True)
+        result = _LLMCallResult()
+        result.content_parts = ['{"result": "done"}']
+        result.prompt_tokens = 100
+        result.total_input_tokens = 100
+        result.total_output_tokens = 10
+        result.elapsed_ms = 50
+        return result
+
+    def fake_compact(messages, llm_config, **kw):
+        return messages, "summary"
+
+    with patch("agency.agskill.compact", side_effect=fake_compact), \
+         patch("agency.agskill._llm_call", side_effect=fake_llm_call):
+        result, *_ = skill.run(LLM_CONFIG, agdata(task="x"), agdata(messages=[]),
+                               sandbox=MagicMock(), _context_limit=BIG_CTX)
+
+    # Must succeed — context_exceeded is not a connection error
+    assert result.error is None
