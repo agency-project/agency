@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Generator, Iterable, TypeVar
-import httpx2 as httpx
+import httpx
 import openai
 
 AGSKILL_REACT_MAX_STEPS = 4096

@@ -1,4 +1,4 @@
-import httpx2 as httpx
+import httpx
 import html2text
 from ..agdata import agdata, agerror, _fmt_exc
 from ..agtool import agtool

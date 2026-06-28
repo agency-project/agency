@@ -72,7 +72,7 @@ class TestWebfetch:
         with patch("httpx.get", return_value=self._mock_response(html)):
             result = self.fn(agdata(url="https://example.com"))
         assert "Hello" in result.output
-        assert getattr(result, "error", None) is None
+        assert not isinstance(result, agerror)
 
     def test_plain_text(self):
         with patch("httpx.get", return_value=self._mock_response("plain text", "text/plain")):
