@@ -429,9 +429,8 @@ def _return_tool_descriptions(field: str, hint) -> tuple[str, str]:
 def _make_return_output_tools(schema: "agdata") -> list[dict]:
     """Build one typed tool per output field from the schema.
 
-    Each tool is named `return_<field>` and has a single `value` parameter
-    with the correct JSON Schema type.  This avoids an untyped `value`
-    parameter which confuses some model/parser combinations (e.g. qwen3_xml).
+    Each tool is named `return_<field>` and has a single parameter named after
+    the field itself with the correct JSON Schema type.
     """
     tools = []
     for field, hint in schema._data.items():
@@ -445,8 +444,8 @@ def _make_return_output_tools(schema: "agdata") -> list[dict]:
                 "description": tool_desc,
                 "parameters": {
                     "type": "object",
-                    "properties": {"value": value_schema},
-                    "required": ["value"],
+                    "properties": {field: value_schema},
+                    "required": [field],
                 },
             },
         })
@@ -755,14 +754,18 @@ def _llm_call(
                 term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  bad request: {_bad_req}")
             return _LLMCallResult(conn_error=_bad_req, should_retry=False, elapsed_ms=_llm_elapsed_ms)
 
-        except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError) as _conn_err:
+        except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError,
+                openai.APIConnectionError) as _conn_err:
             try:
                 client.close()  # best-effort: unblock drain thread's ssl.read()
             except Exception:
                 pass
             messages.pop()  # remove partial placeholder
             _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-            _err_desc = str(_conn_err) if not isinstance(_conn_err, _LLMIdleTimeout) else str(_conn_err)
+            if isinstance(_conn_err, openai.APIConnectionError):
+                _err_desc = f"Connection error: LLM backend unreachable ({_conn_err.__cause__ or _conn_err})"
+            else:
+                _err_desc = str(_conn_err)
             if _timeout_attempt < _LLM_MAX_RETRIES - 1:
                 next_attempt = _timeout_attempt + 1
                 if term:
@@ -844,6 +847,15 @@ def _dispatch_tools(
             except (json.JSONDecodeError, TypeError):
                 args = {}
             result_content = _intercept[fn_name](args)
+            if term:
+                try:
+                    _ret_result = json.loads(result_content)
+                except (json.JSONDecodeError, TypeError):
+                    _ret_result = {}
+                if "error" in _ret_result:
+                    term.log("TOOL ✗   ", f"{fn_name}({fn_args})  → {_ret_result['error']}")
+                else:
+                    term.log("TOOL ✓   ", f"{fn_name}({fn_args})")
             tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
             messages.append(tool_msg)
             if _live_messages_fn:
@@ -1492,7 +1504,7 @@ class agskill:
                 _is_str      = hint is str
 
                 def _handle(args: dict) -> str:
-                    value = args.get("value")
+                    value = next(iter(args.values()), None)
                     err = _validate_output_field(field, value, self.output_schema)
                     if err is not None:
                         hint    = self.output_schema._data[field]

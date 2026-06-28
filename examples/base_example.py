@@ -29,14 +29,14 @@ def _make_run_dir(name: str):
     return run_dir
 
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:18000/v1"),
-    "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   ""),
-    "temperature":       0.6,
-    "max_tokens":        16000,
-    "top_p":             0.95,
-    "top_k":             50,
-    "repetition_penalty": 1.1,
+    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
+    "model":                "",
+    "temperature":          0.6,
+    "max_tokens":           8000,
+    "top_p":                0.95,
+    "top_k":                50,
+    "repetition_penalty":   1.1,
 }
 
 def main():
@@ -108,4 +108,3 @@ def main():
 if __name__ == "__main__":
     from agency.agwebui import agwebui
     agwebui.run(main)
-    # main()

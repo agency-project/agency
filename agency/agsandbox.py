@@ -302,7 +302,8 @@ class agSandbox:
             return
         # Remove any leftover container in a non-running state (created,
         # exited, dead, …) that stop() failed to clean up.
-        self._run([self._runtime, "rm", "-f", name], check=False)
+        if self._container_status():
+            self._rm_container(name)
         if self._runtime == "docker":
             _container_semaphore.acquire()
         try:
@@ -328,7 +329,7 @@ class agSandbox:
                 self._run_with_conflict_retry(run_cmd, name)
                 self._run(
                     [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
-                    check=False,
+                    check=True,
                 )
         except _ContainerAlreadyRunning:
             # Another process started the container while we were retrying;
@@ -380,13 +381,14 @@ class agSandbox:
                 # it creates the container object (reserving the name) but fails
                 # before starting processes.  Remove any such "Created" artifact
                 # so the next attempt does not see a spurious name conflict.
-                self._run([self._runtime, "rm", "-f", name], check=False)
+                if self._container_status():
+                    self._rm_container(name)
             elif conflict:
                 if self._container_running():
                     raise _ContainerAlreadyRunning()
                 # Leftover container in a non-running state — remove it.
                 # Wait until it's actually gone before retrying docker run.
-                self._run([self._runtime, "rm", "-f", name], check=False)
+                self._rm_container(name)
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     if not self._container_status():
@@ -470,6 +472,18 @@ class agSandbox:
                 if err:
                     msg += f": {err}"
                 raise RuntimeError(msg) from e
+
+    def _rm_container(self, name: str) -> None:
+        """Force-remove a container by name. Raises on failure."""
+        self._run([self._runtime, "rm", "-f", name], check=True, timeout=_TIMEOUT_DOCKER_RM)
+
+    def _rmi(self, image_ref: str, *, force: bool = False) -> None:
+        """Remove an image by ID or tag. Raises on failure."""
+        cmd = [self._runtime, "rmi"]
+        if force:
+            cmd.append("-f")
+        cmd.append(image_ref)
+        self._run(cmd, check=True, timeout=_TIMEOUT_IMAGE)
 
     def _container_exec(
         self,
@@ -739,17 +753,11 @@ class agSandbox:
                         time.sleep(1)
             # Delete the previous image now that the tag points to the new one.
             if old_image_id and self._lifecycle_image == tag:
-                try:
-                    self._run(
-                        [self._runtime, "rmi", old_image_id],
-                        check=False, timeout=30,
-                    )
-                except Exception:
-                    pass
+                self._rmi(old_image_id)
         name = self._container_name()
         for _attempt in range(3):
             try:
-                self._run([self._runtime, "rm", "-f", name], check=True, timeout=_TIMEOUT_DOCKER_RM)
+                self._rm_container(name)
                 break
             except Exception:
                 if _attempt == 2:
@@ -781,13 +789,7 @@ class agSandbox:
                     )
                 except Exception as _e:
                     print(f"[agsandbox] WARNING: failed to kill PIDs {pids} in {self._name} during restore: {_e}")
-            try:
-                self._run(
-                    [self._runtime, "rm", "-f", self._container_name()],
-                    timeout=_TIMEOUT_DOCKER_RM,
-                )
-            except Exception as _e:
-                print(f"[agsandbox] WARNING: docker rm -f {self._container_name()} failed during restore: {_e}")
+            self._rm_container(self._container_name())
             self._started = False
             self._watched_pids = {}
             self._baseline_pids = set()
@@ -952,14 +954,11 @@ class agSandbox:
         )
 
         try:
-            self._run(
-                [self._runtime, "rm", "-f", container_name],
-                timeout=_TIMEOUT_DOCKER_RM,
-            )
-        except Exception as _e:
-            print(f"[agsandbox] WARNING: docker rm -f {container_name} failed during destroy: {_e}")
-        if had_container:
-            _container_semaphore.release()
+            if self._container_status():
+                self._rm_container(container_name)
+        finally:
+            if had_container:
+                _container_semaphore.release()
 
         # Remove pre-tool checkpoint images created during this sandbox's lifetime.
         try:
@@ -975,7 +974,7 @@ class agSandbox:
                 # suffix when no explicit tag was given (e.g. "agency/lifecycle-x:latest").
                 tag_repo = tag.rsplit(":", 1)[0] if ":" in tag else tag
                 if tag.startswith(prefix) or tag_repo == lifecycle:
-                    self._run([self._runtime, "rmi", "-f", tag], timeout=_TIMEOUT_IMAGE, check=False)
+                    self._rmi(tag, force=True)
         except Exception as _e:
             print(f"[agsandbox] WARNING: image cleanup failed for {container_name}: {_e}")
 

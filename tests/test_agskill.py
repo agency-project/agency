@@ -300,7 +300,7 @@ def test_output_schema_missing_field_triggers_retry():
     )
     responses = [
         _direct("I'm done."),                             # no return_summary → reprompt
-        _tool_call("return_summary", {"value": "good"}),  # field provided
+        _tool_call("return_summary", {"summary": "good"}),  # field provided
         _direct(""),                                       # done
     ]
     with patch("openai.OpenAI") as MockClient:
@@ -330,9 +330,9 @@ def test_output_schema_type_mismatch_triggers_retry():
         max_output_schema_retries=2,
     )
     responses = [
-        _tool_call("return_count", {"value": "not-an-int"}),  # type error
+        _tool_call("return_count", {"count": "not-an-int"}),  # type error
         _direct(""),                                           # stops → reprompt
-        _tool_call("return_count", {"value": 5}),             # correct
+        _tool_call("return_count", {"count": 5}),             # correct
         _direct(""),                                           # done
     ]
     with patch("openai.OpenAI") as MockClient:
@@ -352,7 +352,7 @@ def test_correction_message_appended_on_retry():
     call_idx = 0
     responses = [
         _direct("I'm done."),                              # no return_answer → correction injected
-        _tool_call("return_answer", {"value": "fixed"}),   # provide field → done
+        _tool_call("return_answer", {"answer": "fixed"})   # provide field → done
     ]
 
     def side_effect(**kwargs):
@@ -408,9 +408,9 @@ def test_return_output_all_fields_correct():
         output_schema=agdata(summary=str, is_duplicate=bool, score=int),
     )
     responses = [
-        _tool_call("return_summary", {"value": "great paper"}),
-        _tool_call("return_is_duplicate", {"value": False}),
-        _tool_call("return_score", {"value": 9}),
+        _tool_call("return_summary", {"summary": "great paper"}),
+        _tool_call("return_is_duplicate", {"is_duplicate": False}),
+        _tool_call("return_score", {"score": 9}),
         _direct(""),
     ]
     with patch("openai.OpenAI") as MockClient:
@@ -432,8 +432,8 @@ def test_return_output_type_error_immediate_feedback():
     all_messages: list[list[dict]] = []
     call_idx = 0
     responses = [
-        _tool_call("return_count", {"value": "not-int"}),  # error
-        _tool_call("return_count", {"value": 42}),          # correct
+        _tool_call("return_count", {"count": "not-int"}),  # error
+        _tool_call("return_count", {"count": 42}),          # correct
         _direct(""),
     ]
 
@@ -461,7 +461,7 @@ def test_return_output_unknown_field_error():
     tools = _make_return_output_tools(schema)
     assert len(tools) == 1
     assert tools[0]["function"]["name"] == "return_summary"
-    assert tools[0]["function"]["parameters"]["properties"]["value"]["type"] == "string"
+    assert tools[0]["function"]["parameters"]["properties"]["summary"]["type"] == "string"
 
     s = agskill(
         name="s", system_prompt="",
@@ -470,8 +470,8 @@ def test_return_output_unknown_field_error():
     )
     call_idx = 0
     responses = [
-        _tool_call("return_WRONG", {"value": "oops"}),    # unknown → "unknown tool" feedback
-        _tool_call("return_summary", {"value": "correct"}),
+        _tool_call("return_WRONG", {"WRONG": "oops"}),    # unknown → "unknown tool" feedback
+        _tool_call("return_summary", {"summary": "correct"}),
         _direct(""),
     ]
 
@@ -494,7 +494,7 @@ def test_return_output_list_of_dicts():
     )
     papers = [{"title": "A", "url": "http://a"}, {"title": "B", "url": "http://b"}]
     responses = [
-        _tool_call("return_papers", {"value": papers}),
+        _tool_call("return_papers", {"papers": papers}),
         _direct(""),
     ]
     with patch("openai.OpenAI") as MockClient:
@@ -510,7 +510,7 @@ def test_return_output_list_str():
         output_schema=agdata(tags=list[str]),
     )
     responses = [
-        _tool_call("return_tags", {"value": ["ml", "nlp"]}),
+        _tool_call("return_tags", {"tags": ["ml", "nlp"]}),
         _direct(""),
     ]
     with patch("openai.OpenAI") as MockClient:
@@ -524,11 +524,11 @@ def test_return_output_bare_list():
     from agency.agskill import _make_return_output_tools
     schema = agdata(items=list)
     tools = _make_return_output_tools(schema)
-    assert tools[0]["function"]["parameters"]["properties"]["value"]["type"] == "array"
+    assert tools[0]["function"]["parameters"]["properties"]["items"]["type"] == "array"
 
     s = agskill(name="s", system_prompt="", output_schema=agdata(items=list))
     responses = [
-        _tool_call("return_items", {"value": [{"a": 1}, {"b": 2}]}),
+        _tool_call("return_items", {"items": [{"a": 1}, {"b": 2}]}),
         _direct(""),
     ]
     with patch("openai.OpenAI") as MockClient:
@@ -558,11 +558,11 @@ def test_return_output_bare_dict():
     from agency.agskill import _make_return_output_tools
     schema = agdata(meta=dict)
     tools = _make_return_output_tools(schema)
-    assert tools[0]["function"]["parameters"]["properties"]["value"]["type"] == "object"
+    assert tools[0]["function"]["parameters"]["properties"]["meta"]["type"] == "object"
 
     s = agskill(name="s", system_prompt="", output_schema=agdata(meta=dict))
     responses = [
-        _tool_call("return_meta", {"value": {"a": 1, "b": "x"}}),
+        _tool_call("return_meta", {"meta": {"a": 1, "b": "x"}}),
         _direct(""),
     ]
     with patch("openai.OpenAI") as MockClient:
@@ -603,8 +603,8 @@ def test_return_output_tool_in_openai_tools():
     )
     captured_kwargs: list[dict] = []
     responses_iter = iter([
-        _tool_call("return_summary", {"value": "x"}),
-        _tool_call("return_score", {"value": 1}),
+        _tool_call("return_summary", {"summary": "x"}),
+        _tool_call("return_score", {"score": 1}),
         _direct(""),
     ])
     with patch("openai.OpenAI") as MockClient:
@@ -622,8 +622,86 @@ def test_return_output_tool_in_openai_tools():
     assert names.index("return_summary") < names.index("return_score") or True  # order matches schema
     # Verify the value parameters are correctly typed.
     by_name = {t["function"]["name"]: t for t in first_tools}
-    assert by_name["return_summary"]["function"]["parameters"]["properties"]["value"]["type"] == "string"
-    assert by_name["return_score"]["function"]["parameters"]["properties"]["value"]["type"] == "integer"
+    assert by_name["return_summary"]["function"]["parameters"]["properties"]["summary"]["type"] == "string"
+    assert by_name["return_score"]["function"]["parameters"]["properties"]["score"]["type"] == "integer"
+
+
+# ---------------------------------------------------------------------------
+# Return tool parameter naming and logging
+# ---------------------------------------------------------------------------
+
+def test_return_tool_parameter_named_after_field():
+    """Each return_<field> tool has a single parameter named after the field, not 'value'."""
+    from agency.agskill import _make_return_output_tools
+    schema = agdata(title=str, count=int, passed=bool)
+    tools = _make_return_output_tools(schema)
+    by_name = {t["function"]["name"]: t for t in tools}
+    for field in ("title", "count", "passed"):
+        params = by_name[f"return_{field}"]["function"]["parameters"]
+        assert field in params["properties"], f"expected '{field}' as parameter name"
+        assert "value" not in params["properties"], "'value' should not be the parameter name"
+        assert params["required"] == [field]
+
+
+def test_return_tool_accepts_any_key_name():
+    """_handle extracts value via next(iter(args.values())) regardless of key name."""
+    s = agskill(name="s", system_prompt="", output_schema=agdata(summary=str))
+    responses = [
+        _tool_call("return_summary", {"summary": "hello"}),
+        _direct(""),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=MagicMock())
+    assert result.summary == "hello"
+
+
+def test_return_tool_accepts_wrong_key_name():
+    """Even if the model uses a different key name, the single value is still extracted."""
+    s = agskill(name="s", system_prompt="", output_schema=agdata(summary=str))
+    responses = [
+        _tool_call("return_summary", {"value": "hello"}),  # old-style key
+        _direct(""),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        result, _, _, _ = s.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=MagicMock())
+    assert result.summary == "hello"
+
+
+def test_return_tool_logs_success_to_term():
+    """Successful return_<field> call emits TOOL ✓ to the term passed to run()."""
+    s = agskill(name="s", system_prompt="", output_schema=agdata(summary=str))
+    responses = [
+        _tool_call("return_summary", {"summary": "ok"}),
+        _direct(""),
+    ]
+    mock_term = MagicMock()
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=MagicMock(), term=mock_term)
+    calls = [str(c) for c in mock_term.log.call_args_list]
+    assert any("TOOL ✓" in c for c in calls), f"Expected TOOL ✓ log call, got: {calls}"
+    assert any("return_summary" in c for c in calls)
+
+
+def test_return_tool_logs_validation_error_to_term():
+    """A type-mismatched return_<field> call emits TOOL ✗ with the tool call args."""
+    s = agskill(name="s", system_prompt="", output_schema=agdata(count=int),
+                max_output_schema_retries=1)
+    responses = [
+        _tool_call("return_count", {"count": "not-an-int"}),  # type error → logged
+        _tool_call("return_count", {"count": 42}),             # correct on retry
+        _direct(""),
+    ]
+    mock_term = MagicMock()
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=MagicMock(), term=mock_term)
+    calls = [str(c) for c in mock_term.log.call_args_list]
+    assert any("TOOL ✗" in c for c in calls), f"Expected TOOL ✗ log call, got: {calls}"
+    assert any("return_count" in c for c in calls)
+    assert any("not-an-int" in c for c in calls)
 
 
 # ---------------------------------------------------------------------------

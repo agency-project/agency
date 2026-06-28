@@ -58,17 +58,18 @@ def _resolve_model(base_url: str, api_key: str, model: str) -> str:
         ) from e
 
 
-_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:18000/v1")
+_BASE_URL = os.environ.get("VLLM_BASE_URL", "")
 _API_KEY  = os.environ.get("VLLM_API_KEY",  "")
-_MODEL    = _resolve_model(_BASE_URL, _API_KEY, os.environ.get("VLLM_MODEL", ""))
 
 LLM_CONFIG = {
-    "base_url":           _BASE_URL,
-    "api_key":            _API_KEY,
-    "model":              _MODEL,
-    "temperature":        0.7,
-    "max_tokens":         8000,
-    "top_p":              0.95,
+    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
+    "model":                "",
+    "temperature":          0.6,
+    "max_tokens":           8000,
+    "top_p":                0.95,
+    "top_k":                50,
+    "repetition_penalty":   1.1,
 }
 
 

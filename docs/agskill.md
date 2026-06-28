@@ -363,21 +363,23 @@ Input validation is **skipped** when `_is_continuation=True` so that process-sta
 When an `output_schema` is declared (and it is not an `agrawstring` schema), the framework generates one typed tool per output field and adds them to the tool list at the start of the skill run:
 
 ```
-return_summary(value: string)
-return_word_count(value: integer)
-return_passed(value: boolean)
+return_summary(summary: string)
+return_word_count(word_count: integer)
+return_passed(passed: boolean)
 ```
+
+Each tool has exactly one parameter named after the field (not `"value"`). This allows models to match the tool name to its parameter by name, improving tool call reliability across LLM vendors.
 
 The system prompt instructs the model to call each `return_<field>` tool once it has the final value for that field. The model may interleave these calls freely with other tool use (bash, read, write, etc.) — it is not required to call them all at once or last.
 
 ### Per-field validation
 
-Each `return_<field>` call is validated immediately against the schema hint:
+Each `return_<field>` call is validated immediately against the schema hint. The result of each call is logged to the `agterm` passed to `run()` (when one is provided):
 
-- **Type mismatch** → the tool returns `{"error": "field 'X': expected bool, got str"}` inline. The model sees the error in the same response turn and can retry just that field without losing any other already-registered outputs.
+- **Type mismatch** → the tool returns `{"error": "field 'X': expected bool, got str"}` inline, and **`TOOL ✗`** is logged to `agterm` with the raw tool call args and the error message. The model sees the error in the same response turn and can retry just that field without losing any other already-registered outputs.
 - **`agfile` field** → file is read from the sandbox immediately; see [Output `agfile` fields](#output-agfile-fields) for the full set of checks and error messages.
 - **`str` field with a sandbox path value** → if the value looks like a sandbox path (starts with `/`, only word characters, dots, and hyphens per segment), the framework silently reads the file at that path and substitutes its content. If the file is unreadable or its content is itself a path, the original value is kept. This handles the common case where the agent writes a `str` output to a file and returns the path instead of the content.
-- **Success** → the tool returns `{"result": "✓ 'X' registered. Still needed: [...]"}` (or `"All required fields complete."` on the last one).
+- **Success** → the tool returns `{"result": "✓ 'X' registered. Still needed: [...]"}` (or `"All required fields complete."` on the last one), and **`TOOL ✓`** is logged to `agterm` with the tool call args.
 
 ### Completeness check and reprompt
 

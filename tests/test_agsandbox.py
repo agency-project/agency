@@ -1560,8 +1560,8 @@ class TestDanglingImageEagerCleanup:
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
 
-    def test_stop_commit_rmi_failure_does_not_raise(self):
-        """A failing rmi (e.g. race condition) must not propagate — best-effort only."""
+    def test_stop_commit_rmi_failure_raises(self):
+        """A failing rmi must propagate — rmi on a known image ID is not best-effort."""
         import agency.agsandbox as _mod
 
         sb = _make_sandbox()
@@ -1583,7 +1583,8 @@ class TestDanglingImageEagerCleanup:
             with patch.object(sb, "_started", True):
                 with patch.object(sb, "_container_running", return_value=True):
                     with patch.object(sb, "_gpu_virtual", False):
-                        sb.stop(commit=True)  # must not raise
+                        with pytest.raises(RuntimeError, match="image in use"):
+                            sb.stop(commit=True)
 
     @docker
     def test_repeated_commits_leave_no_dangling_images(self):
@@ -1624,3 +1625,204 @@ class TestDanglingImageEagerCleanup:
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# _rm_container / _rmi helpers
+# ---------------------------------------------------------------------------
+
+class TestDockerCommandHelpers:
+    """Unit tests for _rm_container and _rmi — no real Docker required."""
+
+    def _sb(self):
+        return _make_sandbox()
+
+    # --- _rm_container ---
+
+    def test_rm_container_sends_rm_force_args(self):
+        sb = self._sb()
+        calls = []
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append((args, check))
+            return OK()
+
+        import agency.agsandbox as _mod
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            sb._rm_container("my-container")
+
+        assert len(calls) == 1
+        args, check = calls[0]
+        assert "rm" in args and "-f" in args and "my-container" in args
+        assert check is True
+
+    def test_rm_container_raises_on_failure(self):
+        sb = self._sb()
+
+        import agency.agsandbox as _mod
+        with patch.object(_mod.agSandbox, "_run", side_effect=RuntimeError("rm failed")):
+            with pytest.raises(RuntimeError, match="rm failed"):
+                sb._rm_container("bad-container")
+
+    # --- _rmi ---
+
+    def test_rmi_sends_rmi_args_without_force(self):
+        sb = self._sb()
+        calls = []
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append((args, check))
+            return OK()
+
+        import agency.agsandbox as _mod
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            sb._rmi("sha256:abc123")
+
+        assert len(calls) == 1
+        args, check = calls[0]
+        assert "rmi" in args and "sha256:abc123" in args
+        assert "-f" not in args
+        assert check is True
+
+    def test_rmi_force_adds_dash_f(self):
+        sb = self._sb()
+        calls = []
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(args)
+            return OK()
+
+        import agency.agsandbox as _mod
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            sb._rmi("myimage:tag", force=True)
+
+        assert "-f" in calls[0]
+
+    def test_rmi_raises_on_failure(self):
+        sb = self._sb()
+
+        import agency.agsandbox as _mod
+        with patch.object(_mod.agSandbox, "_run", side_effect=RuntimeError("rmi failed")):
+            with pytest.raises(RuntimeError, match="rmi failed"):
+                sb._rmi("sha256:deadbeef")
+
+    # --- _ensure_started pre-cleanup guard ---
+
+    def test_ensure_started_skips_rm_when_no_leftover_container(self):
+        """No rm when the container doesn't exist before create."""
+        sb = self._sb()
+        calls = []
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(args)
+            return OK()
+
+        import agency.agsandbox as _mod
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            # status returns "" → no leftover container
+            with patch.object(sb, "_container_running", return_value=False):
+                with patch.object(sb, "_container_status", return_value=""):
+                    with patch.object(sb, "_run_with_conflict_retry"):
+                        sb._ensure_started()
+
+        rm_calls = [a for a in calls if "rm" in a]
+        assert not rm_calls, f"expected no rm call; got {rm_calls}"
+
+    def test_ensure_started_rms_leftover_container(self):
+        """rm is issued when a non-running leftover container exists."""
+        sb = self._sb()
+        calls = []
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append((args, check))
+            return OK()
+
+        import agency.agsandbox as _mod
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=False):
+                with patch.object(sb, "_container_status", return_value="exited"):
+                    with patch.object(sb, "_run_with_conflict_retry"):
+                        sb._ensure_started()
+
+        rm_calls = [(a, c) for (a, c) in calls if "rm" in a]
+        assert rm_calls, "expected rm call for leftover container"
+        assert all(c is True for _, c in rm_calls), "rm must use check=True"
+
+    # --- destroy semaphore release ---
+
+    def test_destroy_releases_semaphore_even_when_rm_raises(self):
+        """_container_semaphore must be released in finally even if rm fails."""
+        import agency.agsandbox as _mod
+
+        sb = self._sb()
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            if "images" in args:
+                result = OK()
+                result.stdout = b""
+                return result
+            return OK()
+
+        released = []
+        real_release = _mod._container_semaphore.release
+
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            with patch.object(sb, "_started", True):
+                with patch.object(sb, "_container_running", return_value=True):
+                    with patch.object(sb, "_container_status", return_value="running"):
+                        with patch.object(_mod._container_semaphore, "release",
+                                          side_effect=lambda: released.append(1)):
+                            with pytest.raises(RuntimeError, match="rm exploded"):
+                                sb.destroy()
+
+        assert released, "semaphore must be released even when rm raises"
+
+    def test_destroy_skips_rm_when_container_absent(self):
+        """destroy() must not call rm when the container does not exist."""
+        import agency.agsandbox as _mod
+
+        sb = self._sb()
+        calls = []
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(args)
+            return OK()
+
+        with patch.object(_mod.agSandbox, "_run", fake_run):
+            with patch.object(sb, "_started", False):
+                with patch.object(sb, "_container_running", return_value=False):
+                    with patch.object(sb, "_container_status", return_value=""):
+                        sb.destroy()
+
+        rm_calls = [a for a in calls if "rm" in a and "rmi" not in a]
+        assert not rm_calls, f"must not rm when container absent; got {rm_calls}"
