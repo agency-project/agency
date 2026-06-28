@@ -2,11 +2,10 @@
 Port of agent_patterns/output_guardrails.py from openai-agents-python.
 
 Original: Output guardrail trips if the agent's response contains a phone number.
-Port: output_validator on the agskill checks the output before it resolves.
-      If it fails all retries, AgError is raised.
+Port: Caller runs a guardrail function on the returned agdata and raises if it trips.
 """
 import os
-from agency import agent, agskill, agdata, AgError
+from agency import agent, agskill, agdata, agerror
 
 LLM_CONFIG = {
     "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:18000/v1"),
@@ -19,36 +18,33 @@ LLM_CONFIG = {
     "repetition_penalty": 1.1,
 }
 
-
-def _no_phone_numbers(result: agdata) -> list[str]:
-    """Trip if the response or reasoning contains what looks like a phone number prefix."""
-    response  = str(getattr(result, "response",  "") or "")
-    reasoning = str(getattr(result, "reasoning", "") or "")
-    if "650" in response or "650" in reasoning:
-        return ["Response contains a sensitive phone number — cannot return this output."]
-    return []
-
-
 assistant_skill = agskill(
     name="assistant",
     system_prompt="You are a helpful assistant.",
     input_schema=agdata(message=str),
     output_schema=agdata(reasoning=str, response=str),
-    output_validator=_no_phone_numbers,
-    max_retries=1,
     replace_tools=[],
 )
 
 ag = agent(llm_config=LLM_CONFIG)
 
+
+def check_no_phone_numbers(result: agdata) -> None:
+    """Raise if the response or reasoning contains what looks like a phone number prefix."""
+    response  = str(result.response  or "")
+    reasoning = str(result.reasoning or "")
+    if "650" in response or "650" in reasoning:
+        raise ValueError("Response contains a sensitive phone number — cannot use this output.")
+
+
 if __name__ == "__main__":
-    # Should pass
     r1 = ag.run(assistant_skill, agdata(message="What's the capital of California?"))
+    check_no_phone_numbers(r1)
     print(f"First message passed: {r1.response}")
 
-    # Should trip the guardrail
+    r2 = ag.run(assistant_skill, agdata(message="My phone number is 650-123-4567. Where do you think I live?"))
     try:
-        r2 = ag.run(assistant_skill, agdata(message="My phone number is 650-123-4567. Where do you think I live?"))
+        check_no_phone_numbers(r2)
         print(f"Guardrail didn't trip (unexpected): {r2.response}")
-    except AgError as e:
+    except ValueError as e:
         print(f"Guardrail tripped: {e}")

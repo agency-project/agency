@@ -2,7 +2,7 @@ import json
 import threading
 import pytest
 from unittest.mock import MagicMock, patch
-from agency.agdata import agdata
+from agency.agdata import agdata, agerror
 from agency.agskill import agskill
 from agency.agtool import agtool
 from agency.agent import agent
@@ -621,11 +621,11 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_ui_state_error_when_skill_returns_error():
-    """_ui_state is set to 'error' when the skill returns agdata(error=...)."""
+    """_ui_state is set to 'error' when the skill returns agerror(...)."""
     skill = agskill(name="s", system_prompt="")
 
     def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
-        return agdata(error="something went wrong"), agdata(messages=[]), [], (0, 0)
+        return agerror("something went wrong"), agdata(messages=[]), [], (0, 0)
 
     skill.run = fake_run
     ag = make_agent()

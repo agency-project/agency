@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -248,6 +249,71 @@ class TestLog:
             _wrapper()
             captured = capsys.readouterr()
             assert "test_agterm.py" in captured.err
+        finally:
+            agwebui_mod._active = old
+
+
+# ---------------------------------------------------------------------------
+# log() — webui active: errors to stderr, non-errors to webui only
+# ---------------------------------------------------------------------------
+
+class TestLogWebui:
+    """When webui is active, only error events (✗) should reach stderr."""
+
+    def _make_mock_webui(self):
+        mock = MagicMock()
+        mock.emitter = MagicMock()
+        mock.emitter.log = MagicMock()
+        return mock
+
+    def test_non_error_event_goes_to_webui_only_not_stderr(self, capsys):
+        import agency.agwebui as agwebui_mod
+        old = agwebui_mod._active
+        agwebui_mod._active = self._make_mock_webui()
+        try:
+            term = _fresh_agterm()
+            term.log("SKILL ✓  ", "normal-event")
+            captured = capsys.readouterr()
+            assert "normal-event" not in captured.err
+            agwebui_mod._active.emitter.log.assert_called()
+        finally:
+            agwebui_mod._active = old
+
+    def test_error_event_goes_to_both_webui_and_stderr(self, capsys):
+        import agency.agwebui as agwebui_mod
+        old = agwebui_mod._active
+        agwebui_mod._active = self._make_mock_webui()
+        try:
+            term = _fresh_agterm()
+            term.log("SKILL ✗  ", "error-event")
+            captured = capsys.readouterr()
+            assert "error-event" in captured.err
+            agwebui_mod._active.emitter.log.assert_called()
+        finally:
+            agwebui_mod._active = old
+
+    def test_prune_error_event_also_reaches_stderr(self, capsys):
+        import agency.agwebui as agwebui_mod
+        old = agwebui_mod._active
+        agwebui_mod._active = self._make_mock_webui()
+        try:
+            term = _fresh_agterm()
+            term.log("PRUNE ✗  ", "prune-error")
+            captured = capsys.readouterr()
+            assert "prune-error" in captured.err
+        finally:
+            agwebui_mod._active = old
+
+    def test_non_error_events_with_webui_do_not_clutter_stderr(self, capsys):
+        import agency.agwebui as agwebui_mod
+        old = agwebui_mod._active
+        agwebui_mod._active = self._make_mock_webui()
+        try:
+            term = _fresh_agterm()
+            for ev in ("CREATED  ", "SKILL ▶  ", "LLM ▶    ", "LLM ✓    ", "TOOL     "):
+                term.log(ev, f"msg-{ev.strip()}")
+            captured = capsys.readouterr()
+            assert captured.err == ""
         finally:
             agwebui_mod._active = old
 

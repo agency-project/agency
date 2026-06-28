@@ -24,7 +24,7 @@ print(d.word_count)   # 42
 d.new_field = "added" # set a field
 ```
 
-Accessing a missing field raises `AttributeError`. Accessing any field on a failed result raises `AgError`. Use `agdata.error` (a property) to read the error message without raising, or `is_error()` for a boolean check.
+Accessing a missing field raises `AttributeError`. Skills and tools that fail return an `agerror` instance instead of an `agdata`. Accessing any field other than `.error` on an `agerror` raises `AgError`.
 
 ## Pending state
 
@@ -102,16 +102,20 @@ See [agskill.md](agskill.md) for how schemas are used in validation and system p
 
 ## Error handling
 
+Skills and tools that fail return an `agerror` instance. Check with `isinstance` and read the message via `.error`:
+
 ```python
+from agency import agdata, agerror
+
 result = ag.run(skill, agdata(text="..."))
 
-if result.is_error():
-    print(result.error)   # error message string, no raise
+if isinstance(result, agerror):
+    print(result.error)    # error message string
 else:
-    print(result.summary) # raises AgError if is_error() is True
+    print(result.summary)  # safe — result is a plain agdata
 ```
 
-`AgError` is a subclass of `RuntimeError`. It is raised when any field other than `.error` is accessed on a failed result.
+`agerror` is a subclass of `agdata`. Constructing one immediately emits a log line to stderr (and to the web UI when active) so errors are always visible without polling. Accessing any field other than `.error` on an `agerror` raises `AgError` (a subclass of `RuntimeError`).
 
 ## API summary
 
@@ -122,10 +126,11 @@ else:
 | `agdata.from_json(s)` | Construct from JSON string |
 | `d.to_dict()` | Serialize to plain dict |
 | `d.to_json()` | Serialize to JSON string |
-| `d.<field>` | Read a field (blocks if pending; raises `AgError` on error) |
+| `d.<field>` | Read a field (blocks if pending; raises `AttributeError` if missing) |
 | `d.<field> = v` | Write a field |
-| `d.error` | Read error message without raising (`None` if healthy) |
-| `d.is_error()` | `True` if the result holds a skill error |
 | `d.is_pending()` | `True` if the future has not yet resolved |
 | `d.wait()` | Block until resolved; return `self` |
 | `agdata.wait_all(list)` | Block until all items resolve; return the list |
+| `agerror(msg)` | Construct an error result; emits to stderr/webui immediately |
+| `isinstance(r, agerror)` | Check whether a result is an error |
+| `r.error` | Read the error message string (only valid on `agerror`) |

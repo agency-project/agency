@@ -4,7 +4,7 @@ import time
 import multiprocessing as _mp
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as _FutureTimeoutError, BrokenExecutor
 from typing import TYPE_CHECKING, Callable
-from .agdata import agdata
+from .agdata import agdata, agerror
 
 if TYPE_CHECKING:
     from .aglog import aglog
@@ -153,7 +153,7 @@ class agtool:
                 result = self.fn(arg)
             except Exception as e:
                 from .agdata import _fmt_exc
-                result = agdata(error=_fmt_exc(e))
+                result = agerror(_fmt_exc(e))
             self.log(arg, result, int((time.monotonic() - t0) * 1000))
             return result
 
@@ -166,7 +166,7 @@ class agtool:
             result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result(timeout=effective_timeout)
         except _FutureTimeoutError:
             elapsed = int((time.monotonic() - t0) * 1000)
-            result = agdata(error=f"tool timed out after {effective_timeout}s")
+            result = agerror(f"tool timed out after {effective_timeout}s")
             self.log(arg, result, elapsed)
             return result
         except BrokenExecutor:
@@ -176,7 +176,7 @@ class agtool:
             with _pool_lock:
                 _pool = None
             elapsed = int((time.monotonic() - t0) * 1000)
-            result = agdata(error="tool worker process died unexpectedly")
+            result = agerror("tool worker process died unexpectedly")
             self.log(arg, result, elapsed)
             return result
         result = pickle.loads(result_bytes)

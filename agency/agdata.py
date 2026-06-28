@@ -9,6 +9,16 @@ if TYPE_CHECKING:
 from .agtype import agtype, agfile
 
 
+def _emit_agdata_error(error: str) -> None:
+    """Log an agdata error through agterm so it reaches both stderr and the webui."""
+    from .agterm import agterm as _agterm_cls
+    # Lazily create a single shared agterm instance named "agdata".
+    if not hasattr(_emit_agdata_error, "_term"):
+        _emit_agdata_error._term = _agterm_cls("agdata")
+    # depth=3: log() → _emit_agdata_error → __init__ → actual agerror(...) call site
+    _emit_agdata_error._term.log("ERROR ✗  ", error, depth=3)
+
+
 def _fmt_exc(e: BaseException) -> str:
     """Format an exception with its full traceback for error emission.
 
@@ -23,11 +33,7 @@ def _fmt_exc(e: BaseException) -> str:
 
 
 class AgError(RuntimeError):
-    """Raised when accessing a result field on an agdata that holds a skill error.
-
-    Use ``agdata.error`` (a property) to read the error message without raising,
-    or ``agdata.is_error()`` for an explicit boolean check.
-    """
+    """Raised when accessing a non-error field on an agerror instance."""
 
 
 class agdata:
@@ -93,11 +99,6 @@ class agdata:
             p._resolve()
         return pending
 
-    def is_error(self) -> bool:
-        """Return True if this agdata holds a skill error (without raising)."""
-        self._resolve()
-        return "error" in object.__getattribute__(self, "_data")
-
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -145,21 +146,9 @@ class agdata:
     # Attribute access
     # ------------------------------------------------------------------
 
-    @property
-    def error(self) -> "str | None":
-        """Return the error message without raising, or None if healthy.
-
-        This is the one safe accessor on a failed agdata — all other field
-        accesses raise AgError.  Use ``is_error()`` for a boolean check.
-        """
-        self._resolve()
-        return object.__getattribute__(self, "_data").get("error")
-
     def __getattr__(self, name: str):
         self._resolve()
         data = object.__getattribute__(self, "_data")
-        if "error" in data:
-            raise AgError(data["error"])
         if name in data:
             return data[name]
         available = list(data.keys())
@@ -183,3 +172,32 @@ class agdata:
             other._resolve()
             return self._data == other._data
         return NotImplemented
+
+
+class agerror(agdata):
+    """Returned by skills and tools to signal failure.
+
+    Usage::
+
+        return agerror("context limit exceeded")
+
+    Callers check with ``isinstance(result, agerror)``.
+    Accessing any field other than ``.error`` raises AgError.
+    """
+
+    def __init__(self, message: str):
+        if not isinstance(message, str):
+            raise TypeError(
+                f"agerror message must be a str, got {type(message).__name__}"
+            )
+        object.__setattr__(self, "_future", None)
+        object.__setattr__(self, "_data", {"error": message})
+        _emit_agdata_error(message)
+
+    def __getattr__(self, name: str):
+        if name == "error":
+            return object.__getattribute__(self, "_data")["error"]
+        raise AgError(object.__getattribute__(self, "_data")["error"])
+
+    def __repr__(self) -> str:
+        return f"agerror({self._data.get('error')!r})"

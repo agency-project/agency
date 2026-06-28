@@ -10,23 +10,23 @@ The framework has four distinct propagation paths:
 
 ```
 Tool call fails
-  └─► agdata(error=...)  ──► LLM sees the error as a tool result message
-                                  and may retry or report failure in its output
+  └─► agerror(...)  ──► LLM sees the error as a tool result message
+                              and may retry or report failure in its output
 
 LLM connection fails
   └─► agskill retry loop (up to 5 attempts, exponential backoff)
-        └─► after 5 failures: agdata(error=...) returned from agskill.run()
+        └─► after 5 failures: agerror(...) returned from agskill.run()
               └─► agent._task() catches it, sets result_future
-                    └─► caller's agdata._resolve() re-raises or returns error agdata
+                    └─► caller's agdata._resolve() returns the agerror
 
 Output schema validation fails
   └─► correction message appended to conversation, loop continues
-        └─► after max_output_schema_retries: agdata(error=...) from agskill.run()
+        └─► after max_output_schema_retries: agerror(...) from agskill.run()
 
 Uncaught exception inside agent._task()
-  └─► except Exception: agdata(error=fmt_exc(exc))  ←── no re-raise
-        └─► result_future resolved with error agdata
-              └─► caller sees error in agdata.error field
+  └─► except Exception: agerror(_fmt_exc(exc))  ←── no re-raise
+        └─► result_future resolved with agerror
+              └─► caller checks isinstance(result, agerror)
 
 Uncaught exception inside agteam._async_run()
   └─► future.set_exception(exc)  ←── stored, not raised yet
@@ -35,7 +35,7 @@ Uncaught exception inside agteam._async_run()
               └─► multiple failures: raised as ExceptionGroup
 ```
 
-Errors almost never propagate as Python exceptions between threads. The canonical representation is `agdata(error=str(...))`: callers inspect the `error` field rather than catching exceptions. The only place Python exceptions cross thread boundaries is in `agteam`, where `future.set_exception()` defers the raise to `agsync()`.
+Errors almost never propagate as Python exceptions between threads. The canonical representation is `agerror(message)`: callers check `isinstance(result, agerror)` and read `result.error` rather than catching exceptions. Constructing an `agerror` immediately emits a log line to stderr (and to the web UI when active) — errors are always visible at the point they are created. The only place Python exceptions cross thread boundaries is in `agteam`, where `future.set_exception()` defers the raise to `agsync()`.
 
 ---
 
@@ -64,9 +64,9 @@ Errors almost never propagate as Python exceptions between threads. The canonica
    - Sleeps 2 s (allows SSL teardown to complete before reconnecting — see Known failure modes).
    - Continues to the next attempt.
 3. After `_LLM_MAX_RETRIES` consecutive failures, returns `_LLMCallResult(ok=False)`.
-4. The ReAct loop emits `{"type": "llm_error", "error": "LLM connection error after 5 attempts: ..."}` and returns `agdata(error=...)` to `agent._task()`.
+4. The ReAct loop emits `{"type": "llm_error", "error": "LLM connection error after 5 attempts: ..."}` and returns `agerror(...)` to `agent._task()`.
 
-**Propagation:** `agdata(error=...)` → `agent._task()` → `result_future.set_result(error_agdata)` → caller's `agdata._resolve()`.
+**Propagation:** `agerror(...)` → `agent._task()` → `result_future.set_result(error_result)` → caller checks `isinstance(result, agerror)`.
 
 ### Output schema validation retry
 
@@ -78,9 +78,9 @@ Errors almost never propagate as Python exceptions between threads. The canonica
 
 **Handler:**
 1. On each validation failure a correction message is appended to `messages` and the loop continues.
-2. Once `output_schema_retries_left` reaches 0, returns `agdata(error="output schema error after retries: ...")`.
+2. Once `output_schema_retries_left` reaches 0, returns `agerror("output schema error after retries: ...")`.
 
-**Propagation:** Same path as LLM error — `agdata(error=...)` flows back through `agent._task()`.
+**Propagation:** Same path as LLM error — `agerror(...)` flows back through `agent._task()`.
 
 ---
 
@@ -96,8 +96,8 @@ try:
     # resolve input, create sandbox, run agskill
     outer_result = af.run(...)
 except Exception as exc:
-    # swallow — convert to agdata
-    outer_result = agdata(error=_fmt_exc(exc))
+    # swallow — convert to agerror
+    outer_result = agerror(_fmt_exc(exc))
     outer_history = prev_history
 finally:
     # always runs, even on exception:
@@ -110,9 +110,9 @@ finally:
 
 **What is caught:** Any unhandled exception from the skill (including `agskill.run()` returning an error agdata is NOT an exception — only genuine throws reach here).
 
-**Handler:** Formats the exception with full traceback via `_fmt_exc(exc)`, stores it in `outer_result`, logs `SKILL ✗` to the terminal, then emits `{"type": "skill_error", "skill": ..., "error": ...}` via `_append_full_history()` after the finally block (line 728).
+**Handler:** Formats the exception with full traceback via `_fmt_exc(exc)`, stores it in `outer_result` as an `agerror`, logs `SKILL ✗` to the terminal, then emits `{"type": "skill_error", "skill": ..., "error": ...}` via `_append_full_history()` after the finally block (line 728).
 
-**Propagation:** `result_future.set_result(outer_result)` — the error stays inside `agdata.error`; the future resolves successfully (no exception crossing thread boundary).
+**Propagation:** `result_future.set_result(outer_result)` — the error is carried in an `agerror`; the future resolves successfully (no exception crossing thread boundary). Callers check `isinstance(result, agerror)`.
 
 ### Post-skill logging errors
 
@@ -161,9 +161,9 @@ finally:
 
 **What is caught:**
 - `subprocess.CalledProcessError` → re-raised as `RuntimeError` with stderr attached.
-- `subprocess.TimeoutExpired` → returns `agdata(error=..., returncode=-1)` without raising; the LLM sees the timeout as a tool result.
+- `subprocess.TimeoutExpired` → returns `agerror(...)` with `returncode=-1` without raising; the LLM sees the timeout as a tool result.
 
-**Propagation:** `exec()` is called by `agtool` via the process pool; timeout and runtime errors surface as `agdata(error=...)` to the ReAct loop, which appends them as tool result messages.
+**Propagation:** `exec()` is called by `agtool` via the process pool; timeout and runtime errors surface as `agerror(...)` to the ReAct loop, which appends them as tool result messages.
 
 ---
 
@@ -175,17 +175,17 @@ finally:
 
 **What is caught:** Any `Exception` from the tool function.
 
-**Handler:** Returns `agdata(error=_fmt_exc(exc))`; execution continues.
+**Handler:** Returns `agerror(_fmt_exc(exc))`; execution continues.
 
 ### Process-pool execution
 
 **Location:** line ~160–176
 
 **What is caught:**
-- `concurrent.futures.TimeoutError` → returns `agdata(error="tool timed out after {N}s")`.
-- `concurrent.futures.process.BrokenProcessPool` → resets `_pool = None` so the next call creates a fresh pool; returns `agdata(error="tool worker process died unexpectedly")`.
+- `concurrent.futures.TimeoutError` → returns `agerror("tool timed out after {N}s")`.
+- `concurrent.futures.process.BrokenProcessPool` → resets `_pool = None` so the next call creates a fresh pool; returns `agerror("tool worker process died unexpectedly")`.
 
-**Propagation:** All tool errors become `agdata(error=...)` appended to the conversation as a `tool` role message. The LLM reads the error and decides how to proceed.
+**Propagation:** All tool errors become `agerror(...)` appended to the conversation as a `tool` role message. The LLM reads the error and decides how to proceed.
 
 ---
 
@@ -256,22 +256,22 @@ finally:
 ## `agency/tools/` — individual tools
 
 ### `read.py`
-- `FileNotFoundError` → `agdata(error="Not found: {path}")`
-- Generic `Exception` → `agdata(error=_fmt_exc(e))`
+- `FileNotFoundError` → `agerror("Not found: {path}")`
+- Generic `Exception` → `agerror(_fmt_exc(e))`
 
 ### `edit.py`
-- `FileNotFoundError` on pre-read → `agdata(error=...)`
-- `ValueError` / `OSError` on write → `agdata(error=_fmt_exc(e))`
+- `FileNotFoundError` on pre-read → `agerror(...)`
+- `ValueError` / `OSError` on write → `agerror(_fmt_exc(e))`
 
 ### `webfetch.py`
-- `httpx.HTTPStatusError` → `agdata(error=f"HTTP {status}: {url}\n{details}")`
-- Generic `Exception` → `agdata(error=_fmt_exc(e))`
+- `httpx.HTTPStatusError` → `agerror(f"HTTP {status}: {url}\n{details}")`
+- Generic `Exception` → `agerror(_fmt_exc(e))`
 
 ### `human.py`
 - `EOFError` from `input()` → puts `_TIMEOUT_REPLY` in the reply queue
 - `queue.Empty` from `q.get(timeout=timeout_s)` → logs timeout and returns `_TIMEOUT_REPLY`
 
-All tool errors return `agdata(error=...)`. This is appended to the conversation as a `tool` role message; the LLM decides whether to retry the tool, try a different approach, or report failure in its final answer.
+All tool errors return `agerror(...)`. This is appended to the conversation as a `tool` role message; the LLM decides whether to retry the tool, try a different approach, or report failure in its final answer.
 
 ---
 

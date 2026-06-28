@@ -52,6 +52,7 @@ _EVENT_STYLES: dict[str, str] = {
     "SKILL ▶  ": "\033[1m",    # bold
     "SKILL ✓  ": "\033[0m",    # normal
     "SKILL ✗  ": "\033[7m",    # reverse video  (visible without colour)
+    "ERROR ✗  ": "\033[7m",    # reverse video  (agdata-level errors)
     "LLM ▶    ": "\033[0m",    # normal
     "LLM ✓    ": "\033[0m",    # normal
     "TOOL     ": "\033[0m",    # normal
@@ -138,12 +139,14 @@ class agterm:
         src       = f"{_DIM}({filename}:{lineno}){_RESET}"
 
         line = f"{ts}  {agent_tag}  {ev_tag}  {agterm._colorize_agnames(msg)}{tok_tag}  {src}"
+        _is_error = "✗" in event
         with agterm._lock:
             try:
                 from . import agwebui as _agwebui
                 if _agwebui._active is not None:
                     _agwebui._active.emitter.log(line)
-                    return
+                    if not _is_error:
+                        return  # non-error events go to webui only when it's active
             except Exception:
                 pass
             print(line, file=sys.stderr, flush=True)

@@ -27,7 +27,6 @@ The input schema is serialized and appended to the system prompt. The output sch
 | `replace_tools` | `list[agtool] \| None` | Replaces the tool list entirely; use `replace_tools=[]` for no tools |
 | `input_schema` | `agdata \| None` | Required input fields and their types |
 | `output_schema` | `agdata \| None` | Required output fields; enforced with retries |
-| `output_validator` | `Callable \| None` | Custom validation function, called after schema check |
 | `max_output_schema_retries` | `int` | Times to retry on output schema failure (default `10`) |
 
 ## Schema field types
@@ -130,8 +129,7 @@ Each call to `agskill.run()` executes a standard ReAct loop:
    g. Append the tool result message and go to 3
 8. If response has no tool calls → check if all required output fields have been registered
 9. If fields are missing and retries remain → inject reprompt message listing missing fields, go to 3
-10. If all fields present and `output_validator` is set → run validator; if it fails and retries remain → inject correction message, go to 3
-11. If sandbox has live background processes → `_wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
+10. If sandbox has live background processes → `_wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
 12. Delete offloaded input files, return `(result, updated_history, history_delta, token_counts)`
 
 The loop exits early when `max_steps` (default `AGSKILL_REACT_MAX_STEPS = 4096`) is exceeded.
@@ -385,9 +383,9 @@ Each `return_<field>` call is validated immediately against the schema hint:
 
 When the model produces a response with no tool calls at all, the framework checks whether all required fields have been registered:
 
-- **All fields present** → assemble `agdata(**collected)`, run `output_validator` if set, then return (or inject background-process status if needed).
+- **All fields present** → assemble `agdata(**collected)`, then return (or inject background-process status if needed).
 - **Fields missing** → inject a reprompt: `"You have not yet provided all required output fields. Still missing: ['X', 'Y']. Call return_<field> for each missing field."` and continue the loop. This consumes one retry from `max_output_schema_retries`.
-- **No retries left** → return `agdata(error="output schema error: missing fields after retries: ...")`.
+- **No retries left** → return `agerror("output schema error: missing fields after retries: ...")`.
 
 Output collection is skipped when the LLM response is answering a mid-conversation user message injected via the inbox (`had_inbox=True`), because the LLM is engaged in dialogue rather than producing a final structured answer.
 
@@ -514,18 +512,3 @@ class PaperCrawlerTeam(agteam):
         self.agent           = agent()
 ```
 
-## Example with output validator
-
-```python
-def validate_score(result: agdata) -> list[str]:
-    if not (0 <= result.score <= 100):
-        return [f"score must be 0–100, got {result.score}"]
-    return []
-
-skill = agskill(
-    name="grade",
-    system_prompt="Grade the submission from 0 to 100.",
-    output_schema=agdata(score=int, feedback=str),
-    output_validator=validate_score,
-)
-```

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agency.agdata import agdata as _agdata
+from agency.agdata import agdata as _agdata, agerror as _agerror
 
 from agency.agcompaction import (
     TAIL_TURNS,
@@ -679,4 +679,4 @@ def test_agskill_context_exceeded_does_not_count_as_retry():
                                sandbox=MagicMock(), _context_limit=BIG_CTX)
 
     # Must succeed — context_exceeded is not a connection error
-    assert result.error is None
+    assert not isinstance(result, _agerror)

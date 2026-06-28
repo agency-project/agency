@@ -5,7 +5,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from agency.agdata import agdata
+from agency.agdata import agdata, agerror
 from agency.agtype import agtype, agbinary
 from agency.agskill import agskill
 
@@ -247,7 +247,7 @@ def test_return_agbinary_missing_file_returns_error():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("out") is None
+    assert isinstance(result, agerror) or result._data.get("out") is None
 
 
 def test_return_agbinary_empty_file_returns_error():
@@ -260,7 +260,7 @@ def test_return_agbinary_empty_file_returns_error():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("out") is None
+    assert isinstance(result, agerror) or result._data.get("out") is None
 
 
 def test_return_agbinary_directory_returns_error():
@@ -273,7 +273,7 @@ def test_return_agbinary_directory_returns_error():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("out") is None
+    assert isinstance(result, agerror) or result._data.get("out") is None
 
 
 def test_return_agbinary_valid_file_is_accepted():

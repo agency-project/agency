@@ -2,7 +2,7 @@
 import json
 import pytest
 from unittest.mock import MagicMock, patch
-from agency.agdata import agdata
+from agency.agdata import agdata, agerror
 from agency.agtype import agtype, agfile
 from agency.agskill import agskill
 
@@ -237,7 +237,7 @@ def test_recover_agtype_outputs_reads_file_and_replaces_path():
 def test_recover_agtype_outputs_skips_error_result():
     from agency.agent import _recover_agtype_outputs
     sandbox = MagicMock()
-    result = agdata(error="something went wrong")
+    result = agerror("something went wrong")
     schema = agdata(report=agfile)
     paths = _recover_agtype_outputs(result, schema, sandbox)
     sandbox.read_file.assert_not_called()
@@ -274,7 +274,7 @@ def test_return_agfile_directory_path_returns_error():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("doc") is None
+    assert isinstance(result, agerror) or result._data.get("doc") is None
 
 
 def test_return_agfile_binary_file_returns_error():
@@ -290,7 +290,7 @@ def test_return_agfile_binary_file_returns_error():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("doc") is None
+    assert isinstance(result, agerror) or result._data.get("doc") is None
 
 
 def test_return_agfile_missing_file_returns_error_and_reprompts():
@@ -305,7 +305,7 @@ def test_return_agfile_missing_file_returns_error_and_reprompts():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("doc") is None
+    assert isinstance(result, agerror) or result._data.get("doc") is None
 
 
 def test_return_agfile_empty_file_returns_error():
@@ -318,7 +318,7 @@ def test_return_agfile_empty_file_returns_error():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("doc") is None
+    assert isinstance(result, agerror) or result._data.get("doc") is None
 
 
 def test_return_agfile_content_is_another_path_returns_error():
@@ -331,7 +331,7 @@ def test_return_agfile_content_is_another_path_returns_error():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.is_error() or result._data.get("doc") is None
+    assert isinstance(result, agerror) or result._data.get("doc") is None
 
 
 def test_return_agfile_valid_content_is_accepted():

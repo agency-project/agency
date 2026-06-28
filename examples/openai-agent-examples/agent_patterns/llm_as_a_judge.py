@@ -39,12 +39,14 @@ evaluator_skill = agskill(
     ),
     input_schema=agdata(outline=str),
     output_schema=agdata(score=str, feedback=str),
-    output_validator=lambda r: (
-        [] if str(getattr(r, "score", "")).lower() in ("pass", "needs_improvement", "fail")
-        else ["score must be 'pass', 'needs_improvement', or 'fail'"]
-    ),
     replace_tools=[],
 )
+
+_VALID_SCORES = {"pass", "needs_improvement", "fail"}
+
+def validate_score(ev: agdata) -> None:
+    if str(ev.score).lower() not in _VALID_SCORES:
+        raise ValueError(f"score must be one of {_VALID_SCORES}, got {ev.score!r}")
 
 ag = agent(llm_config=LLM_CONFIG)
 
@@ -59,6 +61,7 @@ if __name__ == "__main__":
         print(f"[attempt {attempt+1}] Outline: {latest_outline[:80]}...")
 
         ev = ag.run(evaluator_skill, agdata(outline=latest_outline))
+        validate_score(ev)
         print(f"  Score: {ev.score}  Feedback: {ev.feedback[:60]}...")
 
         if str(ev.score).lower() == "pass":

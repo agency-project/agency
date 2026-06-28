@@ -35,6 +35,7 @@ Example output from a running agent:
 | `SKILL ▶  ` | bold | Skill started |
 | `SKILL ✓  ` | normal | Skill completed successfully |
 | `SKILL ✗  ` | reverse | Skill failed (exception or schema error) |
+| `ERROR ✗  ` | reverse | `agerror(...)` constructed — emitted immediately at creation |
 | `LLM      ` | normal | LLM call dispatched |
 | `TOOL ✓   ` | normal | Tool call completed |
 | `PROCS ▶  ` | — | Background processes detected; `_wait_for_processes` polling started |
@@ -63,4 +64,11 @@ Agent names appearing inside log messages from *other* agents are automatically 
 
 ## agwebui integration
 
-When `agwebui.run()` is active, `agterm.log()` routes output to the web UI emitter instead of stderr. The emitter appends a `{"type": "log", "line": ...}` event to `ui_events.jsonl`; the standalone server broadcasts it to all connected browsers. Additionally, `agterm.__init__()` emits an `agent_registered` event with the agent's hex color so the browser can display the agent in its assigned color. See [agwebui.md](agwebui.md).
+When `agwebui.run()` is active, `agterm.log()` routes output based on whether the event label contains `✗`:
+
+- **Error events** (label contains `✗`, e.g. `SKILL ✗  `, `ERROR ✗  `): sent to **both** the web UI emitter and stderr. Errors are always visible regardless of which interface is open.
+- **Non-error events**: sent to the web UI emitter only; stderr is silent so it stays uncluttered during interactive sessions.
+
+When the web UI is not active, all events go to stderr.
+
+The emitter appends a `{"type": "log", "line": ...}` event to `ui_events.jsonl`; the standalone server broadcasts it to all connected browsers. Additionally, `agterm.__init__()` emits an `agent_registered` event with the agent's hex color so the browser can display the agent in its assigned color. See [agwebui.md](agwebui.md).

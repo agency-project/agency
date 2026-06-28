@@ -10,7 +10,7 @@ import threading
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agency.agdata import agdata
+from agency.agdata import agdata, agerror
 
 
 # ---------------------------------------------------------------------------
@@ -131,12 +131,7 @@ class TestTodowrite:
 
 
 # ---------------------------------------------------------------------------
-# _log functions must not raise on error results
-#
-# getattr(agdata_with_error, "field", default) raises AgError instead of
-# returning the default, because agdata.__getattr__ raises AgError whenever
-# the data dict contains an "error" key.  All tool _log functions must use
-# result._data.get() instead so they survive error results gracefully.
+# _log functions must not raise on agerror results
 # ---------------------------------------------------------------------------
 
 class TestToolLogOnErrorResult:
@@ -160,7 +155,7 @@ class TestToolLogOnErrorResult:
         sb = MagicMock()
         tool = make_read(sb)
         tool, term = self._make_tool_with_term(tool)
-        error_result = agdata(error="Not found: /workspace/missing.txt")
+        error_result = agerror("Not found: /workspace/missing.txt")
         # Must not raise AgError
         tool._log_fn(tool, agdata(filePath="/workspace/missing.txt"), error_result, 42)
         # Log was called with the error path, not the success path
@@ -174,7 +169,7 @@ class TestToolLogOnErrorResult:
         sb = MagicMock()
         tool = make_write(sb)
         tool, term = self._make_tool_with_term(tool)
-        error_result = agdata(error="Permission denied")
+        error_result = agerror("Permission denied")
         tool._log_fn(tool, agdata(filePath="/workspace/out.txt"), error_result, 10)
         assert term.log.called
         logged = term.log.call_args[0]
@@ -186,7 +181,7 @@ class TestToolLogOnErrorResult:
         sb = MagicMock()
         tool = make_bash(sb)
         tool, term = self._make_tool_with_term(tool)
-        error_result = agdata(error="timed out")
+        error_result = agerror("timed out")
         tool._log_fn(tool, agdata(command="sleep 999"), error_result, 30000)
         assert term.log.called
 
@@ -196,7 +191,7 @@ class TestToolLogOnErrorResult:
         sb = MagicMock()
         tool = make_glob(sb)
         tool, term = self._make_tool_with_term(tool)
-        error_result = agdata(error="pattern error")
+        error_result = agerror("pattern error")
         tool._log_fn(tool, agdata(pattern="**/*.py"), error_result, 5)
         assert term.log.called
 
@@ -206,7 +201,7 @@ class TestToolLogOnErrorResult:
         sb = MagicMock()
         tool = make_grep(sb)
         tool, term = self._make_tool_with_term(tool)
-        error_result = agdata(error="search failed")
+        error_result = agerror("search failed")
         tool._log_fn(tool, agdata(pattern="TODO"), error_result, 5)
         assert term.log.called
 

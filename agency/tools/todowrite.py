@@ -1,5 +1,5 @@
 import json
-from ..agdata import agdata
+from ..agdata import agdata, agerror
 from ..agtool import agtool
 
 # Module-level todo store (keyed by a session id or default)
@@ -10,9 +10,9 @@ def _run(arg: agdata) -> agdata:
     global _store
     todos = getattr(arg, "todos", None)
     if todos is None:
-        return agdata(error="todos field is required")
+        return agerror("todos field is required")
     if not isinstance(todos, list):
-        return agdata(error="todos must be a list")
+        return agerror("todos must be a list")
 
     _store = [dict(t) for t in todos]
     pending = sum(1 for t in _store if t.get("status") not in ("completed", "cancelled"))

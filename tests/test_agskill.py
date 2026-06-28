@@ -2,7 +2,7 @@
 import json
 import pytest
 from unittest.mock import patch, MagicMock
-from agency.agdata import agdata
+from agency.agdata import agdata, agerror
 from agency.agskill import agskill, LLM_MAX_RETRIES, LLM_IDLE_TIMEOUT, LLM_STREAM_TIMEOUT
 from agency.agtool import agtool
 
@@ -1073,7 +1073,7 @@ def test_tool_failure_triggers_stop_without_commit():
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
-        return agdata(error="boom")
+        return agerror("boom")
 
     t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
     s = make_skill(replace_tools=[t])
@@ -1086,11 +1086,11 @@ def test_tool_failure_triggers_stop_without_commit():
 
 
 def test_tool_failure_adds_workspace_reverted_note():
-    """Tool error response must include workspace_reverted when the tool returns agdata(error=...)."""
+    """Tool error response must include workspace_reverted when the tool returns agerror(...)."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
-        return agdata(error="disk full")
+        return agerror("disk full")
 
     t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
     s = make_skill(replace_tools=[t])
@@ -1110,7 +1110,7 @@ def test_tool_failure_adds_workspace_reverted_note():
 def test_tool_failure_no_restore_without_sandbox():
     """When sandbox=MagicMock(), a tool error is passed through as-is with no stop attempt."""
     def fn(arg: agdata) -> agdata:
-        return agdata(error="nope")
+        return agerror("nope")
 
     t = agtool(name="badtool", description="", fn=fn, need_sandbox=False)
     s = make_skill(replace_tools=[t])
@@ -1130,7 +1130,7 @@ def test_need_sandbox_false_no_stop():
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
-        return agdata(error="oops")
+        return agerror("oops")
 
     t = agtool(name="hosttool", description="", fn=fn, need_sandbox=False)
     s = make_skill(replace_tools=[t])
@@ -1719,7 +1719,7 @@ def test_is_continuation_bypasses_input_schema():
         # Missing required_field — would fail schema without _is_continuation
         result, _, _, _ = s.run(LLM_CONFIG, agdata(), agdata(messages=[]),
                                 sandbox=MagicMock(), _is_continuation=True)
-    assert result.error is None or "input schema" not in str(result.error or "")
+    assert not isinstance(result, agerror) or "input schema" not in result.error
 
 
 # ---------------------------------------------------------------------------

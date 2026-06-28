@@ -15,7 +15,7 @@ import uuid
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agency.agdata import agdata
+from agency.agdata import agdata, agerror
 from agency.agresources import agResourcePool
 
 
@@ -515,10 +515,10 @@ class TestAgSandboxLifecycle:
         try:
             # write runs in a process-pool worker
             w = tools["write"](agdata(filePath="/workspace/cross.txt", content="cross-worker\n"))
-            assert w.error is None, f"write failed: {w.error}"
+            assert not isinstance(w, agerror), f"write failed: {w}"
             # read also runs in a process-pool worker; must find the file
             r = tools["read"](agdata(filePath="/workspace/cross.txt"))
-            assert r.error is None, f"read failed after cross-worker write: {r.error}"
+            assert not isinstance(r, agerror), f"read failed after cross-worker write: {r}"
             assert "cross-worker" in r.content
         finally:
             sb.destroy()
@@ -1249,16 +1249,16 @@ class TestSandboxedTools:
         assert len(live_before) > 0
         for pid in list(live_before):
             result = self.tools["daemon_release"].fn(agdata(pid=pid))
-            assert result.error is None
+            assert not isinstance(result, agerror)
         assert self.sb.get_live_pids() == set()
 
     def test_daemon_release_tool_invalid_pid(self):
         result = self.tools["daemon_release"].fn(agdata(pid="notanint"))
-        assert result.error is not None
+        assert isinstance(result, agerror)
 
     def test_daemon_release_tool_missing_pid(self):
         result = self.tools["daemon_release"].fn(agdata())
-        assert result.error is not None
+        assert isinstance(result, agerror)
 
 
 class TestResourceTools:
@@ -1467,16 +1467,16 @@ class TestResourceTools:
 
     def test_reserve_cpu_applies_limits(self):
         result = self.tools["reserve_cpu"].fn(agdata(cpus=2.0, memory="256m"))
-        assert result.error is None
+        assert not isinstance(result, agerror)
 
     def test_reserve_cpu_requires_at_least_one_param(self):
         result = self.tools["reserve_cpu"].fn(agdata())
-        assert result.error is not None
+        assert isinstance(result, agerror)
 
     def test_cpu_release_resets_to_idle(self):
         self.tools["reserve_cpu"].fn(agdata(cpus=4.0, memory="2g"))
         result = self.tools["cpu_release"].fn(agdata())
-        assert result.error is None
+        assert not isinstance(result, agerror)
         assert "0.5" in result.message
         assert "512m" in result.message
 

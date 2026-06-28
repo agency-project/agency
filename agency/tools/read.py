@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shlex
 from typing import TYPE_CHECKING
-from ..agdata import agdata, _fmt_exc
+from ..agdata import agdata, agerror, _fmt_exc
 from ..agtool import agtool
 
 if TYPE_CHECKING:
@@ -77,7 +77,7 @@ def make_read(sandbox: "agSandbox") -> agtool:
         kind = check_out.strip()
 
         if kind == "notfound":
-            return agdata(error=f"Not found: {file_path}")
+            return agerror(f"Not found: {file_path}")
 
         if kind == "dir":
             ls_out, _ = sandbox._container_exec(
@@ -97,9 +97,9 @@ def make_read(sandbox: "agSandbox") -> agtool:
         try:
             content = sandbox.read_file(file_path)
         except FileNotFoundError:
-            return agdata(error=f"Not found: {file_path}")
+            return agerror(f"Not found: {file_path}")
         except Exception as e:
-            return agdata(error=_fmt_exc(e))
+            return agerror(_fmt_exc(e))
 
         result = _paginate_text(content, offset, limit)
         return agdata(path=file_path, **result._data)

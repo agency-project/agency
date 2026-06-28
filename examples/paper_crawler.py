@@ -75,7 +75,7 @@ class FindPapersSkill(agskill):
             ),
             input_schema=agdata(topic=str),
             output_schema=agdata(papers=[{"title": str, "url": str, "abstract": str}], count=int),
-            output_validator=self._validate_output,
+
             replace_tools=[search_papers],
             **kwargs,
         )
@@ -108,12 +108,6 @@ class FindPapersSkill(agskill):
             if title:
                 papers.append({"title": title, "url": url, "abstract": abstract})
         return agdata(papers=papers, count=len(papers))
-
-    def _validate_output(self, r: agdata) -> list[str]:
-        if not r._data.get("papers"):
-            return ["papers list is empty — you MUST call the search_papers tool before responding"]
-        return []
-
 
 class SummarisePaperSkill(agskill):
     def __init__(self, **kwargs):

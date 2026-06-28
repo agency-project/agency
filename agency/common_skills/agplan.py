@@ -43,7 +43,6 @@ class agplan(agskill):
         add_tools: list[agtool] | None = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
-        output_validator=None,
         max_output_schema_retries: int = 10,
     ):
         super().__init__(
@@ -53,7 +52,6 @@ class agplan(agskill):
             replace_tools=None,   # _build_tools handles tool selection
             input_schema=input_schema,
             output_schema=output_schema,
-            output_validator=output_validator,
             max_output_schema_retries=max_output_schema_retries,
         )
 

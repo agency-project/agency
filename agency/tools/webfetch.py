@@ -1,6 +1,6 @@
-import httpx
+import httpx2 as httpx
 import html2text
-from ..agdata import agdata, _fmt_exc
+from ..agdata import agdata, agerror, _fmt_exc
 from ..agtool import agtool
 
 _MAX_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -14,7 +14,7 @@ def _run(arg: agdata) -> agdata:
     timeout: int = min(int(getattr(arg, "timeout", _DEFAULT_TIMEOUT) or _DEFAULT_TIMEOUT), _MAX_TIMEOUT)
 
     if not url.startswith(("http://", "https://")):
-        return agdata(error="URL must start with http:// or https://")
+        return agerror("URL must start with http:// or https://")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; agency-bot/1.0)",
@@ -25,12 +25,12 @@ def _run(arg: agdata) -> agdata:
         resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
-        return agdata(error=f"HTTP {e.response.status_code}: {url}\n{_fmt_exc(e)}")
+        return agerror(f"HTTP {e.response.status_code}: {url}\n{_fmt_exc(e)}")
     except Exception as e:
-        return agdata(error=_fmt_exc(e))
+        return agerror(_fmt_exc(e))
 
     if len(resp.content) > _MAX_BYTES:
-        return agdata(error="Response too large (>5 MB)")
+        return agerror("Response too large (>5 MB)")
 
     content_type = resp.headers.get("content-type", "")
     body = resp.text

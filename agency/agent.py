@@ -44,9 +44,9 @@ def _pick_llm_config(llm_config: "dict | list[dict]") -> dict:
 # ---------------------------------------------------------------------------
 CHECKPOINT_SAVE_TIMEOUT_S = 600  # Timeout in seconds for `subprocess.run` when exporting a container image during agent.save().
 CHECKPOINT_LOAD_TIMEOUT_S = 600  # Timeout in seconds for `subprocess.run` when loading a container image during agent.load().
-SKILL_ERROR_LOG_TRUNCATE = 80  # Maximum characters of an error string shown in the terminal log line after a skill failure.
+SKILL_ERROR_LOG_TRUNCATE = 300  # Maximum characters of an error string shown in the terminal log line after a skill failure.
 
-from .agdata import agdata, _fmt_exc
+from .agdata import agdata, agerror, _fmt_exc
 from .agtype import agtype
 from .agskill import agskill, AGSKILL_REACT_MAX_STEPS
 from .agtool import agtool
@@ -327,7 +327,7 @@ def _recover_agtype_outputs(
     containers at any depth.  Calls ``hint.recover()`` at each agtype leaf.
     Returns all sandbox paths for cleanup.
     """
-    if schema is None or result.is_error():
+    if schema is None or isinstance(result, agerror):
         return []
     paths: list[str] = []
     for key, hint in schema._data.items():
@@ -773,7 +773,7 @@ class agent:
                     )
 
             except Exception as exc:
-                outer_result  = agdata(error=_fmt_exc(exc))
+                outer_result  = agerror(_fmt_exc(exc))
                 outer_history = prev_history
                 outer_delta   = []
                 history_before = list(prev_history._data.get("messages", []))

@@ -3,7 +3,7 @@ Port of agent_patterns/deterministic.py from openai-agents-python.
 
 Original: Sequential pipeline — outline → quality check (gate) → story.
 Port: Three agskills chained on a single agent's history.
-      The gate uses output_validator on the checker skill.
+      Caller checks good_quality and is_scifi on the checker result and stops if they fail.
 """
 import os
 from agency import agent, agskill, agdata, AgError

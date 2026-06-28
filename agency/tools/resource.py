@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from ..agdata import agdata, _fmt_exc
+from ..agdata import agdata, agerror, _fmt_exc
 from ..agtool import agtool
 
 if TYPE_CHECKING:
@@ -82,7 +82,7 @@ def make_cpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
         cpus: float | None = getattr(arg, "cpus", None)
         memory: str | None = getattr(arg, "memory", None)
         if cpus is None and memory is None:
-            return agdata(error="specify at least one of: cpus, memory")
+            return agerror("specify at least one of: cpus, memory")
 
         try:
             sandbox.update_limits(
@@ -100,7 +100,7 @@ def make_cpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 memory=memory,
             )
         except Exception as e:
-            return agdata(error=_fmt_exc(e))
+            return agerror(_fmt_exc(e))
 
     return agtool(
         name="reserve_cpu",
@@ -139,7 +139,7 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 message=f"CPU/memory reset to idle: cpus={pool.idle_cpus}, memory={pool.idle_memory}"
             )
         except Exception as e:
-            return agdata(error=_fmt_exc(e))
+            return agerror(_fmt_exc(e))
 
     return agtool(
         name="cpu_release",
@@ -164,11 +164,11 @@ def make_daemon_release(sandbox: "agSandbox") -> agtool:
     def _run(arg: agdata) -> agdata:
         pid_val = getattr(arg, "pid", None)
         if pid_val is None:
-            return agdata(error="pid is required")
+            return agerror("pid is required")
         try:
             pid = int(pid_val)
         except (TypeError, ValueError):
-            return agdata(error=f"invalid pid: {pid_val!r}")
+            return agerror(f"invalid pid: {pid_val!r}")
         sandbox.release_daemon(pid)
         return agdata(message=f"PID {pid} released as daemon — will not block skill completion")
 

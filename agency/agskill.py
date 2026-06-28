@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Generator, Iterable, TypeVar
-import httpx
+import httpx2 as httpx
 import openai
 
 AGSKILL_REACT_MAX_STEPS = 4096
@@ -295,7 +295,7 @@ def _drain_inbox(
 
 
 from typing import get_args, get_origin
-from .agdata import agdata, _fmt_exc
+from .agdata import agdata, agerror, _fmt_exc
 from .agtype import agtype, agimage, agrawstring
 from .agtool import agtool
 from .agcompaction import compact, should_compact, estimate_messages_tokens
@@ -1034,7 +1034,6 @@ class agskill:
         replace_tools: list[agtool] | None = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
-        output_validator: "Callable[[agdata], list[str]] | None" = None,
         max_output_schema_retries: int = 10,
         plan_mode: bool = False,
     ):
@@ -1044,7 +1043,6 @@ class agskill:
         self.replace_tools = [] if plan_mode else replace_tools
         self.input_schema = input_schema
         self.output_schema = output_schema
-        self.output_validator = output_validator   # extra check beyond type schema
         self.max_output_schema_retries = max_output_schema_retries
 
     # ------------------------------------------------------------------
@@ -1317,8 +1315,6 @@ class agskill:
 
         if self.output_schema is not None:
             errors = self._check_schema(result, self.output_schema)
-            if not errors and self.output_validator is not None:
-                errors = self.output_validator(result)
             if _parse_error and "invalid json" not in " ".join(errors).lower():
                 errors = [f"JSON parse error: {_parse_error}"] + errors
             if errors:
@@ -1338,11 +1334,15 @@ class agskill:
                             ),
                         },
                     )
+                _raw_out = (msg_dict.get("content") or "")[:2000]
                 updated_history = agdata(messages=messages[1:])
                 return _FinalAnswerResult(
                     kind="error",
                     return_tuple=(
-                        agdata(error=f"output schema error after retries: {errors}"),
+                        agerror(
+                            f"output schema error after retries: {errors}"
+                            + (f"\nmodel output: {_raw_out!r}" if _raw_out else "")
+                        ),
                         updated_history,
                         [messages[0]] + messages[1:][n_before:],
                         tokens,
@@ -1467,7 +1467,7 @@ class agskill:
         input_error = self._validate_input(input, _is_continuation, _extra_system)
         if input_error is not None:
             sys_msg = {"role": "system", "content": self._build_system_prompt(_extra_system)}
-            return agdata(error=input_error), history, [sys_msg], (0, 0)
+            return agerror(input_error), history, [sys_msg], (0, 0)
 
         _active_tools, tool_map, openai_tools = self._build_tools(sandbox, pool, term, log, _ensure_read=_ensure_read)
 
@@ -1673,7 +1673,7 @@ class agskill:
                 _err_msg = f"LLM connection error after 5 attempts: {llm_result.conn_error}"
                 if _full_history_fn:
                     _full_history_fn({"type": "llm_error", "error": _err_msg})
-                return agdata(error=_err_msg), history, [], (0, 0)
+                return agerror(_err_msg), history, [], (0, 0)
             _timeout_attempt = 0
             _total_input_tokens  = llm_result.total_input_tokens
             _total_output_tokens = llm_result.total_output_tokens
@@ -1750,43 +1750,32 @@ class agskill:
                         if _full_history_fn:
                             _full_history_fn(reprompt)
                         continue
+                    _last_asst = next(
+                        (m for m in reversed(messages) if m.get("role") == "assistant"), None
+                    )
+                    _last_out_str = ""
+                    if _last_asst:
+                        if _last_asst.get("content"):
+                            _last_out_str = str(_last_asst["content"])[:2000]
+                        elif _last_asst.get("tool_calls"):
+                            _names = [
+                                tc.get("function", {}).get("name", "?")
+                                for tc in _last_asst["tool_calls"]
+                            ]
+                            _last_out_str = f"[tool calls: {_names}]"
                     updated_history = agdata(messages=messages[1:])
                     return (
-                        agdata(error=f"output schema error: missing fields after retries: {sorted(missing)}"),
+                        agerror(
+                            f"output schema error: missing fields after retries: {sorted(missing)}"
+                            + f"\ncollected: {sorted(_collected_outputs.keys())}"
+                            + (f"\nlast model output: {_last_out_str!r}" if _last_out_str else "")
+                        ),
                         updated_history,
                         [messages[0]] + messages[1:][n_before:],
                         (_total_input_tokens, _total_output_tokens),
                     )
                 # All fields collected — run optional validator.
                 result = agdata(**_collected_outputs)
-                if self.output_validator is not None:
-                    val_errors = self.output_validator(result)
-                    if val_errors:
-                        if output_schema_retries_left > 0:
-                            output_schema_retries_left -= 1
-                            _all_tools = " and ".join(
-                                f"return_{f}" for f in sorted(_required_fields)
-                            )
-                            reprompt = {
-                                "role": "user",
-                                "content": (
-                                    f"[HARNESS SYSTEM] Output validation failed: {val_errors}. "
-                                    f"Please correct your answers using {_all_tools} tool(s)."
-                                ),
-                            }
-                            messages.append(reprompt)
-                            if _live_messages_fn:
-                                _live_messages_fn(messages[1:])
-                            if _full_history_fn:
-                                _full_history_fn(reprompt)
-                            continue
-                        updated_history = agdata(messages=messages[1:])
-                        return (
-                            agdata(error=f"output validation error: {val_errors}"),
-                            updated_history,
-                            [messages[0]] + messages[1:][n_before:],
-                            (_total_input_tokens, _total_output_tokens),
-                        )
                 proc_msg = _wait_for_processes(
                     sandbox, self.name, term, log, _agname,
                     _ping_interval_s, _poll_interval_s, _state_fn,
@@ -1829,7 +1818,7 @@ class agskill:
             return far.return_tuple
 
         updated_history = agdata(messages=messages[1:])
-        return agdata(error="max_steps exceeded"), updated_history, [messages[0]] + messages[1:][n_before:], (_total_input_tokens, _total_output_tokens)
+        return agerror("max_steps exceeded"), updated_history, [messages[0]] + messages[1:][n_before:], (_total_input_tokens, _total_output_tokens)
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"
