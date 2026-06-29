@@ -136,7 +136,7 @@ def test_fork_has_independent_log():
     ag = make_agent()
     _ = ag.run(skill, agdata()).ok   # parent logs one call
 
-    fork = agent(ag)
+    fork = agent.fork(ag)
     assert len(fork.log) == 0   # fork starts fresh
 
     _ = fork.run(skill, agdata()).ok
@@ -176,7 +176,7 @@ def test_created_event_logged():
 
 def test_forked_event_logged():
     parent = make_agent()
-    fork = agent(parent)
+    fork = agent.fork(parent)
     ev = fork.log.events[0]
     assert ev["event"] == "forked"
     assert ev["agname"] == fork.agname
@@ -185,7 +185,7 @@ def test_forked_event_logged():
 
 def test_forked_agent_has_own_agname():
     parent = make_agent()
-    fork = agent(parent)
+    fork = agent.fork(parent)
     assert fork.agname != parent.agname
 
 

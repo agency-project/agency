@@ -5,8 +5,10 @@ from unittest.mock import MagicMock, patch
 from agency.agdata import agdata, agerror
 from agency.agtype import agtype, agfile
 from agency.agskill import agskill
+from agency.agllm import agllm
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
+LLM = agllm(LLM_CONFIG, context_limit=128_000)
 
 
 # ---------------------------------------------------------------------------
@@ -132,16 +134,14 @@ def test_agdata_serializes_agfile_as_file():
 
 
 # ---------------------------------------------------------------------------
-# agskill._check_schema — agfile hints
+# agskill.check_schema — agfile hints
 # ---------------------------------------------------------------------------
 
 def test_check_schema_agfile_hint_accepts_string():
-    sk = agskill("t", "", output_schema=agdata(doc=agfile))
-    assert sk._check_schema(agdata(doc="/workspace/out.txt"), sk.output_schema) == []
+    assert agdata(doc="/workspace/out.txt").check_schema(agdata(doc=agfile)) == []
 
 def test_check_schema_agfile_hint_rejects_non_string():
-    sk = agskill("t", "", output_schema=agdata(doc=agfile))
-    errors = sk._check_schema(agdata(doc=123), sk.output_schema)
+    errors = agdata(doc=123).check_schema(agdata(doc=agfile))
     assert len(errors) == 1
     assert "doc" in errors[0]
 
@@ -189,14 +189,17 @@ def test_system_prompt_agfile_type_shown_as_file():
 
 def test_skill_with_agfile_output_schema_validates_path_string():
     sk = agskill("write", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "recovered file content"
     responses = [
         _tool_call("return_doc", {"value": "/workspace/outputs/write_doc.txt"}),
         _direct(""),
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = sk.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=MagicMock())
-    assert result.doc == "/workspace/outputs/write_doc.txt"
+        result, *_ = sk.run(LLM, agdata(), agdata(messages=[]), sandbox=sandbox)
+    sandbox.read_file.assert_called_with("/workspace/outputs/write_doc.txt")
+    assert result.doc == "recovered file content"
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +207,10 @@ def test_skill_with_agfile_output_schema_validates_path_string():
 # ---------------------------------------------------------------------------
 
 def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
-    from agency.agent import _prepare_agtype_inputs
     sandbox = MagicMock()
     inp = agdata(theme="space opera", background="long background text")
     schema = agdata(theme=str, background=agfile)
-    paths = _prepare_agtype_inputs(inp, schema, sandbox, "design")
+    paths = inp.prepare_agtype_inputs(schema, sandbox, "design")
     sandbox.write_file.assert_called_once_with(
         "/workspace/inputs/background.txt", "long background text"
     )
@@ -217,37 +219,33 @@ def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
     assert len(paths) == 1
 
 def test_prepare_agtype_inputs_no_schema_returns_empty():
-    from agency.agent import _prepare_agtype_inputs
     sandbox = MagicMock()
     inp = agdata(x="hello")
-    paths = _prepare_agtype_inputs(inp, None, sandbox, "skill")
+    paths = inp.prepare_agtype_inputs(None, sandbox, "skill")
     assert paths == []
     sandbox.write_file.assert_not_called()
 
 def test_recover_agtype_outputs_reads_file_and_replaces_path():
-    from agency.agent import _recover_agtype_outputs
     sandbox = MagicMock()
     sandbox.read_file.return_value = "report content"
     result = agdata(report="/workspace/outputs/design_report.txt")
     schema = agdata(report=agfile)
-    paths = _recover_agtype_outputs(result, schema, sandbox)
+    paths = result.recover_agtype_outputs(schema, sandbox)
     assert result._data["report"] == "report content"
     assert paths == ["/workspace/outputs/design_report.txt"]
 
 def test_recover_agtype_outputs_skips_error_result():
-    from agency.agent import _recover_agtype_outputs
     sandbox = MagicMock()
     result = agerror("something went wrong")
     schema = agdata(report=agfile)
-    paths = _recover_agtype_outputs(result, schema, sandbox)
+    paths = result.recover_agtype_outputs(schema, sandbox)
     sandbox.read_file.assert_not_called()
     assert paths == []
 
 def test_recover_agtype_outputs_no_schema_returns_empty():
-    from agency.agent import _recover_agtype_outputs
     sandbox = MagicMock()
     result = agdata(report="/some/path.txt")
-    paths = _recover_agtype_outputs(result, None, sandbox)
+    paths = result.recover_agtype_outputs(None, sandbox)
     assert paths == []
     sandbox.read_file.assert_not_called()
 
@@ -260,7 +258,7 @@ def _run_skill_with_sandbox(skill, responses, sandbox):
     """Helper: run skill with mocked LLM and a provided sandbox."""
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = skill.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=sandbox)
+        result, *_ = skill.run(LLM, agdata(), agdata(messages=[]), sandbox=sandbox)
     return result
 
 
@@ -344,7 +342,7 @@ def test_return_agfile_valid_content_is_accepted():
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.doc == "/workspace/outputs/code.py"
+    assert result.doc == "def main():\n    pass\n"
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +409,7 @@ def test_return_str_resolved_content_that_is_itself_a_path_is_not_substituted():
 # ---------------------------------------------------------------------------
 
 def test_looks_like_path_detects_workspace_paths():
-    from agency.agskill import _looks_like_path
+    from agency.agutil import _looks_like_path
     assert _looks_like_path("/workspace/core.py")
     assert _looks_like_path("/workspace/outputs/report.txt")
     assert _looks_like_path("/tmp/scratch.py")
@@ -420,20 +418,20 @@ def test_looks_like_path_detects_workspace_paths():
 
 
 def test_looks_like_path_rejects_multiline():
-    from agency.agskill import _looks_like_path
+    from agency.agutil import _looks_like_path
     assert not _looks_like_path("def main():\n    pass\n")
     assert not _looks_like_path("/workspace/file.py\nextra content")
 
 
 def test_looks_like_path_rejects_non_absolute():
-    from agency.agskill import _looks_like_path
+    from agency.agutil import _looks_like_path
     assert not _looks_like_path("relative/path.py")
     assert not _looks_like_path("just some text")
     assert not _looks_like_path("")
 
 
 def test_looks_like_path_rejects_paths_with_spaces():
-    from agency.agskill import _looks_like_path
+    from agency.agutil import _looks_like_path
     # Old heuristic would accept these; new regex rejects them
     assert not _looks_like_path("/this is not a path")
     assert not _looks_like_path("/workspace/file.py extra text")
@@ -441,7 +439,7 @@ def test_looks_like_path_rejects_paths_with_spaces():
 
 
 def test_looks_like_path_single_segment():
-    from agency.agskill import _looks_like_path
+    from agency.agutil import _looks_like_path
     assert _looks_like_path("/bin")
     assert _looks_like_path("/a")
     assert _looks_like_path("/tmp")

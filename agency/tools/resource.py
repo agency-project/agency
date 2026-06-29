@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from ..agdata import agdata, agerror, _fmt_exc
+from ..agdata import agdata, agerror
+from ..agutil import format_exception
 from ..agtool import agtool
 
 if TYPE_CHECKING:
@@ -100,7 +101,7 @@ def make_cpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 memory=memory,
             )
         except Exception as e:
-            return agerror(_fmt_exc(e))
+            return agerror(format_exception(e))
 
     return agtool(
         name="reserve_cpu",
@@ -139,7 +140,7 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 message=f"CPU/memory reset to idle: cpus={pool.idle_cpus}, memory={pool.idle_memory}"
             )
         except Exception as e:
-            return agerror(_fmt_exc(e))
+            return agerror(format_exception(e))
 
     return agtool(
         name="cpu_release",

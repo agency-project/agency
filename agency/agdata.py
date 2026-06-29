@@ -1,36 +1,19 @@
 from __future__ import annotations
 import json
-import traceback as _traceback
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
+    from .agsandbox import agSandbox
 
 from .agtype import agtype, agfile
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-def _emit_agdata_error(error: str) -> None:
-    """Log an agdata error through agterm so it reaches both stderr and the webui."""
-    from .agterm import agterm as _agterm_cls
-    # Lazily create a single shared agterm instance named "agdata".
-    if not hasattr(_emit_agdata_error, "_term"):
-        _emit_agdata_error._term = _agterm_cls("agdata")
-    # depth=3: log() → _emit_agdata_error → __init__ → actual agerror(...) call site
-    _emit_agdata_error._term.log("ERROR ✗  ", error, depth=3)
-
-
-def _fmt_exc(e: BaseException) -> str:
-    """Format an exception with its full traceback for error emission.
-
-    Must be called from inside an except block so traceback.format_exc()
-    captures the live stack.  Returns a single string containing the
-    traceback lines followed by the exception type and message.
-    """
-    tb = _traceback.format_exc()
-    if tb and not tb.startswith("NoneType"):
-        return tb.rstrip()
-    return f"{type(e).__name__}: {e}"
-
+# Maximum length of a string field that will be auto-offloaded to a sandbox file.
+INPUT_OFFLOAD_CHARS: int = 40_000
 
 class AgError(RuntimeError):
     """Raised when accessing a non-error field on an agerror instance."""
@@ -173,6 +156,189 @@ class agdata:
             return self._data == other._data
         return NotImplemented
 
+    def check_schema(self, schema: "agdata") -> list[str]:
+        """Return a list of error strings; empty list means the data is valid."""
+        errors: list[str] = []
+        for key, hint in schema._data.items():
+            if key not in self._data:
+                errors.append(f"missing required field '{key}'")
+                continue
+            actual = self._data[key]
+            if isinstance(hint, type) and issubclass(hint, agtype):
+                if not isinstance(actual, str):
+                    errors.append(f"field '{key}' ({hint.__name__}) must be a string")
+                continue
+            if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+                item_template = hint[0]
+                if not isinstance(actual, list):
+                    errors.append(f"field '{key}': expected list, got {type(actual).__name__}")
+                    continue
+                for i, item in enumerate(actual):
+                    if not isinstance(item, dict):
+                        errors.append(f"field '{key}[{i}]': expected dict, got {type(item).__name__}")
+                        continue
+                    for item_key, item_type in item_template.items():
+                        if item_key not in item:
+                            errors.append(f"field '{key}[{i}]': missing key '{item_key}'")
+                        elif isinstance(item_type, type) and not isinstance(item[item_key], item_type):
+                            errors.append(
+                                f"field '{key}[{i}].{item_key}': expected {item_type.__name__}, "
+                                f"got {type(item[item_key]).__name__}"
+                            )
+                continue
+            if isinstance(hint, type):
+                if not isinstance(actual, hint):
+                    errors.append(
+                        f"field '{key}': expected {hint.__name__}, got {type(actual).__name__}"
+                    )
+        return errors
+
+    def validate_input(
+        self,
+        input_schema: "agdata | None",
+        _is_continuation: bool,
+    ) -> "str | None":
+        """Return an error string if input fails schema validation, else None."""
+        if input_schema is None or _is_continuation:
+            return None
+        errors = self.check_schema(input_schema)
+        if errors:
+            return f"input schema error: {errors}"
+        return None
+
+    def offload_large_fields(
+        self,
+        sandbox: "agSandbox",
+        skill_name: str,
+        schema: "agdata | None" = None,
+        suffix: str = "",
+        context_limit: "int | None" = None,
+    ) -> "tuple[list[str], list[str]]":
+        """Write oversized string fields to /workspace/inputs/ in the sandbox.
+
+        Called after agtype fields have already been prepared (so agfile inputs are
+        already short file paths).  Each remaining field whose string value still
+        exceeds _offload_threshold(context_limit) is replaced in-place with a short
+        reference.  Returns (paths_written, field_names) so the caller can delete
+        files and build an auto-offload note for the system prompt.
+
+        Fields already managed by an agtype subclass (e.g. agimage data URLs,
+        agfile/agbinary paths) are skipped — their prepared values must not be
+        replaced by sandbox file references.  agrawstring is the exception: its
+        prepare() is a no-op, so a long value arrives here at full length and
+        should be offloaded like any plain string.
+        """
+        agtype_keys: set[str] = set()
+        if schema is not None:
+            for key, hint in schema._data.items():
+                if agtype.in_hint(hint):
+                    agtype_keys.add(key)
+
+        _threshold = min(INPUT_OFFLOAD_CHARS, int(context_limit * 0.1 * 4)) if context_limit else INPUT_OFFLOAD_CHARS
+        paths: list[str] = []
+        fields: list[str] = []
+        for key, val in list(self._data.items()):
+            if key in agtype_keys:
+                continue
+            if isinstance(val, str):
+                if len(val) <= _threshold:
+                    continue
+                path = f"/workspace/inputs/{skill_name}_{key}{suffix}.txt"
+                try:
+                    sandbox.write_file(path, val)
+                    self._data[key] = (
+                        f"(content saved to {path} — use the read tool to access it)"
+                    )
+                    paths.append(path)
+                    fields.append(key)
+                except Exception as _e:
+                    print(f"[agent] WARNING: failed to offload input field '{key}' to {path}: {_e}")
+            elif isinstance(val, list):
+                new_vals = list(val)
+                offloaded_any = False
+                for i, item in enumerate(val):
+                    if not isinstance(item, str) or len(item) <= _threshold:
+                        continue
+                    path = f"/workspace/inputs/{skill_name}_{key}_{i}{suffix}.txt"
+                    try:
+                        sandbox.write_file(path, item)
+                        new_vals[i] = path
+                        paths.append(path)
+                        offloaded_any = True
+                    except Exception as _e:
+                        print(f"[agent] WARNING: failed to offload input list field '{key}[{i}]' to {path}: {_e}")
+                if offloaded_any:
+                    self._data[key] = new_vals
+                    fields.append(key)
+        return paths, fields
+
+    def prepare_agtype_inputs(
+        self,
+        schema: "agdata | None",
+        sandbox: "agSandbox",
+        skill_name: str,
+        suffix: str = "",
+    ) -> list[str]:
+        """Prepare agtype input fields before the skill runs.
+
+        Recursively handles agtype subclasses nested inside list, dict, and tuple
+        containers at any depth.  Calls ``hint.prepare()`` at each agtype leaf.
+        Returns all sandbox paths written for cleanup.
+        """
+        if schema is None:
+            return []
+        paths: list[str] = []
+        for key, hint in schema._data.items():
+            def on_leaf(h, v, _key=key):
+                try:
+                    return h.prepare(v, sandbox, skill_name, _key, suffix=suffix)
+                except Exception as _e:
+                    print(f"[agent] WARNING: {h.__name__}.prepare failed for field '{_key}': {_e}")
+                    return v, []
+            new_val, written = agtype.walk(hint, self._data.get(key), on_leaf)
+            if written or new_val is not self._data.get(key):
+                self._data[key] = new_val
+            paths.extend(written)
+        return paths
+
+    def recover_agtype_outputs(
+        self,
+        schema: "agdata | None",
+        sandbox: "agSandbox",
+    ) -> list[str]:
+        """Recover agtype output fields after the skill finishes.
+
+        Recursively handles agtype subclasses nested inside list, dict, and tuple
+        containers at any depth.  Calls ``hint.recover()`` at each agtype leaf.
+        Returns all sandbox paths for cleanup.
+        """
+        if schema is None or isinstance(self, agerror):
+            return []
+        paths: list[str] = []
+        for key, hint in schema._data.items():
+            def on_leaf(h, v, _key=key):
+                try:
+                    return h.recover(v, sandbox)
+                except Exception as _e:
+                    print(f"[agent] WARNING: {h.__name__}.recover failed for field '{_key}': {_e}")
+                    return v, []
+            new_val, written = agtype.walk(hint, self._data.get(key), on_leaf)
+            if written or new_val is not self._data.get(key):
+                self._data[key] = new_val
+            paths.extend(written)
+        return paths
+
+    def resolve_input(self) -> None:
+        """Resolve any pending agdata values nested inside self, in-place."""
+        self._resolve()
+        for val in self._data.values():
+            if isinstance(val, agdata):
+                val._resolve()
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, agdata):
+                        item._resolve()
+
 
 class agerror(agdata):
     """Returned by skills and tools to signal failure.
@@ -192,7 +358,10 @@ class agerror(agdata):
             )
         object.__setattr__(self, "_future", None)
         object.__setattr__(self, "_data", {"error": message})
-        _emit_agdata_error(message)
+        from .agterm import agterm as _agterm_cls
+        if not hasattr(agerror, "_term"):
+            agerror._term = _agterm_cls("agdata")
+        agerror._term.log("ERROR ✗  ", message, depth=2)
 
     def __getattr__(self, name: str):
         if name == "error":

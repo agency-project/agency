@@ -263,7 +263,7 @@ class PaperCrawlerTeam(agteam):
 
         print("Step 2 — submitting parallel summarisation tasks...")
         summaries = [
-            agent(self.main_agent).run(
+            agent.fork(self.main_agent).run(
                 self.summarise_paper,
                 agdata(title=p["title"], url=p["url"], abstract=p["abstract"]),
             )

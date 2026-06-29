@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from ..agdata import agdata, agerror, _fmt_exc
+from ..agdata import agdata, agerror
+from ..agutil import format_exception
 from ..agtool import agtool
 
 if TYPE_CHECKING:
@@ -31,7 +32,7 @@ def make_write(sandbox: "agSandbox") -> agtool:
                 bytes_written=len(content.encode()),
             )
         except Exception as e:
-            return agerror(_fmt_exc(e))
+            return agerror(format_exception(e))
 
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:

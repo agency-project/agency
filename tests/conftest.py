@@ -1,16 +1,17 @@
 """Reset mutable agent class-level and module-level state between tests."""
 import sys
 import pytest
-import agency.agskill  # ensure registered in sys.modules
-_agskill_module = sys.modules["agency.agskill"]
-from agency.agent import agent, _allocated_agnames, _noun_counters, _live_agents
+import agency.agutil  # ensure registered in sys.modules
+_agutil_module = sys.modules["agency.agutil"]
+from agency.agent import agent, _live_agents
+from agency.agname import agname as _agname
 
 
 
 @pytest.fixture(autouse=True)
 def _test_env(monkeypatch):
     """Set stream-batch delay to zero so tests don't sleep 100 ms per LLM call."""
-    monkeypatch.setattr(_agskill_module, "_BATCH_INTERVAL_S", 0.0)
+    monkeypatch.setattr(_agutil_module, "_BATCH_INTERVAL_S", 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -29,8 +30,8 @@ def reset_agent_state():
     agent.log_dir         = saved["log_dir"]
     agent.output_dir      = saved["output_dir"]
     # Reset module-level name registry so tests don't bleed agnames into each other
-    _allocated_agnames.clear()
-    _noun_counters.clear()
+    _agname._allocated.clear()
+    _agname._noun_counters.clear()
     # WeakSet clears itself as objects die; force a GC pass to help along
     import gc
     gc.collect()

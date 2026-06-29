@@ -173,7 +173,7 @@ def test_agteam_emits_team_registered(active_webui):
         def setup(self): pass
         def run(self): pass
 
-    with patch("agency.agent._allocate_agname", return_value="MinimalTeam_0000"), \
+    with patch("agency.agname.agname.allocate_agname", return_value="MinimalTeam_0000"), \
          patch("agency.aglog.aglog.__init__", return_value=None), \
          patch("agency.aglog.aglog._lifecycle", return_value=None):
         team = _MinimalTeam.__new__(_MinimalTeam)

@@ -8,8 +8,10 @@ from unittest.mock import MagicMock, patch
 from agency.agdata import agdata, agerror
 from agency.agtype import agtype, agbinary
 from agency.agskill import agskill
+from agency.agllm import agllm
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
+LLM = agllm(LLM_CONFIG, context_limit=128_000)
 
 PNG_MAGIC = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 
@@ -56,7 +58,7 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
 def _run_skill_with_sandbox(skill, responses, sandbox):
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = skill.run(LLM_CONFIG, agdata(), agdata(messages=[]), sandbox=sandbox)
+        result, *_ = skill.run(LLM, agdata(), agdata(messages=[]), sandbox=sandbox)
     return result
 
 
@@ -277,16 +279,17 @@ def test_return_agbinary_directory_returns_error():
 
 
 def test_return_agbinary_valid_file_is_accepted():
-    """Agent returns a non-empty binary file path → accepted, path stored."""
+    """Agent returns a non-empty binary file path → accepted, bytes recovered."""
     # test -d → 1 (not a dir), test -s → 0 (exists and non-empty)
     sandbox = _sandbox_with_exec([("", 1), ("", 0)])
+    sandbox.read_file_bytes.return_value = PNG_MAGIC
     sk = agskill("w", "", output_schema=agdata(out=agbinary), max_output_schema_retries=0)
     responses = [
         _tool_call("return_out", {"value": "/workspace/outputs/clip.bin"}),
         _direct(""),
     ]
     result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.out == "/workspace/outputs/clip.bin"
+    assert result.out == PNG_MAGIC
 
 
 # ---------------------------------------------------------------------------

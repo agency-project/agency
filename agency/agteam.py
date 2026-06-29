@@ -34,7 +34,7 @@ class agteam:
 
             def run(self):
                 papers = self.agent.run(self.find_papers, agdata(topic=self.topic)).papers
-                summaries = [agent(self.agent).run(self.summarise, agdata(**p)) for p in papers]
+                summaries = [agent.fork(self.agent).run(self.summarise, agdata(**p)) for p in papers]
                 return self.agent.run(self.compile, agdata(summaries=summaries))
 
         result = PaperCrawlerTeam(topic="KV cache").run()  # returns immediately
@@ -78,11 +78,12 @@ class agteam:
         self._parent_team: "agteam | None" = parent
 
         # Log team creation to both terminal and file
-        from .agent import agent as _Agent, _allocate_agname
+        from .agent import agent as _Agent
+        from .agname import agname as _agname
         from .aglog import aglog as _aglog, _ts
         import sys
         _base = config.get("name") or f"{type(self).__name__}"
-        self.team_name: str = _allocate_agname(_base)
+        self.team_name: str = _agname.allocate_agname(_base)
         parent_team_name    = parent.team_name if parent is not None else None
         log_dir = _Agent.log_dir
         self._log = _aglog(log_dir / "_teams.jsonl" if log_dir else None)

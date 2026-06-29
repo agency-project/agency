@@ -134,7 +134,7 @@ def test_agent_inherits_team_llm_config(llm_cfg):
         def run(self): pass
 
     team = _T(llm_config=llm_cfg)
-    assert team.ag.llm_config == llm_cfg
+    assert team.ag.llm.config == llm_cfg
 
 
 def test_multiple_agents_in_setup_all_registered():

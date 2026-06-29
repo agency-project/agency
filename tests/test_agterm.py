@@ -430,12 +430,12 @@ class TestRunIsolation:
             "cross-run isolation is broken"
         )
 
-    def test_lifecycle_image_tag_differs_across_runs(self):
+    def test_checkpoint_image_tag_differs_across_runs(self):
         """Lifecycle image tags must be run-scoped to prevent cross-run clobber."""
         script = (
-            "from agency.agsandbox import agSandbox, _RUN_ID; "
+            "from agency.agsandbox import agSandbox; "
             "sb = agSandbox('DataGen_0000'); "
-            "print(f'agency/lifecycle-{sb._name}')"
+            "print(sb._lifecycle_tag())"
         )
         r1 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
         r2 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)

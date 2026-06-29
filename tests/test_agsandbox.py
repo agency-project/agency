@@ -531,7 +531,7 @@ class TestAgSandboxLifecycle:
             sb1.write_file("/workspace/data.txt", "restored\n")
             sb1.commit(tag)
             sb1.destroy()
-            sb2 = _make_sandbox(lifecycle_image=tag)
+            sb2 = _make_sandbox(checkpoint_image=tag)
             content = sb2.read_file("/workspace/data.txt")
             assert content == "restored\n"
             sb2.destroy()
@@ -565,11 +565,11 @@ class TestAgSandboxLifecycle:
         sb2.destroy()
 
     @docker
-    def test_stop_commit_true_creates_lifecycle_image_and_removes_container(self):
+    def test_stop_commit_true_creates_checkpoint_image_and_removes_container(self):
         """stop(commit=True) commits state to agency/lifecycle-<name> and removes the container."""
         sb = _make_sandbox()
         name = sb._container_name()
-        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        lifecycle_tag = sb._lifecycle_tag()
         try:
             sb.write_file("/workspace/marker.txt", "lifecycle\n")
             sb.stop(commit=True)
@@ -585,8 +585,8 @@ class TestAgSandboxLifecycle:
                 capture_output=True, text=True,
             )
             assert img.stdout.strip() != "", "lifecycle image must exist after stop(commit=True)"
-            # _lifecycle_image must be set
-            assert sb._lifecycle_image == lifecycle_tag
+            # _checkpoint_image must be set
+            assert sb._checkpoint_image == lifecycle_tag
         finally:
             subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
             sb.destroy()
@@ -596,10 +596,10 @@ class TestAgSandboxLifecycle:
         """stop(commit=False) removes the container but does not create a lifecycle image."""
         sb = _make_sandbox()
         name = sb._container_name()
-        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        lifecycle_tag = sb._lifecycle_tag()
         try:
             sb.write_file("/workspace/dirty.txt", "dirty\n")
-            previous_lifecycle = sb._lifecycle_image  # None on first call
+            previous_lifecycle = sb._checkpoint_image  # None on first call
             sb.stop(commit=False)
             # Container must be gone
             result = subprocess.run(
@@ -607,8 +607,8 @@ class TestAgSandboxLifecycle:
                 capture_output=True, text=True,
             )
             assert name not in result.stdout, "container must be removed after stop()"
-            # _lifecycle_image must not have changed
-            assert sb._lifecycle_image == previous_lifecycle
+            # _checkpoint_image must not have changed
+            assert sb._checkpoint_image == previous_lifecycle
             # No lifecycle image should have been created
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
@@ -620,10 +620,10 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
-    def test_lifecycle_image_restores_workspace_on_next_start(self):
+    def test_checkpoint_image_restores_workspace_on_next_start(self):
         """After stop(commit=True), _ensure_started() restores /workspace from the lifecycle image."""
         sb = _make_sandbox()
-        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        lifecycle_tag = sb._lifecycle_tag()
         try:
             sb.write_file("/workspace/persistent.txt", "saved\n")
             sb.stop(commit=True)
@@ -640,7 +640,7 @@ class TestAgSandboxLifecycle:
     def test_stop_commit_false_reverts_to_last_checkpoint(self):
         """stop(commit=False) discards dirty state; next start restores from last lifecycle image."""
         sb = _make_sandbox()
-        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        lifecycle_tag = sb._lifecycle_tag()
         try:
             # First successful tool call: write file and commit.
             sb.write_file("/workspace/good.txt", "good\n")
@@ -660,10 +660,10 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
-    def test_destroy_removes_lifecycle_image(self):
+    def test_destroy_removes_checkpoint_image(self):
         """destroy() cleans up the lifecycle image created by stop(commit=True)."""
         sb = _make_sandbox()
-        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        lifecycle_tag = sb._lifecycle_tag()
         sb.write_file("/workspace/x.txt", "x\n")
         sb.stop(commit=True)
         # Confirm image exists before destroy
@@ -744,7 +744,7 @@ class TestAgSandboxLifecycle:
         from agency.agsandbox import _docker_semaphore
 
         sandboxes = [_make_sandbox() for _ in range(4)]
-        lifecycle_tags = [f"agency/lifecycle-{sb._name}" for sb in sandboxes]
+        lifecycle_tags = [sb._lifecycle_tag() for sb in sandboxes]
         for sb in sandboxes:
             sb.write_file("/workspace/x.txt", "x\n")
 
@@ -814,7 +814,7 @@ class TestAgSandboxLifecycle:
         """stop(commit=True) retries docker commit up to 3 times; succeeds if a later attempt works."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
-        lifecycle_tag = f"agency/lifecycle-{sb._name}"
+        lifecycle_tag = sb._lifecycle_tag()
 
         call_count = [0]
         real_run = sb._run
@@ -830,7 +830,7 @@ class TestAgSandboxLifecycle:
         try:
             sb.stop(commit=True)
             assert call_count[0] == 2, "expected one failure then one success"
-            assert sb._lifecycle_image == lifecycle_tag
+            assert sb._checkpoint_image == lifecycle_tag
             assert sb._started is False
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
@@ -844,11 +844,11 @@ class TestAgSandboxLifecycle:
     @docker
     def test_stop_emits_warning_after_all_commit_retries_fail(self):
         """stop(commit=True) emits a WARNING to stderr when all 3 commit attempts fail;
-        _lifecycle_image is not updated so the next start restores from the prior checkpoint."""
+        _checkpoint_image is not updated so the next start restores from the prior checkpoint."""
         import io
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
-        previous_lifecycle = sb._lifecycle_image
+        previous_lifecycle = sb._checkpoint_image
 
         real_run = sb._run
 
@@ -869,7 +869,7 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
         assert "WARNING" in captured.getvalue()
-        assert sb._lifecycle_image == previous_lifecycle  # not updated on all-retry failure
+        assert sb._checkpoint_image == previous_lifecycle  # not updated on all-retry failure
         assert sb._started is False
 
 
@@ -877,7 +877,7 @@ class TestAgSandboxLifecycle:
     def test_ensure_started_removes_exited_container(self):
         """Exited containers are force-removed and recreated (no docker start fast-path).
 
-        State is preserved across stop()/start() cycles via lifecycle_image commits,
+        State is preserved across stop()/start() cycles via checkpoint_image commits,
         not via docker stop/start.  An exited container is treated as a zombie and
         removed so the name is free for a fresh docker run.
         """
@@ -893,7 +893,7 @@ class TestAgSandboxLifecycle:
             assert sb._started is True
             # The fresh container has no /workspace/exited.txt — the exited container
             # was force-removed.  State would only survive if stop(commit=True) had been
-            # called before the stop to commit a lifecycle_image.
+            # called before the stop to commit a checkpoint_image.
             with pytest.raises(FileNotFoundError):
                 sb.read_file("/workspace/exited.txt")
         finally:
@@ -1498,7 +1498,7 @@ class TestDanglingImageEagerCleanup:
         import agency.agsandbox as _mod
 
         sb = _make_sandbox()
-        tag = f"agency/lifecycle-{sb._name}"
+        tag = sb._lifecycle_tag()
 
         run_calls = []
         fake_old_id = "sha256:deadbeef0000"

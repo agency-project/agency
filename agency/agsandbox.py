@@ -10,10 +10,12 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Callable, ClassVar
 
 if TYPE_CHECKING:
     from .agresources import agResourcePool
+    from .agterm import agterm
+    from .aglog import aglog
 
 _BGPIDS_MARKER = "__BGPIDS__:"
 
@@ -231,7 +233,7 @@ class agSandbox:
         self,
         agname: str,
         output_dir: Path | None = None,
-        lifecycle_image: str | None = None,
+        checkpoint_image: str | None = None,
     ) -> None:
         self._agname   = agname
         self._runtime  = get_container_runtime()
@@ -244,8 +246,10 @@ class agSandbox:
         self._watched_pids: dict[int, float] = {}
         self._baseline_pids: set[int]        = set()
         self._daemon_pids:   set[int]        = set()
-        self._started  = False
-        self._lifecycle_image: str | None    = lifecycle_image
+        self._started   = False
+        self._destroyed = False
+        self._checkpoint_image: str | None = checkpoint_image
+        self._output_dir: Path | None      = output_dir
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
@@ -307,17 +311,17 @@ class agSandbox:
         if self._runtime == "docker":
             _container_semaphore.acquire()
         try:
-            if self._lifecycle_image is not None:
+            if self._checkpoint_image is not None:
                 # Restart from last committed checkpoint (set by stop(commit=True)).
                 # /workspace and all state from the previous tool call are preserved.
-                image = self._lifecycle_image
+                image = self._checkpoint_image
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + self._gpu_flags + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
                 )
                 self._run_with_conflict_retry(run_cmd, name)
-                # Keep _lifecycle_image — not a one-shot restore, needed for future restarts.
+                # Keep _checkpoint_image — not a one-shot restore, needed for future restarts.
             else:
                 image = self._resolve_image(self.BASE_IMAGE)
                 cpu_flags = ["--cpus=1"] if self._cfs_supported() else []
@@ -720,7 +724,7 @@ class agSandbox:
         self._watched_pids = {}
         self._baseline_pids = set()
         if commit:
-            tag = f"agency/lifecycle-{self._name}"
+            tag = self._lifecycle_tag()
             # Capture the current image ID before overwriting the tag so we
             # can delete it afterward — committing to an existing tag leaves
             # the old image dangling (untagged but still on disk).
@@ -740,7 +744,7 @@ class agSandbox:
                         [self._runtime, "commit", self._container_name(), tag],
                         check=True, timeout=_TIMEOUT_COMMIT,
                     )
-                    self._lifecycle_image = tag
+                    self._checkpoint_image = tag
                     break
                 except Exception as _e:
                     if _attempt == 2:
@@ -752,7 +756,7 @@ class agSandbox:
                     else:
                         time.sleep(1)
             # Delete the previous image now that the tag points to the new one.
-            if old_image_id and self._lifecycle_image == tag:
+            if old_image_id and self._checkpoint_image == tag:
                 self._rmi(old_image_id)
         name = self._container_name()
         for _attempt in range(3):
@@ -793,7 +797,7 @@ class agSandbox:
             self._started = False
             self._watched_pids = {}
             self._baseline_pids = set()
-        self._lifecycle_image = tag
+        self._checkpoint_image = tag
         self._ensure_started()
 
     def release_daemon(self, pid: int) -> None:
@@ -931,7 +935,16 @@ class agSandbox:
             except Exception as _e:
                 print(f"[agsandbox] WARNING: update_limits failed for {self._name}: {_e}")
 
+    def __del__(self) -> None:
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
     def destroy(self) -> None:
+        if self._destroyed:
+            return
+        self._destroyed = True
         _live_sandboxes.discard(self)
         # _started is only set to True in the process that called _ensure_started.
         # When tools run in worker processes the main process always has
@@ -960,21 +973,170 @@ class agSandbox:
             if had_container:
                 _container_semaphore.release()
 
-        # Remove pre-tool checkpoint images created during this sandbox's lifetime.
+        # Remove the checkpoint image and all pre-tool snapshots created during
+        # this sandbox's lifetime.
+        if self._checkpoint_image:
+            try:
+                self._rmi(self._checkpoint_image, force=True)
+            except Exception as _e:
+                print(f"[agsandbox] WARNING: checkpoint image cleanup failed for {container_name}: {_e}")
+            self._checkpoint_image = None
         try:
             result = self._run(
                 [self._runtime, "images", "--format", "{{.Repository}}:{{.Tag}}"],
                 timeout=_TIMEOUT_IMAGE,
             )
             prefix = f"agency/pretool-{self._name}-"
-            lifecycle = f"agency/lifecycle-{self._name}"
             for line in result.stdout.decode("utf-8", errors="replace").splitlines():
                 tag = line.strip()
-                # docker images --format {{.Repository}}:{{.Tag}} includes the ":latest"
-                # suffix when no explicit tag was given (e.g. "agency/lifecycle-x:latest").
-                tag_repo = tag.rsplit(":", 1)[0] if ":" in tag else tag
-                if tag.startswith(prefix) or tag_repo == lifecycle:
+                if tag.startswith(prefix):
                     self._rmi(tag, force=True)
         except Exception as _e:
-            print(f"[agsandbox] WARNING: image cleanup failed for {container_name}: {_e}")
+            print(f"[agsandbox] WARNING: pretool image cleanup failed for {container_name}: {_e}")
+
+    def remove_files(self, paths: list[str]) -> None:
+        """Delete sandbox files previously written by offload/agfile helpers."""
+        import shlex as _shlex
+        for path in paths:
+            try:
+                self._container_exec(f"rm -f {_shlex.quote(path)}", shell="sh")
+            except Exception as _e:
+                print(f"[agsandbox] WARNING: failed to remove offloaded file {path}: {_e}")
+
+    def fork(self, new_agname: str, output_dir: "Path | None" = None) -> "agSandbox":
+        """Return a new agSandbox for *new_agname* starting from this sandbox's
+        current checkpoint image.  If no checkpoint exists the fork starts fresh.
+
+        The caller owns the returned sandbox and is responsible for calling
+        destroy() on it when done.
+        """
+        fork_sb = agSandbox(new_agname, output_dir=output_dir)
+        if self._checkpoint_image:
+            agSandbox.tag_image(self._checkpoint_image, fork_sb._lifecycle_tag())
+            fork_sb._checkpoint_image = fork_sb._lifecycle_tag()
+        return fork_sb
+
+    def _lifecycle_tag(self) -> str:
+        return f"agency/lifecycle-{self._name}"
+
+    # ------------------------------------------------------------------
+    # Static helpers — image-level operations used for checkpointing.
+    # These operate on image tags, not containers, so they don't need
+    # a sandbox instance.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def tag_image(source: str, dest: str) -> None:
+        """Retag an image from *source* to *dest* (docker/podman tag)."""
+        runtime = get_container_runtime()
+        with _docker_semaphore:
+            subprocess.run(
+                [runtime, "tag", source, dest],
+                capture_output=True, check=True,
+            )
+
+    @staticmethod
+    def delete_image(tag: str, *, force: bool = False) -> None:
+        """Remove an image by tag (docker/podman rmi).  Never raises."""
+        runtime = get_container_runtime()
+        cmd = [runtime, "rmi"]
+        if force:
+            cmd.append("-f")
+        cmd.append(tag)
+        with _docker_semaphore:
+            subprocess.run(cmd, capture_output=True)
+
+    @staticmethod
+    def export_image(tag: str, timeout: int) -> bytes:
+        """Export an image to a tar byte-string (docker/podman save).
+
+        The image must already exist.  Returns the raw tar bytes suitable
+        for writing to a file or embedding in a larger archive.
+        Raises ``subprocess.CalledProcessError`` on failure.
+        """
+        runtime = get_container_runtime()
+        with _docker_semaphore:
+            result = subprocess.run(
+                [runtime, "save", tag],
+                capture_output=True, check=True, timeout=timeout,
+            )
+        return result.stdout
+
+    @staticmethod
+    def import_image(image_bytes: bytes, timeout: int) -> None:
+        """Load an image from a tar byte-string (docker/podman load).
+
+        Raises ``subprocess.CalledProcessError`` on failure.
+        """
+        runtime = get_container_runtime()
+        with _docker_semaphore:
+            subprocess.run(
+                [runtime, "load"],
+                input=image_bytes, capture_output=True, check=True, timeout=timeout,
+            )
+
+    def wait_for_processes(
+        self,
+        skill_name: str,
+        term: "agterm | None",
+        log: "aglog | None",
+        agname: str,
+        ping_interval_s: float,
+        poll_interval_s: float,
+        _state_fn: "Callable | None" = None,
+    ) -> "str | None":
+        """Wait for sandbox background processes after the LLM produces a final answer.
+
+        Returns None if the sandbox is already clean (no action needed).
+        Otherwise polls until all PIDs exit or ping_interval_s elapses, then
+        returns a user-facing message to inject into the conversation so the
+        LLM can act on the outcome.
+        """
+        watched = getattr(self, "_watched_pids", None)
+        if not isinstance(watched, dict) or not watched:
+            return None
+        get_live = self.get_live_pids
+        if not get_live():
+            return None
+
+        summary = self.pid_status_summary()
+        if _state_fn:
+            _state_fn("proc_wait", skill=skill_name)
+        if term:
+            term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
+        if log:
+            log._lifecycle("procs_started", agname=agname, skill=skill_name,
+                           pids=list(get_live()), summary=summary)
+
+        deadline = time.monotonic() + ping_interval_s
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval_s)
+            if not get_live():
+                break
+
+        live_now = get_live()
+
+        if not live_now:
+            if term:
+                term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
+            if log:
+                log._lifecycle("procs_completed", agname=agname, skill=skill_name)
+            return (
+                "Background processes have completed. "
+                "Read their output and act on the results."
+            )
+
+        summary = self.pid_status_summary()
+        if term:
+            term.log("PROCS ⏳  ", f"{skill_name}  still running: {summary}")
+        if log:
+            log._lifecycle("procs_ping", agname=agname, skill=skill_name,
+                           pids=list(live_now), summary=summary)
+        return (
+            f"Background processes are still running: {summary}. "
+            f"You may check their output, wait, or proceed if appropriate. "
+            f"If any of these processes are intentional long-running services "
+            f"(daemons, servers, monitors) that should not block completion, "
+            f"call daemon_release(pid) for each such PID to release it from monitoring."
+        )
 

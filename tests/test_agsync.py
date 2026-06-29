@@ -249,9 +249,9 @@ def test_fork_agents_created_in_run_are_auto_registered():
         def setup(self):
             self.parent = agent()
         def run(self):
-            self.f1 = agent(self.parent)
-            self.f2 = agent(self.parent)
-            self.f3 = agent(self.parent)
+            self.f1 = agent.fork(self.parent)
+            self.f2 = agent.fork(self.parent)
+            self.f3 = agent.fork(self.parent)
             return agdata(done=True)
 
     team = _T()
@@ -269,7 +269,7 @@ def test_agents_in_setup_are_tracked():
         llm_config = LLM_CFG
         def setup(self):
             self.parent = agent()
-            self.fork = agent(self.parent)   # fork in setup — also tracked
+            self.fork = agent.fork(self.parent)   # fork in setup — also tracked
         def run(self): return agdata(done=True)
 
     team = _T()
@@ -285,7 +285,7 @@ def test_fork_agents_tracked_in_run_thread():
         def setup(self):
             self.parent = agent()
         def run(self):
-            self.fork = agent(self.parent)
+            self.fork = agent.fork(self.parent)
             return agdata(done=True)
 
     team = _T()
@@ -301,7 +301,7 @@ def test_fork_agents_scale_correctly(n_forks):
         def setup(self):
             self.parent = agent()
         def run(self):
-            self.forks = [agent(self.parent) for _ in range(n_forks)]
+            self.forks = [agent.fork(self.parent) for _ in range(n_forks)]
             return agdata(done=True)
 
     team = _T()

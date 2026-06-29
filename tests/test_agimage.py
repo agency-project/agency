@@ -8,7 +8,6 @@ import pytest
 from agency.agdata import agdata
 from agency.agtype import agtype, agimage
 from agency.agskill import agskill
-from agency.agent import _prepare_agtype_inputs
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +219,7 @@ def test_prepare_agtype_inputs_list_agimage_encodes_each(tmp_path):
 
     inp = agdata(frames=[str(img_a), str(img_b)])
     schema = agdata(frames=list[agimage])
-    paths = _prepare_agtype_inputs(inp, schema, MagicMock(), "sk")
+    paths = inp.prepare_agtype_inputs(schema, MagicMock(), "sk")
 
     assert paths == []   # agimage doesn't write sandbox paths
     vals = inp._data["frames"]
@@ -237,12 +236,12 @@ def test_prepare_agtype_inputs_single_agimage_encodes(tmp_path):
 
     inp = agdata(photo=str(img))
     schema = agdata(photo=agimage)
-    _prepare_agtype_inputs(inp, schema, MagicMock(), "sk")
+    inp.prepare_agtype_inputs(schema, MagicMock(), "sk")
 
     assert inp._data["photo"].startswith("data:image/png;base64,")
 
 def test_prepare_agtype_inputs_url_agimage_not_modified():
     inp = agdata(photo="https://example.com/img.jpg")
     schema = agdata(photo=agimage)
-    _prepare_agtype_inputs(inp, schema, MagicMock(), "sk")
+    inp.prepare_agtype_inputs(schema, MagicMock(), "sk")
     assert inp._data["photo"] == "https://example.com/img.jpg"

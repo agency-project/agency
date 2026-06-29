@@ -1,8 +1,11 @@
 from __future__ import annotations
 import base64
+import json
 import mimetypes
+import shlex
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, get_args, get_origin
+from .agutil import _looks_like_path
 
 if TYPE_CHECKING:
     from .agsandbox import agSandbox
@@ -104,6 +107,79 @@ class agtype:
     def return_value_description(cls, field_name: str) -> str:
         """Description for the `value` parameter of return_<field>."""
         return f"Value for '{field_name}'"
+
+    @staticmethod
+    def walk(hint, value, on_leaf):
+        """Recursively walk a type hint/value pair, calling on_leaf(hint, value)
+        at every agtype leaf.  Returns (new_value, paths).
+
+        Handles list, dict, and tuple containers at any nesting depth.
+        on_leaf must handle its own exceptions and always return (value, []).
+        """
+        origin = get_origin(hint)
+        args   = get_args(hint)
+
+        if isinstance(hint, type) and issubclass(hint, agtype):
+            return on_leaf(hint, value)
+
+        if origin is list and args:
+            if not isinstance(value, list):
+                return value, []
+            new_vals, paths = [], []
+            for v in value:
+                nv, written = agtype.walk(args[0], v, on_leaf)
+                new_vals.append(nv)
+                paths.extend(written)
+            return new_vals, paths
+
+        if origin is dict and len(args) == 2:
+            if not isinstance(value, dict):
+                return value, []
+            new_vals, paths = {}, []
+            for k, v in value.items():
+                nv, written = agtype.walk(args[1], v, on_leaf)
+                new_vals[k] = nv
+                paths.extend(written)
+            return new_vals, paths
+
+        if origin is tuple and args:
+            if not isinstance(value, (list, tuple)):
+                return value, []
+            new_vals, paths = list(value), []
+            for i, (type_arg, v) in enumerate(zip(args, value)):
+                nv, written = agtype.walk(type_arg, v, on_leaf)
+                new_vals[i] = nv
+                paths.extend(written)
+            return new_vals, paths
+
+        return value, []
+
+    @staticmethod
+    def in_hint(hint) -> bool:
+        """Return True if hint contains any agtype subclass other than agrawstring,
+        at any nesting depth."""
+        if isinstance(hint, type) and issubclass(hint, agtype):
+            return not issubclass(hint, agrawstring)
+        origin = get_origin(hint)
+        args   = get_args(hint)
+        if origin is list and args:
+            return agtype.in_hint(args[0])
+        if origin is dict and len(args) == 2:
+            return agtype.in_hint(args[1])
+        if origin is tuple and args:
+            return any(agtype.in_hint(a) for a in args)
+        return False
+
+    @staticmethod
+    def from_hint(hint: object) -> "type[agtype] | None":
+        """Return the agtype subclass for a hint, handling both T and list[T]."""
+        if isinstance(hint, type) and issubclass(hint, agtype):
+            return hint
+        if get_origin(hint) is list:
+            args = get_args(hint)
+            if args and isinstance(args[0], type) and issubclass(args[0], agtype):
+                return args[0]
+        return None
 
 
 class agfile(agtype):
@@ -447,3 +523,375 @@ class agrawstring(agtype):
     @classmethod
     def needs_sandbox(cls) -> bool:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Type-hint inspection and schema helpers
+# ---------------------------------------------------------------------------
+
+def _hint_to_json_type(hint) -> str:
+    """Map a schema hint to a JSON Schema type string for tool parameter specs."""
+    if isinstance(hint, type):
+        if issubclass(hint, bool):   return "boolean"   # bool before int (bool is subclass of int)
+        if issubclass(hint, int):    return "integer"
+        if issubclass(hint, float):  return "number"
+        if issubclass(hint, agtype): return "string"
+        if issubclass(hint, (list, tuple)): return "array"
+        if issubclass(hint, dict):   return "object"
+        return "string"
+    origin = get_origin(hint)
+    if origin is list or origin is tuple: return "array"
+    if origin is dict:                    return "object"
+    if isinstance(hint, list):            return "array"   # [{"key": type, ...}] literal
+    return "string"
+
+
+def _example_for_hint(hint) -> str:
+    """Return a short valid-JSON example for a type hint (used in tool descriptions/errors).
+
+    Every returned string is parseable by json.loads.
+    """
+    if hint is bool:  return "true"
+    if hint is int:   return "42"
+    if hint is float: return "3.14"
+    if hint is str:   return '"text"'
+    origin = get_origin(hint)
+    args   = get_args(hint)
+    if hint is list or origin is list:
+        return f"[{_example_for_hint(args[0])}]" if args else "[]"
+    if hint is dict or origin is dict:
+        if args and len(args) == 2:
+            return "{" + f"{_example_for_hint(args[0])}: {_example_for_hint(args[1])}" + "}"
+        return "{}"
+    if hint is tuple or origin is tuple:
+        return "[" + ", ".join(_example_for_hint(t) for t in args) + "]" if args else "[]"
+    if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+        obj = "{" + ", ".join(f'"{k}": {_example_for_hint(t)}' for k, t in hint[0].items()) + "}"
+        return f"[{obj}]"
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        return '"value"'
+    return "null"
+
+
+def _value_desc_for_hint(field: str, hint) -> str:
+    """Return a value description with a concrete format example and a 'pass directly' note."""
+    origin = get_origin(hint)
+    args   = get_args(hint)
+    ex     = _example_for_hint(hint)
+    direct = "Pass directly — do not JSON-encode into a string."
+
+    if hint is str:
+        return (
+            f"The complete string value for '{field}'. "
+            "Pass the full content directly — not a file path."
+        )
+    if hint is bool:
+        return f"Boolean for '{field}' (true or false)."
+    if hint is int:
+        return f"Integer for '{field}'. Example: {ex}."
+    if hint is float:
+        return f"Floating-point number for '{field}'. Example: {ex}."
+    if hint is list or origin is list:
+        if args:
+            elem_type = args[0]
+            elem_name = getattr(elem_type, "__name__", repr(elem_type))
+            return (
+                f"JSON array of {elem_name} values for '{field}'. "
+                f"Example: {ex}. {direct}"
+            )
+        return f"JSON array for '{field}'. Example: {ex}. {direct}"
+    if hint is dict or origin is dict:
+        if args and len(args) == 2:
+            kn = getattr(args[0], "__name__", repr(args[0]))
+            vn = getattr(args[1], "__name__", repr(args[1]))
+            return (
+                f"JSON object with {kn} keys and {vn} values for '{field}'. "
+                f"Example: {ex}. {direct}"
+            )
+        return f"JSON object for '{field}'. Example: {ex}. {direct}"
+    if hint is tuple or origin is tuple:
+        if args:
+            types_str = ", ".join(getattr(t, "__name__", repr(t)) for t in args)
+            return (
+                f"JSON array of {len(args)} element(s) ({types_str}) for '{field}'. "
+                f"Example: {ex}. {direct}"
+            )
+        return f"JSON array for '{field}'. Example: {ex}. {direct}"
+    if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+        keys = ", ".join(f'"{k}"' for k in hint[0])
+        obj_ex = "{" + ", ".join(f'"{k}": {_example_for_hint(t)}' for k, t in hint[0].items()) + "}"
+        return (
+            f"JSON array of objects for '{field}'. Each object must have keys: {keys}. "
+            f"Example: [{obj_ex}]. {direct}"
+        )
+    return f"Value for '{field}'."
+
+
+def _return_tool_descriptions(field: str, hint) -> "tuple[str, str]":
+    """Return (tool_description, value_description) for a return_<field> tool."""
+    tool_desc = (
+        f"Return the final value for the '{field}' output field. "
+        f"Pass the actual output content as the '{field}' argument — "
+        f"do not call this tool with empty or placeholder arguments."
+    )
+    # agtype subclass — delegate to its classmethods
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        return hint.return_tool_description(field), hint.return_value_description(field)
+    # list[agtype] — delegate to the inner type, but include a JSON array example
+    if get_origin(hint) is list:
+        args = get_args(hint)
+        if args and isinstance(args[0], type) and issubclass(args[0], agtype):
+            inner = args[0]
+            ex = _example_for_hint(hint)
+            return (
+                inner.return_tool_description(field) + " (as a JSON array)",
+                inner.return_value_description(field) + f" Provide as a JSON array. Example: {ex}.",
+            )
+    return tool_desc, _value_desc_for_hint(field, hint)
+
+
+def _validate_value(hint, value) -> "str | None":
+    """Recursively validate value against hint. Returns an error string or None."""
+    origin = get_origin(hint)
+    args   = get_args(hint)
+
+    if isinstance(hint, type):
+        if issubclass(hint, agtype):
+            return None if isinstance(value, str) else f"expected str, got {type(value).__name__}"
+        if issubclass(hint, bool):
+            return None if isinstance(value, bool) else f"expected bool, got {type(value).__name__}"
+        if issubclass(hint, (int, float, str)):
+            return None if isinstance(value, hint) else f"expected {hint.__name__}, got {type(value).__name__}"
+        # bare list/tuple/dict without type args
+        if issubclass(hint, (list, tuple)):
+            return None if isinstance(value, (list, tuple)) else f"expected array, got {type(value).__name__}"
+        if issubclass(hint, dict):
+            return None if isinstance(value, dict) else f"expected dict, got {type(value).__name__}"
+        return None if isinstance(value, hint) else f"expected {hint.__name__}, got {type(value).__name__}"
+
+    if origin is list:
+        if not isinstance(value, list):
+            return f"expected list, got {type(value).__name__}"
+        if args:
+            for i, item in enumerate(value):
+                err = _validate_value(args[0], item)
+                if err:
+                    return f"item {i}: {err}"
+        return None
+
+    if origin is tuple:
+        if not isinstance(value, (list, tuple)):
+            return f"expected array, got {type(value).__name__}"
+        if args:
+            for i, (type_arg, item) in enumerate(zip(args, value)):
+                err = _validate_value(type_arg, item)
+                if err:
+                    return f"item {i}: {err}"
+        return None
+
+    if origin is dict:
+        if not isinstance(value, dict):
+            return f"expected dict, got {type(value).__name__}"
+        if len(args) == 2:
+            for k, v in value.items():
+                err = _validate_value(args[1], v)
+                if err:
+                    return f"key {k!r}: {err}"
+        return None
+
+    # [{"key": type, ...}] literal list-of-dicts schema
+    if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
+        if not isinstance(value, list):
+            return f"expected list, got {type(value).__name__}"
+        template = hint[0]
+        for i, item in enumerate(value):
+            if not isinstance(item, dict):
+                return f"item {i}: expected dict, got {type(item).__name__}"
+            for k, t in template.items():
+                if k not in item:
+                    return f"item {i}: missing key '{k}'"
+                if isinstance(t, type) and not isinstance(item[k], t):
+                    return f"item {i}.{k}: expected {t.__name__}, got {type(item[k]).__name__}"
+        return None
+
+    return None
+
+
+def _validate_output_field(field: str, value, schema) -> "str | None":
+    """Validate a single (field, value) pair against the output schema hint.
+
+    Returns an error string, or None if valid.
+    schema is an agdata instance; accessed via duck typing to avoid circular imports.
+    """
+    return _validate_value(schema._data[field], value)
+
+
+# ---------------------------------------------------------------------------
+# Type-hint traversal helpers  (now static methods on agtype)
+# ---------------------------------------------------------------------------
+
+
+def output_field_desc(hint: object) -> str:
+    """Return a human-readable type description with usage guidance for an output field."""
+    if isinstance(hint, type) and issubclass(hint, agtype):
+        return hint.schema_type()
+    if hint is str:
+        return "string — pass the complete text content as the value (not a file path)"
+    if hint is int:
+        return "integer — pass the numeric value directly"
+    if hint is float:
+        return "float — pass the numeric value directly"
+    if hint is bool:
+        return "boolean — pass true or false"
+    if hint is list or hint is dict:
+        return hint.__name__
+    if get_origin(hint) is list:
+        args = get_args(hint)
+        inner = output_field_desc(args[0]) if args else "any"
+        return f"array of {inner}"
+    return str(hint)
+
+
+def raw_schema_key(schema: "object | None") -> "str | None":
+    """Return the single field key if schema has exactly one agrawstring field, else None."""
+    if schema is None:
+        return None
+    items = list(schema._data.items())
+    if len(items) == 1:
+        key, hint = items[0]
+        if isinstance(hint, type) and issubclass(hint, agrawstring):
+            return key
+
+
+def make_field_handler(
+    field: str,
+    output_schema: object,
+    sandbox: "agSandbox",
+    collected_outputs: dict,
+    required_fields: set,
+    exec_timeout: int,
+) -> "Callable[[dict], str]":
+    """Build a handler for a single return_<field> intercept tool call.
+
+    The returned callable validates the value, runs agfile/agbinary checks
+    against the sandbox, and records the field in collected_outputs.
+    """
+    hint = output_schema._data[field]
+    _is_agfile   = isinstance(hint, type) and issubclass(hint, agfile)
+    _is_agbinary = isinstance(hint, type) and issubclass(hint, agbinary)
+    _is_str      = hint is str
+
+    def _handle(args: dict) -> str:
+        value = next(iter(args.values()), None)
+        err = _validate_output_field(field, value, output_schema)
+        if err is not None:
+            _hint    = output_schema._data[field]
+            ex       = _example_for_hint(_hint)
+            got_str  = isinstance(value, str)
+            exp_arr  = _hint_to_json_type(_hint) == "array"
+            exp_obj  = _hint_to_json_type(_hint) == "object"
+            if value is None:
+                fix = (
+                    f"You called return_{field}() with no arguments. "
+                    f"Pass the actual output as the '{field}' argument. "
+                    f"Example: return_{field}({field}={ex})"
+                )
+            elif got_str and exp_arr:
+                fix = (
+                    f"You passed a JSON-encoded string; pass a JSON array directly. "
+                    f"Example: {ex}"
+                )
+            elif got_str and exp_obj:
+                fix = (
+                    f"You passed a JSON-encoded string; pass a JSON object directly. "
+                    f"Example: {ex}"
+                )
+            else:
+                fix = f"Expected format: {ex}"
+            return json.dumps({"error": f"field '{field}': {err}. {fix}"})
+
+        if _is_agfile and isinstance(value, str):
+            try:
+                content = sandbox.read_file(value)
+            except IsADirectoryError:
+                return json.dumps({"error": (
+                    f"field '{field}': '{value}' is a directory, not a file. "
+                    f"Pass the path to a specific output file "
+                    f"(e.g. {value}/{field}.txt)."
+                )})
+            except UnicodeDecodeError:
+                return json.dumps({"error": (
+                    f"field '{field}': file at '{value}' contains binary data "
+                    f"and cannot be read as text. Write a UTF-8 text file instead."
+                )})
+            except Exception:
+                return json.dumps({"error": (
+                    f"field '{field}': no file found at path '{value}'. "
+                    f"Write your output to a file first, then call this "
+                    f"tool with that file's path."
+                )})
+            if not content or not content.strip():
+                return json.dumps({"error": (
+                    f"field '{field}': file at '{value}' is empty. "
+                    f"Write the actual content to the file before "
+                    f"registering the path."
+                )})
+            if _looks_like_path(content.strip()):
+                return json.dumps({"error": (
+                    f"field '{field}': file at '{value}' contains only a "
+                    f"path reference ('{content.strip()}'), not real content. "
+                    f"Write the actual content to a file and return that "
+                    f"file's path."
+                )})
+
+        if _is_agbinary and isinstance(value, str):
+            _, dir_rc = sandbox._container_exec(
+                f"test -d {shlex.quote(value)}", timeout=exec_timeout, shell="sh"
+            )
+            if dir_rc == 0:
+                return json.dumps({"error": (
+                    f"field '{field}': '{value}' is a directory, not a file. "
+                    f"Pass the path to a specific binary output file "
+                    f"(e.g. {value}/{field}.bin)."
+                )})
+            _, exist_rc = sandbox._container_exec(
+                f"test -s {shlex.quote(value)}", timeout=exec_timeout, shell="sh"
+            )
+            if exist_rc != 0:
+                _, found_rc = sandbox._container_exec(
+                    f"test -e {shlex.quote(value)}", timeout=exec_timeout, shell="sh"
+                )
+                if found_rc != 0:
+                    return json.dumps({"error": (
+                        f"field '{field}': no file found at path '{value}'. "
+                        f"Write your binary output to a file first, then call "
+                        f"this tool with that file's path."
+                    )})
+                return json.dumps({"error": (
+                    f"field '{field}': file at '{value}' is empty. "
+                    f"Write the actual binary content to the file before "
+                    f"registering the path."
+                )})
+
+        if _is_str and isinstance(value, str) and _looks_like_path(value):
+            try:
+                resolved = sandbox.read_file(value)
+                if resolved and resolved.strip() and not _looks_like_path(resolved.strip()):
+                    value = resolved
+            except Exception:
+                pass
+
+        collected_outputs[field] = value
+        remaining = required_fields - set(collected_outputs)
+        if remaining:
+            _remaining_tools = ", ".join(f"return_{f}" for f in sorted(remaining))
+            return json.dumps({"result": (
+                f"[HARNESS SYSTEM] ✓ '{field}' registered. "
+                f"Still needed: {sorted(remaining)}, call {_remaining_tools} tool(s)."
+            )})
+        return json.dumps({"result": (
+            f"[HARNESS SYSTEM] ✓ '{field}' registered. "
+            f"All required fields complete, please end your response now."
+        )})
+
+    return _handle

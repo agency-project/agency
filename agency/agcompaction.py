@@ -1,6 +1,11 @@
 from __future__ import annotations
 import httpx
 import openai
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from .agterm import agterm
+    from .aglog import aglog
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -66,38 +71,6 @@ that must be respected going forward>
 
 
 # --- Public helpers ----------------------------------------------------------
-
-def fetch_context_limit(llm_config: dict) -> int:
-    """Return the model's context window size.
-
-    Priority:
-    1. ``llm_config["context_limit"]`` — explicit user override
-    2. vLLM ``max_model_len`` from ``GET /v1/models/{model}``
-    3. ``DEFAULT_CONTEXT_LIMIT`` — safe fallback so compaction always runs
-    """
-    if "context_limit" in llm_config:
-        return int(llm_config["context_limit"])
-    try:
-        client = openai.OpenAI(
-            api_key=llm_config.get("api_key", ""),
-            base_url=llm_config.get("base_url"),
-        )
-        model_id = llm_config.get("model", "")
-        # vLLM exposes max_model_len on the model list response.  Always use
-        # list() — retrieve() breaks on model names containing "/" because the
-        # openai client constructs /v1/models/<name> without URL-encoding.
-        all_models = list(client.models.list())
-        # Prefer the model matching our configured name; fall back to the first.
-        candidates = [m for m in all_models if m.id == model_id] or all_models
-        for info in candidates:
-            extra = getattr(info, "model_extra", None) or {}
-            if "max_model_len" in extra:
-                return int(extra["max_model_len"])
-    except Exception as _e:
-        print(f"[agcompaction] WARNING: failed to retrieve max_model_len from API: {_e}")
-    print(f"[agcompaction] WARNING: context limit unknown, falling back to {DEFAULT_CONTEXT_LIMIT}")
-    return DEFAULT_CONTEXT_LIMIT
-
 
 def should_compact(prompt_tokens: int, context_limit: int) -> bool:
     """Return True when the prompt exceeds _COMPACT_THRESHOLD of the context limit."""
@@ -337,3 +310,59 @@ def compact(
     ]
 
     return sys_msg + task_input + injection + tail, summary
+
+
+# ---------------------------------------------------------------------------
+# Compaction orchestration helper
+# ---------------------------------------------------------------------------
+
+def maybe_compact(
+    messages: list[dict],
+    llm_config: dict,
+    _context_limit: "int | None",
+    prompt_tokens: "int | None",
+    _compaction_summary: "str | None",
+    term: "agterm | None",
+    log: "aglog | None",
+    _live_messages_fn: "Callable | None",
+    skill_name: str,
+    agname: str = "",
+    force: bool = False,
+) -> "tuple[list[dict], str | None]":
+    """Run compaction if needed. Returns (messages, updated_compaction_summary).
+
+    prompt_tokens=None → pre-call path (uses chars/4 estimate, log label includes tilde).
+    prompt_tokens=int  → post-call path (uses actual API-reported token count).
+    force=True         → skip the should_compact gate (used after a context-exceeded 400).
+    """
+    if _context_limit is None:
+        return messages, _compaction_summary
+    if prompt_tokens is None:
+        token_count = estimate_messages_tokens(messages)
+        label = f"tokens~{token_count}/{_context_limit}  msgs={len(messages)}  (pre-call estimate)"
+    else:
+        token_count = prompt_tokens
+        label = f"tokens={token_count}/{_context_limit}  msgs={len(messages)}"
+    if not force and not should_compact(token_count, _context_limit):
+        return messages, _compaction_summary
+    if term:
+        term.log("COMPACT  ", f"skill={skill_name}  {label}")
+    msgs_before = len(messages)
+    messages, _compaction_summary = compact(
+        messages, llm_config,
+        context_limit=_context_limit,
+        previous_summary=_compaction_summary,
+    )
+    if log:
+        log._lifecycle(
+            "compacted",
+            agname=agname,
+            skill=skill_name,
+            prompt_tokens=token_count,
+            context_limit=_context_limit,
+            msgs_before=msgs_before,
+            msgs_after=len(messages),
+        )
+    if _live_messages_fn:
+        _live_messages_fn(messages[1:])
+    return messages, _compaction_summary

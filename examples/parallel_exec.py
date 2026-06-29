@@ -122,7 +122,7 @@ class ForkFanoutTeam(agteam):
 
         t0 = time.perf_counter()
         pending = [
-            agent(self.parent).run(self.summariser, agdata(text=t))
+            agent.fork(self.parent).run(self.summariser, agdata(text=t))
             for t in texts
         ]
         elapsed_submit = time.perf_counter() - t0

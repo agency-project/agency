@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from agency.agdata import agdata
-from agency.agtype import agtype, agrawstring
+from agency.agtype import agtype, agrawstring, raw_schema_key
 from agency.agskill import agskill
 
 
@@ -34,32 +34,26 @@ def test_agrawstring_recover_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# _raw_input_key / _raw_output_key helpers
+# raw_schema_key helper
 # ---------------------------------------------------------------------------
 
 def test_raw_input_key_single_field():
-    sk = agskill("t", "", input_schema=agdata(content=agrawstring))
-    assert sk._raw_input_key() == "content"
+    assert raw_schema_key(agdata(content=agrawstring)) == "content"
 
 def test_raw_input_key_none_when_no_schema():
-    sk = agskill("t", "")
-    assert sk._raw_input_key() is None
+    assert raw_schema_key(None) is None
 
 def test_raw_input_key_none_when_multiple_fields():
-    sk = agskill("t", "", input_schema=agdata(a=agrawstring, b=str))
-    assert sk._raw_input_key() is None
+    assert raw_schema_key(agdata(a=agrawstring, b=str)) is None
 
 def test_raw_input_key_none_when_not_agrawstring():
-    sk = agskill("t", "", input_schema=agdata(text=str))
-    assert sk._raw_input_key() is None
+    assert raw_schema_key(agdata(text=str)) is None
 
 def test_raw_output_key_single_field():
-    sk = agskill("t", "", output_schema=agdata(story=agrawstring))
-    assert sk._raw_output_key() == "story"
+    assert raw_schema_key(agdata(story=agrawstring)) == "story"
 
 def test_raw_output_key_none_when_not_agrawstring():
-    sk = agskill("t", "", output_schema=agdata(result=str))
-    assert sk._raw_output_key() is None
+    assert raw_schema_key(agdata(result=str)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -124,18 +118,20 @@ def _make_chunk(text: str, finish: str = "stop"):
     chunk.choices[0].delta.content = text
     chunk.choices[0].delta.tool_calls = None
     chunk.choices[0].finish_reason = finish
+    chunk.usage = None
     return chunk
 
 
 def _run_skill_with_mock_response(sk, inp, response_text):
     """Run a skill, mocking the LLM to return response_text as a single chunk."""
     chunks = [_make_chunk(response_text, "stop"), _make_chunk("", "stop")]
-    with patch("agency.agskill.openai.OpenAI") as mock_openai_cls:
+    with patch("agency.agllm.openai.OpenAI") as mock_openai_cls:
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
         mock_client.chat.completions.create.return_value = iter(chunks)
+        from agency.agllm import agllm as _agllm
         result, *_ = sk.run(
-            llm_config={"base_url": "http://x", "api_key": "", "model": "m"},
+            _agllm({"base_url": "http://x", "api_key": "", "model": "m"}, context_limit=128_000),
             input=inp,
             history=agdata(messages=[]),
             sandbox=MagicMock(),

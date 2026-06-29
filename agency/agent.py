@@ -3,8 +3,6 @@ import copy
 import io
 import json
 import queue
-import shlex
-import subprocess
 import tarfile
 import threading
 import uuid as _uuid_mod
@@ -12,7 +10,7 @@ import weakref
 from concurrent.futures import Future
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar, get_args, get_origin
+from typing import ClassVar
 
 # Single run-level ID for the default log directory.
 # Created once at import time so all agents in one process share it.
@@ -24,20 +22,6 @@ _DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
 # WeakSet entries disappear automatically when agents are garbage-collected.
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
-# Round-robin counter for multi-server llm_config lists.
-_llm_config_counter: int = 0
-_llm_config_lock: threading.Lock = threading.Lock()
-
-
-def _pick_llm_config(llm_config: "dict | list[dict]") -> dict:
-    """Return a single config dict, round-robining across a list."""
-    if not isinstance(llm_config, list):
-        return llm_config
-    global _llm_config_counter
-    with _llm_config_lock:
-        idx = _llm_config_counter % len(llm_config)
-        _llm_config_counter += 1
-    return llm_config[idx]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -46,329 +30,18 @@ CHECKPOINT_SAVE_TIMEOUT_S = 600  # Timeout in seconds for `subprocess.run` when 
 CHECKPOINT_LOAD_TIMEOUT_S = 600  # Timeout in seconds for `subprocess.run` when loading a container image during agent.load().
 SKILL_ERROR_LOG_TRUNCATE = 300  # Maximum characters of an error string shown in the terminal log line after a skill failure.
 
-from .agdata import agdata, agerror, _fmt_exc
-from .agtype import agtype
+from .agdata import agdata, agerror
+from .agutil import format_exception
 from .agskill import agskill, AGSKILL_REACT_MAX_STEPS
-from .agtool import agtool
 from .aglog import aglog, _ts
 from .agterm import agterm
-from .agsandbox import agSandbox, get_container_runtime, _RUN_ID as _SANDBOX_RUN_ID
+from .agsandbox import agSandbox
 from .agresources import agResourcePool
-from .agcompaction import fetch_context_limit, _prune_tool_outputs
+from .agcompaction import _prune_tool_outputs
+from .agllm import agllm
 
-_NOUNS = [
-    "alex", "andy", "arch", "bake", "bale", "band", "bart", "base",
-    "beam", "bear", "beef", "bell", "bill", "bird", "blue", "boat",
-    "bolt", "bond", "bone", "bonk", "book", "boss", "brim", "buzz",
-    "byte", "cage", "cake", "cane", "cant", "cape", "cart", "cask",
-    "cave", "chip", "clam", "clay", "coal", "coil", "coin", "colt",
-    "cord", "core", "corn", "cove", "crab", "crag", "crow", "dale",
-    "dart", "deer", "dome", "dove", "down", "drum", "duck", "dune",
-    "dust", "east", "edge", "evil", "fang", "fast", "fate", "fawn",
-    "felt", "fern", "film", "fire", "fish", "fist", "flat", "flaw",
-    "flux", "foam", "font", "fork", "frog", "fuse", "gale", "game",
-    "gate", "gear", "glen", "greg", "grip", "gust", "hail", "hare",
-    "hawk", "haze", "hemp", "hill", "hind", "hole", "hoop", "hull",
-    "ibex", "ivan", "jake", "jane", "joey", "juke", "kite", "kodo",
-    "ksen", "lake", "land", "lard", "lash", "lava", "leaf", "lego",
-    "lily", "lion", "lord", "love", "lynx", "made", "many", "mark",
-    "mean", "mert", "mess", "meta", "mick", "mill", "mink", "moba",
-    "moon", "moth", "mule", "must", "nail", "nate", "next", "node",
-    "onix", "pain", "park", "peat", "pier", "pike", "pile", "pine",
-    "plug", "pony", "pool", "pork", "puma", "rain", "rate", "real",
-    "reef", "rest", "rice", "road", "rock", "roll", "rope", "rust",
-    "sage", "salt", "sand", "seal", "shot", "silk", "slag", "snow",
-    "soda", "soil", "sold", "song", "spam", "star", "surf", "swan",
-    "tack", "tail", "tide", "tire", "toad", "tony", "tool", "tree",
-    "tuna", "turf", "vast", "vent", "vine", "wake", "ward", "wasp",
-    "well", "wick", "wind", "wire", "wolf", "wood", "yang", "zinc",
-]
+from .agname import agname as _agname
 
-_noun_index:      int           = 0
-_noun_counters:   dict[str, int] = {}
-_allocated_agnames: set[str]    = set()
-_agname_lock      = __import__("threading").Lock()
-
-# Lowercase alphanumeric alphabet used for agent ID suffixes.
-# 4 digits → 36⁴ = 1 679 616 unique values per noun.
-_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
-
-
-def _b36_suffix(n: int, width: int = 4) -> str:
-    """Encode *n* as a fixed-width base-36 string (0000…0009, 000a…)."""
-    base = len(_B36)
-    digits = []
-    for _ in range(width):
-        digits.append(_B36[n % base])
-        n //= base
-    return "".join(reversed(digits))
-
-
-def _register_agname(full_name: str) -> str:
-    """Register an already-final name as in-use, raising if taken."""
-    with _agname_lock:
-        if full_name in _allocated_agnames:
-            raise ValueError(f"agname {full_name!r} is already in use by another agent")
-        _allocated_agnames.add(full_name)
-    return full_name
-
-
-def _allocate_agname(name: str) -> str:
-    """Return a unique name in the form <name>_XXX and register it as in-use.
-
-    XXX is a 4-character base-36 suffix (1 679 616 unique values per noun).
-    """
-    with _agname_lock:
-        n = _noun_counters.get(name, 0)
-        _noun_counters[name] = n + 1
-        full = f"{name}_{_b36_suffix(n)}"
-        _allocated_agnames.add(full)
-    return full
-
-
-def _generate_agname() -> str:
-    """Return a unique agname in the form <noun>_XXX.
-
-    Nouns are assigned in order from _NOUNS, cycling back to the start after
-    the last entry. The suffix is a 5-character base-36 string (60 466 176
-    unique values per noun), so arch_00000 and arch_00001 are the first and
-    second agents that received 'arch', giving names like arch_0000, arch_0001.
-    """
-    global _noun_index
-    with _agname_lock:
-        noun = _NOUNS[_noun_index % len(_NOUNS)]
-        _noun_index += 1
-        n = _noun_counters.get(noun, 0)
-        _noun_counters[noun] = n + 1
-        name = f"{noun}_{_b36_suffix(n)}"
-        _allocated_agnames.add(name)
-    return name
-
-
-# Minimum characters threshold for offloading string fields to sandbox files.
-# The effective threshold is max(INPUT_OFFLOAD_CHARS, context_limit * 0.1 * 4)
-# — 10% of the model context window expressed in characters (4 chars/token).
-INPUT_OFFLOAD_CHARS: int = 40_000
-
-
-def _offload_threshold(context_limit: "int | None") -> int:
-    """Return the effective offload threshold in characters.
-
-    10 % of the model context window expressed in characters (4 chars/token),
-    with INPUT_OFFLOAD_CHARS as the minimum floor.
-    """
-    if context_limit:
-        return max(INPUT_OFFLOAD_CHARS, int(context_limit * 0.1 * 4))
-    return INPUT_OFFLOAD_CHARS
-
-
-def _walk_agtype(hint, value, on_leaf):
-    """Recursively walk a type hint/value pair, calling ``on_leaf(hint, value)``
-    at every agtype leaf.  Returns ``(new_value, paths)``.
-
-    Handles arbitrary nesting of list, dict, and tuple containers around agtype
-    subclasses.  Plain Python values at non-agtype leaves pass through unchanged.
-    ``on_leaf`` must handle its own exceptions and always return ``(value, [])``.
-    """
-    origin = get_origin(hint)
-    args   = get_args(hint)
-
-    if isinstance(hint, type) and issubclass(hint, agtype):
-        return on_leaf(hint, value)
-
-    if origin is list and args:
-        if not isinstance(value, list):
-            return value, []
-        new_vals, paths = [], []
-        for v in value:
-            nv, written = _walk_agtype(args[0], v, on_leaf)
-            new_vals.append(nv)
-            paths.extend(written)
-        return new_vals, paths
-
-    if origin is dict and len(args) == 2:
-        if not isinstance(value, dict):
-            return value, []
-        new_vals, paths = {}, []
-        for k, v in value.items():
-            nv, written = _walk_agtype(args[1], v, on_leaf)
-            new_vals[k] = nv
-            paths.extend(written)
-        return new_vals, paths
-
-    if origin is tuple and args:
-        if not isinstance(value, (list, tuple)):
-            return value, []
-        new_vals, paths = list(value), []
-        for i, (type_arg, v) in enumerate(zip(args, value)):
-            nv, written = _walk_agtype(type_arg, v, on_leaf)
-            new_vals[i] = nv
-            paths.extend(written)
-        return new_vals, paths
-
-    return value, []
-
-
-def _hint_contains_non_raw_agtype(hint) -> bool:
-    """Return True if hint contains any agtype subclass other than agrawstring,
-    at any nesting depth."""
-    from .agtype import agtype, agrawstring
-    if isinstance(hint, type) and issubclass(hint, agtype):
-        return not issubclass(hint, agrawstring)
-    origin = get_origin(hint)
-    args   = get_args(hint)
-    if origin is list and args:
-        return _hint_contains_non_raw_agtype(args[0])
-    if origin is dict and len(args) == 2:
-        return _hint_contains_non_raw_agtype(args[1])
-    if origin is tuple and args:
-        return any(_hint_contains_non_raw_agtype(a) for a in args)
-    return False
-
-
-def _offload_large_fields(
-    inp: agdata, sandbox: "agSandbox", skill_name: str,
-    schema: "agdata | None" = None,
-    suffix: str = "",
-    context_limit: "int | None" = None,
-) -> tuple[list[str], list[str]]:
-    """Write oversized string fields to /workspace/inputs/ in the sandbox.
-
-    Called after agtype fields have already been prepared (so agfile inputs are
-    already short file paths).  Each remaining field whose string value still
-    exceeds _offload_threshold(context_limit) is replaced in-place with a short
-    reference.  Returns (paths_written, field_names) so the caller can delete
-    files and build an auto-offload note for the system prompt.
-
-    Fields already managed by an agtype subclass (e.g. agimage data URLs,
-    agfile/agbinary paths) are skipped — their prepared values must not be
-    replaced by sandbox file references.  agrawstring is the exception: its
-    prepare() is a no-op, so a long value arrives here at full length and
-    should be offloaded like any plain string.
-    """
-    agtype_keys: set[str] = set()
-    if schema is not None:
-        for key, hint in schema._data.items():
-            if _hint_contains_non_raw_agtype(hint):
-                agtype_keys.add(key)
-
-    _threshold = _offload_threshold(context_limit)
-    paths: list[str] = []
-    fields: list[str] = []
-    for key, val in list(inp._data.items()):
-        if key in agtype_keys:
-            continue
-        if isinstance(val, str):
-            if len(val) <= _threshold:
-                continue
-            path = f"/workspace/inputs/{skill_name}_{key}{suffix}.txt"
-            try:
-                sandbox.write_file(path, val)
-                inp._data[key] = (
-                    f"(content saved to {path} — use the read tool to access it)"
-                )
-                paths.append(path)
-                fields.append(key)
-            except Exception as _e:
-                print(f"[agent] WARNING: failed to offload input field '{key}' to {path}: {_e}")
-        elif isinstance(val, list):
-            new_vals = list(val)
-            offloaded_any = False
-            for i, item in enumerate(val):
-                if not isinstance(item, str) or len(item) <= _threshold:
-                    continue
-                path = f"/workspace/inputs/{skill_name}_{key}_{i}{suffix}.txt"
-                try:
-                    sandbox.write_file(path, item)
-                    new_vals[i] = path
-                    paths.append(path)
-                    offloaded_any = True
-                except Exception as _e:
-                    print(f"[agent] WARNING: failed to offload input list field '{key}[{i}]' to {path}: {_e}")
-            if offloaded_any:
-                inp._data[key] = new_vals
-                fields.append(key)
-    return paths, fields
-
-
-def _prepare_agtype_inputs(
-    inp: agdata, schema: "agdata | None", sandbox: "agSandbox", skill_name: str,
-    suffix: str = "",
-) -> list[str]:
-    """Prepare agtype input fields before the skill runs.
-
-    Recursively handles agtype subclasses nested inside list, dict, and tuple
-    containers at any depth.  Calls ``hint.prepare()`` at each agtype leaf.
-    Returns all sandbox paths written for cleanup.
-    """
-    if schema is None:
-        return []
-    paths: list[str] = []
-    for key, hint in schema._data.items():
-        def on_leaf(h, v, _key=key):
-            try:
-                return h.prepare(v, sandbox, skill_name, _key, suffix=suffix)
-            except Exception as _e:
-                print(f"[agent] WARNING: {h.__name__}.prepare failed for field '{_key}': {_e}")
-                return v, []
-        new_val, written = _walk_agtype(hint, inp._data.get(key), on_leaf)
-        if written or new_val is not inp._data.get(key):
-            inp._data[key] = new_val
-        paths.extend(written)
-    return paths
-
-
-def _recover_agtype_outputs(
-    result: agdata, schema: "agdata | None", sandbox: "agSandbox"
-) -> list[str]:
-    """Recover agtype output fields after the skill finishes.
-
-    Recursively handles agtype subclasses nested inside list, dict, and tuple
-    containers at any depth.  Calls ``hint.recover()`` at each agtype leaf.
-    Returns all sandbox paths for cleanup.
-    """
-    if schema is None or isinstance(result, agerror):
-        return []
-    paths: list[str] = []
-    for key, hint in schema._data.items():
-        def on_leaf(h, v, _key=key):
-            try:
-                return h.recover(v, sandbox)
-            except Exception as _e:
-                print(f"[agent] WARNING: {h.__name__}.recover failed for field '{_key}': {_e}")
-                return v, []
-        new_val, written = _walk_agtype(hint, result._data.get(key), on_leaf)
-        if written or new_val is not result._data.get(key):
-            result._data[key] = new_val
-        paths.extend(written)
-    return paths
-
-
-def _remove_offloaded_fields(paths: list[str], sandbox: "agSandbox") -> None:
-    """Delete files previously written by offload/agfile helpers."""
-    for path in paths:
-        try:
-            sandbox._container_exec(f"rm -f {shlex.quote(path)}", shell="sh")
-        except Exception as _e:
-            print(f"[agent] WARNING: failed to remove offloaded file {path}: {_e}")
-
-
-def _resolve_input(inp: agdata) -> None:
-    """Resolve any pending agdata values nested inside inp, in-place.
-
-    Handles:
-    - inp itself being pending (resolves before inspecting fields)
-    - top-level field values that are pending agdata
-    - list fields whose elements are pending agdata
-    """
-    inp._resolve()
-    for val in inp._data.values():
-        if isinstance(val, agdata):
-            val._resolve()
-        elif isinstance(val, list):
-            for item in val:
-                if isinstance(item, agdata):
-                    item._resolve()
 
 
 class agent:
@@ -389,11 +62,11 @@ class agent:
         Calls on the *same* agent object are automatically serialized through
         the history chain.  Calls on different agents (forks) run concurrently.
 
-    agent(existing_agent)
-        Copy constructor.  Blocks until the source agent's in-flight task
-        completes, then deep-copies the resolved history and snapshots the
-        parent's container via ``podman commit``.  The fork starts from the
-        parent's exact filesystem state; its subsequent writes are isolated.
+    agent.fork(existing_agent)
+        Blocks until the source agent's in-flight task completes, then
+        deep-copies the resolved history and snapshots the parent's container
+        filesystem.  The fork starts from the parent's exact state; its
+        subsequent writes are isolated.
 
     Class-level configuration (set once before creating agents)::
 
@@ -439,47 +112,34 @@ class agent:
 
     def __init__(
         self,
-        llm_config: "dict | agent | None" = None,
+        llm_config: "dict | list[dict] | None" = None,
         agname: str | None = None,
+        *,
+        llm: "agllm | None" = None,
+        sandbox: "agSandbox | None" = None,
     ):
-        # Inject llm_config from the enclosing agteam when not supplied.
-        if llm_config is None:
-            from ._context import _active_team as _at
-            _t = _at.get(None)
-            if _t is not None:
-                llm_config = _t.llm_config
-            else:
-                raise TypeError("agent() requires llm_config when called outside an agteam context")
+        # Need llm_config when no pre-built agllm is provided.
+        if llm is None:
+            if llm_config is None:
+                from ._context import _active_team as _at
+                _t = _at.get(None)
+                if _t is not None:
+                    llm_config = _t.llm_config
+                else:
+                    raise TypeError("agent() requires llm_config or llm= when called outside an agteam context")
+            llm_config = agllm.pick_llm_config(llm_config)
 
-        # Resolve a list of configs to a single one via round-robin.
-        llm_config = _pick_llm_config(llm_config)
+        self.agname: _agname = _agname.allocate_agname(agname)
 
-        self.agname = _generate_agname() if agname is None else _allocate_agname(agname)
-        pool = agent.agresource_pool
+        # Track whether sandbox/llm were provided externally.
+        # External objects are NOT destroyed by this agent — the caller owns them.
+        self._external_sandbox: bool = sandbox is not None
 
-        if isinstance(llm_config, agent):
-            src = llm_config
-            self.llm_config    = src.llm_config
-            self._context_limit: int = src._context_limit
-            # Block until source's in-flight task finishes, then deep-copy history
-            src._history._resolve()
-            self._history: agdata = copy.deepcopy(src._history)
-            # Copy parent's checkpoint as this fork's starting state — no docker run yet
-            self._checkpoint: str | None = None
-            if src._checkpoint:
-                fork_tag = f"agency/lifecycle-{_SANDBOX_RUN_ID}-{self.agname}"
-                subprocess.run(
-                    [get_container_runtime(), "tag", src._checkpoint, fork_tag],
-                    capture_output=True, check=True,
-                )
-                self._checkpoint = fork_tag
-            self.sandbox: agSandbox | None = None
-        else:
-            self.llm_config    = llm_config
-            self._context_limit = fetch_context_limit(llm_config)
-            self._history      = agdata(messages=[])
-            self._checkpoint: str | None = None
-            self.sandbox:     agSandbox | None = None
+        self.llm: agllm                = llm if llm is not None else agllm(llm_config)
+        self._history: agdata          = agdata(messages=[])
+        # Sandbox is created lazily on first _task() call to avoid the
+        # gpu-detection subprocess cost at agent construction time.
+        self.sandbox: agSandbox | None = sandbox
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{self.agname}_timeline.jsonl"
@@ -511,26 +171,16 @@ class agent:
 
         team_name = _team.team_name if _team is not None else None
 
-        if isinstance(llm_config, agent):
-            self._term.log("FORKED   ", f"from {src.agname}")
-            self.log._lifecycle(
-                "forked",
-                agname=self.agname,
-                parent_agname=src.agname,
-                team=team_name,
-                llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
-            )
-        else:
-            ctx = f"  context={self._context_limit}" if self._context_limit else "  context=unknown"
-            team_tag = f"  team={team_name}" if team_name else ""
-            self._term.log("CREATED  ", f"model={self.llm_config.get('model','?')}{ctx}{team_tag}")
-            self.log._lifecycle(
-                "created",
-                agname=self.agname,
-                team=team_name,
-                llm_config={k: v for k, v in self.llm_config.items() if k != "api_key"},
-                context_limit=self._context_limit,
-            )
+        ctx = f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
+        team_tag = f"  team={team_name}" if team_name else ""
+        self._term.log("CREATED  ", f"model={self.llm.config.get('model','?')}{ctx}{team_tag}")
+        self.log._lifecycle(
+            "created",
+            agname=self.agname,
+            team=team_name,
+            llm_config={k: v for k, v in self.llm.config.items() if k != "api_key"},
+            context_limit=self.llm.context_limit,
+        )
 
     # ------------------------------------------------------------------
     # History property — blocks until the current chain link resolves
@@ -584,8 +234,7 @@ class agent:
 
     def set_llm_config(self, llm_config: dict) -> None:
         """Replace the agent's LLM config and refresh the context limit."""
-        self.llm_config = dict(llm_config)
-        self._context_limit = fetch_context_limit(self.llm_config)
+        self.llm = agllm(dict(llm_config))
 
     def set_full_history(self, history: list[dict]) -> None:
         """Replace the agent's full history with a deep copy of *history*."""
@@ -639,6 +288,7 @@ class agent:
                 )
         except Exception as _e:
             print(f"[agent] WARNING: push_messages failed for {self.agname}: {_e}")
+            
     def run(self, skill: "agskill", input: agdata, max_steps: int = AGSKILL_REACT_MAX_STEPS) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
@@ -660,21 +310,25 @@ class agent:
         pool = agent.agresource_pool
 
         def _task() -> None:
-            _offloaded_paths: list[str] = []   # declared before try for reliable finally cleanup
-            _out = Path(agent.output_dir) / self.agname if agent.output_dir else None
             try:
+                # ── 1. Unblock: wait for any in-flight predecessor skill to finish,
+                #    then resolve any lazy input futures passed by the caller.
                 prev_history._resolve()
-                _resolve_input(input)
-                self.sandbox = agSandbox(self.agname, lifecycle_image=self._checkpoint, output_dir=_out)
-                self._checkpoint = None
+                input.resolve_input()
+
+                # ── 2. Provision sandbox — created once on first run and reused
+                #    across subsequent runs via its internal checkpoint image.
+                if not self._external_sandbox and self.sandbox is None:
+                    _out = Path(agent.output_dir) / self.agname if agent.output_dir else None
+                    self.sandbox = agSandbox(self.agname, output_dir=_out)
 
                 history_before = list(prev_history._data.get("messages", []))
 
                 self._term.log("SKILL ▶  ", f"{skill_name}  input={list(input._data.keys())}")
                 self._set_ui_state("skill", skill=skill_name)
 
-                # Snapshot cumulative log usage before this skill so the live
-                # token callback can compute the correct agent-total mid-skill.
+                # ── 3. Snapshot cumulative log usage before this skill so the live
+                #    token callback can compute the correct agent-total mid-skill.
                 _log_usage_before = self.log.token_usage
 
                 def _live_token_update(skill_inp: int, skill_out: int) -> None:
@@ -699,98 +353,57 @@ class agent:
                     except Exception as _e:
                         print(f"[agent] WARNING: live token_update push failed for {self.agname}: {_e}")
 
-                # Prepare agtype fields first (agfile → file path), then offload
-                # any remaining oversized plain-string fields.
-                # Timestamp suffix ensures each invocation writes to a unique path
-                # so persistent agents always see new file names and re-read them.
-                import time as _time
-                _input_suffix = f"_{int(_time.time() * 1000)}"
-                _offloaded_paths.extend(
-                    _prepare_agtype_inputs(input, af.input_schema, self.sandbox, skill_name,
-                                           suffix=_input_suffix)
-                )
-                auto_paths, auto_fields = _offload_large_fields(
-                    input, self.sandbox, skill_name, schema=af.input_schema,
-                    suffix=_input_suffix, context_limit=self._context_limit,
-                )
-                _offloaded_paths.extend(auto_paths)
-
-                # Build extra system prompt note for auto-offloaded fields so the
-                # agent knows they are temporary and how to access them.
-                _extra_system: str | None = None
-                if auto_fields:
-                    field_list = ", ".join(f"`{f}`" for f in auto_fields)
-                    _extra_system = (
-                        f"\nNote: The following input fields contain large content "
-                        f"that has been automatically saved to temporary files in "
-                        f"your sandbox: {field_list}. The file paths are shown in "
-                        f"the input JSON. Use the read tool to access the full "
-                        f"content. WARNING: these files are temporary and will be "
-                        f"automatically deleted after this task ends."
-                    )
-
                 def _drain_inbox() -> str | None:
                     try:
                         return self._inbox.get_nowait()
                     except queue.Empty:
                         return None
 
-                def _compact_log(**kw) -> None:
-                    self.log._lifecycle("compacted", agname=self.agname, **kw)
-
-                # Skill-start marker in full history
                 self._append_full_history({
                     "type": "skill_start",
                     "skill": skill_name,
                     "ts": ts_start,
                 })
 
+                # ── 4. Run the ReAct loop — all input prep, LLM calls, tool
+                #    dispatch, output recovery, and sandbox cleanup happen inside.
                 outer_input_tokens  = 0
                 outer_output_tokens = 0
                 outer_result, outer_history, outer_delta, _tok = af.run(
-                    self.llm_config, input, prev_history,
+                    self.llm, input, prev_history,
                     self.sandbox, pool, max_steps, term=self._term, log=self.log,
                     _state_fn=self._set_ui_state,
                     _live_messages_fn=self._push_live_messages,
                     _inbox_fn=_drain_inbox,
-                    _context_limit=self._context_limit,
-                    _compact_log_fn=_compact_log,
                     _full_history_fn=self._append_full_history,
-                    _extra_system=_extra_system,
                     _token_update_fn=_live_token_update,
                     _ping_interval_s=agent.ping_interval_s,
                     _poll_interval_s=agent.poll_interval_s,
                     _agname=self.agname,
-                    _ensure_read=bool(_offloaded_paths),
                 )
                 outer_input_tokens  = _tok[0]
                 outer_output_tokens = _tok[1]
 
-                # Recover agtype output fields from sandbox into the result agdata.
-                if outer_result is not None:
-                    _offloaded_paths.extend(
-                        _recover_agtype_outputs(outer_result, af.output_schema, self.sandbox)
-                    )
-
             except Exception as exc:
-                outer_result  = agerror(_fmt_exc(exc))
+                # ── 4a. Unexpected exception — wrap in agerror so the caller
+                #     gets a clean result instead of a dangling future.
+                outer_result  = agerror(format_exception(exc))
                 outer_history = prev_history
                 outer_delta   = []
                 history_before = list(prev_history._data.get("messages", []))
                 self._term.log("SKILL ✗  ", f"{skill_name}  exception={exc}")
             finally:
+                # ── 5. Teardown — release GPU slot, commit container filesystem
+                #    to a checkpoint image, then stop the container.
+                #    External sandboxes are left running — the caller owns them.
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 self._set_ui_state("error" if _had_error else "finished")
-                if self.sandbox is not None:
-                    _remove_offloaded_fields(_offloaded_paths, self.sandbox)
-                    if self.sandbox._gpu_id is not None:
-                        pool.release_gpu(self.sandbox._gpu_id)
-                    if self.sandbox._lifecycle_image:
-                        self._checkpoint = self.sandbox._lifecycle_image
-                    self.sandbox.destroy()
-                    self.sandbox = None
+                if self.sandbox._gpu_id is not None:
+                    pool.release_gpu(self.sandbox._gpu_id)
+                if not self._external_sandbox:
+                    self.sandbox.stop(commit=True)
 
-            # Log and resolve futures after all background work is done
+            # ── 6. Log result and commit token counts.
             ts_end = _ts()
             assert outer_result is not None
             input_dict  = input.to_dict()
@@ -827,14 +440,14 @@ class agent:
             except Exception as log_exc:
                 self._term.log("SKILL ✗  ", f"[log error] {log_exc}")
 
+            # ── 7. Resolve result future — unblocks the caller immediately so it
+            #    can process the result while pruning runs in the background.
             self._snapshot_messages = list(outer_history._data.get("messages", []))
             result_future.set_result(outer_result)
 
-            # Post-skill history pruning — trim old oversized tool outputs from
-            # the shared history before unblocking the next run() on this agent.
-            # Runs after result_future so the caller can unblock immediately;
-            # history_future holds until pruning is done so the dependency chain
-            # sees clean history.
+            # ── 8. Prune history — trim oversized tool outputs from the shared
+            #    history before resolving history_future so the next skill in
+            #    the chain always starts with a compact context.
             try:
                 pruned_msgs = _prune_tool_outputs(
                     outer_history._data.get("messages", [])
@@ -845,6 +458,7 @@ class agent:
             except Exception as prune_exc:
                 self._term.log("PRUNE ✗  ", f"{skill_name}  pruning failed: {prune_exc}")
 
+            # ── 9. Resolve history future — unblocks the next chained run() call.
             history_future.set_result(outer_history)
 
         threading.Thread(target=_task, daemon=True).start()
@@ -864,23 +478,57 @@ class agent:
             self.log._lifecycle("destroyed", agname=self.agname)
         except Exception as _e:
             print(f"[agent] WARNING: __del__ log failed for {getattr(self, 'agname', '?')}: {_e}")
-        try:
-            if self.sandbox is not None:
-                self.sandbox.destroy()
-        except Exception as _e:
-            print(f"[agent] WARNING: sandbox.destroy() failed in __del__ for {getattr(self, 'agname', '?')}: {_e}")
-        try:
-            if self._checkpoint:
-                subprocess.run(
-                    [get_container_runtime(), "rmi", "-f", self._checkpoint],
-                    capture_output=True,
-                )
-        except Exception as _e:
-            print(f"[agent] WARNING: checkpoint rmi failed in __del__ for {getattr(self, 'agname', '?')}: {_e}")
+        if not getattr(self, "_external_sandbox", False):
+            try:
+                if self.sandbox is not None:
+                    self.sandbox.destroy()
+            except Exception as _e:
+                print(f"[agent] WARNING: sandbox.destroy() failed in __del__ for {getattr(self, 'agname', '?')}: {_e}")
 
-    def fork(self) -> "agent":
-        """Return an independent copy of this agent (same as agent(self))."""
-        return agent(self)
+    @classmethod
+    def fork(cls, src: "agent", agname: str | None = None) -> "agent":
+        """Return an independent agent forked from *src*.
+
+        The fork starts with a deep copy of *src*'s conversation history and,
+        if *src* has a sandbox checkpoint, a tagged copy of that image so the
+        fork's first task resumes from the same container filesystem state.
+        """
+        ag: agent = cls.__new__(cls)
+        ag.agname = _agname.allocate_agname(agname)
+        ag._external_sandbox = False
+        ag.llm = agllm(src.llm.config)
+        src._history._resolve()
+        ag._history = copy.deepcopy(src._history)
+        _out = Path(cls.output_dir) / ag.agname if cls.output_dir else None
+        ag.sandbox = src.sandbox.fork(ag.agname, output_dir=_out) if src.sandbox is not None else None
+        # Initialise the remaining agent bookkeeping fields
+        log_dir  = Path(cls.log_dir) if cls.log_dir is not None else _DEFAULT_LOG_DIR
+        log_path = log_dir / f"{ag.agname}_timeline.jsonl"
+        ag.log   = aglog(path=log_path)
+        ag._full_history = []
+        ag._full_history_path = log_dir / f"{ag.agname}_history.jsonl"
+        ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
+        ag._term = agterm(ag.agname)
+        ag._snapshot_messages = []
+        ag._inbox  = queue.Queue()
+        ag._ui_state = {"state": "inactive", "skill": None, "tool": None}
+        _live_agents.add(ag)
+
+        from ._context import _active_team
+        _team = _active_team.get(None)
+        if _team is not None:
+            _team._agents.add(ag)
+        team_name = _team.team_name if _team is not None else None
+
+        ag._term.log("FORKED   ", f"from {src.agname}")
+        ag.log._lifecycle(
+            "forked",
+            agname=ag.agname,
+            parent_agname=src.agname,
+            team=team_name,
+            llm_config={k: v for k, v in ag.llm.config.items() if k != "api_key"},
+        )
+        return ag
 
     async def asyncio_run(
         self,
@@ -995,7 +643,6 @@ class agent:
         The api_key is never written to disk.
         """
         path = Path(path)
-        runtime = get_container_runtime()
         image_tag = f"agency/ckpt-{self.agname}"
 
         if self._history.is_pending():
@@ -1005,7 +652,7 @@ class agent:
         # Build state dict
         state = {
             "agname":     self.agname,
-            "llm_config": {k: v for k, v in self.llm_config.items() if k != "api_key"},
+            "llm_config": {k: v for k, v in self.llm.config.items() if k != "api_key"},
             "history":    self._history._data.get("messages", []),
             "ts":         _ts(),
         }
@@ -1013,25 +660,18 @@ class agent:
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        if self._checkpoint is not None:
-            # Retag checkpoint for export — keeps _checkpoint intact for next task
-            subprocess.run(
-                [runtime, "tag", self._checkpoint, image_tag],
-                capture_output=True, check=True,
-            )
+        if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
+            # Tag checkpoint for export, then clean up the temp export tag.
+            agSandbox.tag_image(self.sandbox._checkpoint_image, image_tag)
             try:
-                result = subprocess.run(
-                    [runtime, "save", image_tag],
-                    capture_output=True, check=True, timeout=CHECKPOINT_SAVE_TIMEOUT_S,
-                )
-                image_bytes = result.stdout
+                image_bytes = agSandbox.export_image(image_tag, CHECKPOINT_SAVE_TIMEOUT_S)
                 with tarfile.open(path, "w:gz") as tar:
                     for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
                         info = tarfile.TarInfo(name=name)
                         info.size = len(data)
                         tar.addfile(info, io.BytesIO(data))
             finally:
-                subprocess.run([runtime, "rmi", "-f", image_tag], capture_output=True)
+                agSandbox.delete_image(image_tag, force=True)
         else:
             # Agent never used a container — save history only (no filesystem state)
             with tarfile.open(path, "w:gz") as tar:
@@ -1062,7 +702,6 @@ class agent:
         filesystem as at checkpoint time and can continue running skills immediately.
         """
         path = Path(path)
-        runtime = get_container_runtime()
         image_tag = f"agency/ckpt-restore-{_uuid_mod.uuid4().hex[:8]}"
 
         with tarfile.open(path, "r:gz") as tar:
@@ -1073,25 +712,24 @@ class agent:
         checkpoint: str | None = None
         if image_bytes is not None:
             # Load image — docker restores the original tag (agency/ckpt-{agname})
-            subprocess.run(
-                [runtime, "load"],
-                input=image_bytes, capture_output=True, check=True, timeout=CHECKPOINT_LOAD_TIMEOUT_S,
-            )
+            agSandbox.import_image(image_bytes, CHECKPOINT_LOAD_TIMEOUT_S)
             original_tag = f"agency/ckpt-{state['agname']}"
             # Re-tag to a unique name so concurrent restores don't collide,
             # then remove the original tag
-            subprocess.run([runtime, "tag", original_tag, image_tag], capture_output=True, check=True)
-            subprocess.run([runtime, "rmi", original_tag], capture_output=True)
+            agSandbox.tag_image(original_tag, image_tag)
+            agSandbox.delete_image(original_tag)
             checkpoint = image_tag
 
         # Build agent without going through normal __init__ to avoid creating a fresh container
         ag: agent = cls.__new__(cls)
-        ag.agname        = _register_agname(state["agname"])
-        ag.llm_config    = {**state.get("llm_config", {}), **llm_config}
+        ag.agname        = _agname.claim_unique_agname(state["agname"])
+        ag._external_sandbox = False
+        ag.llm           = agllm({**state.get("llm_config", {}), **llm_config})
         ag._history      = agdata(messages=list(state.get("history", [])))
-        ag._context_limit = fetch_context_limit(ag.llm_config)
-        ag._checkpoint   = checkpoint  # None for history-only saves; consumed by first _task()
-        ag.sandbox       = None
+        _out = Path(cls.output_dir) / ag.agname if cls.output_dir else None
+        # Create sandbox eagerly here — the checkpoint image tag is a temporary
+        # unique tag that must be owned by the sandbox immediately; it can't wait.
+        ag.sandbox       = agSandbox(ag.agname, output_dir=_out, checkpoint_image=checkpoint) if checkpoint else None
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         ag.log   = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl")

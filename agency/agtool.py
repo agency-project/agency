@@ -3,12 +3,16 @@ import threading
 import time
 import multiprocessing as _mp
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as _FutureTimeoutError, BrokenExecutor
+import json
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
+from .agutil import format_exception
+from .agtype import _hint_to_json_type, _return_tool_descriptions
 
 if TYPE_CHECKING:
     from .aglog import aglog
     from .agterm import agterm
+    from .agsandbox import agSandbox
 
 # Default ceiling on tool execution time. Prevents a crashed or hung worker
 # process from blocking an agent thread forever via future.result().
@@ -152,8 +156,7 @@ class agtool:
             try:
                 result = self.fn(arg)
             except Exception as e:
-                from .agdata import _fmt_exc
-                result = agerror(_fmt_exc(e))
+                result = agerror(format_exception(e))
             self.log(arg, result, int((time.monotonic() - t0) * 1000))
             return result
 
@@ -195,3 +198,197 @@ class agtool:
 
     def __repr__(self) -> str:
         return f"agtool(name={self.name!r})"
+
+
+# ---------------------------------------------------------------------------
+# Return-output tool builders
+# ---------------------------------------------------------------------------
+
+def make_return_output_tools(schema) -> list[dict]:
+    """Build one typed tool per output field from the schema.
+
+    Each tool is named ``return_<field>`` and has a single parameter named
+    after the field itself with the correct JSON Schema type.
+    schema is an agdata instance; accessed via duck typing.
+    """
+    tools = []
+    for field, hint in schema._data.items():
+        json_type = _hint_to_json_type(hint)
+        tool_desc, value_desc = _return_tool_descriptions(field, hint)
+        value_schema: dict = {"type": json_type, "description": value_desc}
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": f"return_{field}",
+                "description": tool_desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {field: value_schema},
+                    "required": [field],
+                },
+            },
+        })
+    return tools
+
+
+def _make_return_output_tool(schema) -> list[dict]:
+    """Alias kept for test compatibility — returns the full per-field tool list."""
+    return make_return_output_tools(schema)
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
+
+TOOL_OUTPUT_OFFLOAD_CHARS: int = 40_000  # minimum floor for tool-output offloading
+
+
+def dispatch_tools(
+    tool_calls: list[dict],
+    tool_map: dict,
+    messages: list[dict],
+    sandbox: "agSandbox",
+    skill_name: str,
+    _state_fn: "Callable | None",
+    _live_messages_fn: "Callable | None",
+    _full_history_fn: "Callable | None",
+    term: "agterm | None",
+    _intercept: "dict[str, Callable[[dict], str]] | None" = None,
+    tool_offload_chars: int = TOOL_OUTPUT_OFFLOAD_CHARS,
+) -> bool:
+    """Execute all tool calls from one LLM response, appending results to messages.
+
+    Returns True if the read tool was lazily injected into tool_map during this
+    dispatch (because a large output was offloaded and read was not already present).
+    The caller should then add the read tool's schema to openai_tools so the LLM
+    can use it on the next step.
+    """
+    _injected_read = False
+    for tc in tool_calls:
+        fn_name = tc["function"]["name"]
+        fn_args = tc["function"]["arguments"]
+        tc_id   = tc["id"]
+        # Ensure arguments is valid JSON before it goes back into history.
+        # A malformed string (truncated generation, Python repr, etc.) causes
+        # vLLM to crash on the next request when it re-parses the history.
+        try:
+            json.loads(fn_args)
+        except (json.JSONDecodeError, TypeError):
+            fn_args = "{}"
+            tc["function"]["arguments"] = fn_args
+
+        # Framework-internal tools (e.g. return_output) are handled in the
+        # calling thread before normal tool dispatch.
+        if _intercept and fn_name in _intercept:
+            try:
+                args = json.loads(fn_args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            result_content = _intercept[fn_name](args)
+            if term:
+                try:
+                    _ret_result = json.loads(result_content)
+                except (json.JSONDecodeError, TypeError):
+                    _ret_result = {}
+                if "error" in _ret_result:
+                    term.log("TOOL ✗   ", f"{fn_name}({fn_args})  → {_ret_result['error']}")
+                else:
+                    term.log("TOOL ✓   ", f"{fn_name}({fn_args})")
+            tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
+            messages.append(tool_msg)
+            if _live_messages_fn:
+                _live_messages_fn(messages[1:])
+            if _full_history_fn:
+                _full_history_fn(tool_msg)
+            continue
+
+        t = tool_map.get(fn_name)
+        if t is None:
+            if term:
+                term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
+            result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
+        else:
+            try:
+                if _state_fn:
+                    _state_fn("tool", skill=skill_name, tool=fn_name)
+                # Let the agent specify a custom timeout (seconds) via a
+                # "timeout" key in the tool arguments.
+                _tool_timeout: int | None = None
+                try:
+                    _parsed = json.loads(fn_args)
+                    if isinstance(_parsed.get("timeout"), int):
+                        _tool_timeout = _parsed["timeout"]
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+                result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
+                if _state_fn:
+                    _state_fn("skill", skill=skill_name)
+                # Offload large tool outputs regardless of whether the tool
+                # itself uses the sandbox — fetch_paper and other add_tools have
+                # need_sandbox=False but can still produce huge outputs that
+                # bloat the context.
+                if len(result_content) > tool_offload_chars:
+                    safe_id = tc_id.replace("-", "")[:12]
+                    offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
+                    try:
+                        try:
+                            file_body = json.loads(result_content).get("content", result_content)
+                        except (json.JSONDecodeError, AttributeError):
+                            file_body = result_content
+                        sandbox.write_file(offload_path, file_body)
+                        result_content = json.dumps({
+                            "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
+                        })
+                        if "read" not in tool_map:
+                            from .tools import make_read as _make_read
+                            _read_tool = _make_read(sandbox)
+                            tool_map["read"] = _read_tool
+                            _injected_read = True
+                    except Exception as _e:
+                        print(f"[agtool] WARNING: failed to offload large tool output to {offload_path}: {_e}")
+                if t.need_sandbox:
+                    # A tool may signal failure via agdata(error=...) without raising —
+                    # treat that the same as an exception: discard dirty state.
+                    _result_errored = False
+                    try:
+                        if "error" in json.loads(result_content):
+                            _result_errored = True
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    if _result_errored:
+                        sandbox.stop(commit=False)
+                        try:
+                            _result_obj = json.loads(result_content)
+                            _result_obj["workspace_reverted"] = (
+                                "The workspace has been reverted to the state "
+                                "before this tool call."
+                            )
+                            result_content = json.dumps(_result_obj)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    else:
+                        sandbox.stop(commit=True)
+            except Exception as e:
+                if _state_fn:
+                    _state_fn("skill", skill=skill_name)
+                result_content = json.dumps({"error": format_exception(e)})
+                # On failure: remove without committing to discard dirty state.
+                # The next tool call restores from the last successful checkpoint.
+                if t.need_sandbox:
+                    sandbox.stop(commit=False)
+                    try:
+                        _result_obj = json.loads(result_content)
+                        _result_obj["workspace_reverted"] = (
+                            "The workspace has been reverted to the state "
+                            "before this tool call."
+                        )
+                        result_content = json.dumps(_result_obj)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
+        messages.append(tool_msg)
+        if _live_messages_fn:
+            _live_messages_fn(messages[1:])
+        if _full_history_fn:
+            _full_history_fn(tool_msg)
+    return _injected_read
