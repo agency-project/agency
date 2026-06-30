@@ -30,14 +30,14 @@ The configured `max_tokens` is only ever reduced, never increased. If the chars/
 The chars/4 estimate can underestimate token-dense content (code, JSON, base64). When this causes the proactive compaction check to miss, the API returns a 400 `BadRequestError` with a context-length message. `agskill` detects this and triggers forced compaction before retrying:
 
 ```python
-# In _llm_call:
+# In ag.llm.call():
 except openai.BadRequestError as e:
     if "context length" in str(e).lower():
-        return _LLMCallResult(context_exceeded=True)
+        return LLMCallResult(context_exceeded=True)
 
-# In the ReAct loop:
+# In the ReAct loop (agskill.execute_react):
 if llm_result.context_exceeded:
-    messages, _compaction_summary = _maybe_compact(..., force=True)
+    messages, _ = ag.llm.maybe_compact(prev_ctx, messages, None, ..., force=True)
     continue  # retry the same step
 ```
 
@@ -52,7 +52,7 @@ After each LLM response in the ReAct loop, `agskill` checks:
 ```python
 # _COMPACT_THRESHOLD = 0.70
 if prompt_tokens >= int(context_limit * _COMPACT_THRESHOLD):
-    compact(...)
+    ag.llm.maybe_compact(...)
 ```
 
 The trigger fires when the prompt reaches 70% of the context limit, leaving 30% headroom for the summary injection and continued work.
@@ -79,7 +79,7 @@ The detected limit is logged at agent creation:
 
 ## Algorithm
 
-**File:** `agency/agcompaction.py` · `compact(messages, llm_config, *, context_limit, tail_turns=2, previous_summary=None)`
+**File:** `agency/agllm.py` · `ag.llm.compact(messages, *, context_limit, tail_turns=2, previous_summary=None)`
 
 Compaction runs in three sequential phases before the summary LLM call.
 
@@ -173,33 +173,33 @@ The compacted head is replaced by a two-message exchange injected into the messa
 
 The task input always appears before the summary so the LLM sees the original goal, then the accumulated context, then the recent turns.
 
-## Effect on history
+## Effect on context
 
-Compaction modifies the **in-flight `messages` list** inside `agskill.run()`. `agent.history` (the shared cross-skill history) is not affected mid-run. When the skill finishes, `updated_history = agdata(messages=messages[1:])` persists the compacted list (with the summary injection) as the new history for future skill calls.
+Compaction modifies the **in-flight `messages` list** inside `agskill.execute_react()`. `agent.ctx` (the shared cross-skill context) is not affected mid-run. When the skill finishes, the compacted list (with the summary injection) is persisted into `updated_ctx` and passed to the next skill via the `ctx_future`.
 
-The web UI reflects the compacted list immediately via `_live_messages_fn`.
+The web UI reflects the compacted list immediately via the `_live_messages_fn` callback passed to `ag.llm.maybe_compact()`.
 
-Note: unlike opencode, which keeps old messages hidden behind a filtered view, agency replaces them in-place. Pre-compaction messages are not recoverable from the running state, but they are preserved in the JSONL log via the `history_before` field of the skill entry.
+Note: unlike opencode, which keeps old messages hidden behind a filtered view, agency replaces them in-place. Pre-compaction messages are not recoverable from the running state, but they are preserved in the JSONL log via the `history_before` field of the skill entry logged by `ag.log._record()`.
 
 ## Post-skill history pruning
 
-In addition to the in-flight pruning described above, `agent` runs a second pruning pass on `agent.history` after each skill completes. This pass uses the same `_prune_tool_outputs` function with the same thresholds.
+In addition to the in-flight pruning described above, `agskill.run()` runs a second pruning pass on `updated_ctx` after each skill completes. This pass uses the same `agllm._prune_tool_outputs()` function with the same thresholds.
 
-**Timing** — the pass runs inside `agent._task()`, between the two futures that gate the dependency chain:
+**Timing** — the pass runs inside the `_task()` closure in `agskill.run()`, between the two futures that gate the dependency chain:
 
 ```
 result_future.set_result(outer_result)   # caller unblocks immediately
 
-pruned_msgs = _prune_tool_outputs(agent.history.messages)
-# rebuild outer_history if any messages were trimmed
+pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages)
+# update updated_ctx.messages if any messages were trimmed
 
-history_future.set_result(outer_history) # next skill in chain unblocks with clean history
+ctx_future.set_result(updated_ctx)       # next skill in chain unblocks with clean ctx
 ```
 
 This means:
 - The caller receives the skill result as soon as it is ready.
-- The next skill that reads `agent.history` waits until pruning is done and then sees a history with oversized tool outputs already trimmed.
-- Pruning never blocks the result path — only the history hand-off.
+- The next skill that reads `agent.ctx` waits until pruning is done and then sees a context with oversized tool outputs already trimmed.
+- Pruning never blocks the result path — only the context hand-off.
 
 When pruning fires, a terminal log line is emitted:
 
@@ -207,11 +207,13 @@ When pruning fires, a terminal log line is emitted:
 10:00:05  [agent_smith]  [PRUNE    ]  long_task  history pruned to 18 msgs
 ```
 
+This log is emitted via `ag.terminal.log("PRUNE    ", ...)` inside `_task()`.
+
 The pruning threshold is the same as in-flight pruning (`_PRUNE_MIN_FREE_TOKENS = 20_000` tokens of potential savings). If the history does not contain enough large tool outputs to cross that threshold, the pass is a no-op.
 
 ## Tuning
 
-Constants in `agcompaction.py`:
+Constants in `agllm.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|

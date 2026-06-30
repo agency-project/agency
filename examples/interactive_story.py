@@ -136,7 +136,7 @@ def main() -> None:
     planner = agent(llm_config=LLM_CONFIG, agname="PlannerAgent")
     writer  = agent(llm_config=LLM_CONFIG, agname="WriterAgent")
 
-    # ask_human_tool runs in-process (need_sandbox=False) so it can reach the
+    # ask_human_tool runs in-process (run_in_subprocess=False) so it can reach the
     # live webUI singleton. Calling it directly from Python guarantees the
     # human is always asked — the LLM cannot skip or hallucinate the call.
     ask_human_tool = make_ask_human(planner.agname, timeout_s=None)

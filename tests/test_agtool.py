@@ -102,29 +102,29 @@ def test_pickle_round_trip():
 
 
 # ---------------------------------------------------------------------------
-# Process pool — need_sandbox=True runs in a separate worker process
+# Process pool — run_in_subprocess=True runs in a separate worker process
 # ---------------------------------------------------------------------------
 
 def test_process_pool_runs_in_different_pid():
-    """need_sandbox=True (default) offloads fn to a worker process (different PID)."""
+    """run_in_subprocess=True (default) offloads fn to a worker process (different PID)."""
     t = agtool(name="pid_check", description="", fn=_get_pid)
     result = t(agdata())
     assert result.worker_pid != os.getpid()
 
 
 # ---------------------------------------------------------------------------
-# need_sandbox=False — runs in-process, in the calling thread
+# run_in_subprocess=False — runs in-process, in the calling thread
 # ---------------------------------------------------------------------------
 
 def test_no_sandbox_runs_in_same_pid():
-    """need_sandbox=False runs fn directly in the calling thread (same PID)."""
-    t = agtool(name="pid_inproc", description="", fn=_get_pid, need_sandbox=False)
+    """run_in_subprocess=False runs fn directly in the calling thread (same PID)."""
+    t = agtool(name="pid_inproc", description="", fn=_get_pid, run_in_subprocess=False)
     result = t(agdata())
     assert result.worker_pid == os.getpid()
 
 
 def test_no_sandbox_sees_host_state():
-    """need_sandbox=False fn can read module-level state set in the main process.
+    """run_in_subprocess=False fn can read module-level state set in the main process.
 
     This is the key property that sandboxed tools cannot provide: a subprocess
     worker would see the module-level sentinel as None (freshly imported module),
@@ -139,7 +139,7 @@ def test_no_sandbox_sees_host_state():
         return agdata(value=getattr(_m, "_TEST_SENTINEL", None))
 
     try:
-        t = agtool(name="sentinel", description="", fn=_read_sentinel, need_sandbox=False)
+        t = agtool(name="sentinel", description="", fn=_read_sentinel, run_in_subprocess=False)
         result = t(agdata())
         assert result.value == "host-value"
     finally:
@@ -147,26 +147,26 @@ def test_no_sandbox_sees_host_state():
 
 
 def test_no_sandbox_exception_returns_error_agdata():
-    """need_sandbox=False catches exceptions and returns agdata(error=...) like sandboxed tools."""
+    """run_in_subprocess=False catches exceptions and returns agdata(error=...) like sandboxed tools."""
     def _boom(arg: agdata) -> agdata:
         raise ValueError("intentional failure")
 
-    t = agtool(name="boom", description="", fn=_boom, need_sandbox=False)
+    t = agtool(name="boom", description="", fn=_boom, run_in_subprocess=False)
     result = t(agdata())
     assert result.error is not None
     assert "intentional failure" in result.error
 
 
 def test_no_sandbox_timeout_not_enforced():
-    """need_sandbox=False ignores the timeout parameter — it runs in the calling thread."""
+    """run_in_subprocess=False ignores the timeout parameter — it runs in the calling thread."""
     import time
 
     def _slow(arg: agdata) -> agdata:
         time.sleep(0.05)
         return agdata(done=True)
 
-    # Pass a very short timeout; with need_sandbox=True this would race, but
-    # need_sandbox=False bypasses the pool entirely so timeout has no effect.
-    t = agtool(name="slow_inproc", description="", fn=_slow, need_sandbox=False)
+    # Pass a very short timeout; with run_in_subprocess=True this would race, but
+    # run_in_subprocess=False bypasses the pool entirely so timeout has no effect.
+    t = agtool(name="slow_inproc", description="", fn=_slow, run_in_subprocess=False)
     result = t(agdata(), timeout=1)
     assert result.done is True

@@ -85,5 +85,5 @@ def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) ->
             },
             "required": ["question"],
         },
-        need_sandbox=False,
+        run_in_subprocess=False,
     )

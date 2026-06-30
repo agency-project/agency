@@ -370,6 +370,23 @@ Use `agrawstring` when:
 
 Avoid it when the output needs structured fields that downstream code will inspect — use `agfile` or plain schema fields instead.
 
+## Module-level helpers
+
+### `validate_output_field_against_schema(field_name, value, schema) -> str | None`
+
+Validates a single output field value against its type hint declared in `schema._data`.  Returns `None` when the value is valid, or a human-readable error string when it is not.
+
+```python
+from agency.agtype import validate_output_field_against_schema
+
+error = validate_output_field_against_schema("count", "oops", output_schema)
+# error -> "field 'count': expected int, got str"
+```
+
+This is the public replacement for the former private `_validate_output_field_against_schema`.
+
+> **Note**: `_type_error_fix()` and `make_field_handler()` were removed from `agtype.py` during the refactor and now live in `agschema.py`.
+
 ## Writing a custom agtype
 
 ```python

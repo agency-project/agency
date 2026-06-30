@@ -36,7 +36,7 @@ get_weather = agtool(
         },
         "required": ["city"],
     },
-    need_sandbox=False,
+    run_in_subprocess=False,
 )
 
 weather_skill = agskill(

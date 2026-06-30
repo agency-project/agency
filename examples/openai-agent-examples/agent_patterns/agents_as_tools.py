@@ -44,7 +44,7 @@ def _make_translator_tool(language: str, instructions: str) -> agtool:
             "properties": {"text": {"type": "string", "description": "Text to translate"}},
             "required": ["text"],
         },
-        need_sandbox=False,
+        run_in_subprocess=False,
     )
 
 

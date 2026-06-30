@@ -1,6 +1,6 @@
 # Container Sandboxing
 
-All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `need_sandbox=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
+All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
 
 ## Runtime detection
 
@@ -25,7 +25,7 @@ The container exists only during active tool execution. Between tool calls the c
 | Event | What happens |
 |---|---|
 | `agSandbox.__init__` | No container created — cheap object; `_lifecycle_image=None` |
-| Any `need_sandbox=True` tool call | `_ensure_started()` runs lazily: if container is already running, reuse it; otherwise `docker rm -f` any leftover zombie, then `docker run` from `_lifecycle_image` (or `BASE_IMAGE` on first use) |
+| Any `run_in_subprocess=True` tool call | `_ensure_started()` runs lazily: if container is already running, reuse it; otherwise `docker rm -f` any leftover zombie, then `docker run` from `_lifecycle_image` (or `BASE_IMAGE` on first use) |
 | After **successful** sandbox tool call | `sandbox.stop(commit=True)`: `docker commit → agency/lifecycle-<name>`; `docker rm -f` (retried up to 3×); `_lifecycle_image` updated |
 | After **failed** sandbox tool call | `sandbox.stop(commit=False)`: `docker rm -f` without commit; dirty state discarded; next start restores from previous `_lifecycle_image` |
 | Any non-running container detected at startup | Force-removed with `docker rm -f` before `docker run` — covers "Exited", "Created" (partial docker run), and "Dead" states |
@@ -34,7 +34,7 @@ The container exists only during active tool execution. Between tool calls the c
 
 **Failure revert**: when a tool errors, `stop(commit=False)` discards the container with its partial state. The next tool call recreates from the last successful `_lifecycle_image`, so the agent's workspace is automatically rolled back to the last known-good state. The agent receives `workspace_reverted` in the error response to know this happened.
 
-**Container naming**: each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a per-process UUID prefix. This prevents cross-run name collisions when an agent crashes without cleanup and is restarted with the same `agname`.
+**Container naming**: each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a per-process UUID prefix. This prevents cross-run name collisions when an agent crashes without cleanup and is restarted with the same `agname`. The lifecycle image name is produced by `_lifecycle_tag()`, which lowercases the Docker image name — Docker requires all repository names to be lowercase.
 
 **`stop()` reliability**: `docker rm -f` is retried up to 3 times. Each attempt goes through `_run()`, which holds `_docker_semaphore` (caps all concurrent daemon calls at 16). If all retries fail, a `WARNING` is emitted to stderr and the framework continues — `_started` is cleared regardless so the next tool call can attempt a fresh container.
 
@@ -64,7 +64,7 @@ parent._checkpoint ──docker tag──▶ agency/ckpt-<pid>-<fork-agname>
 
 Forking copies the parent's checkpoint image tag to a new tag for the fork via `docker tag`. No container is created at fork time — the fork's container is created lazily when the fork's first `_task()` runs, restoring from the copied tag.
 
-Because forks wait for `src._history._resolve()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
+Because forks wait for `src._ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
 ## exec wrapper
 

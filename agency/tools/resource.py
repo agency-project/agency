@@ -54,7 +54,7 @@ def make_gpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             "Always call gpu_release when finished."
         ),
         params={"type": "object", "properties": {}},
-        need_sandbox=False,
+        run_in_subprocess=False,
     )
 
 
@@ -74,7 +74,7 @@ def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             "Call this as soon as GPU-intensive work is complete."
         ),
         params={"type": "object", "properties": {}},
-        need_sandbox=False,
+        run_in_subprocess=False,
     )
 
 
@@ -123,7 +123,7 @@ def make_cpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 },
             },
         },
-        need_sandbox=False,
+        run_in_subprocess=False,
     )
 
 
@@ -150,7 +150,7 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
             f"(idle: {pool.idle_cpus} CPUs, {pool.idle_memory} memory)."
         ),
         params={"type": "object", "properties": {}},
-        need_sandbox=False,
+        run_in_subprocess=False,
     )
 
 
@@ -189,5 +189,5 @@ def make_daemon_release(sandbox: "agSandbox") -> agtool:
             },
             "required": ["pid"],
         },
-        need_sandbox=False,
+        run_in_subprocess=False,
     )

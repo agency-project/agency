@@ -15,15 +15,15 @@ Tool call fails
 
 LLM connection fails
   └─► agskill retry loop (up to 5 attempts, exponential backoff)
-        └─► after 5 failures: agerror(...) returned from agskill.run()
-              └─► agent._task() catches it, sets result_future
-                    └─► caller's agdata._resolve() returns the agerror
+        └─► after 5 failures: agerror(...) returned from agskill.execute_react()
+              └─► _task() closure in agskill.run() catches it, sets result_future
+                    └─► caller's agdata.resolve_input_dependencies() returns the agerror
 
 Output schema validation fails
   └─► correction message appended to conversation, loop continues
-        └─► after max_output_schema_retries: agerror(...) from agskill.run()
+        └─► after max_output_schema_retries: agerror(...) from agskill.execute_react()
 
-Uncaught exception inside agent._task()
+Uncaught exception inside _task() closure in agskill.run()
   └─► except Exception: agerror(_fmt_exc(exc))  ←── no re-raise
         └─► result_future resolved with agerror
               └─► caller checks isinstance(result, agerror)
@@ -43,7 +43,7 @@ Errors almost never propagate as Python exceptions between threads. The canonica
 
 ### LLM connection retry
 
-**Location:** `_llm_call()` and the ReAct loop in `agskill.run()`
+**Location:** `_llm_call()` and the ReAct loop in `agskill.execute_react()`
 
 **What is caught:** `_LLMIdleTimeout`, `ssl.SSLError`, `OSError`, `httpx.TransportError` — all transient network failures during streaming.
 
@@ -59,18 +59,18 @@ Errors almost never propagate as Python exceptions between threads. The canonica
 
 **Handler:**
 1. `_llm_call()` catches the exception and returns `_LLMCallResult(should_retry=True, conn_error=exc)`.
-2. The ReAct loop in `agskill.run()` checks `llm_result.should_retry`:
-   - Emits `{"type": "llm_retry", "error": str(exc), "attempt": N}` via `_full_history_fn`.
+2. The ReAct loop in `agskill.execute_react()` checks `llm_result.should_retry`:
+   - Emits `{"type": "llm_retry", "error": str(exc), "attempt": N}` via `full_history_fn`.
    - Sleeps 2 s (allows SSL teardown to complete before reconnecting — see Known failure modes).
    - Continues to the next attempt.
 3. After `_LLM_MAX_RETRIES` consecutive failures, returns `_LLMCallResult(ok=False)`.
-4. The ReAct loop emits `{"type": "llm_error", "error": "LLM connection error after 5 attempts: ..."}` and returns `agerror(...)` to `agent._task()`.
+4. The ReAct loop emits `{"type": "llm_error", "error": "LLM connection error after 5 attempts: ..."}` and returns `agerror(...)` to the `_task()` closure in `agskill.run()`.
 
-**Propagation:** `agerror(...)` → `agent._task()` → `result_future.set_result(error_result)` → caller checks `isinstance(result, agerror)`.
+**Propagation:** `agerror(...)` → `_task()` closure in `agskill.run()` → `result_future.set_result(error_result)` → caller checks `isinstance(result, agerror)`.
 
 ### Output schema validation retry
 
-**Location:** `agskill._parse_final_answer()` and the ReAct loop (line ~977–1008, 1199–1206)
+**Location:** Output validation logic in the ReAct loop of `agskill.execute_react()` (line ~977–1008, 1199–1206)
 
 **What is caught:** JSON parse errors and schema/validator violations on the LLM's final answer.
 
@@ -80,25 +80,25 @@ Errors almost never propagate as Python exceptions between threads. The canonica
 1. On each validation failure a correction message is appended to `messages` and the loop continues.
 2. Once `output_schema_retries_left` reaches 0, returns `agerror("output schema error after retries: ...")`.
 
-**Propagation:** Same path as LLM error — `agerror(...)` flows back through `agent._task()`.
+**Propagation:** Same path as LLM connection error — `agerror(...)` flows back through the `_task()` closure in `agskill.run()`.
 
 ---
 
-## `agency/agent.py` — skill execution wrapper
+## `agency/agskill.py` — `_task()` closure (skill execution wrapper)
 
 ### Main skill try/except/finally
 
-**Location:** `agent.run()` → `_task()` (line ~601–718)
+**Location:** `_task()` closure inside `agskill.run()` (line ~601–718)
 
 **Structure:**
 ```python
 try:
     # resolve input, create sandbox, run agskill
-    outer_result = af.run(...)
+    outer_result = af.execute_react(...)
 except Exception as exc:
     # swallow — convert to agerror
     outer_result = agerror(_fmt_exc(exc))
-    outer_history = prev_history
+    outer_ctx = prev_ctx
 finally:
     # always runs, even on exception:
     _remove_offloaded_fields(...)
@@ -108,7 +108,7 @@ finally:
     sandbox = None
 ```
 
-**What is caught:** Any unhandled exception from the skill (including `agskill.run()` returning an error agdata is NOT an exception — only genuine throws reach here).
+**What is caught:** Any unhandled exception from the skill (note: `agskill.execute_react()` returning an error agdata is NOT an exception — only genuine throws reach here).
 
 **Handler:** Formats the exception with full traceback via `_fmt_exc(exc)`, stores it in `outer_result` as an `agerror`, logs `SKILL ✗` to the terminal, then emits `{"type": "skill_error", "skill": ..., "error": ...}` via `_append_full_history()` after the finally block (line 728).
 
@@ -275,9 +275,9 @@ All tool errors return `agerror(...)`. This is appended to the conversation as a
 
 ---
 
-## `agency/agcompaction.py` — context compaction
+## `agency/agllm.py` — context compaction
 
-**Location:** model info retrieval (line ~73–79), vLLM tokenize call (line ~110–127)
+**Location:** `maybe_compact()`, `compact()`, `_prune_tool_outputs()` — model info retrieval (line ~73–79), vLLM tokenize call (line ~110–127)
 
 **What is caught:** Any exception from Anthropic SDK metadata or vLLM tokenize endpoint.
 
@@ -349,8 +349,8 @@ Could not be reproduced with direct vLLM+SSL under normal conditions. This error
 
 | Event type | Emitted from | Meaning |
 |---|---|---|
-| `skill_start` | agent.py:667 | Skill began executing |
-| `skill_error` | agent.py:728 | Skill returned an error or threw |
+| `skill_start` | agskill.py:299 | Skill began executing |
+| `skill_error` | agskill.py:328 | Skill returned an error or threw |
 | `llm_retry` | agskill.py:1157 | LLM call failed transiently; retrying |
 | `llm_error` | agskill.py:1164 | LLM failed after all retry attempts |
 

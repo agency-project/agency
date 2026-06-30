@@ -207,26 +207,26 @@ class TestToolLogOnErrorResult:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox tools must have need_sandbox=False so they run in the calling thread.
+# Sandbox tools must have run_in_subprocess=False so they run in the calling thread.
 #
 # Background: sandbox tools (bash, read, write, edit, glob, grep) close over
 # an agSandbox instance. After reserve_gpu is called, the sandbox holds
 # references to pool.acquire_gpu / pool.release_gpu — bound methods on an
 # agResourcePool which contains threading.Semaphore objects. threading.Semaphore
 # wraps _thread.lock, which cloudpickle cannot serialise. If any sandbox tool
-# had need_sandbox=True, cloudpickle.dumps(t.fn) would raise
+# had run_in_subprocess=True, cloudpickle.dumps(t.fn) would raise
 # "TypeError: cannot pickle '_thread.lock' object" the moment the LLM tried
 # to call bash after calling reserve_gpu.
 #
-# The fix: all sandbox tools use need_sandbox=False, running in the calling
+# The fix: all sandbox tools use run_in_subprocess=False, running in the calling
 # thread (subprocess calls inside them already release the GIL, so no process
 # pool is needed for GIL relief). GPU acquisition inside exec() also runs on
 # the real agResourcePool in the calling thread, not a deserialized copy in a
 # worker process.
 # ---------------------------------------------------------------------------
 
-class TestSandboxToolsNeedSandboxFalse:
-    """Regression tests for the need_sandbox=False requirement on all sandbox tools."""
+class TestSandboxToolsRunInSubprocessFalse:
+    """Regression tests for the run_in_subprocess=False requirement on all sandbox tools."""
 
     SANDBOX_TOOL_FACTORIES = [
         ("bash",   "make_bash",   ("bash.py",   "make_bash")),
@@ -257,14 +257,14 @@ class TestSandboxToolsNeedSandboxFalse:
         return pool
 
     @pytest.mark.parametrize("tool_name,factory_name,_", SANDBOX_TOOL_FACTORIES)
-    def test_need_sandbox_is_false(self, tool_name, factory_name, _):
-        """Every sandbox tool must have need_sandbox=False."""
+    def test_run_in_subprocess_is_false(self, tool_name, factory_name, _):
+        """Every sandbox tool must have run_in_subprocess=False."""
         import importlib
         mod = importlib.import_module(f"agency.tools.{tool_name}")
         factory = getattr(mod, factory_name)
         tool = factory(self._make_sandbox_mock())
-        assert tool.need_sandbox is False, (
-            f"{factory_name} has need_sandbox=True — it will fail cloudpickle "
+        assert tool.run_in_subprocess is False, (
+            f"{factory_name} has run_in_subprocess=True — it will fail cloudpickle "
             f"serialisation after reserve_gpu is called (see test docstring)."
         )
 
@@ -296,8 +296,8 @@ class TestSandboxToolsNeedSandboxFalse:
         bash_result = bash(agdata(command="echo hello"))
         assert getattr(bash_result, "error", None) is None
 
-    def test_make_sandboxed_tools_all_need_sandbox_false(self):
-        """make_sandboxed_tools must return only need_sandbox=False tools.
+    def test_make_sandboxed_tools_all_run_in_subprocess_false(self):
+        """make_sandboxed_tools must return only run_in_subprocess=False tools.
 
         This is the integration check: even after reserve_gpu has been called and
         sandbox._gpu_acquire_fn points to an unpicklable pool method, no tool in
@@ -314,14 +314,14 @@ class TestSandboxToolsNeedSandboxFalse:
         sb._gpu_release_fn = pool.release_gpu
 
         tools = make_sandboxed_tools(sb, pool)
-        sandbox_true = [t.name for t in tools if t.need_sandbox]
+        sandbox_true = [t.name for t in tools if t.run_in_subprocess]
         assert sandbox_true == [], (
-            f"These tools have need_sandbox=True and will fail cloudpickle after "
+            f"These tools have run_in_subprocess=True and will fail cloudpickle after "
             f"reserve_gpu is called: {sandbox_true}"
         )
 
     def test_sandbox_tools_run_in_calling_thread(self):
-        """need_sandbox=False tools run in the calling thread, not a worker process.
+        """run_in_subprocess=False tools run in the calling thread, not a worker process.
 
         This is required for GPU acquisition to update the real agResourcePool
         (a worker process would acquire against a deserialized copy and the

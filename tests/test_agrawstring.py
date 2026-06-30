@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from agency.agdata import agdata
-from agency.agtype import agtype, agrawstring, raw_schema_key
+from agency.agcontext import agcontext
+from agency.agtype import agtype, agrawstring
 from agency.agskill import agskill
 
 
@@ -31,29 +32,6 @@ def test_agrawstring_recover_passthrough():
     val, paths = agrawstring.recover("some output", None)
     assert val == "some output"
     assert paths == []
-
-
-# ---------------------------------------------------------------------------
-# raw_schema_key helper
-# ---------------------------------------------------------------------------
-
-def test_raw_input_key_single_field():
-    assert raw_schema_key(agdata(content=agrawstring)) == "content"
-
-def test_raw_input_key_none_when_no_schema():
-    assert raw_schema_key(None) is None
-
-def test_raw_input_key_none_when_multiple_fields():
-    assert raw_schema_key(agdata(a=agrawstring, b=str)) is None
-
-def test_raw_input_key_none_when_not_agrawstring():
-    assert raw_schema_key(agdata(text=str)) is None
-
-def test_raw_output_key_single_field():
-    assert raw_schema_key(agdata(story=agrawstring)) == "story"
-
-def test_raw_output_key_none_when_not_agrawstring():
-    assert raw_schema_key(agdata(result=str)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +100,28 @@ def _make_chunk(text: str, finish: str = "stop"):
     return chunk
 
 
+def _make_mock_agent(llm):
+    from agency.agent import agent as _agent_cls
+    class _Cls:
+        agresource_pool = MagicMock()
+        ping_interval_s = 300
+        poll_interval_s = 5
+        _drain_inbox = _agent_cls._drain_inbox
+    ag = _Cls()
+    ag.llm = llm
+    ag.sandbox = MagicMock()
+    ag.terminal = MagicMock()
+    ag.log = MagicMock()
+    ag.log.token_usage = {}
+    ag.agname = "test"
+    ag._set_ui_state = MagicMock()
+    ag._push_live_messages = MagicMock()
+    ag._append_full_history = MagicMock()
+    ag._next_inbox_msg = MagicMock(return_value=None)
+    ag.push_token_count_update_to_ui = MagicMock()
+    return ag
+
+
 def _run_skill_with_mock_response(sk, inp, response_text):
     """Run a skill, mocking the LLM to return response_text as a single chunk."""
     chunks = [_make_chunk(response_text, "stop"), _make_chunk("", "stop")]
@@ -130,14 +130,8 @@ def _run_skill_with_mock_response(sk, inp, response_text):
         mock_openai_cls.return_value = mock_client
         mock_client.chat.completions.create.return_value = iter(chunks)
         from agency.agllm import agllm as _agllm
-        result, *_ = sk.run(
-            _agllm({"base_url": "http://x", "api_key": "", "model": "m"}, context_limit=128_000),
-            input=inp,
-            history=agdata(messages=[]),
-            sandbox=MagicMock(),
-            pool=MagicMock(),
-            max_steps=5,
-        )
+        _llm = _agllm({"base_url": "http://x", "api_key": "", "model": "m"}, context_limit=128_000)
+        result, *_ = sk.execute_react(_make_mock_agent(_llm), agcontext(), inp, max_steps=5)
     return result
 
 

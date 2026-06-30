@@ -20,8 +20,8 @@ For each item in `targets`:
 
 | Input type | What is resolved |
 |---|---|
-| `agent` | `agent._history` — the tail of the agent's history chain |
-| `agteam` | the team's background thread (if `run()` was called) + `_history` of every currently-tracked agent |
+| `agent` | `agent.ctx` — the tail of the agent's context chain |
+| `agteam` | the team's background thread (if `run()` was called) + `ctx` of every currently-tracked agent |
 
 For an `agteam`, "currently tracked agents" means:
 
@@ -114,7 +114,7 @@ class WriterTeam(agteam):
             feedback_doc = review
 ```
 
-`agsync` is the right primitive here — not field access on the pending result — because it also waits for all tracked agent histories to resolve, not just the team's background thread. The shared agent's history is what the second invocation chains on.
+`agsync` is the right primitive here — not field access on the pending result — because it also waits for all tracked agent contexts to resolve, not just the team's background thread. The shared agent's context is what the second invocation chains on.
 
 ## Relationship to field access on pending agdata
 
@@ -122,11 +122,11 @@ Both `agsync(team)` and reading a field on the pending `agdata` returned by `run
 
 | | field access on pending `agdata` | `agsync(team)` |
 |---|---|---|
-| Blocks until | `run()` thread completes | `run()` thread + all tracked agent histories |
+| Blocks until | `run()` thread completes | `run()` thread + all tracked agent contexts |
 | Re-raises exception | yes, on first access | yes |
 | Use when | you want a specific result field | you want a hard barrier without caring about the return value |
 
-For most use cases they are equivalent. `agsync` is more thorough because it also resolves histories of fork agents that may have been created inside `run()` but whose results were never returned.
+For most use cases they are equivalent. `agsync` is more thorough because it also resolves contexts of fork agents that may have been created inside `run()` but whose results were never returned.
 
 ## How dynamic agent tracking works
 
@@ -139,5 +139,5 @@ team.run() called
       → agent(parent)  ← __init__ sees _active_team, adds self to team._agents
       → agent(parent)  ← same
   → _active_team reset to None
-agsync(team) joins the thread, then resolves all tracked agent histories
+agsync(team) joins the thread, then resolves all tracked agent contexts
 ```

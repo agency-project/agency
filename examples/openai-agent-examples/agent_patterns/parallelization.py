@@ -50,9 +50,9 @@ async def run_async(msg: str) -> str:
     # All three asyncio_run() calls are submitted immediately and awaited
     # concurrently — none blocks the event loop.
     r1, r2, r3 = await asyncio.gather(
-        agent(parent).asyncio_run(translator_skill, agdata(text=msg)),
-        agent(parent).asyncio_run(translator_skill, agdata(text=msg)),
-        agent(parent).asyncio_run(translator_skill, agdata(text=msg)),
+        agent.fork(parent).asyncio_run(translator_skill, agdata(text=msg)),
+        agent.fork(parent).asyncio_run(translator_skill, agdata(text=msg)),
+        agent.fork(parent).asyncio_run(translator_skill, agdata(text=msg)),
     )
     translations = "\n".join(f"{i+1}. {r.translation}" for i, r in enumerate([r1, r2, r3]))
     print(f"\nTranslations:\n{translations}")
@@ -66,7 +66,7 @@ async def run_async(msg: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run_sync(msg: str) -> str:
-    pending = [agent(parent).run(translator_skill, agdata(text=msg)) for _ in range(3)]
+    pending = [agent.fork(parent).run(translator_skill, agdata(text=msg)) for _ in range(3)]
     translations = "\n".join(f"{i+1}. {r.translation}" for i, r in enumerate(pending))
     print(f"\nTranslations:\n{translations}")
 

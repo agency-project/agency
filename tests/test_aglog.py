@@ -14,12 +14,12 @@ def make_agent(tools=None) -> agent:
 
 
 def make_skill(name: str = "s", out: dict | None = None):
+    from agency.agcontext import agcontext
     sk = agskill(name, "")
-    def fake_run(llm_cfg, inp, hist, sandbox, pool, ms, **_):
-        return agdata(**(out or {"ok": True})), agdata(
-            messages=list(hist._data.get("messages", [])) + [{"role": "user", "content": name}]
-        ), [], (0, 0)
-    sk.run = fake_run
+    def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
+        new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
+        return agdata(**(out or {"ok": True})), agcontext(messages=new_msgs), []
+    sk.execute_react = fake_execute_react
     return sk
 
 

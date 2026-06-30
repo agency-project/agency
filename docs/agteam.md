@@ -45,7 +45,7 @@ class PaperCrawlerTeam(agteam):
     def run(self) -> agdata:
         papers = self.main_agent.run(self.find_papers, agdata(topic=self.topic)).papers
         summaries = [
-            agent(self.main_agent).run(
+            agent.fork(self.main_agent).run(
                 self.summarise,
                 agdata(title=p["title"], url=p["url"], abstract=p["abstract"]),
             )

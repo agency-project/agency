@@ -16,15 +16,15 @@ The common thread (no pun intended): a shared object is called or read from mult
 
 ## Background: how agent history serialization works
 
-Every `agent` instance maintains a `_history` future chain. Each call to `agent.run()` reads the current tail of the chain as `prev_history` and writes a new pending future as the new tail:
+Every `agent` instance maintains a `ctx` future chain. Each call to `agent.run()` reads the current tail of the chain as `prev_ctx` and writes a new pending future as the new tail:
 
 ```
-agent.run() call 1:  prev_history = empty   →  _history = hf1
-agent.run() call 2:  prev_history = hf1     →  _history = hf2
-agent.run() call 3:  prev_history = hf2     →  _history = hf3
+agent.run() call 1:  prev_ctx = empty   →  ctx = hf1
+agent.run() call 2:  prev_ctx = hf1     →  ctx = hf2
+agent.run() call 3:  prev_ctx = hf2     →  ctx = hf3
 ```
 
-Each task waits for `prev_history` to resolve before starting its LLM call. This serializes calls on the same agent in **registration order** — the order in which `agent.run()` was actually called.
+Each task waits for `prev_ctx` to resolve before starting its LLM call. This serializes calls on the same agent in **registration order** — the order in which `agent.run()` was actually called.
 
 This mechanism is safe as long as `agent.run()` is only called from a single thread at a time. When multiple threads call `agent.run()` on the same instance concurrently, the registration order is non-deterministic. If the resulting order inverts a data dependency, a deadlock forms.
 
@@ -56,14 +56,14 @@ class WriterTeam(agteam):
 All four submissions happen before any result arrives. FT1 and FT2 both start their own threads. If FT2's body executes first:
 
 ```
-FT2 body:  self.main_feedback.run(...)  →  prev=empty,  _history=hf2
-FT1 body:  self.main_feedback.run(...)  →  prev=hf2,    _history=hf1
+FT2 body:  self.main_feedback.run(...)  →  prev=empty,  ctx=hf2
+FT1 body:  self.main_feedback.run(...)  →  prev=hf2,    ctx=hf1
 ```
 
 The deadlock cycle:
 
 ```
-FT1's main_feedback task  →  waits on hf2 (FT2's history)
+FT1's main_feedback task  →  waits on hf2 (FT2's ctx)
 hf2 resolves when         →  FT2's main_feedback task completes
 FT2's inputs depend on    →  current_draft → writer → planner → feedback_doc
 feedback_doc is           →  FT1's result future
@@ -110,8 +110,8 @@ b.run()   # both daemon threads race to call shared.run()
 If TeamB's body executes first:
 
 ```
-TeamB body:  shared.run(skill_b, ...)  →  prev=empty,  _history=hfB
-TeamA body:  shared.run(skill_a, ...)  →  prev=hfB,    _history=hfA
+TeamB body:  shared.run(skill_b, ...)  →  prev=empty,  ctx=hfB
+TeamA body:  shared.run(skill_a, ...)  →  prev=hfB,    ctx=hfA
 ```
 
 TeamA's task waits on `hfB`. `hfB` resolves only when TeamB's task finishes. TeamB's task is waiting on `a_result`, which is TeamA's result future. TeamA's result is set when TeamA's task completes. TeamA's task is waiting on `hfB`. Cycle.
@@ -121,7 +121,7 @@ TeamA's task waits on `hfB`. `hfB` resolves only when TeamB's task finishes. Tea
 ```python
 a = TeamA(shared=shared)
 r = a.run()
-agsync(a)           # TeamA fully done — shared._history resolved
+agsync(a)           # TeamA fully done — shared.ctx resolved
 
 b = TeamB(shared=shared, a_result=r)
 b.run()             # TeamB registers on shared after TeamA
@@ -146,10 +146,10 @@ team = SummaryTeam(shared=shared, outline=outline)
 team.run()   # daemon thread may call shared.run() before the main thread's call above registers
 ```
 
-The main thread calls `shared.run(outline_skill, ...)` which sets `_history = hf_outline`. Then `team.run()` is submitted. If the daemon thread executes team's body immediately and reaches `self.shared.run(summary_skill, ...)` before the main thread's task has resolved `hf_outline`:
+The main thread calls `shared.run(outline_skill, ...)` which sets `ctx = hf_outline`. Then `team.run()` is submitted. If the daemon thread executes team's body immediately and reaches `self.shared.run(summary_skill, ...)` before the main thread's task has resolved `hf_outline`:
 
 ```
-daemon thread:  shared.run(summary_skill, ...)  →  prev=hf_outline, _history=hf_summary
+daemon thread:  shared.run(summary_skill, ...)  →  prev=hf_outline, ctx=hf_summary
 ```
 
 Here the registration order is actually correct (main thread registered first), so no deadlock forms. But if the main thread had not yet called `shared.run()` at all before submitting the team — for example, because the outline result was itself a pending agdata passed in — the daemon thread could register on `shared` before the main thread does, inverting the chain.
@@ -158,7 +158,7 @@ Here the registration order is actually correct (main thread registered first), 
 
 ```python
 outline = shared.run(outline_skill, agdata(topic="KV cache"))
-agsync(shared)   # wait for shared._history to resolve
+agsync(shared)   # wait for shared.ctx to resolve
 
 team = SummaryTeam(shared=shared, outline=outline)
 team.run()
@@ -170,13 +170,13 @@ team.run()
 
 | Shared object | Parallel contexts | Risk |
 |---|---|---|
-| `agent` in `agteam.setup()` | same instance's `run()` called twice concurrently | inverted history chain → deadlock if data dependency exists |
+| `agent` in `agteam.setup()` | same instance's `run()` called twice concurrently | inverted ctx chain → deadlock if data dependency exists |
 | `agent` passed to two agteam instances | both `run()` bodies access it concurrently | same |
 | `agent` used on main thread and inside agteam | daemon thread may register before main thread | same if order is inverted |
 | pending `agdata` passed to two concurrent agteams | both bodies receive the same unresolved future | safe to read; deadlock only if a circular data dependency is separately introduced |
 
 ## Avoiding the pattern
 
-**Preferred:** create agents locally inside `run()` rather than in `setup()`. Each call gets its own independent history chain with no shared state to race on.
+**Preferred:** create agents locally inside `run()` rather than in `setup()`. Each call gets its own independent ctx chain with no shared state to race on.
 
 **When persistent agent history across calls is intentional:** use `agsync` as an explicit ordering barrier. Place it after the first call and before any submission that could reach the shared agent concurrently. `agsync` waits for the team's background thread **and** all tracked agent histories to resolve — field access on a pending `agdata` alone is not sufficient because it does not resolve agent history futures.

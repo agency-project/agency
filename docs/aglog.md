@@ -1,6 +1,6 @@
 # Logging
 
-Every agent has an `aglog` instance that records a structured timeline of all skill calls, tool invocations, lifecycle events, and compaction events. Logging is automatic — no manual calls are needed.
+Every agent has a `log` instance that records a structured timeline of all skill calls, tool invocations, lifecycle events, and compaction events. Logging is automatic — no manual calls are needed.
 
 ## Enabling file logging
 
@@ -115,9 +115,9 @@ Written whenever the ReAct loop compacts the context window:
 
 `msgs_before` / `msgs_after` show how many messages were in the list before and after compaction. The difference (`msgs_before - msgs_after`) is the number of messages replaced by the summary injection. See [compaction.md](compaction.md).
 
-## Terminal output (`agterm`)
+## Terminal output (`terminal`)
 
-In addition to `aglog`, each agent writes colour-coded single-line status messages to stderr via `agterm`. These are for interactive monitoring and are not persisted:
+In addition to `log`, each agent writes colour-coded single-line status messages to stderr via `terminal`. These are for interactive monitoring and are not persisted:
 
 ```
 10:00:00  [agent_smith]  [CREATED  ]  skills=['summarize']  model=kimi-k2  context=131072
@@ -136,4 +136,4 @@ Process monitoring events:
 10:07:30  [agent_smith]  [PROCS ✓  ]  train  all processes completed, re-entering agent
 ```
 
-When `agwebui` is active, `agterm` output is routed to the web UI instead of stderr. See [agwebui.md](agwebui.md).
+When `agwebui` is active, `terminal` output is routed to the web UI instead of stderr. See [agwebui.md](agwebui.md).

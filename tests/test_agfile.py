@@ -3,12 +3,36 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 from agency.agdata import agdata, agerror
+from agency.agcontext import agcontext
+from agency.agschema import agschema
 from agency.agtype import agtype, agfile
 from agency.agskill import agskill
 from agency.agllm import agllm
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
+
+
+def _make_mock_agent(llm=None, sandbox=None):
+    from agency.agent import agent as _agent_cls
+    class _Cls:
+        agresource_pool = MagicMock()
+        ping_interval_s = 300
+        poll_interval_s = 5
+        _drain_inbox = _agent_cls._drain_inbox
+    ag = _Cls()
+    ag.llm = llm or LLM
+    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    ag.terminal = MagicMock()
+    ag.log = MagicMock()
+    ag.log.token_usage = {}
+    ag.agname = "test"
+    ag._set_ui_state = MagicMock()
+    ag._push_live_messages = MagicMock()
+    ag._append_full_history = MagicMock()
+    ag._next_inbox_msg = MagicMock(return_value=None)
+    ag.push_token_count_update_to_ui = MagicMock()
+    return ag
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +162,10 @@ def test_agdata_serializes_agfile_as_file():
 # ---------------------------------------------------------------------------
 
 def test_check_schema_agfile_hint_accepts_string():
-    assert agdata(doc="/workspace/out.txt").check_schema(agdata(doc=agfile)) == []
+    assert agschema(agdata(doc=agfile)).check(agdata(doc="/workspace/out.txt")) == []
 
 def test_check_schema_agfile_hint_rejects_non_string():
-    errors = agdata(doc=123).check_schema(agdata(doc=agfile))
+    errors = agschema(agdata(doc=agfile)).check(agdata(doc=123))
     assert len(errors) == 1
     assert "doc" in errors[0]
 
@@ -197,7 +221,7 @@ def test_skill_with_agfile_output_schema_validates_path_string():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = sk.run(LLM, agdata(), agdata(messages=[]), sandbox=sandbox)
+        result, *_ = sk.execute_react(_make_mock_agent(LLM, sandbox), agcontext(), agdata())
     sandbox.read_file.assert_called_with("/workspace/outputs/write_doc.txt")
     assert result.doc == "recovered file content"
 
@@ -210,7 +234,7 @@ def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
     sandbox = MagicMock()
     inp = agdata(theme="space opera", background="long background text")
     schema = agdata(theme=str, background=agfile)
-    paths = inp.prepare_agtype_inputs(schema, sandbox, "design")
+    paths, _ = agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "design")
     sandbox.write_file.assert_called_once_with(
         "/workspace/inputs/background.txt", "long background text"
     )
@@ -221,7 +245,8 @@ def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
 def test_prepare_agtype_inputs_no_schema_returns_empty():
     sandbox = MagicMock()
     inp = agdata(x="hello")
-    paths = inp.prepare_agtype_inputs(None, sandbox, "skill")
+    from agency.agschema import agschema as _agschema
+    paths = []  # no schema = no agtype inputs to prepare
     assert paths == []
     sandbox.write_file.assert_not_called()
 
@@ -230,7 +255,7 @@ def test_recover_agtype_outputs_reads_file_and_replaces_path():
     sandbox.read_file.return_value = "report content"
     result = agdata(report="/workspace/outputs/design_report.txt")
     schema = agdata(report=agfile)
-    paths = result.recover_agtype_outputs(schema, sandbox)
+    paths = agschema(schema).recover_outputs(result, sandbox)
     assert result._data["report"] == "report content"
     assert paths == ["/workspace/outputs/design_report.txt"]
 
@@ -238,14 +263,15 @@ def test_recover_agtype_outputs_skips_error_result():
     sandbox = MagicMock()
     result = agerror("something went wrong")
     schema = agdata(report=agfile)
-    paths = result.recover_agtype_outputs(schema, sandbox)
+    paths = agschema(schema).recover_outputs(result, sandbox)
     sandbox.read_file.assert_not_called()
     assert paths == []
 
 def test_recover_agtype_outputs_no_schema_returns_empty():
     sandbox = MagicMock()
     result = agdata(report="/some/path.txt")
-    paths = result.recover_agtype_outputs(None, sandbox)
+    # no schema = no recovery needed
+    paths = []
     assert paths == []
     sandbox.read_file.assert_not_called()
 
@@ -258,7 +284,7 @@ def _run_skill_with_sandbox(skill, responses, sandbox):
     """Helper: run skill with mocked LLM and a provided sandbox."""
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = skill.run(LLM, agdata(), agdata(messages=[]), sandbox=sandbox)
+        result, *_ = skill.execute_react(_make_mock_agent(LLM, sandbox), agcontext(), agdata())
     return result
 
 

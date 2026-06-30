@@ -111,18 +111,20 @@ The framework validates every element against the template: each item must be a 
 
 ## ReAct loop
 
-Each call to `agskill.run()` executes a standard ReAct loop:
+`agskill.run()` is a non-blocking scheduling wrapper: it captures `prev_ctx`, spawns a daemon thread that calls `execute_react()`, and immediately returns a pending `agdata` (backed by a `Future`). The synchronous ReAct loop itself lives in `agskill.execute_react()`.
+
+Each call to `agskill.execute_react()` runs the following steps:
 
 1. Offload oversized input fields to files in the agent's sandbox (see below)
-2. Build messages: `[system] + history + [user: input.to_json()]`
-3. Drain user inbox (injected mid-conversation messages via `agent._inbox`)
+2. Build messages: `[system] + ctx.messages + [user: input.to_json()]`
+3. Drain user inbox (`agent._drain_inbox()` — injects mid-conversation messages from `agent.inbox`)
 4. Pre-call compaction — check character-based token estimate; compact if over threshold (see [compaction.md](compaction.md))
 5. Call the LLM with `stream=True`; accumulate tokens via `_iter_batched()` (see below); retry on connection failure with exponential backoff
 6. Post-call compaction — check actual `prompt_tokens` from API usage; compact again if needed
 7. If response contains tool calls → for each tool:
    a. Coerce malformed JSON arguments to `"{}"` so history replay never crashes
    b. If the tool is a `return_<field>` output tool → validate and store the value (see [Output collection via tools](#output-collection-via-tools)); skip normal dispatch
-   c. If `need_sandbox=True`, commit the sandbox to a pre-call checkpoint image
+   c. If `run_in_subprocess=True`, commit the sandbox to a pre-call checkpoint image
    d. Execute the tool (in the calling thread for sandbox tools, or offloaded to a worker process)
    e. If the result contains `"error"`, restore the sandbox from the checkpoint and append `workspace_reverted` to the error message (see [Tool failure and checkpoint revert](#tool-failure-and-checkpoint-revert))
    f. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
@@ -130,7 +132,7 @@ Each call to `agskill.run()` executes a standard ReAct loop:
 8. If response has no tool calls → check if all required output fields have been registered
 9. If fields are missing and retries remain → inject reprompt message listing missing fields, go to 3
 10. If sandbox has live background processes → `_wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
-12. Delete offloaded input files, return `(result, updated_history, history_delta, token_counts)`
+12. Delete offloaded input files, return `(result, updated_ctx, delta)`
 
 The loop exits early when `max_steps` (default `AGSKILL_REACT_MAX_STEPS = 4096`) is exceeded.
 
@@ -215,7 +217,7 @@ This guard prevents a single oversized tool result (e.g. a raw PDF fetched via `
 
 ### Tool failure and checkpoint revert
 
-Before every `need_sandbox=True` tool call, the framework commits the sandbox container to a lightweight checkpoint image:
+Before every `run_in_subprocess=True` tool call, the framework commits the sandbox container to a lightweight checkpoint image:
 
 ```
 agency/pretool-<container_name>-<call_id[:8]>
@@ -237,7 +239,7 @@ The LLM sees both the error and the revert notice, so it knows the filesystem is
 
 **When revert does NOT happen:**
 
-- `need_sandbox=False` — no checkpoint is taken, so no revert is possible.
+- `run_in_subprocess=False` — no checkpoint is taken, so no revert is possible.
 - `sandbox` is `None` — no container exists.
 - `sandbox.commit()` raised — checkpoint tag is discarded; the error is still forwarded to the LLM unchanged.
 - The tool succeeded — restore is never called on success.
@@ -374,12 +376,12 @@ The system prompt instructs the model to call each `return_<field>` tool once it
 
 ### Per-field validation
 
-Each `return_<field>` call is validated immediately against the schema hint. The result of each call is logged to the `agterm` passed to `run()` (when one is provided):
+Each `return_<field>` call is validated immediately against the schema hint. The result of each call is logged to `ag.terminal` and `ag.log`:
 
-- **Type mismatch** → the tool returns `{"error": "field 'X': expected bool, got str"}` inline, and **`TOOL ✗`** is logged to `agterm` with the raw tool call args and the error message. The model sees the error in the same response turn and can retry just that field without losing any other already-registered outputs.
+- **Type mismatch** → the tool returns `{"error": "field 'X': expected bool, got str"}` inline, and **`TOOL ✗`** is logged to `ag.terminal` and `ag.log` with the raw tool call args and the error message. The model sees the error in the same response turn and can retry just that field without losing any other already-registered outputs.
 - **`agfile` field** → file is read from the sandbox immediately; see [Output `agfile` fields](#output-agfile-fields) for the full set of checks and error messages.
 - **`str` field with a sandbox path value** → if the value looks like a sandbox path (starts with `/`, only word characters, dots, and hyphens per segment), the framework silently reads the file at that path and substitutes its content. If the file is unreadable or its content is itself a path, the original value is kept. This handles the common case where the agent writes a `str` output to a file and returns the path instead of the content.
-- **Success** → the tool returns `{"result": "✓ 'X' registered. Still needed: [...]"}` (or `"All required fields complete."` on the last one), and **`TOOL ✓`** is logged to `agterm` with the tool call args.
+- **Success** → the tool returns `{"result": "✓ 'X' registered. Still needed: [...]"}` (or `"All required fields complete."` on the last one), and **`TOOL ✓`** is logged to `ag.terminal` and `ag.log` with the tool call args.
 
 ### Completeness check and reprompt
 
@@ -390,6 +392,10 @@ When the model produces a response with no tool calls at all, the framework chec
 - **No retries left** → return `agerror("output schema error: missing fields after retries: ...")`.
 
 Output collection is skipped when the LLM response is answering a mid-conversation user message injected via the inbox (`had_inbox=True`), because the LLM is engaged in dialogue rather than producing a final structured answer.
+
+### No-schema output
+
+When `output_schema=None` (or an `agrawstring` schema is used), no `return_<field>` tools are generated. Instead, when the model produces a response with no tool calls the framework takes the raw text content of the assistant message and returns it as `agdata(result=content)` — it is **not** JSON-parsed. For `agrawstring` schemas the field key is taken from the schema's raw key; for `output_schema=None` the key is always `"result"`.
 
 ## Process monitoring
 
@@ -410,9 +416,9 @@ The LLM receives the status message, can read log files or call more tools, then
 
 See [execution_process_control.md](execution_process_control.md) for per-scenario traces.
 
-## History
+## Context (`agcontext`)
 
-The history passed to `agskill.run()` is the agent's shared conversation context. The skill appends its full message exchange to this history and returns the updated version. The system prompt is re-injected fresh on every call and is not persisted in the stored history.
+The `prev_ctx` (an `agcontext`) passed to `agskill.run()` is the agent's shared conversation context. `agskill.run()` captures it before spawning the thread; `execute_react()` appends the full message exchange and returns the updated `ctx`. The system prompt is re-injected fresh on every call and is not persisted in the stored context.
 
 ## Skill tools
 

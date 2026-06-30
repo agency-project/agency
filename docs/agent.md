@@ -18,7 +18,7 @@ ag = agent(
 
 `llm_config` is passed to every skill run. Any OpenAI-compatible endpoint works via `base_url`.
 
-No container is created at construction time. Within a task, a container is started lazily — only when a tool with `need_sandbox=True` is first called. Tasks that use only host-side tools never create a container at all. When a container is started, it is committed to a checkpoint image (`agency/ckpt-<pid>-<agname>`) when the task completes and then destroyed.
+No container is created at construction time. Within a task, a container is started lazily — only when a tool with `run_in_subprocess=True` is first called. Tasks that use only host-side tools never create a container at all. When a container is started, it is committed to a checkpoint image (`agency/ckpt-<pid>-<agname>`) when the task completes and then destroyed.
 
 An optional `"context_limit"` key in `llm_config` pins the model's context window size for auto-compaction. If omitted, the agent queries the endpoint at startup (vLLM exposes `max_model_len`). Compaction is silently disabled when the limit cannot be determined.
 
@@ -36,11 +36,11 @@ result = ag.run(skill, agdata(question="What is 2+2?"))
 print(result.answer)   # blocks here until the skill finishes
 ```
 
-`run()` is always non-blocking. It returns a pending `agdata` immediately and resolves only when the full skill — including all background processes the agent may have launched — has finished and all resources have been released.
+`run()` is always non-blocking. It calls `skill.run(self, ...)`, which schedules a thread and returns a pending `agdata` immediately. The actual ReAct loop is driven by `agskill.execute_react()`, which runs synchronously inside that thread. The result resolves only when the full skill — including all background processes the agent may have launched — has finished and all resources have been released.
 
 ## Serialized history
 
-Calls on the **same** agent are automatically serialized: each `run()` chains on the previous history future, so history is always consistent even under concurrent callers.
+Calls on the **same** agent are automatically serialized: each `run()` chains on the previous ctx future, so history is always consistent even under concurrent callers.
 
 ```python
 r1 = ag.run(search_skill, agdata(query="..."))
@@ -53,7 +53,7 @@ r2 = ag.run(summarize_skill, agdata(text=r1.text))   # waits for r1 internally
 child = agent(ag)
 ```
 
-Forking blocks until the parent's in-flight task completes, then deep-copies the resolved history and copies the parent's checkpoint image via `docker tag`. The child's container is not started at fork time — it is created lazily when the child's first `run()` executes, restoring from the copied checkpoint. All subsequent writes in either direction are isolated.
+Forking blocks until the parent's in-flight task completes, then deep-copies the resolved ctx and copies the parent's checkpoint image via `docker tag`. The child's container is not started at fork time — it is created lazily when the child's first `run()` executes, restoring from the copied checkpoint. All subsequent writes in either direction are isolated.
 
 ## Class-level configuration
 
@@ -66,7 +66,7 @@ Set once before creating agents:
 | `agent.agresource_pool` | auto-detected | Shared GPU/CPU/memory pool |
 | `agent.ping_interval_s` | `300` | Max seconds `_wait_for_processes` waits before injecting a status ping |
 | `agent.poll_interval_s` | `5` | `get_live_pids()` poll granularity inside each ping window |
-| `agent.max_outer_iters` | `144` | **Unused** — kept for backwards compatibility; process monitoring is now bounded by `AGSKILL_REACT_MAX_STEPS` inside `agskill.run()` |
+| `agent.max_outer_iters` | `144` | **Unused** — kept for backwards compatibility; process monitoring is now bounded by `AGSKILL_REACT_MAX_STEPS` inside `agskill.execute_react()` |
 
 ## Shared output directory
 
@@ -99,7 +99,7 @@ The name is always postfixed with `_XXXX` (a 4-character base-36 counter, digits
 
 ## Lifecycle and cleanup
 
-Containers are created lazily — only when a task calls a tool with `need_sandbox=True` for the first time. Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a container. When a container is started, stale containers from a previous run (e.g. after a hard kill) are removed first. The container is destroyed at task end. An `atexit` handler removes any containers still running at process exit.
+Containers are created lazily — only when a task calls a tool with `run_in_subprocess=True` for the first time. Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a container. When a container is started, stale containers from a previous run (e.g. after a hard kill) are removed first. The container is destroyed at task end. An `atexit` handler removes any containers still running at process exit.
 
 ## UI callbacks
 

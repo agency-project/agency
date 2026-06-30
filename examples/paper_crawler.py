@@ -28,7 +28,7 @@ import html2text
 import httpx
 
 from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
-from agency.agdata import _fmt_exc
+from agency.agutil import format_exception as _fmt_exc
 
 
 LLM_CONFIG = {
@@ -66,7 +66,7 @@ class FindPapersSkill(agskill):
             name="search_papers",
             description="Search Hugging Face Papers for AI research papers. Returns title, URL, and abstract for each result.",
             fn=self._search,
-            need_sandbox=False,
+            run_in_subprocess=False,
             params={
                 "type": "object",
                 "properties": {

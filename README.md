@@ -83,7 +83,7 @@ Pass `"api_key": "bedrock-api-key-..."` to use a static Bedrock API key instead 
 
 **`agtype`** — base class for typed agdata field values. Subclass to control how a schema field is serialised, transferred to/from the sandbox filesystem, represented in the system prompt, and cleaned up. `agfile` is the built-in subclass for file-backed fields. `agimage` is the built-in subclass for multimodal image inputs — local files are base64-encoded automatically; the image is injected into the message content array so the model sees it visually. `agrawstring` bypasses JSON formatting entirely — the input string is sent as raw text and the model's full response is captured as-is, skipping JSON parsing and the retry loop.
 
-**`agskill`** — a named ReAct loop with its own system prompt, optional input/output schemas, and an optional tool list. The LLM calls tools, inspects results, and iterates until it has registered all required output fields. Output is collected via per-field tools (`return_summary`, `return_score`, etc.) generated dynamically from the output schema — each with a typed `value` parameter — rather than a single JSON blob. Each field is validated immediately on registration; missing fields trigger a targeted reprompt.
+**`agskill`** — a named skill with its own system prompt, optional input/output schemas, and an optional tool list. `agskill.run()` is a non-blocking scheduling wrapper: it spawns a daemon thread and returns a pending `agdata` immediately. The actual synchronous ReAct loop is `agskill.execute_react()`. The LLM calls tools, inspects results, and iterates until it has registered all required output fields. Output is collected via per-field tools (`return_summary`, `return_score`, etc.) generated dynamically from the output schema — each with a typed `value` parameter — rather than a single JSON blob. Each field is validated immediately on registration; missing fields trigger a targeted reprompt.
 
 **`agtool`** — a named callable an LLM can invoke via function calling. Every tool call is offloaded to a `ProcessPoolExecutor` worker so CPU-bound tools don't block other agents. Tools are serialised with `cloudpickle`, so bound methods work without any extra machinery. Before each sandboxed tool call the container is checkpointed; on tool failure the sandbox is automatically rolled back to that checkpoint and the LLM is told the workspace was reverted. Agents can pass `"timeout": <seconds>` in any tool call's arguments to override the default 30 s watchdog.
 
@@ -229,7 +229,7 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 |---|---|
 | [agent.md](docs/agent.md) | Agent construction, `run()`, forking, history, UI callbacks |
 | [agdata.md](docs/agdata.md) | Data container — pending results, schema types, serialization, error handling |
-| [agskill.md](docs/agskill.md) | ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
+| [agskill.md](docs/agskill.md) | `run()` scheduling wrapper, `execute_react()` ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
 | [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, `agimage` (multimodal), `agrawstring` (raw bypass), custom subclasses |
 | [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
 | [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
@@ -239,3 +239,6 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, webui routing |
 | [agwebui.md](docs/agwebui.md) | Web UI — browser dashboard, event stream, WebSocket, ask_human path |
 | [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
+| [agname.md](docs/agname.md) | Agent naming — auto-generated unique names for agents and run directories |
+| [agutil.md](docs/agutil.md) | Shared utilities — helpers used across the framework |
+| [agschema.md](docs/agschema.md) | Schema validation — output field validation, type error fixes, field handler construction |

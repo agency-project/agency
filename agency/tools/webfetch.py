@@ -56,7 +56,7 @@ def _run(arg: agdata) -> agdata:
 webfetch = agtool(
     name="webfetch",
     fn=_run,
-    need_sandbox=False,
+    run_in_subprocess=False,
     description="Fetch a URL and return its content as text, markdown, or raw HTML.",
     params={
         "type": "object",

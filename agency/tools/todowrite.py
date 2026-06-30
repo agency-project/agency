@@ -27,7 +27,7 @@ def _run(arg: agdata) -> agdata:
 todowrite = agtool(
     name="todowrite",
     fn=_run,
-    need_sandbox=False,
+    run_in_subprocess=False,
     description="Update the todo list with a new set of items.",
     params={
         "type": "object",

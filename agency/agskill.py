@@ -1,156 +1,32 @@
 from __future__ import annotations
 import json
+import threading
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, get_args, get_origin
+from concurrent.futures import Future
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
-from .agtype import agimage, agtype, output_field_desc, raw_schema_key, make_field_handler
-from .agtool import agtool, make_return_output_tools, dispatch_tools, TOOL_OUTPUT_OFFLOAD_CHARS
-from .agllm import LLM_RETRY_SLEEP_S, agllm
-from .agcompaction import estimate_messages_tokens, maybe_compact
+from .agtype import agtype
+from .agschema import agschema
+from .agcontext import agcontext
+from .agtool import agtool, dispatch_tools, TOOL_OUTPUT_OFFLOAD_CHARS
+from .agllm import agllm
 from .agsandbox import agSandbox
+from .agutil import format_exception
+from .aglog import _ts
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
 AGSKILL_REACT_MAX_STEPS        = 4096
 AGBINARY_VALIDATE_EXEC_TIMEOUT = 5  # Seconds per container exec call when validating agbinary output.
 
-@dataclass
-class _FinalAnswerResult:
-    kind: str  # "return" | "retry" | "error"
-    return_tuple: "tuple | None" = None
-    correction_msg: "dict | None" = None
-
-
-def parse_final_answer(
-    msg_dict: dict,
-    messages: list[dict],
-    n_before: int,
-    output_schema_retries_left: int,
-    tokens: "tuple[int, int]",
-    output_schema: "agdata | None",
-) -> _FinalAnswerResult:
-    """Parse the LLM's final (non-tool-call) response.
-
-    Returns a _FinalAnswerResult with kind:
-      "return"  — caller should return return_tuple immediately
-      "retry"   — caller should append correction_msg and continue the loop
-      "error"   — caller should return an error return_tuple
-    """
-    raw_out_key = raw_schema_key(output_schema)
-    if raw_out_key is not None:
-        raw_content = msg_dict.get("content") or ""
-        updated_history = agdata(messages=messages[1:])
-        return _FinalAnswerResult(
-            kind="return",
-            return_tuple=(
-                agdata(**{raw_out_key: raw_content}),
-                updated_history,
-                [messages[0]] + messages[1:][n_before:],
-                tokens,
-            ),
-        )
-
-    content = msg_dict.get("content") or "{}"
-    stripped = content.strip()
-    if stripped.startswith("```"):
-        stripped = stripped[stripped.find("\n") + 1:] if "\n" in stripped else stripped[3:]
-        if stripped.endswith("```"):
-            stripped = stripped[:-3]
-        content = stripped.strip()
-    _parse_error: str = ""
-    try:
-        result = agdata.from_json(content)
-    except json.JSONDecodeError as _e:
-        if "Extra data" in str(_e):
-            try:
-                _obj, _ = json.JSONDecoder().raw_decode(content.lstrip())
-                result = agdata(**_obj) if isinstance(_obj, dict) else agdata(result=content)
-                _parse_error = ""
-            except (json.JSONDecodeError, TypeError):
-                _parse_error = str(_e)
-                result = agdata(result=content)
-        else:
-            _parse_error = str(_e)
-            result = agdata(result=content)
-    except TypeError as _e:
-        _parse_error = str(_e)
-        result = agdata(result=content)
-
-    if output_schema is not None:
-        errors = result.check_schema(output_schema)
-        if _parse_error and "invalid json" not in " ".join(errors).lower():
-            errors = [f"JSON parse error: {_parse_error}"] + errors
-        if errors:
-            if output_schema_retries_left > 0:
-                return _FinalAnswerResult(
-                    kind="retry",
-                    correction_msg={
-                        "role": "user",
-                        "content": (
-                            f"[HARNESS SYSTEM] Your previous response could not be parsed. Errors: {errors}.\n"
-                            "Common causes: unescaped quotes or backslashes inside a string value, "
-                            "raw newlines inside a string (use \\n instead), trailing comma after "
-                            "the last key, extra text or explanation outside the JSON object, "
-                            "or markdown code fences around the JSON.\n"
-                            "Respond ONLY with a single valid JSON object matching exactly: "
-                            f"{output_schema.to_json()}"
-                        ),
-                    },
-                )
-            _raw_out = (msg_dict.get("content") or "")[:2000]
-            updated_history = agdata(messages=messages[1:])
-            return _FinalAnswerResult(
-                kind="error",
-                return_tuple=(
-                    agerror(
-                        f"output schema error after retries: {errors}"
-                        + (f"\nmodel output: {_raw_out!r}" if _raw_out else "")
-                    ),
-                    updated_history,
-                    [messages[0]] + messages[1:][n_before:],
-                    tokens,
-                ),
-            )
-
-    updated_history = agdata(messages=messages[1:])
-    return _FinalAnswerResult(
-        kind="return",
-        return_tuple=(result, updated_history, [messages[0]] + messages[1:][n_before:], tokens),
-    )
-
 if TYPE_CHECKING:
+    from .agent import agent
     from .agterm import agterm
     from .aglog import aglog
     from .agresources import agResourcePool
-
-
-# ---------------------------------------------------------------------------
-# ReAct loop helpers
-# ---------------------------------------------------------------------------
-
-def _drain_inbox(
-    messages: list[dict],
-    _inbox_fn: "Callable | None",
-    _live_messages_fn: "Callable | None",
-    _full_history_fn: "Callable | None",
-) -> bool:
-    """Drain pending inbox messages into the conversation. Returns True if any were appended."""
-    had_inbox = False
-    if _inbox_fn:
-        while True:
-            msg = _inbox_fn()
-            if msg is None:
-                break
-            inbox_msg = {"role": "user", "content": msg}
-            messages.append(inbox_msg)
-            had_inbox = True
-            if _live_messages_fn:
-                _live_messages_fn(messages[1:])
-            if _full_history_fn:
-                _full_history_fn(inbox_msg)
-    return had_inbox
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +62,8 @@ class agskill:
         self.system_prompt = system_prompt
         self.add_tools = add_tools
         self.replace_tools = [] if plan_mode else replace_tools
-        self.input_schema = input_schema
-        self.output_schema = output_schema
+        self.input_schema  = agschema(input_schema)  if input_schema  else None
+        self.output_schema = agschema(output_schema) if output_schema else None
         self.max_output_schema_retries = max_output_schema_retries
 
     # ------------------------------------------------------------------
@@ -197,8 +73,9 @@ class agskill:
     def _build_system_prompt(self, extra: str | None = None) -> str:
         parts = [self.system_prompt]
 
-        # Collect agtype fields with extra prompt instructions and emit
-        # them before the JSON format sections.
+        # Each agtype subclass (agfile, agbinary, …) can inject extra prompt
+        # lines describing how the LLM should handle that field (e.g. file paths,
+        # binary encoding).  Collect these for both input and output schemas.
         extra_lines: list[str] = []
         for key, hint in (self.input_schema._data.items() if self.input_schema else []):
             cls = agtype.from_hint(hint)
@@ -213,6 +90,7 @@ class agskill:
                 if line:
                     extra_lines.append(line)
 
+        # Emit the agtype instructions as a single block before the format sections.
         if extra_lines:
             parts.append(
                 "\nFile-backed fields — WARNING: these files are temporary and will "
@@ -220,21 +98,27 @@ class agskill:
                 + "\n".join(extra_lines)
             )
 
+        # Caller-supplied extra prompt (e.g. compaction summary injection).
         if extra:
             parts.append(extra)
 
-        if self.input_schema is not None and raw_schema_key(self.input_schema) is None:
+        # Describe the input shape so the LLM knows what JSON keys to expect.
+        # Skipped for agrawstring inputs (the value arrives as plain text, not JSON).
+        if self.input_schema is not None and self.input_schema.raw_key() is None:
             parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}")
+
         if self.output_schema is not None:
-            if raw_schema_key(self.output_schema) is not None:
+            if self.output_schema.raw_key() is not None:
+                # agrawstring output — model must reply with plain text, not a tool call.
                 parts.append("\nRespond with plain text only — no JSON wrapping, no markdown code fences.")
             else:
+                # Structured output — model must call one return_<field> tool per output field.
                 field_tools = ", ".join(
                     f"return_{f}" for f in self.output_schema._data
                 )
                 field_lines = "\n".join(
-                    f"  - {f}: {output_field_desc(h)}"
-                    for f, h in self.output_schema._data.items()
+                    f"  - {f}: {self.output_schema.field_desc(f)}"
+                    for f in self.output_schema._data
                 )
                 parts.append(
                     f"\nTo return your results, call the appropriate return_<field> tool "
@@ -249,159 +133,292 @@ class agskill:
                 )
         return "\n".join(parts)
 
-    def _build_user_content(self, input: agdata) -> "str | list":
+    def _build_user_content(self, skill_input: agdata) -> "str | list":
         """Build the content value for the user message.
 
-        Returns a plain string when there are no image fields, or a multimodal
-        content array when agimage fields are present.  Image field values are
-        replaced with a short placeholder in the text portion so the LLM doesn't
-        see a raw base64 blob in the JSON.
+        Returns a plain string for simple inputs, or a multimodal content array
+        when any agtype field contributes extra content blocks (e.g. agimage).
+        Each agtype subclass declares its contribution via build_content_prompt.
         """
         # agrawstring input — send the value directly, no JSON wrapping.
-        raw_key = raw_schema_key(self.input_schema)
+        raw_key = self.input_schema.raw_key() if self.input_schema is not None else None
         if raw_key is not None:
-            val = input._data.get(raw_key, "")
+            val = skill_input._data.get(raw_key, "")
             return val if isinstance(val, str) else str(val)
 
         schema = self.input_schema
-        image_urls: list[str] = []
-        image_keys: set[str] = set()
+        text_data = dict(skill_input._data)
+        extra_blocks: list[dict] = []
 
+        # Ask each agtype field for its contribution to the user message.
+        # Fields with no agtype (e.g. plain str, int) are left as-is.
         if schema is not None:
             for key, hint in schema._data.items():
-                # Single agimage
-                if isinstance(hint, type) and issubclass(hint, agimage):
-                    image_keys.add(key)
-                    val = input._data.get(key)
-                    if isinstance(val, str):
-                        image_urls.append(val)
-                # list[agimage]
-                elif get_origin(hint) is list:
-                    args = get_args(hint)
-                    if args and isinstance(args[0], type) and issubclass(args[0], agimage):
-                        image_keys.add(key)
-                        vals = input._data.get(key, [])
-                        if isinstance(vals, list):
-                            image_urls.extend(v for v in vals if isinstance(v, str))
+                cls = agtype.from_hint(hint)
+                if cls is None:
+                    continue
+                placeholder, blocks = cls.build_content_prompt(key, skill_input._data.get(key))
+                if placeholder is not None:
+                    text_data[key] = placeholder
+                extra_blocks.extend(blocks)
 
-        if not image_urls:
-            return f"[HARNESS SYSTEM] New Skill Input:\n{input.to_json()}"
+        # No extra blocks — return a plain JSON string (fast path).
+        if not extra_blocks:
+            return f"[HARNESS SYSTEM] New Skill Input:\n{skill_input.to_json()}"
 
-        # Build a copy of the input dict with image fields replaced by placeholders
-        # so the text portion stays compact.
-        text_data = dict(input._data)
-        for key in image_keys:
-            if key in text_data:
-                hint = schema._data.get(key) if schema else None
-                if get_origin(hint) is list:
-                    count = len(text_data[key]) if isinstance(text_data[key], list) else 1
-                    text_data[key] = f"[{count} image(s) attached]"
-                else:
-                    text_data[key] = "[image attached]"
-
+        # Extra blocks present — build a multimodal content array: text first,
+        # then the type-contributed blocks in schema field order.
         text = json.dumps(text_data)
         content: list = [{"type": "text", "text": f"New Skill Input:\n{text}"}]
-        for url in image_urls:
-            content.append({"type": "image_url", "image_url": {"url": url}})
+        content.extend(extra_blocks)
         return content
 
-    def _build_tools(
+    def _build_toolkit(
         self,
-        sandbox: "agSandbox",
-        pool: "agResourcePool | None",
-        term: "agterm | None",
-        log: "aglog | None",
+        agent_sandbox: "agSandbox",
+        resource_pool: "agResourcePool | None",
+        agent_terminal: "agterm | None",
+        agent_log: "aglog | None",
         _ensure_read: bool = False,
-    ) -> "tuple[list, dict, list | None]":
-        """Build and return (active_tools, tool_map, openai_tools)."""
+    ) -> "tuple[dict[str, agtool], dict, set[str]]":
+        """Build toolkit and structured-output collection state.
+
+        Returns (toolkit, collected_outputs, required_fields).
+        collected_outputs and required_fields are mutable containers that the
+        return_<field> tools write into as they are called during the ReAct loop.
+        required_fields is empty when the skill has no structured output schema.
+        """
         if self.replace_tools is not None:
             active_tools: list[agtool] = list(self.replace_tools)
         else:
             from .tools import make_sandboxed_tools, make_read
-            active_tools = make_sandboxed_tools(sandbox, pool)
+            active_tools = make_sandboxed_tools(agent_sandbox, resource_pool)
             if self.add_tools:
                 active_tools.extend(self.add_tools)
-        # If input fields were offloaded to sandbox files, ensure the read tool
-        # is available even for skills that use replace_tools without it.
+
         if _ensure_read:
             if not any(getattr(t, "name", None) == "read" for t in active_tools):
                 from .tools import make_read
-                active_tools.append(make_read(sandbox))
+                active_tools.append(make_read(agent_sandbox))
+
+        collected_outputs: dict = {}
+        required_fields: set[str] = set()
+        if self.output_schema is not None and self.output_schema.raw_key() is None:
+            required_fields = set(self.output_schema._data.keys())
+            active_tools.extend(self.output_schema.make_return_output_agtool(
+                agent_sandbox, collected_outputs, required_fields, AGBINARY_VALIDATE_EXEC_TIMEOUT
+            ))
+
         for t in active_tools:
-            t.attach_logger(term, log)
-        tool_map = {t.name: t for t in active_tools}
-        openai_tools = [t.to_openai_tool() for t in active_tools] or None
-        return active_tools, tool_map, openai_tools
+            t.attach_logger(agent_terminal, agent_log)
+
+        return {t.name: t for t in active_tools}, collected_outputs, required_fields
 
     def _build_initial_messages(
         self,
-        input: agdata,
-        history: agdata,
+        skill_input: agdata,
+        agent_context: agcontext,
         _extra_system: "str | None",
-        _live_messages_fn: "Callable | None",
-        _full_history_fn: "Callable | None",
+        live_messages_fn: "Callable | None",
+        full_history_fn: "Callable | None",
     ) -> "tuple[list[dict], int]":
         """Build initial messages list. Returns (messages, n_before)."""
-        history_msgs: list[dict] = list(history._data.get("messages", []))
-        n_before = len(history_msgs)
+        # n_before records how many messages were in agent_context before this skill run
+        # started.  After the run, messages[n_before+1:] (skipping the leading
+        # system prompt) is the "delta" — the new turns added by this call.
+        n_before = len(agent_context.messages)
+
+        # Three-part structure: [system] + persistent history from agent_context + [new user turn].
         messages: list[dict] = (
             [{"role": "system", "content": self._build_system_prompt(_extra_system)}]
-            + history_msgs
-            + [{"role": "user", "content": self._build_user_content(input)}]
+            + list(agent_context.messages)
+            + [{"role": "user", "content": self._build_user_content(skill_input)}]
         )
-        if _live_messages_fn:
-            _live_messages_fn(messages[1:])
-        if _full_history_fn:
-            _full_history_fn(messages[0])
-            _full_history_fn(messages[-1])
+
+        # Push the conversation (minus system prompt) to the live UI view so the
+        # user can see the running history before the first LLM response arrives.
+        if live_messages_fn:
+            live_messages_fn(messages[1:])
+
+        # Log the system prompt and the new user message to the full-history sink
+        # (e.g. aglog file writer) so they appear in debug transcripts.
+        if full_history_fn:
+            full_history_fn(messages[0])
+            full_history_fn(messages[-1])
         return messages, n_before
 
     # ------------------------------------------------------------------
-    # ReAct loop
+    # Scheduling wrapper — non-blocking, returns pending agdata
     # ------------------------------------------------------------------
 
     def run(
         self,
-        llm: "agllm",
-        input: agdata,
-        history: agdata,
-        sandbox: "agSandbox",
-        pool: "agResourcePool | None" = None,
+        ag: "agent",
+        skill_input: agdata,
         max_steps: int = AGSKILL_REACT_MAX_STEPS,
-        term: "agterm | None" = None,
-        log: "aglog | None" = None,
-        _is_continuation: bool = False,
-        _state_fn: "Callable | None" = None,
-        _live_messages_fn: "Callable | None" = None,
-        _inbox_fn: "Callable | None" = None,
-        _full_history_fn: "Callable[[dict], None] | None" = None,
-        _token_update_fn: "Callable[[int, int], None] | None" = None,
-        _ping_interval_s: float = 300,
-        _poll_interval_s: float = 5,
-        _agname: str = "",
-    ) -> tuple[agdata, agdata, list[dict], tuple[int, int]]:
-        """Run the ReAct loop, including sandbox process monitoring."""
+    ) -> agdata:
+        """Submit a skill run on *ag* and return a pending agdata immediately.
+
+        Spawns a daemon thread that runs execute_react() and resolves futures
+        when done.  Same-agent calls are serialized via the context future chain.
+        """
+        prev_ctx = ag.ctx
+        result_future: Future[agdata] = Future()
+        ctx_future: Future[agcontext] = Future()
+        ts_start = _ts()
+        resource_pool = type(ag).agresource_pool
+
+        SKILL_ERROR_LOG_TRUNCATE = 300
+
+        def _task() -> None:
+            outer_result: agdata | None = None
+            updated_ctx: agcontext = prev_ctx
+            outer_delta: list[dict] = []
+            history_before: list[dict] = []
+            _prev_input_tokens: int = 0
+            _prev_output_tokens: int = 0
+
+            try:
+                # ── 1. Unblock: wait for any in-flight predecessor to finish,
+                #    then resolve any lazy input futures passed by the caller.
+                prev_ctx.resolve_prev_dependencies()
+                skill_input.resolve_input_dependencies()
+
+                # ── 2. Provision sandbox — created once on first run and reused
+                #    across subsequent runs via its internal checkpoint image.
+                if not ag.is_external_sandbox and ag.sandbox is None:
+                    _out = Path(type(ag).output_dir) / ag.agname if type(ag).output_dir else None
+                    ag.sandbox = agSandbox(ag.agname, output_dir=_out)
+
+                history_before = list(prev_ctx.messages)
+                _prev_input_tokens = prev_ctx.total_input_tokens
+                _prev_output_tokens = prev_ctx.total_output_tokens
+
+                ag.terminal.log("SKILL ▶  ", f"{self.name}  input={list(skill_input._data.keys())}")
+                ag._set_ui_state("skill", skill=self.name)
+                ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
+
+                # ── 3. Run the ReAct loop.
+                outer_result, updated_ctx, outer_delta = self.execute_react(
+                    ag, prev_ctx, skill_input, max_steps,
+                )
+
+            except Exception as exc:
+                outer_result = agerror(format_exception(exc))
+                updated_ctx = prev_ctx
+                outer_delta = []
+                history_before = list(prev_ctx.messages)
+                ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
+            finally:
+                # ── 4. Teardown — release GPU slot, commit container filesystem.
+                _had_error = outer_result is not None and bool(outer_result._data.get("error"))
+                ag._set_ui_state("error" if _had_error else "finished")
+                if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
+                    resource_pool.release_gpu(ag.sandbox._gpu_id)
+                if not ag.is_external_sandbox and ag.sandbox is not None:
+                    ag.sandbox.stop(commit=True)
+
+            # ── 5. Log result and commit token counts.
+            ts_end = _ts()
+            assert outer_result is not None
+            input_dict  = skill_input.to_dict()
+            result_dict = outer_result.to_dict()
+            if result_dict.get("error"):
+                ag.terminal.log("SKILL ✗  ", f"{self.name}  error={str(result_dict['error'])[:SKILL_ERROR_LOG_TRUNCATE]}")
+                ag._append_full_history({"type": "skill_error", "skill": self.name,
+                                         "error": str(result_dict["error"])})
+            else:
+                ag.terminal.log("SKILL ✓  ", f"{self.name}  output={list(result_dict.keys())}")
+            outer_input_tokens  = updated_ctx.total_input_tokens  - _prev_input_tokens
+            outer_output_tokens = updated_ctx.total_output_tokens - _prev_output_tokens
+            try:
+                ag.log._record(self.name, ts_start, ts_end,
+                               input_dict, result_dict,
+                               len(updated_ctx.messages),
+                               history_before=history_before,
+                               history_delta=outer_delta,
+                               input_tokens=outer_input_tokens,
+                               output_tokens=outer_output_tokens)
+                type(ag)._add_global_tokens(outer_input_tokens, outer_output_tokens)
+                _ag_usage = ag.log.token_usage
+                _gl_usage = type(ag).global_token_usage()
+                try:
+                    from . import agwebui as _agwebui
+                    if _agwebui._active is not None:
+                        _agwebui._active.emitter.token_update(
+                            ag.agname,
+                            _ag_usage["input_tokens"],
+                            _ag_usage["output_tokens"],
+                            _gl_usage["input_tokens"],
+                            _gl_usage["output_tokens"],
+                        )
+                except Exception as _e:
+                    print(f"[agskill] WARNING: post-skill token_update push failed for {ag.agname}: {_e}")
+            except Exception as log_exc:
+                ag.terminal.log("SKILL ✗  ", f"[log error] {log_exc}")
+
+            # ── 6. Resolve result future — unblocks the caller immediately.
+            ag._snapshot_messages = list(updated_ctx.messages)
+            result_future.set_result(outer_result)
+
+            # ── 7. Prune history, then resolve ctx future for the next chained call.
+            try:
+                pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages)
+                if pruned_msgs is not updated_ctx.messages:
+                    updated_ctx.messages = pruned_msgs
+                    ag.terminal.log("PRUNE    ", f"{self.name}  history pruned to {len(pruned_msgs)} msgs")
+            except Exception as prune_exc:
+                ag.terminal.log("PRUNE ✗  ", f"{self.name}  pruning failed: {prune_exc}")
+
+            ctx_future.set_result(updated_ctx)
+
+        threading.Thread(target=_task, daemon=True).start()
+        ag.ctx = agcontext(_future=ctx_future)
+        return agdata(_future=result_future)
+
+    async def asyncio_run(
+        self,
+        ag: "agent",
+        skill_input: agdata,
+        max_steps: int = AGSKILL_REACT_MAX_STEPS,
+    ) -> agdata:
+        """Async wrapper around run() for use in asyncio event loops."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        pending = self.run(ag, skill_input, max_steps)
+        await loop.run_in_executor(None, pending._resolve)
+        return pending
+
+    # ------------------------------------------------------------------
+    # ReAct loop — synchronous execution
+    # ------------------------------------------------------------------
+
+    def execute_react(
+        self,
+        ag: "agent",
+        prev_ctx: agcontext,
+        skill_input: agdata,
+        max_steps: int = AGSKILL_REACT_MAX_STEPS,
+    ) -> "tuple[agdata, agcontext, list[dict]]":
+        """Run the ReAct loop synchronously against *ag*, return (result, ctx, delta)."""
+
         # ── 1. Validate input against the skill's input schema.
-        input_error = input.validate_input(self.input_schema, _is_continuation)
+        input_error = self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
         if input_error is not None:
             sys_msg = {"role": "system", "content": self._build_system_prompt()}
-            return agerror(input_error), history, [sys_msg], (0, 0)
+            return agerror(input_error), prev_ctx, [sys_msg]
 
-        # ── 2. Prepare inputs — write agtype fields (e.g. agfile content → sandbox
-        #    path) and offload oversized plain strings to temporary sandbox files.
-        #    A timestamp suffix makes paths unique across back-to-back skill calls.
-        _offloaded_paths: list[str] = []
+        # ── 2. Prepare inputs — write agtype fields and offload oversized strings.
         _input_suffix = f"_{int(time.time() * 1000)}"
-        _offloaded_paths.extend(
-            input.prepare_agtype_inputs(self.input_schema, sandbox, self.name, suffix=_input_suffix)
+        _offloaded_paths, auto_fields = (
+            self.input_schema.prepare_inputs_in_sandbox(
+                skill_input, ag.sandbox, self.name,
+                suffix=_input_suffix, context_limit=ag.llm.context_limit,
+            )
+            if self.input_schema is not None
+            else ([], [])
         )
-        auto_paths, auto_fields = input.offload_large_fields(
-            sandbox, self.name, schema=self.input_schema,
-            suffix=_input_suffix, context_limit=llm.context_limit,
-        )
-        _offloaded_paths.extend(auto_paths)
 
-        # Warn the model about auto-offloaded fields so it knows to read them.
         _extra_system: str | None = None
         if auto_fields:
             field_list = ", ".join(f"`{f}`" for f in auto_fields)
@@ -414,146 +431,120 @@ class agskill:
                 f"automatically deleted after this task ends."
             )
 
-        # ── 3. Build tool set — sandbox tools + read (if offloaded inputs exist).
-        _active_tools, tool_map, openai_tools = self._build_tools(
-            sandbox, pool, term, log, _ensure_read=bool(_offloaded_paths)
+        # ── 3. Build toolkit with return_<field> tools for structured output.
+        toolkit, _collected_outputs, _required_fields = self._build_toolkit(
+            ag.sandbox, type(ag).agresource_pool, ag.terminal, ag.log,
+            _ensure_read=bool(_offloaded_paths),
         )
-
-        # ── 4. Set up structured output collection via return_<field> tools.
-        #    Skipped for agrawstring schemas, which capture raw text directly.
-        _use_return_output = (
-            self.output_schema is not None and raw_schema_key(self.output_schema) is None
-        )
-        _collected_outputs: dict = {}
-        _required_fields: set[str] = set()
-        _intercept: "dict[str, Callable[[dict], str]] | None" = None
-        if _use_return_output:
-            _required_fields = set(self.output_schema._data.keys())
-            _return_tools = make_return_output_tools(self.output_schema)
-            openai_tools = _return_tools + (openai_tools or [])
-
-            _intercept = {
-                f"return_{f}": make_field_handler(
-                    f, self.output_schema, sandbox,
-                    _collected_outputs, _required_fields,
-                    AGBINARY_VALIDATE_EXEC_TIMEOUT,
-                )
-                for f in _required_fields
-            }
+        _use_return_output = bool(_required_fields)
 
         # ── 5. Build the initial message list (system prompt + history + user turn).
-        _timeout_attempt = 0
         messages, n_before = self._build_initial_messages(
-            input, history, _extra_system, _live_messages_fn, _full_history_fn,
+            skill_input, prev_ctx, _extra_system,
+            ag._push_live_messages, ag._append_full_history,
         )
         output_schema_retries_left = self.max_output_schema_retries
-        _compaction_summary: str | None = None
-        _total_input_tokens:  int = 0
-        _total_output_tokens: int = 0
+        _skill_tokens_in_start  = prev_ctx.total_input_tokens
+        _skill_tokens_out_start = prev_ctx.total_output_tokens
 
         # ── 6. ReAct loop — each iteration is one LLM call + tool dispatch cycle.
         for _ in range(max_steps):
-            kwargs: dict = llm.build_kwargs(messages, openai_tools)
+            # Derive wire-format tool schemas fresh each iteration — the toolkit dict
+            # may grow mid-loop (e.g. read injected on large output offload).
+            _tool_schemas = [t.to_openai_tool() for t in toolkit.values()] or None
+            kwargs: dict = ag.llm.build_kwargs(messages, _tool_schemas)
 
             # 6a. Drain any inbox messages injected by the orchestrator mid-loop.
-            had_inbox = _drain_inbox(messages, _inbox_fn, _live_messages_fn, _full_history_fn)
+            had_inbox = ag._drain_inbox(messages)
 
-            # 6b. Compact history if it is approaching the context limit.
-            messages, _compaction_summary = maybe_compact(
-                messages, llm.config, llm.context_limit, None,
-                _compaction_summary, term, log, _live_messages_fn, self.name, agname=_agname,
+            # 6b. Compact history if needed.
+            messages, _pre_estimate = ag.llm.maybe_compact(
+                prev_ctx, messages, None,
+                term=ag.terminal, log=ag.log,
+                _live_messages_fn=ag._push_live_messages,
+                skill_name=self.name, agname=str(ag.agname),
             )
 
-            # 6c. Cap max_tokens so the model's reply fits within what's left.
-            _pre_estimate = estimate_messages_tokens(messages)
+            ag.push_token_count_update_to_ui(
+                prev_ctx.total_input_tokens - _skill_tokens_in_start + _pre_estimate,
+                prev_ctx.total_output_tokens - _skill_tokens_out_start,
+            )
 
-            if _token_update_fn is not None:
-                _token_update_fn(_total_input_tokens + _pre_estimate, _total_output_tokens)
-
-            if llm.context_limit is not None:
-                _headroom = max(1, llm.context_limit - _pre_estimate)
+            if ag.llm.context_limit is not None:
+                _headroom = max(1, ag.llm.context_limit - _pre_estimate)
                 if kwargs.get("max_tokens", _headroom) > _headroom:
                     kwargs = dict(kwargs)
                     kwargs["max_tokens"] = _headroom
 
-            # 6d. Call the LLM and handle transient errors (retry / context exceeded).
-            llm_result = llm.call(
-                kwargs, messages, _timeout_attempt,
-                term, _state_fn, _live_messages_fn, _token_update_fn,
-                _total_input_tokens, _total_output_tokens, self.name,
+            # 6c. Call the LLM (with internal retry on transient errors).
+            llm_result = ag.llm.call(
+                kwargs, messages,
+                ag.terminal, ag._set_ui_state, ag._push_live_messages,
+                ag.push_token_count_update_to_ui,
+                prev_ctx.total_input_tokens, prev_ctx.total_output_tokens, self.name,
+                full_history_fn=ag._append_full_history,
             )
             if llm_result.context_exceeded:
-                if _full_history_fn:
-                    _full_history_fn({"type": "llm_context_exceeded"})
-                messages, _compaction_summary = maybe_compact(
-                    messages, llm.config, llm.context_limit, None,
-                    _compaction_summary, term, log, _live_messages_fn, self.name, agname=_agname,
-                    force=True,
+                if ag._append_full_history:
+                    ag._append_full_history({"type": "llm_context_exceeded"})
+                messages, _ = ag.llm.maybe_compact(
+                    prev_ctx, messages, None,
+                    term=ag.terminal, log=ag.log,
+                    _live_messages_fn=ag._push_live_messages,
+                    skill_name=self.name, agname=str(ag.agname), force=True,
                 )
-                continue
-            if llm_result.should_retry:
-                _timeout_attempt = llm_result.next_timeout_attempt
-                if _full_history_fn:
-                    _full_history_fn({"type": "llm_retry",
-                                      "error": str(llm_result.conn_error),
-                                      "attempt": _timeout_attempt})
-                time.sleep(LLM_RETRY_SLEEP_S)
                 continue
             if not llm_result.ok:
-                _err_msg = f"LLM connection error after 5 attempts: {llm_result.conn_error}"
-                if _full_history_fn:
-                    _full_history_fn({"type": "llm_error", "error": _err_msg})
-                sandbox.remove_files(_offloaded_paths)
-                return agerror(_err_msg), history, [], (0, 0)
-            _timeout_attempt = 0
-            _total_input_tokens  = llm_result.total_input_tokens
-            _total_output_tokens = llm_result.total_output_tokens
-            if term:
-                _ctx_str = f"/{llm.context_limit}" if llm.context_limit else ""
+                _err_msg = f"LLM connection error after retries: {llm_result.conn_error}"
+                if ag._append_full_history:
+                    ag._append_full_history({"type": "llm_error", "error": _err_msg})
+                ag.sandbox.remove_files(_offloaded_paths)
+                return agerror(_err_msg), prev_ctx, []
+            prev_ctx.total_input_tokens  = llm_result.total_input_tokens
+            prev_ctx.total_output_tokens = llm_result.total_output_tokens
+            if ag.terminal:
+                _ctx_str = f"/{ag.llm.context_limit}" if ag.llm.context_limit else ""
                 _tok_str = f"  tokens={llm_result.prompt_tokens}{_ctx_str}" if llm_result.prompt_tokens else ""
-                term.log("LLM ✓    ", f"model={llm.config.get('model','?')}  ({llm_result.elapsed_ms}ms){_tok_str}")
-            if _state_fn:
-                _state_fn("skill", skill=self.name)
+                ag.terminal.log("LLM ✓    ", f"model={ag.llm.config.get('model','?')}  ({llm_result.elapsed_ms}ms){_tok_str}")
+            if ag._set_ui_state:
+                ag._set_ui_state("skill", skill=self.name)
 
-            # 6e. Post-response compaction: may compact again now that we know the
-            #     actual prompt_tokens reported by the model.
-            messages, _compaction_summary = maybe_compact(
-                messages, llm.config, llm.context_limit, llm_result.prompt_tokens,
-                _compaction_summary, term, log, _live_messages_fn, self.name, agname=_agname,
+            # 6d. Post-response compaction.
+            messages, _ = ag.llm.maybe_compact(
+                prev_ctx, messages, llm_result.prompt_tokens,
+                term=ag.terminal, log=ag.log,
+                _live_messages_fn=ag._push_live_messages,
+                skill_name=self.name, agname=str(ag.agname),
             )
 
-            # 6f. Append the assistant turn to the message list.
+            # 6e. Append the assistant turn to the message list.
             msg_dict: dict = agllm.build_assistant_msg(llm_result.content_parts, llm_result.reasoning_parts, llm_result.tool_calls_raw)
             messages.append(msg_dict)
-            if _live_messages_fn:
-                _live_messages_fn(messages[1:])
-            if _full_history_fn:
-                _full_history_fn(msg_dict)
+            if ag._push_live_messages:
+                ag._push_live_messages(messages[1:])
+            if ag._append_full_history:
+                ag._append_full_history(msg_dict)
 
-            # 6g. Dispatch tool calls, or check if we can move to the output path.
+            # 6f. Dispatch tool calls, or check if we can move to the output path.
             if msg_dict.get("tool_calls"):
-                _read_injected = dispatch_tools(
-                    msg_dict["tool_calls"], tool_map, messages, sandbox, self.name,
-                    _state_fn, _live_messages_fn, _full_history_fn, term,
-                    _intercept=_intercept,
+                dispatch_tools(
+                    msg_dict["tool_calls"], toolkit, messages, ag.sandbox, self.name,
+                    ag._set_ui_state, ag._push_live_messages, ag._append_full_history, ag.terminal,
                     tool_offload_chars=(
-                        max(TOOL_OUTPUT_OFFLOAD_CHARS, int(llm.context_limit * 0.1 * 4))
-                        if llm.context_limit else TOOL_OUTPUT_OFFLOAD_CHARS
+                        max(TOOL_OUTPUT_OFFLOAD_CHARS, int(ag.llm.context_limit * 0.1 * 4))
+                        if ag.llm.context_limit else TOOL_OUTPUT_OFFLOAD_CHARS
                     ),
                 )
-                if _read_injected:
-                    openai_tools = (openai_tools or []) + [tool_map["read"].to_openai_tool()]
                 # Continue looping unless all required output fields are collected.
                 if not (_use_return_output and not (_required_fields - set(_collected_outputs))):
                     continue
 
             else:
-                # No tool calls — only continue if a mid-loop inbox message arrived,
-                # which may need another LLM turn to process.
+                # No tool calls — only continue if a mid-loop inbox message arrived. If not, move onto the output path (step 7).
                 if had_inbox:
                     continue
 
-            # ── 7. Output-ready path — all required return_<field> calls received.
+            # ── 7. Output-ready path.
             if _use_return_output:
                 missing = _required_fields - set(_collected_outputs)
                 if missing:
@@ -572,10 +563,10 @@ class agskill:
                             ),
                         }
                         messages.append(reprompt)
-                        if _live_messages_fn:
-                            _live_messages_fn(messages[1:])
-                        if _full_history_fn:
-                            _full_history_fn(reprompt)
+                        if ag._push_live_messages:
+                            ag._push_live_messages(messages[1:])
+                        if ag._append_full_history:
+                            ag._append_full_history(reprompt)
                         continue
                     _last_asst = next(
                         (m for m in reversed(messages) if m.get("role") == "assistant"), None
@@ -590,77 +581,66 @@ class agskill:
                                 for tc in _last_asst["tool_calls"]
                             ]
                             _last_out_str = f"[tool calls: {_names}]"
-                    updated_history = agdata(messages=messages[1:])
-                    sandbox.remove_files(_offloaded_paths)
+                    prev_ctx.messages = messages[1:]
+                    ag.sandbox.remove_files(_offloaded_paths)
                     return (
                         agerror(
                             f"output schema error: missing fields after retries: {sorted(missing)}"
                             + f"\ncollected: {sorted(_collected_outputs.keys())}"
                             + (f"\nlast model output: {_last_out_str!r}" if _last_out_str else "")
                         ),
-                        updated_history,
+                        prev_ctx,
                         [messages[0]] + messages[1:][n_before:],
-                        (_total_input_tokens, _total_output_tokens),
                     )
-                # 7b. All fields collected — wait for any background sandbox
-                #     processes before returning (they may write output files).
+                # 7b. All fields collected — wait for any background sandbox processes.
                 result = agdata(**_collected_outputs)
                 proc_msg = agSandbox.wait_for_processes(
-                    sandbox, self.name, term, log, _agname,
-                    _ping_interval_s, _poll_interval_s, _state_fn,
+                    ag.sandbox, self.name, ag.terminal, ag.log,
+                    str(ag.agname), type(ag).ping_interval_s, type(ag).poll_interval_s, ag._set_ui_state,
                 )
                 if proc_msg is not None:
                     messages.append({"role": "user", "content": proc_msg})
-                    if _live_messages_fn:
-                        _live_messages_fn(messages[1:])
-                    if _full_history_fn:
-                        _full_history_fn(messages[-1])
+                    if ag._push_live_messages:
+                        ag._push_live_messages(messages[1:])
+                    if ag._append_full_history:
+                        ag._append_full_history(messages[-1])
                     continue
-                # 7c. Recover agtype outputs (e.g. read file bytes back from sandbox)
-                #     then clean up any auto-offloaded input files.
-                updated_history = agdata(messages=messages[1:])
-                result.recover_agtype_outputs(self.output_schema, sandbox)
-                sandbox.remove_files(_offloaded_paths)
+                # 7c. Recover agtype outputs then clean up auto-offloaded input files.
+                prev_ctx.messages = messages[1:]
+                self.output_schema.recover_outputs(result, ag.sandbox)
+                ag.sandbox.remove_files(_offloaded_paths)
                 return (
                     result,
-                    updated_history,
+                    prev_ctx,
                     [messages[0]] + messages[1:][n_before:],
-                    (_total_input_tokens, _total_output_tokens),
                 )
 
-            # ── 8. Raw-text output path — model replied without tool calls.
-            #    parse_final_answer validates the response against the output schema.
-            far = parse_final_answer(
-                msg_dict, messages, n_before, output_schema_retries_left,
-                (_total_input_tokens, _total_output_tokens),
-                self.output_schema,
+            # ── 8. Raw-text output path (agrawstring schema or no schema).
+            assert self.output_schema is None or self.output_schema.raw_key() is not None, (
+                f"BUG: reached raw-text path with structured output_schema on skill '{self.name}'. "
+                "This should be unreachable — _use_return_output covers all schema cases."
             )
-            if far.kind == "retry":
-                # 8a. Schema mismatch — append a correction prompt and retry.
-                output_schema_retries_left -= 1
-                messages.append(far.correction_msg)
+            out_key = self.output_schema.raw_key() if self.output_schema is not None else "result"
+            result = agdata(**{out_key: msg_dict.get("content") or ""})
+            proc_msg = agSandbox.wait_for_processes(
+                ag.sandbox, self.name, ag.terminal, ag.log,
+                str(ag.agname), type(ag).ping_interval_s, type(ag).poll_interval_s, ag._set_ui_state,
+            )
+            if proc_msg is not None:
+                messages.append({"role": "user", "content": proc_msg})
+                if ag._push_live_messages:
+                    ag._push_live_messages(messages[1:])
+                if ag._append_full_history:
+                    ag._append_full_history(messages[-1])
                 continue
-            if far.kind != "error":
-                # 8b. Valid answer — wait for background processes before returning.
-                proc_msg = agSandbox.wait_for_processes(
-                    sandbox, self.name, term, log, _agname,
-                    _ping_interval_s, _poll_interval_s, _state_fn,
-                )
-                if proc_msg is not None:
-                    messages.append({"role": "user", "content": proc_msg})
-                    if _live_messages_fn:
-                        _live_messages_fn(messages[1:])
-                    if _full_history_fn:
-                        _full_history_fn(messages[-1])
-                    continue
-                far.return_tuple[0].recover_agtype_outputs(self.output_schema, sandbox)
-            sandbox.remove_files(_offloaded_paths)
-            return far.return_tuple
+            prev_ctx.messages = messages[1:]
+            ag.sandbox.remove_files(_offloaded_paths)
+            return (result, prev_ctx, [messages[0]] + messages[1:][n_before:])
 
-        # ── 9. Max steps exhausted — return an error with the accumulated history.
-        updated_history = agdata(messages=messages[1:])
-        sandbox.remove_files(_offloaded_paths)
-        return agerror("max_steps exceeded"), updated_history, [messages[0]] + messages[1:][n_before:], (_total_input_tokens, _total_output_tokens)
+        # ── 9. Max steps exhausted.
+        prev_ctx.messages = messages[1:]
+        ag.sandbox.remove_files(_offloaded_paths)
+        return agerror("max_steps exceeded"), prev_ctx, [messages[0]] + messages[1:][n_before:]
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

@@ -128,5 +128,5 @@ def make_read(sandbox: "agSandbox") -> agtool:
         description="Read a file (with optional offset/limit) or list a directory inside the sandbox.",
         params=_READ_PARAMS,
         log_fn=_log,
-        need_sandbox=False,
+        run_in_subprocess=False,
     )

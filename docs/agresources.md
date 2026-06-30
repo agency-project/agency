@@ -52,18 +52,19 @@ The agent calls these tools itself during a skill, just like any other tool. `da
 
 ## Release guarantee
 
-`sandbox.release_resources(pool)` is always called in the `finally` block of `agent._task()`:
+GPU and CPU/memory teardown is always called in the `finally` block of the `_task()` closure inside `agskill.run()`:
 
 ```python
 try:
-    outer_result, outer_history, outer_delta, _tok = af.run(...)
+    outer_result, updated_ctx, outer_delta = self.execute_react(
+        ag, prev_ctx, skill_input, max_steps,
+    )
     ...
 finally:
-    if self.sandbox is not None:
-        # _gpu_id may already be None after a foreground exec (released lazily);
-        # release_resources() also clears _gpu_virtual.
-        self.sandbox.release_resources(pool)
-        self.sandbox.destroy()
+    if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
+        resource_pool.release_gpu(ag.sandbox._gpu_id)
+    if not ag.is_external_sandbox and ag.sandbox is not None:
+        ag.sandbox.stop(commit=True)
 ```
 
 GPU semaphores and CPU/memory limits are returned even if the skill raises an exception or `max_steps` is exceeded.

@@ -4,22 +4,22 @@ Tools are the functions an LLM can call during a ReAct loop. Each tool is an `ag
 
 ## Built-in tools
 
-| Tool | Host or sandbox | `need_sandbox` | Description |
+| Tool | Host or sandbox | `run_in_subprocess` | Description |
 |---|---|---|---|
-| `bash` | sandbox | `True` | Run a shell command; all spawned processes tracked automatically |
-| `read` | sandbox | `True` | Read a file with line-range pagination, or list a directory |
-| `write` | sandbox | `True` | Write a file, creating parent directories as needed |
-| `edit` | sandbox | `True` | Fuzzy in-place string replacement |
-| `glob` | sandbox | `True` | Find files matching a glob pattern (`rg --files` or `find` fallback) |
-| `grep` | sandbox | `True` | Search file contents by regex (`rg --json` or Python fallback) |
+| `bash` | sandbox | `False` | Run a shell command; all spawned processes tracked automatically |
+| `read` | sandbox | `False` | Read a file with line-range pagination, or list a directory |
+| `write` | sandbox | `False` | Write a file, creating parent directories as needed |
+| `edit` | sandbox | `False` | Fuzzy in-place string replacement |
+| `glob` | sandbox | `False` | Find files matching a glob pattern (`rg --files` or `find` fallback) |
+| `grep` | sandbox | `False` | Search file contents by regex (`rg --json` or Python fallback) |
 | `webfetch` | host | `False` | Fetch a URL and convert HTML to Markdown |
 | `todowrite` | host | `False` | Persist a structured todo list to disk |
 | `ask_human` | host | `False` | Ask the user a question; blocks until a reply arrives (from UI or stdin) |
-| `daemon_release` | sandbox | `True` | Release a PID from monitoring so a long-lived service doesn't block skill completion |
-| `reserve_gpu` | sandbox | `True` | Reserve GPU access (virtual); physical GPU assigned lazily when bash runs |
-| `gpu_release` | sandbox | `True` | Return the GPU to the pool |
-| `reserve_cpu` | sandbox | `True` | Boost container CPU/memory limits for compute-intensive work |
-| `cpu_release` | sandbox | `True` | Reset CPU/memory limits back to idle defaults |
+| `daemon_release` | sandbox | `False` | Release a PID from monitoring so a long-lived service doesn't block skill completion |
+| `reserve_gpu` | sandbox | `False` | Reserve GPU access (virtual); physical GPU assigned lazily when bash runs |
+| `gpu_release` | sandbox | `False` | Return the GPU to the pool |
+| `reserve_cpu` | sandbox | `False` | Boost container CPU/memory limits for compute-intensive work |
+| `cpu_release` | sandbox | `False` | Reset CPU/memory limits back to idle defaults |
 
 All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker/podman exec`.
 
@@ -145,17 +145,17 @@ my_tool = agtool(
         },
         "required": ["a", "b"],
     },
-    # need_sandbox defaults to True for custom tools — set False if the tool
+    # run_in_subprocess defaults to True for custom tools — set False if the tool
     # runs entirely on the host (HTTP calls, file reads from the host, etc.)
-    need_sandbox=False,
+    run_in_subprocess=False,
 )
 ```
 
-### `need_sandbox` flag
+### `run_in_subprocess` flag
 
-Every `agtool` has a `need_sandbox` flag (default `True`). It controls **two** things simultaneously:
+Every `agtool` has a `run_in_subprocess` flag (default `True`). It controls **two** things simultaneously:
 
-| | `need_sandbox=True` | `need_sandbox=False` |
+| | `run_in_subprocess=True` | `run_in_subprocess=False` |
 |---|---|---|
 | **Execution context** | Worker subprocess via `ProcessPoolExecutor` | Calling thread, in-process |
 | **Sandbox container** | Started on first call if not yet running | Never touched |
@@ -164,26 +164,27 @@ Every `agtool` has a `need_sandbox` flag (default `True`). It controls **two** t
 
 **Default `True`** is the safe default for custom tools. The subprocess isolation prevents a CPU-heavy or crashing tool from blocking LLM streaming or corrupting agent state.
 
-**Set `False`** for any tool that must access host-process state — module-level singletons, UI handles, queues, or anything that lives only in the main process and would be `None` or missing in a subprocess worker:
+**Set `False`** for any tool that must access host-process state — module-level singletons, UI handles, queues, or anything that lives only in the main process and would be `None` or missing in a subprocess worker. In particular, all sandbox-backed tools (bash, read, write, edit, glob, grep, daemon_release, and the GPU/CPU tools) use `run_in_subprocess=False` because their functions close over the sandbox object directly — serialising a live sandbox connection across process boundaries does not work.
 
 ```python
 # Wrong: _agwebui._active is a singleton in the main process;
 # it is None in every subprocess worker — the tool silently fails.
-my_tool = agtool(name="notify_ui", ..., fn=_notify_fn)          # need_sandbox=True default
+my_tool = agtool(name="notify_ui", ..., fn=_notify_fn)          # run_in_subprocess=True default
 
 # Correct:
-my_tool = agtool(name="notify_ui", ..., fn=_notify_fn, need_sandbox=False)
+my_tool = agtool(name="notify_ui", ..., fn=_notify_fn, run_in_subprocess=False)
 ```
 
-Common cases that require `need_sandbox=False`:
+Common cases that require `run_in_subprocess=False`:
 
+- **Sandbox-backed tools** — their `fn` closes over the sandbox object (docker/podman exec handle); the sandbox cannot be serialised across process boundaries.
 - **`ask_human` and any human-interaction tool** — they read `_agwebui._active` to route questions to the live UI, then block-poll for a reply. In a subprocess, that singleton is `None` and stdin is an EOF pipe, so the tool either hangs or returns a timeout reply immediately.
 - **Tools that write to shared in-process state** — progress queues, event emitters, result caches.
 - **Tools that perform outbound I/O only** — HTTP requests, host file reads — where no container is needed and running in-process is simpler.
 
-> **Rule of thumb:** if the tool's function body imports or reads anything from `agency` (agents, UI handles, queues) rather than just transforming its input, set `need_sandbox=False`.
+> **Rule of thumb:** if the tool's function body imports or reads anything from `agency` (agents, UI handles, queues, sandbox handles) rather than just transforming its input, set `run_in_subprocess=False`.
 
-Exceptions thrown by `need_sandbox=False` tools are caught by `agtool.__call__` and returned as `agdata(error=...)`, exactly like sandboxed tools. The LLM sees the error and can decide how to proceed.
+Exceptions thrown by `run_in_subprocess=False` tools are caught by `agtool.__call__` and returned as `agdata(error=...)`, exactly like subprocess tools. The LLM sees the error and can decide how to proceed.
 
 Tools belong to skills, not agents. Pass custom tools when defining the skill:
 
@@ -204,7 +205,7 @@ skill = agskill("classify", "Classify this text.", replace_tools=[])
 
 ### Checkpoint revert on failure
 
-Before every `need_sandbox=True` tool call the framework snapshots the sandbox container:
+Before every sandboxed tool call the framework snapshots the sandbox container:
 
 ```
 agency/pretool-<container_name>-<call_id[:8]>
@@ -219,7 +220,7 @@ If the tool returns `agdata(error=...)`, the sandbox is automatically rolled bac
 }
 ```
 
-The LLM sees both the error and the revert notice so it can retry with a corrected approach on a clean filesystem. Revert does not happen when `need_sandbox=False`, when `sandbox` is `None`, when `commit()` failed, or when the tool succeeded.
+The LLM sees both the error and the revert notice so it can retry with a corrected approach on a clean filesystem. Revert does not happen when `run_in_subprocess=False`, when `sandbox` is `None`, when `commit()` failed, or when the tool succeeded.
 
 ### Agent-controlled timeout
 
@@ -241,7 +242,7 @@ If the serialized result exceeds the offload threshold and a sandbox is availabl
 
 ## bash process tracking
 
-The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by `_wait_for_processes` inside `agskill.run()`. See [agsandbox.md](agsandbox.md) for exec wrapper details and [execution_process_control.md](execution_process_control.md) for per-scenario process monitoring traces.
+The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by `_wait_for_processes` inside `agskill.execute_react()`. See [agsandbox.md](agsandbox.md) for exec wrapper details and [execution_process_control.md](execution_process_control.md) for per-scenario process monitoring traces.
 
 ## `daemon_release` tool
 

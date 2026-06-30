@@ -16,7 +16,7 @@ Where CPU is genuinely needed — executing a Python tool function synchronously
 |---|---|---|---|
 | `agteam` tasks | Each other | One daemon thread per `run()` call | `agteam._wrap_run` |
 | `agent` runs | Each other (forked agents) | One daemon thread per `run()` call | `agent.run()` |
-| `agskill` steps | Other agents' steps | Same thread as the owning agent task | inherited via `agent.run()` |
+| `agskill` steps | Other agents' steps | Same thread as the owning agent task | `agskill.execute_react()` (synchronous ReAct loop) |
 | `agtool` calls | Other threads / agents | `ProcessPoolExecutor(max_workers=256)` | `agtool._pool` (module-level) |
 | LLM SSE stream | Other agent threads | Background drain thread + batch queue | `agskill._iter_batched()` |
 
@@ -40,7 +40,7 @@ Using one thread per team rather than a shared pool means recursive team spawnin
 
 ## agent — per-agent task serialization
 
-Each `agent` instance serializes its own runs: `agent.run()` spawns a daemon thread that first waits for the previous task on this agent to complete (`prev_history._resolve()`). This ensures message history is updated in order even when multiple callers call `run()` on the same agent concurrently.
+Each `agent` instance serializes its own runs: `agskill.run()` (the scheduling wrapper) spawns a daemon thread that first waits for the previous task on this agent to complete (`prev_ctx.resolve_prev_dependencies()`). This ensures context is updated in order even when multiple callers call `run()` on the same agent concurrently.
 
 **Fork for parallelism.** When you need several independent runs from the same starting state, fork the agent:
 
@@ -71,7 +71,7 @@ Tool functions execute in a separate OS process via a module-level `ProcessPoolE
 
 ## LLM streaming — stream batching
 
-`agskill.run()` calls the LLM with `stream=True`. Without batching, every SSE token chunk triggers a GIL acquire/release cycle (the background SSE reader thread calls `queue.put`, the main thread calls `queue.get`), creating O(tokens) context switches per LLM call.
+`agskill.execute_react()` calls the LLM with `stream=True`. Without batching, every SSE token chunk triggers a GIL acquire/release cycle (the background SSE reader thread calls `queue.put`, the main thread calls `queue.get`), creating O(tokens) context switches per LLM call.
 
 `_iter_batched(stream)` reduces this to O(tokens / batch_size):
 
@@ -113,12 +113,13 @@ The result: at 60 tokens/s a 100 ms window buffers ~6 tokens per batch, reducing
 
 ```
 agteam.run() ──► daemon thread
-                  ├─ agent A.run() ──► daemon thread ──► agskill.run() ──► LLM (I/O, GIL released)
-                  │                                                       └─► agtool.__call__()
-                  │                                                            └─► ProcessPoolExecutor (256 procs)
-                  │                                                                 └─► worker: fn(arg) [own GIL]
-                  ├─ agent B.run() ──► daemon thread ──► agskill.run() ──► LLM (I/O, GIL released)
-                  │                    (concurrent with A)
+                  ├─ agent A.run() ──► daemon thread ──► agskill.run() [scheduling wrapper]
+                  │                                           └─► agskill.execute_react() ──► LLM (I/O, GIL released)
+                  │                                                                         └─► agtool.__call__()
+                  │                                                                              └─► ProcessPoolExecutor (256 procs)
+                  │                                                                                   └─► worker: fn(arg) [own GIL]
+                  ├─ agent B.run() ──► daemon thread ──► agskill.run() [scheduling wrapper]
+                  │                    (concurrent with A)   └─► agskill.execute_react() ──► LLM (I/O, GIL released)
                   └─ agent C.run() ──► daemon thread ──► ...
 ```
 

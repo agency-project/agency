@@ -71,5 +71,5 @@ def make_bash(sandbox: "agSandbox") -> agtool:
         ),
         params=_BASH_PARAMS,
         log_fn=_log,
-        need_sandbox=False,
+        run_in_subprocess=False,
     )

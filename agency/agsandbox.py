@@ -1017,7 +1017,7 @@ class agSandbox:
         return fork_sb
 
     def _lifecycle_tag(self) -> str:
-        return f"agency/lifecycle-{self._name}"
+        return f"agency/lifecycle-{self._name}".lower()
 
     # ------------------------------------------------------------------
     # Static helpers — image-level operations used for checkpointing.
@@ -1079,11 +1079,11 @@ class agSandbox:
         self,
         skill_name: str,
         term: "agterm | None",
-        log: "aglog | None",
-        agname: str,
-        ping_interval_s: float,
-        poll_interval_s: float,
-        _state_fn: "Callable | None" = None,
+        log: "aglog | None" = None,
+        agname: str = "",
+        ping_interval_s: float = 300,
+        poll_interval_s: float = 5,
+        state_fn: "Callable | None" = None,
     ) -> "str | None":
         """Wait for sandbox background processes after the LLM produces a final answer.
 
@@ -1092,6 +1092,13 @@ class agSandbox:
         returns a user-facing message to inject into the conversation so the
         LLM can act on the outcome.
         """
+        _term            = term
+        _log             = log
+        _agname          = agname
+        _ping_interval_s = ping_interval_s
+        _poll_interval_s = poll_interval_s
+        _state           = state_fn
+
         watched = getattr(self, "_watched_pids", None)
         if not isinstance(watched, dict) or not watched:
             return None
@@ -1100,38 +1107,38 @@ class agSandbox:
             return None
 
         summary = self.pid_status_summary()
-        if _state_fn:
-            _state_fn("proc_wait", skill=skill_name)
-        if term:
-            term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
-        if log:
-            log._lifecycle("procs_started", agname=agname, skill=skill_name,
-                           pids=list(get_live()), summary=summary)
+        if _state:
+            _state("proc_wait", skill=skill_name)
+        if _term:
+            _term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
+        if _log:
+            _log._lifecycle("procs_started", agname=_agname, skill=skill_name,
+                            pids=list(get_live()), summary=summary)
 
-        deadline = time.monotonic() + ping_interval_s
+        deadline = time.monotonic() + _ping_interval_s
         while time.monotonic() < deadline:
-            time.sleep(poll_interval_s)
+            time.sleep(_poll_interval_s)
             if not get_live():
                 break
 
         live_now = get_live()
 
         if not live_now:
-            if term:
-                term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
-            if log:
-                log._lifecycle("procs_completed", agname=agname, skill=skill_name)
+            if _term:
+                _term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
+            if _log:
+                _log._lifecycle("procs_completed", agname=_agname, skill=skill_name)
             return (
                 "Background processes have completed. "
                 "Read their output and act on the results."
             )
 
         summary = self.pid_status_summary()
-        if term:
-            term.log("PROCS ⏳  ", f"{skill_name}  still running: {summary}")
-        if log:
-            log._lifecycle("procs_ping", agname=agname, skill=skill_name,
-                           pids=list(live_now), summary=summary)
+        if _term:
+            _term.log("PROCS ⏳  ", f"{skill_name}  still running: {summary}")
+        if _log:
+            _log._lifecycle("procs_ping", agname=_agname, skill=skill_name,
+                            pids=list(live_now), summary=summary)
         return (
             f"Background processes are still running: {summary}. "
             f"You may check their output, wait, or proceed if appropriate. "

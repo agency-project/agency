@@ -9,10 +9,10 @@ Every concurrency primitive in the framework — semaphores, locks, events, and 
 ### `_llm_call_semaphore` — LLM API concurrency
 | | |
 |---|---|
-| **File** | `agency/agskill.py:288` |
+| **File** | `agency/agllm.py:32` |
 | **Type** | `threading.Semaphore(128)` |
 | **Resource** | Number of simultaneous LLM API calls across all agents |
-| **Acquisition** | `_llm_call_semaphore_slot()` context manager (line 291); wraps every `_llm_call()` invocation |
+| **Acquisition** | `_llm_call_semaphore_slot()` context manager (line 143); wraps every `call()` invocation |
 | **Release** | On context-manager exit (always, including on exception) |
 | **Timeout** | None — callers block indefinitely until a slot is free |
 
@@ -101,39 +101,39 @@ All Docker/Podman subprocess calls go through `_run()` in `agency/agsandbox.py`,
 ### `_llm_config_lock` — round-robin server selection
 | | |
 |---|---|
-| **File** | `agency/agent.py:29` |
+| **File** | `agency/agllm.py:189` |
 | **Type** | `threading.Lock` |
-| **Resource** | Global counter `_llm_config_counter` used to distribute calls across a list of LLM server configs |
-| **Acquisition** | `with _llm_config_lock:` inside `_pick_llm_config()` (line 37) |
+| **Resource** | Class-level counter `_llm_config_counter` used to distribute calls across a list of LLM server configs |
+| **Acquisition** | `with agllm._llm_config_lock:` inside `pick_llm_config()` (line 192) |
 
 ### `_global_token_lock` — global token counters
 | | |
 |---|---|
-| **File** | `agency/agent.py:346` |
+| **File** | `agency/agent.py:74` |
 | **Type** | `threading.Lock` (class variable) |
 | **Resource** | `_global_input_tokens` and `_global_output_tokens` |
-| **Acquisition** | Writer: `_add_global_tokens()` (line 350); reader: `global_token_usage()` (line 364) |
+| **Acquisition** | Writer: `_add_global_tokens()` (line 77); reader: `global_token_usage()` (line 83) |
 
-### `_agname_lock` — agent name allocation
+### `agname._lock` — agent name allocation
 | | |
 |---|---|
-| **File** | `agency/agent.py:83` |
-| **Type** | `threading.Lock` |
-| **Resource** | `_noun_counters` and `_allocated_agnames` — ensures no two agents get the same name |
-| **Acquisition** | `_register_agname()` (line 102), `_allocate_agname()` (line 114) |
+| **File** | `agency/agname.py` |
+| **Type** | `threading.Lock` (class variable on `agname`) |
+| **Resource** | `_noun_counters` — ensures no two agents get the same name |
+| **Acquisition** | `agname.claim_unique_agname()` (line 55), `agname.allocate_agname()` (line 67) |
 
 ### `_pool_lock` — process pool singleton
 | | |
 |---|---|
-| **File** | `agency/agtool.py:25` |
+| **File** | `agency/agtool.py:34` |
 | **Type** | `threading.Lock` |
 | **Resource** | `_pool` global (`ProcessPoolExecutor(max_workers=256, mp_context="spawn")`) |
-| **Acquisition** | Lazy init in `_get_pool()` (line 31); reset to `None` in tool execution error handler when `BrokenProcessPool` is caught (line 171) |
+| **Acquisition** | Lazy init in `_get_pool()` (line 37); reset to `None` in tool execution error handler when `BrokenExecutor` is caught (line 179) |
 
 ### `agterm._lock` — terminal color assignment
 | | |
 |---|---|
-| **File** | `agency/agterm.py:72` |
+| **File** | `agency/agterm.py:78` |
 | **Type** | `threading.Lock` (class variable) |
 | **Resource** | `_color_counter` and `_agname_colors` — maps agent names to ANSI color codes |
 | **Acquisition** | `agterm.__init__()` (color assignment) and `agterm.log()` (UI dispatch) |
@@ -141,7 +141,7 @@ All Docker/Podman subprocess calls go through `_run()` in `agency/agsandbox.py`,
 ### `aglog._lock` — structured log file I/O
 | | |
 |---|---|
-| **File** | `agency/aglog.py:42` |
+| **File** | `agency/aglog.py:49` |
 | **Type** | `threading.Lock` (per instance) |
 | **Resource** | `_entries` list, `_events` list, and JSON file writes |
 | **Acquisition** | `_record()`, `_tool_call()`, `_lifecycle()`, `entries` property, `token_usage` property, `events` property |
@@ -149,7 +149,7 @@ All Docker/Podman subprocess calls go through `_run()` in `agency/agsandbox.py`,
 ### `agwebui_emitter._lock` — event file and registries
 | | |
 |---|---|
-| **File** | `agency/agwebui/emitter.py:56` |
+| **File** | `agency/agwebui/emitter.py:57` |
 | **Type** | `threading.Lock` (per instance) |
 | **Resource** | JSONL event file writes, `_token_state`, `_agent_registry`, `_team_registry` |
 | **Acquisition** | `emit()`, `agent_registered()`, `team_registered()`, `token_update()`, `done()` |
@@ -157,9 +157,9 @@ All Docker/Podman subprocess calls go through `_run()` in `agency/agsandbox.py`,
 ### `server._lock` — web server event index (async)
 | | |
 |---|---|
-| **File** | `agency/agwebui/server.py:51` |
-| **Type** | `asyncio.Lock` — created in the FastAPI lifespan handler (line 68) |
-| **Resource** | `_sparse_index`, `_file_offset`, `_file_size`, `_first_ts/_last_ts`, `_clients`, `_agent_registry`, `_team_registry` |
+| **File** | `agency/agwebui/server.py:49` |
+| **Type** | `asyncio.Lock` — created in the FastAPI lifespan handler (line 217) |
+| **Resource** | `_last_event_id`, `_event_count`, `_first_ts/_last_ts`, `_clients` |
 | **Acquisition** | `async with _lock:` in `/api/timeline`, `/api/events`, `websocket_endpoint`, and the `_tail_events` background loop |
 
 ---
@@ -171,7 +171,7 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 | Variable | File | Type | Purpose |
 |---|---|---|---|
 | `q` (SimpleQueue) | `agency/tools/human.py:43` | `queue.SimpleQueue[str]` | Shuttles console `input()` reply from reader thread to tool function |
-| `self._inbox` | `agency/agent.py:426` | `queue.Queue[str]` | Per-agent inbox for `agent.send()` mid-skill messages |
+| `self.inbox` | `agency/agent.py:128` | `queue.Queue[str]` | Per-agent inbox for `agent.send()` mid-skill messages |
 
 ---
 
@@ -179,17 +179,17 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 
 | Primitive | File | Type | Slots | Resource |
 |---|---|---|---|---|
-| `_llm_call_semaphore` | agskill.py:288 | `threading.Semaphore` | 128 | LLM API call concurrency |
-| `_docker_semaphore` | agsandbox.py:44 | `threading.Semaphore` | 16 | Docker/Podman daemon call throughput |
-| `_container_semaphore` | agsandbox.py:84 | `multiprocessing.Semaphore` | `maxkeys − 5` | Simultaneously running containers (keyring quota) |
+| `_llm_call_semaphore` | agllm.py:32 | `threading.Semaphore` | 128 | LLM API call concurrency |
+| `_docker_semaphore` | agsandbox.py:46 | `threading.Semaphore` | 16 | Docker/Podman daemon call throughput |
+| `_container_semaphore` | agsandbox.py:86 | `multiprocessing.Semaphore` | `maxkeys − 5` | Simultaneously running containers (keyring quota) |
 | `_gpu_locks[id]` | agresources.py:159 | `threading.Semaphore(1)` per GPU | 1 per GPU | GPU exclusive ownership |
 | `_res_lock` | agresources.py:162 | `Lock` | — | Resource counters |
-| `_llm_config_lock` | agent.py:29 | `Lock` | — | LLM server round-robin counter |
-| `_global_token_lock` | agent.py:346 | `Lock` | — | Global token counters |
-| `_agname_lock` | agent.py:83 | `Lock` | — | Agent name uniqueness |
-| `_pool_lock` | agtool.py:25 | `Lock` | — | ProcessPoolExecutor singleton |
-| `agterm._lock` | agterm.py:72 | `Lock` | — | Terminal color assignment |
-| `aglog._lock` | aglog.py:42 | `Lock` per instance | — | Log file I/O |
-| `emitter._lock` | agwebui/emitter.py:56 | `Lock` per instance | — | Event file + registries |
-| `server._lock` | agwebui/server.py:51 | `asyncio.Lock` | — | Web server event index |
-| `self._inbox` | agent.py:426 | `Queue` (unbounded) | ∞ | Mid-skill agent inbox |
+| `_llm_config_lock` | agllm.py:189 | `Lock` | — | LLM server round-robin counter |
+| `_global_token_lock` | agent.py:74 | `Lock` | — | Global token counters |
+| `agname._lock` | agname.py | `Lock` | — | Agent name uniqueness |
+| `_pool_lock` | agtool.py:34 | `Lock` | — | ProcessPoolExecutor singleton |
+| `agterm._lock` | agterm.py:78 | `Lock` | — | Terminal color assignment |
+| `aglog._lock` | aglog.py:49 | `Lock` per instance | — | Log file I/O |
+| `emitter._lock` | agwebui/emitter.py:57 | `Lock` per instance | — | Event file + registries |
+| `server._lock` | agwebui/server.py:49 | `asyncio.Lock` | — | Web server event index |
+| `self.inbox` | agent.py:128 | `Queue` (unbounded) | ∞ | Mid-skill agent inbox |

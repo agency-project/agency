@@ -72,7 +72,7 @@ def agsync(*targets) -> None:
     team_agents = [ag for team in teams for ag in team._agents]
 
     for ag in solo_agents + team_agents:
-        ag._history._resolve()
+        ag.ctx.resolve_prev_dependencies()
 
     if errors:
         if len(errors) == 1:

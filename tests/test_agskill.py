@@ -3,13 +3,41 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 from agency.agdata import agdata, agerror
-from agency.agskill import parse_final_answer
+from agency.agcontext import agcontext
+from agency.agschema import agschema
 from agency.agskill import agskill
 from agency.agllm import LLM_MAX_RETRIES, LLM_IDLE_TIMEOUT, LLM_STREAM_TIMEOUT, agllm
 from agency.agtool import agtool
+from agency.agent import agent as _agent_cls
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
+
+
+def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s=5):
+    _ping = ping_interval_s
+    _poll = poll_interval_s
+
+    class _MockAgent:
+        agresource_pool = MagicMock()
+        ping_interval_s = _ping
+        poll_interval_s = _poll
+        _drain_inbox = _agent_cls._drain_inbox
+
+    ag = _MockAgent()
+    ag.llm = llm or LLM
+    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    ag.terminal = MagicMock()
+    ag.log = MagicMock()
+    ag.log.token_usage = {}
+    ag.agname = "test"
+    ag._set_ui_state = MagicMock()
+    ag._push_live_messages = MagicMock()
+    ag._append_full_history = MagicMock()
+    ag._next_inbox_msg = MagicMock(return_value=None)
+    ag.push_token_count_update_to_ui = MagicMock()
+    return ag
+
 
 
 def _noop(arg: agdata) -> agdata:
@@ -88,25 +116,25 @@ def test_run_returns_agdata_and_history():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"summary": "ok"}')
-        result, hist, delta, _ = s.run(LLM, agdata(text="hello"), agdata(messages=[]), sandbox=MagicMock())
+        result, ctx, delta = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(text="hello"))
     assert isinstance(result, agdata)
-    assert isinstance(hist, agdata)
+    assert isinstance(ctx, agcontext)
     assert isinstance(delta, list)
 
 
-def test_run_direct_json_response():
+def test_run_no_schema_returns_raw_content():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "42"}')
-        result, _, _, _ = s.run(LLM, agdata(q="6*7"), agdata(messages=[]), sandbox=MagicMock())
-    assert result.answer == "42"
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="6*7"))
+    assert result.result == '{"answer": "42"}'
 
 
 def test_run_plain_text_fallback():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("hello world")
-        result, _, _, _ = s.run(LLM, agdata(q="hi"), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="hi"))
     assert result.result == "hello world"
 
 
@@ -115,10 +143,10 @@ def test_run_plain_text_fallback():
 # ---------------------------------------------------------------------------
 
 def test_check_schema_accepts_python_type_objects():
-    assert agdata(x=5, name="hi").check_schema(agdata(x=int, name=str)) == []
+    assert agschema(agdata(x=int, name=str)).check(agdata(x=5, name="hi")) == []
 
 def test_check_schema_type_mismatch_with_type_object():
-    errors = agdata(x="bad").check_schema(agdata(x=int))
+    errors = agschema(agdata(x=int)).check(agdata(x="bad"))
     assert len(errors) == 1
     assert "x" in errors[0]
     assert "int" in errors[0]
@@ -150,7 +178,7 @@ def test_system_prompt_prepended_to_llm_call():
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert captured["messages"][0]["role"] == "system"
     assert captured["messages"][0]["content"] == "You are a summarisation assistant."
 
@@ -159,21 +187,21 @@ def test_system_prompt_not_in_returned_history():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
-    roles = [m["role"] for m in hist.messages]
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
+    roles = [m["role"] for m in ctx.messages]
     assert "system" not in roles
 
 
 def test_existing_history_included_in_call():
     s = make_skill()
-    prior = agdata(messages=[{"role": "user", "content": "prior"}, {"role": "assistant", "content": "ok"}])
+    prior = agcontext(messages=[{"role": "user", "content": "prior"}, {"role": "assistant", "content": "ok"}])
     captured = {}
     def capture(*args, **kwargs):
         captured["messages"] = list(kwargs.get("messages", []))  # snapshot before list is mutated
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM, agdata(x=1), prior, sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), prior, agdata(x=1))
     # system at [0], prior messages at [1] and [2], new user at [-1]
     assert captured["messages"][1]["content"] == "prior"
     assert captured["messages"][-1]["role"] == "user"
@@ -194,13 +222,13 @@ def test_tool_call_executes_and_continues():
     responses = [_tool_call("calc", {"x": 7}), _direct('{"result": 70}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, hist, delta, _ = s.run(LLM, agdata(task="calc"), agdata(messages=[]), sandbox=MagicMock())
+        result, ctx, delta = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(task="calc"))
 
     # Verify the tool ran with the right args and its output reached the LLM
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     assert len(tool_msgs) == 1
     assert json.loads(tool_msgs[0]["content"]) == {"val": 70}
-    assert result.result == 70
+    assert result.result == '{"result": 70}'
 
 
 def test_unknown_tool_error_in_history():
@@ -208,8 +236,8 @@ def test_unknown_tool_error_in_history():
     responses = [_tool_call("ghost", {}), _direct("{}")]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     assert any("unknown tool" in m["content"] for m in tool_msgs)
 
 
@@ -217,7 +245,7 @@ def test_max_steps_exceeded():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = lambda **kw: _tool_call("x", {})
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock(), max_steps=3)
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1), max_steps=3)
     assert result.error == "max_steps exceeded"
 
 
@@ -235,7 +263,7 @@ def test_replace_tools_overrides_defaults():
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert captured["tools"] is not None
     assert len(captured["tools"]) == 1
     assert captured["tools"][0]["function"]["name"] == "mt"
@@ -250,7 +278,7 @@ def test_replace_tools_empty_list_gives_no_tools():
         return _direct("{}")
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert captured["tools"] is None
 
 
@@ -273,7 +301,7 @@ def test_add_tools_extends_sandbox_defaults():
         sb.get_live_pids.return_value = set()
         sb.pid_status_summary.return_value = ""
         sb.commit.return_value = False
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sb)
+        s.execute_react(make_mock_agent(LLM, sb), agcontext(), agdata(x=1))
     names = [t["function"]["name"] for t in (captured.get("tools") or [])]
     assert "bash" in names
     assert "extra" in names
@@ -288,7 +316,7 @@ def test_input_schema_missing_field_returns_error():
         name="s", system_prompt="",
         input_schema=agdata(question=str, context=str),
     )
-    result, _, _, _ = s.run(LLM, agdata(question="hi"), agdata(messages=[]), sandbox=MagicMock())
+    result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(question="hi"))
     assert result.error is not None
     assert "context" in result.error
 
@@ -298,7 +326,7 @@ def test_input_schema_type_error_returns_error():
         name="s", system_prompt="",
         input_schema=agdata(count=int),
     )
-    result, _, _, _ = s.run(LLM, agdata(count="not-an-int"), agdata(messages=[]), sandbox=MagicMock())
+    result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(count="not-an-int"))
     assert result.error is not None
     assert "count" in result.error
 
@@ -310,7 +338,7 @@ def test_input_schema_valid_proceeds():
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": true}')
-        result, _, _, _ = s.run(LLM, agdata(text="hello"), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(text="hello"))
     assert getattr(result, "error", None) is None
 
 
@@ -322,7 +350,7 @@ def test_input_schema_description_value_only_checks_presence():
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        result, _, _, _ = s.run(LLM, agdata(query=42), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(query=42))
     assert getattr(result, "error", None) is None  # 42 is not type-checked
 
 
@@ -340,7 +368,7 @@ def test_output_schema_missing_field_triggers_retry():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(text="hi"), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(text="hi"))
     assert result.summary == "good"
 
 
@@ -352,7 +380,7 @@ def test_output_schema_retry_exhausted_returns_error():
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"wrong": 1}')
-        result, _, _, _ = s.run(LLM, agdata(q="hi"), agdata(messages=[]), sandbox=MagicMock(), max_steps=10)
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="hi"), max_steps=10)
     assert result.error is not None
     assert "output schema error" in result.error
 
@@ -372,7 +400,7 @@ def test_output_schema_type_mismatch_triggers_retry():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.count == 5
 
 
@@ -399,7 +427,7 @@ def test_correction_message_appended_on_retry():
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = side_effect
-        result, _, _, _ = s.run(LLM, agdata(q="hi"), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="hi"))
 
     assert result.answer == "fixed"
     assert len(call_messages) == 2
@@ -450,7 +478,7 @@ def test_return_output_all_fields_correct():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.summary == "great paper"
     assert result.is_duplicate is False
     assert result.score == 9
@@ -480,7 +508,7 @@ def test_return_output_type_error_immediate_feedback():
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = side_effect
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.count == 42
     # Second LLM call should see the tool error message in history.
     second_call_msgs = all_messages[1]
@@ -517,7 +545,7 @@ def test_return_output_unknown_field_error():
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = side_effect
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.summary == "correct"
 
 
@@ -534,7 +562,7 @@ def test_return_output_list_of_dicts():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.papers == papers
 
 
@@ -550,7 +578,7 @@ def test_return_output_list_str():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.tags == ["ml", "nlp"]
 
 
@@ -568,7 +596,7 @@ def test_return_output_bare_list():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.items == [{"a": 1}, {"b": 2}]
 
 
@@ -586,7 +614,7 @@ def test_return_output_bare_dict():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.meta == {"a": 1, "b": "x"}
 
 
@@ -599,7 +627,7 @@ def test_return_output_agrawstring_unchanged():
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("hello world")
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert result.text == "hello world"
 
 
@@ -620,7 +648,7 @@ def test_return_output_tool_in_openai_tools():
         MockClient.return_value.chat.completions.create.side_effect = lambda **kw: (
             captured_kwargs.append(kw) or next(responses_iter)
         )
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     first_tools = captured_kwargs[0].get("tools", [])
     assert first_tools is not None
@@ -661,7 +689,7 @@ def test_return_tool_accepts_any_key_name():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata())
     assert result.summary == "hello"
 
 
@@ -674,7 +702,7 @@ def test_return_tool_accepts_wrong_key_name():
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _, _ = s.run(LLM, agdata(), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata())
     assert result.summary == "hello"
 
 
@@ -688,7 +716,9 @@ def test_return_tool_logs_success_to_term():
     mock_term = MagicMock()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(), agdata(messages=[]), sandbox=MagicMock(), term=mock_term)
+        _ag = make_mock_agent(LLM)
+        _ag.terminal = mock_term
+        s.execute_react(_ag, agcontext(), agdata())
     calls = [str(c) for c in mock_term.log.call_args_list]
     assert any("TOOL ✓" in c for c in calls), f"Expected TOOL ✓ log call, got: {calls}"
     assert any("return_summary" in c for c in calls)
@@ -706,7 +736,9 @@ def test_return_tool_logs_validation_error_to_term():
     mock_term = MagicMock()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(), agdata(messages=[]), sandbox=MagicMock(), term=mock_term)
+        _ag = make_mock_agent(LLM)
+        _ag.terminal = mock_term
+        s.execute_react(_ag, agcontext(), agdata())
     calls = [str(c) for c in mock_term.log.call_args_list]
     assert any("TOOL ✗" in c for c in calls), f"Expected TOOL ✗ log call, got: {calls}"
     assert any("return_count" in c for c in calls)
@@ -725,7 +757,7 @@ def test_semaphore_released_after_success():
     before = _sem._value
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     assert _sem._value == before
 
 
@@ -741,7 +773,7 @@ def test_semaphore_released_after_timeout():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _timeout_iter):
         MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert result.error is not None
     assert _sem._value == before
@@ -784,7 +816,7 @@ def test_timeout_retries_all_attempts_then_error():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _timeout_iter):
         MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert result.error is not None
     assert "error" in result.error.lower()
@@ -811,7 +843,7 @@ def test_timeout_values_fixed_on_retry():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _capture_iter):
         MockClient.return_value.chat.completions.create.return_value = []
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert len(captured) == LLM_MAX_RETRIES, f"expected {LLM_MAX_RETRIES} attempts, got {len(captured)}"
     idle_vals   = [t[0] for t in captured]
@@ -843,10 +875,10 @@ def test_timeout_succeeds_after_retry():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _maybe_timeout):
         MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert getattr(result, "error", None) is None
-    assert result.answer == "ok"
+    assert result.result == '{"answer": "ok"}'
     assert call_count == 3
 
 
@@ -868,7 +900,7 @@ def test_ssl_error_retries_all_attempts_then_error():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _ssl_error_iter):
         MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert result.error is not None
     assert "error" in result.error.lower()
@@ -888,7 +920,7 @@ def test_oserror_retries_all_attempts_then_error():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _oserror_iter):
         MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert result.error is not None
     assert "error" in result.error.lower()
@@ -907,7 +939,7 @@ def test_ssl_error_releases_semaphore():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _ssl_error_iter):
         MockClient.return_value.chat.completions.create.return_value = []
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert _sem._value == before
 
@@ -930,10 +962,10 @@ def test_ssl_error_succeeds_after_retry():
     with patch("openai.OpenAI") as MockClient, \
          patch("agency.agllm._iter_batched", _maybe_ssl):
         MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert getattr(result, "error", None) is None
-    assert result.answer == "ok"
+    assert result.result == '{"answer": "ok"}'
     assert call_count == 2
 
 
@@ -961,7 +993,7 @@ def test_short_tool_output_not_offloaded():
     responses = [_tool_call("mytool", {}, "call-001"), _direct('{"ok": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     assert not written
 
@@ -982,7 +1014,7 @@ def test_long_tool_output_offloaded_to_file():
     responses = [_tool_call("fetcher", {}, "abc-123-xyz"), _direct('{"ok": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     # File was written to the sandbox
     assert len(written) == 1
@@ -992,7 +1024,7 @@ def test_long_tool_output_offloaded_to_file():
     assert big_output in next(iter(written.values()))
 
     # Tool message in history has the note, not the raw content
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     assert len(tool_msgs) == 1
     note = json.loads(tool_msgs[0]["content"])
     assert "note" in note
@@ -1014,11 +1046,11 @@ def test_long_tool_output_offloaded_to_sandbox():
     responses = [_tool_call("fetcher", {}, "call-999"), _direct('{"ok": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     # Large output must be offloaded to sandbox, not kept inline
     sandbox.write_file.assert_called_once()
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     assert len(tool_msgs) == 1
     assert "note" in tool_msgs[0]["content"]
     assert "/workspace/long_tool_call_outputs/" in tool_msgs[0]["content"]
@@ -1048,7 +1080,7 @@ def test_long_output_injects_read_tool_into_openai_tools():
             recorded_tool_schemas.append(kwargs.get("tools") or [])
             return iter(responses.pop(0))
         MockClient.return_value.chat.completions.create.side_effect = capturing_create
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     # First call: only fetcher
     first_names = [t["function"]["name"] for t in recorded_tool_schemas[0]]
@@ -1091,7 +1123,7 @@ def test_long_output_read_tool_persists_for_skill_run():
         MockClient.return_value.chat.completions.create.side_effect = capturing_create
         # read tool in tool_map needs to return something non-empty
         sandbox.read_file.return_value = "file content"
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     # All three calls see read in the schema from call 2 onward
     assert "read" not in [t["function"]["name"] for t in recorded_tool_schemas[0]]
@@ -1125,7 +1157,7 @@ def test_long_output_no_duplicate_read_when_already_present():
             recorded_tool_schemas.append(kwargs.get("tools") or [])
             return iter(responses.pop(0))
         MockClient.return_value.chat.completions.create.side_effect = capturing_create
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     # Second call must have exactly one read entry
     second_names = [t["function"]["name"] for t in recorded_tool_schemas[1]]
@@ -1151,29 +1183,29 @@ def test_tool_success_commits_and_stops():
     def fn(arg: agdata) -> agdata:
         return agdata(result="ok")
 
-    t = agtool(name="mytool", description="", fn=fn, need_sandbox=True)
+    t = agtool(name="mytool", description="", fn=fn, run_in_subprocess=True)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("mytool", {}, "c1"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     sandbox.stop.assert_called_once_with(commit=True)
 
 
 def test_tool_failure_triggers_stop_without_commit():
-    """When a need_sandbox tool returns an error, sandbox.stop(commit=False) is called."""
+    """When a run_in_subprocess tool returns an error, sandbox.stop(commit=False) is called."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
         return agerror("boom")
 
-    t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
+    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("badtool", {}, "c2"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     sandbox.stop.assert_called_once_with(commit=False)
 
@@ -1185,14 +1217,14 @@ def test_tool_failure_adds_workspace_reverted_note():
     def fn(arg: agdata) -> agdata:
         return agerror("disk full")
 
-    t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
+    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("badtool", {}, "c3"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     assert len(tool_msgs) == 1
     content = json.loads(tool_msgs[0]["content"])
     assert "error" in content
@@ -1201,56 +1233,56 @@ def test_tool_failure_adds_workspace_reverted_note():
 
 
 def test_tool_failure_no_restore_without_sandbox():
-    """When sandbox=MagicMock(), a tool error is passed through as-is with no stop attempt."""
+    """When agent_sandbox=MagicMock(), a tool error is passed through as-is with no stop attempt."""
     def fn(arg: agdata) -> agdata:
         return agerror("nope")
 
-    t = agtool(name="badtool", description="", fn=fn, need_sandbox=False)
+    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=False)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("badtool", {}, "c4"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     content = json.loads(tool_msgs[0]["content"])
     assert content["error"] == "nope"
     assert "workspace_reverted" not in content
 
 
-def test_need_sandbox_false_no_stop():
-    """Tools with need_sandbox=False must not trigger sandbox.stop()."""
+def test_run_in_subprocess_false_no_stop():
+    """Tools with run_in_subprocess=False must not trigger sandbox.stop()."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
         return agerror("oops")
 
-    t = agtool(name="hosttool", description="", fn=fn, need_sandbox=False)
+    t = agtool(name="hosttool", description="", fn=fn, run_in_subprocess=False)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("hosttool", {}, "c5"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     sandbox.stop.assert_not_called()
 
 
 def test_tool_exception_triggers_stop_without_commit():
-    """When a need_sandbox tool raises an exception, sandbox.stop(commit=False) is called."""
+    """When a run_in_subprocess tool raises an exception, sandbox.stop(commit=False) is called."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
         raise RuntimeError("exploded")
 
-    t = agtool(name="badtool", description="", fn=fn, need_sandbox=True)
+    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("badtool", {}, "c6"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sandbox)
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
     sandbox.stop.assert_called_once_with(commit=False)
-    tool_msgs = [m for m in hist.messages if m.get("role") == "tool"]
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     assert "error" in json.loads(tool_msgs[0]["content"])
 
 
@@ -1267,14 +1299,14 @@ def test_tool_timeout_uses_agent_provided_value():
     def fn(arg: agdata) -> agdata:
         return agdata(result="ok")
 
-    t = agtool(name="slow", description="", fn=fn, need_sandbox=False,
+    t = agtool(name="slow", description="", fn=fn, run_in_subprocess=False,
                params={"type": "object", "properties": {"timeout": {"type": "integer"}}})
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("slow", {"timeout": 120}, "c7"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient, \
          patch.object(agtool, "__call__", patched_call):
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert received_timeout.get("timeout") == 120
 
@@ -1292,13 +1324,13 @@ def test_tool_timeout_ignored_if_not_int():
     def fn(arg: agdata) -> agdata:
         return agdata(result="ok")
 
-    t = agtool(name="slow", description="", fn=fn, need_sandbox=False)
+    t = agtool(name="slow", description="", fn=fn, run_in_subprocess=False)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("slow", {"timeout": "forever"}, "c8"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient, \
          patch.object(agtool, "__call__", patched_call):
         MockClient.return_value.chat.completions.create.side_effect = responses
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert received_timeout.get("timeout") is None
 
@@ -1394,54 +1426,47 @@ def test_build_assistant_msg_tool_calls_sorted_by_index():
 # _drain_inbox
 # ---------------------------------------------------------------------------
 
-from agency.agskill import _drain_inbox
-
-
-def test_drain_inbox_no_inbox_fn_returns_false():
-    messages = []
-    assert _drain_inbox(messages, None, None, None) is False
-    assert messages == []
-
-
 def test_drain_inbox_empty_queue_returns_false():
+    ag = make_mock_agent()
+    ag._next_inbox_msg = MagicMock(return_value=None)
     messages = []
-    calls = iter([None])
-    assert _drain_inbox(messages, lambda: next(calls), None, None) is False
+    assert ag._drain_inbox(messages) is False
     assert messages == []
 
 
 def test_drain_inbox_single_message_appended():
+    ag = make_mock_agent()
+    ag._next_inbox_msg = MagicMock(side_effect=["hello", None])
     messages = [{"role": "system", "content": "sys"}]
-    calls = iter(["hello", None])
-    had = _drain_inbox(messages, lambda: next(calls), None, None)
+    had = ag._drain_inbox(messages)
     assert had is True
     assert messages[-1] == {"role": "user", "content": "hello"}
 
 
 def test_drain_inbox_multiple_messages_all_appended():
+    ag = make_mock_agent()
+    ag._next_inbox_msg = MagicMock(side_effect=["msg1", "msg2", None])
     messages = []
-    calls = iter(["msg1", "msg2", None])
-    _drain_inbox(messages, lambda: next(calls), None, None)
+    ag._drain_inbox(messages)
     assert len(messages) == 2
     assert messages[0]["content"] == "msg1"
     assert messages[1]["content"] == "msg2"
 
 
 def test_drain_inbox_calls_live_fn():
+    ag = make_mock_agent()
+    ag._next_inbox_msg = MagicMock(side_effect=["hi", None])
     messages = [{"role": "system", "content": "sys"}]
-    live_calls = []
-    calls = iter(["hi", None])
-    _drain_inbox(messages, lambda: next(calls), lambda m: live_calls.append(len(m)), None)
-    assert len(live_calls) == 1
+    ag._drain_inbox(messages)
+    ag._push_live_messages.assert_called_once()
 
 
 def test_drain_inbox_calls_full_history_fn():
+    ag = make_mock_agent()
+    ag._next_inbox_msg = MagicMock(side_effect=["hi", None])
     messages = []
-    history_calls = []
-    calls = iter(["hi", None])
-    _drain_inbox(messages, lambda: next(calls), None, lambda m: history_calls.append(m))
-    assert len(history_calls) == 1
-    assert history_calls[0]["content"] == "hi"
+    ag._drain_inbox(messages)
+    ag._append_full_history.assert_called_once_with({"role": "user", "content": "hi"})
 
 
 # ---------------------------------------------------------------------------
@@ -1538,7 +1563,7 @@ def test_wait_for_processes_calls_state_fn():
 
     states = []
     agSandbox.wait_for_processes(_FakeSandbox(), "myskill", None, None, "", 30, 0.01,
-                        _state_fn=lambda state, **kw: states.append(state))
+                        state_fn=lambda state, **kw: states.append(state))
     assert "proc_wait" in states
 
 
@@ -1550,15 +1575,11 @@ from agency.agtype import agrawstring
 
 
 def test_validate_input_no_schema_returns_none():
-    assert agdata(x=1).validate_input(None, False) is None
-
-
-def test_validate_input_continuation_skips_check():
-    assert agdata().validate_input(agdata(x=agrawstring), True) is None
+    assert agschema(agdata(x=int)).validate_input(agdata(x=1)) is None
 
 
 def test_validate_input_schema_mismatch_returns_error():
-    error = agdata().validate_input(agdata(x=agrawstring), False)
+    error = agschema(agdata(x=agrawstring)).validate_input(agdata())
     assert error is not None
     assert "x" in error
 
@@ -1569,7 +1590,7 @@ def test_validate_input_schema_mismatch_returns_error():
 
 def test_build_initial_messages_structure():
     s = make_skill()
-    history = agdata(messages=[{"role": "user", "content": "prior"}])
+    history = agcontext(messages=[{"role": "user", "content": "prior"}])
     msgs, n_before = s._build_initial_messages(agdata(q="hi"), history, None, None, None)
     assert msgs[0]["role"] == "system"
     assert msgs[1]["content"] == "prior"
@@ -1580,7 +1601,7 @@ def test_build_initial_messages_structure():
 def test_build_initial_messages_fires_live_fn():
     s = make_skill()
     live_calls = []
-    s._build_initial_messages(agdata(), agdata(messages=[]), None,
+    s._build_initial_messages(agdata(), agcontext(), None,
                               lambda m: live_calls.append(m), None)
     assert len(live_calls) == 1
 
@@ -1588,59 +1609,10 @@ def test_build_initial_messages_fires_live_fn():
 def test_build_initial_messages_fires_full_history_fn():
     s = make_skill()
     history_items = []
-    s._build_initial_messages(agdata(q="test"), agdata(messages=[]), None, None,
+    s._build_initial_messages(agdata(q="test"), agcontext(), None, None,
                               lambda m: history_items.append(m["role"]))
     assert "system" in history_items
     assert "user" in history_items
-
-
-# ---------------------------------------------------------------------------
-# agskill.parse_final_answer
-# ---------------------------------------------------------------------------
-
-def test_parse_final_answer_valid_json_returns_result():
-    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-    msg_dict = {"role": "assistant", "content": '{"answer": "42"}'}
-    far = parse_final_answer(msg_dict, msgs, 1, 3, (0, 0), None)
-    assert far.kind == "return"
-    assert far.return_tuple[0].answer == "42"
-
-
-def test_parse_final_answer_invalid_json_with_retries_returns_retry():
-    # Use a str (not agrawstring) field so the JSON parse path is taken.
-    output_schema = agdata(answer=str)
-    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-    msg_dict = {"role": "assistant", "content": "not json at all !!!"}
-    far = parse_final_answer(msg_dict, msgs, 1, 2, (0, 0), output_schema)
-    assert far.kind == "retry"
-    assert far.correction_msg is not None
-
-
-def test_parse_final_answer_invalid_json_no_retries_returns_error():
-    # Use a str (not agrawstring) field so the JSON parse path is taken.
-    output_schema = agdata(answer=str)
-    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-    msg_dict = {"role": "assistant", "content": "not json at all !!!"}
-    far = parse_final_answer(msg_dict, msgs, 1, 0, (0, 0), output_schema)
-    assert far.kind == "error"
-
-
-def test_parse_final_answer_rawstring_output_bypasses_json():
-    from agency.agtype import agrawstring as _agrawstring
-    output_schema = agdata(text=_agrawstring)
-    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-    msg_dict = {"role": "assistant", "content": "plain text response"}
-    far = parse_final_answer(msg_dict, msgs, 1, 3, (0, 0), output_schema)
-    assert far.kind == "return"
-    assert far.return_tuple[0].text == "plain text response"
-
-
-def test_parse_final_answer_strips_markdown_fences():
-    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-    msg_dict = {"role": "assistant", "content": '```json\n{"val": 1}\n```'}
-    far = parse_final_answer(msg_dict, msgs, 1, 3, (0, 0), None)
-    assert far.kind == "return"
-    assert far.return_tuple[0].val == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1687,13 +1659,12 @@ def test_run_continues_loop_when_sandbox_has_live_pids():
     s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = create_side_effect
-        result, _, _, _ = s.run(
-            LLM, agdata(x=1), agdata(messages=[]), sandbox=sb,
-            _ping_interval_s=0.05, _poll_interval_s=0.01,
+        result, _, _ = s.execute_react(
+            make_mock_agent(LLM, sb, ping_interval_s=0.05, poll_interval_s=0.01), agcontext(), agdata(x=1),
         )
 
     assert call_count[0] == 2   # loop re-entered once
-    assert result.done is True
+    assert result.result == '{"done": true}'
 
 
 def test_run_injects_process_completed_message():
@@ -1736,8 +1707,7 @@ def test_run_injects_process_completed_message():
     s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = create_side_effect
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=sb,
-              _ping_interval_s=30, _poll_interval_s=0.01)
+        s.execute_react(make_mock_agent(LLM, sb, ping_interval_s=30, poll_interval_s=0.01), agcontext(), agdata(x=1))
 
     # The second LLM call should have the injected proc message in its user messages
     assert len(all_messages_per_call) == 2
@@ -1766,25 +1736,11 @@ def test_run_clean_sandbox_returns_immediately():
     s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": 1}')
-        result, _, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]),
-                                sandbox=_CleanSandbox(), _ping_interval_s=0.01, _poll_interval_s=0.001)
-    assert result.ok == 1
+        result, _, _ = s.execute_react(make_mock_agent(LLM, _CleanSandbox(), ping_interval_s=0.01, poll_interval_s=0.001), agcontext(), agdata(x=1))
+    assert result.result == '{"ok": 1}'
 
 
 # ---------------------------------------------------------------------------
-# run() — _is_continuation skips input schema validation
-# ---------------------------------------------------------------------------
-
-def test_is_continuation_bypasses_input_schema():
-    s = agskill("s", "p", input_schema=agdata(required_field=agrawstring))
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        # Missing required_field — would fail schema without _is_continuation
-        result, _, _, _ = s.run(LLM, agdata(), agdata(messages=[]),
-                                sandbox=MagicMock(), _is_continuation=True)
-    assert not isinstance(result, agerror) or "input schema" not in result.error
-
-
 # ---------------------------------------------------------------------------
 # run() — thinking extraction from stream
 # ---------------------------------------------------------------------------
@@ -1807,9 +1763,9 @@ def test_run_extracts_thinking_from_think_tag():
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = [_ThinkChunk(), _UsageChunk()]
-        _, hist, _, _ = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
-    assistant_msgs = [m for m in hist.messages if m.get("role") == "assistant"]
+    assistant_msgs = [m for m in ctx.messages if m.get("role") == "assistant"]
     assert any("_thinking" in m for m in assistant_msgs)
 
 
@@ -1821,11 +1777,9 @@ def test_run_returns_token_counts():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{}')
-        _, _, _, tokens = s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
-    assert isinstance(tokens, tuple)
-    assert len(tokens) == 2
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     # _Usage stub reports prompt_tokens=5
-    assert tokens[0] == 5
+    assert ctx.total_input_tokens == 5
 
 
 # ---------------------------------------------------------------------------
@@ -1863,31 +1817,33 @@ def test_plan_mode_no_tools_sent_to_llm():
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
-        s.run(LLM, agdata(x=1), agdata(messages=[]), sandbox=MagicMock())
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assert captured["has_tools"] is False
 
 
 # ---------------------------------------------------------------------------
-# Randomised nested-schema fuzz: _hint_to_json_type + JSON round-trip + validation
+# Randomised nested-schema fuzz: type_hint_to_string_type + JSON round-trip + validation
 # ---------------------------------------------------------------------------
 
 def test_random_nested_schema_roundtrip():
     """100 randomly generated nested schemas exercising every container/leaf combination.
 
     For each trial:
-    - Python → serialized-str: _hint_to_json_type must return the correct JSON Schema
+    - Python → serialized-str: type_hint_to_string_type must return the correct JSON Schema
       type, and json.dumps must succeed.
     - Serialized-str → Python: json.loads must round-trip cleanly, and
-      _validate_output_field must accept the recovered value.
+      validate_output_field_against_schema must accept the recovered value.
     - Wrong-container rejection: a value with the opposite container type (list vs
-      dict) must be rejected by _validate_output_field for bare / generic hints that
+      dict) must be rejected by validate_output_field_against_schema for bare / generic hints that
       the framework validates at the top level.
     """
     import random
     from typing import get_origin, get_args
-    from agency.agtype import _hint_to_json_type, _validate_output_field
+    from agency.agtype import type_hint_to_string_type, validate_output_field_against_schema
     from agency.agtype import agrawstring, agtype, agfile, agbinary, agimage
+
+    _validate_output_field_against_schema = validate_output_field_against_schema
 
     rng = random.Random(20240624)
 
@@ -1947,10 +1903,10 @@ def test_random_nested_schema_roundtrip():
         exp   = ground_truth_json_type(hint)
 
         # -- Python → JSON Schema type --
-        got = _hint_to_json_type(hint)
+        got = type_hint_to_string_type(hint)
         if got != exp:
             failures.append(
-                f"[{trial}] _hint_to_json_type({hint!r}) = {got!r}, want {exp!r}"
+                f"[{trial}] type_hint_to_string_type({hint!r}) = {got!r}, want {exp!r}"
             )
             continue
 
@@ -1975,9 +1931,9 @@ def test_random_nested_schema_roundtrip():
             )
             continue
 
-        # -- Valid value must pass _validate_output_field --
+        # -- Valid value must pass validate_output_field_against_schema --
         schema = agdata(v=hint)
-        err = _validate_output_field("v", recovered, schema)
+        err = _validate_output_field_against_schema("v", recovered, schema)
         if err is not None:
             failures.append(
                 f"[{trial}] valid value rejected — hint={hint!r} value={recovered!r} err={err!r}"
@@ -1994,7 +1950,7 @@ def test_random_nested_schema_roundtrip():
                 or get_origin(hint) in (list, tuple, dict) # generic list[T] / dict[K,V] / tuple[T]
             )
             if validates_top_level:
-                err2 = _validate_output_field("v", wrong, schema)
+                err2 = _validate_output_field_against_schema("v", wrong, schema)
                 if err2 is None:
                     failures.append(
                         f"[{trial}] wrong value not rejected — hint={hint!r} wrong={wrong!r}"
@@ -2005,7 +1961,7 @@ def test_random_nested_schema_roundtrip():
 
 def test_random_schema_prompt_examples_parseable():
     """100 randomly generated schemas: the example in every auto-generated tool
-    description must be valid JSON AND must pass _validate_output_field.
+    description must be valid JSON AND must pass validate_output_field_against_schema.
 
     Also checks that error messages (wrong container type) include a parseable
     example that itself validates correctly.
@@ -2013,10 +1969,12 @@ def test_random_schema_prompt_examples_parseable():
     import random
     from typing import get_origin, get_args
     from agency.agtype import (
-        _example_for_hint, _hint_to_json_type,
-        _return_tool_descriptions, _validate_output_field,
+        get_json_example_for_type_hint, type_hint_to_string_type,
+        get_return_tool_description_prompt, validate_output_field_against_schema,
     )
     from agency.agtype import agrawstring, agtype, agfile, agbinary, agimage
+
+    _validate_output_field_against_schema = validate_output_field_against_schema
 
     rng = random.Random(20240625)
 
@@ -2042,17 +2000,17 @@ def test_random_schema_prompt_examples_parseable():
     for trial in range(100):
         hint = rand_hint(0)
 
-        # -- _example_for_hint must produce valid JSON --
-        ex_str = _example_for_hint(hint)
+        # -- get_json_example_for_type_hint must produce valid JSON --
+        ex_str = get_json_example_for_type_hint(hint)
         try:
             ex_val = json.loads(ex_str)
         except (ValueError, TypeError) as exc:
-            failures.append(f"[{trial}] _example_for_hint({hint!r}) = {ex_str!r} is not valid JSON: {exc}")
+            failures.append(f"[{trial}] get_json_example_for_type_hint({hint!r}) = {ex_str!r} is not valid JSON: {exc}")
             continue
 
-        # -- that example must pass _validate_output_field --
+        # -- that example must pass validate_output_field_against_schema --
         schema = agdata(v=hint)
-        err = _validate_output_field("v", ex_val, schema)
+        err = _validate_output_field_against_schema("v", ex_val, schema)
         if err is not None:
             failures.append(
                 f"[{trial}] example from hint {hint!r} = {ex_val!r} failed validation: {err}"
@@ -2060,7 +2018,7 @@ def test_random_schema_prompt_examples_parseable():
             continue
 
         # -- example must appear in the generated value description --
-        _, vd = _return_tool_descriptions("v", hint)
+        _, vd = get_return_tool_description_prompt("v", hint)
         if not isinstance(hint, type) or not issubclass(hint, agtype):
             # agtype delegates to its own classmethods; skip appearance check there
             if ex_str not in vd:
@@ -2070,7 +2028,7 @@ def test_random_schema_prompt_examples_parseable():
                 continue
 
         # -- the tool JSON Schema type must match the example's top-level type --
-        json_type = _hint_to_json_type(hint)
+        json_type = type_hint_to_string_type(hint)
         type_ok = (
             (json_type == "array"   and isinstance(ex_val, list))   or
             (json_type == "object"  and isinstance(ex_val, dict))   or

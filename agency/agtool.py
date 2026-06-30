@@ -7,7 +7,7 @@ import json
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agutil import format_exception
-from .agtype import _hint_to_json_type, _return_tool_descriptions
+from .agtype import type_hint_to_string_type, get_return_tool_description_prompt
 
 if TYPE_CHECKING:
     from .aglog import aglog
@@ -74,14 +74,14 @@ class agtool:
         fn: Callable[[agdata], agdata],
         params: dict | None = None,
         log_fn: "Callable[[agtool, agdata, agdata, int], None] | None" = None,
-        need_sandbox: bool = True,
+        run_in_subprocess: bool = True,
     ):
         self.name         = name
         self.description  = description
         self.fn           = fn
         self.params       = params or {"type": "object", "properties": {}}
         self._log_fn      = log_fn
-        self.need_sandbox = need_sandbox
+        self.run_in_subprocess = run_in_subprocess
         self._term:  "agterm | None" = None
         self._aglog: "aglog  | None" = None
 
@@ -97,12 +97,12 @@ class agtool:
             "fn":           self.fn,
             "params":       self.params,
             "_log_fn":      self._log_fn,
-            "need_sandbox": self.need_sandbox,
+            "run_in_subprocess": self.run_in_subprocess,
         }
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
-        self.need_sandbox = state.get("need_sandbox", True)
+        self.run_in_subprocess = state.get("run_in_subprocess", True)
         self._term  = None
         self._aglog = None
 
@@ -150,7 +150,7 @@ class agtool:
         self.log_start(arg)
         t0 = time.monotonic()
 
-        if not self.need_sandbox:
+        if not self.run_in_subprocess:
             # Run directly in the calling thread — no subprocess isolation or
             # timeout needed (caller controls blocking behaviour, e.g. ask_human).
             try:
@@ -213,8 +213,8 @@ def make_return_output_tools(schema) -> list[dict]:
     """
     tools = []
     for field, hint in schema._data.items():
-        json_type = _hint_to_json_type(hint)
-        tool_desc, value_desc = _return_tool_descriptions(field, hint)
+        json_type = type_hint_to_string_type(hint)
+        tool_desc, value_desc = get_return_tool_description_prompt(field, hint)
         value_schema: dict = {"type": json_type, "description": value_desc}
         tools.append({
             "type": "function",
@@ -245,25 +245,27 @@ TOOL_OUTPUT_OFFLOAD_CHARS: int = 40_000  # minimum floor for tool-output offload
 
 def dispatch_tools(
     tool_calls: list[dict],
-    tool_map: dict,
+    toolkit: dict,
     messages: list[dict],
     sandbox: "agSandbox",
     skill_name: str,
-    _state_fn: "Callable | None",
-    _live_messages_fn: "Callable | None",
-    _full_history_fn: "Callable | None",
+    state_fn: "Callable | None",
+    live_messages_fn: "Callable | None",
+    full_history_fn: "Callable | None",
     term: "agterm | None",
-    _intercept: "dict[str, Callable[[dict], str]] | None" = None,
     tool_offload_chars: int = TOOL_OUTPUT_OFFLOAD_CHARS,
-) -> bool:
+) -> None:
     """Execute all tool calls from one LLM response, appending results to messages.
 
-    Returns True if the read tool was lazily injected into tool_map during this
-    dispatch (because a large output was offloaded and read was not already present).
-    The caller should then add the read tool's schema to openai_tools so the LLM
-    can use it on the next step.
+    Mutates toolkit in place if the read tool is lazily injected due to a large
+    tool output being offloaded — the caller derives wire-format schemas from the
+    toolkit each iteration, so the injection is automatically visible to the LLM.
     """
-    _injected_read = False
+    _state_fn = state_fn
+    _live_fn  = live_messages_fn
+    _hist_fn  = full_history_fn
+    _term     = term
+
     for tc in tool_calls:
         fn_name = tc["function"]["name"]
         fn_args = tc["function"]["arguments"]
@@ -277,35 +279,10 @@ def dispatch_tools(
             fn_args = "{}"
             tc["function"]["arguments"] = fn_args
 
-        # Framework-internal tools (e.g. return_output) are handled in the
-        # calling thread before normal tool dispatch.
-        if _intercept and fn_name in _intercept:
-            try:
-                args = json.loads(fn_args)
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-            result_content = _intercept[fn_name](args)
-            if term:
-                try:
-                    _ret_result = json.loads(result_content)
-                except (json.JSONDecodeError, TypeError):
-                    _ret_result = {}
-                if "error" in _ret_result:
-                    term.log("TOOL ✗   ", f"{fn_name}({fn_args})  → {_ret_result['error']}")
-                else:
-                    term.log("TOOL ✓   ", f"{fn_name}({fn_args})")
-            tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
-            messages.append(tool_msg)
-            if _live_messages_fn:
-                _live_messages_fn(messages[1:])
-            if _full_history_fn:
-                _full_history_fn(tool_msg)
-            continue
-
-        t = tool_map.get(fn_name)
+        t = toolkit.get(fn_name)
         if t is None:
-            if term:
-                term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
+            if _term:
+                _term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
             result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
         else:
             try:
@@ -325,7 +302,7 @@ def dispatch_tools(
                     _state_fn("skill", skill=skill_name)
                 # Offload large tool outputs regardless of whether the tool
                 # itself uses the sandbox — fetch_paper and other add_tools have
-                # need_sandbox=False but can still produce huge outputs that
+                # run_in_subprocess=False but can still produce huge outputs that
                 # bloat the context.
                 if len(result_content) > tool_offload_chars:
                     safe_id = tc_id.replace("-", "")[:12]
@@ -339,14 +316,15 @@ def dispatch_tools(
                         result_content = json.dumps({
                             "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
                         })
-                        if "read" not in tool_map:
+                        # Inject read into the toolkit so the LLM can access the file.
+                        # The caller derives wire-format schemas from the toolkit each
+                        # iteration, so this is automatically visible on the next step.
+                        if "read" not in toolkit:
                             from .tools import make_read as _make_read
-                            _read_tool = _make_read(sandbox)
-                            tool_map["read"] = _read_tool
-                            _injected_read = True
+                            toolkit["read"] = _make_read(sandbox)
                     except Exception as _e:
                         print(f"[agtool] WARNING: failed to offload large tool output to {offload_path}: {_e}")
-                if t.need_sandbox:
+                if t.run_in_subprocess:
                     # A tool may signal failure via agdata(error=...) without raising —
                     # treat that the same as an exception: discard dirty state.
                     _result_errored = False
@@ -374,7 +352,7 @@ def dispatch_tools(
                 result_content = json.dumps({"error": format_exception(e)})
                 # On failure: remove without committing to discard dirty state.
                 # The next tool call restores from the last successful checkpoint.
-                if t.need_sandbox:
+                if t.run_in_subprocess:
                     sandbox.stop(commit=False)
                     try:
                         _result_obj = json.loads(result_content)
@@ -387,8 +365,7 @@ def dispatch_tools(
                         pass
         tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
         messages.append(tool_msg)
-        if _live_messages_fn:
-            _live_messages_fn(messages[1:])
-        if _full_history_fn:
-            _full_history_fn(tool_msg)
-    return _injected_read
+        if _live_fn:
+            _live_fn(messages[1:])
+        if _hist_fn:
+            _hist_fn(tool_msg)

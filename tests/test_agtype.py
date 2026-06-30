@@ -55,55 +55,55 @@ def test_agdata_serializes_custom_agtype():
 
 
 # ---------------------------------------------------------------------------
-# Deep nesting — _validate_value
+# Deep nesting — validate_value_against_type_hint
 # ---------------------------------------------------------------------------
 
 def test_validate_value_nested_list_str():
-    from agency.agtype import _validate_value
-    assert _validate_value(list[list[str]], [["a", "b"], ["c"]]) is None
-    assert _validate_value(list[list[str]], [["a", 1]]) is not None
+    from agency.agtype import validate_value_against_type_hint
+    assert validate_value_against_type_hint(list[list[str]], [["a", "b"], ["c"]]) is None
+    assert validate_value_against_type_hint(list[list[str]], [["a", 1]]) is not None
 
 def test_validate_value_nested_list_agfile():
-    from agency.agtype import _validate_value
+    from agency.agtype import validate_value_against_type_hint
     # agfile serialises as str; nested list of paths should validate
-    assert _validate_value(list[list[agfile]], [["/a.txt", "/b.txt"]]) is None
-    assert _validate_value(list[list[agfile]], [[123]]) is not None
+    assert validate_value_against_type_hint(list[list[agfile]], [["/a.txt", "/b.txt"]]) is None
+    assert validate_value_against_type_hint(list[list[agfile]], [[123]]) is not None
 
 def test_validate_value_dict_of_list_str():
-    from agency.agtype import _validate_value
-    assert _validate_value(dict[str, list[int]], {"k": [1, 2, 3]}) is None
-    assert _validate_value(dict[str, list[int]], {"k": ["not_int"]}) is not None
+    from agency.agtype import validate_value_against_type_hint
+    assert validate_value_against_type_hint(dict[str, list[int]], {"k": [1, 2, 3]}) is None
+    assert validate_value_against_type_hint(dict[str, list[int]], {"k": ["not_int"]}) is not None
 
 def test_validate_value_tuple_with_nested_list():
-    from agency.agtype import _validate_value
-    assert _validate_value(tuple[list[str], int], [["a", "b"], 42]) is None
-    assert _validate_value(tuple[list[str], int], [["a", "b"], "not_int"]) is not None
+    from agency.agtype import validate_value_against_type_hint
+    assert validate_value_against_type_hint(tuple[list[str], int], [["a", "b"], 42]) is None
+    assert validate_value_against_type_hint(tuple[list[str], int], [["a", "b"], "not_int"]) is not None
 
 
 # ---------------------------------------------------------------------------
-# _hint_to_json_type — moved from test_agskill.py
+# type_hint_to_string_type — moved from test_agskill.py
 # ---------------------------------------------------------------------------
 
-def test_hint_to_json_type_coverage():
-    """_hint_to_json_type maps all common Python types to correct JSON Schema types."""
-    from agency.agtype import _hint_to_json_type
-    assert _hint_to_json_type(str)         == "string"
-    assert _hint_to_json_type(int)         == "integer"
-    assert _hint_to_json_type(float)       == "number"
-    assert _hint_to_json_type(bool)        == "boolean"
-    assert _hint_to_json_type(list)        == "array"
-    assert _hint_to_json_type(list[str])   == "array"
-    assert _hint_to_json_type(tuple)       == "array"
-    assert _hint_to_json_type(tuple[str, int]) == "array"
-    assert _hint_to_json_type(dict)        == "object"
-    assert _hint_to_json_type(dict[str, int]) == "object"
-    assert _hint_to_json_type([{"k": str}]) == "array"  # literal list-of-dicts
+def testtype_hint_to_string_type_coverage():
+    """type_hint_to_string_type maps all common Python types to correct JSON Schema types."""
+    from agency.agtype import type_hint_to_string_type
+    assert type_hint_to_string_type(str)         == "string"
+    assert type_hint_to_string_type(int)         == "integer"
+    assert type_hint_to_string_type(float)       == "number"
+    assert type_hint_to_string_type(bool)        == "boolean"
+    assert type_hint_to_string_type(list)        == "array"
+    assert type_hint_to_string_type(list[str])   == "array"
+    assert type_hint_to_string_type(tuple)       == "array"
+    assert type_hint_to_string_type(tuple[str, int]) == "array"
+    assert type_hint_to_string_type(dict)        == "object"
+    assert type_hint_to_string_type(dict[str, int]) == "object"
+    assert type_hint_to_string_type([{"k": str}]) == "array"  # literal list-of-dicts
 
 
 def test_return_output_list_str_type_error():
     """list[str] with a non-str element returns a validation error."""
-    from agency.agtype import _validate_output_field
+    from agency.agtype import validate_output_field_against_schema
     schema = agdata(tags=list[str])
-    err = _validate_output_field("tags", ["good", 42], schema)
+    err = validate_output_field_against_schema("tags", ["good", 42], schema)
     assert err is not None
     assert "int" in err

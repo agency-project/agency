@@ -6,12 +6,35 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from agency.agdata import agdata, agerror
+from agency.agcontext import agcontext
 from agency.agtype import agtype, agbinary
 from agency.agskill import agskill
 from agency.agllm import agllm
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
+
+
+def _make_mock_agent(llm=None, sandbox=None):
+    from agency.agent import agent as _agent_cls
+    class _Cls:
+        agresource_pool = MagicMock()
+        ping_interval_s = 300
+        poll_interval_s = 5
+        _drain_inbox = _agent_cls._drain_inbox
+    ag = _Cls()
+    ag.llm = llm or LLM
+    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    ag.terminal = MagicMock()
+    ag.log = MagicMock()
+    ag.log.token_usage = {}
+    ag.agname = "test"
+    ag._set_ui_state = MagicMock()
+    ag._push_live_messages = MagicMock()
+    ag._append_full_history = MagicMock()
+    ag._next_inbox_msg = MagicMock(return_value=None)
+    ag.push_token_count_update_to_ui = MagicMock()
+    return ag
 
 PNG_MAGIC = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 
@@ -58,7 +81,7 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
 def _run_skill_with_sandbox(skill, responses, sandbox):
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = skill.run(LLM, agdata(), agdata(messages=[]), sandbox=sandbox)
+        result, *_ = skill.execute_react(_make_mock_agent(LLM, sandbox), agcontext(), agdata())
     return result
 
 
@@ -214,12 +237,12 @@ def test_agdata_serializes_agbinary_as_binary_file():
 # ---------------------------------------------------------------------------
 
 def test_return_tool_description_mentions_binary():
-    desc = agbinary.return_tool_description("audio")
+    desc = agbinary.get_return_tool_description("audio")
     assert "audio" in desc
     assert "binary" in desc.lower()
 
 def test_return_value_description_mentions_path_not_content():
-    desc = agbinary.return_value_description("audio")
+    desc = agbinary.get_return_tool_value_description("audio")
     assert "path" in desc.lower()
     assert "audio" in desc
 

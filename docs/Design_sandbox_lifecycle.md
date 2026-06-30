@@ -9,7 +9,7 @@ This document traces what happens in each process-spawning scenario from the mom
 Every bash tool call follows the same path into the container:
 
 ```
-agskill.run()
+agskill.execute_react()
   └─ t(agdata(command="..."))          agtool.__call__
        └─ _run_sandboxed(arg)          make_bash closure
             └─ sandbox.exec(cmd)       agsandbox.py
@@ -59,7 +59,7 @@ After every tool dispatch in `_dispatch_tools()`, the container is stopped:
 tool returns result
   ├─ success (no "error" key in result)
   │    sandbox.stop(commit=True)
-  │      docker commit → agency/lifecycle-<agname>   # snapshot /workspace
+  │      docker commit → agency/lifecycle-<agname>   # snapshot /workspace (lowercased by _lifecycle_tag())
   │      docker rm -f <container>                    # release session keyring + GPU
   │      _lifecycle_image = "agency/lifecycle-<agname>"
   │
@@ -95,7 +95,7 @@ This keeps at most one container alive per agent during active tool execution. A
 Each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a UUID prefix generated once at module import time (e.g. `r4a7f9c21`). This scopes all containers to the current process run:
 
 - Two agents with the same `agname` in different runs get different container names — no cross-run collision even if a previous run crashed without cleanup.
-- `_lifecycle_image` tags follow the same pattern: `agency/lifecycle-sandbox-{RUN_ID}-{agname}`.
+- `_lifecycle_image` tags follow the same pattern: `agency/lifecycle-sandbox-{RUN_ID}-{agname}` (all lowercased by `_lifecycle_tag()`, since Docker requires lowercase repository names).
 - Worker processes (spawned by `ProcessPoolExecutor`) inherit the parent's `_RUN_ID` because it is set at import time in the parent, so they use the same container names.
 
 ---
@@ -162,20 +162,20 @@ The warning makes accumulation visible rather than silent, and the retries handl
 
 ## Process monitoring inside agskill
 
-Background process monitoring is embedded directly in `agskill.run()`'s ReAct loop (not in an outer caller loop). Each time the LLM produces a valid final answer, the framework calls `_wait_for_processes()` before returning:
+Background process monitoring is embedded directly in `agskill.execute_react()`'s ReAct loop (not in an outer caller loop). Each time the LLM produces a valid final answer, the framework calls `_wait_for_processes()` before returning:
 
 ```python
-# inside agskill.run(), after output schema validation passes:
-if far.kind != "error" and sandbox is not None:
-    proc_msg = _wait_for_processes(
-        sandbox, self.name, term, log, agname,
-        _ping_interval_s, _poll_interval_s, _state_fn,
-    )
-    if proc_msg is not None:
-        messages.append({"role": "user", "content": proc_msg})
-        continue   # re-enter loop — LLM sees process status and acts
+# inside agskill.execute_react(), after output schema validation passes:
+result = agdata(**_collected_outputs)
+proc_msg = agSandbox.wait_for_processes(
+    ag.sandbox, self.name, ag.terminal, ag.log,
+    str(ag.agname), type(ag).ping_interval_s, type(ag).poll_interval_s, ag._set_ui_state,
+)
+if proc_msg is not None:
+    messages.append({"role": "user", "content": proc_msg})
+    continue   # re-enter loop — LLM sees process status and acts
 
-return far.return_tuple   # sandbox clean → truly done
+return (result, prev_ctx, delta_messages)   # sandbox clean → truly done
 ```
 
 `_wait_for_processes()` returns `None` immediately if `_watched_pids` is empty or `get_live_pids()` finds no active processes. Otherwise it polls until either all PIDs exit or `_ping_interval_s` elapses:
@@ -213,7 +213,7 @@ _wait_for_processes() called — train_pid is in _watched_pids
   ↳ _ensure_started() recreates container from lifecycle image
   ↳ get_live_pids() reads /proc — train_pid absent (container is fresh) → returns {}
   ↳ _watched_pids cleared → returns None immediately
-→ far.return_tuple returned
+→ (result, prev_ctx, delta_messages) returned
 
 sandbox.destroy()   # removes agency/lifecycle-<agname> image; container already gone
 aglog._record()
@@ -263,7 +263,7 @@ No `&` — the wrapper shell blocks on `python eval.py` until it exits.
 
 ```
 _wait_for_processes() called — _watched_pids is empty → returns None immediately
-→ far.return_tuple returned
+→ (result, prev_ctx, delta_messages) returned
 
 sandbox.destroy()   # removes agency/lifecycle-<agname> image; container already gone
 result_future.set_result()   ← caller unblocks
@@ -294,7 +294,7 @@ _wait_for_processes() called — train_pid is in _watched_pids
   ↳ _ensure_started(): docker run from lifecycle image (fresh container, train.py absent)
   ↳ get_live_pids() → {} (process does not exist in new container)
   ↳ _watched_pids cleared → returns None immediately
-→ far.return_tuple returned
+→ (result, prev_ctx, delta_messages) returned
 
 sandbox.destroy()
 result_future.set_result()
@@ -335,6 +335,7 @@ After both tools complete: **`sandbox.stop(commit=True)`** — container committ
 _wait_for_processes() called — _watched_pids is empty (server_pid was in _daemon_pids,
   which is cleared when container is removed)
 → returns None immediately
+→ (result, prev_ctx, delta_messages) returned
 
 sandbox.destroy()   # removes lifecycle image
 result_future.set_result()   ← caller unblocks

@@ -107,7 +107,7 @@ agtype
 | Method | Called when | Purpose |
 |---|---|---|
 | `schema_type() → str` | Schema serialization | Human-readable label in the system prompt (e.g. `"file"`, `"image"`) |
-| `needs_sandbox() → bool` | Before skill starts | Whether the sandbox must be running before `prepare()` |
+| `run_in_subprocess() → bool` | Before skill starts | Whether the sandbox must be running before `prepare()` |
 | `prepare(value, sandbox, skill, field, suffix="") → (new_value, paths)` | Before ReAct loop | Transform Python value → LLM-visible value; write sandbox files |
 | `recover(value, sandbox) → (new_value, paths)` | After ReAct loop | Transform LLM-returned string → Python value; read sandbox files |
 | `extra_input_prompt(field) → str` | System prompt build | Extra instruction injected for this input field |
@@ -301,7 +301,7 @@ The offload threshold is `max(40 000, context_limit × 0.1 × 4)` characters —
 System prompt adds:
   "Respond with plain text only — no JSON wrapping, no markdown code fences."
 
-_parse_final_answer() returns the raw text content without trying to parse JSON.
+The raw text content is returned directly without JSON parsing.
 The return_<field> tool mechanism is bypassed entirely.
 
 Caller receives: agdata(chapter="Crimson leaves descend / ...")
@@ -397,7 +397,7 @@ class agcsv(agtype):
         return "csv_file"
 
     @classmethod
-    def needs_sandbox(cls) -> bool:
+    def run_in_subprocess(cls) -> bool:
         return True
 
     @classmethod

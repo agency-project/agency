@@ -408,6 +408,21 @@ class TestGpuMarkers:
 # ---------------------------------------------------------------------------
 
 class TestAgSandboxLifecycle:
+    def test_lifecycle_tag_is_lowercase(self):
+        """_lifecycle_tag() must be fully lowercase — Docker rejects uppercase repository names."""
+        from agency.agsandbox import agSandbox
+        sb = agSandbox.__new__(agSandbox)
+        sb._name = "GenerationAgent_4816622_0000"
+        tag = sb._lifecycle_tag()
+        assert tag == tag.lower(), f"lifecycle tag must be lowercase, got {tag!r}"
+        assert "generationagent" in tag
+
+    def test_lifecycle_tag_format(self):
+        from agency.agsandbox import agSandbox
+        sb = agSandbox.__new__(agSandbox)
+        sb._name = "myagent_0000"
+        assert sb._lifecycle_tag() == "agency/lifecycle-myagent_0000"
+
     @docker
     def test_container_starts_and_destroys(self):
         sb = _make_sandbox()
