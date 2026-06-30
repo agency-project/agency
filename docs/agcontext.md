@@ -52,6 +52,22 @@ ctx.resolve_prev_dependencies()  # wait for any prior skill to finish writing st
 # ... run ReAct loop, append messages, update token counts ...
 ```
 
+### `get_resolved_messages() -> list[dict]`
+
+Blocks until any pending future resolves, then returns a snapshot of the message list. Used by `agent.history` to expose the conversation to callers without requiring them to know about the future mechanism.
+
+```python
+messages = ag.ctx.get_resolved_messages()  # safe — blocks until in-flight skill finishes
+```
+
+### `set_messages(messages: list[dict]) -> None`
+
+Replace the context's message list directly. Used by `agent.history.setter`.
+
+```python
+ag.ctx.set_messages([{"role": "user", "content": "reset"}])
+```
+
 ### `copy() -> agcontext`
 
 Returns a deep copy of this context. If the context is pending, `copy()` blocks by calling `resolve_prev_dependencies()` first, then deep-copies messages and copies the scalar fields into a fresh, non-pending `agcontext`.

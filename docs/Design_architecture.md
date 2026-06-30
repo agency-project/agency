@@ -201,10 +201,15 @@ The sandbox is created lazily on the first skill run (`is_external_sandbox=False
 - `False` (default): agskill calls `sandbox.stop(commit=True/False)` after each skill run and `sandbox.destroy()` when the agent is destroyed via `__del__`.
 - `True`: agskill skips all stop/destroy calls. The caller is fully responsible for cleanup.
 
-Use `agent.get_sandbox()` and `agent.set_sandbox(sb)` — never read/write `agent.sandbox` directly — to ensure `is_external_sandbox` stays in sync:
+`agent.sandbox` is a property backed by `agent._sandbox`:
 
-- `get_sandbox()` returns the sandbox and sets `is_external_sandbox=True`, transferring ownership to the caller.
-- `set_sandbox(sb)` destroys any existing agent-owned sandbox, attaches the new one, and sets `is_external_sandbox=True`. Pass `None` to detach (the next skill run will provision a fresh agent-owned sandbox).
+- Reading `ag.sandbox` returns `_sandbox` with no side effects — safe for internal framework use.
+- Writing `ag.sandbox = sb` goes through the property setter, which destroys any existing agent-owned sandbox before updating `_sandbox`. It does **not** change `is_external_sandbox` — agskill's internal provisioning uses this path.
+
+For external ownership transfer, use the named methods:
+
+- `get_agent_sandbox_as_external_sandbox()` — returns the sandbox and sets `is_external_sandbox=True`, transferring lifecycle responsibility to the caller.
+- `set_agent_sandbox_to_external_sandbox(sb)` — calls the property setter (cleanup) then sets `is_external_sandbox=True`. Pass `None` to detach; the next skill run provisions a fresh agent-owned sandbox.
 
 > **WARNING:** `agSandbox` wraps a live Docker container. Cleanup depends on `agSandbox.__del__` and an `atexit` handler. These do not run on SIGKILL or during interpreter shutdown when `sys.meta_path` has already been nulled. In long-running processes, call `sandbox.destroy()` explicitly when done with the container.
 

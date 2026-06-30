@@ -108,16 +108,17 @@ class agent:
         self.agname: _agname = _agname.allocate_agname(agname)
 
         # True when the sandbox was provided by the caller; agskill will NOT stop
-        # or destroy it at the end of skill runs.  Always manage this via
-        # get_sandbox() / set_sandbox() — never set it directly — to keep it
-        # in sync with self.sandbox.
+        # or destroy it at the end of skill runs.  Managed via get_agent_sandbox_as_external_sandbox() /
+        # set_agent_sandbox_to_external_sandbox() — the sandbox property setter handles cleanup but does not
+        # touch this flag, so agskill's internal provisioning leaves it intact.
         self.is_external_sandbox: bool = sandbox is not None
 
         self.llm: agllm                = llm if llm is not None else agllm(llm_config)
         self.ctx: agcontext            = agcontext()
-        # Sandbox is created lazily on first skill run — container provisioning
+        # Private backing field — accessed via the sandbox property.
+        # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
-        self.sandbox: agSandbox | None = sandbox
+        self._sandbox: "agSandbox | None" = sandbox
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{self.agname}_timeline.jsonl"
@@ -174,12 +175,11 @@ class agent:
     @property
     def history(self) -> agdata:
         """Return the current history, blocking until any in-flight task finishes."""
-        self.ctx.resolve_prev_dependencies()
-        return agdata(messages=list(self.ctx.messages))
+        return agdata(messages=self.ctx.get_resolved_messages())
 
     @history.setter
     def history(self, value: agdata) -> None:
-        self.ctx.messages = list(value._data.get("messages", []))
+        self.ctx.set_messages(value._data.get("messages", []))
 
     @property
     def full_history(self) -> list[dict]:
@@ -194,46 +194,52 @@ class agent:
         """Replace the agent's LLM config and refresh the context limit."""
         self.llm = agllm(dict(llm_config))
 
-    def get_sandbox(self) -> "agSandbox | None":
+    @property
+    def sandbox(self) -> "agSandbox | None":
+        """Read the current sandbox without transferring ownership.
+
+        Use get_agent_sandbox_as_external_sandbox() to take ownership (sets is_external_sandbox=True).
+        Assigning via ag.sandbox = sb destroys any existing agent-owned sandbox
+        and updates the backing field, but does NOT touch is_external_sandbox —
+        agskill uses this path for internal provisioning.
+        """
+        return self._sandbox
+
+    @sandbox.setter
+    def sandbox(self, value: "agSandbox | None") -> None:
+        if self._sandbox is not None and not self.is_external_sandbox:
+            try:
+                self._sandbox.destroy()
+            except Exception as _e:
+                print(f"[agent] WARNING: failed to destroy old sandbox on assignment: {_e}")
+        self._sandbox = value
+
+    def get_agent_sandbox_as_external_sandbox(self) -> "agSandbox | None":
         """Return the agent's sandbox and transfer ownership to the caller.
 
         Sets is_external_sandbox=True so agskill will no longer stop or destroy
         the container at the end of skill runs.  The caller is responsible for
-        the sandbox lifecycle from this point on — either by passing it to another
-        agent via set_sandbox(), or by letting Python's reference counting /
-        agSandbox.__del__ handle destruction when the last reference is dropped.
+        the sandbox lifecycle from this point on.
 
-        WARNING: agsandbox objects wrap live Docker containers.  If all Python
-        references are dropped without an explicit destroy() call, cleanup relies
-        on __del__ and atexit handlers, which may not run during SIGKILL or
-        interpreter shutdown.  In long-running processes or when using many
-        sandboxes, call sandbox.destroy() explicitly when done.
+        WARNING: agsandbox objects wrap live Docker containers.  Cleanup relies
+        on __del__ and atexit handlers, which may not run on SIGKILL or during
+        interpreter shutdown.  In long-running processes, call destroy() explicitly.
         """
         self.is_external_sandbox = True
-        return self.sandbox
+        return self._sandbox
 
-    def set_sandbox(self, sandbox: "agSandbox | None") -> None:
-        """Attach an external sandbox to this agent.
+    def set_agent_sandbox_to_external_sandbox(self, sandbox: "agSandbox | None") -> None:
+        """Attach an external sandbox and transfer ownership to this agent.
 
-        If this agent currently owns a sandbox (is_external_sandbox=False), that
-        sandbox is destroyed before the new one is attached to avoid leaking a
-        container.
+        Destroys any existing agent-owned sandbox before attaching the new one.
+        Sets is_external_sandbox=True so agskill will not manage this sandbox's
+        lifecycle.  Pass None to detach — the next skill run provisions a fresh
+        agent-owned sandbox.
 
-        Sets is_external_sandbox=True so agskill will not stop or destroy the
-        container at the end of skill runs.  Pass None to detach — the next skill
-        run will provision a fresh sandbox owned by this agent.
-
-        WARNING: agsandbox objects wrap live Docker containers.  Passing a sandbox
-        to multiple agents shares a single container; only the last agent to finish
-        should destroy it (or rely on reference counting / __del__).  Use
-        is_external_sandbox to verify ownership before calling destroy().
+        WARNING: sharing a sandbox across agents means only the last holder
+        should destroy it.  Use is_external_sandbox to check ownership.
         """
-        if self.sandbox is not None and not self.is_external_sandbox:
-            try:
-                self.sandbox.destroy()
-            except Exception as _e:
-                print(f"[agent] WARNING: failed to destroy old sandbox before set_sandbox: {_e}")
-        self.sandbox = sandbox
+        self.sandbox = sandbox          # property setter handles cleanup
         self.is_external_sandbox = sandbox is not None
 
     def set_full_history(self, history: list[dict]) -> None:
@@ -365,8 +371,9 @@ class agent:
             print(f"[agent] WARNING: __del__ log failed for {getattr(self, 'agname', '?')}: {_e}")
         if not getattr(self, "is_external_sandbox", False):
             try:
-                if self.sandbox is not None:
-                    self.sandbox.destroy()
+                sb = getattr(self, "_sandbox", None)
+                if sb is not None:
+                    sb.destroy()
             except Exception as _e:
                 print(f"[agent] WARNING: sandbox.destroy() failed in __del__ for {getattr(self, 'agname', '?')}: {_e}")
 
@@ -384,7 +391,7 @@ class agent:
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
         _out = Path(cls.output_dir) / ag.agname if cls.output_dir else None
-        ag.sandbox = src.sandbox.fork(ag.agname, output_dir=_out) if src.sandbox is not None else None
+        ag._sandbox = src.sandbox.fork(ag.agname, output_dir=_out) if src.sandbox is not None else None
         log_dir  = Path(cls.log_dir) if cls.log_dir is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{ag.agname}_timeline.jsonl"
         ag.log   = aglog(path=log_path)
@@ -530,7 +537,7 @@ class agent:
         ag.llm           = agllm({**state.get("llm_config", {}), **llm_config})
         ag.ctx           = agcontext(messages=list(state.get("history", [])))
         _out = Path(cls.output_dir) / ag.agname if cls.output_dir else None
-        ag.sandbox       = agSandbox(ag.agname, output_dir=_out, checkpoint_image=checkpoint) if checkpoint else None
+        ag._sandbox      = agSandbox(ag.agname, output_dir=_out, checkpoint_image=checkpoint) if checkpoint else None
 
         log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
         ag.log   = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl")

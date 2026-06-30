@@ -56,6 +56,15 @@ class agcontext:
     # Helpers
     # ------------------------------------------------------------------
 
+    def get_resolved_messages(self) -> "list[dict]":
+        """Block until pending, then return a snapshot of the message list."""
+        self.resolve_prev_dependencies()
+        return list(self.messages)
+
+    def set_messages(self, messages: "list[dict]") -> None:
+        """Replace the message list directly."""
+        self.messages = list(messages)
+
     def copy(self) -> "agcontext":
         """Return a deep copy of the resolved context (blocks if pending)."""
         self.resolve_prev_dependencies()

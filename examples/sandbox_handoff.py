@@ -11,8 +11,8 @@ This example showcases three sandbox interaction patterns:
   4. Harness runs the fixed file to confirm the repair.
 
 Key APIs demonstrated:
-  - agent.get_sandbox()    : retrieve the running container after a skill run
-  - agent.set_sandbox(sb)  : attach an external sandbox; automatically sets
+  - agent.get_agent_sandbox_as_external_sandbox()    : retrieve the running container after a skill run
+  - agent.set_agent_sandbox_to_external_sandbox(sb)  : attach an external sandbox; automatically sets
                              is_external_sandbox=True so the framework will not
                              stop or destroy it when the skill finishes
   - sandbox.exec(cmd)      : run a shell command in the container from Python
@@ -115,7 +115,7 @@ def main() -> None:
     # ── Step 2: harness gets the sandbox and runs the file ───────────────────
     _sep("Step 2 — harness takes the sandbox and runs hello.py")
 
-    sandbox = agent_a.get_sandbox()    # ← get the running container
+    sandbox = agent_a.get_agent_sandbox_as_external_sandbox()    # ← get the running container
     assert sandbox is not None, "sandbox not started — did the skill run complete?"
 
     content_before = sandbox.read_file(FILE_PATH)
@@ -144,10 +144,10 @@ def main() -> None:
     # ── Step 4: second agent receives the sandbox and fixes the bug ──────────
     _sep("Step 4 — agent_b receives the sandbox as external and fixes the bug")
 
-    # set_sandbox() marks is_external_sandbox=True — the framework will not
+    # set_agent_sandbox_to_external_sandbox() marks is_external_sandbox=True — the framework will not
     # stop or destroy the container when agent_b's skill finishes.
     agent_b = agent(llm_config=LLM_CONFIG)
-    agent_b.set_sandbox(sandbox)
+    agent_b.set_agent_sandbox_to_external_sandbox(sandbox)
     print(f"  agent_b.is_external_sandbox : {agent_b.is_external_sandbox}")
 
     result_b = agent_b.run(
