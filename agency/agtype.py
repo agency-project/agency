@@ -745,7 +745,7 @@ def get_return_tool_description_prompt(field_name: str, type_hint) -> "tuple[str
     tool_desc = (
         f"Use this tool to return the final value for the '{field_name}' output field, by supplying it as an argument to this tool. "
         f"You must pass the actual output content as the '{field_name}' argument. Simply outputting the context and calling this tool without passing an argument will not work. "
-        f'Format Example (JSON): {{"{field_name}": "{ex}"}}'
+        f'Format Example (JSON): {{"{field_name}": {ex}}}'
     )
     # agtype subclass — delegate to its classmethods
     if isinstance(type_hint, type) and issubclass(type_hint, agtype):

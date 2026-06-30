@@ -9,7 +9,7 @@ from agency import agent, agskill, agdata
 from agency.agtool import agtool
 
 LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:18000/v1"),
+    "base_url": os.environ.get("VLLM_BASE_URL", ""),
     "api_key":  os.environ.get("VLLM_API_KEY", ""),
     "model":    os.environ.get("VLLM_MODEL",   ""),
     "temperature":       0.6,

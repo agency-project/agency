@@ -131,7 +131,7 @@ Each call to `agskill.execute_react()` runs the following steps:
    g. Append the tool result message and go to 3
 8. If response has no tool calls → check if all required output fields have been registered
 9. If fields are missing and retries remain → inject reprompt message listing missing fields, go to 3
-10. If sandbox has live background processes → `_wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
+10. If sandbox has live background processes → `agSandbox.wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
 12. Delete offloaded input files, return `(result, updated_ctx, delta)`
 
 The loop exits early when `max_steps` (default `AGSKILL_REACT_MAX_STEPS = 4096`) is exceeded.
@@ -358,7 +358,6 @@ Only top-level string fields are auto-offloaded. Non-string values (integers, bo
 
 Input is validated against `input_schema` before the loop starts. Validation checks that all required fields are present and have the correct Python type. If validation fails, the skill returns immediately with an `agdata(error=...)` without calling the LLM.
 
-Input validation is **skipped** when `_is_continuation=True` so that process-status messages injected by `_wait_for_processes` can flow through without matching the skill's declared input schema.
 
 ## Output collection via tools
 
@@ -410,7 +409,7 @@ else:
     return result
 ```
 
-The LLM receives the status message, can read log files or call more tools, then produces another final answer — which triggers another `_wait_for_processes` check. The skill only exits when `_wait_for_processes` returns `None` (no live watched PIDs).
+The LLM receives the status message, can read log files or call more tools, then produces another final answer — which triggers another `agSandbox.wait_for_processes` check. The skill only exits when `agSandbox.wait_for_processes` returns `None` (no live watched PIDs).
 
 `ping_interval_s` and `poll_interval_s` are class-level attributes on `agent` (defaults 300 s and 5 s) passed through to `agskill.run()` at call time. The total number of monitoring continuations is bounded by `max_steps`.
 

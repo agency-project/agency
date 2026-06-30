@@ -15,7 +15,7 @@ Where CPU is genuinely needed — executing a Python tool function synchronously
 | Object | Parallelized against | Mechanism | Where defined |
 |---|---|---|---|
 | `agteam` tasks | Each other | One daemon thread per `run()` call | `agteam._wrap_run` |
-| `agent` runs | Each other (forked agents) | One daemon thread per `run()` call | `agent.run()` |
+| `agent` runs | Each other (forked agents) | One daemon thread per `run()` call | `agskill.run()` |
 | `agskill` steps | Other agents' steps | Same thread as the owning agent task | `agskill.execute_react()` (synchronous ReAct loop) |
 | `agtool` calls | Other threads / agents | `ProcessPoolExecutor(max_workers=256)` | `agtool._pool` (module-level) |
 | LLM SSE stream | Other agent threads | Background drain thread + batch queue | `agskill._iter_batched()` |
@@ -45,11 +45,11 @@ Each `agent` instance serializes its own runs: `agskill.run()` (the scheduling w
 **Fork for parallelism.** When you need several independent runs from the same starting state, fork the agent:
 
 ```python
-results = [agent(ag).run(summarise_skill, agdata(text=t)) for t in texts]
+results = [agent.fork(ag).run(summarise_skill, agdata(text=t)) for t in texts]
 # All three forks run concurrently, each in its own thread
 ```
 
-Each `agent(ag)` deep-copies the history at that instant and starts its work in an independent thread. The parent agent's history is never touched.
+Each `agent.fork(ag)` deep-copies the history at that instant and starts its work in an independent thread. The parent agent's history is never touched.
 
 ## agskill — intra-agent ReAct steps
 
@@ -93,7 +93,7 @@ The result: at 60 tokens/s a 100 ms window buffers ~6 tokens per batch, reducing
 
 ### Scaling
 
-- **Agent / team threads:** Each `agent.run()` and each `agteam.run()` spawns one daemon thread. Thread creation costs ~100 µs — negligible compared to any LLM call. OS thread limits (typically 10 000+) are the only ceiling; in practice memory is the binding constraint (~1–8 MB stack per thread).
+- **Agent / team threads:** Each `agskill.run()` (invoked by `agent.run()`) and each `agteam.run()` spawns one daemon thread. Thread creation costs ~100 µs — negligible compared to any LLM call. OS thread limits (typically 10 000+) are the only ceiling; in practice memory is the binding constraint (~1–8 MB stack per thread).
 - **Process pool (256 workers):** Workers are OS processes created lazily on first call using `fork`. Fork overhead is ~5–20 ms. At extreme concurrency (hundreds of simultaneous tool calls), new workers are created on demand; subsequent calls reuse the warm pool.
 - **Memory:** Each process worker loads the full Python interpreter and all imported modules (~30–50 MB RSS typical). 256 workers = up to ~10 GB RSS if all are active. In practice, workers are created on demand and the OS reclaims pages from idle workers.
 
@@ -113,14 +113,17 @@ The result: at 60 tokens/s a 100 ms window buffers ~6 tokens per batch, reducing
 
 ```
 agteam.run() ──► daemon thread
-                  ├─ agent A.run() ──► daemon thread ──► agskill.run() [scheduling wrapper]
-                  │                                           └─► agskill.execute_react() ──► LLM (I/O, GIL released)
-                  │                                                                         └─► agtool.__call__()
-                  │                                                                              └─► ProcessPoolExecutor (256 procs)
-                  │                                                                                   └─► worker: fn(arg) [own GIL]
-                  ├─ agent B.run() ──► daemon thread ──► agskill.run() [scheduling wrapper]
-                  │                    (concurrent with A)   └─► agskill.execute_react() ──► LLM (I/O, GIL released)
-                  └─ agent C.run() ──► daemon thread ──► ...
+                  ├─ agent A.run() [delegator]
+                  │       └─► agskill.run() ──► daemon thread
+                  │                                 └─► agskill.execute_react() ──► LLM (I/O, GIL released)
+                  │                                                               └─► agtool.__call__()
+                  │                                                                    └─► ProcessPoolExecutor (256 procs)
+                  │                                                                         └─► worker: fn(arg) [own GIL]
+                  ├─ agent B.run() [delegator]
+                  │       └─► agskill.run() ──► daemon thread (concurrent with A)
+                  │                                 └─► agskill.execute_react() ──► LLM (I/O, GIL released)
+                  └─ agent C.run() [delegator]
+                          └─► agskill.run() ──► daemon thread ──► ...
 ```
 
 LLM calls from agents A, B, C all block on I/O simultaneously — GIL is irrelevant there. Tool calls from any agent are offloaded to the process pool and run in parallel with each other and with all LLM calls.

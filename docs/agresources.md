@@ -36,7 +36,7 @@ Each GPU ID gets a `threading.Semaphore(1)`. `acquire_gpu()` is called internall
 
 `cpu_acquire` calls `docker update --cpus=N --memory=Mg` on the live container, adjusting Linux cgroup limits without restarting. `0.5` CPUs means the container is throttled to at most half a core's worth of CPU time — it can see all cores but is rate-limited at the cgroup level. `cpu_release` resets to the idle defaults.
 
-Idle defaults (`idle_cpus=0.5`, `idle_memory="512m"`) are restored by `release_resources()` when a skill completes.
+CPU and memory limits are set by the sandbox on each tool call via `update_limits()` and are not automatically restored by agresources. `release_resources()` is a manual call to reduce an `agSandbox`'s reported resource usage in the pool (e.g. when the sandbox is destroyed externally).
 
 ## Agent-callable resource tools
 

@@ -1,5 +1,7 @@
 # Container Sandboxing
 
+> **Lifecycle warning:** `agSandbox` wraps a live Docker/Podman container. Cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. To share a sandbox between agents, use `agent.get_sandbox()` / `agent.set_sandbox(sb)` — not direct attribute access — so the `is_external_sandbox` ownership flag stays correct and agskill knows not to destroy a container it doesn't own.
+
 All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
 
 ## Runtime detection
@@ -57,14 +59,14 @@ All agents can write to `/agent_output/<own-agname>/` inside the container; file
 ## Forking
 
 ```
-parent._checkpoint ──docker tag──▶ agency/ckpt-<pid>-<fork-agname>
+parent.sandbox._checkpoint_image ──docker tag──▶ agency/lifecycle-<fork-agname>
                                             │
                                      (consumed by fork's first _task())
 ```
 
 Forking copies the parent's checkpoint image tag to a new tag for the fork via `docker tag`. No container is created at fork time — the fork's container is created lazily when the fork's first `_task()` runs, restoring from the copied tag.
 
-Because forks wait for `src._ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
+Because forks wait for `src.ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
 ## exec wrapper
 

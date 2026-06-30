@@ -16,7 +16,7 @@ The common thread (no pun intended): a shared object is called or read from mult
 
 ## Background: how agent history serialization works
 
-Every `agent` instance maintains a `ctx` future chain. Each call to `agent.run()` reads the current tail of the chain as `prev_ctx` and writes a new pending future as the new tail:
+Every `agent` instance maintains a `ctx` future chain. Each call to `agskill.run()` reads the current tail of the chain as `prev_ctx` and writes a new pending future as the new tail (`ag.ctx = agcontext(_future=ctx_future)`). `agent.run()` is a thin delegator that forwards to `agskill.run()` — it does not manage the chain itself.
 
 ```
 agent.run() call 1:  prev_ctx = empty   →  ctx = hf1
@@ -24,9 +24,9 @@ agent.run() call 2:  prev_ctx = hf1     →  ctx = hf2
 agent.run() call 3:  prev_ctx = hf2     →  ctx = hf3
 ```
 
-Each task waits for `prev_ctx` to resolve before starting its LLM call. This serializes calls on the same agent in **registration order** — the order in which `agent.run()` was actually called.
+Each task waits for `prev_ctx` to resolve before starting its LLM call. This serializes calls on the same agent in **registration order** — the order in which `agskill.run()` was actually called (triggered via `agent.run()`).
 
-This mechanism is safe as long as `agent.run()` is only called from a single thread at a time. When multiple threads call `agent.run()` on the same instance concurrently, the registration order is non-deterministic. If the resulting order inverts a data dependency, a deadlock forms.
+This mechanism is safe as long as `agskill.run()` (and thus `agent.run()`) is only called from a single thread at a time. When multiple threads call `agent.run()` on the same instance concurrently, `agskill.run()` registers on the chain in non-deterministic order. If the resulting order inverts a data dependency, a deadlock forms.
 
 ## Why data dependencies do not prevent the race
 
@@ -48,8 +48,8 @@ class WriterTeam(agteam):
 
     def run(self, scene_goal, design_doc, previous_scenes=""):
         feedback_doc  = self.feedback_team.run(...)          # FT1 — starts its own thread
-        plan_doc      = planner.run(agdata(feedback=feedback_doc, ...))
-        current_draft = writer.run(agdata(plan=plan_doc, ...))
+        plan_doc      = planner.run(plan_skill, agdata(feedback=feedback_doc, ...))
+        current_draft = writer.run(write_skill, agdata(plan=plan_doc, ...))
         review        = self.feedback_team.run(draft=current_draft, ...)  # FT2 — starts its own thread
 ```
 

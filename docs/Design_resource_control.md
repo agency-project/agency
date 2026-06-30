@@ -19,7 +19,7 @@ Every concurrency primitive in the framework — semaphores, locks, events, and 
 ### `_docker_semaphore` — Docker/Podman daemon call throughput
 | | |
 |---|---|
-| **File** | `agency/agsandbox.py:44` |
+| **File** | `agency/agsandbox.py:46` |
 | **Type** | `threading.Semaphore(16)` |
 | **Resource** | All Docker/Podman subprocess calls — held for the duration of every `_run()` invocation |
 | **Acquisition** | `with _docker_semaphore:` inside `_run()` |
@@ -32,7 +32,7 @@ The Docker/Podman daemon serializes most operations internally (GPU init via the
 ### `_container_semaphore` — simultaneously running container cap
 | | |
 |---|---|
-| **File** | `agency/agsandbox.py:84` |
+| **File** | `agency/agsandbox.py:86` |
 | **Type** | `multiprocessing.Semaphore(_docker_container_limit())` |
 | **Resource** | Number of simultaneously running Docker containers, derived from the Linux kernel session-keyring quota |
 | **Acquisition** | `_container_semaphore.acquire()` inside `_ensure_started()`, immediately before `docker run` |
@@ -60,11 +60,11 @@ Automatic startup cleanup was considered and rejected: it would destroy containe
 ### `_gpu_locks[gpu_id]` — per-GPU ownership
 | | |
 |---|---|
-| **File** | `agency/agresources.py:159` |
+| **File** | `agency/agresources.py:180` |
 | **Type** | `dict[int, threading.Semaphore(1)]` — one binary semaphore per GPU index |
 | **Resource** | Exclusive ownership of one physical GPU |
-| **Acquisition** | Non-blocking poll inside `acquire_gpu()` (line 221): `sem.acquire(blocking=False)`; the method loops over all GPU semaphores sleeping 0.25 s between passes until one succeeds or a deadline is exceeded |
-| **Release** | `pool.release_gpu(gpu_id)` calls `sem.release()` (line 237); guarded by a `try/except ValueError` to prevent crashes on accidental double-release |
+| **Acquisition** | Non-blocking poll inside `acquire_gpu()` (line 199): `sem.acquire(blocking=False)`; the method loops over all GPU semaphores sleeping 0.25 s between passes until one succeeds or a deadline is exceeded |
+| **Release** | `pool.release_gpu(gpu_id)` calls `sem.release()` (line 215); guarded by a `try/except ValueError` to prevent crashes on accidental double-release |
 | **Timeout** | Optional `timeout` parameter on `acquire_gpu()`; raises `TimeoutError` if deadline passed |
 
 ---
@@ -93,7 +93,7 @@ All Docker/Podman subprocess calls go through `_run()` in `agency/agsandbox.py`,
 ### `_res_lock` — resource counter integrity
 | | |
 |---|---|
-| **File** | `agency/agresources.py:162` |
+| **File** | `agency/agresources.py:183` |
 | **Type** | `threading.Lock` |
 | **Resource** | Counters `_gpus_acquired`, `cpus_acquired`, `memory_acquired_mb` |
 | **Acquisition** | `with self._res_lock:` around all counter increments and decrements in `acquire_gpu`, `release_gpu`, `acquire_resources`, `release_resources` |
@@ -128,7 +128,7 @@ All Docker/Podman subprocess calls go through `_run()` in `agency/agsandbox.py`,
 | **File** | `agency/agtool.py:34` |
 | **Type** | `threading.Lock` |
 | **Resource** | `_pool` global (`ProcessPoolExecutor(max_workers=256, mp_context="spawn")`) |
-| **Acquisition** | Lazy init in `_get_pool()` (line 37); reset to `None` in tool execution error handler when `BrokenExecutor` is caught (line 179) |
+| **Acquisition** | Lazy init in `_get_pool()` (line 37); reset to `None` in tool execution error handler when `BrokenExecutor` is caught (line 175) |
 
 ### `agterm._lock` — terminal color assignment
 | | |
@@ -171,7 +171,7 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 | Variable | File | Type | Purpose |
 |---|---|---|---|
 | `q` (SimpleQueue) | `agency/tools/human.py:43` | `queue.SimpleQueue[str]` | Shuttles console `input()` reply from reader thread to tool function |
-| `self.inbox` | `agency/agent.py:128` | `queue.Queue[str]` | Per-agent inbox for `agent.send()` mid-skill messages |
+| `self.inbox` | `agency/agent.py:131` | `queue.Queue[str]` | Per-agent inbox for `agent.send()` mid-skill messages |
 
 ---
 
@@ -182,8 +182,8 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 | `_llm_call_semaphore` | agllm.py:32 | `threading.Semaphore` | 128 | LLM API call concurrency |
 | `_docker_semaphore` | agsandbox.py:46 | `threading.Semaphore` | 16 | Docker/Podman daemon call throughput |
 | `_container_semaphore` | agsandbox.py:86 | `multiprocessing.Semaphore` | `maxkeys − 5` | Simultaneously running containers (keyring quota) |
-| `_gpu_locks[id]` | agresources.py:159 | `threading.Semaphore(1)` per GPU | 1 per GPU | GPU exclusive ownership |
-| `_res_lock` | agresources.py:162 | `Lock` | — | Resource counters |
+| `_gpu_locks[id]` | agresources.py:180 | `threading.Semaphore(1)` per GPU | 1 per GPU | GPU exclusive ownership |
+| `_res_lock` | agresources.py:183 | `Lock` | — | Resource counters |
 | `_llm_config_lock` | agllm.py:189 | `Lock` | — | LLM server round-robin counter |
 | `_global_token_lock` | agent.py:74 | `Lock` | — | Global token counters |
 | `agname._lock` | agname.py | `Lock` | — | Agent name uniqueness |
@@ -192,4 +192,4 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 | `aglog._lock` | aglog.py:49 | `Lock` per instance | — | Log file I/O |
 | `emitter._lock` | agwebui/emitter.py:57 | `Lock` per instance | — | Event file + registries |
 | `server._lock` | agwebui/server.py:49 | `asyncio.Lock` | — | Web server event index |
-| `self.inbox` | agent.py:128 | `Queue` (unbounded) | ∞ | Mid-skill agent inbox |
+| `self.inbox` | agent.py:131 | `Queue` (unbounded) | ∞ | Mid-skill agent inbox |

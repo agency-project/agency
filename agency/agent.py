@@ -107,10 +107,13 @@ class agent:
 
         self.agname: _agname = _agname.allocate_agname(agname)
 
+        # True when the sandbox was provided by the caller; agskill will NOT stop
+        # or destroy it at the end of skill runs.  Always manage this via
+        # get_sandbox() / set_sandbox() — never set it directly — to keep it
+        # in sync with self.sandbox.
         self.is_external_sandbox: bool = sandbox is not None
 
         self.llm: agllm                = llm if llm is not None else agllm(llm_config)
-        # Context of the agent. resolve_prev_dependencies() must be called before using it to resolve future and update the context to the latest state.
         self.ctx: agcontext            = agcontext()
         # Sandbox is created lazily on first skill run — container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -190,6 +193,48 @@ class agent:
     def set_llm_config(self, llm_config: dict) -> None:
         """Replace the agent's LLM config and refresh the context limit."""
         self.llm = agllm(dict(llm_config))
+
+    def get_sandbox(self) -> "agSandbox | None":
+        """Return the agent's sandbox and transfer ownership to the caller.
+
+        Sets is_external_sandbox=True so agskill will no longer stop or destroy
+        the container at the end of skill runs.  The caller is responsible for
+        the sandbox lifecycle from this point on — either by passing it to another
+        agent via set_sandbox(), or by letting Python's reference counting /
+        agSandbox.__del__ handle destruction when the last reference is dropped.
+
+        WARNING: agsandbox objects wrap live Docker containers.  If all Python
+        references are dropped without an explicit destroy() call, cleanup relies
+        on __del__ and atexit handlers, which may not run during SIGKILL or
+        interpreter shutdown.  In long-running processes or when using many
+        sandboxes, call sandbox.destroy() explicitly when done.
+        """
+        self.is_external_sandbox = True
+        return self.sandbox
+
+    def set_sandbox(self, sandbox: "agSandbox | None") -> None:
+        """Attach an external sandbox to this agent.
+
+        If this agent currently owns a sandbox (is_external_sandbox=False), that
+        sandbox is destroyed before the new one is attached to avoid leaking a
+        container.
+
+        Sets is_external_sandbox=True so agskill will not stop or destroy the
+        container at the end of skill runs.  Pass None to detach — the next skill
+        run will provision a fresh sandbox owned by this agent.
+
+        WARNING: agsandbox objects wrap live Docker containers.  Passing a sandbox
+        to multiple agents shares a single container; only the last agent to finish
+        should destroy it (or rely on reference counting / __del__).  Use
+        is_external_sandbox to verify ownership before calling destroy().
+        """
+        if self.sandbox is not None and not self.is_external_sandbox:
+            try:
+                self.sandbox.destroy()
+            except Exception as _e:
+                print(f"[agent] WARNING: failed to destroy old sandbox before set_sandbox: {_e}")
+        self.sandbox = sandbox
+        self.is_external_sandbox = sandbox is not None
 
     def set_full_history(self, history: list[dict]) -> None:
         self._full_history = copy.deepcopy(history)

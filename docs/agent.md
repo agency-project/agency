@@ -1,6 +1,6 @@
 # Agent
 
-The `agent` class is the top-level orchestrator. It manages a sandbox container lifecycle, a shared conversation history, and a pool of tools. Skills are passed directly to `run()` and always run asynchronously; the caller blocks only when it reads a result field.
+The `agent` class is the top-level orchestrator. It manages a sandbox container lifecycle and a shared conversation history. Skills are passed directly to `run()` and always run asynchronously; the caller blocks only when it reads a result field.
 
 ## Construction
 
@@ -18,7 +18,7 @@ ag = agent(
 
 `llm_config` is passed to every skill run. Any OpenAI-compatible endpoint works via `base_url`.
 
-No container is created at construction time. Within a task, a container is started lazily — only when a tool with `run_in_subprocess=True` is first called. Tasks that use only host-side tools never create a container at all. When a container is started, it is committed to a checkpoint image (`agency/ckpt-<pid>-<agname>`) when the task completes and then destroyed.
+No sandbox is created at construction time. Within a task, a sandbox is started lazily — only when a tool with `run_in_subprocess=True` is first called. Tasks that use only host-side tools never create a sandbox at all. When a sandbox is started, it is committed to a checkpoint image (`agency/ckpt-<pid>-<agname>`) when the task completes and then destroyed.
 
 An optional `"context_limit"` key in `llm_config` pins the model's context window size for auto-compaction. If omitted, the agent queries the endpoint at startup (vLLM exposes `max_model_len`). Compaction is silently disabled when the limit cannot be determined.
 
@@ -53,7 +53,7 @@ r2 = ag.run(summarize_skill, agdata(text=r1.text))   # waits for r1 internally
 child = agent(ag)
 ```
 
-Forking blocks until the parent's in-flight task completes, then deep-copies the resolved ctx and copies the parent's checkpoint image via `docker tag`. The child's container is not started at fork time — it is created lazily when the child's first `run()` executes, restoring from the copied checkpoint. All subsequent writes in either direction are isolated.
+Forking blocks until the parent's in-flight task completes, then deep-copies the resolved ctx and copies the parent's checkpoint image via `docker tag`. The child's sandbox is not started at fork time — it is created lazily when the child's first `run()` executes, restoring from the copied checkpoint. All subsequent writes in either direction are isolated.
 
 ## Class-level configuration
 
@@ -62,21 +62,21 @@ Set once before creating agents:
 | Variable | Default | Meaning |
 |---|---|---|
 | `agent.log_dir` | `None` | Directory for per-agent JSONL logs |
-| `agent.output_dir` | `None` | Shared output directory mounted into every container |
+| `agent.output_dir` | `None` | Shared output directory mounted into every sandbox |
 | `agent.agresource_pool` | auto-detected | Shared GPU/CPU/memory pool |
-| `agent.ping_interval_s` | `300` | Max seconds `_wait_for_processes` waits before injecting a status ping |
+| `agent.ping_interval_s` | `300` | Max seconds `wait_for_processes` waits before injecting a status ping |
 | `agent.poll_interval_s` | `5` | `get_live_pids()` poll granularity inside each ping window |
 | `agent.max_outer_iters` | `144` | **Unused** — kept for backwards compatibility; process monitoring is now bounded by `AGSKILL_REACT_MAX_STEPS` inside `agskill.execute_react()` |
 
 ## Shared output directory
 
-When `agent.output_dir` is set, every container gets a per-agent subdirectory mounted at `/agent_output/<agname>`:
+When `agent.output_dir` is set, every sandbox gets a per-agent subdirectory mounted at `/agent_output/<agname>`:
 
 ```python
 agent.output_dir = Path("runs/agent_output")
 ag = agent(...)
 
-# inside container: write to /agent_output/agent_smith/report.md
+# inside sandbox: write to /agent_output/agent_smith/report.md
 # on host:          runs/agent_output/agent_smith/report.md
 
 # access the paths
@@ -99,7 +99,7 @@ The name is always postfixed with `_XXXX` (a 4-character base-36 counter, digits
 
 ## Lifecycle and cleanup
 
-Containers are created lazily — only when a task calls a tool with `run_in_subprocess=True` for the first time. Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a container. When a container is started, stale containers from a previous run (e.g. after a hard kill) are removed first. The container is destroyed at task end. An `atexit` handler removes any containers still running at process exit.
+sandboxs are created lazily — only when a task calls a tool with `run_in_subprocess=True` for the first time. Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a sandbox. When a sandbox is started, stale sandboxs from a previous run (e.g. after a hard kill) are removed first. The sandbox is stopped with `ag.sandbox.stop(commit=True)` — a single call that snapshots and stops the container — at task end. An `atexit` handler removes any sandboxs still running at process exit.
 
 ## UI callbacks
 
@@ -109,4 +109,4 @@ Three internal callbacks are available for custom monitoring:
 |---|---|---|
 | `ag._ui_state` | `dict` | After every state transition (`inactive`, `skill`, `llm`, `tool`, `proc_wait`, `human`) |
 | `ag._snapshot_messages` | `list[dict]` | After every LLM response and tool result within a skill |
-| `ag._inbox` | `queue.Queue[str]` | Drain to inject a user message before the next LLM call |
+| `ag.inbox` | `queue.Queue[str]` | Drain to inject a user message before the next LLM call |

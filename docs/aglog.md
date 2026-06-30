@@ -9,7 +9,7 @@ from pathlib import Path
 from agency import agent
 
 agent.log_dir = Path("runs/logs")   # set before creating agents
-ag = agent(llm_config, agskills=[...])
+ag = agent(llm_config)
 # writes to runs/logs/<agname>_timeline.jsonl  (structured event log)
 # writes to runs/logs/<agname>_history.jsonl   (raw LLM message transcript)
 ```
@@ -113,7 +113,7 @@ Written whenever the ReAct loop compacts the context window:
 }
 ```
 
-`msgs_before` / `msgs_after` show how many messages were in the list before and after compaction. The difference (`msgs_before - msgs_after`) is the number of messages replaced by the summary injection. See [compaction.md](compaction.md).
+`msgs_before` / `msgs_after` show how many messages were in the list before and after compaction. The difference (`msgs_before - msgs_after`) is the number of messages replaced by the summary injection. See [Design_compaction.md](Design_compaction.md).
 
 ## Terminal output (`terminal`)
 

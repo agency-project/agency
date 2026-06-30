@@ -31,8 +31,8 @@ def _type_error_fix(field_name: str, type_hint, value) -> str:
     if value is None:
         return (
             f"You called return_{field_name} without providing the required argument. "
-            f"You must pass your output as '{field_name}' keyed argument to the tool. Calling this tool without passing an argument will not work."
-            f'Format Example (JSON): {{"{field_name}": "{ex}"}}'
+            f"You must pass your output as '{field_name}' keyed argument to the tool. Calling this tool without passing an argument will not work. "
+            f'Format Example (JSON): {{"{field_name}": {ex}}}'
         )
     if got_str and type_hint_to_string_type(type_hint) == "array":
         return f"You passed a JSON-encoded string; pass a JSON array directly. Example: {ex}"

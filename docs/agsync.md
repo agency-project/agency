@@ -11,7 +11,7 @@ from agency import agsync
 ## Signature
 
 ```python
-agsync(targets: agent | agteam | list[agent | agteam]) -> None
+agsync(*targets) -> None
 ```
 
 ## What it waits on
@@ -26,7 +26,7 @@ For each item in `targets`:
 For an `agteam`, "currently tracked agents" means:
 
 * Agents created in `setup()` — always tracked (the ContextVar is set during `setup()` too).
-* Fork agents (`agent(parent)`) created anywhere inside `run()` — **automatically tracked** because `agteam` sets a context variable for the duration of `run()` and `agent.__init__` registers itself when that variable is set.
+* Fork agents (`agent.fork(parent)`) created anywhere inside `run()` — **automatically tracked** because `agteam` sets a context variable for the duration of `run()` and `agent.fork` registers itself when that variable is set.
 
 Agents that have already completed and have no other live reference are GC'd from the `WeakSet` automatically — `agsync` skips them since they are already done.
 
@@ -136,8 +136,8 @@ For most use cases they are equivalent. `agsync` is more thorough because it als
 team.run() called
   → background thread starts, _active_team = team
   → user code runs
-      → agent(parent)  ← __init__ sees _active_team, adds self to team._agents
-      → agent(parent)  ← same
+      → agent.fork(parent)  ← __init__ sees _active_team, adds self to team._agents
+      → agent.fork(parent)  ← same
   → _active_team reset to None
 agsync(team) joins the thread, then resolves all tracked agent contexts
 ```

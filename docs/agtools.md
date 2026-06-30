@@ -51,7 +51,7 @@ if pool is not None:
 
 ## Tool logging
 
-Every tool call is logged automatically after it returns. `agent.__init__` calls `tool.attach_logger(term, log)` on each tool, wiring up both terminal and file logging.
+Every tool call is logged automatically after it returns. `agskill._build_toolkit()` calls `tool.attach_logger(ag.terminal, ag.log)` on each tool when building the toolkit for a skill run, wiring up both terminal and file logging.
 
 | Tool | Terminal line |
 |---|---|
@@ -242,7 +242,7 @@ If the serialized result exceeds the offload threshold and a sandbox is availabl
 
 ## bash process tracking
 
-The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by `_wait_for_processes` inside `agskill.execute_react()`. See [agsandbox.md](agsandbox.md) for exec wrapper details and [execution_process_control.md](execution_process_control.md) for per-scenario process monitoring traces.
+The sandboxed `bash` tool uses a `/proc` diff inside the container to detect all processes spawned by a command — regardless of whether they were started with `&`, via `subprocess.Popen`, or through a double-fork. The before-snapshot is taken immediately before the command runs; the after-scan runs immediately after. Any new PID not in the before-snapshot is added to `sandbox._watched_pids` and monitored by `wait_for_processes` inside `agskill.execute_react()`. See [agsandbox.md](agsandbox.md) for exec wrapper details and [execution_process_control.md](execution_process_control.md) for per-scenario process monitoring traces.
 
 ## `daemon_release` tool
 
@@ -252,7 +252,7 @@ Use this when a process is intentionally long-lived (a server, monitor, or backg
 LLM calls: daemon_release({"pid": 1234})
 ```
 
-This moves PID 1234 (and all its future descendants) from `_watched_pids` to `_daemon_pids`. `_wait_for_processes` no longer sees it as a live process, and the skill resolves normally. The process keeps running in the container until the container is destroyed.
+This moves PID 1234 (and all its future descendants) from `_watched_pids` to `_daemon_pids`. `wait_for_processes` no longer sees it as a live process, and the skill resolves normally. The process keeps running in the container until the container is destroyed.
 
 ## `ask_human` tool
 

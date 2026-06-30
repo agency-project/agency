@@ -57,8 +57,8 @@ Input JSON format:
 Caller side                 Framework                       LLM side
 ──────────                  ─────────                       ────────
 
-agdata(theme="AI",          _prepare_agtype_inputs()        system prompt:
-       background="<text>") ↳ agfile.prepare() writes       - Input JSON format
+agdata(theme="AI",          agschema.prepare_inputs_in_sandbox()  system prompt:
+       background="<text>") ↳ agfile.prepare() writes             - Input JSON format
                                text → /workspace/inputs/    - Output format hints
                                background.txt               - File-backed field hints
                                replaces value with path
@@ -75,7 +75,7 @@ agdata(theme="AI",          _prepare_agtype_inputs()        system prompt:
                             ↳ agfile: reads file back        return_report("/workspace/outputs/report.txt")
                             ↳ agbinary: reads bytes back
 
-                            _recover_agtype_outputs()
+                            agschema.recover_outputs()
                             ↳ agfile.recover() reads file
                                content → plain string
                             ↳ agbinary.recover() reads bytes
@@ -85,6 +85,12 @@ agdata(theme="AI",          _prepare_agtype_inputs()        system prompt:
 agdata(report="<content>",  ←─────────────────────────────
        score=7)
 ```
+
+---
+
+## `agschema` — the schema layer
+
+Users write `agdata(field=type)` at call sites. `agskill.__init__` converts these to `agschema` objects internally. All schema operations — validation, return-tool generation, input preparation, output recovery — go through `agschema`, not directly through `agskill` or `agtype`. Key methods: `prepare_inputs_in_sandbox()`, `recover_outputs()`, `make_return_output_agtool()`, `check()`, `raw_key()`.
 
 ---
 
@@ -107,13 +113,14 @@ agtype
 | Method | Called when | Purpose |
 |---|---|---|
 | `schema_type() → str` | Schema serialization | Human-readable label in the system prompt (e.g. `"file"`, `"image"`) |
-| `run_in_subprocess() → bool` | Before skill starts | Whether the sandbox must be running before `prepare()` |
+| `needs_sandbox() → bool` | Before skill starts | Whether sandbox filesystem access is needed before `prepare()` |
 | `prepare(value, sandbox, skill, field, suffix="") → (new_value, paths)` | Before ReAct loop | Transform Python value → LLM-visible value; write sandbox files |
 | `recover(value, sandbox) → (new_value, paths)` | After ReAct loop | Transform LLM-returned string → Python value; read sandbox files |
 | `extra_input_prompt(field) → str` | System prompt build | Extra instruction injected for this input field |
 | `extra_output_prompt(field, skill) → str` | System prompt build | Extra instruction injected for this output field |
-| `return_tool_description(field) → str` | Tool spec generation | Description of the `return_<field>` tool |
-| `return_value_description(field) → str` | Tool spec generation | Description of the `value` parameter |
+| `get_return_tool_description(field_name) → str` | Tool spec generation | Description of the `return_<field>` tool |
+| `get_return_tool_value_description(field_name) → str` | Tool spec generation | Description of the `value` parameter |
+| `build_content_prompt(key, value) → tuple[str|None, list[dict]]` | User-message construction | Returns optional JSON placeholder and extra multimodal content blocks (e.g. image_url entries for agimage) |
 
 `prepare()` and `recover()` each return `(new_value, cleanup_paths)`.  The
 framework replaces the field value in `_data` with `new_value` and accumulates
@@ -248,7 +255,7 @@ _build_user_content():
 
 **Container nesting.** `agtype` subclasses can appear inside `list`, `dict`,
 and `tuple` containers at any nesting depth in both input and output schemas.
-`_prepare_agtype_inputs()` and `_recover_agtype_outputs()` recurse through the
+`agschema.prepare_inputs_in_sandbox()` and `agschema.recover_outputs()` recurse through the
 container structure and call `prepare()`/`recover()` at every agtype leaf.
 Plain Python values at non-agtype positions pass through unchanged.
 
@@ -397,11 +404,11 @@ class agcsv(agtype):
         return "csv_file"
 
     @classmethod
-    def run_in_subprocess(cls) -> bool:
+    def needs_sandbox(cls) -> bool:
         return True
 
     @classmethod
-    def prepare(cls, value, sandbox, skill_name, field_name):
+    def prepare(cls, value, sandbox, skill_name, field_name, suffix=""):
         import csv, io
         if not isinstance(value, list):
             return value, []
@@ -432,6 +439,6 @@ class agcsv(agtype):
 
 The same `agtype` subclass works for `field=agcsv`, `field=list[agcsv]`,
 `field=dict[str, agcsv]`, `field=tuple[agcsv, int]`, and any deeper nesting —
-`_prepare_agtype_inputs()` and `_recover_agtype_outputs()` recurse through
+`agschema.prepare_inputs_in_sandbox()` and `agschema.recover_outputs()` recurse through
 `list`, `dict`, and `tuple` containers at any depth and call `prepare()`/`recover()`
 at every agtype leaf automatically.

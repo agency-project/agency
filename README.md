@@ -87,7 +87,7 @@ Pass `"api_key": "bedrock-api-key-..."` to use a static Bedrock API key instead 
 
 **`agtool`** — a named callable an LLM can invoke via function calling. Every tool call is offloaded to a `ProcessPoolExecutor` worker so CPU-bound tools don't block other agents. Tools are serialised with `cloudpickle`, so bound methods work without any extra machinery. Before each sandboxed tool call the container is checkpointed; on tool failure the sandbox is automatically rolled back to that checkpoint and the LLM is told the workspace was reverted. Agents can pass `"timeout": <seconds>` in any tool call's arguments to override the default 30 s watchdog.
 
-**`agent`** — holds an LLM config, sandboxed tools, and a conversation history. `agent.run(skill, input)` accepts an `agskill` object directly and is non-blocking; each call spawns a daemon thread and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the history and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
+**`agent`** — a pure state container: holds an LLM config, sandboxed tools, conversation context (`agcontext`), and a name. It does not own an execution loop. `agent.run(skill, input)` is a thin dispatch call; the scheduling wrapper is `agskill.run()`, which spawns a daemon thread, and the ReAct loop is `agskill.execute_react()`. Each `run()` call is non-blocking and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the context and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
 
 **GPU support** — NVIDIA and AMD (ROCm) GPUs are both supported. `agResourcePool` auto-detects GPUs via `nvidia-smi` (NVIDIA) or `rocm-smi` (AMD) and issues leases to prevent two agents from sharing a device. The sandbox container receives `--gpus all` (NVIDIA) or `--device /dev/kfd --device /dev/dri` (AMD) at startup. GPU access uses *lazy physical allocation*: `reserve_gpu` sets a virtual flag with no physical cost; a physical GPU is claimed from the pool only when a bash command actually runs, and returned as soon as the command's processes finish. Between bash calls the GPU is free for other agents. `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES` are set to the assigned device ID for the duration of each bash execution.
 
@@ -227,8 +227,10 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 
 | File | Topic |
 |---|---|
-| [agent.md](docs/agent.md) | Agent construction, `run()`, forking, history, UI callbacks |
+| [agent.md](docs/agent.md) | Agent construction, `run()`, forking, context, UI callbacks |
+| [agcontext.md](docs/agcontext.md) | Persistent conversation state — message history, token counts, compaction summary |
 | [agdata.md](docs/agdata.md) | Data container — pending results, schema types, serialization, error handling |
+| [agllm.md](docs/agllm.md) | LLM wrapper — streaming calls, message construction, compaction, Bedrock support |
 | [agskill.md](docs/agskill.md) | `run()` scheduling wrapper, `execute_react()` ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
 | [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, `agimage` (multimodal), `agrawstring` (raw bypass), custom subclasses |
 | [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |

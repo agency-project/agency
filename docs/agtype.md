@@ -73,7 +73,7 @@ The same recursive walk applies to `_offload_large_fields`: a field whose hint c
 
 `agrawstring` is the only agtype subclass that is **not** excluded from offloading, because its `prepare` is a no-op — the raw string arrives at the offload step unchanged and is written to a sandbox file when it exceeds the offload threshold (`max(40 000, context_limit × 0.1 × 4)` characters).
 
-Output schema validation (`_validate_value`) is also recursive: it descends into `list`, `dict`, and `tuple` containers and checks each element against the corresponding inner type, reporting the exact path (e.g. `item 2: key 'x': expected str, got int`) on mismatch.
+Output schema validation (`validate_value_against_type_hint`) is also recursive: it descends into `list`, `dict`, and `tuple` containers and checks each element against the corresponding inner type, reporting the exact path (e.g. `item 2: key 'x': expected str, got int`) on mismatch.
 
 ### `extra_input_prompt(field_name) -> str`
 
@@ -95,12 +95,12 @@ from agency import agfile
 |---|---|
 | `schema_type()` | `"file"` |
 | `needs_sandbox()` | `True` |
-| `prepare(value, ...)` | Writes `value` to `/workspace/inputs/<skill>_<field>.txt`; returns the path and adds it to cleanup. |
+| `prepare(value, ...)` | Writes `value` to `/workspace/inputs/<field><suffix>.txt`; returns the path and adds it to cleanup. |
 | `recover(value, ...)` | Reads the file at `value` (the path returned by the LLM); returns the content and adds the path to cleanup. |
 | `extra_input_prompt` | Tells the agent to use the `read` tool to access the file. |
 | `extra_output_prompt` | Tells the agent to write output to a file and return the path. |
-| `return_tool_description(field_name)` | Tool description for `return_<field>` — explicitly instructs the agent to write to a file first and then pass the path. |
-| `return_value_description(field_name)` | Parameter description for the `value` argument — asks for an absolute file path, not raw content. |
+| `get_return_tool_description(field_name)` | Tool description for `return_<field>` — explicitly instructs the agent to write to a file first and then pass the path. |
+| `get_return_tool_value_description(field_name)` | Parameter description for the `value` argument — asks for an absolute file path, not raw content. |
 
 ### Live validation during return
 
@@ -142,8 +142,8 @@ design_skill = agskill(
 
 The framework:
 
-1. Writes `background` content to `/workspace/inputs/design_background.txt` in the sandbox.
-2. Sends `{"theme": "...", "background": "/workspace/inputs/design_background.txt"}` to the LLM.
+1. Writes `background` content to `/workspace/inputs/background.txt` in the sandbox.
+2. Sends `{"theme": "...", "background": "/workspace/inputs/background.txt"}` to the LLM.
 3. Appends instructions telling the agent to read that path and to write `design_doc` to a file.
 4. When the agent calls `return_design_doc(value="/workspace/outputs/design_design_doc.txt")`, validates the file immediately — directory, binary, missing, empty, and path-in-file checks all run now, while the agent can still fix them.
 5. After the loop, `recover()` reads the file content from the sandbox.
@@ -167,8 +167,8 @@ from agency import agbinary
 | `recover(value, ...)` | Reads raw bytes from the path via `sandbox.read_file_bytes()`; returns `bytes`. |
 | `extra_input_prompt` | Tells the agent the field is a binary file and to use shell tools (`file`, `xxd`, domain-specific CLIs) rather than text tools. |
 | `extra_output_prompt` | Tells the agent to write a binary output file and return the path. |
-| `return_tool_description` | Instructs the agent to write a binary file first, then pass its path. |
-| `return_value_description` | Asks for an absolute file path — explicitly says not to encode content as text. |
+| `get_return_tool_description` | Instructs the agent to write a binary file first, then pass its path. |
+| `get_return_tool_value_description` | Asks for an absolute file path — explicitly says not to encode content as text. |
 
 ### Caller value types
 

@@ -162,7 +162,7 @@ The warning makes accumulation visible rather than silent, and the retries handl
 
 ## Process monitoring inside agskill
 
-Background process monitoring is embedded directly in `agskill.execute_react()`'s ReAct loop (not in an outer caller loop). Each time the LLM produces a valid final answer, the framework calls `_wait_for_processes()` before returning:
+Background process monitoring is embedded directly in `agskill.execute_react()`'s ReAct loop (not in an outer caller loop). Each time the LLM produces a valid final answer, the framework calls `agSandbox.wait_for_processes()` before returning:
 
 ```python
 # inside agskill.execute_react(), after output schema validation passes:
@@ -178,7 +178,7 @@ if proc_msg is not None:
 return (result, prev_ctx, delta_messages)   # sandbox clean → truly done
 ```
 
-`_wait_for_processes()` returns `None` immediately if `_watched_pids` is empty or `get_live_pids()` finds no active processes. Otherwise it polls until either all PIDs exit or `_ping_interval_s` elapses:
+`agSandbox.wait_for_processes()` returns `None` immediately if `_watched_pids` is empty or `get_live_pids()` finds no active processes. Otherwise it polls until either all PIDs exit or `ping_interval_s` elapses:
 
 | Outcome | Return value | Log event |
 |---|---|---|
@@ -209,13 +209,13 @@ The `&` means the shell starts `train.py` and continues without waiting.
 ### Process monitoring (inside agskill)
 
 ```
-_wait_for_processes() called — train_pid is in _watched_pids
+agSandbox.wait_for_processes() called — train_pid is in _watched_pids
   ↳ _ensure_started() recreates container from lifecycle image
   ↳ get_live_pids() reads /proc — train_pid absent (container is fresh) → returns {}
   ↳ _watched_pids cleared → returns None immediately
 → (result, prev_ctx, delta_messages) returned
 
-sandbox.destroy()   # removes agency/lifecycle-<agname> image; container already gone
+ag.sandbox.stop(commit=True)   # commits container to lifecycle image and stops it
 aglog._record()
 result_future.set_result()   ← caller unblocks
 ```
@@ -262,10 +262,10 @@ No `&` — the wrapper shell blocks on `python eval.py` until it exits.
 ### Process monitoring (inside agskill)
 
 ```
-_wait_for_processes() called — _watched_pids is empty → returns None immediately
+agSandbox.wait_for_processes() called — _watched_pids is empty → returns None immediately
 → (result, prev_ctx, delta_messages) returned
 
-sandbox.destroy()   # removes agency/lifecycle-<agname> image; container already gone
+ag.sandbox.stop(commit=True)   # commits container to lifecycle image and stops it
 result_future.set_result()   ← caller unblocks
 ```
 
@@ -290,13 +290,13 @@ Example: `python launcher.py`, where launcher.py does `subprocess.Popen(['python
 ### Process monitoring (inside agskill)
 
 ```
-_wait_for_processes() called — train_pid is in _watched_pids
+agSandbox.wait_for_processes() called — train_pid is in _watched_pids
   ↳ _ensure_started(): docker run from lifecycle image (fresh container, train.py absent)
   ↳ get_live_pids() → {} (process does not exist in new container)
   ↳ _watched_pids cleared → returns None immediately
 → (result, prev_ctx, delta_messages) returned
 
-sandbox.destroy()
+ag.sandbox.stop(commit=True)   # commits container to lifecycle image and stops it
 result_future.set_result()
 ```
 
@@ -332,12 +332,12 @@ After both tools complete: **`sandbox.stop(commit=True)`** — container committ
 ### Process monitoring (inside agskill)
 
 ```
-_wait_for_processes() called — _watched_pids is empty (server_pid was in _daemon_pids,
+agSandbox.wait_for_processes() called — _watched_pids is empty (server_pid was in _daemon_pids,
   which is cleared when container is removed)
 → returns None immediately
 → (result, prev_ctx, delta_messages) returned
 
-sandbox.destroy()   # removes lifecycle image
+ag.sandbox.stop(commit=True)   # commits container to lifecycle image and stops it
 result_future.set_result()   ← caller unblocks
 ```
 
@@ -347,7 +347,7 @@ result_future.set_result()   ← caller unblocks
 
 ## `get_live_pids()` — baseline diff approach
 
-Called during `_wait_for_processes`'s polling window. Reads the full `/proc` table in one pass and returns every PID that is:
+Called during `agSandbox.wait_for_processes`'s polling window. Reads the full `/proc` table in one pass and returns every PID that is:
 - **not** in `_baseline_pids` (the container's process set at sandbox creation), and
 - **not** in `_daemon_pids` (or descended from one), and
 - **not** in zombie state (`State: Z` in `/proc/<pid>/status`)
@@ -358,7 +358,7 @@ Any newly discovered non-baseline PID is added to `_watched_pids` with the curre
 
 ## Summary
 
-| Scenario | `docker exec` blocks? | `/proc` diff finds PIDs? | `_watched_pids` after exec | After tool call | `_wait_for_processes` result |
+| Scenario | `docker exec` blocks? | `/proc` diff finds PIDs? | `_watched_pids` after exec | After tool call | `agSandbox.wait_for_processes` result |
 |---|---|---|---|---|---|
 | Background job (`&`) | No | Yes — background process | non-empty | `stop(commit=True)` — process killed | `None` immediately (process gone in fresh container) |
 | Foreground job | Yes | No — process already exited | empty | `stop(commit=True)` | `None` immediately |

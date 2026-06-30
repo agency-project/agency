@@ -38,10 +38,10 @@ Example output from a running agent:
 | `ERROR ✗  ` | reverse | `agerror(...)` constructed — emitted immediately at creation |
 | `LLM ▶    ` | normal | LLM call dispatched |
 | `LLM ✓    ` | normal | LLM call completed |
-| `LLM ✗    ` | reverse | LLM call failed (retrying or exhausted) |
-| `TOOL ✓   ` | normal | `return_<field>` tool call succeeded; field value registered |
-| `TOOL ✗   ` | reverse | `return_<field>` tool call failed; type mismatch or validation error |
-| `PROCS ▶  ` | — | Background processes detected; `_wait_for_processes` polling started |
+| `LLM ✗    ` | — | LLM call failed (retrying or exhausted) |
+| `TOOL ✓   ` | normal | Tool call completed successfully |
+| `TOOL ✗   ` | — | Tool call failed or returned an error |
+| `PROCS ▶  ` | — | Background processes detected; `wait_for_processes` polling started |
 | `PROCS ⏳  ` | — | Ping timeout elapsed; processes still running — injecting status message |
 | `PROCS ✓  ` | — | All processes completed; injecting completion message |
 | `COMPACT  ` | — | Context window compacted |

@@ -14,7 +14,7 @@ Launch vLLM (example):
 
 Run this script:
     uv run python example.py
-    VLLM_BASE_URL=http://127.0.0.1:18000/v1 VLLM_MODEL=kimi_k2.6 uv run python example.py
+    VLLM_BASE_URL="" VLLM_MODEL=kimi_k2.6 uv run python example.py
 """
 import os
 from pathlib import Path
@@ -107,4 +107,4 @@ def main():
 
 if __name__ == "__main__":
     from agency.agwebui import agwebui
-    agwebui.run(main)
+    agwebui.run(main, port=8000)

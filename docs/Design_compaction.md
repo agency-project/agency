@@ -12,7 +12,7 @@ Before each LLM call, `agskill` computes a prompt size estimate used for two pur
 The estimate uses the fast chars/4 heuristic (`estimate_messages_tokens`) over the full message list. No tokenize endpoint call is made pre-call.
 
 ```python
-_pre_estimate = estimate_messages_tokens(messages)  # sum(len(content) // 4) for all messages
+_pre_estimate = estimate_messages_tokens(messages)  # sum((len(content) + len(tool_call_args)) // 4) for all messages
 ```
 
 ### `max_tokens` clamping
@@ -32,7 +32,7 @@ The chars/4 estimate can underestimate token-dense content (code, JSON, base64).
 ```python
 # In ag.llm.call():
 except openai.BadRequestError as e:
-    if "context length" in str(e).lower():
+    if any(kw in str(e).lower() for kw in ("context_length_exceeded", "maximum context length", "context length", "too long", "reduce the length")):
         return LLMCallResult(context_exceeded=True)
 
 # In the ReAct loop (agskill.execute_react):
@@ -57,7 +57,7 @@ if prompt_tokens >= int(context_limit * _COMPACT_THRESHOLD):
 
 The trigger fires when the prompt reaches 70% of the context limit, leaving 30% headroom for the summary injection and continued work.
 
-Compaction runs at most once per ReAct step (after the LLM fires, before tool dispatch or final-answer processing), so the messages list is always current before the next call.
+Compaction runs at most once per ReAct step (after the LLM fires, before tool dispatch or output collection), so the messages list is always current before the next call.
 
 ## Context limit detection
 
@@ -166,8 +166,8 @@ The compacted head is replaced by a two-message exchange injected into the messa
 ```
 [system]
 [user: task input]          ← preserved from original
-[user: "[Conversation history summary…]\n<summary>"]   ← injection
-[assistant: "Understood. I'll continue from this context."]
+[user: "[HARNESS SYSTEM] [Conversation history summary — treat as established context, do not ask to re-confirm]\n<summary>"]   ← injection
+[assistant: "[HARNESS SYSTEM] Understood. I'll continue from this context."]
 [tail turns verbatim]
 ```
 

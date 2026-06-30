@@ -24,7 +24,7 @@ Output schema validation fails
         └─► after max_output_schema_retries: agerror(...) from agskill.execute_react()
 
 Uncaught exception inside _task() closure in agskill.run()
-  └─► except Exception: agerror(_fmt_exc(exc))  ←── no re-raise
+  └─► except Exception: agerror(format_exception(exc))  ←── no re-raise
         └─► result_future resolved with agerror
               └─► caller checks isinstance(result, agerror)
 
@@ -97,20 +97,19 @@ try:
     outer_result = af.execute_react(...)
 except Exception as exc:
     # swallow — convert to agerror
-    outer_result = agerror(_fmt_exc(exc))
+    outer_result = agerror(format_exception(exc))
     outer_ctx = prev_ctx
 finally:
     # always runs, even on exception:
     _remove_offloaded_fields(...)
     pool.release_gpu(...)     # GPU released even if skill crashed
-    sandbox.commit(...)       # checkpoint best-effort
-    sandbox.destroy()         # container torn down no matter what
+    ag.sandbox.stop(commit=True)  # checkpoint and tear down container no matter what
     sandbox = None
 ```
 
 **What is caught:** Any unhandled exception from the skill (note: `agskill.execute_react()` returning an error agdata is NOT an exception — only genuine throws reach here).
 
-**Handler:** Formats the exception with full traceback via `_fmt_exc(exc)`, stores it in `outer_result` as an `agerror`, logs `SKILL ✗` to the terminal, then emits `{"type": "skill_error", "skill": ..., "error": ...}` via `_append_full_history()` after the finally block (line 728).
+**Handler:** Formats the exception with full traceback via `format_exception(exc)`, stores it in `outer_result` as an `agerror`, logs `SKILL ✗` to the terminal, then emits `{"type": "skill_error", "skill": ..., "error": ...}` via `_append_full_history()` after the finally block (line 728).
 
 **Propagation:** `result_future.set_result(outer_result)` — the error is carried in an `agerror`; the future resolves successfully (no exception crossing thread boundary). Callers check `isinstance(result, agerror)`.
 
@@ -175,7 +174,7 @@ finally:
 
 **What is caught:** Any `Exception` from the tool function.
 
-**Handler:** Returns `agerror(_fmt_exc(exc))`; execution continues.
+**Handler:** Returns `agerror(format_exception(exc))`; execution continues.
 
 ### Process-pool execution
 
@@ -257,15 +256,15 @@ finally:
 
 ### `read.py`
 - `FileNotFoundError` → `agerror("Not found: {path}")`
-- Generic `Exception` → `agerror(_fmt_exc(e))`
+- Generic `Exception` → `agerror(format_exception(e))`
 
 ### `edit.py`
 - `FileNotFoundError` on pre-read → `agerror(...)`
-- `ValueError` / `OSError` on write → `agerror(_fmt_exc(e))`
+- `ValueError` / `OSError` on write → `agerror(format_exception(e))`
 
 ### `webfetch.py`
 - `httpx.HTTPStatusError` → `agerror(f"HTTP {status}: {url}\n{details}")`
-- Generic `Exception` → `agerror(_fmt_exc(e))`
+- Generic `Exception` → `agerror(format_exception(e))`
 
 ### `human.py`
 - `EOFError` from `input()` → puts `_TIMEOUT_REPLY` in the reply queue

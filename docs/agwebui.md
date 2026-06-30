@@ -166,7 +166,7 @@ Every event has `type` and `ts`. `agname` is present for per-agent events.
 | `agent_state` | yes | `state, skill, tool` | `agent._set_ui_state()` |
 | `team_registered` | no | `team_name, agents: list[str]` | `agteam.__init__()` |
 | `messages_snapshot` | yes | `messages: list[dict]` | `agent._push_live_messages()` |
-| `token_update` | yes | `agent_input, agent_output, global_input, global_output` | `agent` on each LLM chunk |
+| `token_update` | yes | `agent_input, agent_output, global_input, global_output` | `agskill` via `agent.push_token_count_update_to_ui()` after each LLM call completes |
 | `resource_update` | no | `gpus_acquired/total, cpus_acquired/total, memory_acquired/total_mb` | `agresources` on acquire/release |
 | `ask_human` | yes | `ask_id, question` | `ask_human` tool |
 | `human_reply` | yes | `ask_id, reply` | emitter after reply file is read |
