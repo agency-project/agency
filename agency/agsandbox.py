@@ -756,8 +756,26 @@ class agSandbox:
                     else:
                         time.sleep(1)
             # Delete the previous image now that the tag points to the new one.
+            # Only delete if no containers are currently using it — a fork may still
+            # be running from the same image.  The fork's own stop() will delete it
+            # once its container is gone.
             if old_image_id and self._checkpoint_image == tag:
-                self._rmi(old_image_id)
+                try:
+                    in_use = self._run(
+                        [self._runtime, "ps", "-a",
+                         "--filter", f"ancestor={old_image_id}",
+                         "--format", "{{.ID}}"],
+                        check=False, timeout=10,
+                    )
+                    if in_use and in_use.stdout.strip():
+                        pass  # containers still running from this image — leave it
+                    else:
+                        self._rmi(old_image_id)
+                except Exception as _e:
+                    print(
+                        f"[agsandbox] WARNING: could not check/delete old image {old_image_id}: {_e}",
+                        file=__import__("sys").stderr, flush=True,
+                    )
         name = self._container_name()
         for _attempt in range(3):
             try:
