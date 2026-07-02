@@ -9,19 +9,14 @@ Port: Uses agent.asyncio_run() — an async wrapper over run() — so the three
       the event loop.  The sync fork fan-out pattern is shown as an alternative.
 """
 import asyncio
-import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from llm_config import make_llm_config
 from agency import agent, agskill, agdata
 
-LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   ""),
-    "temperature":       0.6,
-    "max_tokens":        16000,
-    "top_p":             0.95,
-    "top_k":             50,
-    "repetition_penalty": 1.1,
-}
+LLM_CONFIG = make_llm_config(max_tokens=16000)
 
 translator_skill = agskill(
     name="translate",

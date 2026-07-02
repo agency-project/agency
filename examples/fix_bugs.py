@@ -13,6 +13,7 @@ from pathlib import Path
 
 from agency import agent, agskill, agdata
 from agency.agsandbox import agSandbox, _RUN_ID
+from llm_config import make_llm_config
 
 
 def _make_run_dir(name: str):
@@ -23,16 +24,7 @@ def _make_run_dir(name: str):
     return run_dir
 
 
-LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   ""),
-    "temperature":       0.6,
-    "max_tokens":        16000,
-    "top_p":             0.95,
-    "top_k":             50,
-    "repetition_penalty": 1.1,
-}
+LLM_CONFIG = make_llm_config(max_tokens=16000)
 
 VLLM_SRC = Path(__file__).parent / "vllm"
 

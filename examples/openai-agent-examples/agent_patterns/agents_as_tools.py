@@ -4,20 +4,15 @@ Port of agent_patterns/agents_as_tools.py from openai-agents-python.
 Original: Orchestrator calls translator sub-agents as tools.
 Each translator agent is invoked synchronously inside a tool function.
 """
-import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from llm_config import make_llm_config
 from agency import agent, agskill, agdata
 from agency.agtool import agtool
 
-LLM_CONFIG = {
-    "base_url": os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":  os.environ.get("VLLM_API_KEY", ""),
-    "model":    os.environ.get("VLLM_MODEL",   ""),
-    "temperature":       0.6,
-    "max_tokens":        16000,
-    "top_p":             0.95,
-    "top_k":             50,
-    "repetition_penalty": 1.1,
-}
+LLM_CONFIG = make_llm_config(max_tokens=16000)
 
 
 def _make_translator_tool(language: str, instructions: str) -> agtool:

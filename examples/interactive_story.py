@@ -25,7 +25,6 @@ Usage:
 """
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -33,44 +32,14 @@ from pathlib import Path
 from agency import agent, agskill, agdata, agfile
 from agency.agwebui import agwebui
 from agency.tools.human import make_ask_human
+from llm_config import make_llm_config
 
 
 # ---------------------------------------------------------------------------
 # LLM config — override via environment variables
 # ---------------------------------------------------------------------------
 
-def _resolve_model(base_url: str, api_key: str, model: str) -> str:
-    """If model is blank, ask the server which model it's serving."""
-    if model:
-        return model
-    import urllib.request, json as _json
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/models",
-        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = _json.loads(resp.read())
-        return data["data"][0]["id"]
-    except Exception as e:
-        raise RuntimeError(
-            f"VLLM_MODEL not set and could not auto-detect from {base_url}: {e}"
-        ) from e
-
-
-_BASE_URL = os.environ.get("VLLM_BASE_URL", "")
-_API_KEY  = os.environ.get("VLLM_API_KEY",  "")
-
-LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
-    "temperature":          0.6,
-    "max_tokens":           8000,
-    "top_p":                0.95,
-    "top_k":                50,
-    "repetition_penalty":   1.1,
-}
+LLM_CONFIG = make_llm_config(max_tokens=8000)
 
 
 # ---------------------------------------------------------------------------

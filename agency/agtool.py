@@ -1,4 +1,5 @@
 from __future__ import annotations
+import atexit
 import threading
 import time
 import multiprocessing as _mp
@@ -34,13 +35,34 @@ _pool:      ProcessPoolExecutor | None = None
 _pool_lock: threading.Lock             = threading.Lock()
 
 
+def _ignore_sigint_in_worker() -> None:
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def _get_pool() -> ProcessPoolExecutor:
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ProcessPoolExecutor(max_workers=TOOL_POOL_MAX_WORKERS, mp_context=_mp.get_context("spawn"))
+                _pool = ProcessPoolExecutor(
+                    max_workers=TOOL_POOL_MAX_WORKERS,
+                    mp_context=_mp.get_context("spawn"),
+                    initializer=_ignore_sigint_in_worker,
+                )
     return _pool
+
+
+def shutdown_tool_pool(*, wait: bool = False, cancel_futures: bool = True) -> None:
+    global _pool
+    with _pool_lock:
+        pool = _pool
+        _pool = None
+    if pool is not None:
+        pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+atexit.register(shutdown_tool_pool)
 
 
 def _process_worker(fn_bytes: bytes, arg_bytes: bytes) -> bytes:

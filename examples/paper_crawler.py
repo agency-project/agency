@@ -29,18 +29,10 @@ import httpx
 
 from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
 from agency.agutil import format_exception as _fmt_exc
+from llm_config import make_llm_config
 
 
-LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
-    "temperature":          0.6,
-    "max_tokens":           8000,
-    "top_p":                0.95,
-    "top_k":                50,
-    "repetition_penalty":   1.1,
-}
+LLM_CONFIG = make_llm_config(max_tokens=8000)
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "6"))
 _MAX_CHARS = 32_000
 
@@ -252,7 +244,12 @@ class PaperCrawlerTeam(agteam):
         print()
 
         print("Step 1 — searching for papers...")
-        papers = self.main_agent.run(self.find_papers, agdata(topic=topic)).papers
+        papers_result = self.main_agent.run(self.find_papers, agdata(topic=topic))
+        papers_data = papers_result.to_dict()
+        if "error" in papers_data:
+            print(f"  error: {papers_data['error']}")
+            return agdata(error=papers_data["error"])
+        papers = papers_data["papers"]
         if not papers:
             print("  No papers found — try a different topic or re-run.")
             return agdata(error="no papers found")
@@ -278,14 +275,18 @@ class PaperCrawlerTeam(agteam):
             self.compile_report,
             agdata(topic=topic, summaries=summaries),
         )
-        print(f"  compiled  ({result.paper_count} papers, {len(result.report)} chars)")
+        result_data = result.to_dict()
+        if "error" in result_data:
+            print(f"  error: {result_data['error']}")
+            return agdata(error=result_data["error"])
+        print(f"  compiled  ({result_data['paper_count']} papers, {len(result_data['report'])} chars)")
 
         if output_dir is not None:
             slug = topic.lower().replace(" ", "_")[:40]
             host_path = Path(output_dir) / f"{slug}_report.md"
-            host_path.write_text(result.report)
+            host_path.write_text(result_data["report"])
             print(f"  saved     → {host_path}")
-            print(f"\n--- report preview ---\n{result.report[:400]}\n...")
+            print(f"\n--- report preview ---\n{result_data['report'][:400]}\n...")
 
         print(f"\nMain agent history: {len(self.main_agent.history.messages)} messages total")
         return result
@@ -320,7 +321,11 @@ if __name__ == "__main__":
             pending = [t.run(output_dir=reports_dir) for t in teams]  # all start immediately
             agsync(teams)
             for t, r in zip(topics, pending):
-                print(f"\n[{t}] {r.paper_count} papers  ({len(r.report)} chars)")
+                data = r.to_dict()
+                if "error" in data:
+                    print(f"\n[{t}] ERROR: {data['error']}")
+                else:
+                    print(f"\n[{t}] {data['paper_count']} papers  ({len(data['report'])} chars)")
         except AgError as e:
             print(f"\nERROR: {e}")
 

@@ -22,26 +22,17 @@ Run:
     uv run python examples/sandbox_handoff.py
     VLLM_BASE_URL=https://... VLLM_MODEL=... uv run python examples/sandbox_handoff.py
 """
-import os
 from pathlib import Path
 from datetime import datetime
 
 from agency import agent, agskill, agdata
+from llm_config import make_llm_config
 
 # ---------------------------------------------------------------------------
 # LLM config
 # ---------------------------------------------------------------------------
 
-LLM_CONFIG = {
-    "base_url":          os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":           os.environ.get("VLLM_API_KEY",  ""),
-    "model":             os.environ.get("VLLM_MODEL",    ""),
-    "temperature":       0.6,
-    "max_tokens":        8000,
-    "top_p":             0.95,
-    "top_k":             50,
-    "repetition_penalty": 1.1,
-}
+LLM_CONFIG = make_llm_config(max_tokens=8000)
 
 FILE_PATH = "/workspace/hello.py"
 

@@ -623,3 +623,4 @@ class _AnthropicBackend(agllm_backend):
         # first; this covers new models this table hasn't been updated for yet
         # falling through, and any transient failure of the live lookup.
         return _known_anthropic_context_window(model)
+

@@ -372,15 +372,25 @@ class agllm:
 
     @staticmethod
     def build_llm_kwargs(llm_config: dict, messages: list[dict], openai_tools: "list | None") -> dict:
-        _OPENAI_GEN_PARAMS = {"temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
+        _OPENAI_GEN_PARAMS = {"temperature", "max_tokens", "max_completion_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
         _EXTRA_BODY_GEN_PARAMS = {"top_k", "repetition_penalty", "min_p", "min_tokens", "guided_json", "guided_regex"}
+        wire_messages: list[dict] = []
+        for m in messages:
+            wire_msg = {k: v for k, v in m.items() if not k.startswith("_")}
+            if wire_msg.get("content") is None:
+                wire_msg["content"] = ""
+            wire_messages.append(wire_msg)
         kwargs: dict = dict(
             model=llm_config.get("model", "gpt-4o"),
-            messages=[{k: v for k, v in m.items() if not k.startswith("_")} for m in messages],
+            messages=wire_messages,
         )
         for _p in _OPENAI_GEN_PARAMS:
             if _p in llm_config:
                 kwargs[_p] = llm_config[_p]
+        if agllm._uses_max_completion_tokens(llm_config) and "max_tokens" in kwargs:
+            if "max_completion_tokens" not in llm_config:
+                kwargs["max_completion_tokens"] = kwargs["max_tokens"]
+            kwargs.pop("max_tokens", None)
         _extra_body: dict = dict(llm_config.get("extra_body") or {})
         for _p in _EXTRA_BODY_GEN_PARAMS:
             if _p in llm_config:
@@ -390,6 +400,19 @@ class agllm:
         if openai_tools:
             kwargs["tools"] = openai_tools
         return kwargs
+
+    @staticmethod
+    def _uses_max_completion_tokens(llm_config: dict) -> bool:
+        model = str(llm_config.get("model") or "").lower()
+        return model.startswith("gpt-5")
+
+    @staticmethod
+    def _set_completion_token_limit(kwargs: dict, limit: int, llm_config: dict) -> None:
+        if agllm._uses_max_completion_tokens(llm_config):
+            kwargs["max_completion_tokens"] = limit
+            kwargs.pop("max_tokens", None)
+        else:
+            kwargs["max_tokens"] = limit
 
     @staticmethod
     def build_assistant_msg(
@@ -592,8 +615,8 @@ class agllm:
                 {"role": "system", "content": _SUMMARY_SYSTEM},
                 {"role": "user",   "content": "\n".join(lines)},
             ],
-            max_tokens=SUMMARY_MAX_TOKENS,
         )
+        agllm._set_completion_token_limit(compact_kwargs, SUMMARY_MAX_TOKENS, self.config)
         if "extra_body" in self.config:
             compact_kwargs["extra_body"] = self.config["extra_body"]
         resp = client.chat.completions.create(**compact_kwargs)

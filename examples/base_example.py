@@ -16,10 +16,10 @@ Run this script:
     uv run python example.py
     VLLM_BASE_URL="" VLLM_MODEL=kimi_k2.6 uv run python example.py
 """
-import os
 from pathlib import Path
 
 from agency import agent, agskill, agdata
+from llm_config import make_llm_config
 
 def _make_run_dir(name: str):
     from datetime import datetime
@@ -28,16 +28,7 @@ def _make_run_dir(name: str):
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
-LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
-    "temperature":          0.6,
-    "max_tokens":           8000,
-    "top_p":                0.95,
-    "top_k":                50,
-    "repetition_penalty":   1.1,
-}
+LLM_CONFIG = make_llm_config(max_tokens=8000)
 
 def main():
     run_dir = _make_run_dir("base_example")
@@ -78,7 +69,6 @@ def main():
     # No tools= argument — uses the default sandboxed tool list
     ag = agent(llm_config=LLM_CONFIG)
 
-    print(f"Model    : {LLM_CONFIG['model']}")
     print(f"Tools    : {[t.name for t in (file_skill.replace_tools or file_skill.add_tools or [])]}")
     print()
 
@@ -90,9 +80,13 @@ def main():
             file_path="/workspace/note.txt",
         ),
     )
-    print(f"   status  : {r1.status!r}")
-    print(f"   path    : {r1.path!r}")
-    print(f"   content : {r1.content!r}")
+    r1_data = r1.to_dict()
+    if "error" in r1_data:
+        print(f"   error   : {r1_data['error']!r}")
+        return
+    print(f"   status  : {r1_data['status']!r}")
+    print(f"   path    : {r1_data['path']!r}")
+    print(f"   content : {r1_data['content']!r}")
     print()
 
     print(">> [qa] ask about the note using shared history")
@@ -100,7 +94,11 @@ def main():
         qa_skill,
         agdata(question="What was written to the note file, and where is it?"),
     )
-    print(f"   answer : {r2.answer!r}")
+    r2_data = r2.to_dict()
+    if "error" in r2_data:
+        print(f"   error  : {r2_data['error']!r}")
+        return
+    print(f"   answer : {r2_data['answer']!r}")
     print()
 
     print(f"Shared history : {len(ag.history.messages)} messages total")

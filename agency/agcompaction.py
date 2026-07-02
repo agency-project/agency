@@ -201,6 +201,19 @@ def _prune_tool_outputs(messages: list[dict]) -> list[dict]:
     return result
 
 
+def _uses_max_completion_tokens(llm_config: dict) -> bool:
+    model = str(llm_config.get("model") or "").lower()
+    return model.startswith("gpt-5")
+
+
+def _set_completion_token_limit(kwargs: dict, limit: int, llm_config: dict) -> None:
+    if _uses_max_completion_tokens(llm_config):
+        kwargs["max_completion_tokens"] = limit
+        kwargs.pop("max_tokens", None)
+    else:
+        kwargs["max_tokens"] = limit
+
+
 def compact(
     messages: list[dict],
     llm_config: dict,
@@ -288,8 +301,8 @@ def compact(
             {"role": "system", "content": _SUMMARY_SYSTEM},
             {"role": "user",   "content": "\n".join(lines)},
         ],
-        max_tokens=SUMMARY_MAX_TOKENS,
     )
+    _set_completion_token_limit(compact_kwargs, SUMMARY_MAX_TOKENS, llm_config)
     if "extra_body" in llm_config:
         compact_kwargs["extra_body"] = llm_config["extra_body"]
     resp = client.chat.completions.create(**compact_kwargs)
