@@ -774,7 +774,11 @@ def validate_value_against_type_hint(type_hint, value) -> "str | None":
         if issubclass(type_hint, bool):
             return None if isinstance(value, bool) else f"expected bool, got {type(value).__name__}"
         if issubclass(type_hint, (int, float, str)):
-            return None if isinstance(value, type_hint) else f"expected {type_hint.__name__}, got {type(value).__name__}"
+            if isinstance(value, type_hint):
+                return None
+            if issubclass(type_hint, float) and isinstance(value, int):
+                return None  # int is accepted for float fields; caller receives the int, which is a valid float
+            return f"expected {type_hint.__name__}, got {type(value).__name__}"
         # bare list/tuple/dict without type args
         if issubclass(type_hint, (list, tuple)):
             return None if isinstance(value, (list, tuple)) else f"expected array, got {type(value).__name__}"

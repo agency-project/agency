@@ -372,6 +372,8 @@ class agschema:
                 except Exception:
                     pass
 
+            if type_hint is float and isinstance(value, int):
+                value = float(value)
             collected_outputs[field_name] = value
             remaining = required_fields - set(collected_outputs)
             if remaining:

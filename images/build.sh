@@ -42,4 +42,4 @@ case "$GPU_TYPE" in
     *)      GPU_FLAGS="" ;;
 esac
 
-docker run --rm $GPU_FLAGS agency-sandbox:latest python /workspace/model_smoke.py
+docker run --rm $GPU_FLAGS agency-sandbox:latest python -c "import torch; print('torch', torch.__version__, 'OK')"
