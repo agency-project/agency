@@ -283,6 +283,21 @@ def test_fetch_context_limit_reads_max_model_len():
     assert limit == 200_000
 
 
+def test_fetch_context_limit_reads_max_input_tokens_for_anthropic_provider():
+    """The first-party Anthropic API exposes max_input_tokens as a typed
+    field (not a model_extra vLLM-style extension) — see agllm_backend.py's
+    _AnthropicBackend.list_models()."""
+    mock_model = MagicMock()
+    mock_model.id = "claude-sonnet-5"
+    mock_model.model_extra = {}
+    mock_model.max_input_tokens = 1_000_000
+    mock_sdk = MagicMock()
+    mock_sdk.Anthropic.return_value.models.list.return_value = [mock_model]
+    with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
+        limit = fetch_context_limit({"provider": "anthropic", "model": "claude-sonnet-5"})
+    assert limit == 1_000_000
+
+
 # ---------------------------------------------------------------------------
 # agllm class
 # ---------------------------------------------------------------------------
@@ -474,6 +489,67 @@ def test_llm_call_transient_error_notifies_full_history_fn():
         )
     retry_events = [e for e in events if e.get("type") == "llm_retry"]
     assert len(retry_events) == LLM_MAX_RETRIES - 1
+
+def test_llm_call_rate_limit_honors_retry_after_header():
+    """A 429 must retry (not crash the skill) and sleep for exactly the
+    server-provided Retry-After duration when present."""
+    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    msgs = [{"role": "user", "content": "hi"}]
+    err  = openai.RateLimitError(
+        message="rate_limit_error", response=MagicMock(status_code=429, headers={"retry-after": "3"}), body=None,
+    )
+    with patch("agency.agllm.openai.OpenAI") as MockCls, \
+         patch("agency.agllm.time.sleep") as mock_sleep:
+        MockCls.return_value.chat.completions.create.side_effect = err
+        result = llm_call(
+            build_llm_kwargs(cfg, msgs, None), cfg, msgs,
+            None, None, None, None, 0, 0, "sk",
+        )
+    assert not result.ok
+    assert result.conn_error is err
+    assert mock_sleep.call_args_list[0].args[0] == 3.0
+
+def test_llm_call_rate_limit_falls_back_to_exponential_backoff_without_header():
+    """Missing/unparseable Retry-After must not crash — fall back to bounded,
+    jittered exponential backoff instead of raising a TypeError/ValueError."""
+    from agency.agllm import LLM_RATE_LIMIT_MAX_BACKOFF_S
+    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    msgs = [{"role": "user", "content": "hi"}]
+    err  = openai.RateLimitError(
+        message="rate_limit_error", response=MagicMock(status_code=429, headers={}), body=None,
+    )
+    with patch("agency.agllm.openai.OpenAI") as MockCls, \
+         patch("agency.agllm.time.sleep") as mock_sleep:
+        MockCls.return_value.chat.completions.create.side_effect = err
+        result = llm_call(
+            build_llm_kwargs(cfg, msgs, None), cfg, msgs,
+            None, None, None, None, 0, 0, "sk",
+        )
+    assert not result.ok
+    assert result.conn_error is err
+    for retry_call in mock_sleep.call_args_list:
+        sleep_s = retry_call.args[0]
+        assert 0 <= sleep_s <= LLM_RATE_LIMIT_MAX_BACKOFF_S
+
+def test_llm_call_rate_limit_exhausts_retries_without_raising():
+    """The 429 must never propagate uncaught — this was the original bug
+    (agskill.py crashing on anthropic.RateLimitError)."""
+    from agency.agllm import LLM_MAX_RETRIES
+    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    msgs = [{"role": "user", "content": "hi"}]
+    err  = openai.RateLimitError(
+        message="rate_limit_error", response=MagicMock(status_code=429, headers={"retry-after": "0"}), body=None,
+    )
+    with patch("agency.agllm.openai.OpenAI") as MockCls, \
+         patch("agency.agllm.time.sleep") as mock_sleep:
+        MockCls.return_value.chat.completions.create.side_effect = err
+        result = llm_call(
+            build_llm_kwargs(cfg, msgs, None), cfg, msgs,
+            None, None, None, None, 0, 0, "sk",
+        )
+    assert not result.ok
+    assert result.conn_error is err
+    assert mock_sleep.call_count == LLM_MAX_RETRIES - 1
 
 def test_llm_call_partial_placeholder_removed_on_error():
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}

@@ -12,6 +12,8 @@ import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar
 
+from .agresources import detect_gpus
+
 if TYPE_CHECKING:
     from .agresources import agResourcePool
     from .agterm import agterm
@@ -179,32 +181,39 @@ def get_container_runtime() -> str:
     return _RUNTIME
 
 
+_gpu_flags_cache: "list[str] | None" = None
+_gpu_flags_lock = threading.Lock()
+
+
 def _gpu_flags() -> list[str]:
-    """Return GPU passthrough flags for the container runtime.
+    """Return GPU passthrough flags for the container runtime, cached for the
+    process lifetime.
 
     NVIDIA: ``--gpus all`` (requires nvidia-container-toolkit).
     AMD:    ``--device /dev/kfd --device /dev/dri`` (ROCm device files).
     CPU-only hosts get no flags so they keep working without GPU drivers.
+
+    GPU presence is delegated to agresources.detect_gpus() — the same probe
+    the process-wide agResourcePool singleton uses — instead of running an
+    independent nvidia-smi/rocm-smi subprocess here. Every agSandbox()
+    construction used to pay its own full subprocess round-trip just to pick
+    a CLI flag; on a busy shared GPU host that adds up to real contention.
+    Caching the result (rather than only reusing detect_gpus()'s logic)
+    means this now runs at most once per process regardless of how many
+    sandboxes get created.
     """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, timeout=_TIMEOUT_INSPECT,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return ["--gpus", "all"]
-    except Exception:
-        pass
-    try:
-        result = subprocess.run(
-            ["rocm-smi", "--showid", "--csv"],
-            capture_output=True, timeout=_TIMEOUT_INSPECT,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return ["--device", "/dev/kfd", "--device", "/dev/dri"]
-    except Exception:
-        pass
-    return []
+    global _gpu_flags_cache
+    if _gpu_flags_cache is not None:
+        return _gpu_flags_cache
+    with _gpu_flags_lock:
+        if _gpu_flags_cache is None:
+            if not detect_gpus():
+                _gpu_flags_cache = []
+            elif shutil.which("nvidia-smi"):
+                _gpu_flags_cache = ["--gpus", "all"]
+            else:
+                _gpu_flags_cache = ["--device", "/dev/kfd", "--device", "/dev/dri"]
+        return _gpu_flags_cache
 
 
 class agSandbox:

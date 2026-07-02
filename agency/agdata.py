@@ -188,7 +188,7 @@ class agerror(agdata):
         object.__setattr__(self, "_data", {"error": message})
         from .agterm import agterm as _agterm_cls
         if not hasattr(agerror, "_term"):
-            agerror._term = _agterm_cls("agdata")
+            agerror._term = _agterm_cls("agerror")
         agerror._term.log("ERROR ✗  ", message, depth=2)
 
     def __getattr__(self, name: str):

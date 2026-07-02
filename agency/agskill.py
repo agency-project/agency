@@ -559,7 +559,7 @@ class agskill:
                             "content": (
                                 f"[HARNESS SYSTEM] You have not yet provided all required output fields. "
                                 f"Still missing: {sorted(missing)}. "
-                                f"Call {_missing_tools} tool(s) for each missing field."
+                                f"Call {_missing_tools} tool(s) with your output as tool argument."
                             ),
                         }
                         messages.append(reprompt)

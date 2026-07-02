@@ -1,4 +1,5 @@
 from __future__ import annotations
+import random
 import re
 import ssl
 import threading
@@ -7,8 +8,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 import httpx
-import openai
+import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
 from .agutil import _iter_batched, _strip_thinking, _extract_thinking, _LLMIdleTimeout
+from .agllm_backend import agllm_backend, BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS
 
 if TYPE_CHECKING:
     from .agterm import agterm
@@ -19,7 +21,7 @@ if TYPE_CHECKING:
 # Constants
 # ---------------------------------------------------------------------------
 _DEFAULT_CONTEXT_LIMIT     = 128_000 # Fallback context window size when model reports none.
-LLM_CALL_MAX_CONCURRENCY   = 128    # Maximum simultaneous in-flight LLM streaming calls across all skills.
+LLM_CALL_MAX_CONCURRENCY   = 256    # Maximum simultaneous in-flight LLM streaming calls across all skills.
 LLM_HTTP_CONNECT_TIMEOUT   = 10.0   # Seconds for httpx to establish a TCP/TLS connection.
 LLM_HTTP_WRITE_TIMEOUT     = 10.0   # Seconds for httpx to finish writing the request body.
 LLM_HTTP_POOL_TIMEOUT      = 10.0   # Seconds httpx waits to acquire a connection from the pool.
@@ -28,6 +30,12 @@ LLM_RETRY_SLEEP_S          = 2      # Seconds to wait after a connection/SSL err
 LLM_MAX_RETRIES            = 10
 LLM_IDLE_TIMEOUT           = 300.0  # seconds to wait for first chunk (server dead?)
 LLM_STREAM_TIMEOUT         = 1800.0 # seconds to wait between chunks mid-stream
+# 429 rate-limit backoff: prefer the server's Retry-After header (it knows exactly
+# when the org's per-minute window resets); exponential-with-jitter is only a
+# fallback for the rare case the header is missing. Uncapped exponential growth
+# isn't needed since 60s already covers a full per-minute rate-limit window.
+LLM_RATE_LIMIT_BASE_BACKOFF_S = 5.0
+LLM_RATE_LIMIT_MAX_BACKOFF_S  = 80.0
 
 _llm_call_semaphore = threading.Semaphore(LLM_CALL_MAX_CONCURRENCY)
 
@@ -41,7 +49,7 @@ DEFAULT_CONTEXT_LIMIT                  = 128_000
 SUMMARY_TASK_INPUT_MAX_CHARS           = 400
 SUMMARY_ASSISTANT_CONTENT_MAX_CHARS    = 400
 SUMMARY_ROLE_CONTENT_MAX_CHARS         = 600
-SUMMARY_MAX_TOKENS                     = 1024
+SUMMARY_MAX_TOKENS                     = 4096
 
 _COMPACT_THRESHOLD  = 0.70
 TAIL_TURNS          = 2
@@ -82,57 +90,6 @@ that must be respected going forward>
 ## Relevant Files
 <bullet list of every file path created, read, or modified>\
 """
-
-
-# ---------------------------------------------------------------------------
-# AWS Bedrock SigV4 auth
-# ---------------------------------------------------------------------------
-
-class _BedrockSigV4Auth(httpx.Auth):
-    """httpx auth handler that signs requests with AWS SigV4 for Amazon Bedrock."""
-
-    def __init__(self, region: str, api_key: str | None = None) -> None:
-        import boto3
-        from botocore.credentials import Credentials
-        self._region = region
-        if api_key:
-            parts = api_key.split(":", 2)
-            if len(parts) < 2:
-                raise ValueError(
-                    "Bedrock api_key must be 'ACCESS_KEY_ID:SECRET_ACCESS_KEY' "
-                    "or 'ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN'."
-                )
-            self._creds = Credentials(
-                access_key=parts[0],
-                secret_key=parts[1],
-                token=parts[2] if len(parts) == 3 else None,
-            )
-        else:
-            creds = boto3.Session(region_name=region).get_credentials()
-            if creds is None:
-                raise RuntimeError(
-                    "No AWS credentials found for Amazon Bedrock. "
-                    "Set api_key='ACCESS_KEY_ID:SECRET_ACCESS_KEY' in the llm_config, "
-                    "or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars, "
-                    "or run: aws configure"
-                )
-            self._creds = creds
-
-    def auth_flow(self, request: httpx.Request):
-        import botocore.auth
-        import botocore.awsrequest
-
-        aws_req = botocore.awsrequest.AWSRequest(
-            method=request.method,
-            url=str(request.url),
-            data=request.content or b"",
-            headers={k: v for k, v in request.headers.items()
-                     if k.lower() not in ("host", "content-length")},
-        )
-        botocore.auth.SigV4Auth(self._creds.get_frozen_credentials(), "bedrock", self._region).add_auth(aws_req)
-        for k, v in aws_req.headers.items():
-            request.headers[k] = v
-        yield request
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +136,7 @@ class agllm:
 
     def __init__(self, config: dict, context_limit: "int | None" = None) -> None:
         self.config: dict = config
+        self.backend: agllm_backend = agllm_backend.for_config(config)
         self.context_limit: int = context_limit if context_limit is not None else agllm.fetch_context_limit(config)
 
     # ------------------------------------------------------------------
@@ -247,10 +205,10 @@ class agllm:
             total_input_tokens  = _initial_input_tokens
             total_output_tokens = _initial_output_tokens
             _retry_err: "Exception | None" = None
+            _retry_sleep_s: float = LLM_RETRY_SLEEP_S
 
             with _llm_call_semaphore_slot():
-                client = agllm._make_client(
-                    llm_config,
+                client = self.backend.make_client(
                     httpx.Timeout(connect=LLM_HTTP_CONNECT_TIMEOUT, read=None, write=LLM_HTTP_WRITE_TIMEOUT, pool=LLM_HTTP_POOL_TIMEOUT),
                 )
 
@@ -318,7 +276,7 @@ class agllm:
                                         if tc_delta.function.arguments:
                                             slot["function"]["arguments"] += tc_delta.function.arguments
 
-                except openai.BadRequestError as _bad_req:
+                except BAD_REQUEST_EXCS as _bad_req:
                     try:
                         client.close()
                     except Exception:
@@ -335,15 +293,40 @@ class agllm:
                         term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  bad request: {_bad_req}")
                     return LLMCallResult(conn_error=_bad_req, elapsed_ms=_llm_elapsed_ms)
 
-                except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError,
-                        openai.APIConnectionError) as _conn_err:
+                except RATE_LIMIT_EXCS as _rate_err:
                     try:
                         client.close()
                     except Exception:
                         pass
                     messages.pop()
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-                    if isinstance(_conn_err, openai.APIConnectionError):
+                    _retry_after = getattr(getattr(_rate_err, "response", None), "headers", {}).get("retry-after")
+                    try:
+                        _retry_sleep_s = float(_retry_after)
+                    except (TypeError, ValueError):
+                        # No (or unparseable) Retry-After header — exponential backoff with
+                        # full jitter so many concurrently-throttled skills don't all wake
+                        # up and retry in the same instant (thundering herd).
+                        _backoff = min(LLM_RATE_LIMIT_MAX_BACKOFF_S, LLM_RATE_LIMIT_BASE_BACKOFF_S * (2 ** attempt))
+                        _retry_sleep_s = random.uniform(0, _backoff)
+                    if attempt < _LLM_MAX_RETRIES - 1:
+                        if term:
+                            term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  rate limited: {_rate_err}  "
+                                                    f"retry {attempt + 1}/{_LLM_MAX_RETRIES - 1} in {_retry_sleep_s:.1f}s")
+                        _retry_err = _rate_err
+                    else:
+                        if term:
+                            term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  rate limited: {_rate_err}  all retries exhausted")
+                        return LLMCallResult(conn_error=_rate_err, elapsed_ms=_llm_elapsed_ms)
+
+                except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError) + API_CONN_EXCS as _conn_err:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    messages.pop()
+                    _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
+                    if isinstance(_conn_err, API_CONN_EXCS):
                         _err_desc = f"Connection error: LLM backend unreachable ({_conn_err.__cause__ or _conn_err})"
                     else:
                         _err_desc = str(_conn_err)
@@ -363,7 +346,7 @@ class agllm:
             if _retry_err is not None:
                 if full_history_fn:
                     full_history_fn({"type": "llm_retry", "error": str(_retry_err), "attempt": attempt + 1})
-                time.sleep(LLM_RETRY_SLEEP_S)
+                time.sleep(_retry_sleep_s)
                 continue
             break  # success
 
@@ -436,66 +419,33 @@ class agllm:
 
         Priority:
         1. ``llm_config["context_limit"]`` — explicit user override
-        2. vLLM ``max_model_len`` from ``GET /v1/models/{model}``
-        3. ``_DEFAULT_CONTEXT_LIMIT`` — safe fallback so compaction always runs
+        2. Live API model listing — vLLM's ``max_model_len`` (a model_extra
+           field) or the Anthropic API's ``max_input_tokens`` (a typed field)
+        3. ``backend.known_context_limit()`` — static fallback (e.g. Bedrock,
+           which has no model-listing API at all)
+        4. ``_DEFAULT_CONTEXT_LIMIT`` — safe fallback so compaction always runs
         """
         if "context_limit" in llm_config:
             return int(llm_config["context_limit"])
+        model_id = llm_config.get("model", "")
+        backend = agllm_backend.for_config(llm_config)
         try:
-            client = openai.OpenAI(
-                api_key=llm_config.get("api_key", ""),
-                base_url=llm_config.get("base_url"),
-            )
-            model_id = llm_config.get("model", "")
-            all_models = list(client.models.list())
+            all_models = backend.list_models()
             candidates = [m for m in all_models if m.id == model_id] or all_models
             for info in candidates:
                 extra = getattr(info, "model_extra", None) or {}
                 if "max_model_len" in extra:
                     return int(extra["max_model_len"])
+                max_input_tokens = getattr(info, "max_input_tokens", None)
+                if max_input_tokens is not None:
+                    return int(max_input_tokens)
         except Exception as _e:
             print(f"[agllm] WARNING: failed to retrieve max_model_len from API: {_e}")
+        known = backend.known_context_limit(model_id)
+        if known is not None:
+            return known
         print(f"[agllm] WARNING: context limit unknown, falling back to {_DEFAULT_CONTEXT_LIMIT}")
         return _DEFAULT_CONTEXT_LIMIT
-
-    @staticmethod
-    def _make_client(llm_config: dict, timeout: httpx.Timeout) -> openai.OpenAI:
-        """Create an OpenAI-compatible client from llm_config.
-
-        Supports two providers:
-          - Default (OpenAI / vLLM / any OpenAI-compatible endpoint):
-              {"base_url": "...", "api_key": "...", ...}
-          - Amazon Bedrock (SigV4 auth, OpenAI-compatible endpoint):
-              {"provider": "bedrock", "region": "us-east-2", "model": "<bedrock-model-id>", ...}
-        """
-        if llm_config.get("provider") == "bedrock":
-            region  = llm_config.get("region", "us-east-1")
-            api_key = llm_config.get("api_key") or None
-            mantle_url  = f"https://bedrock-mantle.{region}.api.aws/v1"
-            runtime_url = f"https://bedrock-runtime.{region}.amazonaws.com"
-            if api_key and api_key.startswith("bedrock-api-key-"):
-                return openai.OpenAI(api_key=api_key, base_url=mantle_url, timeout=timeout)
-            if not api_key:
-                try:
-                    import os as _os
-                    from aws_bedrock_token_generator import provide_token as _provide_token
-                    _os.environ.setdefault("AWS_DEFAULT_REGION", region)
-                    token = _provide_token(region=region)
-                    return openai.OpenAI(api_key=token, base_url=mantle_url, timeout=timeout)
-                except ImportError:
-                    pass
-            return openai.OpenAI(
-                api_key="bedrock",
-                base_url=runtime_url,
-                http_client=httpx.Client(
-                    auth=_BedrockSigV4Auth(region, api_key=api_key), timeout=timeout
-                ),
-            )
-        return openai.OpenAI(
-            api_key=llm_config.get("api_key", "") or "EMPTY",
-            base_url=llm_config.get("base_url", None),
-            timeout=timeout,
-        )
 
     # ------------------------------------------------------------------
     # Compaction — token estimation, pruning, summarisation
@@ -516,10 +466,7 @@ class agllm:
     @staticmethod
     def count_messages_tokens(messages: list[dict], llm_config: dict) -> int:
         """Token count via the vLLM /tokenize endpoint, falling back to char estimate."""
-        base_url: str = llm_config.get("base_url", "") or ""
-        root = base_url.rstrip("/")
-        if root.endswith("/v1"):
-            root = root[:-3]
+        root = agllm_backend.for_config(llm_config).tokenize_url()
         if root:
             try:
                 resp = httpx.post(
@@ -638,10 +585,7 @@ class agllm:
                 lines.append(f"[tool result]: {content[:_TOOL_OUTPUT_MAX_CHARS]}")
             elif content:
                 lines.append(f"[{role}]: {content[:SUMMARY_ROLE_CONTENT_MAX_CHARS]}")
-        client = openai.OpenAI(
-            api_key=self.config.get("api_key", ""),
-            base_url=self.config.get("base_url"),
-        )
+        client = self.backend.make_client(httpx.Timeout(120.0))
         compact_kwargs: dict = dict(
             model=self.config.get("model", "gpt-4o"),
             messages=[
