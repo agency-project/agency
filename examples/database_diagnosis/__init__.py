@@ -1,0 +1,2 @@
+"""Simplified database diagnosis example."""
+
