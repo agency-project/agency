@@ -423,6 +423,80 @@ def test_agent_all_excludes_destroyed():
 
 
 # ---------------------------------------------------------------------------
+# Sandbox garbage collection
+#
+# agent has no __del__ logic for sandboxes anymore (no is_external_sandbox,
+# no custom sandbox getter/setter) — cleanup relies entirely on Python
+# refcounting plus agSandbox's own __del__/destroy(). These tests use a
+# lightweight stand-in that mirrors agSandbox's destroy-on-GC contract
+# (idempotent destroy() invoked from __del__) without touching Docker.
+# ---------------------------------------------------------------------------
+
+class _GCSandbox:
+    def __init__(self, on_destroy):
+        self._on_destroy = on_destroy
+        self._destroyed = False
+
+    def destroy(self):
+        if self._destroyed:
+            return
+        self._destroyed = True
+        self._on_destroy()
+
+    def __del__(self):
+        self.destroy()
+
+
+def test_agent_internal_sandbox_destroyed_only_after_agent_is_gone():
+    """A sandbox the agent owns outright must not be destroyed while the
+    agent is still alive, but must be cleaned up once it isn't."""
+    import gc
+    import weakref
+
+    destroyed = []
+    sb = _GCSandbox(lambda: destroyed.append(True))
+    ref = weakref.ref(sb)
+
+    ag = make_agent()
+    ag.sandbox = sb
+    del sb
+    gc.collect()
+
+    assert ref() is not None       # still alive — ag.sandbox holds it
+    assert destroyed == []         # not destroyed just because ag exists
+
+    del ag
+    gc.collect()
+
+    assert ref() is None           # collected once its last owner is gone
+    assert destroyed == [True]
+
+
+def test_external_sandbox_survives_agent_deletion_while_still_referenced():
+    """A caller-provided sandbox shared beyond the agent must outlive that
+    agent's deletion — nothing in agent.__del__ should force-destroy it."""
+    import gc
+    import weakref
+
+    destroyed = []
+    sb = _GCSandbox(lambda: destroyed.append(True))
+    ref = weakref.ref(sb)
+
+    ag = agent(llm_config={"api_key": "k", "model": "gpt-4o"}, sandbox=sb)
+    del ag
+    gc.collect()
+
+    assert ref() is not None       # our own reference keeps it alive
+    assert destroyed == []
+
+    del sb
+    gc.collect()
+
+    assert ref() is None           # only now, with no references left
+    assert destroyed == [True]
+
+
+# ---------------------------------------------------------------------------
 # Checkpointing (requires Docker)
 # ---------------------------------------------------------------------------
 

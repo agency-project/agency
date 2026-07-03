@@ -111,6 +111,14 @@ Two semaphores gate Docker daemon calls:
 
 `_docker_semaphore` limits *throughput* (concurrent daemon calls); `_container_semaphore` limits *capacity* (simultaneously running containers).
 
+A third mechanism guards a different axis — not Docker daemon load, but **exclusive use of one `agSandbox` object**:
+
+| Lock | Scope | Held by | Guards |
+|---|---|---|---|
+| `agSandbox._lock` (`threading.RLock`) | Per `agSandbox` instance | `agskill.py`'s `_task()`, for the full duration of one skill run (acquired right after provisioning, released after teardown's `stop()`) | Two skill runs interleaving `exec()` / `stop()` / `_ensure_started()` against the *same* container. There's no ownership flag anymore that ties a sandbox to exactly one agent, so a shared `agSandbox` (e.g. handed from one agent to another) needs this to stay safe. |
+
+This lock is reentrant and thread-local to whichever thread is running the skill — every per-tool-call `stop()`/`_ensure_started()` described above (and `wait_for_processes()`'s polling) happens on that same thread, so they re-acquire the already-held lock at no cost. The lock is *not* acquired automatically by `agSandbox`'s methods themselves; only `agskill`'s session-scoped acquire/release around a whole skill run establishes the "one skill run at a time" invariant. See `Design_architecture.md`'s "Per-sandbox mutex" section and `agsandbox.md`'s "Concurrent access" section for the full rationale, including why the lock is excluded from pickling.
+
 ---
 
 ## Dangling image accumulation and eager cleanup

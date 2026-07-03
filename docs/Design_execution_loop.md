@@ -58,15 +58,23 @@ r1 = ag.run(search_skill, agdata(query="..."))   # pending
 r2 = ag.run(summarize_skill, agdata(text=r1))    # r1 resolved here inside _task for r2
 ```
 
-### 3b. Sandbox provisioning
+### 3b. Sandbox provisioning and locking
 
 ```python
-if not ag.is_external_sandbox and ag.sandbox is None:
+if ag.sandbox is None:
     _out = Path(type(ag).output_dir) / ag.agname if type(ag).output_dir else None
     ag.sandbox = agSandbox(ag.agname, output_dir=_out)
+
+# Hold the sandbox's lock for the rest of the skill run so a sandbox
+# shared across agents is never driven by more than one skill run
+# at a time — released in the teardown below.
+sandbox_lock = ag.sandbox._lock
+sandbox_lock.acquire()
 ```
 
-Sandbox creation is lazy — only on the first skill run that needs tools. If `is_external_sandbox=True`, the framework skips creation and uses the externally-provided container.
+Sandbox creation is lazy — only on the first skill run that needs tools, and only if `ag.sandbox` isn't already set (either from a prior run on this agent, or a caller-provided sandbox passed to `agent(sandbox=...)`). There's no "external sandbox" special case anymore — whoever created the `agSandbox`, this skill run provisions it if missing and manages its lifecycle identically.
+
+Immediately after provisioning, `_task()` acquires `ag.sandbox._lock` (a `threading.RLock`, one per `agSandbox` instance) and holds it until the teardown in 3d releases it. This matters because a single `agSandbox` object can now be shared across more than one agent (e.g. handed from one agent to another, as in `examples/sandbox_handoff.py`); the lock ensures two skill runs never interleave `exec()`/`stop()`/`_ensure_started()` calls against the same container. Everything the ReAct loop does to the sandbox — each tool call's own `stop()`/`_ensure_started()` (see `Design_sandbox_lifecycle.md`), `wait_for_processes()` polling — happens on this same thread, so those calls reentrantly reuse the lock this thread already holds at no cost.
 
 ### 3c. Skill execution
 
@@ -99,11 +107,13 @@ finally:
     ag._set_ui_state("error" if _had_error else "finished")
     if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
         resource_pool.release_gpu(ag.sandbox._gpu_id)
-    if not ag.is_external_sandbox and ag.sandbox is not None:
+    if ag.sandbox is not None:
         ag.sandbox.stop(commit=True)
+    if sandbox_lock is not None:
+        sandbox_lock.release()
 ```
 
-The `finally` block always runs. It releases any GPU held by the sandbox and commits + stops the container (`stop(commit=True)` snapshots the container to the lifecycle image and removes it). The next skill run will restore from that image.
+The `finally` block always runs. It releases any GPU held by the sandbox, unconditionally commits + stops the container (`stop(commit=True)` snapshots the container to the lifecycle image and removes it — the next skill run, on this agent or whichever one next holds this `agSandbox`, will restore from that image), and finally releases the per-sandbox lock acquired in 3b. The lock release is last so nothing else can touch this sandbox until this skill run's own teardown has fully finished.
 
 ### 3e. Logging, token accounting, future resolution
 

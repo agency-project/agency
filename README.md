@@ -107,11 +107,76 @@ See [docs/Design_parallelization.md](docs/Design_parallelization.md) for the ful
 
 ## Examples
 
-End-to-end examples now live in the separate [`agency-examples`](https://github.com/agency-project/agency-examples) repository.
+All examples read LLM config from environment variables:
 
-The examples repository includes runnable workflows for sandboxed file I/O, shared agent history, forked parallel execution, paper crawling, multimodal image input, human-in-the-loop writing, sandbox handoff, bug-fixing loops, and ports of selected OpenAI Agents examples.
+| Variable | Default | Description |
+|---|---|---|
+| `VLLM_BASE_URL` | `https://kimi.js-park.info:18000/v1` | API endpoint |
+| `VLLM_API_KEY` | _(empty)_ | API key |
+| `VLLM_MODEL` | `moonshotai/Kimi-K2.6` | Model name |
 
-For local development, clone `agency` and `agency-examples` side by side, install `agency` in editable mode, and run the examples from the `agency-examples` checkout.
+### base_example — file I/O and sandboxed tools
+
+An agent writes a file inside its container, then reads it back. Demonstrates sandboxed tool use and typed skill schemas.
+
+```bash
+uv run python examples/base_example.py
+```
+
+### parallel_exec — sequential chain and fork fan-out
+
+Two parallelism patterns side by side:
+
+- **Sequential chain** — two `agent.run()` calls on the same agent; the second waits for the first automatically via the history chain
+- **Fork fan-out** — `agent(parent).run()` creates an independent copy per input; all run concurrently, results resolve lazily
+
+```bash
+uv run python examples/parallel_exec.py
+```
+
+### custom_tools — parallel summarisation pipeline with a custom host-side tool
+
+Searches arXiv for papers on a topic via a custom `search_papers` tool, summarises each in parallel with forked agents, then compiles a markdown report inside the sandbox.
+
+```bash
+uv run python examples/custom_tools.py
+uv run python examples/custom_tools.py "speculative decoding"
+MAX_PAPERS=6 uv run python examples/custom_tools.py "flash attention"
+```
+
+The report lands at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.md`.
+
+### image_processing — multimodal image input with `agimage`
+
+Demonstrates all three `agimage` patterns: single local file (auto base64-encoded), list of images compared side-by-side, and an image from a public URL. Requires a vision-capable model (e.g. `Qwen/Qwen2.5-VL-7B-Instruct`).
+
+```bash
+VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py photo.jpg
+VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py before.jpg after.jpg
+```
+
+### human_in_the_loop — human-in-the-loop collaborative writing
+
+A creative writing loop where the human acts as director, approving or revising every step from Python — the LLM never decides when to stop. Demonstrates `ask_human` with no timeout and the plan-then-write pattern.
+
+1. Python asks what scene to write next.
+2. Planner agent generates a paragraph-by-paragraph scene plan.
+3. Python presents the plan and asks for approval; loops with feedback until approved.
+4. Writer agent generates the full scene prose from the approved plan.
+5. Python presents the scene; loops (re-plan → re-write) until approved.
+6. Approved scenes are saved to `plans.md` and `story.txt` in the run directory.
+
+```bash
+uv run python examples/human_in_the_loop.py
+```
+
+### sandbox_handoff — driving `agent.sandbox` directly and handing it between agents
+
+Shows that `agent.sandbox` is a plain attribute the host can read, drive, and reassign — not something reachable only through a skill. One agent writes a file; the harness runs it and patches it with `sed` from Python, outside any skill; a second agent is pointed at the same sandbox (`agent_b.sandbox = sandbox`) and fixes the resulting bug; the harness re-runs it to confirm.
+
+```bash
+uv run python examples/sandbox_handoff.py
+```
 
 ## Common skills
 

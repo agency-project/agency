@@ -1575,8 +1575,16 @@ class TestDanglingImageEagerCleanup:
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
 
-    def test_stop_commit_rmi_failure_raises(self):
-        """A failing rmi must propagate — rmi on a known image ID is not best-effort."""
+    def test_stop_commit_rmi_failure_is_best_effort(self):
+        """A failing rmi during old-image cleanup must NOT propagate.
+
+        Per Design_sandbox_lifecycle.md's "Dangling image accumulation and
+        eager cleanup" section, this rmi is best-effort: a race with another
+        agent's inspect/rmi (or a fork still using the image) is expected and
+        should leave a dangling image rather than crash stop() — which runs
+        after every tool call, so a hard failure here would be far worse than
+        the disk-space cost of an occasional dangling image."""
+        import io
         import agency.agsandbox as _mod
 
         sb = _make_sandbox()
@@ -1594,12 +1602,20 @@ class TestDanglingImageEagerCleanup:
                 raise RuntimeError("image in use")
             return FakeCompleted()
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            with patch.object(sb, "_started", True):
-                with patch.object(sb, "_container_running", return_value=True):
-                    with patch.object(sb, "_gpu_virtual", False):
-                        with pytest.raises(RuntimeError, match="image in use"):
-                            sb.stop(commit=True)
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(_mod.agSandbox, "_run", fake_run):
+                with patch.object(sb, "_started", True):
+                    with patch.object(sb, "_container_running", return_value=True):
+                        with patch.object(sb, "_gpu_virtual", False):
+                            sb.stop(commit=True)  # must not raise
+        finally:
+            sys.stderr = old_stderr
+
+        assert "WARNING" in captured.getvalue()
+        assert fake_old_id in captured.getvalue()
 
     @docker
     def test_repeated_commits_leave_no_dangling_images(self):

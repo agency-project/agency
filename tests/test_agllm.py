@@ -490,9 +490,70 @@ def test_llm_call_transient_error_notifies_full_history_fn():
     retry_events = [e for e in events if e.get("type") == "llm_retry"]
     assert len(retry_events) == LLM_MAX_RETRIES - 1
 
+def test_llm_call_bare_api_error_retries_and_exhausts():
+    """A bare openai.APIError (e.g. a mid-stream server error frame with no
+    HTTP status to build a more specific subclass from) must retry like any
+    other transient error, not propagate uncaught and crash the skill."""
+    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    msgs = [{"role": "user", "content": "hi"}]
+    err  = openai.APIError(
+        "The server had an error while processing your request. Sorry about that!",
+        httpx.Request("POST", "http://x"),
+        body=None,
+    )
+    with patch("agency.agllm.openai.OpenAI") as MockCls, \
+         patch("agency.agllm.time.sleep"):
+        MockCls.return_value.chat.completions.create.side_effect = err
+        result = llm_call(
+            build_llm_kwargs(cfg, msgs, None), cfg, msgs,
+            None, None, None, None, 0, 0, "sk",
+        )
+    assert not result.ok
+    assert result.conn_error is err
+
+def test_llm_call_bare_api_error_notifies_full_history_fn():
+    from agency.agllm import LLM_MAX_RETRIES
+    cfg   = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    msgs  = [{"role": "user", "content": "hi"}]
+    err   = openai.APIError("server error", httpx.Request("POST", "http://x"), body=None)
+    events: list = []
+    with patch("agency.agllm.openai.OpenAI") as MockCls, \
+         patch("agency.agllm.time.sleep"):
+        MockCls.return_value.chat.completions.create.side_effect = err
+        llm_call(
+            build_llm_kwargs(cfg, msgs, None), cfg, msgs,
+            None, None, None, None, 0, 0, "sk",
+            events.append,
+        )
+    retry_events = [e for e in events if e.get("type") == "llm_retry"]
+    assert len(retry_events) == LLM_MAX_RETRIES - 1
+
+def test_llm_call_bad_request_still_immediate_despite_being_an_api_error():
+    """BadRequestError is itself an openai.APIError subclass — the broadened
+    retry-on-APIError clause must not shadow the more specific BadRequestError
+    handling (which returns immediately, no retry) since it's checked first."""
+    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    msgs = [{"role": "user", "content": "hi"}]
+    err  = openai.BadRequestError(
+        message="invalid_request_error",
+        response=MagicMock(status_code=400),
+        body=None,
+    )
+    with patch("agency.agllm.openai.OpenAI") as MockCls, \
+         patch("agency.agllm.time.sleep") as mock_sleep:
+        MockCls.return_value.chat.completions.create.side_effect = err
+        result = llm_call(
+            build_llm_kwargs(cfg, msgs, None), cfg, msgs,
+            None, None, None, None, 0, 0, "sk",
+        )
+    assert result.conn_error is err
+    mock_sleep.assert_not_called()
+
 def test_llm_call_rate_limit_honors_retry_after_header():
-    """A 429 must retry (not crash the skill) and sleep for exactly the
-    server-provided Retry-After duration when present."""
+    """A 429 must retry (not crash the skill) and never sleep for less than
+    the server-provided Retry-After duration when present — jitter is added
+    on top, never subtracted, so this asserts a floor rather than equality."""
+    from agency.agllm import LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
@@ -507,7 +568,28 @@ def test_llm_call_rate_limit_honors_retry_after_header():
         )
     assert not result.ok
     assert result.conn_error is err
-    assert mock_sleep.call_args_list[0].args[0] == 3.0
+    for retry_call in mock_sleep.call_args_list:
+        sleep_s = retry_call.args[0]
+        assert 3.0 <= sleep_s <= 3.0 + LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S
+
+def test_llm_call_rate_limit_retry_after_jitter_decorrelates_calls():
+    """Two agents that receive the identical Retry-After value must not be
+    guaranteed to sleep for the identical duration — otherwise concurrently
+    throttled agents sharing one org-wide window would all wake up and
+    retry in the same instant."""
+    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    msgs = [{"role": "user", "content": "hi"}]
+    err  = openai.RateLimitError(
+        message="rate_limit_error", response=MagicMock(status_code=429, headers={"retry-after": "3"}), body=None,
+    )
+    sleeps: list[float] = []
+    with patch("agency.agllm.openai.OpenAI") as MockCls, \
+         patch("agency.agllm.time.sleep", side_effect=lambda s: sleeps.append(s)):
+        MockCls.return_value.chat.completions.create.side_effect = err
+        llm_call(build_llm_kwargs(cfg, msgs, None), cfg, msgs, None, None, None, None, 0, 0, "sk")
+    # Across the many retries within a single run, jitter must vary the sleep
+    # duration rather than collapsing to the bare Retry-After value every time.
+    assert len(set(sleeps)) > 1
 
 def test_llm_call_rate_limit_falls_back_to_exponential_backoff_without_header():
     """Missing/unparseable Retry-After must not crash — fall back to bounded,

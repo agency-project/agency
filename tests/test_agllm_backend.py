@@ -16,6 +16,7 @@ from agency.agllm_backend import (
     BAD_REQUEST_EXCS,
     API_CONN_EXCS,
     agllm_backend,
+    _AnthropicAWSBackend,
     _AnthropicBackend,
     _AnthropicBedrockBackend,
     _AnthropicBedrockChatClient,
@@ -105,6 +106,15 @@ class TestForConfig:
         backend = agllm_backend.for_config({"provider": "anthropic", "model": "claude-sonnet-5"})
         assert isinstance(backend, _AnthropicBackend)
         assert not isinstance(backend, _AnthropicBedrockBackend)
+
+    def test_anthropic_aws_provider_returns_anthropic_aws_backend(self):
+        backend = agllm_backend.for_config({"provider": "anthropicAWS", "model": "claude-sonnet-5"})
+        assert isinstance(backend, _AnthropicAWSBackend)
+        assert not isinstance(backend, _AnthropicBackend)
+
+    def test_anthropic_aws_snake_case_alias(self):
+        backend = agllm_backend.for_config({"provider": "anthropic_aws", "model": "claude-sonnet-5"})
+        assert isinstance(backend, _AnthropicAWSBackend)
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +329,61 @@ class TestAnthropicBedrockBackend:
         backend = _AnthropicBedrockBackend({})
         assert backend.known_context_limit("us.anthropic.claude-sonnet-5") == 1_000_000
         assert backend.known_context_limit("anthropic.claude-nonexistent-model") is None
+
+
+# ---------------------------------------------------------------------------
+# _AnthropicAWSBackend (Claude Platform on AWS via AnthropicAWS client)
+# ---------------------------------------------------------------------------
+
+class TestAnthropicAWSBackend:
+    def test_make_client_uses_anthropic_aws(self):
+        backend = _AnthropicAWSBackend({
+            "api_key": "aws-api-key",
+            "region": "us-east-2",
+            "workspace_id": "wrkspc_test",
+        })
+        mock_sdk = MagicMock()
+        mock_sdk.AnthropicAWS = MagicMock()
+        with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
+            client = backend.make_client(httpx.Timeout(30.0))
+        mock_sdk.AnthropicAWS.assert_called_once_with(
+            timeout=httpx.Timeout(30.0),
+            api_key="aws-api-key",
+            aws_region="us-east-2",
+            workspace_id="wrkspc_test",
+        )
+        assert isinstance(client, _AnthropicBedrockChatClient)
+
+    def test_env_var_fallbacks(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_AWS_API_KEY", "key-from-env")
+        monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_from_env")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://aws-external-anthropic.us-east-2.api.aws")
+        backend = _AnthropicAWSBackend({})
+        mock_sdk = MagicMock()
+        mock_sdk.AnthropicAWS = MagicMock()
+        with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
+            backend.make_client(httpx.Timeout(5.0))
+        _, kwargs = mock_sdk.AnthropicAWS.call_args
+        assert kwargs["api_key"] == "key-from-env"
+        assert kwargs["workspace_id"] == "wrkspc_from_env"
+        assert kwargs["base_url"] == "https://aws-external-anthropic.us-east-2.api.aws"
+
+    def test_list_models_calls_anthropic_aws(self):
+        backend = _AnthropicAWSBackend({"api_key": "k", "workspace_id": "w", "base_url": "https://example.test"})
+        mock_sdk = MagicMock()
+        mock_raw = MagicMock()
+        mock_raw.models.list.return_value = ["claude-sonnet-5"]
+        mock_sdk.AnthropicAWS.return_value = mock_raw
+        with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
+            result = backend.list_models()
+        assert result == ["claude-sonnet-5"]
+
+    def test_tokenize_url_is_none(self):
+        assert _AnthropicAWSBackend({}).tokenize_url() is None
+
+    def test_known_context_limit_delegates_to_lookup(self):
+        backend = _AnthropicAWSBackend({})
+        assert backend.known_context_limit("claude-sonnet-5") == 1_000_000
 
 
 # ---------------------------------------------------------------------------

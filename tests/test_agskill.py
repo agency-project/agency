@@ -749,7 +749,7 @@ def test_return_tool_logs_validation_error_to_term():
 # Concurrency semaphore
 # ---------------------------------------------------------------------------
 
-from agency.agllm import _llm_call_semaphore as _sem
+from agency.agllm import _llm_call_semaphore as _sem, LLM_CALL_MAX_CONCURRENCY
 
 
 def test_semaphore_released_after_success():
@@ -784,7 +784,7 @@ def test_semaphore_limits_concurrency():
     sem = _sem
     # Grab all but one slot
     grabbed = []
-    for _ in range(127):
+    for _ in range(LLM_CALL_MAX_CONCURRENCY - 1):
         sem.acquire()
         grabbed.append(True)
     try:
