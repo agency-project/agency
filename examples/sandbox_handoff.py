@@ -23,7 +23,7 @@ restarts the container from that checkpoint.
 
 Run:
     uv run python examples/sandbox_handoff.py
-    VLLM_BASE_URL=https://... VLLM_MODEL=... uv run python examples/sandbox_handoff.py
+    VLLM_BASE_URL="" uv run python examples/sandbox_handoff.py
 """
 import os
 from pathlib import Path
@@ -39,11 +39,6 @@ LLM_CONFIG = {
     "base_url":          os.environ.get("VLLM_BASE_URL", ""),
     "api_key":           os.environ.get("VLLM_API_KEY",  ""),
     "model":             os.environ.get("VLLM_MODEL",    ""),
-    "temperature":       0.6,
-    "max_tokens":        8000,
-    "top_p":             0.95,
-    "top_k":             50,
-    "repetition_penalty": 1.1,
 }
 
 FILE_PATH = "/workspace/hello.py"
@@ -172,10 +167,10 @@ def main() -> None:
 
     _run_file(sandbox, "after fix")
 
-    # Sandbox cleanup: agSandbox.__del__ calls destroy() when the object is GC'd,
+    # Sandbox cleanup: agSandbox.__del__ calls destroy() when the object is garbage collected,
     # and an atexit handler catches anything that survives to interpreter shutdown.
     # Explicit destroy() is only needed in long-running processes where you want
-    # deterministic resource release rather than waiting for GC.
+    # deterministic container resource release on the host-side rather than waiting for GC.
     print("\nDone.")
 
 

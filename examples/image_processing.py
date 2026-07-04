@@ -23,19 +23,11 @@ from pathlib import Path
 
 from agency import agent, agdata, agimage, agskill, agteam, agsync
 
-
 LLM_CONFIG = {
     "base_url":             os.environ.get("VLLM_BASE_URL", ""),
     "api_key":              os.environ.get("VLLM_API_KEY",  ""),
     "model":                "",
-    "temperature":          0.6,
-    "max_tokens":           8000,
-    "top_p":                0.95,
-    "top_k":                50,
-    "repetition_penalty":   1.1,
 }
-
-
 
 # ---------------------------------------------------------------------------
 # Skills

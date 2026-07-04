@@ -23,11 +23,6 @@ LLM_CONFIG = {
     "base_url":             os.environ.get("VLLM_BASE_URL", ""),
     "api_key":              os.environ.get("VLLM_API_KEY",  ""),
     "model":                "",
-    "temperature":          0.6,
-    "max_tokens":           8000,
-    "top_p":                0.95,
-    "top_k":                50,
-    "repetition_penalty":   1.1,
 }
 
 
@@ -149,7 +144,6 @@ if __name__ == "__main__":
 
     def _script() -> None:
         print(f"Endpoint : {LLM_CONFIG['base_url']}")
-        print(f"Model    : {LLM_CONFIG['model']}\n")
         print(f"Run dir  : {run_dir}\n")
         try:
             seq_team = SequentialChainTeam()

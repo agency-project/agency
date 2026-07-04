@@ -1,25 +1,30 @@
 """
-Example: agent talking to a remote vLLM server, with typed agskill schemas.
+Example: agent talking to a remote LLM server, with typed agskill schemas.
 
-vLLM exposes an OpenAI-compatible API:
+vLLM-based OpenAI-compatible API example::
   - base_url  → http://<host>:<port>/v1
   - api_key   → "EMPTY" (or whatever --api-key you set when launching vLLM)
-  - model     → the model name exactly as vLLM registered it
+  - model     → The model to be used. (If empty, the server will be queried for the model.)
 
-Launch vLLM (example):
-    vllm serve meta-llama/Llama-3.1-8B-Instruct \
-        --enable-auto-tool-choice \
-        --tool-call-parser llama3 \
-        --port 8000
+    Launch vLLM (example):
+        vllm serve google/gemma-4-E2B-it \
+            --enable-auto-tool-choice \
+            --tool-call-parser gemma4 \
+            --reasoning-parser gemma4
 
-Run this script:
-    uv run python example.py
-    VLLM_BASE_URL="" VLLM_MODEL=kimi_k2.6 uv run python example.py
+    Run this script:
+        uv run python example.py
+        VLLM_BASE_URL="http://localhost:8000/v1" uv run python example.py
 """
 import os
 from pathlib import Path
-
 from agency import agent, agskill, agdata
+
+LLM_CONFIG = {
+    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
+    "model":                "",
+}
 
 def _make_run_dir(name: str):
     from datetime import datetime
@@ -27,17 +32,6 @@ def _make_run_dir(name: str):
     run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
-
-LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
-    "temperature":          0.6,
-    "max_tokens":           8000,
-    "top_p":                0.95,
-    "top_k":                50,
-    "repetition_penalty":   1.1,
-}
 
 def main():
     run_dir = _make_run_dir("base_example")
@@ -78,7 +72,6 @@ def main():
     # No tools= argument — uses the default sandboxed tool list
     ag = agent(llm_config=LLM_CONFIG)
 
-    print(f"Model    : {LLM_CONFIG['model']}")
     print(f"Tools    : {[t.name for t in (file_skill.replace_tools or file_skill.add_tools or [])]}")
     print()
 

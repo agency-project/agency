@@ -35,33 +35,15 @@ LLM_CONFIG = {
     "base_url":             os.environ.get("VLLM_BASE_URL", ""),
     "api_key":              os.environ.get("VLLM_API_KEY",  ""),
     "model":                "",
-    "temperature":          0.6,
-    "max_tokens":           8000,
-    "top_p":                0.95,
-    "top_k":                50,
-    "repetition_penalty":   1.1,
 }
-MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "6"))
+MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 _MAX_CHARS = 32_000
-
-
-def _arxiv_html_url(url: str) -> str:
-    m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
-    if not m:
-        return url
-    return f"https://arxiv.org/html/{m.group(1)}"
-
-
-def _arxiv_pdf_url(url: str) -> str:
-    m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
-    if not m:
-        return url
-    return f"https://arxiv.org/pdf/{m.group(1)}"
 
 
 class FindPapersSkill(agskill):
     def __init__(self, max_papers: int = 10, **kwargs):
         self.max_papers = max_papers
+
         search_papers = agtool(
             name="search_papers",
             description="Search Hugging Face Papers for AI research papers. Returns title, URL, and abstract for each result.",
@@ -76,6 +58,7 @@ class FindPapersSkill(agskill):
                 "required": ["query"],
             },
         )
+
         super().__init__(
             name="find_papers",
             system_prompt=(
@@ -122,6 +105,7 @@ class FindPapersSkill(agskill):
 
 class SummarisePaperSkill(agskill):
     def __init__(self, **kwargs):
+
         fetch_paper = agtool(
             name="fetch_paper",
             description=(
@@ -144,6 +128,7 @@ class SummarisePaperSkill(agskill):
                 "required": ["url"],
             },
         )
+    
         super().__init__(
             name="summarise_paper",
             system_prompt=(
@@ -162,9 +147,15 @@ class SummarisePaperSkill(agskill):
         )
         self.fetch_paper = fetch_paper
 
+    def _arxiv_html_url(self, url: str) -> str:
+        m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
+        if not m:
+            return url
+        return f"https://arxiv.org/html/{m.group(1)}"
+
     def _fetch_paper(self, arg: agdata) -> agdata:
         url = str(arg.url)
-        html_url = _arxiv_html_url(url)
+        html_url = self._arxiv_html_url(url)
         offset = int(getattr(arg, "offset", 0) or 0)
         try:
             resp = httpx.get(html_url, timeout=30, follow_redirects=True)
@@ -308,12 +299,10 @@ if __name__ == "__main__":
 
     def _script() -> None:
         print(f"Endpoint : {LLM_CONFIG['base_url']}")
-        print(f"Model    : {LLM_CONFIG['model']}")
         print(f"Run dir  : {run_dir}\n")
         try:
             topics = [topic] if topic != "KV cache quantization" else [
                 "KV cache quantization",
-                "flash attention",
                 "speculative decoding",
             ]
             teams = [PaperCrawlerTeam(topic=t) for t in topics]
