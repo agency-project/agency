@@ -21,11 +21,6 @@ cd agency
 # Auto-detects the host GPU (NVIDIA / AMD / CPU-only):
 ./images/build.sh
 
-# Override GPU type explicitly:
-GPU_TYPE=rocm ./images/build.sh    # AMD ROCm 7.2
-GPU_TYPE=nvidia ./images/build.sh  # NVIDIA CUDA
-GPU_TYPE=cpu ./images/build.sh     # CPU only
-
 uv venv
 source .venv/bin/activate
 
@@ -42,9 +37,9 @@ The sandbox image comes with `torch torchvision transformers datasets accelerate
 ```python
 from agency import agent, agskill, agdata
 
-summarise = agskill(
+continuation = agskill(
     name="summarise",
-    system_prompt="Summarise the given text in one sentence.",
+    system_prompt="Continue the sentence.",
     input_schema=agdata(text=str),
     output_schema=agdata(summary=str),
 )
@@ -52,14 +47,43 @@ summarise = agskill(
 ag = agent(
     llm_config={
         "base_url": "http://localhost:8000/v1",
-        "api_key":  "EMPTY",
-        "model":    "meta-llama/Llama-3.1-8B-Instruct",
+        "api_key":  "", # Leave blank if unused
+        "model":    "", # Will auto-detect if using vLLM
     },
 )
 
-result = ag.run(summarise, agdata(text="The quick brown fox jumps over the lazy dog."))
+result = ag.run(continuation, agdata(text="Fly me to the moon and let me "))
 print(result.summary)   # blocks until done
 ```
+
+**OpenAI**
+
+```python
+ag = agent(
+    llm_config={
+        "model":   "gpt-4o",
+        "api_key": os.environ["OPENAI_API_KEY"],
+    },
+)
+```
+
+This is the same default backend used for vLLM/local endpoints above — omit `base_url` and it talks to `https://api.openai.com/v1`. Unlike the other providers, the API key isn't picked up from an environment variable automatically; pass it explicitly.
+
+**Anthropic**
+
+```python
+ag = agent(
+    llm_config={
+        "provider": "anthropic",
+        "model":    "claude-sonnet-5",
+        "api_key":  os.environ["ANTHROPIC_API_KEY"]
+    },
+)
+```
+
+Requires the `anthropic` package (`pip install anthropic`). 
+For Claude on Bedrock, set `"provider": "bedrock"` instead (see below) — it's picked automatically for `anthropic.*` model IDs. 
+For Claude via AWS's direct Anthropic-on-AWS API, use `"provider": "anthropicAWS"`.
 
 **Amazon Bedrock**
 
@@ -79,21 +103,21 @@ Pass `"api_key": "bedrock-api-key-..."` to use a static Bedrock API key instead 
 
 ## Core concepts
 
-**`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. Fields are accessed as attributes (`result.summary`). Supports JSON serialisation and schema validation.
-
-**`agtype`** — base class for typed agdata field values. Subclass to control how a schema field is serialised, transferred to/from the sandbox filesystem, represented in the system prompt, and cleaned up. `agfile` is the built-in subclass for file-backed fields. `agimage` is the built-in subclass for multimodal image inputs — local files are base64-encoded automatically; the image is injected into the message content array so the model sees it visually. `agrawstring` bypasses JSON formatting entirely — the input string is sent as raw text and the model's full response is captured as-is, skipping JSON parsing and the retry loop.
+**`agent`** — a pure state container: holds an LLM config, sandboxed tools, conversation context (`agcontext`), and a name. It does not own an execution loop. `agent.run(skill, input)` is a thin dispatch call; the scheduling wrapper is `agskill.run()`, which spawns a daemon thread, and the ReAct loop is `agskill.execute_react()`. Each `run()` call is non-blocking and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the context and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
 
 **`agskill`** — a named skill with its own system prompt, optional input/output schemas, and an optional tool list. `agskill.run()` is a non-blocking scheduling wrapper: it spawns a daemon thread and returns a pending `agdata` immediately. The actual synchronous ReAct loop is `agskill.execute_react()`. The LLM calls tools, inspects results, and iterates until it has registered all required output fields. Output is collected via per-field tools (`return_summary`, `return_score`, etc.) generated dynamically from the output schema — each with a typed `value` parameter — rather than a single JSON blob. Each field is validated immediately on registration; missing fields trigger a targeted reprompt.
 
 **`agtool`** — a named callable an LLM can invoke via function calling. Every tool call is offloaded to a `ProcessPoolExecutor` worker so CPU-bound tools don't block other agents. Tools are serialised with `cloudpickle`, so bound methods work without any extra machinery. Before each sandboxed tool call the container is checkpointed; on tool failure the sandbox is automatically rolled back to that checkpoint and the LLM is told the workspace was reverted. Agents can pass `"timeout": <seconds>` in any tool call's arguments to override the default 30 s watchdog.
 
-**`agent`** — a pure state container: holds an LLM config, sandboxed tools, conversation context (`agcontext`), and a name. It does not own an execution loop. `agent.run(skill, input)` is a thin dispatch call; the scheduling wrapper is `agskill.run()`, which spawns a daemon thread, and the ReAct loop is `agskill.execute_react()`. Each `run()` call is non-blocking and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the context and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
+**`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. Fields are accessed as attributes (`result.summary`). Supports JSON serialisation and schema validation.
 
-**GPU support** — NVIDIA and AMD (ROCm) GPUs are both supported. `agResourcePool` auto-detects GPUs via `nvidia-smi` (NVIDIA) or `rocm-smi` (AMD) and issues leases to prevent two agents from sharing a device. The sandbox container receives `--gpus all` (NVIDIA) or `--device /dev/kfd --device /dev/dri` (AMD) at startup. GPU access uses *lazy physical allocation*: `reserve_gpu` sets a virtual flag with no physical cost; a physical GPU is claimed from the pool only when a bash command actually runs, and returned as soon as the command's processes finish. Between bash calls the GPU is free for other agents. `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES` are set to the assigned device ID for the duration of each bash execution.
+**`agtype`** — base class for typed agdata field values. Subclass to control how a schema field is serialised, transferred to/from the sandbox filesystem, represented in the system prompt, and cleaned up. `agfile` is the built-in subclass for file-backed fields. `agimage` is the built-in subclass for multimodal image inputs — local files are base64-encoded automatically; the image is injected into the message content array so the model sees it visually. `agrawstring` bypasses JSON formatting entirely — the input string is sent as raw text and the model's full response is captured as-is, skipping JSON parsing and the retry loop.
 
 **`agteam`** — coordinates multiple agents or tasks. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow. Each `run()` call executes in its own daemon thread.
 
 **`agwebui`** — a browser-based dashboard that runs in a separate process. Writes structured events to a JSONL file; a standalone FastAPI server tails it and pushes updates to connected browsers over WebSocket. See [docs/agwebui.md](docs/agwebui.md).
+
+**GPU support** — NVIDIA and AMD (ROCm) GPUs are both supported. `agResourcePool` auto-detects GPUs via `nvidia-smi` (NVIDIA) or `rocm-smi` (AMD) and issues leases to prevent two agents from sharing a device. The sandbox container receives `--gpus all` (NVIDIA) or `--device /dev/kfd --device /dev/dri` (AMD) at startup. GPU access uses *lazy physical allocation*: `reserve_gpu` sets a virtual flag with no physical cost; a physical GPU is claimed from the pool only when a bash command actually runs, and returned as soon as the command's processes finish. Between bash calls the GPU is free for other agents. `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES` are set to the assigned device ID for the duration of each bash execution.
 
 ## Parallelism model
 
@@ -107,20 +131,12 @@ See [docs/Design_parallelization.md](docs/Design_parallelization.md) for the ful
 
 ## Examples
 
-All examples read LLM config from environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `VLLM_BASE_URL` | `https://kimi.js-park.info:18000/v1` | API endpoint |
-| `VLLM_API_KEY` | _(empty)_ | API key |
-| `VLLM_MODEL` | `moonshotai/Kimi-K2.6` | Model name |
-
 ### base_example — file I/O and sandboxed tools
 
 An agent writes a file inside its container, then reads it back. Demonstrates sandboxed tool use and typed skill schemas.
 
 ```bash
-uv run python examples/base_example.py
+python examples/base_example.py
 ```
 
 ### parallel_exec — sequential chain and fork fan-out
@@ -131,7 +147,7 @@ Two parallelism patterns side by side:
 - **Fork fan-out** — `agent(parent).run()` creates an independent copy per input; all run concurrently, results resolve lazily
 
 ```bash
-uv run python examples/parallel_exec.py
+python examples/parallel_exec.py
 ```
 
 ### custom_tools — parallel summarisation pipeline with a custom host-side tool
@@ -140,8 +156,6 @@ Searches arXiv for papers on a topic via a custom `search_papers` tool, summaris
 
 ```bash
 uv run python examples/custom_tools.py
-uv run python examples/custom_tools.py "speculative decoding"
-MAX_PAPERS=6 uv run python examples/custom_tools.py "flash attention"
 ```
 
 The report lands at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.md`.
@@ -151,8 +165,7 @@ The report lands at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.
 Demonstrates all three `agimage` patterns: single local file (auto base64-encoded), list of images compared side-by-side, and an image from a public URL. Requires a vision-capable model (e.g. `Qwen/Qwen2.5-VL-7B-Instruct`).
 
 ```bash
-VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py photo.jpg
-VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py before.jpg after.jpg
+python examples/image_processing.py photo.jpg
 ```
 
 ### human_in_the_loop — human-in-the-loop collaborative writing
