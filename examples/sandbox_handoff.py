@@ -23,7 +23,7 @@ restarts the container from that checkpoint.
 
 Run:
     uv run python examples/sandbox_handoff.py
-    VLLM_BASE_URL=https://... VLLM_MODEL=... uv run python examples/sandbox_handoff.py
+    VLLM_BASE_URL="" uv run python examples/sandbox_handoff.py
 """
 import os
 from pathlib import Path

@@ -21,7 +21,7 @@ Output files written to runs/<timestamp>_human_in_the_loop/:
 
 Usage:
     uv run python examples/human_in_the_loop.py
-    VLLM_BASE_URL=http://... VLLM_MODEL=... uv run python examples/human_in_the_loop.py
+    VLLM_BASE_URL="" uv run python examples/human_in_the_loop.py
 """
 from __future__ import annotations
 

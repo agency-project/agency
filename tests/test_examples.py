@@ -10,6 +10,7 @@ Two tiers:
 import importlib.util
 import os
 import runpy
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,5 +37,8 @@ def test_example_runs_live(path):
     # Every example wraps its run in agwebui.run(fn, ...), which spawns a
     # dashboard server and then blocks forever waiting for Ctrl+C (linger=True).
     # Bypass the dashboard and just call fn() directly so the test can complete.
-    with patch("agency.agwebui.agwebui.run", side_effect=lambda fn, *a, **kw: fn()):
+    # Also reset sys.argv so examples that read sys.argv[1:] (e.g. for an
+    # optional topic/image path) don't pick up pytest's own CLI args.
+    with patch("agency.agwebui.agwebui.run", side_effect=lambda fn, *a, **kw: fn()), \
+         patch.object(sys, "argv", [str(path)]):
         runpy.run_path(str(path), run_name="__main__")

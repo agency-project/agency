@@ -1358,9 +1358,9 @@ def test_build_llm_kwargs_strips_private_keys():
 
 
 def test_build_llm_kwargs_openai_gen_params():
-    kw = build_llm_kwargs({"model": "m", "temperature": 0.7, "max_tokens": 100}, [], None)
+    kw = build_llm_kwargs({"model": "m", "temperature": 0.7, "max_completion_tokens": 100}, [], None)
     assert kw["temperature"] == 0.7
-    assert kw["max_tokens"] == 100
+    assert kw["max_completion_tokens"] == 100
 
 
 def test_build_llm_kwargs_extra_body_vllm_params():

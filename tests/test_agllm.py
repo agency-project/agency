@@ -156,10 +156,22 @@ def test_build_llm_kwargs_tools_included():
     assert kw["tools"] == tools
 
 def test_build_llm_kwargs_openai_gen_params_forwarded():
-    cfg = {"model": "m", "temperature": 0.7, "max_tokens": 512}
+    cfg = {"model": "m", "temperature": 0.7, "max_completion_tokens": 512}
     kw  = build_llm_kwargs(cfg, [], None)
     assert kw["temperature"] == 0.7
-    assert kw["max_tokens"]  == 512
+    assert kw["max_completion_tokens"] == 512
+
+def test_build_llm_kwargs_max_tokens_translated_with_warning(capsys):
+    kw = build_llm_kwargs({"model": "m", "max_tokens": 256}, [], None)
+    assert kw["max_completion_tokens"] == 256
+    assert "max_tokens" not in kw
+    assert "deprecated" in capsys.readouterr().out
+
+def test_build_llm_kwargs_max_completion_tokens_wins_when_both_present(capsys):
+    cfg = {"model": "m", "max_tokens": 256, "max_completion_tokens": 512}
+    kw  = build_llm_kwargs(cfg, [], None)
+    assert kw["max_completion_tokens"] == 512
+    assert "deprecated" in capsys.readouterr().out
 
 def test_build_llm_kwargs_unknown_params_not_forwarded():
     cfg = {"model": "m", "custom_param": "ignored"}

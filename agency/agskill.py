@@ -481,10 +481,9 @@ class agskill:
 
             if ag.llm.context_limit is not None:
                 _headroom = max(1, ag.llm.context_limit - _pre_estimate)
-                _limit_key = "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
-                if kwargs.get(_limit_key, _headroom) > _headroom:
+                if kwargs.get("max_completion_tokens", _headroom) > _headroom:
                     kwargs = dict(kwargs)
-                    kwargs[_limit_key] = _headroom
+                    kwargs["max_completion_tokens"] = _headroom
 
             # 6c. Call the LLM (with internal retry on transient errors).
             llm_result = ag.llm.call(
