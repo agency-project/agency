@@ -144,7 +144,6 @@ if __name__ == "__main__":
 
     def _script() -> None:
         print(f"Endpoint : {LLM_CONFIG['base_url']}")
-        print(f"Model    : {LLM_CONFIG['model']}\n")
         print(f"Run dir  : {run_dir}\n")
         try:
             seq_team = SequentialChainTeam()

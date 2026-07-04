@@ -1,9 +1,16 @@
 """Tests for the agtool class."""
+import importlib
 import os
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from agency.agdata import agdata
 from agency.agtool import agtool
+
+# `agency/__init__.py` does `from .agtool import agtool`, which overwrites the
+# `agtool` attribute on the `agency` package with the class — so a plain
+# `import agency.agtool as _agtool_mod` would resolve to the class, not the
+# module. Go through importlib to get the actual module object.
+_agtool_mod = importlib.import_module("agency.agtool")
 
 
 def _echo(arg: agdata) -> agdata:
@@ -170,3 +177,55 @@ def test_no_sandbox_timeout_not_enforced():
     t = agtool(name="slow_inproc", description="", fn=_slow, run_in_subprocess=False)
     result = t(agdata(), timeout=1)
     assert result.done is True
+
+
+# ---------------------------------------------------------------------------
+# Process pool lifecycle — SIGINT-ignoring workers, explicit shutdown
+# ---------------------------------------------------------------------------
+
+def test_ignore_sigint_in_worker_sets_sig_ign():
+    """The pool initializer makes workers ignore SIGINT so Ctrl+C doesn't kill
+    a tool call mid-flight; call it directly rather than actually changing
+    this process's signal disposition."""
+    import signal
+    with patch("signal.signal") as mock_signal:
+        _agtool_mod._ignore_sigint_in_worker()
+    mock_signal.assert_called_once_with(signal.SIGINT, signal.SIG_IGN)
+
+
+def test_get_pool_uses_sigint_ignoring_initializer():
+    pool = _agtool_mod._get_pool()
+    assert pool._initializer is _agtool_mod._ignore_sigint_in_worker
+
+
+def test_shutdown_tool_pool_resets_pool_and_calls_shutdown():
+    mock_pool = MagicMock()
+    original = _agtool_mod._pool
+    _agtool_mod._pool = mock_pool
+    try:
+        _agtool_mod.shutdown_tool_pool()
+        assert _agtool_mod._pool is None
+        mock_pool.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+    finally:
+        _agtool_mod._pool = original
+
+
+def test_shutdown_tool_pool_forwards_custom_kwargs():
+    mock_pool = MagicMock()
+    original = _agtool_mod._pool
+    _agtool_mod._pool = mock_pool
+    try:
+        _agtool_mod.shutdown_tool_pool(wait=True, cancel_futures=False)
+        mock_pool.shutdown.assert_called_once_with(wait=True, cancel_futures=False)
+    finally:
+        _agtool_mod._pool = original
+
+
+def test_shutdown_tool_pool_noop_when_no_pool():
+    original = _agtool_mod._pool
+    _agtool_mod._pool = None
+    try:
+        _agtool_mod.shutdown_tool_pool()  # must not raise
+        assert _agtool_mod._pool is None
+    finally:
+        _agtool_mod._pool = original
