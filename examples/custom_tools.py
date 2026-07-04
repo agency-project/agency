@@ -1,5 +1,5 @@
 """
-paper_crawler.py — Research paper crawler with parallel summarisation.
+custom_tools.py — Research paper crawler with parallel summarisation.
 
 Workflow:
   1. find_papers skill  — agent searches arxiv for the topic; returns a list of
@@ -14,9 +14,9 @@ Workflow:
                           and the host writes it to disk with no shared mounts.
 
 Run:
-    uv run python examples/paper_crawler.py
-    uv run python examples/paper_crawler.py "speculative decoding"
-    MAX_PAPERS=6 uv run python examples/paper_crawler.py "flash attention"
+    uv run python examples/custom_tools.py
+    uv run python examples/custom_tools.py "speculative decoding"
+    MAX_PAPERS=6 uv run python examples/custom_tools.py "flash attention"
 """
 import io
 import os
@@ -29,31 +29,21 @@ import httpx
 
 from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
 from agency.agutil import format_exception as _fmt_exc
-from llm_config import make_llm_config
 
 
-LLM_CONFIG = make_llm_config(max_tokens=8000)
-MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "6"))
+LLM_CONFIG = {
+    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
+    "model":                "",
+}
+MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 _MAX_CHARS = 32_000
-
-
-def _arxiv_html_url(url: str) -> str:
-    m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
-    if not m:
-        return url
-    return f"https://arxiv.org/html/{m.group(1)}"
-
-
-def _arxiv_pdf_url(url: str) -> str:
-    m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
-    if not m:
-        return url
-    return f"https://arxiv.org/pdf/{m.group(1)}"
 
 
 class FindPapersSkill(agskill):
     def __init__(self, max_papers: int = 10, **kwargs):
         self.max_papers = max_papers
+
         search_papers = agtool(
             name="search_papers",
             description="Search Hugging Face Papers for AI research papers. Returns title, URL, and abstract for each result.",
@@ -68,6 +58,7 @@ class FindPapersSkill(agskill):
                 "required": ["query"],
             },
         )
+
         super().__init__(
             name="find_papers",
             system_prompt=(
@@ -114,6 +105,7 @@ class FindPapersSkill(agskill):
 
 class SummarisePaperSkill(agskill):
     def __init__(self, **kwargs):
+
         fetch_paper = agtool(
             name="fetch_paper",
             description=(
@@ -136,6 +128,7 @@ class SummarisePaperSkill(agskill):
                 "required": ["url"],
             },
         )
+    
         super().__init__(
             name="summarise_paper",
             system_prompt=(
@@ -154,9 +147,15 @@ class SummarisePaperSkill(agskill):
         )
         self.fetch_paper = fetch_paper
 
+    def _arxiv_html_url(self, url: str) -> str:
+        m = re.search(r"arxiv\.org/(?:abs|pdf|html)/([^\s/?#]+)", url)
+        if not m:
+            return url
+        return f"https://arxiv.org/html/{m.group(1)}"
+
     def _fetch_paper(self, arg: agdata) -> agdata:
         url = str(arg.url)
-        html_url = _arxiv_html_url(url)
+        html_url = self._arxiv_html_url(url)
         offset = int(getattr(arg, "offset", 0) or 0)
         try:
             resp = httpx.get(html_url, timeout=30, follow_redirects=True)
@@ -244,12 +243,7 @@ class PaperCrawlerTeam(agteam):
         print()
 
         print("Step 1 — searching for papers...")
-        papers_result = self.main_agent.run(self.find_papers, agdata(topic=topic))
-        papers_data = papers_result.to_dict()
-        if "error" in papers_data:
-            print(f"  error: {papers_data['error']}")
-            return agdata(error=papers_data["error"])
-        papers = papers_data["papers"]
+        papers = self.main_agent.run(self.find_papers, agdata(topic=topic)).papers
         if not papers:
             print("  No papers found — try a different topic or re-run.")
             return agdata(error="no papers found")
@@ -275,18 +269,14 @@ class PaperCrawlerTeam(agteam):
             self.compile_report,
             agdata(topic=topic, summaries=summaries),
         )
-        result_data = result.to_dict()
-        if "error" in result_data:
-            print(f"  error: {result_data['error']}")
-            return agdata(error=result_data["error"])
-        print(f"  compiled  ({result_data['paper_count']} papers, {len(result_data['report'])} chars)")
+        print(f"  compiled  ({result.paper_count} papers, {len(result.report)} chars)")
 
         if output_dir is not None:
             slug = topic.lower().replace(" ", "_")[:40]
             host_path = Path(output_dir) / f"{slug}_report.md"
-            host_path.write_text(result_data["report"])
+            host_path.write_text(result.report)
             print(f"  saved     → {host_path}")
-            print(f"\n--- report preview ---\n{result_data['report'][:400]}\n...")
+            print(f"\n--- report preview ---\n{result.report[:400]}\n...")
 
         print(f"\nMain agent history: {len(self.main_agent.history.messages)} messages total")
         return result
@@ -301,7 +291,7 @@ if __name__ == "__main__":
     import sys
 
     topic   = " ".join(sys.argv[1:]) or "KV cache quantization"
-    run_dir = _make_run_dir("paper_crawler")
+    run_dir = _make_run_dir("custom_tools")
 
     agent.log_dir = run_dir / "logs"
     reports_dir   = run_dir / "reports"
@@ -309,23 +299,17 @@ if __name__ == "__main__":
 
     def _script() -> None:
         print(f"Endpoint : {LLM_CONFIG['base_url']}")
-        print(f"Model    : {LLM_CONFIG['model']}")
         print(f"Run dir  : {run_dir}\n")
         try:
             topics = [topic] if topic != "KV cache quantization" else [
                 "KV cache quantization",
-                "flash attention",
                 "speculative decoding",
             ]
             teams = [PaperCrawlerTeam(topic=t) for t in topics]
             pending = [t.run(output_dir=reports_dir) for t in teams]  # all start immediately
             agsync(teams)
             for t, r in zip(topics, pending):
-                data = r.to_dict()
-                if "error" in data:
-                    print(f"\n[{t}] ERROR: {data['error']}")
-                else:
-                    print(f"\n[{t}] {data['paper_count']} papers  ({len(data['report'])} chars)")
+                print(f"\n[{t}] {r.paper_count} papers  ({len(r.report)} chars)")
         except AgError as e:
             print(f"\nERROR: {e}")
 

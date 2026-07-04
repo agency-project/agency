@@ -13,13 +13,17 @@ Demonstrates the two natural parallelism patterns enabled by a single run() meth
 Run:
     uv run python examples/parallel_exec.py
 """
+import os
 import time
 from pathlib import Path
 
 from agency import agent, agdata, agskill, agteam
-from llm_config import make_llm_config
 
-LLM_CONFIG = make_llm_config(max_tokens=8000)
+LLM_CONFIG = {
+    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
+    "model":                "",
+}
 
 
 class SummariserSkill(agskill):
@@ -79,7 +83,7 @@ class SequentialChainTeam(agteam):
         r2 = self.agent.run(self.writer, agdata(file_path="/workspace/out.txt", content="second write"))
         elapsed = time.perf_counter() - t0
 
-        print(f"  r1={r1}  r2={r2}")
+        print(f"  r1 status={r1.status!r}  r2 status={r2.status!r}")
         print(f"  total history: {len(self.agent.history.messages)} messages  elapsed {elapsed:.2f}s")
         print()
 

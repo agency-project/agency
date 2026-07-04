@@ -246,6 +246,10 @@ class agSandbox:
     ) -> None:
         self._agname   = agname
         self._runtime  = get_container_runtime()
+        # Held by agskill for the full duration of a skill run so a sandbox
+        # shared across agents is never driven by more than one skill run
+        # at a time. See agskill.py's _task().
+        self._lock     = threading.RLock()
         self._gpu_id:  int | None           = None
         self._gpu_virtual: bool             = False   # LLM has called reserve_gpu
         self._gpu_acquire_fn                = None    # pool.acquire_gpu, set by make_gpu_reserve
@@ -270,6 +274,18 @@ class agSandbox:
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
             self._vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
+
+    def __getstate__(self) -> dict:
+        # threading.RLock isn't picklable — custom tools with run_in_subprocess=True
+        # (the default) get cloudpickled to a worker process, so this must not crash.
+        # A lock is process-local anyway, so there's nothing meaningful to carry over.
+        state = self.__dict__.copy()
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
 
     def _container_running(self) -> bool:
         """Return True if the named container is currently running in Docker/Podman."""

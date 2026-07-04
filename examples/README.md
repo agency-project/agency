@@ -1,6 +1,6 @@
 # Examples
 
-End-to-end examples showing how to use the agency framework.
+Simple feature examples showing how to use the agency framework.
 
 ## base_example.py
 
@@ -29,29 +29,69 @@ python examples/parallel_exec.py
 
 ---
 
-## paper_crawler.py
+## custom_tools.py
 
 **What it shows:** A multi-step, multi-agent research pipeline combining a custom host-side tool, parallel summarisation forks, and the shared output directory.
 
-1. **`find_papers`** — calls a custom `search_arxiv` tool (HTTP request to the arXiv API, runs on the host) and returns a list of papers.
+1. **`find_papers`** — calls a custom `search_papers` tool (HTTP request to the arXiv API, runs on the host) and returns a list of papers.
 2. **Parallel summarisation** — one `agent(main_agent)` fork per paper; all `run(summarise_paper, ...)` calls fire concurrently. Each fork runs in its own sandbox container.
 3. **`compile_report`** — waits for all pending summaries (resolved automatically when passed as input), then uses the sandboxed `write` tool to save a markdown report to `/agent_output/<agname>/report.md`.
 
-The report appears on the host at `runs/<timestamp>_paper_crawler/agent_output/<agname>/report.md`.
+The report appears on the host at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.md`.
 
 ```bash
-python examples/paper_crawler.py
-python examples/paper_crawler.py "speculative decoding"
-MAX_PAPERS=6 python examples/paper_crawler.py "flash attention"
+python examples/custom_tools.py
+python examples/custom_tools.py "speculative decoding"
+MAX_PAPERS=6 python examples/custom_tools.py "flash attention"
 ```
 
 ---
 
-## openai-agent-examples/
+## image_processing.py
 
-Ports of the [openai/openai-agents-python](https://github.com/openai/openai-agents-python/tree/main/examples) examples, demonstrating feature parity and framework gaps. See [`openai-agent-examples/README.md`](openai-agent-examples/README.md) for the full concept mapping and gap analysis.
+**What it shows:** `agimage` — the multimodal image input field type — across three input forms, run concurrently as separate teams.
 
-| Subdir | Contents |
-|---|---|
-| [`basic/`](openai-agent-examples/basic/) | `hello_world.py`, `tools.py` — minimal agent and function tools |
-| [`agent_patterns/`](openai-agent-examples/agent_patterns/) | `agents_as_tools`, `routing`, `parallelization`, `deterministic`, `llm_as_a_judge`, `input_guardrails`, `output_guardrails` |
+1. **`SingleImageTeam`** — describes one local image file (`agdata(photo=agimage)`); the path is base64-encoded and injected into the message content automatically.
+2. **`MultiImageTeam`** — compares two local images side by side via `agdata(frames=list[agimage])`.
+3. **`UrlImageTeam`** — analyses an image passed as a public URL; no local encoding needed.
+
+Requires a vision-capable model.
+
+```bash
+VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py photo.jpg
+VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py before.jpg after.jpg
+```
+
+---
+
+## human_in_the_loop.py
+
+**What it shows:** Driving approval loops entirely from Python so `ask_human` is *guaranteed* to be called — the LLM never decides on its own whether to stop and ask.
+
+1. Python asks the human what scene to write next (`ask_human`, no timeout).
+2. A planner skill drafts a paragraph-by-paragraph scene plan.
+3. Python shows the plan and asks for approval; on rejection it loops back into the planner with the human's feedback until approved.
+4. A writer skill generates the full scene prose from the approved plan.
+5. Python shows the prose and asks for approval; on rejection it loops (re-plan → re-write) until approved.
+6. Approved output is appended to `plans.md` / `story.txt` in the run directory, and the loop advances to the next scene.
+
+```bash
+python examples/human_in_the_loop.py
+VLLM_BASE_URL=http://... VLLM_MODEL=... python examples/human_in_the_loop.py
+```
+
+---
+
+## sandbox_handoff.py
+
+**What it shows:** Reading and driving an agent's `agSandbox` directly from the host, and handing one sandbox off between two agents — the sandbox is a plain `agent.sandbox` attribute, not something you have to go through a skill to touch.
+
+1. `agent_a` runs a skill that writes `hello.py` inside its sandbox.
+2. The harness reads `agent_a.sandbox` directly and calls `sandbox.exec(...)` to run the file from Python, outside of any skill.
+3. The harness patches the file with `sed` via the same `sandbox.exec(...)`, introducing a syntax error.
+4. `agent_b` is pointed at the same sandbox (`agent_b.sandbox = sandbox`) and runs a skill that fixes the bug.
+5. The harness runs the file again to confirm the fix — `agskill` stops+commits the container after `agent_b`'s skill the same way it would for a sandbox it provisioned itself, and the harness's next `sandbox.exec()` call transparently restarts the container from that checkpoint.
+
+```bash
+python examples/sandbox_handoff.py
+```

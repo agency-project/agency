@@ -35,6 +35,15 @@ API_CONN_EXCS: tuple = (openai.APIConnectionError,) + (
 RATE_LIMIT_EXCS: tuple = (openai.RateLimitError,) + (
     (_anthropic_sdk.RateLimitError,) if _anthropic_sdk else ()
 )
+# Base/catch-all API error classes — covers mid-stream server-side error frames
+# (e.g. openai._streaming raises openai.APIError directly, with no HTTP status
+# to build a more specific subclass from) and any other APIStatusError subclass
+# not special-cased above (e.g. InternalServerError). Callers should check the
+# more specific tuples above first — BadRequestError/RateLimitError/connection
+# errors are all subclasses of these and get their own handling.
+API_ERROR_EXCS: tuple = (openai.APIError,) + (
+    (_anthropic_sdk.APIError,) if _anthropic_sdk else ()
+)
 
 _ANTHROPIC_BEDROCK_MODEL_RE = re.compile(r"^(?:(?:us|eu|apac|global)\.)?anthropic\.")
 _MODEL_LISTING_TIMEOUT_SECONDS = 10.0  # httpx timeout for the best-effort /v1/models lookup.
@@ -453,7 +462,10 @@ class agllm_backend:
             if _is_anthropic_bedrock_model(llm_config.get("model", "")):
                 return _AnthropicBedrockBackend(llm_config)
             return _OpenAICompatibleBedrockBackend(llm_config)
-        if llm_config.get("provider") == "anthropic":
+        provider = llm_config.get("provider")
+        if provider in ("anthropicAWS", "anthropic_aws"):
+            return _AnthropicAWSBackend(llm_config)
+        if provider == "anthropic":
             return _AnthropicBackend(llm_config)
         return _OpenAICompatibleBackend(llm_config)
 
@@ -572,21 +584,80 @@ class _AnthropicBedrockBackend(agllm_backend):
         return _known_anthropic_context_window(model)
 
 
-class _AnthropicBackend(agllm_backend):
-    """Claude models via the first-party Anthropic API (not Bedrock) — the
-    anthropic SDK's plain Anthropic client (Messages API shape). Reuses the
-    same _AnthropicBedrockChatClient adapter as the Bedrock backend since it
-    only depends on `.messages.create()`, which both clients expose alike.
+class _AnthropicAWSBackend(agllm_backend):
+    """Claude Platform on AWS via the anthropic SDK's AnthropicAWS client.
 
-    Also covers Claude Platform on AWS accessed via a short-term API key
-    (an AWS SigV4 pre-signed-URL bearer token): set `api_key`/`ANTHROPIC_API_KEY`
-    to the short-term key and `base_url`/`ANTHROPIC_BASE_URL` to
-    `https://aws-external-anthropic.{region}.api.aws` — the anthropic SDK
-    reads ANTHROPIC_BASE_URL automatically when base_url isn't passed, so no
-    extra code is needed for that part. The workspace ID, however, is NOT
-    auto-read from ANTHROPIC_WORKSPACE_ID by the plain client — the API
-    rejects the request with "Missing 'anthropic-workspace-id' header." if
-    it's absent, so this backend sends it explicitly via default_headers.
+    Auth (resolved by the SDK): SigV4 via the default AWS credential chain,
+    explicit aws_access_key/aws_secret_key, or an API key (config `api_key` /
+    ANTHROPIC_AWS_API_KEY). Requires workspace_id (config /
+    ANTHROPIC_AWS_WORKSPACE_ID) and aws_region (config `region` or
+    `aws_region` / AWS_REGION) unless base_url is set.
+    """
+
+    def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
+        cfg = self.config
+        kwargs: dict = dict(timeout=timeout)
+        api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_AWS_API_KEY")
+        if api_key:
+            kwargs["api_key"] = api_key
+        for key in ("aws_access_key", "aws_secret_key", "aws_session_token", "aws_profile"):
+            if cfg.get(key):
+                kwargs[key] = cfg[key]
+        region = cfg.get("aws_region") or cfg.get("region")
+        if region:
+            kwargs["aws_region"] = region
+        workspace_id = (
+            cfg.get("workspace_id")
+            or os.environ.get("ANTHROPIC_AWS_WORKSPACE_ID")
+            or os.environ.get("ANTHROPIC_WORKSPACE_ID")
+        )
+        if workspace_id:
+            kwargs["workspace_id"] = workspace_id
+        base_url = (
+            cfg.get("base_url")
+            or os.environ.get("ANTHROPIC_AWS_BASE_URL")
+            or os.environ.get("ANTHROPIC_BASE_URL")
+        )
+        if base_url:
+            kwargs["base_url"] = base_url
+        return kwargs
+
+    def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
+        if _anthropic_sdk is None:
+            raise RuntimeError(
+                "provider='anthropicAWS' requires the 'anthropic' package: pip install anthropic"
+            )
+        if not hasattr(_anthropic_sdk, "AnthropicAWS"):
+            raise RuntimeError(
+                "provider='anthropicAWS' requires a recent 'anthropic' package with AnthropicAWS support"
+            )
+        anthropic_client = _anthropic_sdk.AnthropicAWS(**self._client_kwargs(timeout))
+        return _AnthropicBedrockChatClient(anthropic_client)
+
+    def list_models(self) -> list:
+        if _anthropic_sdk is None or not hasattr(_anthropic_sdk, "AnthropicAWS"):
+            return []
+        client = _anthropic_sdk.AnthropicAWS(
+            **self._client_kwargs(httpx.Timeout(_MODEL_LISTING_TIMEOUT_SECONDS))
+        )
+        return list(client.models.list())
+
+    def tokenize_url(self) -> "str | None":
+        return None
+
+    def known_context_limit(self, model: str) -> "int | None":
+        return _known_anthropic_context_window(model)
+
+
+class _AnthropicBackend(agllm_backend):
+    """Claude models via the first-party Anthropic API (api.anthropic.com) —
+    the anthropic SDK's plain Anthropic client (Messages API shape). Reuses
+    the same _AnthropicBedrockChatClient adapter as the Bedrock backend since
+    it only depends on `.messages.create()`, which both clients expose alike.
+
+    For Claude Platform on AWS, prefer provider='anthropicAWS' and the
+    AnthropicAWS client instead — it handles SigV4/API-key auth, region-
+    derived base URLs, and the workspace header natively.
     """
 
     def _client_kwargs(self, timeout: httpx.Timeout) -> dict:

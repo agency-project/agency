@@ -63,11 +63,13 @@ try:
 finally:
     if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
         resource_pool.release_gpu(ag.sandbox._gpu_id)
-    if not ag.is_external_sandbox and ag.sandbox is not None:
+    if ag.sandbox is not None:
         ag.sandbox.stop(commit=True)
+    if sandbox_lock is not None:
+        sandbox_lock.release()
 ```
 
-GPU semaphores and CPU/memory limits are returned even if the skill raises an exception or `max_steps` is exceeded.
+GPU semaphores and CPU/memory limits are returned even if the skill raises an exception or `max_steps` is exceeded. `sandbox.stop()` now runs unconditionally — there's no "externally owned" sandbox that skips teardown (see `Design_architecture.md`'s "Per-sandbox mutex" section). The `sandbox_lock` release, held since provisioning, always happens last.
 
 ## `agResourcePool` API
 

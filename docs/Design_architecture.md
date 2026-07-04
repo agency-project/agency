@@ -40,12 +40,11 @@ Holds all runtime state. No execution logic.
 |---|---|---|
 | `llm` | `agllm` | LLM endpoint config and call interface |
 | `ctx` | `agcontext` | Current/pending conversation context |
-| `sandbox` | `agSandbox \| None` | Container sandbox; created lazily on first skill run |
+| `sandbox` | `agSandbox \| None` | Container sandbox; created lazily on first skill run, or supplied directly by the caller. Plain attribute — no property, no ownership flag. |
 | `terminal` | `agterm` | Structured terminal output for this agent |
 | `log` | `aglog` | Persistent event log |
 | `agname` | `agname` | Unique allocated agent name |
 | `inbox` | `Queue[str]` | Mid-loop message injection from orchestrators |
-| `is_external_sandbox` | `bool` | Whether sandbox was provided by caller (not managed by framework) |
 | `_ui_state` | `dict` | Current state pushed to webui |
 | `_full_history` | `list[dict]` | Append-only transcript of all messages |
 
@@ -192,24 +191,24 @@ When a skill has no `output_schema`, the model's raw text response is returned a
 
 ### Sandbox lifecycle
 
-The sandbox is created lazily on the first skill run (`is_external_sandbox=False`). After each successful tool call (`run_in_subprocess=True` tools), the sandbox is checkpointed via `stop(commit=True)` + `restore()`. After the skill run completes, the final sandbox state is committed. `_lifecycle_tag()` always lowercases the Docker image name (Docker requires lowercase repository names).
+The sandbox is created lazily on the first skill run that needs one. After each successful tool call (`run_in_subprocess=True` tools), the sandbox is checkpointed via `stop(commit=True)` + the next `_ensure_started()` restoring from that image. After the skill run completes, `agskill` commits + stops the sandbox again in its teardown. `_lifecycle_tag()` always lowercases the Docker image name (Docker requires lowercase repository names).
 
-**Sandbox ownership and `is_external_sandbox`**
+**Sandbox ownership — no flag, plain attribute**
 
-`is_external_sandbox: bool` controls whether agskill manages the sandbox lifecycle:
+`agent.sandbox` is a plain instance attribute — no property, no getter/setter, no `is_external_sandbox` flag. There used to be an ownership flag that let a caller "check out" a sandbox (`get_agent_sandbox_as_external_sandbox()` / `set_agent_sandbox_to_external_sandbox()`) so agskill would skip stopping/destroying a container it didn't create. That indirection is gone:
 
-- `False` (default): agskill calls `sandbox.stop(commit=True/False)` after each skill run and `sandbox.destroy()` when the agent is destroyed via `__del__`.
-- `True`: agskill skips all stop/destroy calls. The caller is fully responsible for cleanup.
+- `agskill` always provisions a sandbox when `ag.sandbox is None`, and always calls `sandbox.stop(commit=...)` in its teardown — regardless of whether the sandbox was created by agskill or handed in via `agent(sandbox=...)` / direct assignment (`ag.sandbox = sb`). `stop()` is non-destructive to the Python object: it commits + removes the *container*, and the next access transparently restarts it from that checkpoint.
+- `agent.__del__` has no sandbox-specific logic at all. Once nothing references an `agSandbox` instance (the agent that held it is gone, and no one else kept a reference), Python's refcounting collects it and `agSandbox.__del__` (which calls `destroy()`) runs — see `agsandbox.md`. Sharing a sandbox across agents (e.g. a harness handing the same `agSandbox` to two agents in turn) works by simply assigning `ag.sandbox = sb` on each; whoever drops the last reference triggers the real cleanup.
 
-`agent.sandbox` is a property backed by `agent._sandbox`:
+**Per-sandbox mutex — serializing concurrent skill runs on a shared sandbox**
 
-- Reading `ag.sandbox` returns `_sandbox` with no side effects — safe for internal framework use.
-- Writing `ag.sandbox = sb` goes through the property setter, which destroys any existing agent-owned sandbox before updating `_sandbox`. It does **not** change `is_external_sandbox` — agskill's internal provisioning uses this path.
+Because agskill no longer special-cases "externally owned" sandboxes, a single `agSandbox` object can legitimately be driven by more than one agent's skill run (e.g. a harness pattern like `examples/sandbox_handoff.py`, or two agents constructed with the same `sandbox=` object). Without serialization, two skill runs racing on the same container could interleave `exec()`/`stop()`/`_ensure_started()` calls and corrupt container state (e.g. one run committing+removing the container while another is mid-`exec`).
 
-For external ownership transfer, use the named methods:
+`agSandbox.__init__` allocates `self._lock = threading.RLock()` for this purpose. `agskill.py`'s `_task()` acquires it right after provisioning (`sandbox_lock = ag.sandbox._lock; sandbox_lock.acquire()`) and releases it only after the final teardown `stop()` — the lock is held for the *entire* skill run, not just for individual tool calls. Everything the skill run does to the sandbox in between (each tool call's own `stop()`/`_ensure_started()` from `agtool.py`, `wait_for_processes()` polling) runs on that same thread and reentrantly re-acquires the same `RLock` for free.
 
-- `get_agent_sandbox_as_external_sandbox()` — returns the sandbox and sets `is_external_sandbox=True`, transferring lifecycle responsibility to the caller.
-- `set_agent_sandbox_to_external_sandbox(sb)` — calls the property setter (cleanup) then sets `is_external_sandbox=True`. Pass `None` to detach; the next skill run provisions a fresh agent-owned sandbox.
+This lock is **not** self-enforcing on `agSandbox` — calling `sandbox.exec()` (or any other method) directly does not itself acquire the lock. It's `agskill` that establishes the "one skill run owns this sandbox at a time" invariant by holding the lock around the whole run; code that drives a shared sandbox outside of an agskill run (harness scripts, `subgraph_owner.py`-style direct access) is responsible for its own coordination if it needs the same guarantee. See `Design_sandbox_lifecycle.md`'s "Concurrency controls" section and `agsandbox.md` for details.
+
+The lock is intentionally excluded from `agSandbox.__getstate__`/`__setstate__` — `threading.RLock` isn't picklable, and custom tools with `run_in_subprocess=True` (the default) get `cloudpickle`d to a worker process. A fresh lock is created on unpickling; it has no relationship to the original process's lock (locks are process-local by nature, so there was never real cross-process mutual exclusion to preserve).
 
 > **WARNING:** `agSandbox` wraps a live Docker container. Cleanup depends on `agSandbox.__del__` and an `atexit` handler. These do not run on SIGKILL or during interpreter shutdown when `sys.meta_path` has already been nulled. In long-running processes, call `sandbox.destroy()` explicitly when done with the container.
 

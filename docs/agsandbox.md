@@ -1,6 +1,6 @@
 # Container Sandboxing
 
-> **Lifecycle warning:** `agSandbox` wraps a live Docker/Podman container. Cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. To share a sandbox between agents, use `agent.get_agent_sandbox_as_external_sandbox()` / `agent.set_agent_sandbox_to_external_sandbox(sb)` — not direct attribute access — so the `is_external_sandbox` ownership flag stays correct and agskill knows not to destroy a container it doesn't own.
+> **Lifecycle warning:** `agSandbox` wraps a live Docker/Podman container. Cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. There's no ownership flag to manage — sharing a sandbox between agents is just `ag.sandbox = sb` (or `agent(sandbox=sb)`) on each; `agskill` provisions/stops any sandbox it finds on `ag.sandbox` the same way regardless of where it came from, and the object itself is cleaned up once nothing references it anymore (see "Concurrent access" below).
 
 All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
 
@@ -39,6 +39,14 @@ The container exists only during active tool execution. Between tool calls the c
 **Container naming**: each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a per-process UUID prefix. This prevents cross-run name collisions when an agent crashes without cleanup and is restarted with the same `agname`. The lifecycle image name is produced by `_lifecycle_tag()`, which lowercases the Docker image name — Docker requires all repository names to be lowercase.
 
 **`stop()` reliability**: `docker rm -f` is retried up to 3 times. Each attempt goes through `_run()`, which holds `_docker_semaphore` (caps all concurrent daemon calls at 16). If all retries fail, a `WARNING` is emitted to stderr and the framework continues — `_started` is cleared regardless so the next tool call can attempt a fresh container.
+
+## Concurrent access
+
+Each `agSandbox` allocates `self._lock = threading.RLock()` in `__init__`. It exists because a single `agSandbox` instance can be handed to more than one agent (there's no ownership flag preventing this — see the lifecycle warning above), and two skill runs interleaving `exec()` / `stop()` / `_ensure_started()` calls against the same container would corrupt its state.
+
+The lock is **not self-enforcing** — `agSandbox`'s own methods don't acquire it. Instead, `agskill.py`'s `_task()` acquires `ag.sandbox._lock` right after provisioning and holds it for the *entire* skill run, releasing it only after the final teardown `stop()`. This makes "one skill run owns this sandbox at a time" an invariant enforced by the caller (agskill), not by `agSandbox` itself. Code that drives a shared `agSandbox` outside of an agskill run (harness scripts, custom orchestration) must coordinate its own access if it needs the same guarantee — see `Design_architecture.md`'s "Per-sandbox mutex" section for the full rationale.
+
+Because `threading.RLock` isn't picklable, `agSandbox` defines `__getstate__`/`__setstate__` to drop `_lock` before pickling and allocate a fresh one on unpickling. This matters because custom tools with `run_in_subprocess=True` (the default) get `cloudpickle`d to a worker process — without this, capturing a sandbox in such a tool's closure would raise `TypeError: cannot pickle '_thread.RLock' object`. All built-in tools (bash, read, write, grep, glob, …) use `run_in_subprocess=False` and never hit this path.
 
 ## GPU device access
 
@@ -140,6 +148,8 @@ sb = agSandbox(agname, lifecycle_image="agency/lifecycle-myagent")
 
 # Construction is cheap — no Docker calls until _ensure_started() runs.
 sb._ensure_started()    # called automatically on first exec(); idempotent
+
+sb._lock  # threading.RLock; held by agskill for the whole skill run — see "Concurrent access" above
 
 sb.exec(cmd, workdir="/workspace", timeout=120) -> (str, int)
 sb.read_file(path) -> str           # UTF-8 text; raises UnicodeDecodeError for binary

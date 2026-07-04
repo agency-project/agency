@@ -11,28 +11,35 @@ This example showcases three sandbox interaction patterns:
   4. Harness runs the fixed file to confirm the repair.
 
 Key APIs demonstrated:
-  - agent.get_agent_sandbox_as_external_sandbox()    : retrieve the running container after a skill run
-  - agent.set_agent_sandbox_to_external_sandbox(sb)  : attach an external sandbox; automatically sets
-                             is_external_sandbox=True so the framework will not
-                             stop or destroy it when the skill finishes
-  - sandbox.exec(cmd)      : run a shell command in the container from Python
-  - sandbox.read_file(path): read a file out of the container
+  - agent.sandbox            : read/assign an agent's sandbox directly (plain attribute)
+  - sandbox.exec(cmd)        : run a shell command in the container from Python
+  - sandbox.read_file(path)  : read a file out of the container
+
+Note: agskill always stops+commits an agent's sandbox at the end of a skill
+run, regardless of who created it. This isn't destructive — stop(commit=True)
+commits the container filesystem to an image first, so the next access (by
+the harness or another agent sharing the same agSandbox object) transparently
+restarts the container from that checkpoint.
 
 Run:
     uv run python examples/sandbox_handoff.py
     VLLM_BASE_URL=https://... VLLM_MODEL=... uv run python examples/sandbox_handoff.py
 """
+import os
 from pathlib import Path
 from datetime import datetime
 
 from agency import agent, agskill, agdata
-from llm_config import make_llm_config
 
 # ---------------------------------------------------------------------------
 # LLM config
 # ---------------------------------------------------------------------------
 
-LLM_CONFIG = make_llm_config(max_tokens=8000)
+LLM_CONFIG = {
+    "base_url":          os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":           os.environ.get("VLLM_API_KEY",  ""),
+    "model":             os.environ.get("VLLM_MODEL",    ""),
+}
 
 FILE_PATH = "/workspace/hello.py"
 
@@ -106,7 +113,7 @@ def main() -> None:
     # ── Step 2: harness gets the sandbox and runs the file ───────────────────
     _sep("Step 2 — harness takes the sandbox and runs hello.py")
 
-    sandbox = agent_a.get_agent_sandbox_as_external_sandbox()    # ← get the running container
+    sandbox = agent_a.sandbox    # ← the sandbox agent_a's skill run just used
     assert sandbox is not None, "sandbox not started — did the skill run complete?"
 
     content_before = sandbox.read_file(FILE_PATH)
@@ -133,13 +140,10 @@ def main() -> None:
     _run_file(sandbox, "after patch — broken")
 
     # ── Step 4: second agent receives the sandbox and fixes the bug ──────────
-    _sep("Step 4 — agent_b receives the sandbox as external and fixes the bug")
+    _sep("Step 4 — agent_b receives the sandbox and fixes the bug")
 
-    # set_agent_sandbox_to_external_sandbox() marks is_external_sandbox=True — the framework will not
-    # stop or destroy the container when agent_b's skill finishes.
     agent_b = agent(llm_config=LLM_CONFIG)
-    agent_b.set_agent_sandbox_to_external_sandbox(sandbox)
-    print(f"  agent_b.is_external_sandbox : {agent_b.is_external_sandbox}")
+    agent_b.sandbox = sandbox
 
     result_b = agent_b.run(
         fix_skill,
@@ -163,10 +167,10 @@ def main() -> None:
 
     _run_file(sandbox, "after fix")
 
-    # Sandbox cleanup: agSandbox.__del__ calls destroy() when the object is GC'd,
+    # Sandbox cleanup: agSandbox.__del__ calls destroy() when the object is garbage collected,
     # and an atexit handler catches anything that survives to interpreter shutdown.
     # Explicit destroy() is only needed in long-running processes where you want
-    # deterministic resource release rather than waiting for GC.
+    # deterministic container resource release on the host-side rather than waiting for GC.
     print("\nDone.")
 
 

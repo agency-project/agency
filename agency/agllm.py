@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
 from .agutil import _iter_batched, _strip_thinking, _extract_thinking, _LLMIdleTimeout
-from .agllm_backend import agllm_backend, BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS
+from .agllm_backend import agllm_backend, BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS, API_ERROR_EXCS
 
 if TYPE_CHECKING:
     from .agterm import agterm
@@ -36,6 +36,11 @@ LLM_STREAM_TIMEOUT         = 1800.0 # seconds to wait between chunks mid-stream
 # isn't needed since 60s already covers a full per-minute rate-limit window.
 LLM_RATE_LIMIT_BASE_BACKOFF_S = 5.0
 LLM_RATE_LIMIT_MAX_BACKOFF_S  = 80.0
+# Added on top of an honored Retry-After value, never subtracted from it — many
+# concurrently-throttled agents share the same org-wide window and so tend to
+# receive the same Retry-After, which would otherwise make them all wake up and
+# retry in the same instant.
+LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S = 5.0
 
 _llm_call_semaphore = threading.Semaphore(LLM_CALL_MAX_CONCURRENCY)
 
@@ -302,7 +307,9 @@ class agllm:
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
                     _retry_after = getattr(getattr(_rate_err, "response", None), "headers", {}).get("retry-after")
                     try:
-                        _retry_sleep_s = float(_retry_after)
+                        # Jitter is added on top, never subtracted — the header is a floor,
+                        # not a target, so we never retry sooner than the server said to.
+                        _retry_sleep_s = float(_retry_after) + random.uniform(0, LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S)
                     except (TypeError, ValueError):
                         # No (or unparseable) Retry-After header — exponential backoff with
                         # full jitter so many concurrently-throttled skills don't all wake
@@ -319,7 +326,7 @@ class agllm:
                             term.log("LLM ✗    ", f"model={llm_config.get('model','?')}  rate limited: {_rate_err}  all retries exhausted")
                         return LLMCallResult(conn_error=_rate_err, elapsed_ms=_llm_elapsed_ms)
 
-                except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError) + API_CONN_EXCS as _conn_err:
+                except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError) + API_CONN_EXCS + API_ERROR_EXCS as _conn_err:
                     try:
                         client.close()
                     except Exception:
@@ -328,6 +335,8 @@ class agllm:
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
                     if isinstance(_conn_err, API_CONN_EXCS):
                         _err_desc = f"Connection error: LLM backend unreachable ({_conn_err.__cause__ or _conn_err})"
+                    elif isinstance(_conn_err, API_ERROR_EXCS):
+                        _err_desc = f"API error: {_conn_err}"
                     else:
                         _err_desc = str(_conn_err)
                     if attempt < _LLM_MAX_RETRIES - 1:

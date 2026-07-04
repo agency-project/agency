@@ -134,17 +134,17 @@ Two parallelism patterns side by side:
 uv run python examples/parallel_exec.py
 ```
 
-### paper_crawler — parallel summarisation pipeline
+### custom_tools — parallel summarisation pipeline with a custom host-side tool
 
-Searches arXiv for papers on a topic, summarises each in parallel with forked agents, then compiles a markdown report inside the sandbox.
+Searches arXiv for papers on a topic via a custom `search_papers` tool, summarises each in parallel with forked agents, then compiles a markdown report inside the sandbox.
 
 ```bash
-uv run python examples/paper_crawler.py
-uv run python examples/paper_crawler.py "speculative decoding"
-MAX_PAPERS=6 uv run python examples/paper_crawler.py "flash attention"
+uv run python examples/custom_tools.py
+uv run python examples/custom_tools.py "speculative decoding"
+MAX_PAPERS=6 uv run python examples/custom_tools.py "flash attention"
 ```
 
-The report lands at `runs/<timestamp>_paper_crawler/agent_output/<agname>/report.md`.
+The report lands at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.md`.
 
 ### image_processing — multimodal image input with `agimage`
 
@@ -155,7 +155,7 @@ VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.p
 VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct uv run python examples/image_processing.py before.jpg after.jpg
 ```
 
-### interactive_story — human-in-the-loop collaborative writing
+### human_in_the_loop — human-in-the-loop collaborative writing
 
 A creative writing loop where the human acts as director, approving or revising every step from Python — the LLM never decides when to stop. Demonstrates `ask_human` with no timeout and the plan-then-write pattern.
 
@@ -167,7 +167,15 @@ A creative writing loop where the human acts as director, approving or revising 
 6. Approved scenes are saved to `plans.md` and `story.txt` in the run directory.
 
 ```bash
-uv run python examples/interactive_story.py
+uv run python examples/human_in_the_loop.py
+```
+
+### sandbox_handoff — driving `agent.sandbox` directly and handing it between agents
+
+Shows that `agent.sandbox` is a plain attribute the host can read, drive, and reassign — not something reachable only through a skill. One agent writes a file; the harness runs it and patches it with `sed` from Python, outside any skill; a second agent is pointed at the same sandbox (`agent_b.sandbox = sandbox`) and fixes the resulting bug; the harness re-runs it to confirm.
+
+```bash
+uv run python examples/sandbox_handoff.py
 ```
 
 ## Common skills

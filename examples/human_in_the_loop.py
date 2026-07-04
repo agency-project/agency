@@ -1,5 +1,5 @@
 """
-interactive_story.py — Human-in-the-loop collaborative scene writer.
+human_in_the_loop.py — Human-in-the-loop collaborative scene writer.
 
 The human acts as the creative director, approving or revising each step:
 
@@ -15,16 +15,17 @@ The human acts as the creative director, approving or revising each step:
 Human interaction is driven entirely from Python, not delegated to the LLM.
 This guarantees ask_human is always called — the LLM cannot shortcut approvals.
 
-Output files written to runs/<timestamp>_interactive_story/:
+Output files written to runs/<timestamp>_human_in_the_loop/:
   plans.md   — one section per scene, overwritten if revised
   story.txt  — approved scene texts appended in order, overwritten if revised
 
 Usage:
-    uv run python examples/interactive_story.py
-    VLLM_BASE_URL=http://... VLLM_MODEL=... uv run python examples/interactive_story.py
+    uv run python examples/human_in_the_loop.py
+    VLLM_BASE_URL=http://... VLLM_MODEL=... uv run python examples/human_in_the_loop.py
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -32,15 +33,12 @@ from pathlib import Path
 from agency import agent, agskill, agdata, agfile
 from agency.agwebui import agwebui
 from agency.tools.human import make_ask_human
-from llm_config import make_llm_config
 
-
-# ---------------------------------------------------------------------------
-# LLM config — override via environment variables
-# ---------------------------------------------------------------------------
-
-LLM_CONFIG = make_llm_config(max_tokens=8000)
-
+LLM_CONFIG = {
+    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
+    "model":                "",
+}
 
 # ---------------------------------------------------------------------------
 # Human interaction helpers — called directly from Python, never delegated
@@ -87,7 +85,7 @@ def save_scene(path: Path, scene_num: int, text: str) -> None:
 
 def main() -> None:
     ts      = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_interactive_story"
+    run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_human_in_the_loop"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     agent.log_dir    = run_dir / "logs"

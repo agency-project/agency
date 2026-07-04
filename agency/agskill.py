@@ -277,6 +277,7 @@ class agskill:
             history_before: list[dict] = []
             _prev_input_tokens: int = 0
             _prev_output_tokens: int = 0
+            sandbox_lock: "threading.RLock | None" = None
 
             try:
                 # ── 1. Unblock: wait for any in-flight predecessor to finish,
@@ -286,9 +287,15 @@ class agskill:
 
                 # ── 2. Provision sandbox — created once on first run and reused
                 #    across subsequent runs via its internal checkpoint image.
-                if not ag.is_external_sandbox and ag.sandbox is None:
+                if ag.sandbox is None:
                     _out = Path(type(ag).output_dir) / ag.agname if type(ag).output_dir else None
                     ag.sandbox = agSandbox(ag.agname, output_dir=_out)
+
+                # Hold the sandbox's lock for the rest of the skill run so a
+                # sandbox shared across agents is never driven by more than
+                # one skill run at a time — released in the teardown below.
+                sandbox_lock = ag.sandbox._lock
+                sandbox_lock.acquire()
 
                 history_before = list(prev_ctx.messages)
                 _prev_input_tokens = prev_ctx.total_input_tokens
@@ -315,8 +322,10 @@ class agskill:
                 ag._set_ui_state("error" if _had_error else "finished")
                 if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
                     resource_pool.release_gpu(ag.sandbox._gpu_id)
-                if not ag.is_external_sandbox and ag.sandbox is not None:
+                if ag.sandbox is not None:
                     ag.sandbox.stop(commit=True)
+                if sandbox_lock is not None:
+                    sandbox_lock.release()
 
             # ── 5. Log result and commit token counts.
             ts_end = _ts()

@@ -17,16 +17,17 @@ multimodal model, e.g. Qwen/Qwen2.5-VL-7B-Instruct.
 Run:
     uv run python examples/image_processing.py /path/to/image.jpg [/path/to/image2.jpg]
 """
+import os
 import sys
 from pathlib import Path
 
 from agency import agent, agdata, agimage, agskill, agteam, agsync
-from llm_config import make_llm_config
 
-
-LLM_CONFIG = make_llm_config(max_tokens=8000)
-
-
+LLM_CONFIG = {
+    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
+    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
+    "model":                "",
+}
 
 # ---------------------------------------------------------------------------
 # Skills
