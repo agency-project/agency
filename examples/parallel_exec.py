@@ -23,17 +23,17 @@ from agency import agent, agdata, agskill, agteam
 LLM_CONFIG = {
     "api_key":  os.environ.get("LLM_API_KEY", ""),
     "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", "gpt-4o"),
+    "model":    os.environ.get("LLM_MODEL", ""),
 }
 
 
-class SummariserSkill(agskill):
+class ContinuationSkill(agskill):
     def __init__(self, **kwargs):
         super().__init__(
-            name="summarise",
-            system_prompt="Summarise the given text in one sentence.",
+            name="continuation",
+            system_prompt="Continue the given text in one sentence.",
             input_schema=agdata(text=str),
-            output_schema=agdata(summary=str),
+            output_schema=agdata(continuation=str),
             replace_tools=[],
             **kwargs,
         )
@@ -100,13 +100,13 @@ class ForkFanoutTeam(agteam):
 
     # Default texts — override at construction time via texts=[ ... ]
     _default_texts = [
-        "The quick brown fox jumps over the lazy dog.",
-        "Machine learning models require large amounts of labelled training data.",
-        "Python is widely used in scientific computing and data analysis.",
+        "The quick brown fox jumps over ",
+        "Machine learning models require large amounts of ",
+        "Python is widely used in ",
     ]
 
     def setup(self) -> None:
-        self.summariser = SummariserSkill()
+        self.continuation = ContinuationSkill()
         self.parent = agent()
 
     def run(self) -> None:
@@ -118,13 +118,13 @@ class ForkFanoutTeam(agteam):
 
         t0 = time.perf_counter()
         pending = [
-            agent.fork(self.parent).run(self.summariser, agdata(text=t))
+            agent.fork(self.parent).run(self.continuation, agdata(text=t))
             for t in texts
         ]
         elapsed_submit = time.perf_counter() - t0
 
         for i, r in enumerate(pending):
-            print(f"  text {i}: {r.summary!r}")
+            print(f"  text {i}: {r.continuation!r}")
 
         elapsed_total = time.perf_counter() - t0
         print(f"  submitted in {elapsed_submit:.3f}s   total {elapsed_total:.2f}s")
@@ -144,7 +144,6 @@ if __name__ == "__main__":
     agent.output_dir = run_dir / "agent_output"
 
     def _script() -> None:
-        print(f"Endpoint : {LLM_CONFIG.get('base_url', 'default')}")
         print(f"Run dir  : {run_dir}\n")
         try:
             seq_team = SequentialChainTeam()

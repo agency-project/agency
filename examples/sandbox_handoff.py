@@ -39,7 +39,7 @@ from agency import agent, agskill, agdata
 LLM_CONFIG = {
     "api_key":  os.environ.get("LLM_API_KEY", ""),
     "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", "gpt-4o"),
+    "model":    os.environ.get("LLM_MODEL", ""),
 }
 
 FILE_PATH = "/workspace/hello.py"
@@ -93,7 +93,6 @@ def main() -> None:
     agent.log_dir    = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
 
-    print(f"Model   : {LLM_CONFIG.get('model', 'default')}")
     print(f"Run dir : {run_dir}\n")
 
     # ── Step 1: first agent writes hello.py ─────────────────────────────────

@@ -390,7 +390,7 @@ class agllm:
                 wire_msg["content"] = ""
             wire_messages.append(wire_msg)
         kwargs: dict = dict(
-            model=llm_config.get("model", "gpt-4o"),
+            model=llm_config.get("model", ""),
             messages=wire_messages,
         )
         for _p in _OPENAI_GEN_PARAMS:
@@ -605,7 +605,7 @@ class agllm:
                 lines.append(f"[{role}]: {content[:SUMMARY_ROLE_CONTENT_MAX_CHARS]}")
         client = self.backend.make_client(httpx.Timeout(120.0))
         compact_kwargs: dict = dict(
-            model=self.config.get("model", "gpt-4o"),
+            model=self.config.get("model", ""),
             messages=[
                 {"role": "system", "content": _SUMMARY_SYSTEM},
                 {"role": "user",   "content": "\n".join(lines)},

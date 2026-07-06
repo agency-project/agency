@@ -31,7 +31,7 @@ def llm_call(kwargs, cfg, messages, *args, **kwargs2):
     """Test shim: create a temporary agllm instance and call .call()."""
     return agllm(cfg).call(kwargs, messages, *args, **kwargs2)
 
-LLM_COMPACT_CONFIG = {"api_key": "test", "model": "gpt-4o", "base_url": "http://localhost/v1"}
+LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
 BIG_CTX = 100_000
 LLM_COMPACT = agllm(LLM_COMPACT_CONFIG, context_limit=BIG_CTX)
 
@@ -127,13 +127,13 @@ def _run_call(chunks, llm_config=None):
 # ---------------------------------------------------------------------------
 
 def test_build_llm_kwargs_includes_model():
-    cfg = {"model": "gpt-4o", "api_key": "x"}
+    cfg = {"model": "", "api_key": "x"}
     kw  = build_llm_kwargs(cfg, [], None)
-    assert kw["model"] == "gpt-4o"
+    assert kw["model"] == ""
 
 def test_build_llm_kwargs_default_model():
     kw = build_llm_kwargs({}, [], None)
-    assert kw["model"] == "gpt-4o"
+    assert kw["model"] == ""
 
 def test_build_llm_kwargs_messages_included():
     msgs = [{"role": "user", "content": "hi"}]
@@ -327,7 +327,7 @@ def test_agllm_no_context_limit_calls_fetch():
     assert llm.context_limit == 32_000
 
 def test_agllm_config_stored():
-    cfg = {"model": "gpt-4o", "temperature": 0.5}
+    cfg = {"model": "", "temperature": 0.5}
     llm = agllm(cfg, context_limit=128_000)
     assert llm.config is cfg
 

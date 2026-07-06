@@ -10,7 +10,7 @@ from agency.agllm import LLM_MAX_RETRIES, LLM_IDLE_TIMEOUT, LLM_STREAM_TIMEOUT, 
 from agency.agtool import agtool
 from agency.agent import agent as _agent_cls
 
-LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
+LLM_CONFIG = {"api_key": "test", "model": ""}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
 
 
@@ -1345,8 +1345,8 @@ build_llm_kwargs = _agllm_mod.build_llm_kwargs
 
 def test_build_llm_kwargs_model_and_messages():
     msgs = [{"role": "user", "content": "hi"}]
-    kw = build_llm_kwargs({"model": "gpt-4o"}, msgs, None)
-    assert kw["model"] == "gpt-4o"
+    kw = build_llm_kwargs({"model": ""}, msgs, None)
+    assert kw["model"] == ""
     assert kw["messages"] == msgs
 
 

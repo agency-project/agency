@@ -4,23 +4,16 @@ Simple feature examples showing how to use the agency framework.
 
 ## LLM configuration
 
-For hosted OpenAI, leave `LLM_BASE_URL` unset so the OpenAI SDK uses its default endpoint:
-
-```bash
-export LLM_API_KEY="$OPENAI_API_KEY"
-export LLM_MODEL="gpt-4o"
-unset LLM_BASE_URL
-uv run examples/human_in_the_loop.py
-```
-
-For vLLM or another local/OpenAI-compatible endpoint, set `LLM_BASE_URL` explicitly:
+For vLLM or another local/OpenAI-compatible endpoint, set `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODE` as needed.
 
 ```bash
 export LLM_BASE_URL="http://localhost:8000/v1"
-export LLM_API_KEY="EMPTY"
+export LLM_API_KEY="your-api-key"
 export LLM_MODEL="your-model-id"
 uv run examples/human_in_the_loop.py
 ```
+
+Please refer to the main README.md at project root for other LLM APIs.
 
 ---
 

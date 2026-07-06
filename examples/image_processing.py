@@ -27,7 +27,7 @@ from agency import agent, agdata, agimage, agskill, agteam, agsync
 LLM_CONFIG = {
     "api_key":  os.environ.get("LLM_API_KEY", ""),
     "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", "gpt-4o"),
+    "model":    os.environ.get("LLM_MODEL", ""),
 }
 
 # ---------------------------------------------------------------------------

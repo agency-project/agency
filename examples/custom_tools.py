@@ -35,7 +35,7 @@ from agency.agutil import format_exception as _fmt_exc
 LLM_CONFIG = {
     "api_key":  os.environ.get("LLM_API_KEY", ""),
     "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", "gpt-4o"),
+    "model":    os.environ.get("LLM_MODEL", ""),
 }
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 _MAX_CHARS = 32_000
@@ -299,7 +299,6 @@ if __name__ == "__main__":
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     def _script() -> None:
-        print(f"Endpoint : {LLM_CONFIG.get('base_url', 'default')}")
         print(f"Run dir  : {run_dir}\n")
         try:
             topics = [topic] if topic != "KV cache quantization" else [
