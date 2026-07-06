@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
+from .agconfig import agconfig
 from .agutil import _iter_batched, _strip_thinking, _extract_thinking, _LLMIdleTimeout
 from .agllm_backend import agllm_backend, BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS, API_ERROR_EXCS
 
@@ -139,10 +140,11 @@ class agllm:
     """Encapsulates an LLM configuration and provides methods for building
     requests and executing streaming calls against that configuration."""
 
-    def __init__(self, config: dict, context_limit: "int | None" = None) -> None:
-        self.config: dict = config
-        self.backend: agllm_backend = agllm_backend.for_config(config)
-        self.context_limit: int = context_limit if context_limit is not None else agllm.fetch_context_limit(config)
+    def __init__(self, config: "dict | agconfig", context_limit: "int | None" = None) -> None:
+        self.agconfig: agconfig = agconfig.from_user(config)
+        self.config: dict = self.agconfig.raw
+        self.backend: agllm_backend = agllm_backend.for_config(self.agconfig.backend_config())
+        self.context_limit: int = context_limit if context_limit is not None else agllm.fetch_context_limit(self.agconfig)
 
     # ------------------------------------------------------------------
     # Round-robin config selector
@@ -166,7 +168,7 @@ class agllm:
     # ------------------------------------------------------------------
 
     def build_kwargs(self, messages: list[dict], openai_tools: "list | None" = None) -> dict:
-        return agllm.build_llm_kwargs(self.config, messages, openai_tools)
+        return self.agconfig.build_chat_kwargs(messages, openai_tools)
 
     def call(
         self,
@@ -380,34 +382,8 @@ class agllm:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_llm_kwargs(llm_config: dict, messages: list[dict], openai_tools: "list | None") -> dict:
-        _OPENAI_GEN_PARAMS = {"temperature", "max_completion_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
-        _EXTRA_BODY_GEN_PARAMS = {"top_k", "repetition_penalty", "min_p", "min_tokens", "guided_json", "guided_regex"}
-        wire_messages: list[dict] = []
-        for m in messages:
-            wire_msg = {k: v for k, v in m.items() if not k.startswith("_")}
-            if wire_msg.get("content") is None:
-                wire_msg["content"] = ""
-            wire_messages.append(wire_msg)
-        kwargs: dict = dict(
-            model=llm_config.get("model", "gpt-4o"),
-            messages=wire_messages,
-        )
-        for _p in _OPENAI_GEN_PARAMS:
-            if _p in llm_config:
-                kwargs[_p] = llm_config[_p]
-        if "max_tokens" in llm_config:
-            print("[agllm] WARNING: llm_config['max_tokens'] is deprecated; use 'max_completion_tokens' instead.")
-            kwargs.setdefault("max_completion_tokens", llm_config["max_tokens"])
-        _extra_body: dict = dict(llm_config.get("extra_body") or {})
-        for _p in _EXTRA_BODY_GEN_PARAMS:
-            if _p in llm_config:
-                _extra_body[_p] = llm_config[_p]
-        if _extra_body:
-            kwargs["extra_body"] = _extra_body
-        if openai_tools:
-            kwargs["tools"] = openai_tools
-        return kwargs
+    def build_llm_kwargs(llm_config: "dict | agconfig", messages: list[dict], openai_tools: "list | None") -> dict:
+        return agconfig.from_user(llm_config).build_chat_kwargs(messages, openai_tools)
 
     @staticmethod
     def build_assistant_msg(
@@ -432,7 +408,7 @@ class agllm:
         return msg_dict
 
     @staticmethod
-    def fetch_context_limit(llm_config: dict) -> int:
+    def fetch_context_limit(llm_config: "dict | agconfig") -> int:
         """Return the model's context window size.
 
         Priority:
@@ -443,10 +419,11 @@ class agllm:
            which has no model-listing API at all)
         4. ``_DEFAULT_CONTEXT_LIMIT`` — safe fallback so compaction always runs
         """
-        if "context_limit" in llm_config:
-            return int(llm_config["context_limit"])
-        model_id = llm_config.get("model", "")
-        backend = agllm_backend.for_config(llm_config)
+        cfg = agconfig.from_user(llm_config)
+        if cfg.context_limit is not None:
+            return cfg.context_limit
+        model_id = cfg.model
+        backend = agllm_backend.for_config(cfg.backend_config())
         try:
             all_models = backend.list_models()
             candidates = [m for m in all_models if m.id == model_id] or all_models
@@ -482,15 +459,16 @@ class agllm:
         return max(1, chars // CHARS_PER_TOKEN)
 
     @staticmethod
-    def count_messages_tokens(messages: list[dict], llm_config: dict) -> int:
+    def count_messages_tokens(messages: list[dict], llm_config: "dict | agconfig") -> int:
         """Token count via the vLLM /tokenize endpoint, falling back to char estimate."""
-        root = agllm_backend.for_config(llm_config).tokenize_url()
+        cfg = agconfig.from_user(llm_config)
+        root = agllm_backend.for_config(cfg.backend_config()).tokenize_url()
         if root:
             try:
                 resp = httpx.post(
                     f"{root}/tokenize",
                     json={
-                        "model": llm_config.get("model", ""),
+                        "model": cfg.model,
                         "messages": [{k: v for k, v in m.items() if not k.startswith("_")}
                                      for m in messages],
                     },
@@ -604,16 +582,13 @@ class agllm:
             elif content:
                 lines.append(f"[{role}]: {content[:SUMMARY_ROLE_CONTENT_MAX_CHARS]}")
         client = self.backend.make_client(httpx.Timeout(120.0))
-        compact_kwargs: dict = dict(
-            model=self.config.get("model", "gpt-4o"),
-            messages=[
+        compact_kwargs = self.agconfig.build_compact_kwargs(
+            [
                 {"role": "system", "content": _SUMMARY_SYSTEM},
                 {"role": "user",   "content": "\n".join(lines)},
             ],
+            SUMMARY_MAX_TOKENS,
         )
-        compact_kwargs["max_completion_tokens"] = SUMMARY_MAX_TOKENS
-        if "extra_body" in self.config:
-            compact_kwargs["extra_body"] = self.config["extra_body"]
         resp = client.chat.completions.create(**compact_kwargs)
         summary = (resp.choices[0].message.content or "").strip()
         injection: list[dict] = [

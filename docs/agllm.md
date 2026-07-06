@@ -13,7 +13,7 @@ llm = agllm(
         "api_key":     "EMPTY",
         "model":       "meta-llama/Llama-3.1-8B-Instruct",
         "temperature": 0.0,
-        "max_tokens":  4096,
+        "max_completion_tokens": 4096,
     }
 )
 ```
@@ -26,7 +26,9 @@ llm = agllm(
 | `api_key` | str | Bearer token. Pass `"EMPTY"` for vLLM without auth. |
 | `model` | str | Model identifier passed verbatim to the API. |
 | `temperature` | float | Sampling temperature. |
-| `max_tokens` | int | Maximum tokens in the completion. |
+| `max_completion_tokens` | int | Maximum tokens in the completion. Canonical framework key. |
+| `max_output_tokens` | int | Provider-neutral alias for `max_completion_tokens`. |
+| `max_tokens` | int | Deprecated alias for `max_completion_tokens`; still accepted for compatibility. |
 | `top_p` | float | Nucleus sampling probability. |
 | `top_k` | int | Top-k sampling (sent via `extra_body`). |
 | `repetition_penalty` | float | Repetition penalty (sent via `extra_body`). |
@@ -124,7 +126,9 @@ kwargs = agllm.build_llm_kwargs(llm_config, messages, openai_tools)
 kwargs = llm.build_kwargs(messages, openai_tools)
 ```
 
-`build_llm_kwargs` strips private keys (those starting with `_`) from messages before sending. Generation params (`temperature`, `max_tokens`, `top_p`, etc.) are copied from `llm_config` into the kwargs dict. Params that are not native OpenAI fields (`top_k`, `repetition_penalty`, `min_p`, `min_tokens`, `guided_json`, `guided_regex`) are placed under `extra_body` instead.
+`build_llm_kwargs` strips private keys (those starting with `_`) from messages before sending. Generation params (`temperature`, `max_completion_tokens`, `top_p`, etc.) are copied from `llm_config` into the kwargs dict after `agconfig` normalizes aliases. Params that are not native OpenAI fields (`top_k`, `repetition_penalty`, `min_p`, `min_tokens`, `guided_json`, `guided_regex`) are placed under `extra_body` instead.
+
+`agconfig` keeps the public dict API intact while centralizing config aliases and provider-specific wire names. OpenAI-compatible backends receive `max_completion_tokens`; Anthropic Messages API backends receive `max_tokens`.
 
 ## Building an assistant message
 
