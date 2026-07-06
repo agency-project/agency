@@ -71,12 +71,12 @@ class TestIsAnthropicBedrockModel:
 
 class TestForConfig:
     def test_plain_config_returns_openai_compatible(self):
-        backend = agllm_backend.for_config({"api_key": "k", "model": "gpt-4o"})
+        backend = agllm_backend.for_config({"api_key": "k", "model": ""})
         assert isinstance(backend, _OpenAICompatibleBackend)
         assert not isinstance(backend, _OpenAICompatibleBedrockBackend)
 
     def test_no_provider_key_returns_openai_compatible(self):
-        backend = agllm_backend.for_config({"model": "gpt-4o"})
+        backend = agllm_backend.for_config({"model": ""})
         assert isinstance(backend, _OpenAICompatibleBackend)
 
     def test_bedrock_non_anthropic_model_returns_mantle_backend(self):
@@ -98,7 +98,7 @@ class TestForConfig:
         assert isinstance(backend, _AnthropicBedrockBackend)
 
     def test_config_stored_on_instance(self):
-        cfg = {"model": "gpt-4o"}
+        cfg = {"model": ""}
         backend = agllm_backend.for_config(cfg)
         assert backend.config is cfg
 

@@ -381,15 +381,24 @@ class agllm:
 
     @staticmethod
     def build_llm_kwargs(llm_config: dict, messages: list[dict], openai_tools: "list | None") -> dict:
-        _OPENAI_GEN_PARAMS = {"temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
+        _OPENAI_GEN_PARAMS = {"temperature", "max_completion_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
         _EXTRA_BODY_GEN_PARAMS = {"top_k", "repetition_penalty", "min_p", "min_tokens", "guided_json", "guided_regex"}
+        wire_messages: list[dict] = []
+        for m in messages:
+            wire_msg = {k: v for k, v in m.items() if not k.startswith("_")}
+            if wire_msg.get("content") is None:
+                wire_msg["content"] = ""
+            wire_messages.append(wire_msg)
         kwargs: dict = dict(
-            model=llm_config.get("model", "gpt-4o"),
-            messages=[{k: v for k, v in m.items() if not k.startswith("_")} for m in messages],
+            model=llm_config.get("model", ""),
+            messages=wire_messages,
         )
         for _p in _OPENAI_GEN_PARAMS:
             if _p in llm_config:
                 kwargs[_p] = llm_config[_p]
+        if "max_tokens" in llm_config:
+            print("[agllm] WARNING: llm_config['max_tokens'] is deprecated; use 'max_completion_tokens' instead.")
+            kwargs.setdefault("max_completion_tokens", llm_config["max_tokens"])
         _extra_body: dict = dict(llm_config.get("extra_body") or {})
         for _p in _EXTRA_BODY_GEN_PARAMS:
             if _p in llm_config:
@@ -596,13 +605,13 @@ class agllm:
                 lines.append(f"[{role}]: {content[:SUMMARY_ROLE_CONTENT_MAX_CHARS]}")
         client = self.backend.make_client(httpx.Timeout(120.0))
         compact_kwargs: dict = dict(
-            model=self.config.get("model", "gpt-4o"),
+            model=self.config.get("model", ""),
             messages=[
                 {"role": "system", "content": _SUMMARY_SYSTEM},
                 {"role": "user",   "content": "\n".join(lines)},
             ],
-            max_tokens=SUMMARY_MAX_TOKENS,
         )
+        compact_kwargs["max_completion_tokens"] = SUMMARY_MAX_TOKENS
         if "extra_body" in self.config:
             compact_kwargs["extra_body"] = self.config["extra_body"]
         resp = client.chat.completions.create(**compact_kwargs)

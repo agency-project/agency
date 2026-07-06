@@ -10,7 +10,7 @@ from agency.agllm import LLM_MAX_RETRIES, LLM_IDLE_TIMEOUT, LLM_STREAM_TIMEOUT, 
 from agency.agtool import agtool
 from agency.agent import agent as _agent_cls
 
-LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
+LLM_CONFIG = {"api_key": "test", "model": ""}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
 
 
@@ -1345,8 +1345,8 @@ build_llm_kwargs = _agllm_mod.build_llm_kwargs
 
 def test_build_llm_kwargs_model_and_messages():
     msgs = [{"role": "user", "content": "hi"}]
-    kw = build_llm_kwargs({"model": "gpt-4o"}, msgs, None)
-    assert kw["model"] == "gpt-4o"
+    kw = build_llm_kwargs({"model": ""}, msgs, None)
+    assert kw["model"] == ""
     assert kw["messages"] == msgs
 
 
@@ -1358,9 +1358,9 @@ def test_build_llm_kwargs_strips_private_keys():
 
 
 def test_build_llm_kwargs_openai_gen_params():
-    kw = build_llm_kwargs({"model": "m", "temperature": 0.7, "max_tokens": 100}, [], None)
+    kw = build_llm_kwargs({"model": "m", "temperature": 0.7, "max_completion_tokens": 100}, [], None)
     assert kw["temperature"] == 0.7
-    assert kw["max_tokens"] == 100
+    assert kw["max_completion_tokens"] == 100
 
 
 def test_build_llm_kwargs_extra_body_vllm_params():

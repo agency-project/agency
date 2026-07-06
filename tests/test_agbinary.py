@@ -11,7 +11,7 @@ from agency.agtype import agtype, agbinary
 from agency.agskill import agskill
 from agency.agllm import agllm
 
-LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
+LLM_CONFIG = {"api_key": "test", "model": ""}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
 
 

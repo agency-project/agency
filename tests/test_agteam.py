@@ -47,7 +47,7 @@ def test_init_multiple_kwargs_all_become_attributes():
 
 
 @pytest.mark.parametrize("llm_cfg", [
-    {"api_key": "x", "model": "gpt-4o"},
+    {"api_key": "x", "model": ""},
     {"api_key": "y", "model": "claude-3", "base_url": "https://api.example.com"},
     {"api_key": "z", "model": "llama-3", "temperature": 0.7},
     {"api_key": "a", "model": "mistral"},
