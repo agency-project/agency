@@ -1,10 +1,10 @@
 """
 Example: agent talking to a remote LLM server, with typed agskill schemas.
 
-vLLM-based OpenAI-compatible API example::
+OpenAI-compatible API example::
   - base_url  → http://<host>:<port>/v1
-  - api_key   → "EMPTY" (or whatever --api-key you set when launching vLLM)
-  - model     → The model to be used. (If empty, the server will be queried for the model.)
+  - api_key   → "EMPTY" for local endpoints with no auth, or a real API key
+  - model     → The model to use.
 
     Launch vLLM (example):
         vllm serve google/gemma-4-E2B-it \
@@ -14,17 +14,19 @@ vLLM-based OpenAI-compatible API example::
 
     Run this script:
         uv run python example.py
-        VLLM_BASE_URL="http://localhost:8000/v1" uv run python example.py
+        LLM_BASE_URL="http://localhost:8000/v1" uv run python example.py
 """
 import os
 from pathlib import Path
 from agency import agent, agskill, agdata
 
 LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
+    "api_key":              os.environ.get("LLM_API_KEY", ""),
 }
+if os.environ.get("LLM_BASE_URL"):
+    LLM_CONFIG["base_url"] = os.environ["LLM_BASE_URL"]
+if os.environ.get("LLM_MODEL"):
+    LLM_CONFIG["model"] = os.environ["LLM_MODEL"]
 
 def _make_run_dir(name: str):
     from datetime import datetime

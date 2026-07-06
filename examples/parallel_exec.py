@@ -20,10 +20,12 @@ from pathlib import Path
 from agency import agent, agdata, agskill, agteam
 
 LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
+    "api_key":              os.environ.get("LLM_API_KEY", ""),
 }
+if os.environ.get("LLM_BASE_URL"):
+    LLM_CONFIG["base_url"] = os.environ["LLM_BASE_URL"]
+if os.environ.get("LLM_MODEL"):
+    LLM_CONFIG["model"] = os.environ["LLM_MODEL"]
 
 
 class SummariserSkill(agskill):
@@ -143,7 +145,7 @@ if __name__ == "__main__":
     agent.output_dir = run_dir / "agent_output"
 
     def _script() -> None:
-        print(f"Endpoint : {LLM_CONFIG['base_url']}")
+        print(f"Endpoint : {LLM_CONFIG.get('base_url', 'default')}")
         print(f"Run dir  : {run_dir}\n")
         try:
             seq_team = SequentialChainTeam()

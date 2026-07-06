@@ -23,7 +23,7 @@ restarts the container from that checkpoint.
 
 Run:
     uv run python examples/sandbox_handoff.py
-    VLLM_BASE_URL="" uv run python examples/sandbox_handoff.py
+    LLM_MODEL=gpt-4o uv run python examples/sandbox_handoff.py
 """
 import os
 from pathlib import Path
@@ -36,10 +36,12 @@ from agency import agent, agskill, agdata
 # ---------------------------------------------------------------------------
 
 LLM_CONFIG = {
-    "base_url":          os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":           os.environ.get("VLLM_API_KEY",  ""),
-    "model":             os.environ.get("VLLM_MODEL",    ""),
+    "api_key":           os.environ.get("LLM_API_KEY", ""),
 }
+if os.environ.get("LLM_BASE_URL"):
+    LLM_CONFIG["base_url"] = os.environ["LLM_BASE_URL"]
+if os.environ.get("LLM_MODEL"):
+    LLM_CONFIG["model"] = os.environ["LLM_MODEL"]
 
 FILE_PATH = "/workspace/hello.py"
 
@@ -92,7 +94,7 @@ def main() -> None:
     agent.log_dir    = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
 
-    print(f"Model   : {LLM_CONFIG['model']}")
+    print(f"Model   : {LLM_CONFIG.get('model', 'default')}")
     print(f"Run dir : {run_dir}\n")
 
     # ── Step 1: first agent writes hello.py ─────────────────────────────────
