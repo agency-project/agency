@@ -22,11 +22,11 @@ READ_LS_TIMEOUT_S = 10     # Timeout in seconds for the ls command used to list 
 _READ_PARAMS = {
     "type": "object",
     "properties": {
-        "filePath": {"type": "string", "description": "Absolute path to the file or directory"},
+        "file_path": {"type": "string", "description": "Absolute path to the file or directory"},
         "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)"},
         "limit": {"type": "integer", "description": "Maximum number of lines to read"},
     },
-    "required": ["filePath"],
+    "required": ["file_path"],
 }
 
 
@@ -65,7 +65,7 @@ def _paginate_text(content: str, offset: int, limit: int) -> agdata:
 def make_read(sandbox: "agSandbox") -> agtool:
     """Return a read tool that reads files from inside *sandbox*'s container."""
     def _run_sandboxed(arg: agdata) -> agdata:
-        file_path = str(arg.filePath)  # type: ignore[arg-type]
+        file_path = str(arg.file_path)  # type: ignore[arg-type]
         offset: int = int(getattr(arg, "offset", 1) or 1)
         limit: int = int(getattr(arg, "limit", _DEFAULT_LIMIT) or _DEFAULT_LIMIT)
 
@@ -108,7 +108,7 @@ def make_read(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        path  = str(arg._data.get("filePath", "?"))
+        path  = str(arg._data.get("file_path", "?"))
         rdata = result._data
         if "error" in rdata:
             tool._term.log("TOOL ✗   ", f"read  {path}  error: {rdata['error']}  ({elapsed_ms}ms)")

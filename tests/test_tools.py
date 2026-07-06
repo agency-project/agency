@@ -157,7 +157,7 @@ class TestToolLogOnErrorResult:
         tool, term = self._make_tool_with_term(tool)
         error_result = agerror("Not found: /workspace/missing.txt")
         # Must not raise AgError
-        tool._log_fn(tool, agdata(filePath="/workspace/missing.txt"), error_result, 42)
+        tool._log_fn(tool, agdata(file_path="/workspace/missing.txt"), error_result, 42)
         # Log was called with the error path, not the success path
         assert term.log.called
         logged = term.log.call_args[0]
@@ -170,7 +170,7 @@ class TestToolLogOnErrorResult:
         tool = make_write(sb)
         tool, term = self._make_tool_with_term(tool)
         error_result = agerror("Permission denied")
-        tool._log_fn(tool, agdata(filePath="/workspace/out.txt"), error_result, 10)
+        tool._log_fn(tool, agdata(file_path="/workspace/out.txt"), error_result, 10)
         assert term.log.called
         logged = term.log.call_args[0]
         assert "✗" in logged[0] or "error" in str(logged).lower()

@@ -79,7 +79,7 @@ _ensure_started() (called lazily from exec())
        ├─ docker rm -f <name>   (no-op if absent; clears any "Created"/"Exited" zombie)
        ├─ _container_semaphore.acquire()   (blocks until a keyring slot is free)
        ├─ _lifecycle_image set → docker run from lifecycle image
-       └─ not set              → docker run from BASE_IMAGE (first tool call ever)
+       └─ not set              → docker run from base_image (first tool call ever)
 ```
 
 **Two states only.** The "exited" fast-path (`docker start`) was removed. Any container that is not running is treated as a zombie and force-removed before a fresh `docker run`. State is preserved exclusively through `_lifecycle_image` commits, not through the container's overlay filesystem. This eliminates a class of zombie containers that accumulated when `docker stop` succeeded but `docker rm` later failed.

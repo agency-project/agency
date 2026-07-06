@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from .agsandbox import agSandbox
 
 from .agtype import agtype
+from .agutil import _camel_to_snake
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -123,7 +124,11 @@ class agdata:
 
     @classmethod
     def from_json(cls, s: str) -> "agdata":
-        return cls(**json.loads(s))
+        """Parse a JSON object into an agdata, tolerating camelCase keys --
+        some LLMs emit tool-call arguments in camelCase even when a tool's
+        schema declares snake_case parameter names. Normalizes only
+        top-level keys; nested dict/list values are left untouched."""
+        return cls(**{_camel_to_snake(k): v for k, v in json.loads(s).items()})
 
     # ------------------------------------------------------------------
     # Attribute access

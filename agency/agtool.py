@@ -8,22 +8,13 @@ from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agutil import format_exception
 from .agtype import type_hint_to_string_type, get_return_tool_description_prompt
+from .agconfig import GlobalConfigParam, DynamicConfigParam
 
 if TYPE_CHECKING:
     from .aglog import aglog
     from .agterm import agterm
     from .agsandbox import agSandbox
-
-# Default ceiling on tool execution time. Prevents a crashed or hung worker
-# process from blocking an agent thread forever via future.result().
-# Set to 1800s (30 min) to accommodate long-running bash commands; agents
-# can pass "timeout": <seconds> in tool arguments to override per-call.
-TOOL_TIMEOUT_S: int = 1800
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-TOOL_POOL_MAX_WORKERS = 256  # Maximum number of worker processes in the tool executor pool; one worker per in-flight tool call.
+    from .agconfig import agConfig
 
 # ---------------------------------------------------------------------------
 # Process pool — workers are created lazily on first tool call and scale up
@@ -34,12 +25,36 @@ _pool:      ProcessPoolExecutor | None = None
 _pool_lock: threading.Lock             = threading.Lock()
 
 
+# Exists only to register agtool's config fields (via __set_name__ at import
+# time). Constants are plain class attributes (not descriptors) so other code
+# in this file needing the same hardcoded value -- e.g. agtool.__call__'s own
+# timeout fallback -- can reference it directly (_AgToolFields.TOOL_TIMEOUT_S)
+# without going through the (possibly agconfig-overridden) ConfigParam.
+# Reads use a throwaway instance -- _AgToolFields(agconfig) -- since __init__
+# does nothing but (optionally) store an agconfig; there's no persistent
+# agtool instance to hang descriptors on for reading.
+class _AgToolFields:
+    TOOL_TIMEOUT_S = 1800   # Default ceiling on tool execution time (seconds). Prevents a crashed or
+                            # hung worker process from blocking an agent thread forever via future.result();
+                            # agents can pass "timeout": <seconds> in tool arguments to override per-call.
+    TOOL_POOL_MAX_WORKERS = 256      # Maximum number of worker processes in the tool executor pool; one worker per in-flight tool call.
+    TOOL_OUTPUT_OFFLOAD_CHARS = 40_000  # minimum floor for tool-output offloading
+
+    pool_max_workers     = GlobalConfigParam("agtool", default=TOOL_POOL_MAX_WORKERS)
+    timeout_s            = DynamicConfigParam("agtool", default=TOOL_TIMEOUT_S)
+    output_offload_chars = DynamicConfigParam("agtool", default=TOOL_OUTPUT_OFFLOAD_CHARS)
+
+    def __init__(self, agconfig=None) -> None:
+        self._agconfig = agconfig
+
+
 def _get_pool() -> ProcessPoolExecutor:
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ProcessPoolExecutor(max_workers=TOOL_POOL_MAX_WORKERS, mp_context=_mp.get_context("spawn"))
+                max_workers = _AgToolFields().pool_max_workers
+                _pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=_mp.get_context("spawn"))
     return _pool
 
 
@@ -164,7 +179,7 @@ class agtool:
         import pickle
         fn_bytes         = cloudpickle.dumps(self.fn)
         arg_bytes        = pickle.dumps(arg)
-        effective_timeout = timeout if timeout is not None else TOOL_TIMEOUT_S
+        effective_timeout = timeout if timeout is not None else _AgToolFields.TOOL_TIMEOUT_S
         try:
             result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result(timeout=effective_timeout)
         except _FutureTimeoutError:
@@ -240,9 +255,6 @@ def _make_return_output_tool(schema) -> list[dict]:
 # Tool dispatch
 # ---------------------------------------------------------------------------
 
-TOOL_OUTPUT_OFFLOAD_CHARS: int = 40_000  # minimum floor for tool-output offloading
-
-
 def dispatch_tools(
     tool_calls: list[dict],
     toolkit: dict,
@@ -253,7 +265,8 @@ def dispatch_tools(
     live_messages_fn: "Callable | None",
     full_history_fn: "Callable | None",
     term: "agterm | None",
-    tool_offload_chars: int = TOOL_OUTPUT_OFFLOAD_CHARS,
+    tool_offload_chars: "int | None" = None,
+    agconfig: "agConfig | None" = None,
 ) -> None:
     """Execute all tool calls from one LLM response, appending results to messages.
 
@@ -265,6 +278,10 @@ def dispatch_tools(
     _live_fn  = live_messages_fn
     _hist_fn  = full_history_fn
     _term     = term
+    _fields = _AgToolFields(agconfig)
+    if tool_offload_chars is None:
+        tool_offload_chars = _fields.output_offload_chars
+    _default_tool_timeout = _fields.timeout_s
 
     for tc in tool_calls:
         fn_name = tc["function"]["name"]
@@ -297,6 +314,8 @@ def dispatch_tools(
                         _tool_timeout = _parsed["timeout"]
                 except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
+                if _tool_timeout is None:
+                    _tool_timeout = _default_tool_timeout
                 result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)

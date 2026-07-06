@@ -6,13 +6,28 @@ import subprocess
 import threading
 import time
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-GPU_DETECT_TIMEOUT_S = 10        # Seconds to wait for nvidia-smi or rocm-smi to respond before giving up
-SYSCTL_DETECT_TIMEOUT_S = 5      # Seconds to wait for sysctl hw.memsize to respond on macOS
-MEMORY_DETECT_FALLBACK_MB = 4096  # Safe fallback total RAM in MB when detection fails on both Linux and macOS
-GPU_ACQUIRE_POLL_INTERVAL_S = 0.25  # Seconds between polling attempts when waiting for a free GPU semaphore
+from .agconfig import GlobalConfigParam
+
+# Exists only to register agResourcePool's config fields (via __set_name__ at
+# import time). All four are tier 1 (global): read once at process-wide
+# resource-detection time, or gate a shared pool, never per-instance. Reads
+# use a throwaway instance -- _AgResourcePoolFields() -- since __init__ does
+# nothing but (optionally) store an agconfig, and GlobalConfigParam ignores
+# it anyway, always routing to agConfig.GLOBAL.
+class _AgResourcePoolFields:
+    GPU_DETECT_TIMEOUT_S = 10           # Seconds to wait for nvidia-smi or rocm-smi to respond before giving up
+    SYSCTL_DETECT_TIMEOUT_S = 5         # Seconds to wait for sysctl hw.memsize to respond on macOS
+    MEMORY_DETECT_FALLBACK_MB = 4096    # Safe fallback total RAM in MB when detection fails on both Linux and macOS
+    GPU_ACQUIRE_POLL_INTERVAL_S = 0.25  # Seconds between polling attempts when waiting for a free GPU semaphore
+
+    gpu_detect_timeout_s = GlobalConfigParam("agResourcePool", default=GPU_DETECT_TIMEOUT_S)
+    sysctl_detect_timeout_s = GlobalConfigParam("agResourcePool", default=SYSCTL_DETECT_TIMEOUT_S)
+    memory_detect_fallback_mb = GlobalConfigParam("agResourcePool", default=MEMORY_DETECT_FALLBACK_MB)
+    gpu_acquire_poll_interval_s = GlobalConfigParam("agResourcePool", default=GPU_ACQUIRE_POLL_INTERVAL_S)
+
+    def __init__(self, agconfig=None) -> None:
+        self._agconfig = agconfig
+
 
 # VRAM held per GPU as a framework presence marker (visible in nvidia-smi).
 _MARKER_MB = 128
@@ -75,10 +90,11 @@ def _cvd_filter(gpu_ids: list[int]) -> list[int]:
 
 def detect_gpus() -> list[int]:
     """Return GPU IDs visible to nvidia-smi or rocm-smi, filtered by CUDA_VISIBLE_DEVICES."""
+    _timeout = _AgResourcePoolFields().gpu_detect_timeout_s
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=GPU_DETECT_TIMEOUT_S,
+            capture_output=True, text=True, timeout=_timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             ids = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
@@ -88,7 +104,7 @@ def detect_gpus() -> list[int]:
     try:
         result = subprocess.run(
             ["rocm-smi", "--showid", "--csv"],
-            capture_output=True, text=True, timeout=GPU_DETECT_TIMEOUT_S,
+            capture_output=True, text=True, timeout=_timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             ids = []
@@ -132,13 +148,14 @@ def detect_memory_mb() -> int:
     try:
         result = subprocess.run(
             ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=SYSCTL_DETECT_TIMEOUT_S,
+            capture_output=True, text=True,
+            timeout=_AgResourcePoolFields().sysctl_detect_timeout_s,
         )
         if result.returncode == 0:
             return int(result.stdout.strip()) // (1024 * 1024)
     except Exception:
         pass
-    return MEMORY_DETECT_FALLBACK_MB  # safe fallback
+    return _AgResourcePoolFields().memory_detect_fallback_mb
 
 
 class agResourcePool:
@@ -192,7 +209,7 @@ class agResourcePool:
     def acquire_gpu(self, timeout: float | None = None) -> int:
         """Block until any GPU is free; return its id."""
         deadline = None if timeout is None else time.monotonic() + timeout
-        poll = GPU_ACQUIRE_POLL_INTERVAL_S
+        poll = _AgResourcePoolFields().gpu_acquire_poll_interval_s
 
         while True:
             for gpu_id, sem in self._gpu_locks.items():

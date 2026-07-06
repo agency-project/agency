@@ -11,17 +11,17 @@ if TYPE_CHECKING:
 _WRITE_PARAMS = {
     "type": "object",
     "properties": {
-        "filePath": {"type": "string", "description": "Absolute path to the file to write"},
+        "file_path": {"type": "string", "description": "Absolute path to the file to write"},
         "content": {"type": "string", "description": "Content to write"},
     },
-    "required": ["filePath", "content"],
+    "required": ["file_path", "content"],
 }
 
 
 def make_write(sandbox: "agSandbox") -> agtool:
     """Return a write tool that writes files inside *sandbox*'s container."""
     def _run_sandboxed(arg: agdata) -> agdata:
-        file_path = str(arg.filePath)  # type: ignore[arg-type]
+        file_path = str(arg.file_path)  # type: ignore[arg-type]
         content: str = str(arg.content)  # type: ignore[arg-type]
 
         try:
@@ -37,7 +37,7 @@ def make_write(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        path  = str(arg._data.get("filePath", "?"))
+        path  = str(arg._data.get("file_path", "?"))
         rdata = result._data
         if "error" in rdata:
             tool._term.log("TOOL ✗   ", f"write  {path}  error: {rdata['error']}  ({elapsed_ms}ms)")

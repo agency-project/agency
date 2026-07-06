@@ -106,6 +106,7 @@ def _make_mock_agent(llm):
         agresource_pool = MagicMock()
         ping_interval_s = 300
         poll_interval_s = 5
+        agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
     ag = _Cls()
     ag.llm = llm

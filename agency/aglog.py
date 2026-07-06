@@ -4,20 +4,28 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from .agdata import agdata
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DUMP_TOOL_ARGS_TRUNCATE_LEN = 60    # Max characters of tool call arguments shown in dump() human-readable summary
-DUMP_CONTENT_TRUNCATE_LEN = 120     # Max characters of message content shown per history delta line in dump() output
-DUMP_TOOL_CALL_ID_PREFIX_LEN = 8    # Number of leading characters of tool_call_id shown in dump() output
+from .agconfig import agConfig, DynamicConfigParam
 
 
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-class aglog:
+# Exists to register aglog's config fields (via __set_name__ at import time)
+# and hold their hardcoded defaults as plain class attributes -- aglog
+# inherits from this below, so self.dump_content_truncate_len etc. work via
+# the inherited ConfigParam descriptors exactly as if declared directly on aglog.
+class _AgLogFields:
+    DUMP_TOOL_ARGS_TRUNCATE_LEN = 60    # Max characters of tool call arguments shown in dump() human-readable summary
+    DUMP_CONTENT_TRUNCATE_LEN = 120     # Max characters of message content shown per history delta line in dump() output
+    DUMP_TOOL_CALL_ID_PREFIX_LEN = 8    # Number of leading characters of tool_call_id shown in dump() output
+
+    dump_tool_args_truncate_len = DynamicConfigParam("aglog", default=DUMP_TOOL_ARGS_TRUNCATE_LEN)
+    dump_content_truncate_len = DynamicConfigParam("aglog", default=DUMP_CONTENT_TRUNCATE_LEN)
+    dump_tool_call_id_prefix_len = DynamicConfigParam("aglog", default=DUMP_TOOL_CALL_ID_PREFIX_LEN)
+
+
+class aglog(_AgLogFields):
     """Structured, thread-safe log of all agskill calls and lifecycle events on an agent.
 
     Automatically populated by agent — no manual calls required.
@@ -43,11 +51,12 @@ class aglog:
       parent_agname : (forked only) agname of the source agent
     """
 
-    def __init__(self, path: "Path | str | None" = None) -> None:
+    def __init__(self, path: "Path | str | None" = None, agconfig: "agConfig | None" = None) -> None:
         self._entries: list[dict] = []   # skill calls only
         self._events:  list[dict] = []   # all events (lifecycle + skills)
         self._lock = threading.Lock()
         self._path = Path(path) if path is not None else None
+        self._agconfig = agconfig
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -170,18 +179,18 @@ class aglog:
                     role = m.get("role", "?")
                     if m.get("tool_calls"):
                         calls = ", ".join(
-                            f"{tc['function']['name']}({tc['function']['arguments'][:DUMP_TOOL_ARGS_TRUNCATE_LEN]})"
+                            f"{tc['function']['name']}({tc['function']['arguments'][:self.dump_tool_args_truncate_len]})"
                             for tc in m["tool_calls"]
                         )
                         delta_lines.append(f"      [{role}] tool_calls: {calls}")
                     elif role == "tool":
                         delta_lines.append(
-                            f"      [tool/{m.get('tool_call_id','')[:DUMP_TOOL_CALL_ID_PREFIX_LEN]}] "
-                            f"{str(m.get('content',''))[:DUMP_CONTENT_TRUNCATE_LEN]}"
+                            f"      [tool/{m.get('tool_call_id','')[:self.dump_tool_call_id_prefix_len]}] "
+                            f"{str(m.get('content',''))[:self.dump_content_truncate_len]}"
                         )
                     else:
                         delta_lines.append(
-                            f"      [{role}] {str(m.get('content',''))[:DUMP_CONTENT_TRUNCATE_LEN]}"
+                            f"      [{role}] {str(m.get('content',''))[:self.dump_content_truncate_len]}"
                         )
                 delta_str = ("\n" + "\n".join(delta_lines)) if delta_lines else " (none)"
                 inp = e.get("input_tokens",  0)

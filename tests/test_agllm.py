@@ -12,15 +12,17 @@ import json
 from agency.agdata import agdata as _agdata, agerror as _agerror
 from agency.agcontext import agcontext
 from agency.agllm import (
-    TAIL_TURNS,
     _COMPACT_THRESHOLD,
     _TAIL_MAX_TOKENS,
     _TAIL_MIN_TOKENS,
     _TAIL_FRACTION,
     _TOOL_OUTPUT_MAX_CHARS,
     _PRUNE_MIN_FREE_TOKENS,
-    DEFAULT_CONTEXT_LIMIT,
+    _AgLLMFields,
 )
+
+TAIL_TURNS = _AgLLMFields.TAIL_TURNS
+DEFAULT_CONTEXT_LIMIT = _AgLLMFields.DEFAULT_CONTEXT_LIMIT
 
 build_assistant_msg  = agllm.build_assistant_msg
 build_llm_kwargs     = agllm.build_llm_kwargs
@@ -42,6 +44,7 @@ def _make_mock_agent(llm=None, sandbox=None):
         agresource_pool = MagicMock()
         ping_interval_s = 300
         poll_interval_s = 5
+        agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
     ag = _Cls()
     ag.llm = llm or LLM_COMPACT
@@ -474,7 +477,8 @@ def test_llm_call_transient_error_retries_and_exhausts():
     assert result.conn_error is err
 
 def test_llm_call_transient_error_notifies_full_history_fn():
-    from agency.agllm import LLM_MAX_RETRIES
+    from agency.agllm import _AgLLMFields
+    LLM_MAX_RETRIES = _AgLLMFields.LLM_MAX_RETRIES
     cfg   = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs  = [{"role": "user", "content": "hi"}]
     err   = OSError("connection reset")
@@ -512,7 +516,8 @@ def test_llm_call_bare_api_error_retries_and_exhausts():
     assert result.conn_error is err
 
 def test_llm_call_bare_api_error_notifies_full_history_fn():
-    from agency.agllm import LLM_MAX_RETRIES
+    from agency.agllm import _AgLLMFields
+    LLM_MAX_RETRIES = _AgLLMFields.LLM_MAX_RETRIES
     cfg   = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs  = [{"role": "user", "content": "hi"}]
     err   = openai.APIError("server error", httpx.Request("POST", "http://x"), body=None)
@@ -553,7 +558,8 @@ def test_llm_call_rate_limit_honors_retry_after_header():
     """A 429 must retry (not crash the skill) and never sleep for less than
     the server-provided Retry-After duration when present — jitter is added
     on top, never subtracted, so this asserts a floor rather than equality."""
-    from agency.agllm import LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S
+    from agency.agllm import _AgLLMFields
+    LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S = _AgLLMFields.LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
@@ -594,7 +600,8 @@ def test_llm_call_rate_limit_retry_after_jitter_decorrelates_calls():
 def test_llm_call_rate_limit_falls_back_to_exponential_backoff_without_header():
     """Missing/unparseable Retry-After must not crash — fall back to bounded,
     jittered exponential backoff instead of raising a TypeError/ValueError."""
-    from agency.agllm import LLM_RATE_LIMIT_MAX_BACKOFF_S
+    from agency.agllm import _AgLLMFields
+    LLM_RATE_LIMIT_MAX_BACKOFF_S = _AgLLMFields.LLM_RATE_LIMIT_MAX_BACKOFF_S
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
@@ -616,7 +623,8 @@ def test_llm_call_rate_limit_falls_back_to_exponential_backoff_without_header():
 def test_llm_call_rate_limit_exhausts_retries_without_raising():
     """The 429 must never propagate uncaught — this was the original bug
     (agskill.py crashing on anthropic.RateLimitError)."""
-    from agency.agllm import LLM_MAX_RETRIES
+    from agency.agllm import _AgLLMFields
+    LLM_MAX_RETRIES = _AgLLMFields.LLM_MAX_RETRIES
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(

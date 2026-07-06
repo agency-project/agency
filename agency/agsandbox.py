@@ -10,8 +10,9 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, ClassVar
+from typing import TYPE_CHECKING, Callable
 
+from .agconfig import agConfig, GlobalConfigParam, StaticConfigParam
 from .agresources import detect_gpus
 
 if TYPE_CHECKING:
@@ -45,7 +46,23 @@ _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
 # teardown), so more than ~16 concurrent calls increase contention without
 # reducing wall-clock time.  A single semaphore replaces the former trio of
 # _startup_semaphore / _commit_semaphore / _shutdown_semaphore.
-_docker_semaphore = threading.Semaphore(16)
+# Tier-1 (global class) config: lazily created on first use so a caller can
+# override the limit via agSandbox.docker_semaphore_limit = N (or
+# cfg.agSandbox.docker_semaphore_limit = N before any agSandbox exists)
+# before the first docker/podman call in the process. Locked once actually
+# read, matching a real semaphore's can't-resize-after-creation semantics.
+_docker_semaphore: threading.Semaphore | None = None
+_docker_semaphore_init_lock = threading.Lock()
+
+
+def _get_docker_semaphore() -> threading.Semaphore:
+    global _docker_semaphore
+    if _docker_semaphore is None:
+        with _docker_semaphore_init_lock:
+            if _docker_semaphore is None:
+                limit = _AgSandboxFields().docker_semaphore_limit
+                _docker_semaphore = threading.Semaphore(limit)
+    return _docker_semaphore
 
 # ---------------------------------------------------------------------------
 # Timeout constants (seconds)
@@ -181,6 +198,27 @@ def get_container_runtime() -> str:
     return _RUNTIME
 
 
+def seed_cache_from_image(host_dir, container_path: str, image: str, timeout: int = 900) -> None:
+    """Copy *container_path* out of *image* into *host_dir*, once, if *host_dir* is empty.
+
+    For a shared host mount (see ``agSandboxConfig.add_mount``) that would
+    otherwise shadow pre-baked, gated content already inside the image (e.g.
+    HuggingFace model weights only fetchable with credentials available at
+    build time, not at container-run time).
+    """
+    host_dir = Path(host_dir).resolve()
+    host_dir.mkdir(parents=True, exist_ok=True)
+    if any(host_dir.iterdir()):
+        return
+    runtime = get_container_runtime()
+    subprocess.run(
+        [runtime, "run", "--rm", "-v", f"{host_dir}:/__seed_out",
+         image, "sh", "-c",
+         f"cp -a {shlex.quote(container_path)}/. /__seed_out/ 2>/dev/null || true"],
+        check=False, timeout=timeout,
+    )
+
+
 _gpu_flags_cache: "list[str] | None" = None
 _gpu_flags_lock = threading.Lock()
 
@@ -216,7 +254,70 @@ def _gpu_flags() -> list[str]:
         return _gpu_flags_cache
 
 
-class agSandbox:
+class agSandboxConfig:
+    """View over an ``agConfig`` exposing ``agSandbox``'s own vocabulary
+    (image, mounts) scoped to the ``"agSandbox"`` namespace.
+
+    Composition, not inheritance: the object propagated through
+    ``agent`` -> ``agllm``/``agSandbox`` is always a plain, class-agnostic
+    ``agConfig``. This wraps whichever one is at hand to give sandbox-
+    specific sugar without putting mount/image vocabulary on the shared
+    base class other framework classes also use.
+    """
+
+    CLASS_NAME = "agSandbox"
+
+    def __init__(self, agconfig: "agConfig | None" = None) -> None:
+        self._agconfig = agconfig if agconfig is not None else agConfig()
+
+    @property
+    def agconfig(self) -> "agConfig":
+        """The underlying, propagatable agConfig — pass this onward, not the view."""
+        return self._agconfig
+
+    @property
+    def base_image(self) -> str:
+        return self._agconfig.get_static(self.CLASS_NAME, "base_image", _AgSandboxFields.BASE_IMAGE)
+
+    def set_base_image(self, image: str) -> "agSandboxConfig":
+        self._agconfig.set(self.CLASS_NAME, "base_image", image)
+        return self
+
+    @property
+    def mounts(self) -> dict[str, tuple[str, str, str]]:
+        return self._agconfig.get_static(self.CLASS_NAME, "mounts", {})
+
+    def add_mount(self, name: str, host_path, container_path: str, mode: str = "rw") -> "agSandboxConfig":
+        # Raw (non-locking) read: this is a builder mutating a not-yet-consumed
+        # config, not a consumer resolving it — going through the `mounts`
+        # property here would lock the key via get_static() on its own first
+        # call and then immediately fail the .set() below.
+        current = self._agconfig.get(self.CLASS_NAME, "mounts", {})
+        mounts = {**current, name: (str(host_path), container_path, mode)}
+        self._agconfig.set(self.CLASS_NAME, "mounts", mounts)
+        return self
+
+    def remove_mount(self, name: str) -> "agSandboxConfig":
+        current = self._agconfig.get(self.CLASS_NAME, "mounts", {})
+        mounts = dict(current)
+        mounts.pop(name, None)
+        self._agconfig.set(self.CLASS_NAME, "mounts", mounts)
+        return self
+
+
+# Exists to register agSandbox's config fields (via __set_name__ at import
+# time) and hold their hardcoded defaults as plain class attributes --
+# agSandbox inherits from this below, so self.base_image etc. work via the
+# inherited ConfigParam descriptors exactly as if declared directly on it.
+class _AgSandboxFields:
+    BASE_IMAGE = "agency-sandbox:latest"
+    DOCKER_SEMAPHORE_LIMIT = 16
+
+    base_image = StaticConfigParam("agSandbox", default=BASE_IMAGE)
+    docker_semaphore_limit = GlobalConfigParam("agSandbox", default=DOCKER_SEMAPHORE_LIMIT)
+
+
+class agSandbox(_AgSandboxFields):
     """Manages a single container for one agent via docker or podman.
 
     All filesystem operations route through ``docker exec`` / ``podman exec``.
@@ -224,8 +325,6 @@ class agSandbox:
     the outer monitoring loop in ``agent._task()`` waits for them before
     resolving the skill future.
     """
-
-    BASE_IMAGE: ClassVar[str] = "agency-sandbox:latest"
 
     def _resolve_image(self, name: str) -> str:
         """Prefix bare image names with ``localhost/`` for Podman.
@@ -241,8 +340,8 @@ class agSandbox:
     def __init__(
         self,
         agname: str,
-        output_dir: Path | None = None,
         checkpoint_image: str | None = None,
+        agconfig: "agConfig | None" = None,
     ) -> None:
         self._agname   = agname
         self._runtime  = get_container_runtime()
@@ -262,18 +361,23 @@ class agSandbox:
         self._started   = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
-        self._output_dir: Path | None      = output_dir
+        self._agconfig: "agConfig | None"  = agconfig
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
         self._name = f"sandbox-{_RUN_ID}-{agname}"
 
-        # Store startup parameters for _ensure_started().
+        # Resolve image/mounts once, here, rather than lazily in
+        # _ensure_started() -- a running container is physically fixed once
+        # created, so this is a tier-2 (object-static) read: it locks these
+        # keys on *this* agconfig instance against further mutation.
         self._gpu_flags     = _gpu_flags()
+        self._base_image = self.base_image
         self._vol_flags: list[str] = []
-        if output_dir is not None:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            self._vol_flags = ["-v", f"{output_dir.resolve()}:/agent_output:rw"]
+        for host, container, mode in agSandboxConfig(agconfig).mounts.values():
+            host_path = Path(host)
+            host_path.mkdir(parents=True, exist_ok=True)
+            self._vol_flags += ["-v", f"{host_path.resolve()}:{container}:{mode}"]
 
     def __getstate__(self) -> dict:
         # threading.RLock isn't picklable — custom tools with run_in_subprocess=True
@@ -348,7 +452,7 @@ class agSandbox:
                 self._run_with_conflict_retry(run_cmd, name)
                 # Keep _checkpoint_image — not a one-shot restore, needed for future restarts.
             else:
-                image = self._resolve_image(self.BASE_IMAGE)
+                image = self._resolve_image(self._base_image)
                 cpu_flags = ["--cpus=1"] if self._cfs_supported() else []
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
@@ -486,7 +590,7 @@ class agSandbox:
         input: bytes | None = None,
         timeout: int = 120,
     ) -> subprocess.CompletedProcess[bytes]:
-        with _docker_semaphore:
+        with _get_docker_semaphore():
             try:
                 return subprocess.run(
                     args,
@@ -1046,14 +1150,19 @@ class agSandbox:
             except Exception as _e:
                 print(f"[agsandbox] WARNING: failed to remove offloaded file {path}: {_e}")
 
-    def fork(self, new_agname: str, output_dir: "Path | None" = None) -> "agSandbox":
+    def fork(self, new_agname: str, agconfig: "agConfig | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_agname* starting from this sandbox's
         current checkpoint image.  If no checkpoint exists the fork starts fresh.
+
+        When *agconfig* is not given, the fork inherits this sandbox's own
+        agconfig unchanged (rather than silently re-reading whatever
+        base_image happens to be at fork time).
 
         The caller owns the returned sandbox and is responsible for calling
         destroy() on it when done.
         """
-        fork_sb = agSandbox(new_agname, output_dir=output_dir)
+        cfg = agconfig if agconfig is not None else self._agconfig
+        fork_sb = agSandbox(new_agname, agconfig=cfg)
         if self._checkpoint_image:
             agSandbox.tag_image(self._checkpoint_image, fork_sb._lifecycle_tag())
             fork_sb._checkpoint_image = fork_sb._lifecycle_tag()
@@ -1072,7 +1181,7 @@ class agSandbox:
     def tag_image(source: str, dest: str) -> None:
         """Retag an image from *source* to *dest* (docker/podman tag)."""
         runtime = get_container_runtime()
-        with _docker_semaphore:
+        with _get_docker_semaphore():
             subprocess.run(
                 [runtime, "tag", source, dest],
                 capture_output=True, check=True,
@@ -1086,7 +1195,7 @@ class agSandbox:
         if force:
             cmd.append("-f")
         cmd.append(tag)
-        with _docker_semaphore:
+        with _get_docker_semaphore():
             subprocess.run(cmd, capture_output=True)
 
     @staticmethod
@@ -1098,7 +1207,7 @@ class agSandbox:
         Raises ``subprocess.CalledProcessError`` on failure.
         """
         runtime = get_container_runtime()
-        with _docker_semaphore:
+        with _get_docker_semaphore():
             result = subprocess.run(
                 [runtime, "save", tag],
                 capture_output=True, check=True, timeout=timeout,
@@ -1112,7 +1221,7 @@ class agSandbox:
         Raises ``subprocess.CalledProcessError`` on failure.
         """
         runtime = get_container_runtime()
-        with _docker_semaphore:
+        with _get_docker_semaphore():
             subprocess.run(
                 [runtime, "load"],
                 input=image_bytes, capture_output=True, check=True, timeout=timeout,

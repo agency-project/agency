@@ -6,9 +6,13 @@ from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
 from agency.agschema import agschema
 from agency.agskill import agskill
-from agency.agllm import LLM_MAX_RETRIES, LLM_IDLE_TIMEOUT, LLM_STREAM_TIMEOUT, agllm
-from agency.agtool import agtool
+from agency.agllm import _AgLLMFields, agllm
+from agency.agtool import agtool, _AgToolFields
 from agency.agent import agent as _agent_cls
+
+LLM_MAX_RETRIES    = _AgLLMFields.LLM_MAX_RETRIES
+LLM_IDLE_TIMEOUT   = _AgLLMFields.LLM_IDLE_TIMEOUT
+LLM_STREAM_TIMEOUT = _AgLLMFields.LLM_STREAM_TIMEOUT
 
 LLM_CONFIG = {"api_key": "test", "model": "gpt-4o"}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
@@ -22,6 +26,7 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
         agresource_pool = MagicMock()
         ping_interval_s = _ping
         poll_interval_s = _poll
+        agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
 
     ag = _MockAgent()
@@ -749,7 +754,11 @@ def test_return_tool_logs_validation_error_to_term():
 # Concurrency semaphore
 # ---------------------------------------------------------------------------
 
-from agency.agllm import _llm_call_semaphore as _sem, LLM_CALL_MAX_CONCURRENCY
+from agency.agllm import _get_llm_call_semaphore, _AgLLMFields
+
+LLM_CALL_MAX_CONCURRENCY = _AgLLMFields.LLM_CALL_MAX_CONCURRENCY
+
+_sem = _get_llm_call_semaphore()
 
 
 def test_semaphore_released_after_success():
@@ -999,11 +1008,11 @@ def test_short_tool_output_not_offloaded():
 
 
 def test_long_tool_output_offloaded_to_file():
-    from agency.agtool import TOOL_OUTPUT_OFFLOAD_CHARS
+    from agency.agtool import _AgToolFields
     written = {}
     sandbox = _make_sandbox(written)
 
-    _eff_thresh = max(TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
     big_output = "x" * (_eff_thresh + 1)
 
     def fn(arg: agdata) -> agdata:
@@ -1032,9 +1041,9 @@ def test_long_tool_output_offloaded_to_file():
 
 
 def test_long_tool_output_offloaded_to_sandbox():
-    from agency.agtool import TOOL_OUTPUT_OFFLOAD_CHARS
+    from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
     big_output = "y" * (_eff_thresh + 1)
 
     def fn(arg: agdata) -> agdata:
@@ -1059,10 +1068,10 @@ def test_long_tool_output_offloaded_to_sandbox():
 def test_long_output_injects_read_tool_into_openai_tools():
     """When a large output is offloaded, the read tool is added to the tool schema
     passed to the LLM on the next step so the model can actually call it."""
-    from agency.agtool import TOOL_OUTPUT_OFFLOAD_CHARS
+    from agency.agtool import _AgToolFields
     from agency.tools import make_read
 
-    _eff_thresh = max(TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1095,9 +1104,9 @@ def test_long_output_injects_read_tool_into_openai_tools():
 def test_long_output_read_tool_persists_for_skill_run():
     """Once the read tool is injected it stays in the tool list for subsequent
     LLM calls — it is not removed between iterations."""
-    from agency.agtool import TOOL_OUTPUT_OFFLOAD_CHARS
+    from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1134,10 +1143,10 @@ def test_long_output_read_tool_persists_for_skill_run():
 def test_long_output_no_duplicate_read_when_already_present():
     """If the skill already has the read tool (e.g. via make_sandboxed_tools),
     offloading must not add a second read entry to openai_tools."""
-    from agency.agtool import TOOL_OUTPUT_OFFLOAD_CHARS
+    from agency.agtool import _AgToolFields
     import agency.tools as _tools_mod
 
-    _eff_thresh = max(TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1286,6 +1295,35 @@ def test_tool_exception_triggers_stop_without_commit():
     assert "error" in json.loads(tool_msgs[0]["content"])
 
 
+def test_dispatch_tools_accepts_camel_case_llm_arguments():
+    """End-to-end: an LLM emitting camelCase tool-call JSON (e.g. `filePath`
+    instead of `file_path`) still reaches the tool fn correctly -- dispatch_tools
+    parses fn_args via agdata.from_json(), which normalizes top-level keys."""
+    received = {}
+
+    def fn(arg: agdata) -> agdata:
+        received["file_path"] = arg.file_path
+        received["old_string"] = arg.old_string
+        return agdata(result="ok")
+
+    t = agtool(
+        name="camel_tool", description="", fn=fn, run_in_subprocess=False,
+        params={"type": "object", "properties": {
+            "file_path": {"type": "string"}, "old_string": {"type": "string"},
+        }},
+    )
+    s = make_skill(replace_tools=[t])
+    responses = [
+        _tool_call("camel_tool", {"filePath": "/tmp/x.txt", "oldString": "a"}, "c8"),
+        _direct('{"done": 1}'),
+    ]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
+
+    assert received == {"file_path": "/tmp/x.txt", "old_string": "a"}
+
+
 def test_tool_timeout_uses_agent_provided_value():
     """When fn_args includes a 'timeout' int, agtool.__call__ receives it as keyword arg."""
     received_timeout = {}
@@ -1312,7 +1350,9 @@ def test_tool_timeout_uses_agent_provided_value():
 
 
 def test_tool_timeout_ignored_if_not_int():
-    """Non-integer 'timeout' in fn_args is silently ignored; agtool uses default."""
+    """Non-integer 'timeout' in fn_args is silently ignored; dispatch_tools resolves
+    the default itself (agconfig-aware) before calling the tool, rather than passing
+    None through for agtool.__call__ to default internally."""
     received_timeout = {}
 
     original_call = agtool.__call__
@@ -1332,7 +1372,7 @@ def test_tool_timeout_ignored_if_not_int():
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
-    assert received_timeout.get("timeout") is None
+    assert received_timeout.get("timeout") == _AgToolFields.TOOL_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------

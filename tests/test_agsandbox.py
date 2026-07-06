@@ -65,6 +65,16 @@ def _make_sandbox(**kwargs):
     return agSandbox(uid, **kwargs)
 
 
+def _agconfig_with_output_dir(output_dir):
+    """Build an agconfig mounting output_dir at /agent_output, replacing the
+    old output_dir= constructor kwarg."""
+    from agency.agconfig import agConfig
+    from agency.agsandbox import agSandboxConfig
+    cfg = agConfig()
+    agSandboxConfig(cfg).add_mount("agent_output", output_dir, "/agent_output")
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # detect_gpus
 # ---------------------------------------------------------------------------
@@ -529,10 +539,10 @@ class TestAgSandboxLifecycle:
         tools = {t.name: t for t in make_sandboxed_tools(sb)}
         try:
             # write runs in a process-pool worker
-            w = tools["write"](agdata(filePath="/workspace/cross.txt", content="cross-worker\n"))
+            w = tools["write"](agdata(file_path="/workspace/cross.txt", content="cross-worker\n"))
             assert not isinstance(w, agerror), f"write failed: {w}"
             # read also runs in a process-pool worker; must find the file
-            r = tools["read"](agdata(filePath="/workspace/cross.txt"))
+            r = tools["read"](agdata(file_path="/workspace/cross.txt"))
             assert not isinstance(r, agerror), f"read failed after cross-worker write: {r}"
             assert "cross-worker" in r.content
         finally:
@@ -557,7 +567,7 @@ class TestAgSandboxLifecycle:
     def test_output_dir_agent_can_write_and_read(self, tmp_path):
         agname = "test-agent"
         output_dir = tmp_path / "agent_output" / agname
-        sb = _make_sandbox(output_dir=output_dir)
+        sb = _make_sandbox(agconfig=_agconfig_with_output_dir(output_dir))
         out, rc = sb.exec("echo hello > /agent_output/result.txt")
         assert rc == 0
         assert (output_dir / "result.txt").read_text().strip() == "hello"
@@ -569,8 +579,8 @@ class TestAgSandboxLifecycle:
         # via the parent mount if needed, but here we test per-agent isolation.
         out_dir1 = tmp_path / "agent_output" / "brave-fox"
         out_dir2 = tmp_path / "agent_output" / "swift-hawk"
-        sb1 = _make_sandbox(output_dir=out_dir1)
-        sb2 = _make_sandbox(output_dir=out_dir2)
+        sb1 = _make_sandbox(agconfig=_agconfig_with_output_dir(out_dir1))
+        sb2 = _make_sandbox(agconfig=_agconfig_with_output_dir(out_dir2))
         sb1.exec("echo from_agent1 > /agent_output/out.txt")
         out, rc = sb1.exec("cat /agent_output/out.txt")
         assert rc == 0
@@ -808,7 +818,7 @@ class TestAgSandboxLifecycle:
         try:
             # Manually create a container in 'Created' state (no --detach run, just create).
             subprocess.run(
-                ["docker", "create", "--name", name, sb.BASE_IMAGE, "tail", "-f", "/dev/null"],
+                ["docker", "create", "--name", name, sb.base_image, "tail", "-f", "/dev/null"],
                 capture_output=True, check=True,
             )
             status = subprocess.run(
@@ -1230,29 +1240,29 @@ class TestSandboxedTools:
         assert result.output.strip() != ""
 
     def test_write_then_read_tool(self):
-        self.tools["write"].fn(agdata(filePath="/workspace/t.txt", content="abc\n"))
-        r = self.tools["read"].fn(agdata(filePath="/workspace/t.txt"))
+        self.tools["write"].fn(agdata(file_path="/workspace/t.txt", content="abc\n"))
+        r = self.tools["read"].fn(agdata(file_path="/workspace/t.txt"))
         assert "abc" in r.content
 
     def test_glob_tool_finds_files(self):
-        self.tools["write"].fn(agdata(filePath="/workspace/a.py", content="x\n"))
-        self.tools["write"].fn(agdata(filePath="/workspace/b.py", content="y\n"))
+        self.tools["write"].fn(agdata(file_path="/workspace/a.py", content="x\n"))
+        self.tools["write"].fn(agdata(file_path="/workspace/b.py", content="y\n"))
         r = self.tools["glob"].fn(agdata(pattern="*.py", path="/workspace"))
         assert len(r.files) >= 2
 
     def test_grep_tool_finds_pattern(self):
-        self.tools["write"].fn(agdata(filePath="/workspace/src.py", content="SECRET=42\n"))
+        self.tools["write"].fn(agdata(file_path="/workspace/src.py", content="SECRET=42\n"))
         r = self.tools["grep"].fn(agdata(pattern="SECRET", path="/workspace"))
         assert any("SECRET" in m["text"] for m in r.matches)
 
     def test_edit_tool_replaces_content(self):
-        self.tools["write"].fn(agdata(filePath="/workspace/edit_me.txt", content="foo bar\n"))
+        self.tools["write"].fn(agdata(file_path="/workspace/edit_me.txt", content="foo bar\n"))
         self.tools["edit"].fn(agdata(
-            filePath="/workspace/edit_me.txt",
-            oldString="foo",
-            newString="baz",
+            file_path="/workspace/edit_me.txt",
+            old_string="foo",
+            new_string="baz",
         ))
-        r = self.tools["read"].fn(agdata(filePath="/workspace/edit_me.txt"))
+        r = self.tools["read"].fn(agdata(file_path="/workspace/edit_me.txt"))
         assert "baz" in r.content
         assert "foo" not in r.content
 

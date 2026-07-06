@@ -62,8 +62,16 @@ r2 = ag.run(summarize_skill, agdata(text=r1))    # r1 resolved here inside _task
 
 ```python
 if ag.sandbox is None:
-    _out = Path(type(ag).output_dir) / ag.agname if type(ag).output_dir else None
-    ag.sandbox = agSandbox(ag.agname, output_dir=_out)
+    _out_dir = (
+        ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
+        if ag.agconfig is not None else type(ag).output_dir
+    )
+    _out = Path(_out_dir) / ag.agname if _out_dir else None
+    sb_cfg = ag.agconfig
+    if _out is not None:
+        sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
+        agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+    ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
 
 # Hold the sandbox's lock for the rest of the skill run so a sandbox
 # shared across agents is never driven by more than one skill run

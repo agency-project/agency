@@ -9,18 +9,30 @@ from .agdata import agdata, agerror
 from .agtype import agtype
 from .agschema import agschema
 from .agcontext import agcontext
-from .agtool import agtool, dispatch_tools, TOOL_OUTPUT_OFFLOAD_CHARS
+from .agtool import agtool, dispatch_tools, _AgToolFields
 from .agllm import agllm
-from .agsandbox import agSandbox
+from .agsandbox import agSandbox, agSandboxConfig
+from .agconfig import agConfig, DynamicConfigParam
 from .agutil import format_exception
 from .aglog import _ts
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# Exists only to register agskill's config fields (via __set_name__ at import
+# time). Constants are plain class attributes (not descriptors) so other code
+# in this file needing the same hardcoded value can reference it directly.
+# Reads use a throwaway instance -- _AgSkillFields(agconfig) -- since
+# agskill instances don't hold their own agconfig (a skill runs on behalf of
+# different agents with different agconfigs), so there's no self to hang a
+# descriptor on.
+class _AgSkillFields:
+    AGSKILL_REACT_MAX_STEPS = 4096
+    AGBINARY_VALIDATE_EXEC_TIMEOUT = 5  # Seconds per container exec call when validating agbinary output.
 
-AGSKILL_REACT_MAX_STEPS        = 4096
-AGBINARY_VALIDATE_EXEC_TIMEOUT = 5  # Seconds per container exec call when validating agbinary output.
+    react_max_steps = DynamicConfigParam("agskill", default=AGSKILL_REACT_MAX_STEPS)
+    agbinary_validate_exec_timeout = DynamicConfigParam("agskill", default=AGBINARY_VALIDATE_EXEC_TIMEOUT)
+
+    def __init__(self, agconfig=None) -> None:
+        self._agconfig = agconfig
+
 
 if TYPE_CHECKING:
     from .agent import agent
@@ -180,6 +192,7 @@ class agskill:
         agent_terminal: "agterm | None",
         agent_log: "aglog | None",
         _ensure_read: bool = False,
+        agconfig: "agConfig | None" = None,
     ) -> "tuple[dict[str, agtool], dict, set[str]]":
         """Build toolkit and structured-output collection state.
 
@@ -188,6 +201,7 @@ class agskill:
         return_<field> tools write into as they are called during the ReAct loop.
         required_fields is empty when the skill has no structured output schema.
         """
+        _agbinary_validate_exec_timeout = _AgSkillFields(agconfig).agbinary_validate_exec_timeout
         if self.replace_tools is not None:
             active_tools: list[agtool] = list(self.replace_tools)
         else:
@@ -206,7 +220,7 @@ class agskill:
         if self.output_schema is not None and self.output_schema.raw_key() is None:
             required_fields = set(self.output_schema._data.keys())
             active_tools.extend(self.output_schema.make_return_output_agtool(
-                agent_sandbox, collected_outputs, required_fields, AGBINARY_VALIDATE_EXEC_TIMEOUT
+                agent_sandbox, collected_outputs, required_fields, _agbinary_validate_exec_timeout
             ))
 
         for t in active_tools:
@@ -255,7 +269,7 @@ class agskill:
         self,
         ag: "agent",
         skill_input: agdata,
-        max_steps: int = AGSKILL_REACT_MAX_STEPS,
+        max_steps: "int | None" = None,
     ) -> agdata:
         """Submit a skill run on *ag* and return a pending agdata immediately.
 
@@ -288,8 +302,16 @@ class agskill:
                 # ── 2. Provision sandbox — created once on first run and reused
                 #    across subsequent runs via its internal checkpoint image.
                 if ag.sandbox is None:
-                    _out = Path(type(ag).output_dir) / ag.agname if type(ag).output_dir else None
-                    ag.sandbox = agSandbox(ag.agname, output_dir=_out)
+                    _out_dir = (
+                        ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
+                        if ag.agconfig is not None else type(ag).output_dir
+                    )
+                    _out = Path(_out_dir) / ag.agname if _out_dir else None
+                    sb_cfg = ag.agconfig
+                    if _out is not None:
+                        sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
+                        agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+                    ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
 
                 # Hold the sandbox's lock for the rest of the skill run so a
                 # sandbox shared across agents is never driven by more than
@@ -389,7 +411,7 @@ class agskill:
         self,
         ag: "agent",
         skill_input: agdata,
-        max_steps: int = AGSKILL_REACT_MAX_STEPS,
+        max_steps: "int | None" = None,
     ) -> agdata:
         """Async wrapper around run() for use in asyncio event loops."""
         import asyncio
@@ -407,9 +429,11 @@ class agskill:
         ag: "agent",
         prev_ctx: agcontext,
         skill_input: agdata,
-        max_steps: int = AGSKILL_REACT_MAX_STEPS,
+        max_steps: "int | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         """Run the ReAct loop synchronously against *ag*, return (result, ctx, delta)."""
+        if max_steps is None:
+            max_steps = _AgSkillFields(ag.agconfig).react_max_steps
 
         # ── 1. Validate input against the skill's input schema.
         input_error = self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
@@ -423,6 +447,7 @@ class agskill:
             self.input_schema.prepare_inputs_in_sandbox(
                 skill_input, ag.sandbox, self.name,
                 suffix=_input_suffix, context_limit=ag.llm.context_limit,
+                agconfig=ag.agconfig,
             )
             if self.input_schema is not None
             else ([], [])
@@ -443,7 +468,7 @@ class agskill:
         # ── 3. Build toolkit with return_<field> tools for structured output.
         toolkit, _collected_outputs, _required_fields = self._build_toolkit(
             ag.sandbox, type(ag).agresource_pool, ag.terminal, ag.log,
-            _ensure_read=bool(_offloaded_paths),
+            _ensure_read=bool(_offloaded_paths), agconfig=ag.agconfig,
         )
         _use_return_output = bool(_required_fields)
 
@@ -536,13 +561,15 @@ class agskill:
 
             # 6f. Dispatch tool calls, or check if we can move to the output path.
             if msg_dict.get("tool_calls"):
+                _base_offload_chars = _AgToolFields(ag.agconfig).output_offload_chars
                 dispatch_tools(
                     msg_dict["tool_calls"], toolkit, messages, ag.sandbox, self.name,
                     ag._set_ui_state, ag._push_live_messages, ag._append_full_history, ag.terminal,
                     tool_offload_chars=(
-                        max(TOOL_OUTPUT_OFFLOAD_CHARS, int(ag.llm.context_limit * 0.1 * 4))
-                        if ag.llm.context_limit else TOOL_OUTPUT_OFFLOAD_CHARS
+                        max(_base_offload_chars, int(ag.llm.context_limit * 0.1 * 4))
+                        if ag.llm.context_limit else _base_offload_chars
                     ),
+                    agconfig=ag.agconfig,
                 )
                 # Continue looping unless all required output fields are collected.
                 if not (_use_return_output and not (_required_fields - set(_collected_outputs))):

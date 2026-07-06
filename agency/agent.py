@@ -30,11 +30,25 @@ from .agdata import agdata
 from .agcontext import agcontext
 from .aglog import aglog, _ts
 from .agterm import agterm
-from .agsandbox import agSandbox
+from .agsandbox import agSandbox, agSandboxConfig
 from .agresources import agResourcePool
 from .agllm import agllm
+from .agconfig import agConfig
 
 from .agname import agname as _agname
+
+
+def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_default):
+    """Resolve one of agent's own knobs (log_dir, output_dir, ...): the plain
+    ClassVar default, optionally overridden by agconfig.
+
+    Deliberately NOT a ConfigParam descriptor: agent's docstring documents
+    ``agent.log_dir = Path(...)`` as a supported class-level override, and
+    assigning to a class attribute that holds a descriptor replaces the
+    descriptor itself (silently breaking it for every future instance) --
+    so these fields stay plain ClassVars, resolved via this helper instead.
+    """
+    return classvar_default if agconfig is None else agconfig.get("agent", name, classvar_default)
 
 
 class agent:
@@ -68,6 +82,12 @@ class agent:
     poll_interval_s:  ClassVar[int]                  = 5
     max_outer_iters:  ClassVar[int]                  = 144
 
+    # Tier-1-style fallback: agent(agconfig=...) not given -> use this if set.
+    # Same "set once before creating agents" convention as the ClassVars
+    # above, so scripts that construct agents directly (agent(agname=...),
+    # with no agconfig= kwarg) still pick up a run-wide agConfig.
+    default_agconfig: "ClassVar[agConfig | None]"    = None
+
     # Global token counter — accumulates across all agents and skill calls.
     _global_input_tokens:  ClassVar[int]             = 0
     _global_output_tokens: ClassVar[int]             = 0
@@ -94,8 +114,13 @@ class agent:
         *,
         llm: "agllm | None" = None,
         sandbox: "agSandbox | None" = None,
+        agconfig: "agConfig | None" = None,
     ):
+        self.agconfig: "agConfig | None" = agconfig if agconfig is not None else agent.default_agconfig
+
         if llm is None:
+            if llm_config is None and self.agconfig is not None:
+                llm_config = self.agconfig.get("agllm", "llm_config", None)
             if llm_config is None:
                 from ._context import _active_team as _at
                 _t = _at.get(None)
@@ -107,15 +132,16 @@ class agent:
 
         self.agname: _agname = _agname.allocate_agname(agname)
 
-        self.llm: agllm                = llm if llm is not None else agllm(llm_config)
+        self.llm: agllm                = llm if llm is not None else agllm(llm_config, agconfig=self.agconfig)
         self.ctx: agcontext            = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
 
-        log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
+        _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
+        log_dir  = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{self.agname}_timeline.jsonl"
-        self.log  = aglog(path=log_path)
+        self.log  = aglog(path=log_path, agconfig=self.agconfig)
         self._full_history: list[dict] = []
         self._full_history_path: Path = log_dir / f"{self.agname}_history.jsonl"
         self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,13 +177,15 @@ class agent:
 
     @property
     def output_path(self) -> Path | None:
-        if agent.output_dir is None:
+        out_dir = _classvar_or_agconfig(self.agconfig, "output_dir", agent.output_dir)
+        if out_dir is None:
             return None
-        return Path(agent.output_dir) / self.agname
+        return Path(out_dir) / self.agname
 
     @property
     def container_output_path(self) -> str | None:
-        if agent.output_dir is None:
+        out_dir = _classvar_or_agconfig(self.agconfig, "output_dir", agent.output_dir)
+        if out_dir is None:
             return None
         return f"/agent_output/{self.agname}"
 
@@ -185,7 +213,7 @@ class agent:
 
     def set_llm_config(self, llm_config: dict) -> None:
         """Replace the agent's LLM config and refresh the context limit."""
-        self.llm = agllm(dict(llm_config))
+        self.llm = agllm(dict(llm_config), agconfig=self.agconfig)
 
     def set_full_history(self, history: list[dict]) -> None:
         self._full_history = copy.deepcopy(history)
@@ -325,14 +353,21 @@ class agent:
         """Return an independent agent forked from *src*."""
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname)
-        ag.llm = agllm(src.llm.config)
+        ag.agconfig = src.agconfig
+        ag.llm = agllm(src.llm.config, agconfig=ag.agconfig)
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
-        _out = Path(cls.output_dir) / ag.agname if cls.output_dir else None
-        ag.sandbox = src.sandbox.fork(ag.agname, output_dir=_out) if src.sandbox is not None else None
-        log_dir  = Path(cls.log_dir) if cls.log_dir is not None else _DEFAULT_LOG_DIR
+        _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
+        _out = Path(_out_dir) / ag.agname if _out_dir else None
+        sb_cfg = ag.agconfig
+        if _out is not None:
+            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
+            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+        ag.sandbox = src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
+        _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", cls.log_dir)
+        log_dir  = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{ag.agname}_timeline.jsonl"
-        ag.log   = aglog(path=log_path)
+        ag.log   = aglog(path=log_path, agconfig=ag.agconfig)
         ag._full_history = []
         ag._full_history_path = log_dir / f"{ag.agname}_history.jsonl"
         ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -451,6 +486,7 @@ class agent:
         cls,
         path: "Path | str",
         llm_config: dict,
+        agconfig: "agConfig | None" = None,
     ) -> "agent":
         """Restore an agent from a checkpoint file created by agent.save()."""
         path = Path(path)
@@ -471,13 +507,20 @@ class agent:
 
         ag: agent = cls.__new__(cls)
         ag.agname        = _agname.claim_unique_agname(state["agname"])
-        ag.llm           = agllm({**state.get("llm_config", {}), **llm_config})
+        ag.agconfig      = agconfig if agconfig is not None else agent.default_agconfig
+        ag.llm           = agllm({**state.get("llm_config", {}), **llm_config}, agconfig=ag.agconfig)
         ag.ctx           = agcontext(messages=list(state.get("history", [])))
-        _out = Path(cls.output_dir) / ag.agname if cls.output_dir else None
-        ag.sandbox       = agSandbox(ag.agname, output_dir=_out, checkpoint_image=checkpoint) if checkpoint else None
+        _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
+        _out = Path(_out_dir) / ag.agname if _out_dir else None
+        sb_cfg = ag.agconfig
+        if _out is not None:
+            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
+            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+        ag.sandbox       = agSandbox(ag.agname, checkpoint_image=checkpoint, agconfig=sb_cfg) if checkpoint else None
 
-        log_dir  = Path(agent.log_dir) if agent.log_dir is not None else _DEFAULT_LOG_DIR
-        ag.log   = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl")
+        _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", agent.log_dir)
+        log_dir  = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
+        ag.log   = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl", agconfig=ag.agconfig)
         ag._full_history: list[dict] = []
         ag._full_history_path: Path = log_dir / f"{ag.agname}_history.jsonl"
         ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)

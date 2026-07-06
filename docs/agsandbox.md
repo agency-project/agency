@@ -27,7 +27,7 @@ The container exists only during active tool execution. Between tool calls the c
 | Event | What happens |
 |---|---|
 | `agSandbox.__init__` | No container created — cheap object; `_lifecycle_image=None` |
-| Any `run_in_subprocess=True` tool call | `_ensure_started()` runs lazily: if container is already running, reuse it; otherwise `docker rm -f` any leftover zombie, then `docker run` from `_lifecycle_image` (or `BASE_IMAGE` on first use) |
+| Any `run_in_subprocess=True` tool call | `_ensure_started()` runs lazily: if container is already running, reuse it; otherwise `docker rm -f` any leftover zombie, then `docker run` from `_lifecycle_image` (or `base_image` on first use) |
 | After **successful** sandbox tool call | `sandbox.stop(commit=True)`: `docker commit → agency/lifecycle-<name>`; `docker rm -f` (retried up to 3×); `_lifecycle_image` updated |
 | After **failed** sandbox tool call | `sandbox.stop(commit=False)`: `docker rm -f` without commit; dirty state discarded; next start restores from previous `_lifecycle_image` |
 | Any non-running container detected at startup | Force-removed with `docker rm -f` before `docker run` — covers "Exited", "Created" (partial docker run), and "Dead" states |
@@ -143,7 +143,7 @@ The `__BGPIDS__` annotation is stripped before output is returned to the LLM. PI
 
 ```python
 sb = agSandbox(agname)
-sb = agSandbox(agname, output_dir=Path("runs/agent_output"))
+sb = agSandbox(agname, agconfig=agSandboxConfig(agConfig()).add_mount("out", Path("runs/agent_output"), "/agent_output").agconfig)
 sb = agSandbox(agname, lifecycle_image="agency/lifecycle-myagent")
 
 # Construction is cheap — no Docker calls until _ensure_started() runs.
@@ -166,11 +166,31 @@ sb.release_resources(pool)
 sb.destroy()            # rm container + rmi lifecycle image + rmi any pretool images
 ```
 
-## Custom base image
+## Custom base image and mounts
 
-Override before creating any agents:
+Preferred: pass an `agConfig` — image/mounts are resolved once per sandbox at
+construction (not a shared mutable global, so no race between differently-
+configured sandboxes created concurrently):
 
 ```python
-from agency.agsandbox import agSandbox
-agSandbox.BASE_IMAGE = "my-registry/custom-image:latest"
+from agency.agconfig import agConfig
+from agency.agsandbox import agSandboxConfig
+
+cfg = agConfig()
+agSandboxConfig(cfg).set_base_image("my-registry/custom-image:latest")
+agSandboxConfig(cfg).add_mount("hf_cache", "/host/path/to/cache", "/root/.cache/huggingface")
+agent.default_agconfig = cfg   # picked up by every agent()/agSandbox() created after this
 ```
+
+`base_image` is declared as a real field on `agSandbox` (`agSandbox.base_image`),
+so the same override can also be spelled as nested attribute access on the
+`agConfig` before any sandbox is constructed — equivalent to the
+`set_base_image` call above:
+
+```python
+cfg.agSandbox.base_image = "my-registry/custom-image:latest"
+```
+
+Don't assign `agSandbox.base_image = ...` directly on the class — that
+replaces the field descriptor itself rather than setting a value, breaking
+the field for every sandbox in the process.

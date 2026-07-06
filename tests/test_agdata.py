@@ -37,6 +37,29 @@ def test_from_json():
     assert d.value == 42
 
 
+def test_from_json_normalizes_camel_case_keys():
+    """Some LLMs emit tool-call arguments in camelCase even when the tool
+    schema declares snake_case params -- from_json() tolerates this."""
+    d = agdata.from_json('{"filePath": "/tmp/x.txt", "oldString": "a", "newString": "b", "replaceAll": true}')
+    assert d.file_path == "/tmp/x.txt"
+    assert d.old_string == "a"
+    assert d.new_string == "b"
+    assert d.replace_all is True
+
+
+def test_from_json_snake_case_keys_are_unaffected():
+    d = agdata.from_json('{"file_path": "/tmp/y.txt", "command": "ls"}')
+    assert d.file_path == "/tmp/y.txt"
+    assert d.command == "ls"
+
+
+def test_from_json_does_not_normalize_nested_keys():
+    """Normalization is shallow (top-level only) -- nested dict/list values
+    are argument *data*, not argument *names*, and must pass through as-is."""
+    d = agdata.from_json('{"todos": [{"someKey": "value"}]}')
+    assert d.todos == [{"someKey": "value"}]
+
+
 def test_roundtrip_json():
     original = agdata(items=[1, 2, 3], nested={"a": "b"})
     restored = agdata.from_json(original.to_json())

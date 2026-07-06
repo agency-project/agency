@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from .agsandbox import agSandbox
+    from .agconfig import agConfig
 
-from .agdata import agdata, agerror
+from .agdata import agdata, agerror, INPUT_OFFLOAD_CHARS
 from .agtype import (
     agtype,
     agrawstring,
@@ -22,6 +23,20 @@ from .agtype import (
     output_field_desc,
 )
 from .agutil import _looks_like_path
+from .agconfig import DynamicConfigParam
+
+
+# Exists only to register agschema's config fields (via __set_name__ at
+# import time). Reads use a throwaway instance -- _AgSchemaFields(agconfig)
+# -- since agschema instances don't hold their own agconfig, so there's no
+# self to hang a descriptor on. INPUT_OFFLOAD_CHARS itself lives in agdata.py
+# (a genuinely shared, cross-file constant with its own external consumers),
+# not here -- only imported for this field's default.
+class _AgSchemaFields:
+    input_offload_chars = DynamicConfigParam("agschema", default=INPUT_OFFLOAD_CHARS)
+
+    def __init__(self, agconfig=None) -> None:
+        self._agconfig = agconfig
 
 
 def _type_error_fix(field_name: str, type_hint, value) -> str:
@@ -136,6 +151,7 @@ class agschema:
         skill_name: str,
         suffix: str = "",
         context_limit: "int | None" = None,
+        agconfig: "agConfig | None" = None,
     ) -> "tuple[list[str], list[str]]":
         """Prepare all input fields that require sandbox access, in one pass.
 
@@ -152,11 +168,11 @@ class agschema:
         the names of fields that were size-offloaded (used for the system prompt
         warning telling the LLM to read those files).
         """
-        from .agdata import INPUT_OFFLOAD_CHARS
+        _input_offload_chars = _AgSchemaFields(agconfig).input_offload_chars
         _threshold = (
-            min(INPUT_OFFLOAD_CHARS, int(context_limit * 0.1 * 4))
+            min(_input_offload_chars, int(context_limit * 0.1 * 4))
             if context_limit
-            else INPUT_OFFLOAD_CHARS
+            else _input_offload_chars
         )
         all_paths: list[str] = []
         auto_offloaded_fields: list[str] = []

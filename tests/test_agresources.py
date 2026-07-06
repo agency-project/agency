@@ -11,7 +11,7 @@ from agency.agresources import (
     detect_gpus,
     detect_memory_mb,
     _cvd_filter,
-    MEMORY_DETECT_FALLBACK_MB,
+    _AgResourcePoolFields,
 )
 
 
@@ -121,7 +121,7 @@ def test_detect_memory_mb_fallback_when_proc_missing(monkeypatch, tmp_path):
     fake.write_text("Garbage: 0\n")
     with patch("builtins.open", side_effect=FileNotFoundError):
         with patch("agency.agresources.subprocess.run", side_effect=FileNotFoundError):
-            assert detect_memory_mb() == MEMORY_DETECT_FALLBACK_MB
+            assert detect_memory_mb() == _AgResourcePoolFields.MEMORY_DETECT_FALLBACK_MB
 
 
 # ---------------------------------------------------------------------------

@@ -237,7 +237,7 @@ _STRATEGIES = [
 
 def _replace(content: str, old: str, new: str, replace_all: bool = False) -> str:
     if old == new:
-        raise ValueError("oldString and newString are identical — no change to apply.")
+        raise ValueError("old_string and new_string are identical — no change to apply.")
 
     not_found = True
     for strategy in _STRATEGIES:
@@ -255,11 +255,11 @@ def _replace(content: str, old: str, new: str, replace_all: bool = False) -> str
 
     if not_found:
         raise ValueError(
-            "Could not find oldString in the file. "
+            "Could not find old_string in the file. "
             "It must match exactly (including whitespace and indentation)."
         )
     raise ValueError(
-        "Found multiple matches for oldString. "
+        "Found multiple matches for old_string. "
         "Provide more surrounding context to make the match unique."
     )
 
@@ -267,12 +267,12 @@ def _replace(content: str, old: str, new: str, replace_all: bool = False) -> str
 _EDIT_PARAMS = {
     "type": "object",
     "properties": {
-        "filePath": {"type": "string", "description": "Absolute path to the file to edit"},
-        "oldString": {"type": "string", "description": "The text to replace"},
-        "newString": {"type": "string", "description": "The replacement text"},
-        "replaceAll": {"type": "boolean", "description": "Replace all occurrences (default false)"},
+        "file_path": {"type": "string", "description": "Absolute path to the file to edit"},
+        "old_string": {"type": "string", "description": "The text to replace"},
+        "new_string": {"type": "string", "description": "The replacement text"},
+        "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)"},
     },
-    "required": ["filePath", "oldString", "newString"],
+    "required": ["file_path", "old_string", "new_string"],
 }
 
 def make_edit(sandbox: "agSandbox") -> agtool:
@@ -282,10 +282,10 @@ def make_edit(sandbox: "agSandbox") -> agtool:
     fuzzy-match pipeline in Python, then writes back via ``sandbox.write_file``.
     """
     def _run_sandboxed(arg: agdata) -> agdata:
-        file_path = str(arg.filePath)  # type: ignore[arg-type]
-        old_string: str = str(arg.oldString)  # type: ignore[arg-type]
-        new_string: str = str(arg.newString)  # type: ignore[arg-type]
-        replace_all: bool = bool(getattr(arg, "replaceAll", False))
+        file_path = str(arg.file_path)  # type: ignore[arg-type]
+        old_string: str = str(arg.old_string)  # type: ignore[arg-type]
+        new_string: str = str(arg.new_string)  # type: ignore[arg-type]
+        replace_all: bool = bool(getattr(arg, "replace_all", False))
 
         try:
             content = sandbox.read_file(file_path)
@@ -304,7 +304,7 @@ def make_edit(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        path = str(getattr(arg, "filePath", "?"))
+        path = str(getattr(arg, "file_path", "?"))
         ok   = not isinstance(result, agerror)
         status = "✓" if ok else f"✗ {result.error}"
         tool._term.log("TOOL ✓   ", f"edit  {path}  {status}  ({elapsed_ms}ms)")

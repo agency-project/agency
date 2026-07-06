@@ -15,6 +15,7 @@ _IDLE_CHECK_INTERVAL_S: float = 1.0  # how often to check idle timeout
 
 _THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 _PATH_RE     = re.compile(r"^(/[\w.\-]+)+$")
+_CAMEL_CASE_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 # Lowercase alphanumeric alphabet for agent ID suffixes.
 # 4 digits → 36⁴ = 1 679 616 unique values per noun.
@@ -144,6 +145,16 @@ def _extract_thinking(content: str) -> str:
 def _looks_like_path(s: str) -> bool:
     """Return True if s looks like a sandbox path (file or directory)."""
     return bool(_PATH_RE.match(s.strip())) if isinstance(s, str) else False
+
+
+def _camel_to_snake(key: str) -> str:
+    """Normalize one dict key from camelCase/PascalCase to snake_case.
+
+    Idempotent on keys that are already snake_case or single-word (no
+    uppercase letters to act on). Used to tolerate LLMs that emit tool-call
+    arguments in camelCase even though our tool schemas declare snake_case.
+    """
+    return _CAMEL_CASE_RE.sub("_", key).lower()
 
 
 # ---------------------------------------------------------------------------

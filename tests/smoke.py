@@ -66,8 +66,8 @@ def smoke_write_read_cycle():
     ag = agent(llm_config=LLM_CONFIG)
 
     responses = [
-        _tool_call("write", {"filePath": "/workspace/greeting.txt", "content": "Hello, World!"}),
-        _tool_call("read", {"filePath": "/workspace/greeting.txt"}),
+        _tool_call("write", {"file_path": "/workspace/greeting.txt", "content": "Hello, World!"}),
+        _tool_call("read", {"file_path": "/workspace/greeting.txt"}),
         _direct('{"result": "File written and read successfully"}'),
     ]
 

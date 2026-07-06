@@ -4,5 +4,3 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 runs/
-projects/output/
-projects/agent*
