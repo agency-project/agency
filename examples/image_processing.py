@@ -23,13 +23,12 @@ from pathlib import Path
 
 from agency import agent, agdata, agimage, agskill, agteam, agsync
 
+# See ../README.md for Anthropic or Bedrock llm_config examples.
 LLM_CONFIG = {
-    "api_key":              os.environ.get("LLM_API_KEY", ""),
+    "api_key":  os.environ.get("LLM_API_KEY", ""),
+    "base_url": os.environ.get("LLM_BASE_URL"),
+    "model":    os.environ.get("LLM_MODEL", "gpt-4o"),
 }
-if os.environ.get("LLM_BASE_URL"):
-    LLM_CONFIG["base_url"] = os.environ["LLM_BASE_URL"]
-if os.environ.get("LLM_MODEL"):
-    LLM_CONFIG["model"] = os.environ["LLM_MODEL"]
 
 # ---------------------------------------------------------------------------
 # Skills
