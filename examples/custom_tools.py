@@ -31,10 +31,11 @@ from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
 from agency.agutil import format_exception as _fmt_exc
 
 
+# See ../README.md for Anthropic or Bedrock llm_config examples.
 LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
+    "api_key":  os.environ.get("LLM_API_KEY", ""),
+    "base_url": os.environ.get("LLM_BASE_URL"),
+    "model":    os.environ.get("LLM_MODEL", ""),
 }
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 _MAX_CHARS = 32_000
@@ -298,7 +299,6 @@ if __name__ == "__main__":
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     def _script() -> None:
-        print(f"Endpoint : {LLM_CONFIG['base_url']}")
         print(f"Run dir  : {run_dir}\n")
         try:
             topics = [topic] if topic != "KV cache quantization" else [

@@ -21,7 +21,7 @@ Output files written to runs/<timestamp>_human_in_the_loop/:
 
 Usage:
     uv run python examples/human_in_the_loop.py
-    VLLM_BASE_URL="" uv run python examples/human_in_the_loop.py
+    LLM_MODEL=gpt-4o uv run python examples/human_in_the_loop.py
 """
 from __future__ import annotations
 
@@ -34,10 +34,11 @@ from agency import agent, agskill, agdata, agfile
 from agency.agwebui import agwebui
 from agency.tools.human import make_ask_human
 
+# See ../README.md for Anthropic or Bedrock llm_config examples.
 LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
+    "api_key":  os.environ.get("LLM_API_KEY", ""),
+    "base_url": os.environ.get("LLM_BASE_URL"),
+    "model":    os.environ.get("LLM_MODEL", ""),
 }
 
 # ---------------------------------------------------------------------------

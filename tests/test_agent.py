@@ -54,7 +54,7 @@ def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
 
 
 def make_agent() -> agent:
-    return agent(llm_config={"api_key": "k", "model": "gpt-4o"})
+    return agent(llm_config={"api_key": "k", "model": ""})
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +482,7 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
     sb = _GCSandbox(lambda: destroyed.append(True))
     ref = weakref.ref(sb)
 
-    ag = agent(llm_config={"api_key": "k", "model": "gpt-4o"}, sandbox=sb)
+    ag = agent(llm_config={"api_key": "k", "model": ""}, sandbox=sb)
     del ag
     gc.collect()
 

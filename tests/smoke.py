@@ -6,7 +6,7 @@ from agency.agskill import agskill
 from agency.agent import agent
 from agency.agtool import agtool
 
-LLM_CONFIG = {"api_key": "dummy", "model": "gpt-4o"}
+LLM_CONFIG = {"api_key": "dummy", "model": ""}
 
 
 # ---------------------------------------------------------------------------

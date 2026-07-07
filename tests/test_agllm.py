@@ -33,7 +33,7 @@ def llm_call(kwargs, cfg, messages, *args, **kwargs2):
     """Test shim: create a temporary agllm instance and call .call()."""
     return agllm(cfg).call(kwargs, messages, *args, **kwargs2)
 
-LLM_COMPACT_CONFIG = {"api_key": "test", "model": "gpt-4o", "base_url": "http://localhost/v1"}
+LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
 BIG_CTX = 100_000
 LLM_COMPACT = agllm(LLM_COMPACT_CONFIG, context_limit=BIG_CTX)
 
@@ -130,13 +130,13 @@ def _run_call(chunks, llm_config=None):
 # ---------------------------------------------------------------------------
 
 def test_build_llm_kwargs_includes_model():
-    cfg = {"model": "gpt-4o", "api_key": "x"}
+    cfg = {"model": "", "api_key": "x"}
     kw  = build_llm_kwargs(cfg, [], None)
-    assert kw["model"] == "gpt-4o"
+    assert kw["model"] == ""
 
 def test_build_llm_kwargs_default_model():
     kw = build_llm_kwargs({}, [], None)
-    assert kw["model"] == "gpt-4o"
+    assert kw["model"] == ""
 
 def test_build_llm_kwargs_messages_included():
     msgs = [{"role": "user", "content": "hi"}]
@@ -159,10 +159,22 @@ def test_build_llm_kwargs_tools_included():
     assert kw["tools"] == tools
 
 def test_build_llm_kwargs_openai_gen_params_forwarded():
-    cfg = {"model": "m", "temperature": 0.7, "max_tokens": 512}
+    cfg = {"model": "m", "temperature": 0.7, "max_completion_tokens": 512}
     kw  = build_llm_kwargs(cfg, [], None)
     assert kw["temperature"] == 0.7
-    assert kw["max_tokens"]  == 512
+    assert kw["max_completion_tokens"] == 512
+
+def test_build_llm_kwargs_max_tokens_translated_with_warning(capsys):
+    kw = build_llm_kwargs({"model": "m", "max_tokens": 256}, [], None)
+    assert kw["max_completion_tokens"] == 256
+    assert "max_tokens" not in kw
+    assert "deprecated" in capsys.readouterr().out
+
+def test_build_llm_kwargs_max_completion_tokens_wins_when_both_present(capsys):
+    cfg = {"model": "m", "max_tokens": 256, "max_completion_tokens": 512}
+    kw  = build_llm_kwargs(cfg, [], None)
+    assert kw["max_completion_tokens"] == 512
+    assert "deprecated" in capsys.readouterr().out
 
 def test_build_llm_kwargs_unknown_params_not_forwarded():
     cfg = {"model": "m", "custom_param": "ignored"}
@@ -318,7 +330,7 @@ def test_agllm_no_context_limit_calls_fetch():
     assert llm.context_limit == 32_000
 
 def test_agllm_config_stored():
-    cfg = {"model": "gpt-4o", "temperature": 0.5}
+    cfg = {"model": "", "temperature": 0.5}
     llm = agllm(cfg, context_limit=128_000)
     assert llm.config is cfg
 

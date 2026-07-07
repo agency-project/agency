@@ -2,6 +2,21 @@
 
 Simple feature examples showing how to use the agency framework.
 
+## LLM configuration
+
+For vLLM or another local/OpenAI-compatible endpoint, set `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODE` as needed.
+
+```bash
+export LLM_BASE_URL="http://localhost:8000/v1"
+export LLM_API_KEY="your-api-key"
+export LLM_MODEL="your-model-id"
+uv run examples/human_in_the_loop.py
+```
+
+Please refer to the main README.md at project root for other LLM APIs.
+
+---
+
 ## base_example.py
 
 **What it shows:** The simplest complete agent — one agent, two skills, shared history.
@@ -58,8 +73,8 @@ MAX_PAPERS=6 python examples/custom_tools.py "flash attention"
 Requires a vision-capable model.
 
 ```bash
-VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py photo.jpg
-VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py before.jpg after.jpg
+LLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py photo.jpg
+LLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py before.jpg after.jpg
 ```
 
 ---
@@ -77,7 +92,7 @@ VLLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py befor
 
 ```bash
 python examples/human_in_the_loop.py
-VLLM_BASE_URL=http://... VLLM_MODEL=... python examples/human_in_the_loop.py
+LLM_BASE_URL=http://... LLM_MODEL=... python examples/human_in_the_loop.py
 ```
 
 ---

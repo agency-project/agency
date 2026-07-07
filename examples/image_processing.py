@@ -11,7 +11,7 @@ Three patterns are shown:
 
   3. UrlImageTeam      — analyse an image passed as an http URL (no encoding needed).
 
-The model in LLM_CONFIG must support vision.  Set VLLM_MODEL to a
+The model in LLM_CONFIG must support vision.  Set LLM_MODEL to a
 multimodal model, e.g. Qwen/Qwen2.5-VL-7B-Instruct.
 
 Run:
@@ -23,10 +23,11 @@ from pathlib import Path
 
 from agency import agent, agdata, agimage, agskill, agteam, agsync
 
+# See ../README.md for Anthropic or Bedrock llm_config examples.
 LLM_CONFIG = {
-    "base_url":             os.environ.get("VLLM_BASE_URL", ""),
-    "api_key":              os.environ.get("VLLM_API_KEY",  ""),
-    "model":                "",
+    "api_key":  os.environ.get("LLM_API_KEY", ""),
+    "base_url": os.environ.get("LLM_BASE_URL"),
+    "model":    os.environ.get("LLM_MODEL", ""),
 }
 
 # ---------------------------------------------------------------------------
@@ -136,7 +137,7 @@ if __name__ == "__main__":
     agent.output_dir = run_dir / "agent_output"
 
     def _script() -> None:
-        print(f"Model  : {LLM_CONFIG['model']}")
+        print(f"Model  : {LLM_CONFIG.get('model', 'default')}")
         print(f"Rundir : {run_dir}\n")
 
         teams = []

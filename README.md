@@ -48,7 +48,7 @@ ag = agent(
     llm_config={
         "base_url": "http://localhost:8000/v1",
         "api_key":  "", # Leave blank if unused
-        "model":    "", # Will auto-detect if using vLLM
+        "model":    "", # Will auto-detect if using vLLM, need to specify if using Ollama
     },
 )
 
@@ -61,7 +61,8 @@ print(result.summary)   # blocks until done
 ```python
 ag = agent(
     llm_config={
-        "model":   "gpt-4o",
+        "base_url": "https://api.openai.com/v1"
+        "model":   os.environ["LLM_MODEL"],
         "api_key": os.environ["OPENAI_API_KEY"],
     },
 )
