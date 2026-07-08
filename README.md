@@ -6,7 +6,7 @@ Agents are non-blocking by default. `agent.run()` returns a pending `agdata` imm
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.12
 - [uv](https://docs.astral.sh/uv/) — package manager
 - Docker or Podman
 - GPU (optional): NVIDIA (CUDA) or AMD (ROCm)
@@ -32,9 +32,16 @@ The sandbox image comes with `torch torchvision transformers datasets accelerate
 
 ## Quick start
 
-Agents don't take LLM config directly — build an `agConfig` and pass it as `agconfig=`. The canonical way to build one is `agConfig(agXXXConfig(...), ...)` — never `agXXXConfig(...).agconfig` directly — since it's the same shape whether you're setting one owner's fields or composing several (see [`agconfig.md`](docs/agconfig.md) and [`Design_configuration.md`](docs/Design_configuration.md)). Each backend has its own config class (`agVLLMBackendConfig`, `agOpenAIBackendConfig`, `agAnthropicBackendConfig`, `agBedrockBackendConfig`) that fixes `provider` for you and only accepts the fields that backend actually reads — an unknown or silently-ignored-by-that-backend field raises `TypeError` immediately instead of quietly never reaching the API call. The generic `agLLMBackendConfig` (accepts every field, for any provider, including `anthropicAWS`) is still available for cases the dedicated classes don't cover. See [`agllm.md`](docs/agllm.md) for the full field reference and the alternative `cfg.agllm_backend.<field> = value` form for setting/changing fields one at a time.
+Supply LLM backends to agents by building an `agConfig` object and passing it to the agents:
 
-**OpenAI-compatible endpoint (vLLM, local, etc.)**
+```python
+cfg = agConfig(agVLLMBackendConfig(model="...", api_key="..."))
+ag = agent(agconfig=cfg)
+```
+
+Pick the config class for your backend — `agVLLMBackendConfig`, `agOpenAIBackendConfig`, `agAnthropicBackendConfig`, or `agBedrockBackendConfig` — and it only accepts the fields that backend actually uses, catching typos and unsupported options immediately. Need config for more than one thing (an LLM backend and a sandbox mount, say)? Pass several to the same `agConfig(...)` call. See [`agconfig.md`](docs/agconfig.md) and [`Design_configuration.md`](docs/Design_configuration.md) for the full picture, and [`agllm.md`](docs/agllm.md) for the complete LLM field reference.
+
+**OpenAI-compatible serving endpoint (vLLM, local, etc.)**
 
 ```python
 from agency import agent, agskill, agdata
@@ -50,9 +57,9 @@ continuation = agskill(
 
 cfg = agConfig(
     agVLLMBackendConfig(
-        base_url="http://localhost:8000/v1",
-        api_key="",  # Leave blank if unused
-        model="",    # Will auto-detect if using vLLM, need to specify if using Ollama
+        base_url="http://localhost:8000/v1", # Your serving API URL
+        model="YOUR_SERVED_MODEL",
+        api_key="YOUR_API_KEY" # Leave blank ("") if unused 
     )
 )
 
@@ -71,8 +78,8 @@ from agency.agllm_backend import agOpenAIBackendConfig
 cfg = agConfig(
         agOpenAIBackendConfig(
         base_url="https://api.openai.com/v1",
-        model=os.environ["LLM_MODEL"],
-        api_key=os.environ["OPENAI_API_KEY"],
+        model="YOUR_OPENAI_MODEL",
+        api_key="YOUR_API_KEY",
     )
 )
 
@@ -111,7 +118,7 @@ from agency.agllm_backend import agBedrockBackendConfig
 
 cfg = agConfig(
         agBedrockBackendConfig(
-        region="us-east-2",
+        region="us-east-1",
         model="nvidia.nemotron-super-3-120b",
     )
 )
@@ -119,9 +126,7 @@ cfg = agConfig(
 ag = agent(agconfig=cfg)
 ```
 
-Pass `api_key="bedrock-api-key-..."` to `agBedrockBackendConfig(...)` to use a static Bedrock API key instead of IAM credentials. If `model` resolves to an Anthropic model on Bedrock, only the fields `agAnthropicBackendConfig` accepts actually take effect — everything else is silently ignored by that code path, same as calling `agAnthropicBackendConfig` directly.
-
-Need both LLM backend fields and something else (a sandbox mount, an agent tunable) on the same `agConfig`? Pass several views to one `agConfig(...)` call: `agConfig(agVLLMBackendConfig(...), agSandboxConfig().add_mount("out", path, "/agent_output"))`. See [`agconfig.md`](docs/agconfig.md) for the full mechanics.
+Pass `api_key="bedrock-api-key-..."` to `agBedrockBackendConfig(...)` to use a static Bedrock API key instead of IAM credentials. For Claude models on Bedrock, stick to the fields listed under **Anthropic** above — other generation params aren't supported there.
 
 ## Core concepts
 
