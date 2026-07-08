@@ -98,9 +98,9 @@ class TestForConfig:
         assert isinstance(backend, _AnthropicBedrockBackend)
 
     def test_config_stored_on_instance(self):
-        cfg = {"model": ""}
+        cfg = {"model": "some-model"}
         backend = agllm_backend.for_config(cfg)
-        assert backend.config is cfg
+        assert backend.model == "some-model"
 
     def test_anthropic_provider_returns_anthropic_backend(self):
         backend = agllm_backend.for_config({"provider": "anthropic", "model": "claude-sonnet-5"})
@@ -937,7 +937,7 @@ class TestAnthropicBedrockCompletions:
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": "ping", "cache_control": {"type": "ephemeral"}},
             ]}],
-            max_tokens=32000,
+            max_tokens=128000,
         )
         assert isinstance(result, _AnthropicNonStreamResponse)
         assert result.choices[0].message.content == "pong"
@@ -956,7 +956,7 @@ class TestAnthropicBedrockCompletions:
         mock_client.messages.create.assert_called_once_with(
             model="us.anthropic.claude-sonnet-5",
             messages=[],
-            max_tokens=32000,
+            max_tokens=128000,
             system=[{"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}],
         )
 
@@ -1001,7 +1001,7 @@ class TestAnthropicBedrockCompletions:
 
         assert original_messages == [{"role": "user", "content": "ping"}]
 
-    def test_max_tokens_defaults_to_32000_when_omitted(self):
+    def test_max_tokens_defaults_to_128000_when_omitted(self):
         # Regression: a 4096 default could truncate mid-tool-call on a large
         # structured tool argument, silently dropping the call entirely.
         mock_client = MagicMock()
@@ -1010,7 +1010,7 @@ class TestAnthropicBedrockCompletions:
             model="m", messages=[{"role": "user", "content": "x"}],
         )
         _, kwargs = mock_client.messages.create.call_args
-        assert kwargs["max_tokens"] == 32000
+        assert kwargs["max_tokens"] == 128000
 
     def test_extra_body_without_top_k_is_ignored(self):
         mock_client = MagicMock()

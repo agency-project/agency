@@ -289,10 +289,10 @@ def test_make_field_handler_all_fields_complete_message():
 # ---------------------------------------------------------------------------
 
 def test_prepare_inputs_in_sandbox_replaces_long_string():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     s = agschema(agdata(text=str))
     sb = MagicMock()
-    data = agdata(text="x" * (INPUT_OFFLOAD_CHARS + 1))
+    data = agdata(text="x" * (_AgSchemaFields.input_offload_chars.default + 1))
     paths, fields = s.prepare_inputs_in_sandbox(data, sb, "skill")
     assert fields == ["text"]
     assert len(paths) == 1

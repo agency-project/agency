@@ -34,9 +34,15 @@ class agConfig:
     name (see ``FIELD_REGISTRY``); the returned ``_OwnerView`` dispatches
     the read/write to the right tier automatically.
 
-    Class-specific vocabulary (like ``agSandbox``'s ``add_mount``) belongs
-    on a class-specific view built on top of this, not on ``agConfig``
-    itself -- see ``agSandboxConfig`` in ``agsandbox.py``.
+    For setting several fields on one owner at once (instead of one
+    ``cfg.<owner>.<field> = value`` line per field), each owner has a
+    ``*Config`` view subclassing ``_AgConfigViewBase`` below (e.g.
+    ``agLLMBackendConfig``, ``agAgentConfig`` -- see the owning module for
+    each). Passing several of these views (or plain dicts, or other
+    ``agConfig`` instances) straight to ``agConfig(...)`` merges them into
+    one config in a single call. Class-specific vocabulary that doesn't fit
+    a flat field (like ``agSandbox``'s ``add_mount``) belongs on that
+    owner's view instead -- see ``agSandboxConfig`` in ``agsandbox.py``.
     """
 
     GLOBAL: ClassVar["agConfig"]  # assigned once, right after the class body
@@ -48,10 +54,40 @@ class agConfig:
     FIELD_REGISTRY: ClassVar[dict[tuple[str, str], "_ConfigParam"]] = {}
     _registry_lock: ClassVar[threading.Lock] = threading.Lock()
 
-    def __init__(self, data: dict[str, dict[str, Any]] | None = None) -> None:
-        self.data: dict[str, dict[str, Any]] = {k: dict(v) for k, v in (data or {}).items()}
+    def __init__(self, *sources: "agConfig | dict[str, dict[str, Any]] | _AgConfigViewBase") -> None:
+        """Each source contributes its data, later sources winning on a
+        conflicting (owner, name) -- same semantics as ``{**a, **b}``. A
+        source may be a plain nested dict (the original single-argument
+        form, e.g. ``agConfig({"agllm_backend": {...}})``), another
+        ``agConfig`` (e.g. ``.clone()``'s ``agConfig(self.data)``), or any
+        ``*Config`` view (``agLLMBackendConfig``, ``agSandboxConfig``, ...)
+        -- anything exposing an ``.agconfig`` property. This lets several
+        owners' worth of config be assembled in one call::
+
+            cfg = agConfig(
+                agLLMBackendConfig(model="...", api_key="..."),
+                agSandboxConfig().add_mount("out", path, "/agent_output"),
+            )
+        """
+        self.data: dict[str, dict[str, Any]] = {}
         self._locked_keys: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
+        for src in sources:
+            if src is None:
+                continue
+            if isinstance(src, dict):
+                src_data = src
+            elif isinstance(src, agConfig):
+                src_data = src.data
+            elif hasattr(src, "agconfig"):
+                src_data = src.agconfig.data
+            else:
+                raise TypeError(
+                    f"agConfig() cannot merge a {type(src).__name__} -- pass a dict, "
+                    f"an agConfig, or a *Config view (something with an .agconfig property)"
+                )
+            for owner, fields in src_data.items():
+                self.data.setdefault(owner, {}).update(fields)
 
     def get(self, owner: str, name: str, default: Any = None) -> Any:
         """Tier 3 (dynamic): live read, never locks."""
@@ -215,3 +251,68 @@ class _OwnerView:
             agConfig.GLOBAL.set(self._owner, name, value)  # same shared target regardless of which agconfig this is
         else:
             self._agconfig.set(self._owner, name, value)
+
+
+class _AgConfigViewBase:
+    """Base for a ``*Config`` view scoped to one owner (e.g. ``agLLMBackendConfig``
+    for ``"agllm_backend"``, ``agAgentConfig`` for ``"agent"``). Each subclass
+    just sets ``_OWNER``; this class provides the shared construction,
+    ``.agconfig`` handoff, and multi-field ``update()`` -- so setting several
+    fields on one owner doesn't need one ``cfg.<owner>.<field> = value`` line
+    each::
+
+        cfg = agConfig(agLLMBackendConfig(model="...", api_key="...", base_url="..."))
+        ag = agent(agconfig=cfg)
+
+    Not a descriptor and not related to ``_OwnerView`` above (which dispatches
+    live attribute reads/writes on an *existing* agConfig for a class that
+    already has one) -- this is a standalone builder usable before any
+    consuming instance, or its agConfig, exists yet. Wraps an existing
+    ``agConfig`` if given one (mutating it in place, so it composes with other
+    owners' views on the same object regardless of order), or creates a fresh
+    one. Multiple views (or plain dicts) can also be merged in one call via
+    ``agConfig(view_a, view_b, ...)``.
+
+    Only covers flat fields registered as a ``ConfigParam`` under ``_OWNER``.
+    Structural, non-flat vocabulary (like ``agSandboxConfig``'s ``add_mount``,
+    which read-modify-writes a dict rather than overwriting one field) is
+    layered on top by the subclass -- see ``agSandboxConfig`` in ``agsandbox.py``.
+    """
+
+    _OWNER: ClassVar[str]  # set by each subclass
+    # Narrows update()/__init__ to a subset of _OWNER's registered fields --
+    # e.g. a backend-specific agLLMBackendConfig subclass that only exposes
+    # the fields its backend actually reads, so passing one it silently
+    # ignores raises immediately instead of failing later at the API call.
+    # None (the default) means every field registered under _OWNER is
+    # allowed -- unchanged behavior for every pre-existing *Config view.
+    _ALLOWED_FIELDS: "ClassVar[frozenset[str] | None]" = None
+
+    def __init__(self, agconfig: "agConfig | None" = None, **fields: Any) -> None:
+        self._agconfig = agconfig if agconfig is not None else agConfig()
+        if fields:
+            self.update(**fields)
+
+    @property
+    def agconfig(self) -> "agConfig":
+        """The underlying, propagatable agConfig -- pass this onward, not the view."""
+        return self._agconfig
+
+    def update(self, **fields: Any) -> "_AgConfigViewBase":
+        # Same per-field tier dispatch as _OwnerView.__setattr__: a
+        # GlobalConfigParam always targets agConfig.GLOBAL, regardless of
+        # which agConfig this view wraps -- writing it onto self._agconfig
+        # instead would silently create a dead override nothing ever reads,
+        # since GlobalConfigParam.__get__ only ever consults agConfig.GLOBAL.
+        known = {name: knob for (owner, name), knob in agConfig.FIELD_REGISTRY.items() if owner == self._OWNER}
+        if self._ALLOWED_FIELDS is not None:
+            known = {name: knob for name, knob in known.items() if name in self._ALLOWED_FIELDS}
+        unknown = set(fields) - set(known)
+        if unknown:
+            raise TypeError(f"{type(self).__name__} has no field(s) {sorted(unknown)}")
+        for name, value in fields.items():
+            if isinstance(known[name], GlobalConfigParam):
+                agConfig.GLOBAL.set(self._OWNER, name, value)
+            else:
+                self._agconfig.set(self._OWNER, name, value)
+        return self

@@ -30,18 +30,21 @@ from pathlib import Path
 from datetime import datetime
 
 from agency import agent, agskill, agdata
+from agency.agconfig import agConfig
+from agency.agllm_backend import agVLLMBackendConfig
 
 # ---------------------------------------------------------------------------
 # LLM config
 # ---------------------------------------------------------------------------
 
-# See ../README.md for Anthropic or Bedrock llm_config examples.
-LLM_CONFIG = {
-    "api_key":  os.environ.get("LLM_API_KEY", ""),
-    "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", ""),
-}
-
+# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+cfg = agConfig(
+    agVLLMBackendConfig(
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+    )
+)
 FILE_PATH = "/workspace/hello.py"
 
 # ---------------------------------------------------------------------------
@@ -98,7 +101,7 @@ def main() -> None:
     # ── Step 1: first agent writes hello.py ─────────────────────────────────
     _sep("Step 1 — agent_a writes hello.py")
 
-    agent_a = agent(llm_config=LLM_CONFIG)
+    agent_a = agent(agconfig=cfg)
     result_a = agent_a.run(
         write_skill,
         agdata(
@@ -122,7 +125,7 @@ def main() -> None:
     _run_file(sandbox, "before patch")
 
     # ── Step 3: harness patches the file with sed, breaking the syntax ───────
-    _sep("Step 3 — harness patches with sed (removes string quotes → syntax error)")
+    _sep("Step 3 — harness patches with sed (removes string quotes → SYNTEX ERROR EXPECTED)")
 
     # This sed command replaces  print("Hello World")  or  print('Hello World')
     # with                       print(Hello External World)
@@ -142,7 +145,7 @@ def main() -> None:
     # ── Step 4: second agent receives the sandbox and fixes the bug ──────────
     _sep("Step 4 — agent_b receives the sandbox and fixes the bug")
 
-    agent_b = agent(llm_config=LLM_CONFIG)
+    agent_b = agent(agconfig=cfg)
     agent_b.sandbox = sandbox
 
     result_b = agent_b.run(

@@ -6,12 +6,41 @@ import time
 import traceback as _traceback
 from typing import Generator, Iterable, TypeVar
 
+from .agconfig import GlobalConfigParam, _AgConfigViewBase
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 _T = TypeVar("_T")
+# Kept as a plain module attribute (not a ConfigParam) -- tests/conftest.py
+# monkeypatches this by name (`monkeypatch.setattr(_agutil_module,
+# "_BATCH_INTERVAL_S", 0.0)`) to speed up streaming tests; a descriptor would
+# silently break that.
 _BATCH_INTERVAL_S: float = 0.1       # main thread drains stream every 100 ms
-_IDLE_CHECK_INTERVAL_S: float = 1.0  # how often to check idle timeout
+
+
+# Exists only to register agutil's config fields (via __set_name__ at import
+# time). Tier 1 (global): _iter_batched is a free function with no agconfig
+# threaded through it, so — like _AgResourcePoolFields -- reads use a
+# throwaway instance and GlobalConfigParam ignores it anyway, always routing
+# to agConfig.GLOBAL.
+class _AgUtilFields:
+    idle_check_interval_s = GlobalConfigParam("agutil", default=1.0)  # how often to check idle timeout
+
+    def __init__(self, agconfig=None) -> None:
+        self._agconfig = agconfig
+
+
+class agUtilConfig(_AgConfigViewBase):
+    """View over an agConfig for pre-setting agutil tunables in one call::
+
+        cfg = agConfig(agUtilConfig(idle_check_interval_s=0.5))
+
+    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
+    """
+
+    _OWNER = "agutil"
+
 
 _THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 _PATH_RE     = re.compile(r"^(/[\w.\-]+)+$")
@@ -92,7 +121,7 @@ def _iter_batched(
         _current_timeout = stream_timeout if _streaming else idle_timeout
         try:
             if _current_timeout is not None:
-                item = q.get(timeout=_IDLE_CHECK_INTERVAL_S)
+                item = q.get(timeout=_AgUtilFields().idle_check_interval_s)
             else:
                 item = q.get()
         except queue.Empty:

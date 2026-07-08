@@ -4,15 +4,15 @@ import pytest
 from unittest.mock import patch, MagicMock
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
-from agency.agschema import agschema
+from agency.agschema import agschema, _AgSchemaFields
 from agency.agskill import agskill
 from agency.agllm import _AgLLMFields, agllm
 from agency.agtool import agtool, _AgToolFields
 from agency.agent import agent as _agent_cls
 
-LLM_MAX_RETRIES    = _AgLLMFields.LLM_MAX_RETRIES
-LLM_IDLE_TIMEOUT   = _AgLLMFields.LLM_IDLE_TIMEOUT
-LLM_STREAM_TIMEOUT = _AgLLMFields.LLM_STREAM_TIMEOUT
+LLM_MAX_RETRIES    = _AgLLMFields.max_retries.default
+LLM_IDLE_TIMEOUT   = _AgLLMFields.idle_timeout.default
+LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
 
 LLM_CONFIG = {"api_key": "test", "model": ""}
 LLM = agllm(LLM_CONFIG, context_limit=128_000)
@@ -756,7 +756,7 @@ def test_return_tool_logs_validation_error_to_term():
 
 from agency.agllm import _get_llm_call_semaphore, _AgLLMFields
 
-LLM_CALL_MAX_CONCURRENCY = _AgLLMFields.LLM_CALL_MAX_CONCURRENCY
+LLM_CALL_MAX_CONCURRENCY = _AgLLMFields.call_max_concurrency.default
 
 _sem = _get_llm_call_semaphore()
 
@@ -1012,7 +1012,7 @@ def test_long_tool_output_offloaded_to_file():
     written = {}
     sandbox = _make_sandbox(written)
 
-    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "x" * (_eff_thresh + 1)
 
     def fn(arg: agdata) -> agdata:
@@ -1043,7 +1043,7 @@ def test_long_tool_output_offloaded_to_file():
 def test_long_tool_output_offloaded_to_sandbox():
     from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "y" * (_eff_thresh + 1)
 
     def fn(arg: agdata) -> agdata:
@@ -1071,7 +1071,7 @@ def test_long_output_injects_read_tool_into_openai_tools():
     from agency.agtool import _AgToolFields
     from agency.tools import make_read
 
-    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1106,7 +1106,7 @@ def test_long_output_read_tool_persists_for_skill_run():
     LLM calls — it is not removed between iterations."""
     from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1146,7 +1146,7 @@ def test_long_output_no_duplicate_read_when_already_present():
     from agency.agtool import _AgToolFields
     import agency.tools as _tools_mod
 
-    _eff_thresh = max(_AgToolFields.TOOL_OUTPUT_OFFLOAD_CHARS, int(LLM.context_limit * 0.1 * 4))
+    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1372,7 +1372,7 @@ def test_tool_timeout_ignored_if_not_int():
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
-    assert received_timeout.get("timeout") == _AgToolFields.TOOL_TIMEOUT_S
+    assert received_timeout.get("timeout") == _AgToolFields.timeout_s.default
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ Without `agteam`, a workflow is a loose collection of module-level objects:
 ```python
 search_tool  = agtool(...)
 find_skill   = agskill(..., tools=[search_tool])
-main_agent   = agent(llm_config=LLM_CONFIG)
+main_agent   = agent(agconfig=cfg)
 main_agent.run(find_skill, agdata(topic="KV cache"))
 ```
 
@@ -29,9 +29,13 @@ Configuration specific to the team (topic, file paths, limits, …) is passed as
 ```python
 from agency import agteam, agent, agskill, agdata, agsync
 from agency.agtool import agtool
+from agency.agconfig import agConfig
+from agency.agllm_backend import agLLMBackendConfig
+
+cfg = agConfig(agLLMBackendConfig(base_url="...", model="...", api_key="..."))
 
 class PaperCrawlerTeam(agteam):
-    llm_config = LLM_CONFIG          # class-level default; overridable per instance
+    agconfig = cfg                   # class-level default; overridable per instance
 
     def setup(self) -> None:
         self.search_arxiv = agtool(name="search_arxiv", ...)
@@ -39,7 +43,7 @@ class PaperCrawlerTeam(agteam):
         self.summarise     = agskill(name="summarise_paper", ..., tools=[])
         self.compile       = agskill(name="compile_report", ...)
 
-        # llm_config injected automatically from the team
+        # agconfig injected automatically from the team
         self.main_agent = agent()
 
     def run(self) -> agdata:
@@ -65,12 +69,12 @@ team = PaperCrawlerTeam(topic="KV cache quantization")
 
 Keyword arguments are set as instance attributes before `setup()` is called, so `self.topic` is available inside `setup()` and `run()`.
 
-An explicit `llm_config` dict overrides the class-level default:
+An explicit `agconfig` overrides the class-level default:
 
 ```python
 team = PaperCrawlerTeam(
     topic="flash attention",
-    llm_config={...},        # per-instance override
+    agconfig=other_cfg,        # per-instance override
 )
 ```
 
@@ -124,29 +128,34 @@ Each `run()` call executes in its own daemon thread. There is no shared pool to 
 
 ## Auto agent tracking
 
-Any `agent(...)` call made inside `setup()` or `run()` is automatically registered with the team. The `llm_config` argument is optional — it defaults to `self.llm_config` from the active team:
+Any `agent(...)` call made inside `setup()` or `run()` is automatically registered with the team. The `agconfig` argument is optional — an agent created with no explicit `agconfig=` inherits the active team's `agconfig` outright (not just its LLM fields — log_dir/output_dir/sandbox settings set on it apply too):
 
 ```python
 def setup(self) -> None:
-    self.main_agent = agent()   # llm_config injected automatically
+    self.main_agent = agent()   # agconfig injected automatically
 ```
 
 `self.agents` returns a snapshot list of all agents currently registered with this team instance. Completed anonymous agents (fork agents with no other live reference) are GC'd automatically — only agents held via `self.*` or still in-flight are visible.
 
-## llm_config class attribute
+## agconfig class attribute
 
-Declaring `llm_config` at the class level provides a default shared by all instances:
+Declaring `agconfig` at the class level provides a default shared by all instances:
 
 ```python
+from agency.agconfig import agConfig
+from agency.agllm_backend import agLLMBackendConfig
+
+_cfg = agConfig(agLLMBackendConfig(
+    base_url="https://my-vllm/v1",
+    api_key="...",
+    model="my-model",
+))
+
 class MyTeam(agteam):
-    llm_config = {
-        "base_url": "https://my-vllm/v1",
-        "api_key":  "...",
-        "model":    "my-model",
-    }
+    agconfig = _cfg
 ```
 
-Passing `llm_config=` at construction time creates an instance attribute that shadows the class default, leaving other instances unaffected.
+Passing `agconfig=` at construction time creates an instance attribute that shadows the class default, leaving other instances unaffected.
 
 ## Log and output directories
 
@@ -161,7 +170,7 @@ teams = [PaperCrawlerTeam(topic=t) for t in topics]
 
 ## API reference
 
-### `agteam.__init__(llm_config=None, **config)`
+### `agteam.__init__(agconfig=None, **config)`
 
 Creates the team. Sets all `config` kwargs as instance attributes, then calls `setup()`.
 

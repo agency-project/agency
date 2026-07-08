@@ -11,7 +11,7 @@ Three patterns are shown:
 
   3. UrlImageTeam      — analyse an image passed as an http URL (no encoding needed).
 
-The model in LLM_CONFIG must support vision.  Set LLM_MODEL to a
+The model in cfg.agllm_backend.model must support vision.  Set LLM_MODEL to a
 multimodal model, e.g. Qwen/Qwen2.5-VL-7B-Instruct.
 
 Run:
@@ -22,13 +22,17 @@ import sys
 from pathlib import Path
 
 from agency import agent, agdata, agimage, agskill, agteam, agsync
+from agency.agconfig import agConfig
+from agency.agllm_backend import agVLLMBackendConfig
 
-# See ../README.md for Anthropic or Bedrock llm_config examples.
-LLM_CONFIG = {
-    "api_key":  os.environ.get("LLM_API_KEY", ""),
-    "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", ""),
-}
+# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+cfg = agConfig(
+    agVLLMBackendConfig(
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+    )
+)
 
 # ---------------------------------------------------------------------------
 # Skills
@@ -72,7 +76,7 @@ analyse_url_skill = agskill(
 class SingleImageTeam(agteam):
     """Describe a single local image file."""
 
-    llm_config = LLM_CONFIG
+    agconfig = cfg
 
     def setup(self) -> None:
         self.ag = agent()
@@ -89,7 +93,7 @@ class SingleImageTeam(agteam):
 class MultiImageTeam(agteam):
     """Compare two local image files side by side."""
 
-    llm_config = LLM_CONFIG
+    agconfig = cfg
 
     def setup(self) -> None:
         self.ag = agent()
@@ -106,7 +110,7 @@ class MultiImageTeam(agteam):
 class UrlImageTeam(agteam):
     """Analyse an image from a public URL — no local file needed."""
 
-    llm_config = LLM_CONFIG
+    agconfig = cfg
 
     def setup(self) -> None:
         self.ag = agent()
@@ -137,7 +141,7 @@ if __name__ == "__main__":
     agent.output_dir = run_dir / "agent_output"
 
     def _script() -> None:
-        print(f"Model  : {LLM_CONFIG.get('model', 'default')}")
+        print(f"Model  : {cfg.agllm_backend.model or 'default'}")
         print(f"Rundir : {run_dir}\n")
 
         teams = []

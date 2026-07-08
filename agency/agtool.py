@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agutil import format_exception
 from .agtype import type_hint_to_string_type, get_return_tool_description_prompt
-from .agconfig import GlobalConfigParam, DynamicConfigParam
+from .agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
 if TYPE_CHECKING:
     from .aglog import aglog
@@ -32,26 +32,34 @@ def _ignore_sigint_in_worker() -> None:
 
 
 # Exists only to register agtool's config fields (via __set_name__ at import
-# time). Constants are plain class attributes (not descriptors) so other code
-# in this file needing the same hardcoded value -- e.g. agtool.__call__'s own
-# timeout fallback -- can reference it directly (_AgToolFields.TOOL_TIMEOUT_S)
-# without going through the (possibly agconfig-overridden) ConfigParam.
+# time). Other code in this file needing the same hardcoded value -- e.g.
+# agtool.__call__'s own timeout fallback -- reads the descriptor's frozen
+# default directly (_AgToolFields.timeout_s.default) instead of going through
+# a separate plain constant, so there's a single source of truth.
 # Reads use a throwaway instance -- _AgToolFields(agconfig) -- since __init__
 # does nothing but (optionally) store an agconfig; there's no persistent
 # agtool instance to hang descriptors on for reading.
 class _AgToolFields:
-    TOOL_TIMEOUT_S = 1800   # Default ceiling on tool execution time (seconds). Prevents a crashed or
-                            # hung worker process from blocking an agent thread forever via future.result();
-                            # agents can pass "timeout": <seconds> in tool arguments to override per-call.
-    TOOL_POOL_MAX_WORKERS = 256      # Maximum number of worker processes in the tool executor pool; one worker per in-flight tool call.
-    TOOL_OUTPUT_OFFLOAD_CHARS = 40_000  # minimum floor for tool-output offloading
-
-    pool_max_workers     = GlobalConfigParam("agtool", default=TOOL_POOL_MAX_WORKERS)
-    timeout_s            = DynamicConfigParam("agtool", default=TOOL_TIMEOUT_S)
-    output_offload_chars = DynamicConfigParam("agtool", default=TOOL_OUTPUT_OFFLOAD_CHARS)
+    pool_max_workers     = GlobalConfigParam("agtool", default=256)  # Max worker processes in the tool executor pool; one per in-flight tool call.
+    timeout_s            = DynamicConfigParam("agtool", default=1800)  # Default ceiling on tool execution time (seconds). Prevents a crashed or
+                                                                        # hung worker process from blocking an agent thread forever via future.result();
+                                                                        # agents can pass "timeout": <seconds> in tool arguments to override per-call.
+    output_offload_chars = DynamicConfigParam("agtool", default=40_000)  # minimum floor for tool-output offloading
+    offload_id_prefix_len = DynamicConfigParam("agtool", default=12)  # Chars of the tool_call_id kept when naming an offloaded-output file.
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
+
+
+class agToolConfig(_AgConfigViewBase):
+    """View over an agConfig for pre-setting agtool tunables in one call::
+
+        cfg = agConfig(agToolConfig(timeout_s=60))
+
+    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
+    """
+
+    _OWNER = "agtool"
 
 
 def _get_pool() -> ProcessPoolExecutor:
@@ -201,7 +209,7 @@ class agtool:
         import pickle
         fn_bytes         = cloudpickle.dumps(self.fn)
         arg_bytes        = pickle.dumps(arg)
-        effective_timeout = timeout if timeout is not None else _AgToolFields.TOOL_TIMEOUT_S
+        effective_timeout = timeout if timeout is not None else _AgToolFields.timeout_s.default
         try:
             result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result(timeout=effective_timeout)
         except _FutureTimeoutError:
@@ -346,7 +354,7 @@ def dispatch_tools(
                 # run_in_subprocess=False but can still produce huge outputs that
                 # bloat the context.
                 if len(result_content) > tool_offload_chars:
-                    safe_id = tc_id.replace("-", "")[:12]
+                    safe_id = tc_id.replace("-", "")[:_fields.offload_id_prefix_len]
                     offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
                     try:
                         try:

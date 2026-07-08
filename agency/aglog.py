@@ -4,7 +4,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from .agdata import agdata
-from .agconfig import agConfig, DynamicConfigParam
+from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 
 def _ts() -> str:
@@ -16,13 +16,20 @@ def _ts() -> str:
 # inherits from this below, so self.dump_content_truncate_len etc. work via
 # the inherited ConfigParam descriptors exactly as if declared directly on aglog.
 class _AgLogFields:
-    DUMP_TOOL_ARGS_TRUNCATE_LEN = 60    # Max characters of tool call arguments shown in dump() human-readable summary
-    DUMP_CONTENT_TRUNCATE_LEN = 120     # Max characters of message content shown per history delta line in dump() output
-    DUMP_TOOL_CALL_ID_PREFIX_LEN = 8    # Number of leading characters of tool_call_id shown in dump() output
+    dump_tool_args_truncate_len = DynamicConfigParam("aglog", default=60)     # Max chars of tool call arguments shown in dump() human-readable summary
+    dump_content_truncate_len = DynamicConfigParam("aglog", default=120)     # Max chars of message content shown per history delta line in dump() output
+    dump_tool_call_id_prefix_len = DynamicConfigParam("aglog", default=8)    # Number of leading chars of tool_call_id shown in dump() output
 
-    dump_tool_args_truncate_len = DynamicConfigParam("aglog", default=DUMP_TOOL_ARGS_TRUNCATE_LEN)
-    dump_content_truncate_len = DynamicConfigParam("aglog", default=DUMP_CONTENT_TRUNCATE_LEN)
-    dump_tool_call_id_prefix_len = DynamicConfigParam("aglog", default=DUMP_TOOL_CALL_ID_PREFIX_LEN)
+
+class agLogConfig(_AgConfigViewBase):
+    """View over an agConfig for pre-setting aglog tunables in one call::
+
+        cfg = agConfig(agLogConfig(dump_content_truncate_len=200))
+
+    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
+    """
+
+    _OWNER = "aglog"
 
 
 class aglog(_AgLogFields):

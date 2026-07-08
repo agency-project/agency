@@ -8,6 +8,7 @@ from agency.agskill import agskill
 from agency.agtool import agtool
 from agency.agent import agent
 from agency.agname import agname as _agname
+from agency.agconfig import agConfig
 
 # ---------------------------------------------------------------------------
 # Streaming mock helpers (agskill uses stream=True)
@@ -53,8 +54,12 @@ def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
     return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
+def _llm_agconfig(d: dict) -> agConfig:
+    return agConfig({"agllm_backend": dict(d)})
+
+
 def make_agent() -> agent:
-    return agent(llm_config={"api_key": "k", "model": ""})
+    return agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}))
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +247,7 @@ def test_fork_inherits_config():
     ag = make_agent()
 
     forked = agent.fork(ag)
-    assert forked.llm.config == ag.llm.config
+    assert forked.llm.backend.as_dict() == ag.llm.backend.as_dict()
 
 
 def test_fork_deep_copies_history():
@@ -260,7 +265,7 @@ def test_fork_copies_history_and_config():
     ag.history = agdata(messages=[{"role": "user", "content": "prior"}])
 
     forked = agent.fork(ag)
-    assert forked.llm.config == ag.llm.config
+    assert forked.llm.backend.as_dict() == ag.llm.backend.as_dict()
     assert len(forked.history.messages) == 1
     assert forked.history.messages[0]["content"] == "prior"
 
@@ -482,7 +487,7 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
     sb = _GCSandbox(lambda: destroyed.append(True))
     ref = weakref.ref(sb)
 
-    ag = agent(llm_config={"api_key": "k", "model": ""}, sandbox=sb)
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), sandbox=sb)
     del ag
     gc.collect()
 
@@ -523,7 +528,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
         return agdata(answer="42"), new_ctx, []
     skill_write.execute_react = fake_write
 
-    ag = agent(llm_config={"api_key": "k", "model": "m"})
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     ag.run(skill_write, agdata(q="test")).answer
 
     ckpt = tmp_path / "agent.ckpt"
@@ -533,7 +538,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     del ag
     _agname._allocated.discard(saved_agname)
 
-    ag2 = agent.load(ckpt, llm_config={"api_key": "k", "model": "m"})
+    ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     assert ag2.agname == saved_agname
     assert len(ag2.ctx.messages) > 0
     assert ag2 in agent.all()
@@ -590,8 +595,8 @@ def test_save_all_and_load_all(tmp_path, monkeypatch):
     skill_write.execute_react = fake_write
 
     def _create_and_save():
-        ag1 = agent(llm_config={"api_key": "k", "model": "m"})
-        ag2 = agent(llm_config={"api_key": "k", "model": "m"})
+        ag1 = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
+        ag2 = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
         ag1.run(skill_write, agdata(agname=ag1.agname)).ok
         ag2.run(skill_write, agdata(agname=ag2.agname)).ok
         saved_names.update([ag1.agname, ag2.agname])
@@ -601,7 +606,7 @@ def test_save_all_and_load_all(tmp_path, monkeypatch):
     gc.collect()
     _agname._allocated.difference_update(saved_names)
 
-    restored = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
+    restored = agent.load_all(tmp_path, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     try:
         assert len(restored) == 2
         assert {a.agname for a in restored} == saved_names
@@ -630,13 +635,13 @@ def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
         return agdata(ok=True), prev_ctx, []
     skill.execute_react = fake_execute_react
 
-    ag1 = agent(llm_config={"api_key": "k", "model": "m"})
+    ag1 = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     ag1.run(skill, agdata()).ok  # needs a checkpoint for save
     ag1_name = ag1.agname
     ag2_name = [None]
 
     def _create_save_ag2():
-        ag2 = agent(llm_config={"api_key": "k", "model": "m"})
+        ag2 = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
         ag2.run(skill, agdata()).ok
         ag2_name[0] = ag2.agname
         agent.save_all(tmp_path)
@@ -645,7 +650,7 @@ def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
     gc.collect()
     _agname._allocated.discard(ag2_name[0])
 
-    result = agent.load_all(tmp_path, llm_config={"api_key": "k", "model": "m"})
+    result = agent.load_all(tmp_path, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     try:
         assert len(result) == 2
         assert ag1 in result
@@ -674,13 +679,13 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
         return agdata(done=True), prev_ctx, []
     skill.execute_react = fake_execute_react
 
-    ag = agent(llm_config={"api_key": "k", "model": "m"})
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     ag.run(skill, agdata()).done  # must run a skill to get a checkpoint
     ckpt = tmp_path / "ag.ckpt"
     ag.save(ckpt)
 
     with pytest.raises(ValueError, match="already in use"):
-        agent.load(ckpt, llm_config={"api_key": "k", "model": "m"})
+        agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     _agname._allocated.discard(ag.agname)
 
 
@@ -740,9 +745,9 @@ from agency.agschema import agschema as _agschema
 
 
 def test_prepare_inputs_in_sandbox_replaces_long_string():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_val = "x" * (INPUT_OFFLOAD_CHARS + 1)
+    long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(text=long_val, small="hi")
     paths, fields = _agschema(agdata(text=str, small=str)).prepare_inputs_in_sandbox(inp, sandbox, "mskill")
     sandbox.write_file.assert_called_once()
@@ -769,10 +774,10 @@ def test_prepare_inputs_in_sandbox_skips_non_string_scalars():
     assert paths == []
 
 def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
-    long_val = "y" * (INPUT_OFFLOAD_CHARS + 1)
+    long_val = "y" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(text=long_val)
     paths, fields = _agschema(agdata(text=str)).prepare_inputs_in_sandbox(inp, sandbox, "skill")
     assert paths == []
@@ -780,10 +785,10 @@ def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
     assert inp._data["text"] == long_val
 
 def test_prepare_inputs_in_sandbox_list_large_strings_replaced_with_paths():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_a = "a" * (INPUT_OFFLOAD_CHARS + 1)
-    long_b = "b" * (INPUT_OFFLOAD_CHARS + 1)
+    long_a = "a" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_b = "b" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(items=[long_a, long_b])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     assert sandbox.write_file.call_count == 2
@@ -805,9 +810,9 @@ def test_prepare_inputs_in_sandbox_list_short_strings_unchanged():
     assert inp._data["items"] == ["short", "also short"]
 
 def test_prepare_inputs_in_sandbox_list_mixed_only_large_replaced():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_val = "x" * (INPUT_OFFLOAD_CHARS + 1)
+    long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(items=["short", long_val])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     sandbox.write_file.assert_called_once()
@@ -823,10 +828,10 @@ def test_prepare_inputs_in_sandbox_list_non_string_elements_skipped():
     assert paths == []
 
 def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
-    long_val = "x" * (INPUT_OFFLOAD_CHARS + 1)
+    long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(items=[long_val])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     assert paths == []
@@ -834,9 +839,9 @@ def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged
     assert inp._data["items"] == [long_val]
 
 def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    data_url = "data:image/jpeg;base64," + "A" * (INPUT_OFFLOAD_CHARS + 1)
+    data_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(frames=[data_url, data_url])
     schema = agdata(frames=list[agimage])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -845,9 +850,9 @@ def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
     assert inp._data["frames"] == [data_url, data_url]
 
 def test_prepare_inputs_in_sandbox_skips_single_agtype_field():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    data_url = "data:image/jpeg;base64," + "A" * (INPUT_OFFLOAD_CHARS + 1)
+    data_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(photo=data_url)
     schema = agdata(photo=agimage)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -855,11 +860,11 @@ def test_prepare_inputs_in_sandbox_skips_single_agtype_field():
     assert inp._data["photo"] == data_url
 
 def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
     # After agbinary.prepare() the value is a short sandbox path, but the skip
     # should fire on the schema hint alone — verify with a long string too.
-    long_path = "/workspace/inputs/" + "a" * (INPUT_OFFLOAD_CHARS + 1)
+    long_path = "/workspace/inputs/" + "a" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(audio=long_path)
     schema = agdata(audio=agbinary)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -868,9 +873,9 @@ def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
     assert inp._data["audio"] == long_path
 
 def test_prepare_inputs_in_sandbox_skips_agbinary_list_fields():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_path = "/workspace/inputs/" + "b" * (INPUT_OFFLOAD_CHARS + 1)
+    long_path = "/workspace/inputs/" + "b" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(clips=[long_path, long_path])
     schema = agdata(clips=list[agbinary])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -888,9 +893,9 @@ def test_prepare_inputs_in_sandbox_processes_agfile_field_via_prepare():
     assert "doc" in paths[0]
 
 def test_prepare_inputs_in_sandbox_offloads_agrawstring_when_long():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_text = "x" * (INPUT_OFFLOAD_CHARS + 1)
+    long_text = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(prompt=long_text)
     schema = agdata(prompt=agrawstring)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -909,9 +914,9 @@ def test_prepare_inputs_in_sandbox_preserves_short_agrawstring():
     assert inp._data["prompt"] == "short"
 
 def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_val = "data:image/jpeg;base64," + "A" * (INPUT_OFFLOAD_CHARS + 1)
+    long_val = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(images={"a": long_val})
     schema = agdata(images=dict[str, agimage])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -920,9 +925,9 @@ def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
     assert inp._data["images"] == {"a": long_val}
 
 def test_prepare_inputs_in_sandbox_skips_tuple_agtype_field():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_val = "data:image/jpeg;base64," + "A" * (INPUT_OFFLOAD_CHARS + 1)
+    long_val = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(pair=(long_val, "label"))
     schema = agdata(pair=tuple[agimage, str])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1047,9 +1052,9 @@ def test_recover_agtype_outputs_dict_of_list_agfile():
 # ---------------------------------------------------------------------------
 
 def test_offload_skips_nested_list_agimage():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_url = "data:image/jpeg;base64," + "A" * (INPUT_OFFLOAD_CHARS + 1)
+    long_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(batches=[[long_url], [long_url]])
     schema = agdata(batches=list[list[agimage]])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1057,9 +1062,9 @@ def test_offload_skips_nested_list_agimage():
     assert paths == []
 
 def test_offload_skips_dict_of_list_agimage():
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
     sandbox = MagicMock()
-    long_url = "data:image/jpeg;base64," + "A" * (INPUT_OFFLOAD_CHARS + 1)
+    long_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(groups={"g": [long_url]})
     schema = agdata(groups=dict[str, list[agimage]])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1179,11 +1184,11 @@ def test_random_offload_agtype_skip_fuzz():
     """100 randomly generated single-field schemas: _offload_large_fields must
     skip fields whose hint contains any non-agrawstring agtype at any nesting
     depth, and must offload plain str and agrawstring fields when the value
-    exceeds INPUT_OFFLOAD_CHARS.
+    exceeds _AgSchemaFields.input_offload_chars.default.
     """
     import random
     from typing import get_origin, get_args
-    from agency.agdata import INPUT_OFFLOAD_CHARS
+    from agency.agschema import _AgSchemaFields
 
     rng = random.Random(20240629)
 
@@ -1214,7 +1219,7 @@ def test_random_offload_agtype_skip_fuzz():
             return any(hint_has_non_raw_agtype(a) for a in args)
         return False
 
-    long_str = "x" * (INPUT_OFFLOAD_CHARS + 1)
+    long_str = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
 
     failures = []
     for trial in range(100):

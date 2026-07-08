@@ -31,15 +31,19 @@ from datetime import datetime
 from pathlib import Path
 
 from agency import agent, agskill, agdata, agfile
+from agency.agconfig import agConfig
+from agency.agllm_backend import agVLLMBackendConfig
 from agency.agwebui import agwebui
 from agency.tools.human import make_ask_human
 
-# See ../README.md for Anthropic or Bedrock llm_config examples.
-LLM_CONFIG = {
-    "api_key":  os.environ.get("LLM_API_KEY", ""),
-    "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", ""),
-}
+# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+cfg = agConfig(
+    agVLLMBackendConfig(
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+    )
+)
 
 # ---------------------------------------------------------------------------
 # Human interaction helpers — called directly from Python, never delegated
@@ -101,8 +105,8 @@ def main() -> None:
 
     # ── Agents ───────────────────────────────────────────────────────────────
 
-    planner = agent(llm_config=LLM_CONFIG, agname="PlannerAgent")
-    writer  = agent(llm_config=LLM_CONFIG, agname="WriterAgent")
+    planner = agent(agconfig=cfg, agname="PlannerAgent")
+    writer  = agent(agconfig=cfg, agname="WriterAgent")
 
     # ask_human_tool runs in-process (run_in_subprocess=False) so it can reach the
     # live webUI singleton. Calling it directly from Python guarantees the
@@ -162,7 +166,7 @@ def main() -> None:
         print(f"{'─' * 60}")
 
         # ── Step 1: Ask human for scene description (Python-level) ───────────
-        print(f"[Scene {scene_num}] Waiting for scene description from human...")
+        print(f"[Scene {scene_num}] Waiting for scene description from human... (Please use the webUI to interact with the agent.)")
         scene_description = _ask(
             ask_human_tool,
             f"What scene would you like written next? "

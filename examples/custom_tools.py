@@ -28,15 +28,18 @@ import html2text
 import httpx
 
 from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
+from agency.agconfig import agConfig
+from agency.agllm_backend import agVLLMBackendConfig
 from agency.agutil import format_exception as _fmt_exc
 
-
-# See ../README.md for Anthropic or Bedrock llm_config examples.
-LLM_CONFIG = {
-    "api_key":  os.environ.get("LLM_API_KEY", ""),
-    "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", ""),
-}
+# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+cfg = agConfig(
+    agVLLMBackendConfig(
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+    )
+)
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 _MAX_CHARS = 32_000
 
@@ -216,8 +219,9 @@ class PaperCrawlerTeam(agteam):
         Research topic to search on arxiv.
     max_papers : int
         Maximum number of papers to fetch (default 16).
-    llm_config : dict | None
-        LLM endpoint config; falls back to the class-level default.
+    agconfig : agConfig | None
+        LLM endpoint config (and any other agconfig-based settings); falls
+        back to the class-level default.
 
     Usage::
 
@@ -225,7 +229,7 @@ class PaperCrawlerTeam(agteam):
         team.run()
     """
 
-    llm_config = LLM_CONFIG
+    agconfig = cfg
 
     def setup(self) -> None:
         max_p = getattr(self, "max_papers", MAX_PAPERS)

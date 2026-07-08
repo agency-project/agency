@@ -98,14 +98,6 @@ All Docker/Podman subprocess calls go through `_run()` in `agency/agsandbox.py`,
 | **Resource** | Counters `_gpus_acquired`, `cpus_acquired`, `memory_acquired_mb` |
 | **Acquisition** | `with self._res_lock:` around all counter increments and decrements in `acquire_gpu`, `release_gpu`, `acquire_resources`, `release_resources` |
 
-### `_llm_config_lock` — round-robin server selection
-| | |
-|---|---|
-| **File** | `agency/agllm.py:189` |
-| **Type** | `threading.Lock` |
-| **Resource** | Class-level counter `_llm_config_counter` used to distribute calls across a list of LLM server configs |
-| **Acquisition** | `with agllm._llm_config_lock:` inside `pick_llm_config()` (line 192) |
-
 ### `_global_token_lock` — global token counters
 | | |
 |---|---|
@@ -184,7 +176,6 @@ These are unbounded — they do not throttle resource usage but provide thread-s
 | `_container_semaphore` | agsandbox.py:86 | `multiprocessing.Semaphore` | `maxkeys − 5` | Simultaneously running containers (keyring quota) |
 | `_gpu_locks[id]` | agresources.py:180 | `threading.Semaphore(1)` per GPU | 1 per GPU | GPU exclusive ownership |
 | `_res_lock` | agresources.py:183 | `Lock` | — | Resource counters |
-| `_llm_config_lock` | agllm.py:189 | `Lock` | — | LLM server round-robin counter |
 | `_global_token_lock` | agent.py:74 | `Lock` | — | Global token counters |
 | `agname._lock` | agname.py | `Lock` | — | Agent name uniqueness |
 | `_pool_lock` | agtool.py:34 | `Lock` | — | ProcessPoolExecutor singleton |

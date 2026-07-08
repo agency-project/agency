@@ -11,18 +11,17 @@ import json
 
 from agency.agdata import agdata as _agdata, agerror as _agerror
 from agency.agcontext import agcontext
-from agency.agllm import (
-    _COMPACT_THRESHOLD,
-    _TAIL_MAX_TOKENS,
-    _TAIL_MIN_TOKENS,
-    _TAIL_FRACTION,
-    _TOOL_OUTPUT_MAX_CHARS,
-    _PRUNE_MIN_FREE_TOKENS,
-    _AgLLMFields,
-)
+from agency.agllm import _AgLLMFields
 
-TAIL_TURNS = _AgLLMFields.TAIL_TURNS
-DEFAULT_CONTEXT_LIMIT = _AgLLMFields.DEFAULT_CONTEXT_LIMIT
+_COMPACT_THRESHOLD     = _AgLLMFields.COMPACT_THRESHOLD
+_TAIL_MAX_TOKENS       = _AgLLMFields.TAIL_MAX_TOKENS
+_TAIL_MIN_TOKENS       = _AgLLMFields.TAIL_MIN_TOKENS
+_TAIL_FRACTION         = _AgLLMFields.TAIL_FRACTION
+_TOOL_OUTPUT_MAX_CHARS = _AgLLMFields.TOOL_OUTPUT_MAX_CHARS
+_PRUNE_MIN_FREE_TOKENS = _AgLLMFields.PRUNE_MIN_FREE_TOKENS
+
+TAIL_TURNS = _AgLLMFields.tail_turns.default
+DEFAULT_CONTEXT_LIMIT = _AgLLMFields.default_context_limit.default
 
 build_assistant_msg  = agllm.build_assistant_msg
 build_llm_kwargs     = agllm.build_llm_kwargs
@@ -285,8 +284,7 @@ def test_fetch_context_limit_falls_back_to_default(capsys):
     with patch("agency.agllm.openai.OpenAI") as MockCls:
         MockCls.return_value.models.list.side_effect = RuntimeError("offline")
         limit = fetch_context_limit({"model": "m"})
-    from agency.agllm import _DEFAULT_CONTEXT_LIMIT
-    assert limit == _DEFAULT_CONTEXT_LIMIT
+    assert limit == _AgLLMFields.default_context_limit.default
 
 def test_fetch_context_limit_reads_max_model_len():
     mock_model = MagicMock()
@@ -332,7 +330,8 @@ def test_agllm_no_context_limit_calls_fetch():
 def test_agllm_config_stored():
     cfg = {"model": "", "temperature": 0.5}
     llm = agllm(cfg, context_limit=128_000)
-    assert llm.config is cfg
+    assert llm.backend.model == ""
+    assert llm.backend.temperature == 0.5
 
 def test_agllm_build_kwargs_delegates():
     llm  = agllm({"model": "m"}, context_limit=128_000)
@@ -490,7 +489,7 @@ def test_llm_call_transient_error_retries_and_exhausts():
 
 def test_llm_call_transient_error_notifies_full_history_fn():
     from agency.agllm import _AgLLMFields
-    LLM_MAX_RETRIES = _AgLLMFields.LLM_MAX_RETRIES
+    LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
     cfg   = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs  = [{"role": "user", "content": "hi"}]
     err   = OSError("connection reset")
@@ -529,7 +528,7 @@ def test_llm_call_bare_api_error_retries_and_exhausts():
 
 def test_llm_call_bare_api_error_notifies_full_history_fn():
     from agency.agllm import _AgLLMFields
-    LLM_MAX_RETRIES = _AgLLMFields.LLM_MAX_RETRIES
+    LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
     cfg   = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs  = [{"role": "user", "content": "hi"}]
     err   = openai.APIError("server error", httpx.Request("POST", "http://x"), body=None)
@@ -571,7 +570,7 @@ def test_llm_call_rate_limit_honors_retry_after_header():
     the server-provided Retry-After duration when present — jitter is added
     on top, never subtracted, so this asserts a floor rather than equality."""
     from agency.agllm import _AgLLMFields
-    LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S = _AgLLMFields.LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S
+    LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S = _AgLLMFields.rate_limit_retry_after_jitter_s.default
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
@@ -613,7 +612,7 @@ def test_llm_call_rate_limit_falls_back_to_exponential_backoff_without_header():
     """Missing/unparseable Retry-After must not crash — fall back to bounded,
     jittered exponential backoff instead of raising a TypeError/ValueError."""
     from agency.agllm import _AgLLMFields
-    LLM_RATE_LIMIT_MAX_BACKOFF_S = _AgLLMFields.LLM_RATE_LIMIT_MAX_BACKOFF_S
+    LLM_RATE_LIMIT_MAX_BACKOFF_S = _AgLLMFields.rate_limit_max_backoff_s.default
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
@@ -636,7 +635,7 @@ def test_llm_call_rate_limit_exhausts_retries_without_raising():
     """The 429 must never propagate uncaught — this was the original bug
     (agskill.py crashing on anthropic.RateLimitError)."""
     from agency.agllm import _AgLLMFields
-    LLM_MAX_RETRIES = _AgLLMFields.LLM_MAX_RETRIES
+    LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
     cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(

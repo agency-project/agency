@@ -18,13 +18,17 @@ import time
 from pathlib import Path
 
 from agency import agent, agdata, agskill, agteam
+from agency.agconfig import agConfig
+from agency.agllm_backend import agVLLMBackendConfig
 
-# See ../README.md for Anthropic or Bedrock llm_config examples.
-LLM_CONFIG = {
-    "api_key":  os.environ.get("LLM_API_KEY", ""),
-    "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", ""),
-}
+# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+cfg = agConfig(
+    agVLLMBackendConfig(
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+    )
+)
 
 
 class ContinuationSkill(agskill):
@@ -68,7 +72,7 @@ def _make_run_dir(name: str) -> Path:
 class SequentialChainTeam(agteam):
     """One agent runs two file-write tasks sequentially via the history chain."""
 
-    llm_config = LLM_CONFIG
+    agconfig = cfg
 
     def setup(self) -> None:
         self.writer = WriterSkill()
@@ -96,7 +100,7 @@ class SequentialChainTeam(agteam):
 class ForkFanoutTeam(agteam):
     """Forks one agent per text; all summaries run concurrently."""
 
-    llm_config = LLM_CONFIG
+    agconfig = cfg
 
     # Default texts — override at construction time via texts=[ ... ]
     _default_texts = [

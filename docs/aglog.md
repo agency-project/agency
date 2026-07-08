@@ -9,7 +9,7 @@ from pathlib import Path
 from agency import agent
 
 agent.log_dir = Path("runs/logs")   # set before creating agents
-ag = agent(llm_config)
+ag = agent(agconfig=cfg)
 # writes to runs/logs/<agname>_timeline.jsonl  (structured event log)
 # writes to runs/logs/<agname>_history.jsonl   (raw LLM message transcript)
 ```
@@ -85,7 +85,7 @@ Each individual tool invocation is logged as a separate entry in `events` (but n
 {"type": "lifecycle", "event": "destroyed", "ts": "...", "agname": "..."}
 ```
 
-`context_limit` is included in `created` when a context window size was successfully determined at startup (from `llm_config` or the endpoint).
+`context_limit` is included in `created` when a context window size was successfully determined at startup (from `agconfig` or the endpoint).
 
 Outer monitoring loop events appear as lifecycle entries:
 

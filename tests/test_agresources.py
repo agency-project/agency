@@ -121,7 +121,7 @@ def test_detect_memory_mb_fallback_when_proc_missing(monkeypatch, tmp_path):
     fake.write_text("Garbage: 0\n")
     with patch("builtins.open", side_effect=FileNotFoundError):
         with patch("agency.agresources.subprocess.run", side_effect=FileNotFoundError):
-            assert detect_memory_mb() == _AgResourcePoolFields.MEMORY_DETECT_FALLBACK_MB
+            assert detect_memory_mb() == _AgResourcePoolFields.memory_detect_fallback_mb.default
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +143,8 @@ def test_pool_empty_gpus():
 
 def test_pool_default_idle_values():
     pool = agResourcePool(gpus=[], total_cpus=4, total_memory_mb=8192)
-    assert pool.idle_cpus == 0.5
-    assert pool.idle_memory == "512m"
+    assert pool.idle_cpus == 4.0
+    assert pool.idle_memory == "4096m"
 
 
 def test_pool_initial_acquired_counts_are_zero():

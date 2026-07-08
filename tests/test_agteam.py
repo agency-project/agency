@@ -3,6 +3,14 @@ import pytest
 from agency.agteam import agteam
 from agency.agskill import agskill
 from agency.agdata import agdata
+from agency.agconfig import agConfig
+
+
+def _llm_agconfig(d: dict) -> agConfig:
+    return agConfig({"agllm_backend": dict(d)})
+
+
+_ECHO_LLM = {"api_key": "k", "model": "m"}
 
 
 # ---------------------------------------------------------------------------
@@ -10,7 +18,7 @@ from agency.agdata import agdata
 # ---------------------------------------------------------------------------
 
 class _EchoTeam(agteam):
-    llm_config = {"api_key": "k", "model": "m"}
+    agconfig = _llm_agconfig(_ECHO_LLM)
 
     def setup(self):
         self.skill = agskill(name="echo", system_prompt="Echo.")
@@ -51,19 +59,19 @@ def test_init_multiple_kwargs_all_become_attributes():
     {"api_key": "y", "model": "claude-3", "base_url": "https://api.example.com"},
     {"api_key": "z", "model": "llama-3", "temperature": 0.7},
     {"api_key": "a", "model": "mistral"},
-    {},
 ])
-def test_init_llm_config_instance_override_does_not_affect_class(llm_cfg):
-    team = _EchoTeam(llm_config=llm_cfg)
-    assert team.llm_config is llm_cfg
-    assert _EchoTeam.llm_config == {"api_key": "k", "model": "m"}
+def test_init_agconfig_instance_override_does_not_affect_class(llm_cfg):
+    cfg = _llm_agconfig(llm_cfg)
+    team = _EchoTeam(agconfig=cfg)
+    assert team.agconfig is cfg
+    assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
     other = _EchoTeam()
-    assert other.llm_config == {"api_key": "k", "model": "m"}
+    assert other.agconfig.data.get("agllm_backend") == _ECHO_LLM
 
 
-def test_init_llm_config_none_falls_back_to_class_attr():
-    team = _EchoTeam(llm_config=None)
-    assert team.llm_config == {"api_key": "k", "model": "m"}
+def test_init_agconfig_none_falls_back_to_class_attr():
+    team = _EchoTeam(agconfig=None)
+    assert team.agconfig.data.get("agllm_backend") == _ECHO_LLM
 
 
 def test_init_calls_setup_before_returning():
@@ -100,7 +108,7 @@ def test_setup_runs_before_run():
 def test_base_agteam_setup_is_noop():
     t = agteam.__new__(agteam)
     t._agents = __import__("weakref").WeakSet()
-    t.llm_config = {}
+    t.agconfig = None
     t.setup()
 
 
@@ -133,8 +141,8 @@ def test_agent_inherits_team_llm_config(llm_cfg):
             self.ag = agent()
         def run(self): pass
 
-    team = _T(llm_config=llm_cfg)
-    assert team.ag.llm.config == llm_cfg
+    team = _T(agconfig=_llm_agconfig(llm_cfg))
+    assert team.ag.llm.backend.as_dict() == llm_cfg
 
 
 def test_multiple_agents_in_setup_all_registered():
@@ -147,7 +155,7 @@ def test_multiple_agents_in_setup_all_registered():
             self.a3 = agent()
         def run(self): pass
 
-    team = _MultiTeam(llm_config={"api_key": "k", "model": "m"})
+    team = _MultiTeam(agconfig=_llm_agconfig(_ECHO_LLM))
     assert len(team.agents) == 3
     assert team.a1 in team.agents
     assert team.a2 in team.agents
@@ -164,7 +172,7 @@ def test_agent_agname_kwarg_accepted():
             self.ag = agent(agname="my-custom-agent")
         def run(self): pass
 
-    team = _T(llm_config={"api_key": "k", "model": "m"})
+    team = _T(agconfig=_llm_agconfig(_ECHO_LLM))
     assert team.ag.agname == "my-custom-agent_0000"
 
 
@@ -185,7 +193,7 @@ def test_agents_property_contains_all_setup_agents():
             self.third  = agent()
         def run(self): pass
 
-    team = _T(llm_config={"api_key": "k", "model": "m"})
+    team = _T(agconfig=_llm_agconfig(_ECHO_LLM))
     agents = team.agents
     assert team.first  in agents
     assert team.second in agents
@@ -321,7 +329,7 @@ def test_repr_contains_class_name_and_agent_count(n_agents, expect_in_repr):
             self._ags = [agent() for _ in range(n_agents)]
         def run(self): pass
 
-    r = repr(_T(llm_config={"api_key": "k", "model": "m"}))
+    r = repr(_T(agconfig=_llm_agconfig(_ECHO_LLM)))
     assert "_T" in r
     assert expect_in_repr in r
 
@@ -348,16 +356,16 @@ def test_config_kwargs_are_independent_per_instance(key, vals):
         assert getattr(team, key) == expected
 
 
-def test_llm_config_overrides_are_independent_per_instance():
+def test_agconfig_overrides_are_independent_per_instance():
     cfgs = [
-        {"api_key": "a", "model": "m1"},
-        {"api_key": "b", "model": "m2"},
-        {"api_key": "c", "model": "m3"},
+        _llm_agconfig({"api_key": "a", "model": "m1"}),
+        _llm_agconfig({"api_key": "b", "model": "m2"}),
+        _llm_agconfig({"api_key": "c", "model": "m3"}),
     ]
-    teams = [_EchoTeam(llm_config=c) for c in cfgs]
+    teams = [_EchoTeam(agconfig=c) for c in cfgs]
     for team, cfg in zip(teams, cfgs):
-        assert team.llm_config is cfg
-    assert _EchoTeam.llm_config == {"api_key": "k", "model": "m"}
+        assert team.agconfig is cfg
+    assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
 
 
 def test_many_instances_each_have_own_agent_list():

@@ -12,13 +12,69 @@ import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from .agconfig import agConfig, GlobalConfigParam, StaticConfigParam
-from .agresources import detect_gpus
+from .agconfig import agConfig, GlobalConfigParam, StaticConfigParam, _AgConfigViewBase
+from .agresources import detect_gpus, _AgResourcePoolFields
 
 if TYPE_CHECKING:
     from .agresources import agResourcePool
     from .agterm import agterm
     from .aglog import aglog
+
+
+# Exists to register agSandbox's config fields (via __set_name__ at import
+# time) and hold their hardcoded defaults as plain class attributes --
+# agSandbox inherits from this below, so self.base_image etc. work via the
+# inherited ConfigParam descriptors exactly as if declared directly on it.
+# All fields here are tier 1 (global): agsandbox.py's subprocess-execution
+# layer is shared process-wide (docker/podman daemon calls, the container
+# semaphore, the keyring quota), and several of these values are also read
+# from bare module-level functions with no agSandbox instance/agconfig at
+# hand (e.g. _runtime_works, _docker_container_limit) -- GlobalConfigParam
+# lets both `self.xxx` (from an instance) and `_AgSandboxFields().xxx` (a
+# throwaway instance, from a module function) resolve identically.
+class _AgSandboxFields:
+    # Referenced by name elsewhere as def-time default arguments (bare
+    # class-attribute reads with no instance at hand) -- must stay plain
+    # attributes, not inlined into a ConfigParam.
+    DEFAULT_EXEC_TIMEOUT_S = 120  # Fallback for _run/_container_exec/exec when no explicit timeout is passed.
+    SEED_CACHE_TIMEOUT_S = 900    # seed_cache_from_image: copying a large pre-baked directory out of an image.
+    WAIT_PING_INTERVAL_S = 300    # wait_for_processes() fallback, overridden in practice by every real caller.
+    WAIT_POLL_INTERVAL_S = 5      # wait_for_processes() fallback, overridden in practice by every real caller.
+
+    base_image = StaticConfigParam("agSandbox", default="agency-sandbox:latest")
+    docker_semaphore_limit = GlobalConfigParam("agSandbox", default=16)
+
+    # Timeouts (seconds) for the various classes of docker/podman subprocess call.
+    inspect_timeout_s = GlobalConfigParam("agSandbox", default=120)      # Fast metadata queries: docker inspect, docker ps, nvidia-smi, docker update.
+    exec_quick_timeout_s = GlobalConfigParam("agSandbox", default=120)   # Quick in-container exec calls: kill <pids>, test -d, and similar.
+    docker_run_timeout_s = GlobalConfigParam("agSandbox", default=120)   # docker run: GPU init via the NVIDIA container runtime can take 60+ s under load.
+    docker_rm_timeout_s = GlobalConfigParam("agSandbox", default=120)    # docker rm -f: fast teardown; should complete in a few seconds.
+    file_io_timeout_s = GlobalConfigParam("agSandbox", default=120)      # In-container file I/O via docker exec (base64 read/write, mkdir).
+    image_timeout_s = GlobalConfigParam("agSandbox", default=120)        # docker images list / docker rmi.
+    commit_timeout_s = GlobalConfigParam("agSandbox", default=120)       # docker commit: snapshots a full overlay layer; large workspaces need extra time.
+    keyring_wait_timeout_s = GlobalConfigParam("agSandbox", default=120) # Maximum time to wait for a keyring slot before abandoning a docker run retry.
+
+    # _docker_container_limit(): concurrent-container cap derived from the kernel
+    # session-keyring quota (see that function's docstring for the full rationale).
+    container_limit_floor = GlobalConfigParam("agSandbox", default=4)      # Never cap below this many concurrent containers.
+    container_limit_buffer = GlobalConfigParam("agSandbox", default=5)     # Safety margin subtracted from the raw kernel/fallback quota.
+    container_limit_fallback = GlobalConfigParam("agSandbox", default=200) # Assumed kernel quota when /proc/sys/kernel/keys/maxkeys isn't readable.
+
+    # _run_with_conflict_retry(): retrying `docker run` on name-conflict/keyring errors.
+    conflict_retry_max_attempts = GlobalConfigParam("agSandbox", default=8)
+    keyring_poll_interval_s = GlobalConfigParam("agSandbox", default=5)              # Poll interval while waiting for a free keyring slot.
+    container_removal_wait_s = GlobalConfigParam("agSandbox", default=10)            # Max time to wait for a conflicting container to finish being removed.
+    container_removal_poll_interval_s = GlobalConfigParam("agSandbox", default=0.5)
+    conflict_retry_backoff_base_s = GlobalConfigParam("agSandbox", default=0.5)      # Multiplied by attempt number for linear backoff between retries.
+
+    # stop(): commit-then-remove teardown sequence.
+    stop_inspect_timeout_s = GlobalConfigParam("agSandbox", default=30)  # docker inspect (pre-commit image-id lookup).
+    commit_retry_attempts = GlobalConfigParam("agSandbox", default=3)
+    commit_retry_backoff_s = GlobalConfigParam("agSandbox", default=1)
+    stop_ps_check_timeout_s = GlobalConfigParam("agSandbox", default=10)  # docker ps (checking whether the old image is still in use).
+    rm_retry_attempts = GlobalConfigParam("agSandbox", default=3)
+    rm_retry_backoff_s = GlobalConfigParam("agSandbox", default=1)
+
 
 _BGPIDS_MARKER = "__BGPIDS__:"
 
@@ -64,27 +120,6 @@ def _get_docker_semaphore() -> threading.Semaphore:
                 _docker_semaphore = threading.Semaphore(limit)
     return _docker_semaphore
 
-# ---------------------------------------------------------------------------
-# Timeout constants (seconds)
-# ---------------------------------------------------------------------------
-# Fast metadata queries: docker inspect, docker ps, nvidia-smi, docker update.
-_TIMEOUT_INSPECT    = 120
-# Quick in-container exec calls: kill <pids>, test -d, and similar.
-_TIMEOUT_EXEC_QUICK = 120
-# docker run: GPU initialisation via the NVIDIA container runtime serialises
-# across concurrent containers and can take 60+ s under load.
-_TIMEOUT_DOCKER_RUN = 120
-# docker rm -f: fast teardown; should complete in a few seconds.
-_TIMEOUT_DOCKER_RM  = 120
-# In-container file I/O via docker exec (base64 read/write, mkdir).
-_TIMEOUT_FILE_IO    = 120
-# docker images list / docker rmi.
-_TIMEOUT_IMAGE      = 120
-# docker commit: snapshots a full overlay layer; large workspaces need extra time.
-_TIMEOUT_COMMIT     = 120
-# Maximum time to wait for a keyring slot before abandoning a docker run retry.
-_TIMEOUT_KEYRING_WAIT = 120
-
 # Hard cap on the number of simultaneously running Docker containers, derived from
 # the Linux kernel session-keyring quota.  Each running Docker container holds one
 # session keyring against the user that ran `docker run`; when total keys reach
@@ -97,10 +132,12 @@ _TIMEOUT_KEYRING_WAIT = 120
 # process (which calls stop/destroy).
 def _docker_container_limit() -> int:
     """Return the concurrent-Docker-container cap derived from the kernel keyring quota."""
+    _fields = _AgSandboxFields()
     try:
-        return max(4, int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip()) - 5)
+        maxkeys = int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip())
+        return max(_fields.container_limit_floor, maxkeys - _fields.container_limit_buffer)
     except OSError:
-        return 200 - 5
+        return _fields.container_limit_fallback - _fields.container_limit_buffer
 
 _container_semaphore: multiprocessing.Semaphore = multiprocessing.Semaphore(
     _docker_container_limit()
@@ -161,7 +198,7 @@ def _runtime_works(runtime: str) -> bool:
         proc = subprocess.run(
             [runtime, "info"],
             capture_output=True,
-            timeout=_TIMEOUT_INSPECT,
+            timeout=_AgSandboxFields().inspect_timeout_s,
         )
         return proc.returncode == 0
     except Exception:
@@ -198,7 +235,7 @@ def get_container_runtime() -> str:
     return _RUNTIME
 
 
-def seed_cache_from_image(host_dir, container_path: str, image: str, timeout: int = 900) -> None:
+def seed_cache_from_image(host_dir, container_path: str, image: str, timeout: int = _AgSandboxFields.SEED_CACHE_TIMEOUT_S) -> None:
     """Copy *container_path* out of *image* into *host_dir*, once, if *host_dir* is empty.
 
     For a shared host mount (see ``agSandboxConfig.add_mount``) that would
@@ -254,67 +291,47 @@ def _gpu_flags() -> list[str]:
         return _gpu_flags_cache
 
 
-class agSandboxConfig:
+class agSandboxConfig(_AgConfigViewBase):
     """View over an ``agConfig`` exposing ``agSandbox``'s own vocabulary
     (image, mounts) scoped to the ``"agSandbox"`` namespace.
 
-    Composition, not inheritance: the object propagated through
-    ``agent`` -> ``agllm``/``agSandbox`` is always a plain, class-agnostic
-    ``agConfig``. This wraps whichever one is at hand to give sandbox-
-    specific sugar without putting mount/image vocabulary on the shared
-    base class other framework classes also use.
+    ``base_image`` is a flat registered field, so it's just sugar over the
+    inherited ``update()``. ``mounts`` is a ``dict[str, tuple[str, str, str]]``
+    built incrementally (``add_mount``/``remove_mount`` read-modify-write it)
+    -- that doesn't fit ``update()``'s one-field-at-a-time-overwrite model, so
+    it's layered on top here directly via the raw ``agConfig`` get/set calls,
+    same as before this class subclassed ``_AgConfigViewBase``.
     """
 
-    CLASS_NAME = "agSandbox"
-
-    def __init__(self, agconfig: "agConfig | None" = None) -> None:
-        self._agconfig = agconfig if agconfig is not None else agConfig()
-
-    @property
-    def agconfig(self) -> "agConfig":
-        """The underlying, propagatable agConfig — pass this onward, not the view."""
-        return self._agconfig
+    _OWNER = "agSandbox"
 
     @property
     def base_image(self) -> str:
-        return self._agconfig.get_static(self.CLASS_NAME, "base_image", _AgSandboxFields.BASE_IMAGE)
+        return self._agconfig.get_static(self._OWNER, "base_image", _AgSandboxFields.base_image.default)
 
     def set_base_image(self, image: str) -> "agSandboxConfig":
-        self._agconfig.set(self.CLASS_NAME, "base_image", image)
-        return self
+        return self.update(base_image=image)
 
     @property
     def mounts(self) -> dict[str, tuple[str, str, str]]:
-        return self._agconfig.get_static(self.CLASS_NAME, "mounts", {})
+        return self._agconfig.get_static(self._OWNER, "mounts", {})
 
     def add_mount(self, name: str, host_path, container_path: str, mode: str = "rw") -> "agSandboxConfig":
         # Raw (non-locking) read: this is a builder mutating a not-yet-consumed
         # config, not a consumer resolving it — going through the `mounts`
         # property here would lock the key via get_static() on its own first
         # call and then immediately fail the .set() below.
-        current = self._agconfig.get(self.CLASS_NAME, "mounts", {})
+        current = self._agconfig.get(self._OWNER, "mounts", {})
         mounts = {**current, name: (str(host_path), container_path, mode)}
-        self._agconfig.set(self.CLASS_NAME, "mounts", mounts)
+        self._agconfig.set(self._OWNER, "mounts", mounts)
         return self
 
     def remove_mount(self, name: str) -> "agSandboxConfig":
-        current = self._agconfig.get(self.CLASS_NAME, "mounts", {})
+        current = self._agconfig.get(self._OWNER, "mounts", {})
         mounts = dict(current)
         mounts.pop(name, None)
-        self._agconfig.set(self.CLASS_NAME, "mounts", mounts)
+        self._agconfig.set(self._OWNER, "mounts", mounts)
         return self
-
-
-# Exists to register agSandbox's config fields (via __set_name__ at import
-# time) and hold their hardcoded defaults as plain class attributes --
-# agSandbox inherits from this below, so self.base_image etc. work via the
-# inherited ConfigParam descriptors exactly as if declared directly on it.
-class _AgSandboxFields:
-    BASE_IMAGE = "agency-sandbox:latest"
-    DOCKER_SEMAPHORE_LIMIT = 16
-
-    base_image = StaticConfigParam("agSandbox", default=BASE_IMAGE)
-    docker_semaphore_limit = GlobalConfigParam("agSandbox", default=DOCKER_SEMAPHORE_LIMIT)
 
 
 class agSandbox(_AgSandboxFields):
@@ -395,7 +412,7 @@ class agSandbox(_AgSandboxFields):
         """Return True if the named container is currently running in Docker/Podman."""
         result = self._run(
             [self._runtime, "inspect", "--format", "{{.State.Running}}", self._name],
-            check=False, timeout=_TIMEOUT_INSPECT,
+            check=False, timeout=self.inspect_timeout_s,
         )
         return result.returncode == 0 and result.stdout.strip() == b"true"
 
@@ -403,7 +420,7 @@ class agSandbox(_AgSandboxFields):
         """Return the container state string: 'running', 'exited', 'created', etc., or '' if not found."""
         result = self._run(
             [self._runtime, "inspect", "--format", "{{.State.Status}}", self._name],
-            check=False, timeout=_TIMEOUT_INSPECT,
+            check=False, timeout=self.inspect_timeout_s,
         )
         if result.returncode != 0:
             return ""
@@ -453,10 +470,13 @@ class agSandbox(_AgSandboxFields):
                 # Keep _checkpoint_image — not a one-shot restore, needed for future restarts.
             else:
                 image = self._resolve_image(self._base_image)
-                cpu_flags = ["--cpus=1"] if self._cfs_supported() else []
+                _pool_fields = _AgResourcePoolFields(self._agconfig)
+                limit_flags = [f"--memory={_pool_fields.idle_memory}"]
+                if self._cfs_supported():
+                    limit_flags.append(f"--cpus={_pool_fields.idle_cpus}")
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
-                    + cpu_flags + self._gpu_flags + self._vol_flags
+                    + limit_flags + self._gpu_flags + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
                 )
                 self._run_with_conflict_retry(run_cmd, name)
@@ -482,7 +502,8 @@ class agSandbox(_AgSandboxFields):
         self._baseline_pids = self._snapshot_pids()
 
     def _run_with_conflict_retry(self, run_cmd: list[str], name: str) -> None:
-        """Run a docker run command, retrying up to 3 times on name-conflict errors.
+        """Run a docker run command, retrying on name-conflict/keyring errors
+        up to conflict_retry_max_attempts times.
 
         A "Conflict / already in use" error can arise when a previous docker run
         call failed mid-way (e.g. GPU allocation timeout) and left a container
@@ -490,8 +511,8 @@ class agSandbox(_AgSandboxFields):
         stale entry and retry rather than surfacing an opaque error to the agent.
         """
         _last_stderr = ""
-        for attempt in range(8):
-            result = self._run(run_cmd, timeout=_TIMEOUT_DOCKER_RUN)
+        for attempt in range(self.conflict_retry_max_attempts):
+            result = self._run(run_cmd, timeout=self.docker_run_timeout_s)
             if result.returncode == 0:
                 return
             stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
@@ -505,11 +526,11 @@ class agSandbox(_AgSandboxFields):
                 # prevents our own containers from exceeding the limit, but external
                 # processes can consume slots outside our accounting.  Poll the
                 # actual keyring free count from /proc until a slot opens up.
-                deadline = time.monotonic() + _TIMEOUT_KEYRING_WAIT
+                deadline = time.monotonic() + self.keyring_wait_timeout_s
                 while time.monotonic() < deadline:
                     if keyring_quota().get("free", 0) > 0:
                         break
-                    time.sleep(5)
+                    time.sleep(self.keyring_poll_interval_s)
                 # docker run can partially succeed before failing with keyring:
                 # it creates the container object (reserving the name) but fails
                 # before starting processes.  Remove any such "Created" artifact
@@ -522,20 +543,20 @@ class agSandbox(_AgSandboxFields):
                 # Leftover container in a non-running state — remove it.
                 # Wait until it's actually gone before retrying docker run.
                 self._rm_container(name)
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + self.container_removal_wait_s
                 while time.monotonic() < deadline:
                     if not self._container_status():
                         break
-                    time.sleep(0.5)
+                    time.sleep(self.container_removal_poll_interval_s)
                 # If keyring is also full (docker created the object then hit
                 # the limit), wait for a slot before retrying — otherwise we'll
                 # create another "Created" container and loop on conflicts.
-                deadline = time.monotonic() + _TIMEOUT_KEYRING_WAIT
+                deadline = time.monotonic() + self.keyring_wait_timeout_s
                 while time.monotonic() < deadline:
                     if keyring_quota().get("free", 0) > 0:
                         break
-                    time.sleep(5)
-                time.sleep(0.5 * (attempt + 1))
+                    time.sleep(self.keyring_poll_interval_s)
+                time.sleep(self.conflict_retry_backoff_base_s * (attempt + 1))
             else:
                 msg = f"{' '.join(run_cmd[:3])} failed (exit {result.returncode})"
                 if stderr:
@@ -573,7 +594,7 @@ class agSandbox(_AgSandboxFields):
             "  __p=${__d##*/}\n"
             "  [ \"$__p\" != \"$__SELF\" ] && echo \"$__p\"\n"
             "done",
-            timeout=_TIMEOUT_INSPECT, shell="sh",
+            timeout=self.inspect_timeout_s, shell="sh",
         )
         pids: set[int] = set()
         for line in out.splitlines():
@@ -588,7 +609,7 @@ class agSandbox(_AgSandboxFields):
         *,
         check: bool = False,
         input: bytes | None = None,
-        timeout: int = 120,
+        timeout: int = _AgSandboxFields.DEFAULT_EXEC_TIMEOUT_S,
     ) -> subprocess.CompletedProcess[bytes]:
         with _get_docker_semaphore():
             try:
@@ -608,7 +629,7 @@ class agSandbox(_AgSandboxFields):
 
     def _rm_container(self, name: str) -> None:
         """Force-remove a container by name. Raises on failure."""
-        self._run([self._runtime, "rm", "-f", name], check=True, timeout=_TIMEOUT_DOCKER_RM)
+        self._run([self._runtime, "rm", "-f", name], check=True, timeout=self.docker_rm_timeout_s)
 
     def _rmi(self, image_ref: str, *, force: bool = False) -> None:
         """Remove an image by ID or tag. Raises on failure."""
@@ -616,13 +637,13 @@ class agSandbox(_AgSandboxFields):
         if force:
             cmd.append("-f")
         cmd.append(image_ref)
-        self._run(cmd, check=True, timeout=_TIMEOUT_IMAGE)
+        self._run(cmd, check=True, timeout=self.image_timeout_s)
 
     def _container_exec(
         self,
         sh_cmd: str,
         workdir: str = "/workspace",
-        timeout: int = 120,
+        timeout: int = _AgSandboxFields.DEFAULT_EXEC_TIMEOUT_S,
         stdin: bytes | None = None,
         shell: str = "bash",
     ) -> tuple[str, int]:
@@ -645,7 +666,7 @@ class agSandbox(_AgSandboxFields):
         self,
         cmd: str,
         workdir: str = "/workspace",
-        timeout: int = 120,
+        timeout: int = _AgSandboxFields.DEFAULT_EXEC_TIMEOUT_S,
     ) -> tuple[str, int]:
         """Run a user command inside the container."""
         # Lazily acquire a physical GPU now that we have a bash call to run.
@@ -726,11 +747,11 @@ class agSandbox(_AgSandboxFields):
         """
         import base64
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=_TIMEOUT_FILE_IO, shell="sh"
+            f"base64 {shlex.quote(path)}", timeout=self.file_io_timeout_s, shell="sh"
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
-                f"test -d {shlex.quote(path)}", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
+                f"test -d {shlex.quote(path)}", timeout=self.exec_quick_timeout_s, shell="sh"
             )
             if dir_rc == 0:
                 raise IsADirectoryError(f"Path is a directory, not a file: {path}")
@@ -756,11 +777,11 @@ class agSandbox(_AgSandboxFields):
         """
         import base64
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=_TIMEOUT_FILE_IO, shell="sh"
+            f"base64 {shlex.quote(path)}", timeout=self.file_io_timeout_s, shell="sh"
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
-                f"test -d {shlex.quote(path)}", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
+                f"test -d {shlex.quote(path)}", timeout=self.exec_quick_timeout_s, shell="sh"
             )
             if dir_rc == 0:
                 raise IsADirectoryError(f"Path is a directory, not a file: {path}")
@@ -781,7 +802,7 @@ class agSandbox(_AgSandboxFields):
             f"mkdir -p $(dirname {quoted}) && "
             f"printf '%s' {shlex.quote(b64)} | base64 -d > {quoted}"
         )
-        _, rc = self._container_exec(sh_cmd, timeout=_TIMEOUT_FILE_IO, shell="sh")
+        _, rc = self._container_exec(sh_cmd, timeout=self.file_io_timeout_s, shell="sh")
         if rc != 0:
             raise OSError(f"Failed to write binary file {path} in container")
 
@@ -789,7 +810,7 @@ class agSandbox(_AgSandboxFields):
         quoted = shlex.quote(path)
         sh_cmd = f"mkdir -p $(dirname {quoted}) && cat > {quoted}"
         _, rc = self._container_exec(
-            sh_cmd, stdin=content.encode("utf-8"), timeout=_TIMEOUT_FILE_IO, shell="sh"
+            sh_cmd, stdin=content.encode("utf-8"), timeout=self.file_io_timeout_s, shell="sh"
         )
         if rc != 0:
             raise OSError(f"Failed to write {path} in container")
@@ -811,7 +832,7 @@ class agSandbox(_AgSandboxFields):
         if len(cmd) == 2:
             return  # nothing to update
         cmd.append(self._container_name())
-        self._run(cmd, timeout=_TIMEOUT_INSPECT)
+        self._run(cmd, timeout=self.inspect_timeout_s)
 
     def commit(self, tag: str) -> bool:
         """Commit the container filesystem to a new image tag.
@@ -828,7 +849,7 @@ class agSandbox(_AgSandboxFields):
         self._run(
             [self._runtime, "commit", self._container_name(), tag],
             check=True,
-            timeout=_TIMEOUT_COMMIT,
+            timeout=self.commit_timeout_s,
         )
         return True
 
@@ -861,29 +882,29 @@ class agSandbox(_AgSandboxFields):
             try:
                 result = self._run(
                     [self._runtime, "inspect", "--format={{.Id}}", tag],
-                    check=False, timeout=30,
+                    check=False, timeout=self.stop_inspect_timeout_s,
                 )
                 if result and result.returncode == 0:
                     old_image_id = result.stdout.decode("utf-8", errors="replace").strip() or None
             except Exception:
                 pass
-            for _attempt in range(3):
+            for _attempt in range(self.commit_retry_attempts):
                 try:
                     self._run(
                         [self._runtime, "commit", self._container_name(), tag],
-                        check=True, timeout=_TIMEOUT_COMMIT,
+                        check=True, timeout=self.commit_timeout_s,
                     )
                     self._checkpoint_image = tag
                     break
                 except Exception as _e:
-                    if _attempt == 2:
+                    if _attempt == self.commit_retry_attempts - 1:
                         print(
                             f"[agsandbox] WARNING: docker commit {self._container_name()} → {tag} "
-                            f"failed after 3 attempts: {_e}",
+                            f"failed after {self.commit_retry_attempts} attempts: {_e}",
                             file=__import__("sys").stderr, flush=True,
                         )
                     else:
-                        time.sleep(1)
+                        time.sleep(self.commit_retry_backoff_s)
             # Delete the previous image now that the tag points to the new one.
             # Only delete if no containers are currently using it — a fork may still
             # be running from the same image.  The fork's own stop() will delete it
@@ -894,7 +915,7 @@ class agSandbox(_AgSandboxFields):
                         [self._runtime, "ps", "-a",
                          "--filter", f"ancestor={old_image_id}",
                          "--format", "{{.ID}}"],
-                        check=False, timeout=10,
+                        check=False, timeout=self.stop_ps_check_timeout_s,
                     )
                     if in_use and in_use.stdout.strip():
                         pass  # containers still running from this image — leave it
@@ -906,20 +927,20 @@ class agSandbox(_AgSandboxFields):
                         file=__import__("sys").stderr, flush=True,
                     )
         name = self._container_name()
-        for _attempt in range(3):
+        for _attempt in range(self.rm_retry_attempts):
             try:
                 self._rm_container(name)
                 break
             except Exception:
-                if _attempt == 2:
+                if _attempt == self.rm_retry_attempts - 1:
                     import traceback as _tb
                     print(
-                        f"[agsandbox] WARNING: docker rm -f {name} failed after 3 attempts:\n"
+                        f"[agsandbox] WARNING: docker rm -f {name} failed after {self.rm_retry_attempts} attempts:\n"
                         f"{_tb.format_exc()}",
                         file=__import__("sys").stderr, flush=True,
                     )
                 else:
-                    time.sleep(1)
+                    time.sleep(self.rm_retry_backoff_s)
         if self._runtime == "docker":
             _container_semaphore.release()
         self._started = False
@@ -936,7 +957,7 @@ class agSandbox(_AgSandboxFields):
                 pids = " ".join(str(p) for p in self._watched_pids)
                 try:
                     self._container_exec(
-                        f"kill {pids} 2>/dev/null; true", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
+                        f"kill {pids} 2>/dev/null; true", timeout=self.exec_quick_timeout_s, shell="sh"
                     )
                 except Exception as _e:
                     print(f"[agsandbox] WARNING: failed to kill PIDs {pids} in {self._name} during restore: {_e}")
@@ -974,7 +995,7 @@ class agSandbox(_AgSandboxFields):
             "  echo \"$__p $__ppid $__st $__nm\"\n"
             "done"
         )
-        output, _ = self._container_exec(script, timeout=_TIMEOUT_INSPECT, shell="sh")
+        output, _ = self._container_exec(script, timeout=self.inspect_timeout_s, shell="sh")
 
         proc_info: dict[int, tuple[int, str, str]] = {}   # pid → (ppid, state, name)
         for line in output.splitlines():
@@ -1103,7 +1124,7 @@ class agSandbox(_AgSandboxFields):
             pids = " ".join(str(p) for p in self._watched_pids)
             try:
                 self._container_exec(
-                    f"kill {pids} 2>/dev/null; true", timeout=_TIMEOUT_EXEC_QUICK, shell="sh"
+                    f"kill {pids} 2>/dev/null; true", timeout=self.exec_quick_timeout_s, shell="sh"
                 )
             except Exception as _e:
                 print(f"[agsandbox] WARNING: failed to kill PIDs {pids} in {container_name}: {_e}")
@@ -1131,7 +1152,7 @@ class agSandbox(_AgSandboxFields):
         try:
             result = self._run(
                 [self._runtime, "images", "--format", "{{.Repository}}:{{.Tag}}"],
-                timeout=_TIMEOUT_IMAGE,
+                timeout=self.image_timeout_s,
             )
             prefix = f"agency/pretool-{self._name}-"
             for line in result.stdout.decode("utf-8", errors="replace").splitlines():
@@ -1233,8 +1254,8 @@ class agSandbox(_AgSandboxFields):
         term: "agterm | None",
         log: "aglog | None" = None,
         agname: str = "",
-        ping_interval_s: float = 300,
-        poll_interval_s: float = 5,
+        ping_interval_s: float = _AgSandboxFields.WAIT_PING_INTERVAL_S,
+        poll_interval_s: float = _AgSandboxFields.WAIT_POLL_INTERVAL_S,
         state_fn: "Callable | None" = None,
     ) -> "str | None":
         """Wait for sandbox background processes after the LLM produces a final answer.

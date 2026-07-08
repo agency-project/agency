@@ -5,8 +5,10 @@ from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agent import agent
 from agency.agtool import agtool
+from agency.agconfig import agConfig
 
 LLM_CONFIG = {"api_key": "dummy", "model": ""}
+LLM_AGCONFIG = agConfig({"agllm_backend": LLM_CONFIG})
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +65,7 @@ def smoke_write_read_cycle():
         system_prompt="You manage files. Use write and read tools.",
     )
     # No tools= → uses default sandboxed tool list; files live in container
-    ag = agent(llm_config=LLM_CONFIG)
+    ag = agent(agconfig=LLM_AGCONFIG)
 
     responses = [
         _tool_call("write", {"file_path": "/workspace/greeting.txt", "content": "Hello, World!"}),
@@ -87,7 +89,7 @@ def smoke_history_shared_across_skills():
     """Two different skills share and accumulate history."""
     skill_a = agskill(name="a", system_prompt="Skill A")
     skill_b = agskill(name="b", system_prompt="Skill B")
-    ag = agent(llm_config=LLM_CONFIG)
+    ag = agent(agconfig=LLM_AGCONFIG)
 
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"turn": 1}')
@@ -106,7 +108,7 @@ def smoke_skill_own_tools():
     skill_t = agtool(name="skill_tool", description="", fn=_skill_tool_fn)
 
     skill = agskill(name="s", system_prompt="", add_tools=[skill_t])
-    ag = agent(llm_config=LLM_CONFIG)
+    ag = agent(agconfig=LLM_AGCONFIG)
 
     responses = [_tool_call("skill_tool", {}), _direct("{}")]
     with patch("openai.OpenAI") as MockClient:

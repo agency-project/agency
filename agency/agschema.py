@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from .agsandbox import agSandbox
     from .agconfig import agConfig
 
-from .agdata import agdata, agerror, INPUT_OFFLOAD_CHARS
+from .agdata import agdata, agerror
 from .agtype import (
     agtype,
     agrawstring,
@@ -23,20 +23,38 @@ from .agtype import (
     output_field_desc,
 )
 from .agutil import _looks_like_path
-from .agconfig import DynamicConfigParam
+from .agconfig import DynamicConfigParam, _AgConfigViewBase
 
 
 # Exists only to register agschema's config fields (via __set_name__ at
 # import time). Reads use a throwaway instance -- _AgSchemaFields(agconfig)
 # -- since agschema instances don't hold their own agconfig, so there's no
-# self to hang a descriptor on. INPUT_OFFLOAD_CHARS itself lives in agdata.py
-# (a genuinely shared, cross-file constant with its own external consumers),
-# not here -- only imported for this field's default.
+# self to hang a descriptor on.
 class _AgSchemaFields:
-    input_offload_chars = DynamicConfigParam("agschema", default=INPUT_OFFLOAD_CHARS)
+    # Maximum length of a string field that will be auto-offloaded to a
+    # sandbox file. Other code needing this same value (e.g. tests) reads
+    # the descriptor's frozen default directly: _AgSchemaFields.input_offload_chars.default
+    input_offload_chars = DynamicConfigParam("agschema", default=40_000)
+    # Cap the per-field offload threshold at a fraction of the context window
+    # (converted from tokens to chars) so a single oversized field can't eat
+    # the whole context on small-context models. Shared with agskill.py's
+    # tool-output offload sizing -- this class is the source of truth for both.
+    offload_context_fraction = DynamicConfigParam("agschema", default=0.1)
+    chars_per_token = DynamicConfigParam("agschema", default=4)
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
+
+
+class agSchemaConfig(_AgConfigViewBase):
+    """View over an agConfig for pre-setting agschema tunables in one call::
+
+        cfg = agConfig(agSchemaConfig(input_offload_chars=2000))
+
+    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
+    """
+
+    _OWNER = "agschema"
 
 
 def _type_error_fix(field_name: str, type_hint, value) -> str:
@@ -168,9 +186,10 @@ class agschema:
         the names of fields that were size-offloaded (used for the system prompt
         warning telling the LLM to read those files).
         """
-        _input_offload_chars = _AgSchemaFields(agconfig).input_offload_chars
+        _schema_fields = _AgSchemaFields(agconfig)
+        _input_offload_chars = _schema_fields.input_offload_chars
         _threshold = (
-            min(_input_offload_chars, int(context_limit * 0.1 * 4))
+            min(_input_offload_chars, int(context_limit * _schema_fields.offload_context_fraction * _schema_fields.chars_per_token))
             if context_limit
             else _input_offload_chars
         )

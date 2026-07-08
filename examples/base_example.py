@@ -19,13 +19,17 @@ OpenAI-compatible API example::
 import os
 from pathlib import Path
 from agency import agent, agskill, agdata
+from agency.agconfig import agConfig
+from agency.agllm_backend import agVLLMBackendConfig
 
-# See ../README.md for Anthropic or Bedrock llm_config examples.
-LLM_CONFIG = {
-    "api_key":  os.environ.get("LLM_API_KEY", ""),
-    "base_url": os.environ.get("LLM_BASE_URL"),
-    "model":    os.environ.get("LLM_MODEL", ""),
-}
+# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+cfg = agConfig(
+    agVLLMBackendConfig(
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+    )
+)
 
 def _make_run_dir(name: str):
     from datetime import datetime
@@ -71,7 +75,7 @@ def main():
     )
 
     # No tools= argument — uses the default sandboxed tool list
-    ag = agent(llm_config=LLM_CONFIG)
+    ag = agent(agconfig=cfg)
 
     print(f"Tools    : {[t.name for t in (file_skill.replace_tools or file_skill.add_tools or [])]}")
     print()

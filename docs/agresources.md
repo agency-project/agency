@@ -34,7 +34,24 @@ Each GPU ID gets a `threading.Semaphore(1)`. `acquire_gpu()` is called internall
 
 ## CPU and memory limits
 
-`cpu_acquire` calls `docker update --cpus=N --memory=Mg` on the live container, adjusting Linux cgroup limits without restarting. `0.5` CPUs means the container is throttled to at most half a core's worth of CPU time — it can see all cores but is rate-limited at the cgroup level. `cpu_release` resets to the idle defaults.
+`cpu_acquire` calls `docker update --cpus=N --memory=Mg` on the live container, adjusting Linux cgroup limits without restarting. `cpu_release` resets to the idle defaults (`pool.idle_cpus`/`pool.idle_memory`).
+
+A fresh container is created with the same `--cpus=<idle_cpus> --memory=<idle_memory>` limits (`_ensure_started()` in `agsandbox.py`) — the resting-state footprint every sandbox gets before any `reserve_cpu` call, and the one it's reset back to afterward. `idle_cpus`/`idle_memory` are `DynamicConfigParam`s under the `agResourcePool` owner, defaulting to 4 CPUs / 4096m:
+
+```python
+from agency.agconfig import agConfig
+from agency.agresources import agResourcePool, agResourcePoolConfig
+
+# Constructor kwargs (convenience, equivalent to the agConfig form below):
+pool = agResourcePool(idle_cpus=1.0, idle_memory="1024m")
+
+# agConfig form -- composes with the rest of an agent's config, and can be
+# changed live (it's Dynamic, not locked once read):
+cfg = agConfig(agResourcePoolConfig(idle_cpus=1.0, idle_memory="1024m"))
+pool = agResourcePool(agconfig=cfg)
+```
+
+`idle_cpus`/`idle_memory` are read from the *sandbox's own* `agconfig` at container-creation time (a throwaway `_AgResourcePoolFields(self._agconfig)` instance in `_ensure_started()`) — set them on whatever `agConfig` you pass to `agent(agconfig=...)`, not necessarily the same object `agent.agresource_pool` was built from, and they'll take effect for that agent's sandboxes.
 
 CPU and memory limits are set by the sandbox on each tool call via `update_limits()` and are not automatically restored by agresources. `release_resources()` is a manual call to reduce an `agSandbox`'s reported resource usage in the pool (e.g. when the sandbox is destroyed externally).
 
@@ -75,12 +92,13 @@ GPU semaphores and CPU/memory limits are returned even if the skill raises an ex
 
 ```python
 pool = agResourcePool(
-    gpus=None,             # list[int] or None for auto-detect
-    total_cpus=None,       # int or None for auto-detect
-    total_memory_mb=None,  # int or None for auto-detect
-    idle_cpus=0.5,         # CPU limit when idle (0.5 = half a core)
-    idle_memory="512m",    # memory limit when idle
-    mark_gpus=False,       # launch a marker process per GPU (see below)
+    gpus=None,                # list[int] or None for auto-detect
+    total_cpus=None,          # int or None for auto-detect
+    total_memory_mb=None,     # int or None for auto-detect
+    idle_cpus=None,           # None -> DynamicConfigParam default, 4.0 -- also the starting limit
+    idle_memory=None,         # None -> DynamicConfigParam default, "4096m" -- also the starting limit
+    mark_gpus=False,          # launch a marker process per GPU (see below)
+    agconfig=None,            # None -> a fresh, private agConfig
 )
 
 gpu_id = pool.acquire_gpu()  # blocks until a GPU is free; called internally by exec()

@@ -4,28 +4,36 @@ The `agent` class is the top-level orchestrator. It manages a sandbox container 
 
 ## Construction
 
+`agent` takes its LLM config exclusively via `agconfig=` — there is no `llm_config=` parameter. Build an `agConfig` with `agConfig(agLLMBackendConfig(...))` before constructing — see [`agconfig.md`](agconfig.md) for why this is always the form, even for a single owner's fields:
+
 ```python
 from agency import agent, agskill
+from agency.agconfig import agConfig
+from agency.agllm_backend import agLLMBackendConfig
 
-ag = agent(
-    llm_config={
-        "base_url": "http://localhost:8000/v1",
-        "api_key":  "EMPTY",
-        "model":    "meta-llama/Llama-3.1-8B-Instruct",
-    },
-)
+cfg = agConfig(agLLMBackendConfig(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+))
+
+ag = agent(agconfig=cfg)
 ```
 
-`llm_config` is passed to every skill run. Any OpenAI-compatible endpoint works via `base_url`.
+The `agconfig` is passed to every skill run. Any OpenAI-compatible endpoint works via `cfg.agllm_backend.base_url`. See [`agllm.md`](agllm.md) for the full field reference.
 
 No sandbox is created at construction time. Within a task, a sandbox is started lazily — only when a tool with `run_in_subprocess=True` is first called. Tasks that use only host-side tools never create a sandbox at all. When a sandbox is started, it is committed to a checkpoint image (`agency/ckpt-<pid>-<agname>`) when the task completes and then destroyed.
 
-An optional `"context_limit"` key in `llm_config` pins the model's context window size for auto-compaction. If omitted, the agent queries the endpoint at startup (vLLM exposes `max_model_len`). Compaction is silently disabled when the limit cannot be determined.
+An optional `context_limit` field pins the model's context window size for auto-compaction. If omitted, the agent queries the endpoint at startup (vLLM exposes `max_model_len`). Compaction is silently disabled when the limit cannot be determined.
 
 ```python
 # explicit override — useful for non-vLLM backends
-llm_config = {..., "context_limit": 131072}
+cfg.agllm_backend.context_limit = 131072
 ```
+
+Because the agent's `agconfig` is stored as-is (not copied), fields can be changed live after construction — `ag.agconfig.agllm_backend.model = "..."` takes effect on the agent's next LLM call, no `set_llm_config`-style method needed.
+
+Inside an `agteam`, agents created with no explicit `agconfig=` automatically inherit the team's `agconfig` — see [`agteam.md`](agteam.md).
 
 ## Running a skill
 
@@ -91,7 +99,7 @@ See [agsandbox.md](agsandbox.md) for mount implementation details.
 Each agent is assigned a unique pronounceable name (adjective + noun, e.g. `swift_hawk`) if none is provided. Pass `agname` to use a specific base name:
 
 ```python
-ag = agent(llm_config, agname="worker")
+ag = agent(agconfig=cfg, agname="worker")
 # ag.agname == "worker_0000"
 ```
 

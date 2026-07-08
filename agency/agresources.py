@@ -6,42 +6,54 @@ import subprocess
 import threading
 import time
 
-from .agconfig import GlobalConfigParam
+from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
-# Exists only to register agResourcePool's config fields (via __set_name__ at
-# import time). All four are tier 1 (global): read once at process-wide
-# resource-detection time, or gate a shared pool, never per-instance. Reads
-# use a throwaway instance -- _AgResourcePoolFields() -- since __init__ does
-# nothing but (optionally) store an agconfig, and GlobalConfigParam ignores
-# it anyway, always routing to agConfig.GLOBAL.
+# Exists to register agResourcePool's config fields (via __set_name__ at
+# import time). The detection/gating tunables are tier 1 (global): read once
+# at process-wide resource-detection time, shared regardless of which
+# agconfig (if any) is in play. idle_cpus/idle_memory are tier 3 (dynamic):
+# a per-agent sandbox resource footprint, not a process-wide constant, so
+# they're read fresh from whichever agConfig the consumer holds
+# (agResourcePool itself, or a throwaway instance reading a sandbox's own
+# agconfig -- see agsandbox.py's _ensure_started(), which also applies these
+# as the container's starting limits, not just its idle-reset limits).
 class _AgResourcePoolFields:
-    GPU_DETECT_TIMEOUT_S = 10           # Seconds to wait for nvidia-smi or rocm-smi to respond before giving up
-    SYSCTL_DETECT_TIMEOUT_S = 5         # Seconds to wait for sysctl hw.memsize to respond on macOS
-    MEMORY_DETECT_FALLBACK_MB = 4096    # Safe fallback total RAM in MB when detection fails on both Linux and macOS
-    GPU_ACQUIRE_POLL_INTERVAL_S = 0.25  # Seconds between polling attempts when waiting for a free GPU semaphore
+    gpu_detect_timeout_s = GlobalConfigParam("agResourcePool", default=10)          # Seconds to wait for nvidia-smi/rocm-smi before giving up
+    sysctl_detect_timeout_s = GlobalConfigParam("agResourcePool", default=5)        # Seconds to wait for sysctl hw.memsize on macOS
+    memory_detect_fallback_mb = GlobalConfigParam("agResourcePool", default=4096)   # Safe fallback total RAM in MB when detection fails on both Linux and macOS
+    gpu_acquire_poll_interval_s = GlobalConfigParam("agResourcePool", default=0.25)  # Seconds between polls waiting for a free GPU semaphore
+    marker_mb = GlobalConfigParam("agResourcePool", default=128)  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
 
-    gpu_detect_timeout_s = GlobalConfigParam("agResourcePool", default=GPU_DETECT_TIMEOUT_S)
-    sysctl_detect_timeout_s = GlobalConfigParam("agResourcePool", default=SYSCTL_DETECT_TIMEOUT_S)
-    memory_detect_fallback_mb = GlobalConfigParam("agResourcePool", default=MEMORY_DETECT_FALLBACK_MB)
-    gpu_acquire_poll_interval_s = GlobalConfigParam("agResourcePool", default=GPU_ACQUIRE_POLL_INTERVAL_S)
+    # CPU/memory limit applied both when a sandbox container is first created
+    # (docker run) and whenever it's reset to idle (docker update, via
+    # cpu_release) -- the same footprint at rest either way.
+    idle_cpus = DynamicConfigParam("agResourcePool", default=4.0)
+    idle_memory = DynamicConfigParam("agResourcePool", default="4096m")
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
 
 
-# VRAM held per GPU as a framework presence marker (visible in nvidia-smi).
-_MARKER_MB = 128
-_MARKER_BYTES = _MARKER_MB * 1024 * 1024
+class agResourcePoolConfig(_AgConfigViewBase):
+    """View over an agConfig for pre-setting agResourcePool tunables in one call::
+
+        cfg = agConfig(agResourcePoolConfig(gpu_detect_timeout_s=20))
+
+    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
+    """
+
+    _OWNER = "agResourcePool"
 
 
 def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
-    """Allocate _MARKER_MB of VRAM on each GPU directly in the calling process.
+    """Allocate marker_mb of VRAM on each GPU directly in the calling process.
 
     Uses the CUDA driver API via ctypes — no torch dependency required.
     Allocations live for the process lifetime, which is fine: the memory is
-    tiny (128 MB per GPU) and there is no need to release it mid-run.
+    tiny (128 MB per GPU by default) and there is no need to release it mid-run.
     Runs silently if CUDA is unavailable.
     """
+    marker_bytes = _AgResourcePoolFields().marker_mb * 1024 * 1024
     try:
         cuda = ctypes.CDLL("libcuda.so.1")
     except OSError:
@@ -68,7 +80,7 @@ def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
             ptr = ctypes.c_void_p()
             if cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) != 0:
                 continue
-            cuda.cuMemAlloc_v2(ctypes.byref(ptr), _MARKER_BYTES)
+            cuda.cuMemAlloc_v2(ctypes.byref(ptr), marker_bytes)
             # Leave context current; allocation persists for the process lifetime.
         except Exception:
             pass
@@ -158,7 +170,7 @@ def detect_memory_mb() -> int:
     return _AgResourcePoolFields().memory_detect_fallback_mb
 
 
-class agResourcePool:
+class agResourcePool(_AgResourcePoolFields):
     """Manages shared GPU tokens and CPU/memory limits for all sandboxes.
 
     All parameters are optional — call ``agResourcePool()`` with no arguments
@@ -176,8 +188,14 @@ class agResourcePool:
         agent.agresource_pool = agResourcePool(gpus=[0], total_cpus=8, total_memory_mb=16384)
 
     ``total_cpus`` and ``total_memory_mb`` set the ceiling for ``reserve_cpu``
-    (what an agent may request). ``idle_cpus`` / ``idle_memory`` are the limits
-    applied when no work is running (restored by ``cpu_release``).
+    (what an agent may request). ``idle_cpus``/``idle_memory`` are the
+    resting-state limits -- applied both when a sandbox container is first
+    created (see ``agsandbox.py``'s ``_ensure_started()``) and whenever it's
+    reset to idle afterward (restored by ``cpu_release``). Both are
+    ``DynamicConfigParam`` -- inherited from ``_AgResourcePoolFields``, so
+    they're re-read live from whichever ``agconfig`` this pool holds; the
+    keyword arguments below are just a convenience for setting them at
+    construction without building an ``agResourcePoolConfig`` separately.
     """
 
     def __init__(
@@ -185,15 +203,20 @@ class agResourcePool:
         gpus: list[int] | None = None,
         total_cpus: int | None = None,
         total_memory_mb: int | None = None,
-        idle_cpus: float = 0.5,
-        idle_memory: str = "512m",
+        idle_cpus: float | None = None,
+        idle_memory: str | None = None,
         mark_gpus: bool = False,
+        agconfig: "agConfig | None" = None,
     ) -> None:
+        self._agconfig = agconfig if agconfig is not None else agConfig()
+        for _name, _value in (
+            ("idle_cpus", idle_cpus), ("idle_memory", idle_memory),
+        ):
+            if _value is not None:
+                self._agconfig.set("agResourcePool", _name, _value)
         self.gpus = list(gpus) if gpus is not None else detect_gpus()
         self.total_cpus = total_cpus if total_cpus is not None else detect_cpus()
         self.total_memory_mb = total_memory_mb if total_memory_mb is not None else detect_memory_mb()
-        self.idle_cpus = idle_cpus
-        self.idle_memory = idle_memory
         self._gpu_locks: dict[int, threading.Semaphore] = {
             gpu_id: threading.Semaphore(1) for gpu_id in self.gpus
         }

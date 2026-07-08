@@ -47,7 +47,7 @@
 from agency.agwebui import agwebui
 
 def main():
-    ag = agent(llm_config=..., agname="MyAgent")
+    ag = agent(agconfig=..., agname="MyAgent")
     result = ag.run(my_skill, agdata(topic="..."))
     print(result.output)
 

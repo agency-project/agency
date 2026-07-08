@@ -20,12 +20,6 @@ _DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-CHECKPOINT_SAVE_TIMEOUT_S = 600
-CHECKPOINT_LOAD_TIMEOUT_S = 600
-
 from .agdata import agdata
 from .agcontext import agcontext
 from .aglog import aglog, _ts
@@ -33,9 +27,32 @@ from .agterm import agterm
 from .agsandbox import agSandbox, agSandboxConfig
 from .agresources import agResourcePool
 from .agllm import agllm
-from .agconfig import agConfig
+from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname
+
+
+# Exists only to register agent's config fields (via __set_name__ at import
+# time). Reads use a throwaway instance -- _AgAgentFields(agconfig) -- since
+# these values are needed in a classmethod (load()) and an instance method
+# (save()) that doesn't otherwise inherit from this class.
+class _AgAgentFields:
+    checkpoint_save_timeout_s = DynamicConfigParam("agent", default=600)
+    checkpoint_load_timeout_s = DynamicConfigParam("agent", default=600)
+
+    def __init__(self, agconfig=None) -> None:
+        self._agconfig = agconfig
+
+
+class agAgentConfig(_AgConfigViewBase):
+    """View over an agConfig for pre-setting agent tunables in one call::
+
+        cfg = agConfig(agAgentConfig(checkpoint_save_timeout_s=300))
+
+    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
+    """
+
+    _OWNER = "agent"
 
 
 def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_default):
@@ -109,7 +126,6 @@ class agent:
 
     def __init__(
         self,
-        llm_config: "dict | list[dict] | None" = None,
         agname: str | None = None,
         *,
         llm: "agllm | None" = None,
@@ -119,20 +135,25 @@ class agent:
         self.agconfig: "agConfig | None" = agconfig if agconfig is not None else agent.default_agconfig
 
         if llm is None:
-            if llm_config is None and self.agconfig is not None:
-                llm_config = self.agconfig.get("agllm", "llm_config", None)
-            if llm_config is None:
+            if self.agconfig is None or not self.agconfig.data.get("agllm_backend"):
                 from ._context import _active_team as _at
                 _t = _at.get(None)
-                if _t is not None:
-                    llm_config = _t.llm_config
+                if _t is not None and _t.agconfig is not None and _t.agconfig.data.get("agllm_backend"):
+                    # Adopt the team's agconfig outright (not just for the LLM
+                    # fields) -- log_dir/output_dir/sandbox settings etc. should
+                    # also come from it, matching "agents inherit the team's
+                    # agconfig automatically" (see agteam's docstring).
+                    self.agconfig = _t.agconfig
                 else:
-                    raise TypeError("agent() requires llm_config or llm= when called outside an agteam context")
-            llm_config = agllm.pick_llm_config(llm_config)
+                    raise TypeError(
+                        "agent() requires an agconfig with LLM fields set "
+                        "(e.g. cfg.agllm_backend.model = ...), or llm=, "
+                        "when called outside an agteam context"
+                    )
 
         self.agname: _agname = _agname.allocate_agname(agname)
 
-        self.llm: agllm                = llm if llm is not None else agllm(llm_config, agconfig=self.agconfig)
+        self.llm: agllm                = llm if llm is not None else agllm(self.agconfig)
         self.ctx: agcontext            = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -162,12 +183,12 @@ class agent:
 
         ctx = f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
         team_tag = f"  team={team_name}" if team_name else ""
-        self.terminal.log("CREATED  ", f"model={self.llm.config.get('model','?')}{ctx}{team_tag}")
+        self.terminal.log("CREATED  ", f"model={self.llm.backend.model or '?'}{ctx}{team_tag}")
         self.log._lifecycle(
             "created",
             agname=self.agname,
             team=team_name,
-            llm_config={k: v for k, v in self.llm.config.items() if k != "api_key"},
+            llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             context_limit=self.llm.context_limit,
         )
 
@@ -206,14 +227,6 @@ class agent:
     def full_history(self) -> list[dict]:
         """Append-only transcript: every message ever sent/received."""
         return list(self._full_history)
-
-    # ------------------------------------------------------------------
-    # LLM config helpers
-    # ------------------------------------------------------------------
-
-    def set_llm_config(self, llm_config: dict) -> None:
-        """Replace the agent's LLM config and refresh the context limit."""
-        self.llm = agllm(dict(llm_config), agconfig=self.agconfig)
 
     def set_full_history(self, history: list[dict]) -> None:
         self._full_history = copy.deepcopy(history)
@@ -354,7 +367,7 @@ class agent:
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname)
         ag.agconfig = src.agconfig
-        ag.llm = agllm(src.llm.config, agconfig=ag.agconfig)
+        ag.llm = agllm(ag.agconfig)
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
@@ -389,7 +402,7 @@ class agent:
             agname=ag.agname,
             parent_agname=src.agname,
             team=team_name,
-            llm_config={k: v for k, v in ag.llm.config.items() if k != "api_key"},
+            llm_config={k: v for k, v in ag.llm.backend.as_dict().items() if k != "api_key"},
         )
         return ag
 
@@ -416,7 +429,7 @@ class agent:
     def load_all(
         cls,
         directory: "Path | str",
-        llm_config: dict,
+        agconfig: "agConfig | None" = None,
     ) -> "list[agent]":
         directory = Path(directory)
         live_names = {ag.agname: ag for ag in cls.all()}
@@ -432,7 +445,7 @@ class agent:
                 existing.terminal.log("CKPT     ", f"load_all: {agname} already live, skipping {ckpt.name}")
                 restored.append(existing)
             else:
-                ag = cls.load(ckpt, llm_config=llm_config)
+                ag = cls.load(ckpt, agconfig=agconfig)
                 restored.append(ag)
 
         return restored
@@ -452,7 +465,7 @@ class agent:
 
         state = {
             "agname":     self.agname,
-            "llm_config": {k: v for k, v in self.llm.config.items() if k != "api_key"},
+            "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             "history":    self.ctx.messages,
             "ts":         _ts(),
         }
@@ -463,7 +476,8 @@ class agent:
         if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
             agSandbox.tag_image(self.sandbox._checkpoint_image, image_tag)
             try:
-                image_bytes = agSandbox.export_image(image_tag, CHECKPOINT_SAVE_TIMEOUT_S)
+                _save_timeout = _AgAgentFields(self.agconfig).checkpoint_save_timeout_s
+                image_bytes = agSandbox.export_image(image_tag, _save_timeout)
                 with tarfile.open(path, "w:gz") as tar:
                     for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
                         info = tarfile.TarInfo(name=name)
@@ -485,10 +499,16 @@ class agent:
     def load(
         cls,
         path: "Path | str",
-        llm_config: dict,
         agconfig: "agConfig | None" = None,
     ) -> "agent":
-        """Restore an agent from a checkpoint file created by agent.save()."""
+        """Restore an agent from a checkpoint file created by agent.save().
+
+        The checkpointed LLM config (everything except ``api_key``, which
+        ``save()`` strips) is merged into ``agconfig``'s ``agllm_backend``
+        fields -- a field already set explicitly on ``agconfig`` (e.g.
+        ``cfg.agllm_backend.api_key = ...``, to restore the secret ``save()``
+        dropped) wins over the checkpointed value.
+        """
         path = Path(path)
         image_tag = f"agency/ckpt-restore-{_uuid_mod.uuid4().hex[:8]}"
 
@@ -499,7 +519,8 @@ class agent:
 
         checkpoint: str | None = None
         if image_bytes is not None:
-            agSandbox.import_image(image_bytes, CHECKPOINT_LOAD_TIMEOUT_S)
+            _load_timeout = _AgAgentFields(agconfig).checkpoint_load_timeout_s
+            agSandbox.import_image(image_bytes, _load_timeout)
             original_tag = f"agency/ckpt-{state['agname']}"
             agSandbox.tag_image(original_tag, image_tag)
             agSandbox.delete_image(original_tag)
@@ -507,8 +528,13 @@ class agent:
 
         ag: agent = cls.__new__(cls)
         ag.agname        = _agname.claim_unique_agname(state["agname"])
-        ag.agconfig      = agconfig if agconfig is not None else agent.default_agconfig
-        ag.llm           = agllm({**state.get("llm_config", {}), **llm_config}, agconfig=ag.agconfig)
+        _base_agconfig   = agconfig if agconfig is not None else agent.default_agconfig
+        ag.agconfig      = _base_agconfig.clone() if _base_agconfig is not None else agConfig()
+        _already_set     = _base_agconfig.data.get("agllm_backend", {}) if _base_agconfig is not None else {}
+        for k, v in state.get("llm_config", {}).items():
+            if k not in _already_set:
+                ag.agconfig.set("agllm_backend", k, v)
+        ag.llm           = agllm(ag.agconfig)
         ag.ctx           = agcontext(messages=list(state.get("history", [])))
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None

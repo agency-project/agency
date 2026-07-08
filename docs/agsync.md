@@ -87,7 +87,7 @@ The fix is an `agsync` barrier between the two calls, placed so the first invoca
 ```python
 class WriterTeam(agteam):
     def setup(self):
-        self.feedback_team = FeedbackTeam(llm_config=self.llm_config)
+        self.feedback_team = FeedbackTeam(agconfig=self.agconfig)
         ...
 
     def run(self, scene_goal, design_doc, previous_scenes=""):

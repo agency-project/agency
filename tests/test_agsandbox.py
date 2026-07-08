@@ -107,6 +107,10 @@ class TestDetectGpus:
         mock.returncode = 0
         mock.stdout = "0\n1\n2\n"
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock)
+        # Isolate from whatever CUDA_VISIBLE_DEVICES happens to be set to on
+        # the host running this test -- this test is about nvidia-smi output
+        # parsing, not _cvd_filter (see TestCvdFilter for that).
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         assert detect_gpus() == [0, 1, 2]
 
     def test_cvd_filter_applied_to_nvidia_smi_output(self, monkeypatch):
@@ -227,6 +231,10 @@ class TestPoolAutoDetect:
         mock.returncode = 0
         mock.stdout = "0\n1\n"
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock)
+        # Isolate from the host's real CUDA_VISIBLE_DEVICES -- this test is
+        # about auto-detection wiring, not CVD filtering (see
+        # test_pool_auto_detect_respects_cvd for that).
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         pool = agResourcePool()
         assert pool.gpus == [0, 1]
 
@@ -1073,7 +1081,7 @@ class TestAgSandboxPIDTracking:
         self.sb.destroy()
 
     def test_background_pid_tracked(self):
-        self.sb.exec("sleep 5 &")
+        self.sb.exec("sleep 30 &")
         assert len(self.sb._watched_pids) > 0
 
     def test_foreground_spawned_child_tracked(self):
@@ -1081,7 +1089,7 @@ class TestAgSandboxPIDTracking:
         # The child escapes jobs -p but must still be captured via /proc diffing.
         self.sb.write_file("/workspace/spawner.py", (
             "import subprocess, time\n"
-            "subprocess.Popen(['sleep', '5'])\n"   # detached child, not waited on
+            "subprocess.Popen(['sleep', '30'])\n"   # detached child, not waited on
         ))
         self.sb.exec("python3 /workspace/spawner.py")
         assert len(self.sb._watched_pids) > 0
@@ -1091,7 +1099,7 @@ class TestAgSandboxPIDTracking:
         # escapes any BFS from the original PID. Baseline diff must find it.
         self.sb.write_file("/workspace/spawner.py", (
             "import subprocess, os\n"
-            "subprocess.Popen(['sleep', '5'])\n"  # child detaches
+            "subprocess.Popen(['sleep', '30'])\n"  # child detaches
             "os._exit(0)\n"                        # parent exits immediately
         ))
         self.sb.exec("python3 /workspace/spawner.py")
@@ -1106,9 +1114,9 @@ class TestAgSandboxPIDTracking:
             "import subprocess, time\n"
             "# Spawn two long-lived children after a brief pause\n"
             "time.sleep(0.2)\n"
-            "subprocess.Popen(['sleep', '5'])\n"
-            "subprocess.Popen(['sleep', '5'])\n"
-            "time.sleep(5)\n"   # parent also stays alive
+            "subprocess.Popen(['sleep', '30'])\n"
+            "subprocess.Popen(['sleep', '30'])\n"
+            "time.sleep(30)\n"   # parent also stays alive
         ))
         self.sb.exec("python3 /workspace/parent.py &")
         time.sleep(0.5)          # let the parent spawn its children
@@ -1123,7 +1131,7 @@ class TestAgSandboxPIDTracking:
             "import os, time\n"
             "if os.fork() == 0:\n"          # first fork
             "    if os.fork() == 0:\n"      # second fork — grandchild
-            "        time.sleep(5)\n"      # grandchild runs in background
+            "        time.sleep(30)\n"      # grandchild runs in background
             "    os._exit(0)\n"             # intermediate child exits
             "os.wait()\n"                   # parent waits for intermediate child
         ))
@@ -1131,7 +1139,7 @@ class TestAgSandboxPIDTracking:
         assert len(self.sb._watched_pids) > 0
 
     def test_get_live_pids_returns_running(self):
-        self.sb.exec("sleep 5 &")
+        self.sb.exec("sleep 30 &")
         live = self.sb.get_live_pids()
         assert len(live) > 0
 
@@ -1146,7 +1154,7 @@ class TestAgSandboxPIDTracking:
         assert self.sb.get_live_pids() == set()
 
     def test_daemon_release_removes_pid_from_monitoring(self):
-        self.sb.exec("sleep 5 &")
+        self.sb.exec("sleep 30 &")
         live = self.sb.get_live_pids()
         assert len(live) > 0
         for pid in list(live):
@@ -1157,13 +1165,13 @@ class TestAgSandboxPIDTracking:
         # Release a parent as daemon; children it spawns later must also be excluded.
         self.sb.write_file("/workspace/daemon_parent.py", (
             "import subprocess, time\n"
-            "subprocess.Popen(['sleep', '5'])\n"
-            "time.sleep(5)\n"
+            "subprocess.Popen(['sleep', '30'])\n"
+            "time.sleep(30)\n"
         ))
         self.sb.exec("python3 /workspace/daemon_parent.py &")
         live = self.sb.get_live_pids()
         assert len(live) > 0
-        # Release the parent; its child (sleep 5) should also be excluded
+        # Release the parent; its child (sleep 30) should also be excluded
         for pid in list(live):
             self.sb.release_daemon(pid)
         time.sleep(0.3)   # let the child spawn
@@ -1174,7 +1182,7 @@ class TestAgSandboxPIDTracking:
         assert "no background" in summary
 
     def test_pid_status_summary_with_running_process(self):
-        self.sb.exec("sleep 5 &")
+        self.sb.exec("sleep 30 &")
         summary = self.sb.pid_status_summary()
         assert "PID" in summary
         assert "running" in summary
@@ -1269,7 +1277,7 @@ class TestSandboxedTools:
     def test_daemon_release_tool_stops_monitoring(self):
         # Start a background process, get its PID, release it as daemon,
         # verify the outer loop would no longer wait for it.
-        self.tools["bash"].fn(agdata(command="sleep 5 &"))
+        self.tools["bash"].fn(agdata(command="sleep 30 &"))
         live_before = self.sb.get_live_pids()
         assert len(live_before) > 0
         for pid in list(live_before):
@@ -1290,7 +1298,7 @@ class TestResourceTools:
     @docker
     def setup_method(self, _):
         self.sb = _make_sandbox()
-        self.pool = agResourcePool(gpus=[0, 1], idle_cpus=0.5, idle_memory="512m")
+        self.pool = agResourcePool(gpus=[0, 1], idle_cpus=1.0, idle_memory="1024m")
         from agency.tools import make_sandboxed_tools
         self.tools = {t.name: t for t in make_sandboxed_tools(self.sb, self.pool)}
 
@@ -1382,7 +1390,12 @@ class TestResourceTools:
     def test_physical_gpu_held_while_background_process_running(self):
         """Physical GPU stays held while a background process is alive."""
         self.tools["reserve_gpu"].fn(agdata())
-        self.sb.exec("sleep 5 &")
+        # A generous ceiling, not an actual wait -- killed explicitly below.
+        # Needs enough margin over real `docker exec` round-trip latency
+        # (get_live_pids() does its own exec to walk /proc, GPU-passthrough
+        # containers add overhead classifying nvidia_entrypoi helpers) that a
+        # loaded host doesn't let it expire mid-test.
+        self.sb.exec("sleep 30 &")
         live = self.sb.get_live_pids()
         assert len(live) > 0
         assert self.sb._gpu_id is not None
@@ -1392,7 +1405,7 @@ class TestResourceTools:
     def test_same_physical_gpu_used_for_subsequent_exec_during_background_process(self):
         """While a background process holds the GPU, subsequent exec() calls use the same GPU."""
         self.tools["reserve_gpu"].fn(agdata())
-        self.sb.exec("sleep 5 &")
+        self.sb.exec("sleep 30 &")  # ceiling, not a real wait -- see comment above
         self.sb.get_live_pids()
         first_gpu_id = self.sb._gpu_id
         assert first_gpu_id is not None
@@ -1452,7 +1465,7 @@ class TestResourceTools:
     def test_gpu_release_also_frees_physical_gpu_held_by_background_process(self):
         """gpu_release forcibly releases a physical GPU even while a background process runs."""
         self.tools["reserve_gpu"].fn(agdata())
-        self.sb.exec("sleep 5 &")
+        self.sb.exec("sleep 30 &")
         self.sb.get_live_pids()
         assert self.sb._gpu_id is not None
         self.tools["gpu_release"].fn(agdata())
@@ -1473,7 +1486,7 @@ class TestResourceTools:
     def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self):
         """release_resources() clears _gpu_virtual and returns any held physical GPU."""
         self.tools["reserve_gpu"].fn(agdata())
-        self.sb.exec("sleep 5 &")
+        self.sb.exec("sleep 30 &")
         self.sb.get_live_pids()
         assert self.sb._gpu_id is not None
         self.sb.release_resources(self.pool)
@@ -1502,8 +1515,8 @@ class TestResourceTools:
         self.tools["reserve_cpu"].fn(agdata(cpus=4.0, memory="2g"))
         result = self.tools["cpu_release"].fn(agdata())
         assert not isinstance(result, agerror)
-        assert "0.5" in result.message
-        assert "512m" in result.message
+        assert "1.0" in result.message
+        assert "1024m" in result.message
 
 
 # ---------------------------------------------------------------------------

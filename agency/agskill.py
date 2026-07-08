@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agtype import agtype
-from .agschema import agschema
+from .agschema import agschema, _AgSchemaFields
 from .agcontext import agcontext
 from .agtool import agtool, dispatch_tools, _AgToolFields
 from .agllm import agllm
 from .agsandbox import agSandbox, agSandboxConfig
-from .agconfig import agConfig, DynamicConfigParam
+from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
 from .aglog import _ts
 
@@ -24,14 +24,24 @@ from .aglog import _ts
 # different agents with different agconfigs), so there's no self to hang a
 # descriptor on.
 class _AgSkillFields:
-    AGSKILL_REACT_MAX_STEPS = 4096
-    AGBINARY_VALIDATE_EXEC_TIMEOUT = 5  # Seconds per container exec call when validating agbinary output.
-
-    react_max_steps = DynamicConfigParam("agskill", default=AGSKILL_REACT_MAX_STEPS)
-    agbinary_validate_exec_timeout = DynamicConfigParam("agskill", default=AGBINARY_VALIDATE_EXEC_TIMEOUT)
+    react_max_steps = DynamicConfigParam("agskill", default=4096)
+    agbinary_validate_exec_timeout = DynamicConfigParam("agskill", default=5)
+    error_log_truncate = DynamicConfigParam("agskill", default=300)
+    last_output_log_truncate = DynamicConfigParam("agskill", default=2000)
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
+
+
+class agSkillConfig(_AgConfigViewBase):
+    """View over an agConfig for pre-setting agskill tunables in one call::
+
+        cfg = agConfig(agSkillConfig(react_max_steps=64))
+
+    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
+    """
+
+    _OWNER = "agskill"
 
 
 if TYPE_CHECKING:
@@ -282,8 +292,6 @@ class agskill:
         ts_start = _ts()
         resource_pool = type(ag).agresource_pool
 
-        SKILL_ERROR_LOG_TRUNCATE = 300
-
         def _task() -> None:
             outer_result: agdata | None = None
             updated_ctx: agcontext = prev_ctx
@@ -355,7 +363,8 @@ class agskill:
             input_dict  = skill_input.to_dict()
             result_dict = outer_result.to_dict()
             if result_dict.get("error"):
-                ag.terminal.log("SKILL ✗  ", f"{self.name}  error={str(result_dict['error'])[:SKILL_ERROR_LOG_TRUNCATE]}")
+                _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate
+                ag.terminal.log("SKILL ✗  ", f"{self.name}  error={str(result_dict['error'])[:_error_log_truncate]}")
                 ag._append_full_history({"type": "skill_error", "skill": self.name,
                                          "error": str(result_dict["error"])})
             else:
@@ -539,7 +548,7 @@ class agskill:
             if ag.terminal:
                 _ctx_str = f"/{ag.llm.context_limit}" if ag.llm.context_limit else ""
                 _tok_str = f"  tokens={llm_result.prompt_tokens}{_ctx_str}" if llm_result.prompt_tokens else ""
-                ag.terminal.log("LLM ✓    ", f"model={ag.llm.config.get('model','?')}  ({llm_result.elapsed_ms}ms){_tok_str}")
+                ag.terminal.log("LLM ✓    ", f"model={ag.llm.backend.model or '?'}  ({llm_result.elapsed_ms}ms){_tok_str}")
             if ag._set_ui_state:
                 ag._set_ui_state("skill", skill=self.name)
 
@@ -562,11 +571,12 @@ class agskill:
             # 6f. Dispatch tool calls, or check if we can move to the output path.
             if msg_dict.get("tool_calls"):
                 _base_offload_chars = _AgToolFields(ag.agconfig).output_offload_chars
+                _schema_fields = _AgSchemaFields(ag.agconfig)
                 dispatch_tools(
                     msg_dict["tool_calls"], toolkit, messages, ag.sandbox, self.name,
                     ag._set_ui_state, ag._push_live_messages, ag._append_full_history, ag.terminal,
                     tool_offload_chars=(
-                        max(_base_offload_chars, int(ag.llm.context_limit * 0.1 * 4))
+                        max(_base_offload_chars, int(ag.llm.context_limit * _schema_fields.offload_context_fraction * _schema_fields.chars_per_token))
                         if ag.llm.context_limit else _base_offload_chars
                     ),
                     agconfig=ag.agconfig,
@@ -610,7 +620,8 @@ class agskill:
                     _last_out_str = ""
                     if _last_asst:
                         if _last_asst.get("content"):
-                            _last_out_str = str(_last_asst["content"])[:2000]
+                            _truncate = _AgSkillFields(ag.agconfig).last_output_log_truncate
+                            _last_out_str = str(_last_asst["content"])[:_truncate]
                         elif _last_asst.get("tool_calls"):
                             _names = [
                                 tc.get("function", {}).get("name", "?")

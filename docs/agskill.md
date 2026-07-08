@@ -167,7 +167,7 @@ This means threads running other agents get 100 ms of uncontested GIL time for e
 
 ### Generation parameters
 
-Standard OpenAI generation parameters set in `llm_config` are forwarded directly to every API call. vLLM-specific parameters that are not part of the OpenAI spec are merged into `extra_body` automatically.
+Standard OpenAI generation parameters set on the agent's `agconfig` (`cfg.agllm_backend.<field>`) are forwarded directly to every API call. vLLM-specific parameters that are not part of the OpenAI spec are merged into `extra_body` automatically.
 
 **Standard OpenAI parameters** (forwarded directly):
 
@@ -189,18 +189,18 @@ Standard OpenAI generation parameters set in `llm_config` are forwarded directly
 | `min_p`, `min_tokens` | — |
 | `guided_json`, `guided_regex` | — |
 
-Any value already in `llm_config["extra_body"]` is preserved; vLLM-specific keys are added on top.
+Any value already set on `cfg.agllm_backend.extra_body` is preserved; vLLM-specific keys are added on top.
 
 ```python
-LLM_CONFIG = {
-    "base_url": "http://localhost:8000/v1",
-    "model": "Qwen/Qwen3-30B",
-    "temperature": 0.6,
-    "max_tokens": 16000,
-    "top_p": 0.95,
-    "top_k": 50,
-    "repetition_penalty": 1.1,
-}
+cfg = agConfig(agLLMBackendConfig(
+    base_url="http://localhost:8000/v1",
+    model="Qwen/Qwen3-30B",
+    temperature=0.6,
+    max_tokens=16000,
+    top_p=0.95,
+    top_k=50,
+    repetition_penalty=1.1,
+))
 ```
 
 ### Tool output offloading
@@ -510,7 +510,7 @@ from agency import agteam, agdata
 from agency.common_skills import FindPapersSkill, SummarisePaperSkill, CompileReportSkill
 
 class PaperCrawlerTeam(agteam):
-    llm_config = LLM_CONFIG
+    agconfig = cfg
 
     def setup(self):
         self.find_papers     = FindPapersSkill(max_papers=10)

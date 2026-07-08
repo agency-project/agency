@@ -32,25 +32,31 @@ The sandbox image comes with `torch torchvision transformers datasets accelerate
 
 ## Quick start
 
+Agents don't take LLM config directly — build an `agConfig` and pass it as `agconfig=`. The canonical way to build one is `agConfig(agXXXConfig(...), ...)` — never `agXXXConfig(...).agconfig` directly — since it's the same shape whether you're setting one owner's fields or composing several (see [`agconfig.md`](docs/agconfig.md) and [`Design_configuration.md`](docs/Design_configuration.md)). Each backend has its own config class (`agVLLMBackendConfig`, `agOpenAIBackendConfig`, `agAnthropicBackendConfig`, `agBedrockBackendConfig`) that fixes `provider` for you and only accepts the fields that backend actually reads — an unknown or silently-ignored-by-that-backend field raises `TypeError` immediately instead of quietly never reaching the API call. The generic `agLLMBackendConfig` (accepts every field, for any provider, including `anthropicAWS`) is still available for cases the dedicated classes don't cover. See [`agllm.md`](docs/agllm.md) for the full field reference and the alternative `cfg.agllm_backend.<field> = value` form for setting/changing fields one at a time.
+
 **OpenAI-compatible endpoint (vLLM, local, etc.)**
 
 ```python
 from agency import agent, agskill, agdata
+from agency.agconfig import agConfig
+from agency.agllm_backend import agVLLMBackendConfig
 
 continuation = agskill(
-    name="summarise",
+    name="continuation",
     system_prompt="Continue the sentence.",
     input_schema=agdata(text=str),
     output_schema=agdata(summary=str),
 )
 
-ag = agent(
-    llm_config={
-        "base_url": "http://localhost:8000/v1",
-        "api_key":  "", # Leave blank if unused
-        "model":    "", # Will auto-detect if using vLLM, need to specify if using Ollama
-    },
+cfg = agConfig(
+    agVLLMBackendConfig(
+        base_url="http://localhost:8000/v1",
+        api_key="",  # Leave blank if unused
+        model="",    # Will auto-detect if using vLLM, need to specify if using Ollama
+    )
 )
+
+ag = agent(agconfig=cfg)
 
 result = ag.run(continuation, agdata(text="Fly me to the moon and let me "))
 print(result.summary)   # blocks until done
@@ -59,48 +65,63 @@ print(result.summary)   # blocks until done
 **OpenAI**
 
 ```python
-ag = agent(
-    llm_config={
-        "base_url": "https://api.openai.com/v1"
-        "model":   os.environ["LLM_MODEL"],
-        "api_key": os.environ["OPENAI_API_KEY"],
-    },
+from agency.agconfig import agConfig
+from agency.agllm_backend import agOpenAIBackendConfig
+
+cfg = agConfig(
+        agOpenAIBackendConfig(
+        base_url="https://api.openai.com/v1",
+        model=os.environ["LLM_MODEL"],
+        api_key=os.environ["OPENAI_API_KEY"],
+    )
 )
+
+ag = agent(agconfig=cfg)
 ```
 
-This is the same default backend used for vLLM/local endpoints above — omit `base_url` and it talks to `https://api.openai.com/v1`. Unlike the other providers, the API key isn't picked up from an environment variable automatically; pass it explicitly.
+This is the same underlying backend used for vLLM/local endpoints above — omit `base_url` and it talks to `https://api.openai.com/v1`. Unlike the other providers, the API key isn't picked up from an environment variable automatically; pass it explicitly.
 
 **Anthropic**
 
 ```python
-ag = agent(
-    llm_config={
-        "provider": "anthropic",
-        "model":    "claude-sonnet-5",
-        "api_key":  os.environ["ANTHROPIC_API_KEY"]
-    },
+from agency.agconfig import agConfig
+from agency.agllm_backend import agAnthropicBackendConfig
+
+cfg = agConfig(
+        agAnthropicBackendConfig(
+        model="claude-sonnet-5",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+    )
 )
+
+ag = agent(agconfig=cfg)
 ```
 
 Requires the `anthropic` package (`pip install anthropic`). 
-For Claude on Bedrock, set `"provider": "bedrock"` instead (see below) — it's picked automatically for `anthropic.*` model IDs. 
-For Claude via AWS's direct Anthropic-on-AWS API, use `"provider": "anthropicAWS"`.
+For Claude on Bedrock, use `agBedrockBackendConfig` instead (see below) — it's picked automatically for `anthropic.*` model IDs. 
+For Claude via AWS's direct Anthropic-on-AWS API, use the generic `agLLMBackendConfig(provider="anthropicAWS", ...)` — there's no dedicated class for it yet.
 
 **Amazon Bedrock**
 
 Credentials are picked up automatically from the environment (IAM role, `~/.aws/credentials`, SSO, etc.). `aws_bedrock_token_generator` (included in dependencies) exchanges them for a bearer token on each request.
 
 ```python
-ag = agent(
-    llm_config={
-        "provider": "bedrock",
-        "region":   "us-east-2",
-        "model":    "nvidia.nemotron-super-3-120b",
-    },
+from agency.agconfig import agConfig
+from agency.agllm_backend import agBedrockBackendConfig
+
+cfg = agConfig(
+        agBedrockBackendConfig(
+        region="us-east-2",
+        model="nvidia.nemotron-super-3-120b",
+    )
 )
+
+ag = agent(agconfig=cfg)
 ```
 
-Pass `"api_key": "bedrock-api-key-..."` to use a static Bedrock API key instead of IAM credentials.
+Pass `api_key="bedrock-api-key-..."` to `agBedrockBackendConfig(...)` to use a static Bedrock API key instead of IAM credentials. If `model` resolves to an Anthropic model on Bedrock, only the fields `agAnthropicBackendConfig` accepts actually take effect — everything else is silently ignored by that code path, same as calling `agAnthropicBackendConfig` directly.
+
+Need both LLM backend fields and something else (a sandbox mount, an agent tunable) on the same `agConfig`? Pass several views to one `agConfig(...)` call: `agConfig(agVLLMBackendConfig(...), agSandboxConfig().add_mount("out", path, "/agent_output"))`. See [`agconfig.md`](docs/agconfig.md) for the full mechanics.
 
 ## Core concepts
 
@@ -243,6 +264,7 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | [Design_parallelization.md](docs/Design_parallelization.md) | Parallelism model — threads, GIL, process pool, LLM streaming |
 | [Design_resource_control.md](docs/Design_resource_control.md) | All semaphores and locks — what each guards and how it is acquired |
 | [Design_error_handling.md](docs/Design_error_handling.md) | All try/except blocks, retry loops, error emissions, and propagation paths |
+| [Design_configuration.md](docs/Design_configuration.md) | Configuring agents/teams, the tiered parameter system, adding custom config params |
 
 
 ### Implementation
@@ -250,6 +272,7 @@ Most tests mock the OpenAI client and run entirely in-process (no container need
 | File | Topic |
 |---|---|
 | [agent.md](docs/agent.md) | Agent construction, `run()`, forking, context, UI callbacks |
+| [agconfig.md](docs/agconfig.md) | `agConfig` storage model, `ConfigParam` tiers, `FIELD_REGISTRY`, `_AgConfigViewBase`, `_ALLOWED_FIELDS` |
 | [agcontext.md](docs/agcontext.md) | Persistent conversation state — message history, token counts, compaction summary |
 | [agdata.md](docs/agdata.md) | Data container — pending results, schema types, serialization, error handling |
 | [agllm.md](docs/agllm.md) | LLM wrapper — streaming calls, message construction, compaction, Bedrock support |

@@ -63,13 +63,14 @@ Compaction runs at most once per ReAct step (after the LLM fires, before tool di
 
 The context limit is determined once at agent creation, in this order:
 
-1. `llm_config["context_limit"]` — explicit user override
+1. `cfg.agllm_backend.context_limit` — explicit user override
 2. `GET /v1/models` → `max_model_len` — vLLM exposes this on the model list response. `list()` is always used instead of `retrieve()` because model names containing `/` would produce a malformed URL with `retrieve()`.
 3. `DEFAULT_CONTEXT_LIMIT` (128 000) — safe fallback so compaction always runs even when the API is unreachable at agent creation time.
 
 ```python
 # explicit override (useful for non-vLLM backends)
-ag = agent(llm_config={..., "context_limit": 131072}, ...)
+cfg.agllm_backend.context_limit = 131072
+ag = agent(agconfig=cfg)
 ```
 
 The detected limit is logged at agent creation:

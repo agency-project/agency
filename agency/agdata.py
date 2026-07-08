@@ -9,19 +9,13 @@ if TYPE_CHECKING:
 from .agtype import agtype
 from .agutil import _camel_to_snake
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# Maximum length of a string field that will be auto-offloaded to a sandbox file.
-INPUT_OFFLOAD_CHARS: int = 40_000
 
 class AgError(RuntimeError):
     """Raised when accessing a non-error field on an agerror instance."""
 
 
 class agdata:
-    """Generic data container with JSON/dict serialization.
+    """Generic data container with dict serialization.
 
     An agdata may be in a *pending* state when created by agent.run() or
     agteam.run().  In that case it wraps a Future[agdata] internally.  Any

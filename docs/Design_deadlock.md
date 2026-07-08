@@ -43,7 +43,7 @@ This is the most common pattern. A `WriterTeam` holds a `FeedbackTeam` in `setup
 ```python
 class WriterTeam(agteam):
     def setup(self):
-        self.feedback_team = FeedbackTeam(llm_config=self.llm_config)
+        self.feedback_team = FeedbackTeam(agconfig=self.agconfig)
         ...
 
     def run(self, scene_goal, design_doc, previous_scenes=""):
@@ -88,7 +88,7 @@ review = self.feedback_team.run(draft=current_draft, ...)
 An agent is created outside any team and passed to two teams that both run concurrently. Each team's `run()` body calls `shared.run()` from its own thread.
 
 ```python
-shared = agent(llm_config=LLM_CONFIG, agname="Shared")
+shared = agent(agconfig=cfg, agname="Shared")
 
 class TeamA(agteam):
     def run(self):
@@ -134,7 +134,7 @@ b.run()             # TeamB registers on shared after TeamA
 The main thread calls `agent.run()` and then submits an agteam that also calls the same agent — but the agteam's daemon thread can execute before the main thread's first call has registered.
 
 ```python
-shared = agent(llm_config=LLM_CONFIG, agname="Shared")
+shared = agent(agconfig=cfg, agname="Shared")
 
 class SummaryTeam(agteam):
     def run(self):

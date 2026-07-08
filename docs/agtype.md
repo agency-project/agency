@@ -287,7 +287,7 @@ For `list[agimage]` with N images, the placeholder reads `"[N image(s) attached]
 
 ### Requirements
 
-The model in `llm_config` must support multimodal input (vision). Passing `agimage` fields to a text-only model will produce a provider-side error or silently ignored images depending on the backend.
+The model set on the agent's `agconfig` (`cfg.agllm_backend.model`) must support multimodal input (vision). Passing `agimage` fields to a text-only model will produce a provider-side error or silently ignored images depending on the backend.
 
 ## Built-in subclass: `agrawstring`
 

@@ -143,7 +143,7 @@ The `__BGPIDS__` annotation is stripped before output is returned to the LLM. PI
 
 ```python
 sb = agSandbox(agname)
-sb = agSandbox(agname, agconfig=agSandboxConfig(agConfig()).add_mount("out", Path("runs/agent_output"), "/agent_output").agconfig)
+sb = agSandbox(agname, agconfig=agConfig(agSandboxConfig().add_mount("out", Path("runs/agent_output"), "/agent_output")))
 sb = agSandbox(agname, lifecycle_image="agency/lifecycle-myagent")
 
 # Construction is cheap — no Docker calls until _ensure_started() runs.

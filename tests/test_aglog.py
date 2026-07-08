@@ -4,13 +4,15 @@ from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.aglog import aglog
 from agency.agent import agent
+from agency.agconfig import agConfig
 
 
 def make_agent(tools=None) -> agent:
     kwargs = {}
     if tools is not None:
         kwargs["tools"] = tools
-    return agent(llm_config={"api_key": "k", "model": "m"}, **kwargs)
+    cfg = agConfig({"agllm_backend": {"api_key": "k", "model": "m"}})
+    return agent(agconfig=cfg, **kwargs)
 
 
 def make_skill(name: str = "s", out: dict | None = None):

@@ -6,6 +6,7 @@ from agency.agteam import agteam
 from agency.agdata import agdata
 from agency.agent import agent
 from agency._context import _active_team
+from agency.agconfig import agConfig
 
 
 # ---------------------------------------------------------------------------
@@ -13,11 +14,12 @@ from agency._context import _active_team
 # ---------------------------------------------------------------------------
 
 LLM_CFG = {"api_key": "k", "model": "m"}
+LLM_AGCONFIG = agConfig({"agllm_backend": LLM_CFG})
 
 
 class _SimpleTeam(agteam):
     """One agent, run() returns immediately."""
-    llm_config = LLM_CFG
+    agconfig = LLM_AGCONFIG
 
     def setup(self):
         self.ag = agent()
@@ -105,6 +107,7 @@ def test_agsync_raises_on_nested_list():
 @pytest.mark.parametrize("n_agents", [1, 2, 3, 5])
 def test_agsync_resolves_all_agents_in_team(n_agents):
     class _T(agteam):
+        agconfig = LLM_AGCONFIG
         def setup(self):
             self.ags = [agent() for _ in range(n_agents)]
         def run(self): pass
@@ -245,7 +248,7 @@ def test_agsync_does_not_raise_for_idle_team_that_had_no_error():
 
 def test_fork_agents_created_in_run_are_auto_registered():
     class _T(agteam):
-        llm_config = LLM_CFG
+        agconfig = LLM_AGCONFIG
         def setup(self):
             self.parent = agent()
         def run(self):
@@ -266,7 +269,7 @@ def test_fork_agents_created_in_run_are_auto_registered():
 def test_agents_in_setup_are_tracked():
     """All agents created in setup() are auto-tracked — setup runs inside the team context."""
     class _T(agteam):
-        llm_config = LLM_CFG
+        agconfig = LLM_AGCONFIG
         def setup(self):
             self.parent = agent()
             self.fork = agent.fork(self.parent)   # fork in setup — also tracked
@@ -281,7 +284,7 @@ def test_agents_in_setup_are_tracked():
 def test_fork_agents_tracked_in_run_thread():
     """Auto-registration must work in the background thread used by run()."""
     class _T(agteam):
-        llm_config = LLM_CFG
+        agconfig = LLM_AGCONFIG
         def setup(self):
             self.parent = agent()
         def run(self):
@@ -297,7 +300,7 @@ def test_fork_agents_tracked_in_run_thread():
 @pytest.mark.parametrize("n_forks", [1, 2, 5, 8])
 def test_fork_agents_scale_correctly(n_forks):
     class _T(agteam):
-        llm_config = LLM_CFG
+        agconfig = LLM_AGCONFIG
         def setup(self):
             self.parent = agent()
         def run(self):
@@ -313,7 +316,7 @@ def test_fork_agents_scale_correctly(n_forks):
 def test_no_duplicate_registration_on_multiple_run_calls():
     """An agent created in setup() must not appear twice after run() is called."""
     class _T(agteam):
-        llm_config = LLM_CFG
+        agconfig = LLM_AGCONFIG
         def setup(self):
             self.ag = agent()
         def run(self): return agdata(done=True)

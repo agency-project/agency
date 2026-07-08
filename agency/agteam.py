@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
 from ._context import _active_team
+from .agconfig import agConfig
 
 if TYPE_CHECKING:
     from .agent import agent as _Agent
@@ -23,8 +24,13 @@ class agteam:
     thread and returns a pending :class:`agdata` immediately.  Field access
     on the returned value blocks until the workflow finishes::
 
+        cfg = agConfig()
+        cfg.agllm_backend.model = "claude-sonnet-5"
+        cfg.agllm_backend.provider = "anthropic"
+        cfg.agllm_backend.api_key = os.environ["ANTHROPIC_API_KEY"]
+
         class PaperCrawlerTeam(agteam):
-            llm_config = LLM_CONFIG
+            agconfig = cfg
 
             def setup(self):
                 self.find_papers   = agskill(...)
@@ -49,12 +55,14 @@ class agteam:
 
     Class attributes
     ----------------
-    llm_config : dict
-        Default LLM configuration shared by all instances unless overridden
-        at construction time.
+    agconfig : agConfig | None
+        Default LLM configuration (and any other agconfig-based settings)
+        shared by all instances unless overridden at construction time.
+        Agents created with no explicit ``agconfig=`` inside ``setup()``/
+        ``run()`` inherit this automatically.
     """
 
-    llm_config: "dict | list[dict]" = {}
+    agconfig: "agConfig | None" = None
 
     # Global weak registry of all live agteam instances.
     _live_teams: "weakref.WeakSet[agteam]" = weakref.WeakSet()
@@ -64,9 +72,9 @@ class agteam:
         if "run" in cls.__dict__:
             _wrap_run(cls)
 
-    def __init__(self, llm_config: "dict | list[dict] | None" = None, **config) -> None:
-        # Instance-level llm_config: explicit arg > class attribute
-        self.llm_config: "dict | list[dict]" = llm_config if llm_config is not None else type(self).llm_config
+    def __init__(self, agconfig: "agConfig | None" = None, **config) -> None:
+        # Instance-level agconfig: explicit arg > class attribute
+        self.agconfig: "agConfig | None" = agconfig if agconfig is not None else type(self).agconfig
         # Expose every config kwarg as a plain attribute
         for k, v in config.items():
             setattr(self, k, v)
