@@ -128,6 +128,20 @@ ag = agent(agconfig=cfg)
 
 Pass `api_key="bedrock-api-key-..."` to `agBedrockBackendConfig(...)` to use a static Bedrock API key instead of IAM credentials. For Claude models on Bedrock, stick to the fields listed under **Anthropic** above — other generation params aren't supported there.
 
+## Usage Examples
+
+| Example | What it shows |
+| --- | --- |
+| [`base_example.py`](examples/base_example.py) | The simplest complete agent — one agent, two skills, shared history. |
+| [`parallel_exec.py`](examples/parallel_exec.py) | The two natural parallelism patterns: sequential chaining on one agent, and fork fan-out across multiple agents/containers. |
+| [`custom_tools.py`](examples/custom_tools.py) | A multi-step, multi-agent research pipeline combining a custom host-side tool, parallel summarisation forks, and a shared output directory. |
+| [`image_processing.py`](examples/image_processing.py) | `agimage`, the multimodal image input field type, across single-image, multi-image, and URL-image forms. |
+| [`human_in_the_loop.py`](examples/human_in_the_loop.py) | Driving approval loops from Python so `ask_human` is guaranteed to be called, with re-plan/re-write cycles on rejection. |
+| [`sandbox_handoff.py`](examples/sandbox_handoff.py) | Reading and driving an agent's `agSandbox` directly from the host, and handing one sandbox off between two agents. |
+| [`dynamic_config_example.py`](examples/dynamic_config_example.py) | Composing an `agConfig` from two owners' fields, then updating a `DynamicConfigParam` field on the same config between two skill calls. |
+
+See [`examples/README.md`](examples/README.md) for more details on each example.
+
 ## Core concepts
 
 **`agent`** — a pure state container: holds an LLM config, sandboxed tools, conversation context (`agcontext`), and a name. It does not own an execution loop. `agent.run(skill, input)` is a thin dispatch call; the scheduling wrapper is `agskill.run()`, which spawns a daemon thread, and the ReAct loop is `agskill.execute_react()`. Each `run()` call is non-blocking and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the context and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
@@ -145,108 +159,6 @@ Pass `api_key="bedrock-api-key-..."` to `agBedrockBackendConfig(...)` to use a s
 **`agwebui`** — a browser-based dashboard that runs in a separate process. Writes structured events to a JSONL file; a standalone FastAPI server tails it and pushes updates to connected browsers over WebSocket. See [docs/agwebui.md](docs/agwebui.md).
 
 **GPU support** — NVIDIA and AMD (ROCm) GPUs are both supported. `agResourcePool` auto-detects GPUs via `nvidia-smi` (NVIDIA) or `rocm-smi` (AMD) and issues leases to prevent two agents from sharing a device. The sandbox container receives `--gpus all` (NVIDIA) or `--device /dev/kfd --device /dev/dri` (AMD) at startup. GPU access uses *lazy physical allocation*: `reserve_gpu` sets a virtual flag with no physical cost; a physical GPU is claimed from the pool only when a bash command actually runs, and returned as soon as the command's processes finish. Between bash calls the GPU is free for other agents. `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES` are set to the assigned device ID for the duration of each bash execution.
-
-## Parallelism model
-
-| Layer | Mechanism | Notes |
-|---|---|---|
-| Agents / team tasks | One daemon thread per `run()` call | Threads release the GIL during LLM I/O; no shared pool to exhaust |
-| LLM streaming | Background drain thread + 100 ms batch queue | Reduces GIL acquisitions from O(tokens) to O(tokens/batch) |
-| Tool execution | `ProcessPoolExecutor` (256 workers) | Each tool call gets its own GIL |
-
-See [docs/Design_parallelization.md](docs/Design_parallelization.md) for the full design.
-
-## Examples
-
-### base_example — file I/O and sandboxed tools
-
-An agent writes a file inside its container, then reads it back. Demonstrates sandboxed tool use and typed skill schemas.
-
-```bash
-python examples/base_example.py
-```
-
-### parallel_exec — sequential chain and fork fan-out
-
-Two parallelism patterns side by side:
-
-- **Sequential chain** — two `agent.run()` calls on the same agent; the second waits for the first automatically via the history chain
-- **Fork fan-out** — `agent(parent).run()` creates an independent copy per input; all run concurrently, results resolve lazily
-
-```bash
-python examples/parallel_exec.py
-```
-
-### custom_tools — parallel summarisation pipeline with a custom host-side tool
-
-Searches arXiv for papers on a topic via a custom `search_papers` tool, summarises each in parallel with forked agents, then compiles a markdown report inside the sandbox.
-
-```bash
-uv run python examples/custom_tools.py
-```
-
-The report lands at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.md`.
-
-### image_processing — multimodal image input with `agimage`
-
-Demonstrates all three `agimage` patterns: single local file (auto base64-encoded), list of images compared side-by-side, and an image from a public URL. Requires a vision-capable model (e.g. `Qwen/Qwen2.5-VL-7B-Instruct`).
-
-```bash
-python examples/image_processing.py photo.jpg
-```
-
-### human_in_the_loop — human-in-the-loop collaborative writing
-
-A creative writing loop where the human acts as director, approving or revising every step from Python — the LLM never decides when to stop. Demonstrates `ask_human` with no timeout and the plan-then-write pattern.
-
-1. Python asks what scene to write next.
-2. Planner agent generates a paragraph-by-paragraph scene plan.
-3. Python presents the plan and asks for approval; loops with feedback until approved.
-4. Writer agent generates the full scene prose from the approved plan.
-5. Python presents the scene; loops (re-plan → re-write) until approved.
-6. Approved scenes are saved to `plans.md` and `story.txt` in the run directory.
-
-```bash
-uv run python examples/human_in_the_loop.py
-```
-
-### sandbox_handoff — driving `agent.sandbox` directly and handing it between agents
-
-Shows that `agent.sandbox` is a plain attribute the host can read, drive, and reassign — not something reachable only through a skill. One agent writes a file; the harness runs it and patches it with `sed` from Python, outside any skill; a second agent is pointed at the same sandbox (`agent_b.sandbox = sandbox`) and fixes the resulting bug; the harness re-runs it to confirm.
-
-```bash
-uv run python examples/sandbox_handoff.py
-```
-
-## Common skills
-
-`agency.common_skills` provides two base skill subclasses for structured agent workflows:
-
-| Class | Mode | Tools available | Workflow |
-|---|---|---|---|
-| `agplan` | Plan | `read`, `grep`, `glob`, `webfetch` (read-only; no bash or write) | UNDERSTAND → DESIGN → REVIEW → OUTPUT |
-| `agbuild` | Build | Full sandbox tool set (bash, read, write, grep, glob, …) | UNDERSTAND → PLAN → IMPLEMENT → VERIFY → OUTPUT |
-
-Both classes prepend a structured workflow prompt to the skill's system prompt and override `_build_tools()` to enforce the correct tool set. Subclass them the same way as `agskill`:
-
-```python
-from agency.common_skills import agplan, agbuild
-
-analysis = agplan(
-    name="analyse_codebase",
-    system_prompt="Analyse the repository structure and identify the main entry points.",
-    output_schema=agdata(summary=str, entry_points=list),
-)
-
-implementation = agbuild(
-    name="add_feature",
-    system_prompt="Implement the feature described in the plan.",
-    input_schema=agdata(plan=str),
-    output_schema=agdata(files_changed=list, tests_passed=bool),
-)
-```
-
-`agplan` skills are well-suited to research, code review, gap analysis, and structured report generation. `agbuild` skills are suited to code generation, refactoring, running experiments, and any task that requires writing files or executing commands.
 
 ## Running tests
 

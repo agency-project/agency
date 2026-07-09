@@ -8,9 +8,9 @@ For vLLM or another local/OpenAI-compatible endpoint, set `LLM_BASE_URL`, `LLM_A
 
 ```bash
 export LLM_BASE_URL="http://localhost:8000/v1"
-export LLM_API_KEY="your-api-key"
-export LLM_MODEL="your-model-id"
-uv run examples/human_in_the_loop.py
+export LLM_MODEL="YOUR_SERVED_MODEL"
+export LLM_API_KEY="YOUR_API_KEY"
+python examples/base_example.py
 ```
 
 Please refer to the main README.md at project root for other LLM APIs.
@@ -73,8 +73,8 @@ MAX_PAPERS=6 python examples/custom_tools.py "flash attention"
 Requires a vision-capable model.
 
 ```bash
-LLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py photo.jpg
-LLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py before.jpg after.jpg
+LLM_MODEL=google/gemma-4-E2B-it python examples/image_processing.py photo.jpg
+LLM_MODEL=google/gemma-4-E2B-it python examples/image_processing.py before.jpg after.jpg
 ```
 
 ---
@@ -92,7 +92,6 @@ LLM_MODEL=Qwen/Qwen2.5-VL-7B-Instruct python examples/image_processing.py before
 
 ```bash
 python examples/human_in_the_loop.py
-LLM_BASE_URL=http://... LLM_MODEL=... python examples/human_in_the_loop.py
 ```
 
 ---
@@ -109,4 +108,19 @@ LLM_BASE_URL=http://... LLM_MODEL=... python examples/human_in_the_loop.py
 
 ```bash
 python examples/sandbox_handoff.py
+```
+
+---
+
+## dynamic_config_example.py
+
+**What it shows:** Composing an `agConfig` from two owners' fields in one call, and updating a `DynamicConfigParam` field on that same `agConfig` between two skill calls on the same agent — no clone, no sandbox teardown, no new agent.
+
+1. `agConfig(agVLLMBackendConfig(...), agSandboxConfig(...))` merges the `agllm_backend` fields (including a deliberately too-small `max_completion_tokens=32`) and an `agSandbox` "data" mount into one config.
+2. **Call 1** runs `write_note` with the tiny token budget; the vLLM server truncates the tool-call JSON mid-argument, so the skill can't complete within a few ReAct steps and the run fails as expected.
+3. `cfg.agllm_backend.max_completion_tokens = 4096` bumps the budget on the *same* `agConfig` — since it's a `DynamicConfigParam`, it's re-read fresh on every LLM call rather than cached/locked.
+4. **Call 2** runs the identical skill again; with the higher budget it completes and the note is written and confirmed.
+
+```bash
+python examples/dynamic_config_example.py
 ```
