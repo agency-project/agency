@@ -661,6 +661,12 @@ class agllm_backend(AgLLMBackendFields):
             return _AnthropicAWSBackend(agconfig)
         if provider == "anthropic":
             return _AnthropicBackend(agconfig)
+        if provider == "vllm" and not agconfig.get("agllm_backend", "base_url"):
+            raise ValueError(
+                "agVLLMBackendConfig (provider='vllm') requires base_url "
+                "-- point it at your vLLM/OpenAI-compatible endpoint (e.g. "
+                "'http://localhost:8000/v1')."
+            )
         return _OpenAICompatibleBackend(agconfig)
 
     def make_client(self, timeout: httpx.Timeout):

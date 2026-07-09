@@ -39,9 +39,9 @@ from agency.tools.human import make_ask_human
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agConfig(
     agVLLMBackendConfig(
-        api_key=os.environ.get("LLM_API_KEY", ""),
         base_url=os.environ.get("LLM_BASE_URL"),
         model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
     )
 )
 
@@ -283,4 +283,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    agwebui.run(main, port=8082)
+    agwebui.run(main, port=8004)

@@ -35,9 +35,9 @@ from agency.agutil import format_exception as _fmt_exc
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agConfig(
     agVLLMBackendConfig(
-        api_key=os.environ.get("LLM_API_KEY", ""),
         base_url=os.environ.get("LLM_BASE_URL"),
         model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
     )
 )
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
@@ -318,4 +318,4 @@ if __name__ == "__main__":
             print(f"\nERROR: {e}")
 
     from agency.agwebui import agwebui
-    agwebui.run(_script)
+    agwebui.run(_script, port=8002)

@@ -24,9 +24,9 @@ from agency.agllm_backend import agVLLMBackendConfig
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agConfig(
     agVLLMBackendConfig(
-        api_key=os.environ.get("LLM_API_KEY", ""),
         base_url=os.environ.get("LLM_BASE_URL"),
         model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
     )
 )
 
@@ -160,4 +160,4 @@ if __name__ == "__main__":
             print(f"\nERROR: {e}")
 
     from agency.agwebui import agwebui
-    agwebui.run(_script)
+    agwebui.run(_script, port=8006)
