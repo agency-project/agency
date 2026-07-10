@@ -7,7 +7,7 @@ Agents are non-blocking by default. `agent.run()` returns a pending `agdata` imm
 ## Requirements
 
 - Python 3.12
-- [uv](https://docs.astral.sh/uv/) — package manager
+- [uv](https://docs.astral.sh/uv/) — package manager ([installation](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer))
 - Docker or Podman
 - GPU (optional): NVIDIA (CUDA) or AMD (ROCm)
 
@@ -21,7 +21,7 @@ cd agency
 # Auto-detects the host GPU (NVIDIA / AMD / CPU-only):
 ./images/build.sh
 
-uv venv
+uv venv --python 3.12 --seed --managed-python
 source .venv/bin/activate
 
 uv pip install -e .

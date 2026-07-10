@@ -823,8 +823,13 @@ class TestProviderBackendConfigClasses:
         assert cfg.agllm_backend.top_k == 40
 
     def test_vllm_config_routes_to_openai_compatible_backend(self):
-        cfg = agConfig(agVLLMBackendConfig(model="m"))
+        cfg = agConfig(agVLLMBackendConfig(model="m", base_url="http://localhost:8000/v1"))
         assert isinstance(agllm_backend.for_config(cfg), _OpenAICompatibleBackend)
+
+    def test_vllm_config_without_base_url_raises(self):
+        cfg = agConfig(agVLLMBackendConfig(model="m"))
+        with pytest.raises(ValueError, match="base_url"):
+            agllm_backend.for_config(cfg)
 
     def test_openai_config_routes_to_openai_compatible_backend(self):
         cfg = agConfig(agOpenAIBackendConfig(model="m"))
