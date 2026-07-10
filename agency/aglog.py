@@ -63,7 +63,7 @@ class aglog(_AgLogFields):
         self._events:  list[dict] = []   # all events (lifecycle + skills)
         self._lock = threading.Lock()
         self._path = Path(path) if path is not None else None
-        self._agconfig = agconfig
+        self._agconfig = agconfig.clone() if agconfig is not None else None
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
 

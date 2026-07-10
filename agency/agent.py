@@ -132,10 +132,10 @@ class agent:
         sandbox: "agSandbox | None" = None,
         agconfig: "agConfig | None" = None,
     ):
-        self.agconfig: "agConfig | None" = agconfig if agconfig is not None else agent.default_agconfig
+        _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
         if llm is None:
-            if self.agconfig is None or not self.agconfig.data.get("agllm_backend"):
+            if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
                 from ._context import _active_team as _at
                 _t = _at.get(None)
                 if _t is not None and _t.agconfig is not None and _t.agconfig.data.get("agllm_backend"):
@@ -143,13 +143,21 @@ class agent:
                     # fields) -- log_dir/output_dir/sandbox settings etc. should
                     # also come from it, matching "agents inherit the team's
                     # agconfig automatically" (see agteam's docstring).
-                    self.agconfig = _t.agconfig
+                    _src_agconfig = _t.agconfig
                 else:
                     raise TypeError(
                         "agent() requires an agconfig with LLM fields set "
                         "(e.g. cfg.agllm_backend.model = ...), or llm=, "
                         "when called outside an agteam context"
                     )
+
+        # Cloned so this agent's own agconfig is independent of whatever
+        # source it was built from (an explicit agconfig=, agent.default_agconfig,
+        # or the active agteam's agconfig) -- mutating that source afterward
+        # must not silently change an already-constructed agent. To change this
+        # agent's live config, mutate ag.agconfig (or ag.llm._agconfig, etc.)
+        # directly, or reassign it to a new agConfig outright.
+        self.agconfig: "agConfig | None" = _src_agconfig.clone() if _src_agconfig is not None else None
 
         self.agname: _agname = _agname.allocate_agname(agname)
 
@@ -366,7 +374,9 @@ class agent:
         """Return an independent agent forked from *src*."""
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname)
-        ag.agconfig = src.agconfig
+        # Cloned so the fork's own agconfig is independent of src's -- see
+        # the matching comment in __init__.
+        ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.llm = agllm(ag.agconfig)
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()

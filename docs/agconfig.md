@@ -119,6 +119,8 @@ class DynamicConfigParam(_ConfigParam):
 
 No caching, no locking. Every read hits `agConfig.get(...)` fresh; every write goes straight to `agConfig.set(...)`. Two instances sharing the same `agConfig` see each other's writes immediately; instances with different (or no) `agConfig`s never interfere. This is the tier almost every per-call tunable uses (LLM sampling params, timeouts, retry counts) — anything that's safe to change on a live object because nothing has "already used" the old value in a way that can't be revisited.
 
+In practice, framework classes (`agent`, `agllm`, `agSandbox`, `aglog`, `agResourcePool`, `agteam`, ...) each `.clone()` whatever `agConfig` they're given at construction time rather than storing it as-is — so two framework objects never end up sharing the literal same `agConfig` instance just by being built from a common source, even though the "two instances sharing the same `agConfig`" behavior described above is real if you deliberately hand one `agConfig` object to two constructors that don't clone it (e.g. two test-only classes, or your own custom owner). See [Design_configuration.md](Design_configuration.md#changing-a-dynamic-field-live) for how to update a framework object's config live given this.
+
 ## `FIELD_REGISTRY` — registration without instantiation
 
 ```python

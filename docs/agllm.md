@@ -4,7 +4,7 @@
 
 ## Construction
 
-`agent` requires an `agConfig` with LLM fields set under the `agllm_backend` owner — see the [README](../README.md#quick-start) for the `agent(agconfig=...)` pattern used day to day. `agllm` itself is lower-level and accepts any of three forms directly, for fine-grained control outside the standard `agskill` ReAct loop:
+`agent` requires an `agConfig` with LLM fields set under the `agllm_backend` owner — see the [README](../README.md#quick-start) for the `agent(agconfig=...)` pattern used day to day. `agllm` itself is lower-level and always takes an `agConfig` (no plain-dict shortcut), for fine-grained control outside the standard `agskill` ReAct loop:
 
 ```python
 from agency.agllm import agllm
@@ -22,8 +22,7 @@ cfg = agConfig(agLLMBackendConfig(
 ))
 llm = agllm(cfg)
 
-# 2. Plain agConfig -- for setting/changing fields one at a time, or when
-#    you need the same agConfig object elsewhere (e.g. an agent's agconfig).
+# 2. Plain agConfig -- for setting/changing fields one at a time.
 cfg = agConfig()
 cfg.agllm_backend.base_url    = "http://localhost:8000/v1"
 cfg.agllm_backend.api_key     = "EMPTY"
@@ -31,17 +30,9 @@ cfg.agllm_backend.model       = "meta-llama/Llama-3.1-8B-Instruct"
 cfg.agllm_backend.temperature = 0.0
 cfg.agllm_backend.max_tokens  = 4096
 llm = agllm(cfg)
-
-# 3. Plain dict -- convenience shortcut for quick/manual scripts; wrapped
-#    in a fresh private agConfig internally, so it behaves identically.
-llm = agllm({
-    "base_url":    "http://localhost:8000/v1",
-    "api_key":     "EMPTY",
-    "model":       "meta-llama/Llama-3.1-8B-Instruct",
-    "temperature": 0.0,
-    "max_tokens":  4096,
-})
 ```
+
+`agllm` clones whatever `agConfig` it's given (see "How config values are stored internally" below) — passing the *same* `cfg` to two different `agllm(cfg)` calls produces two independent LLM configs, not two views onto one shared config.
 
 `agLLMBackendConfig(**fields)` is a small view over an `agConfig`, scoped to the `agllm_backend` owner — `agConfig(agLLMBackendConfig(**fields))` is equivalent to `agConfig({"agllm_backend": {**fields}})` plus a field-name check (an unknown keyword raises `TypeError` immediately instead of the field silently being ignored). Every other framework class with tunable fields has the same kind of view (`agAgentConfig`, `agSandboxConfig`, ...) — see `_AgConfigViewBase` in `agconfig.py`, and [`agconfig.md`](agconfig.md) for the full implementation. The canonical form is always `agConfig(agXXXConfig(...), ...)`, whether you're setting one owner's fields or composing several — never `agXXXConfig(...).agconfig` directly:
 
@@ -78,14 +69,13 @@ The second argument `context_limit` overrides the `context_limit` field and also
 
 `agllm_backend.for_config()` builds one concrete backend (`_OpenAICompatibleBackend`, `_AnthropicBackend`, `_AnthropicAWSBackend`, or one of the Bedrock variants). Every `agllm_backend` inherits `AgLLMBackendFields`, which declares each LLM parameter (`model`, `api_key`, `base_url`, `temperature`, `top_k`, `workspace_id`, `aws_access_key`, ...) as a `DynamicConfigParam` — the same descriptor machinery every other framework class uses for its tunables (see `agllm.py`'s `_AgLLMFields`).
 
-- Given an `agConfig`, the backend stores it as-is (`self._agconfig`) — not copied — so a caller that mutates it later (`cfg.agllm_backend.temperature = 0.9`) sees the change on the next attribute read, same as any other `DynamicConfigParam` consumer. This is what `agent` uses: an agent's `agconfig` is shared with its `agllm_backend`, so `ag.agconfig.agllm_backend.model = "..."` changes the live model with no extra API needed.
-- Given a plain dict, it's wrapped in a fresh **private** `agConfig` the caller never sees — same attribute-backed reads, but no live external mutation path.
+- The backend clones the `agConfig` it's given (`self._agconfig`) rather than storing it as-is — so its config is independent of the caller's, and `ag.llm._agconfig` is independent of `ag.agconfig` too. Mutating the caller's original `agConfig` after construction has no effect on the backend. To change the backend's config live, mutate `backend._agconfig` (e.g. `ag.llm.backend._agconfig.agllm_backend.temperature = 0.9`, or more directly `ag.llm._agconfig.agllm_backend.temperature = 0.9`) directly, or reassign it to a new `agConfig` outright.
 
 `model_listing_timeout_seconds` and `default_max_tokens` are different in kind: genuine process-wide tunables for the backend machinery itself (unrelated to any one call's parameters), so they stay tier-1 (`GlobalConfigParam`), overridable via `cfg.agllm_backend.default_max_tokens = ...` like any other global framework tunable.
 
 ## Context limit detection
 
-`agllm.fetch_context_limit(llm_config)` (accepts a dict, an `agConfig`, or an already-built backend) tries, in order:
+`agllm.fetch_context_limit(llm_config)` (accepts an `agConfig` or an already-built backend) tries, in order:
 
 1. `context_limit` — explicit override, no network call made.
 2. `GET /v1/models/{model}` — reads `max_model_len` from vLLM's model info response.

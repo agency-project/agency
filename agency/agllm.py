@@ -168,10 +168,10 @@ class agllm(_AgLLMFields):
 
     def __init__(
         self,
-        config: "dict | agConfig",
+        agconfig: "agConfig",
         context_limit: "int | None" = None,
     ) -> None:
-        self._agconfig: agConfig = config if isinstance(config, agConfig) else agConfig({"agllm_backend": dict(config)})
+        self._agconfig: agConfig = agconfig.clone()
         self.backend: agllm_backend = agllm_backend.for_config(self._agconfig)
         self.context_limit: int = context_limit if context_limit is not None else agllm.fetch_context_limit(self.backend)
 
@@ -391,7 +391,7 @@ class agllm(_AgLLMFields):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_llm_kwargs(llm_config: "dict | AgLLMBackendFields", messages: list[dict], openai_tools: "list | None") -> dict:
+    def build_llm_kwargs(llm_config: "agConfig | AgLLMBackendFields", messages: list[dict], openai_tools: "list | None") -> dict:
         backend = llm_config if isinstance(llm_config, AgLLMBackendFields) else agllm_backend.for_config(llm_config)
         _OPENAI_GEN_PARAMS = {"temperature", "max_completion_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
         _EXTRA_BODY_GEN_PARAMS = {"top_k", "repetition_penalty", "min_p", "min_tokens", "guided_json", "guided_regex"}
@@ -446,7 +446,7 @@ class agllm(_AgLLMFields):
         return msg_dict
 
     @staticmethod
-    def fetch_context_limit(llm_config: "dict | agllm_backend") -> int:
+    def fetch_context_limit(llm_config: "agConfig | agllm_backend") -> int:
         """Return the model's context window size.
 
         Priority:
@@ -496,7 +496,7 @@ class agllm(_AgLLMFields):
         return max(1, chars // _AgLLMFields.CHARS_PER_TOKEN)
 
     @staticmethod
-    def count_messages_tokens(messages: list[dict], llm_config: "dict | agllm_backend") -> int:
+    def count_messages_tokens(messages: list[dict], llm_config: "agConfig | agllm_backend") -> int:
         """Token count via the vLLM /tokenize endpoint, falling back to char estimate."""
         backend = llm_config if isinstance(llm_config, AgLLMBackendFields) else agllm_backend.for_config(llm_config)
         root = backend.tokenize_url()

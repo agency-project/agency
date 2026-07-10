@@ -73,8 +73,12 @@ class agteam:
             _wrap_run(cls)
 
     def __init__(self, agconfig: "agConfig | None" = None, **config) -> None:
-        # Instance-level agconfig: explicit arg > class attribute
-        self.agconfig: "agConfig | None" = agconfig if agconfig is not None else type(self).agconfig
+        # Instance-level agconfig: explicit arg > class attribute. Cloned so
+        # this team's own agconfig is independent of whatever source it was
+        # built from -- mutating that source afterward must not silently
+        # change an already-constructed team (or the agents it already spawned).
+        _src_agconfig = agconfig if agconfig is not None else type(self).agconfig
+        self.agconfig: "agConfig | None" = _src_agconfig.clone() if _src_agconfig is not None else None
         # Expose every config kwarg as a plain attribute
         for k, v in config.items():
             setattr(self, k, v)

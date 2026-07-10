@@ -19,6 +19,8 @@ cfg = agConfig(
 ag = agent(agconfig=cfg)
 ```
 
+Every object that takes `agconfig=` clones it at construction time, so `ag.agconfig`, `ag.llm._agconfig`, and `ag.sandbox._agconfig` are independent copies of `cfg`, not the same object — this is what lets two agents built from one shared `cfg` diverge safely later. See "Changing a Dynamic field live" below for how to update config after construction now that mutating `cfg` itself no longer reaches anything already built from it.
+
 ## The canonical form: `agConfig(agXXXConfig(...), ...)`
 
 Every framework owner (the LLM backend, the agent itself, the sandbox, tools, skills, ...) has a matching `agXXXConfig` class — `agLLMBackendConfig`, `agAgentConfig`, `agSandboxConfig`, `agToolConfig`, and so on. Always build your `agConfig` by passing one or more of these into `agConfig(...)`:
@@ -54,16 +56,26 @@ You can always tell which tier a field is from its behavior, but you don't need 
 
 ### Changing a Dynamic field live
 
-This is the common case and needs nothing special:
+Every framework object that takes `agconfig=` clones it at construction time — `ag.agconfig`, `ag.llm._agconfig`, `ag.sandbox._agconfig`, etc. are each independent copies of whatever you passed in, not the same object. This means mutating your original `cfg` (or even `ag.agconfig`) after construction does **not** reach `ag.llm` — each object only sees writes made through its *own* `agconfig`. This is deliberate: it's what stops two agents built from the same `cfg` from silently changing each other's behavior.
+
+To change a Dynamic field live, reach into the specific object whose behavior you want to change:
 
 ```python
 ag = agent(agconfig=cfg)
 ag.run(skill, agdata(...))                    # call 1, temperature=0.7 (say)
-cfg.agllm_backend.temperature = 0.2
+ag.llm._agconfig.agllm_backend.temperature = 0.2
 ag.run(skill, agdata(...))                    # call 2, sees temperature=0.2 immediately
 ```
 
-No clone, no new agent, no sandbox teardown — the field is re-read from `cfg` on every LLM call.
+No new agent, no sandbox teardown — the field is re-read from `ag.llm._agconfig` on every LLM call. Mutating `cfg` or `ag.agconfig` instead would have no effect on `ag.llm`, since `ag.llm._agconfig` is its own clone.
+
+You can also replace an object's config wholesale instead of mutating it in place:
+
+```python
+ag.llm._agconfig = agConfig(agVLLMBackendConfig(model="...", temperature=0.2))
+```
+
+See `examples/dynamic_config_example.py` for this pattern end to end.
 
 ### Changing a Static field — the clone-and-recreate pattern
 
@@ -75,10 +87,10 @@ agSandboxConfig(cfg).add_mount("data", new_host_dir, "/data")
 # clone() it first to change it for new objects
 ```
 
-The fix is exactly what the message says — `clone()` for a fresh `agConfig` with no lock history, apply the change there, and make sure whatever creates the *next* sandbox uses the clone instead of the original:
+The fix is exactly what the message says — `clone()` for a fresh `agConfig` with no lock history, apply the change there, and make sure whatever creates the *next* sandbox uses the clone instead of the original. Since `ag.agconfig` is already an independent clone (see above), mutate it directly rather than the `cfg` you originally built:
 
 ```python
-cfg2 = cfg.clone()
+cfg2 = ag.agconfig.clone()
 agSandboxConfig(cfg2).add_mount("data", new_host_dir, "/data")
 ag.sandbox.destroy()      # tear down the old container -- it's still on the old mount
 ag.sandbox  = None        # agskill only provisions a new sandbox when this is None
@@ -110,7 +122,7 @@ class MyTeam(agteam):
         self.main_agent = agent()   # no agconfig= given -- inherits the team's agconfig outright
 ```
 
-Any `agent(...)` created inside `setup()`/`run()` with no explicit `agconfig=` inherits the active team's `agconfig` wholesale — not just LLM fields, but sandbox mounts, log/output dirs, and anything else set on it. Pass `agconfig=` explicitly to an `agent(...)` call inside a team to give that one agent a different config (e.g. a `.clone()` with one field overridden) instead.
+Any `agent(...)` created inside `setup()`/`run()` with no explicit `agconfig=` inherits the active team's `agconfig` wholesale — not just LLM fields, but sandbox mounts, log/output dirs, and anything else set on it, at the moment the agent is constructed. Like every other framework object, the agent clones the team's `agconfig` rather than sharing it, so a later change to `team.agconfig` (or to the original `cfg` the team was built from) does not retroactively affect agents already constructed — only agents created *after* the change pick it up. Pass `agconfig=` explicitly to an `agent(...)` call inside a team to give that one agent a different config (e.g. a `.clone()` with one field overridden) instead.
 
 ## Adding your own custom config param
 
@@ -156,7 +168,7 @@ Anything passed to `update()`/the constructor outside that set raises `TypeError
 |---|---|
 | Set several fields on one owner in one call | `agConfig(agXXXConfig(field=value, ...))` |
 | Set fields on several owners at once | `agConfig(agXXXConfig(...), agYYYConfig(...))` |
-| Change an LLM param, timeout, or similar mid-run | `cfg.owner.field = value` directly — works immediately if it's Dynamic (most fields are) |
+| Change an LLM param, timeout, or similar mid-run | `ag.llm._agconfig.owner.field = value` (target the specific object's own `agconfig`, not `cfg`/`ag.agconfig`) — works immediately if it's Dynamic (most fields are) |
 | Change a sandbox mount/image after the first sandbox exists | `cfg.clone()`, apply the change to the clone, tear down and let the next `run()` recreate the sandbox from the clone |
 | Set a process-wide tunable (a worker-pool size, ...) | Do it once, early, before constructing anything that might read it |
 | Add a tunable for my own tool/team | Define a `_AgXXXFields` class + a matching `agXXXConfig(_AgConfigViewBase)` with a unique `_OWNER` string, same as any framework owner |

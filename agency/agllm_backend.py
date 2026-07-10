@@ -635,22 +635,18 @@ class agllm_backend(AgLLMBackendFields):
     instantiate a subclass directly.
 
     Inherits AgLLMBackendFields so every concrete backend reads its
-    parameters as plain attributes (self.model, self.api_key, ...). Given an
-    agConfig, it's stored as-is (self._agconfig) -- not copied -- so a
-    caller that mutates it later (`cfg.agllm_backend.temperature = 0.9`)
-    sees the change reflected on the next attribute read, same as any other
-    DynamicConfigParam consumer in the framework. Given a plain dict (for
-    quick/manual construction outside the agconfig-driven path), it's
-    wrapped in a fresh private agConfig -- same attribute-backed reads, just
-    with no caller-visible agConfig to mutate afterwards.
+    parameters as plain attributes (self.model, self.api_key, ...). The
+    given agConfig is cloned (self._agconfig) -- so this backend's own config
+    is independent of the caller's; mutating the caller's original agConfig
+    afterward does not affect this backend. To change this backend's live
+    config, mutate backend._agconfig (or one of its owner views) directly.
     """
 
-    def __init__(self, config: "dict | agConfig") -> None:
-        self._agconfig = config if isinstance(config, agConfig) else agConfig({"agllm_backend": dict(config)})
+    def __init__(self, agconfig: "agConfig") -> None:
+        self._agconfig = agconfig.clone()
 
     @staticmethod
-    def for_config(config: "dict | agConfig") -> "agllm_backend":
-        agconfig = config if isinstance(config, agConfig) else agConfig({"agllm_backend": dict(config)})
+    def for_config(agconfig: "agConfig") -> "agllm_backend":
         provider = agconfig.get("agllm_backend", "provider")
         model = agconfig.get("agllm_backend", "model", "") or ""
         if provider == "bedrock":

@@ -31,7 +31,7 @@ An optional `context_limit` field pins the model's context window size for auto-
 cfg.agllm_backend.context_limit = 131072
 ```
 
-Because the agent's `agconfig` is stored as-is (not copied), fields can be changed live after construction — `ag.agconfig.agllm_backend.model = "..."` takes effect on the agent's next LLM call, no `set_llm_config`-style method needed.
+The agent clones whatever `agconfig` it's given at construction time, and `ag.llm` clones it again — so `ag.agconfig` and `ag.llm._agconfig` are independent copies, not the same object. Mutating `cfg` (or even `ag.agconfig`) after construction does **not** reach `ag.llm`. To change the LLM config live, mutate `ag.llm._agconfig` directly — `ag.llm._agconfig.agllm_backend.model = "..."` takes effect on the agent's next LLM call, no `set_llm_config`-style method needed. See [Design_configuration.md](Design_configuration.md) for the full rationale (this is what stops two agents built from the same `cfg` from silently affecting each other).
 
 Inside an `agteam`, agents created with no explicit `agconfig=` automatically inherit the team's `agconfig` — see [`agteam.md`](agteam.md).
 

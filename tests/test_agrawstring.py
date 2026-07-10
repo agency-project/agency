@@ -131,7 +131,8 @@ def _run_skill_with_mock_response(sk, inp, response_text):
         mock_openai_cls.return_value = mock_client
         mock_client.chat.completions.create.return_value = iter(chunks)
         from agency.agllm import agllm as _agllm
-        _llm = _agllm({"base_url": "http://x", "api_key": "", "model": "m"}, context_limit=128_000)
+        from agency.agconfig import agConfig as _agConfig
+        _llm = _agllm(_agConfig({"agllm_backend": {"base_url": "http://x", "api_key": "", "model": "m"}}), context_limit=128_000)
         result, *_ = sk.execute_react(_make_mock_agent(_llm), agcontext(), inp, max_steps=5)
     return result
 

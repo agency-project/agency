@@ -208,7 +208,7 @@ class agResourcePool(_AgResourcePoolFields):
         mark_gpus: bool = False,
         agconfig: "agConfig | None" = None,
     ) -> None:
-        self._agconfig = agconfig if agconfig is not None else agConfig()
+        self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
         for _name, _value in (
             ("idle_cpus", idle_cpus), ("idle_memory", idle_memory),
         ):

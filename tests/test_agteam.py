@@ -63,7 +63,10 @@ def test_init_multiple_kwargs_all_become_attributes():
 def test_init_agconfig_instance_override_does_not_affect_class(llm_cfg):
     cfg = _llm_agconfig(llm_cfg)
     team = _EchoTeam(agconfig=cfg)
-    assert team.agconfig is cfg
+    # team.agconfig is its own clone of cfg, not cfg itself -- see
+    # docs/Design_configuration.md ("Changing a Dynamic field live").
+    assert team.agconfig is not cfg
+    assert team.agconfig.data.get("agllm_backend") == llm_cfg
     assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
     other = _EchoTeam()
     assert other.agconfig.data.get("agllm_backend") == _ECHO_LLM
@@ -364,7 +367,9 @@ def test_agconfig_overrides_are_independent_per_instance():
     ]
     teams = [_EchoTeam(agconfig=c) for c in cfgs]
     for team, cfg in zip(teams, cfgs):
-        assert team.agconfig is cfg
+        # Each team's agconfig is its own clone, not the source cfg itself.
+        assert team.agconfig is not cfg
+        assert team.agconfig.data.get("agllm_backend") == cfg.data.get("agllm_backend")
     assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
 
 

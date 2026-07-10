@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
+from agency.agconfig import agConfig
 from agency.agschema import agschema, _AgSchemaFields
 from agency.agskill import agskill
 from agency.agllm import _AgLLMFields, agllm
@@ -15,7 +16,7 @@ LLM_IDLE_TIMEOUT   = _AgLLMFields.idle_timeout.default
 LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
 
 LLM_CONFIG = {"api_key": "test", "model": ""}
-LLM = agllm(LLM_CONFIG, context_limit=128_000)
+LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
 
 
 def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s=5):
@@ -1383,40 +1384,45 @@ from agency.agllm import agllm as _agllm_mod
 build_llm_kwargs = _agllm_mod.build_llm_kwargs
 
 
+def _llm_cfg(**fields) -> agConfig:
+    """Test helper: wrap agllm_backend fields in an agConfig."""
+    return agConfig({"agllm_backend": fields})
+
+
 def test_build_llm_kwargs_model_and_messages():
     msgs = [{"role": "user", "content": "hi"}]
-    kw = build_llm_kwargs({"model": ""}, msgs, None)
+    kw = build_llm_kwargs(_llm_cfg(model=""), msgs, None)
     assert kw["model"] == ""
     assert kw["messages"] == msgs
 
 
 def test_build_llm_kwargs_strips_private_keys():
     msgs = [{"role": "assistant", "content": "ok", "_thinking": "secret"}]
-    kw = build_llm_kwargs({"model": "m"}, msgs, None)
+    kw = build_llm_kwargs(_llm_cfg(model="m"), msgs, None)
     assert "_thinking" not in kw["messages"][0]
     assert "content" in kw["messages"][0]
 
 
 def test_build_llm_kwargs_openai_gen_params():
-    kw = build_llm_kwargs({"model": "m", "temperature": 0.7, "max_completion_tokens": 100}, [], None)
+    kw = build_llm_kwargs(_llm_cfg(model="m", temperature=0.7, max_completion_tokens=100), [], None)
     assert kw["temperature"] == 0.7
     assert kw["max_completion_tokens"] == 100
 
 
 def test_build_llm_kwargs_extra_body_vllm_params():
-    kw = build_llm_kwargs({"model": "m", "top_k": 50, "repetition_penalty": 1.1}, [], None)
+    kw = build_llm_kwargs(_llm_cfg(model="m", top_k=50, repetition_penalty=1.1), [], None)
     assert kw["extra_body"]["top_k"] == 50
     assert kw["extra_body"]["repetition_penalty"] == 1.1
 
 
 def test_build_llm_kwargs_tools_included_when_provided():
     tools = [{"type": "function", "function": {"name": "f"}}]
-    kw = build_llm_kwargs({"model": "m"}, [], tools)
+    kw = build_llm_kwargs(_llm_cfg(model="m"), [], tools)
     assert kw["tools"] == tools
 
 
 def test_build_llm_kwargs_no_tools_key_when_none():
-    kw = build_llm_kwargs({"model": "m"}, [], None)
+    kw = build_llm_kwargs(_llm_cfg(model="m"), [], None)
     assert "tools" not in kw
 
 

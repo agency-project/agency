@@ -45,13 +45,16 @@ from agency.agresources import agResourcePool, agResourcePoolConfig
 # Constructor kwargs (convenience, equivalent to the agConfig form below):
 pool = agResourcePool(idle_cpus=1.0, idle_memory="1024m")
 
-# agConfig form -- composes with the rest of an agent's config, and can be
-# changed live (it's Dynamic, not locked once read):
+# agConfig form -- composes with the rest of an agent's config. idle_cpus/
+# idle_memory are Dynamic (not locked once read), but agResourcePool clones
+# cfg at construction, so changing cfg afterward does not reach pool --
+# mutate pool._agconfig directly instead:
 cfg = agConfig(agResourcePoolConfig(idle_cpus=1.0, idle_memory="1024m"))
 pool = agResourcePool(agconfig=cfg)
+pool._agconfig.agResourcePool.idle_cpus = 2.0   # live update, reaches pool immediately
 ```
 
-`idle_cpus`/`idle_memory` are read from the *sandbox's own* `agconfig` at container-creation time (a throwaway `_AgResourcePoolFields(self._agconfig)` instance in `_ensure_started()`) — set them on whatever `agConfig` you pass to `agent(agconfig=...)`, not necessarily the same object `agent.agresource_pool` was built from, and they'll take effect for that agent's sandboxes.
+`idle_cpus`/`idle_memory` are read from the *sandbox's own* `agconfig` at container-creation time (a throwaway `_AgResourcePoolFields(self._agconfig)` instance in `_ensure_started()`) — that's the sandbox's own cloned `agconfig` (`sandbox._agconfig`), not necessarily `agent.agresource_pool`'s. Set them on the `agConfig` you pass to `agent(agconfig=...)` *before* the agent (and its sandbox) is constructed, or mutate `ag.sandbox._agconfig` directly once a sandbox already exists — mutating the original `cfg`/`agent.agresource_pool._agconfig` afterward will not reach an already-built sandbox.
 
 CPU and memory limits are set by the sandbox on each tool call via `update_limits()` and are not automatically restored by agresources. `release_resources()` is a manual call to reduce an `agSandbox`'s reported resource usage in the pool (e.g. when the sandbox is destroyed externally).
 

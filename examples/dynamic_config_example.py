@@ -14,8 +14,13 @@ agent.
     fresh from the agConfig on every LLM call, no caching or locking. Set it
     too low (32) and the vLLM server truncates the tool-call JSON mid-
     argument, so the skill can't complete its required output field within
-    a few ReAct steps. Raise it (4096) on the *same* agConfig -- no clone,
-    no sandbox teardown, no new agent -- and the very next call succeeds.
+    a few ReAct steps.
+  - Every framework object clones whatever agConfig it's given at
+    construction time, so `cfg`, `ag.agconfig`, and `ag.llm._agconfig` are
+    all independent copies -- mutating `cfg` (or even `ag.agconfig`) after
+    `agent(agconfig=cfg)` no longer reaches `ag.llm`. To change the LLM
+    config live, reach into `ag.llm._agconfig` directly -- no new agent, no
+    sandbox teardown -- and the very next call sees it.
 
 See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 
@@ -89,10 +94,12 @@ def main():
         # tool call, or the truncated JSON never parsed, that access raises.
         print(f"   failed as expected: {e}\n")
 
-    # Raise the budget on the SAME agConfig -- max_completion_tokens is a
-    # DynamicConfigParam, so this is visible on the very next LLM call.
-    print("Bumping max_completion_tokens: 32 -> 4096 (dynamic update, same agConfig, same agent)\n")
-    cfg.agllm_backend.max_completion_tokens = 4096
+    # ag.llm._agconfig is its own clone -- mutating cfg (or ag.agconfig) here
+    # would NOT reach ag.llm. max_completion_tokens is a DynamicConfigParam,
+    # so this update on ag.llm's own agconfig is visible on the very next
+    # LLM call -- no new agent, no sandbox teardown needed.
+    print("Bumping max_completion_tokens: 32 -> 4096 (dynamic update, ag.llm's own agconfig, same agent)\n")
+    ag.llm._agconfig.agllm_backend.max_completion_tokens = 4096
 
     print(">> [call 2] max_completion_tokens=4096")
     print(">> Execution should succeed.")

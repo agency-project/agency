@@ -128,12 +128,14 @@ Each `run()` call executes in its own daemon thread. There is no shared pool to 
 
 ## Auto agent tracking
 
-Any `agent(...)` call made inside `setup()` or `run()` is automatically registered with the team. The `agconfig` argument is optional — an agent created with no explicit `agconfig=` inherits the active team's `agconfig` outright (not just its LLM fields — log_dir/output_dir/sandbox settings set on it apply too):
+Any `agent(...)` call made inside `setup()` or `run()` is automatically registered with the team. The `agconfig` argument is optional — an agent created with no explicit `agconfig=` inherits the active team's `agconfig` at the moment it's constructed (not just LLM fields — log_dir/output_dir/sandbox settings set on it apply too):
 
 ```python
 def setup(self) -> None:
     self.main_agent = agent()   # agconfig injected automatically
 ```
+
+Like every other framework object, the agent clones `team.agconfig` rather than sharing it — so a later change to `team.agconfig` (or to the `cfg` the team itself was built from) does not retroactively affect agents already constructed, only ones created afterward.
 
 `self.agents` returns a snapshot list of all agents currently registered with this team instance. Completed anonymous agents (fork agents with no other live reference) are GC'd automatically — only agents held via `self.*` or still in-flight are visible.
 

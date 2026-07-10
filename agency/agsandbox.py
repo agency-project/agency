@@ -378,7 +378,11 @@ class agSandbox(_AgSandboxFields):
         self._started   = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
-        self._agconfig: "agConfig | None"  = agconfig
+        # Cloned so this sandbox's own agconfig is independent of the
+        # caller's -- mutating the caller's original agConfig afterward does
+        # not affect this sandbox. To change it live, mutate
+        # sandbox._agconfig (or one of its owner views) directly.
+        self._agconfig: "agConfig | None"  = agconfig.clone() if agconfig is not None else None
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
@@ -391,7 +395,7 @@ class agSandbox(_AgSandboxFields):
         self._gpu_flags     = _gpu_flags()
         self._base_image = self.base_image
         self._vol_flags: list[str] = []
-        for host, container, mode in agSandboxConfig(agconfig).mounts.values():
+        for host, container, mode in agSandboxConfig(self._agconfig).mounts.values():
             host_path = Path(host)
             host_path.mkdir(parents=True, exist_ok=True)
             self._vol_flags += ["-v", f"{host_path.resolve()}:{container}:{mode}"]
