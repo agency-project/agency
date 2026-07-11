@@ -1,8 +1,6 @@
 """Reset mutable agent class-level and module-level state between tests."""
-import sys
 import pytest
-import agency.agutil  # noqa: F401 -- ensure registered in sys.modules
-_agutil_module = sys.modules["agency.agutil"]
+import agency.agutil as _agutil_module
 from agency.agent import agent
 from agency.agname import agname as _agname
 
