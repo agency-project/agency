@@ -233,6 +233,10 @@ class agResourcePool(_AgResourcePoolFields):
         """Replace this pool's agconfig with a clone of the given one."""
         self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
 
+    def get_config_copy(self) -> "agConfig":
+        """Return a clone of this pool's agconfig."""
+        return self._agconfig.clone()
+
     def acquire_gpu(self, timeout: float | None = None) -> int:
         """Block until any GPU is free; return its id."""
         deadline = None if timeout is None else time.monotonic() + timeout

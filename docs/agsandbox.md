@@ -191,6 +191,12 @@ so the same override can also be spelled as nested attribute access on the
 cfg.agSandbox.base_image = "my-registry/custom-image:latest"
 ```
 
+## `change_config` / `get_config_copy`
+
+`agSandbox.change_config(new_cfg)` clones `new_cfg` and replaces `sb._agconfig` with it; `sb.get_config_copy()` returns a clone of the sandbox's current agconfig (or `None` if it has none). These exist mainly for consistency with the rest of the object graph — `agent.change_config()` calls `ag.sandbox.change_config()` alongside `ag.llm`/`ag.log` so every object shares one source of truth.
+
+They do **not** let you change a running sandbox's image or mounts: `base_image` and `mounts` are `StaticConfigParam` fields, resolved once at construction and locked from then on (see "Changing a Static field" in [Design_configuration.md](Design_configuration.md)) — `change_config` replaces the agconfig object, but a already-locked static value doesn't re-resolve from it. To change a sandbox's image/mounts, use the clone-and-recreate pattern (`cfg2 = ag.agconfig.clone()`, mount on `cfg2`, `ag.sandbox.destroy()`, `ag.sandbox = None`, `ag.agconfig = cfg2`) documented there instead.
+
 Don't assign `agSandbox.base_image = ...` directly on the class — that
 replaces the field descriptor itself rather than setting a value, breaking
 the field for every sandbox in the process.

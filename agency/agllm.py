@@ -184,6 +184,10 @@ class agllm(_AgLLMFields):
         self._agconfig = agconfig.clone()
         self.backend.change_config(self._agconfig)
 
+    def get_config_copy(self) -> "agConfig":
+        """Return a clone of this llm's agconfig."""
+        return self._agconfig.clone()
+
     # ------------------------------------------------------------------
     # Instance methods — delegate to static methods using self.backend
     # ------------------------------------------------------------------

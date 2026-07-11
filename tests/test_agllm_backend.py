@@ -148,6 +148,40 @@ class TestBaseBackendDefaults:
 
 
 # ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+class TestBackendChangeConfigAndGetConfigCopy:
+    def test_change_config_replaces_agconfig(self):
+        backend = agllm_backend(_cfg(temperature=0.7))
+        backend.change_config(_cfg(temperature=0.2))
+        assert backend.temperature == 0.2
+
+    def test_change_config_clones_given_agconfig(self):
+        backend = agllm_backend(_cfg())
+        new_cfg = _cfg(temperature=0.2)
+        backend.change_config(new_cfg)
+        new_cfg.agllm_backend.temperature = 0.9
+        assert backend.temperature == 0.2
+
+    def test_get_config_copy_returns_clone_not_same_object(self):
+        cfg = _cfg(temperature=0.7)
+        backend = agllm_backend(cfg)
+        copy = backend.get_config_copy()
+        assert copy is not backend._agconfig
+
+    def test_get_config_copy_reflects_current_values(self):
+        backend = agllm_backend(_cfg(temperature=0.7))
+        assert backend.get_config_copy().agllm_backend.temperature == 0.7
+
+    def test_mutating_get_config_copy_does_not_affect_backend(self):
+        backend = agllm_backend(_cfg(temperature=0.7))
+        copy = backend.get_config_copy()
+        copy.agllm_backend.temperature = 0.1
+        assert backend.temperature == 0.7
+
+
+# ---------------------------------------------------------------------------
 # _OpenAICompatibleBackend
 # ---------------------------------------------------------------------------
 

@@ -213,6 +213,10 @@ class agent:
         if self.sandbox is not None:
             self.sandbox.change_config(self.agconfig)
 
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this agent's agconfig, or None if it has none."""
+        return self.agconfig.clone() if self.agconfig is not None else None
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------

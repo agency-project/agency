@@ -277,6 +277,8 @@ agSandboxConfig(cfg2).add_mount("data", host_dir_2, "/data")  # succeeds
 
 Note that `GlobalConfigParam` locks are **not** per-instance — they live on `agConfig.GLOBAL`, a single process-wide singleton, so `clone()` cannot undo a tier-1 lock. There is no "fresh GLOBAL" to get back to within one process; a tier-1 field really is fixed for the rest of the process once anything has read it.
 
+Every consuming class that holds an `agconfig` (`agent`, `agteam`, `agllm`, `agllm_backend`, `aglog`, `agSandbox`, `agResourcePool`) builds this same `clone()` call into a symmetric pair of public methods: `change_config(new_cfg)` replaces the object's agconfig with a clone of `new_cfg` (propagating to sub-objects where relevant), and `get_config_copy()` returns a clone of the object's current agconfig. See [`Design_configuration.md`](Design_configuration.md#changing-a-dynamic-field-live) for usage.
+
 ## How to add a new owner's config fields
 
 This is the recipe every existing owner (`agtool`, `agllm`, `agsandbox`, ...) follows, and the one to copy for a new one:

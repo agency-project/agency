@@ -70,6 +70,10 @@ class aglog(_AgLogFields):
         """Replace this log's agconfig with a clone of the given one."""
         self._agconfig = agconfig.clone() if agconfig is not None else None
 
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this log's agconfig, or None if it has none."""
+        return self._agconfig.clone() if self._agconfig is not None else None
+
     # ------------------------------------------------------------------
     # Internal — called by agent
     # ------------------------------------------------------------------

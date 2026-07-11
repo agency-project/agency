@@ -408,6 +408,10 @@ class agSandbox(_AgSandboxFields):
         re-resolved here."""
         self._agconfig = agconfig.clone() if agconfig is not None else None
 
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this sandbox's agconfig, or None if it has none."""
+        return self._agconfig.clone() if self._agconfig is not None else None
+
     def __getstate__(self) -> dict:
         # threading.RLock isn't picklable — custom tools with run_in_subprocess=True
         # (the default) get cloudpickled to a worker process, so this must not crash.

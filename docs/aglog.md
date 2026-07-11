@@ -115,6 +115,18 @@ Written whenever the ReAct loop compacts the context window:
 
 `msgs_before` / `msgs_after` show how many messages were in the list before and after compaction. The difference (`msgs_before - msgs_after`) is the number of messages replaced by the summary injection. See [Design_compaction.md](Design_compaction.md).
 
+## Live config: `change_config` / `get_config_copy`
+
+`ag.log` clones whatever `agconfig` it's given at construction, independent of `ag.agconfig`. To change one of its tunables (`dump_tool_args_truncate_len`, `dump_content_truncate_len`, `dump_tool_call_id_prefix_len`) live, call `ag.log.change_config(new_cfg)` — it replaces `ag.log`'s agconfig with a clone of `new_cfg`. `ag.log.get_config_copy()` returns a clone of the log's current agconfig (or `None` if it has none):
+
+```python
+cfg = ag.log.get_config_copy() or agConfig()
+cfg.aglog.dump_content_truncate_len = 500
+ag.log.change_config(cfg)
+```
+
+In practice you rarely call these directly — `agent.change_config()` already propagates to `ag.log` (and `ag.llm`, `ag.sandbox`) in one call. See [Design_configuration.md](Design_configuration.md#changing-a-dynamic-field-live).
+
 ## Terminal output (`terminal`)
 
 In addition to `log`, each agent writes colour-coded single-line status messages to stderr via `terminal`. These are for interactive monitoring and are not persisted:

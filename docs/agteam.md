@@ -139,6 +139,18 @@ Like every other framework object, the agent clones `team.agconfig` rather than 
 
 `self.agents` returns a snapshot list of all agents currently registered with this team instance. Completed anonymous agents (fork agents with no other live reference) are GC'd automatically — only agents held via `self.*` or still in-flight are visible.
 
+## Live config: `change_config` / `get_config_copy`
+
+`team.change_config(new_cfg)` replaces `team.agconfig` with a clone of `new_cfg` and propagates that same clone to every agent the team has spawned so far (via each agent's own `change_config`) — agents created afterward pick up `team.agconfig` automatically, the same way they do at construction:
+
+```python
+team.change_config(agConfig(agLLMBackendConfig(model="...", temperature=0.2)))
+# every agent already in team.agents, and every agent() call inside setup()/run()
+# from now on, sees temperature=0.2
+```
+
+`team.get_config_copy()` returns a clone of the team's current `agconfig` (or `None` if it has none) — a convenient starting point for building `new_cfg` from the team's live settings.
+
 ## agconfig class attribute
 
 Declaring `agconfig` at the class level provides a default shared by all instances:

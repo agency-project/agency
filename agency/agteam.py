@@ -151,6 +151,10 @@ class agteam:
         for a in self._agents:
             a.change_config(self.agconfig)
 
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this team's agconfig, or None if it has none."""
+        return self.agconfig.clone() if self.agconfig is not None else None
+
     @property
     def agents(self) -> list["_Agent"]:
         """All agents tracked by this team (setup + dynamic run-time forks)."""

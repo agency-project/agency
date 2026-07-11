@@ -71,6 +71,16 @@ ag.run(skill, agdata(...))                    # call 2, sees temperature=0.2 imm
 
 No new agent, no sandbox teardown needed. `agllm`, `aglog`, `agSandbox`, `agResourcePool`, and `agteam` each expose the same `change_config(agconfig)` method; `agteam.change_config` also propagates to every agent it has spawned so far.
 
+Each of these objects also exposes `get_config_copy()` — the read-side complement to `change_config`. It returns a clone of that object's *own* current agconfig (`None` if the object has none), which is handy as a starting point for building `new_cfg` from the object's live settings rather than from scratch:
+
+```python
+cfg = ag.get_config_copy()          # clone of ag.agconfig — safe to mutate freely
+cfg.agllm_backend.temperature = 0.2
+ag.change_config(cfg)
+```
+
+`get_config_copy()` always returns a fresh clone, never the object's live `agconfig` itself — mutating the returned value never affects the object until you pass it back through `change_config`.
+
 See `examples/dynamic_config_example.py` for this pattern end to end.
 
 ### Changing a Static field — the clone-and-recreate pattern
@@ -165,6 +175,7 @@ Anything passed to `update()`/the constructor outside that set raises `TypeError
 | Set several fields on one owner in one call | `agConfig(agXXXConfig(field=value, ...))` |
 | Set fields on several owners at once | `agConfig(agXXXConfig(...), agYYYConfig(...))` |
 | Change an LLM param, timeout, or similar mid-run | `ag.change_config(new_cfg)` — works immediately if it's Dynamic (most fields are) |
+| Read an object's current live config (e.g. to build `new_cfg` from it) | `ag.get_config_copy()` — always a fresh clone, safe to mutate |
 | Change a sandbox mount/image after the first sandbox exists | `cfg.clone()`, apply the change to the clone, tear down and let the next `run()` recreate the sandbox from the clone |
 | Set a process-wide tunable (a worker-pool size, ...) | Do it once, early, before constructing anything that might read it |
 | Add a tunable for my own tool/team | Define a `_AgXXXFields` class + a matching `agXXXConfig(_AgConfigViewBase)` with a unique `_OWNER` string, same as any framework owner |

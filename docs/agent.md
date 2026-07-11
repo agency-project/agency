@@ -31,7 +31,22 @@ An optional `context_limit` field pins the model's context window size for auto-
 cfg.agllm_backend.context_limit = 131072
 ```
 
-The agent clones whatever `agconfig` it's given at construction time, and `ag.llm` clones it again — so `ag.agconfig` and `ag.llm._agconfig` are independent copies, not the same object. Mutating `cfg` (or even `ag.agconfig`) after construction does **not** reach `ag.llm`. To change the LLM config live, mutate `ag.llm._agconfig` directly — `ag.llm._agconfig.agllm_backend.model = "..."` takes effect on the agent's next LLM call, no `set_llm_config`-style method needed. See [Design_configuration.md](Design_configuration.md) for the full rationale (this is what stops two agents built from the same `cfg` from silently affecting each other).
+The agent clones whatever `agconfig` it's given at construction time, and `ag.llm` (and its backend) clones it again — so `ag.agconfig`, `ag.llm._agconfig`, and `ag.llm.backend._agconfig` are independent copies, not the same object. Mutating `cfg` (or even `ag.agconfig`) after construction does **not** reach `ag.llm`. This is what stops two agents built from the same `cfg` from silently affecting each other — see [Design_configuration.md](Design_configuration.md) for the full rationale.
+
+To change the LLM config live, call `ag.change_config(new_cfg)`:
+
+```python
+new_cfg = agConfig(agLLMBackendConfig(model="claude-sonnet-5", api_key="..."))
+ag.change_config(new_cfg)
+```
+
+This clones `new_cfg` and pushes that clone down through `ag.llm` (and its backend), `ag.log`, and `ag.sandbox` — the very next LLM call sees it. `ag.get_config_copy()` returns a clone of the agent's current `agconfig` (or `None` if it has none) — useful for building a modified `new_cfg` from the agent's live settings:
+
+```python
+cfg = ag.get_config_copy()
+cfg.agllm_backend.temperature = 0.2
+ag.change_config(cfg)
+```
 
 Inside an `agteam`, agents created with no explicit `agconfig=` automatically inherit the team's `agconfig` — see [`agteam.md`](agteam.md).
 

@@ -203,6 +203,45 @@ def test_build_llm_kwargs_no_extra_body_when_empty():
 
 
 # ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+def test_llm_change_config_reaches_backend():
+    """Mutating a cloned agconfig's field alone never reaches llm.backend --
+    change_config is the supported way to push a live update through."""
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    llm.change_config(_cfg(temperature=0.2))
+    assert llm.backend.temperature == 0.2
+
+def test_llm_change_config_clones_given_agconfig():
+    llm = agllm(_cfg(), context_limit=BIG_CTX)
+    new_cfg = _cfg(temperature=0.2)
+    llm.change_config(new_cfg)
+    new_cfg.agllm_backend.temperature = 0.9
+    assert llm.backend.temperature == 0.2
+
+def test_llm_get_config_copy_returns_clone_not_same_object():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    copy = llm.get_config_copy()
+    assert copy is not llm._agconfig
+
+def test_llm_get_config_copy_reflects_current_values():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    assert llm.get_config_copy().agllm_backend.temperature == 0.7
+
+def test_llm_get_config_copy_after_change_config_reflects_new_values():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    llm.change_config(_cfg(temperature=0.2))
+    assert llm.get_config_copy().agllm_backend.temperature == 0.2
+
+def test_mutating_llm_get_config_copy_does_not_affect_llm():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    copy = llm.get_config_copy()
+    copy.agllm_backend.temperature = 0.1
+    assert llm.backend.temperature == 0.7
+
+
+# ---------------------------------------------------------------------------
 # build_assistant_msg
 # ---------------------------------------------------------------------------
 

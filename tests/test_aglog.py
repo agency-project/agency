@@ -222,3 +222,45 @@ def test_dump_shows_lifecycle_and_skills():
     d = ag.log.dump()
     assert "CREATED" in d
     assert "my_skill" in d
+
+
+# ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+def test_log_change_config_replaces_agconfig():
+    log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+    log.change_config(agConfig({"agllm_backend": {"temperature": 0.2}}))
+    assert log._agconfig.get("agllm_backend", "temperature") == 0.2
+
+def test_log_change_config_clones_given_agconfig():
+    log = aglog(agconfig=agConfig())
+    new_cfg = agConfig({"agllm_backend": {"temperature": 0.2}})
+    log.change_config(new_cfg)
+    new_cfg.agllm_backend.temperature = 0.9
+    assert log._agconfig.get("agllm_backend", "temperature") == 0.2
+
+def test_log_get_config_copy_returns_clone_not_same_object():
+    cfg = agConfig({"agllm_backend": {"temperature": 0.7}})
+    log = aglog(agconfig=cfg)
+    copy = log.get_config_copy()
+    assert copy is not log._agconfig
+
+def test_log_get_config_copy_reflects_current_values():
+    log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+    assert log.get_config_copy().agllm_backend.temperature == 0.7
+
+def test_mutating_log_get_config_copy_does_not_affect_log():
+    log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+    copy = log.get_config_copy()
+    copy.agllm_backend.temperature = 0.1
+    assert log._agconfig.get("agllm_backend", "temperature") == 0.7
+
+def test_log_get_config_copy_none_when_no_agconfig():
+    log = aglog()
+    assert log.get_config_copy() is None
+
+def test_log_change_config_none_clears_agconfig():
+    log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+    log.change_config(None)
+    assert log.get_config_copy() is None

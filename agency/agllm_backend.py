@@ -651,6 +651,10 @@ class agllm_backend(AgLLMBackendFields):
         """Replace this backend's agconfig with a clone of the given one."""
         self._agconfig = agconfig.clone()
 
+    def get_config_copy(self) -> "agConfig":
+        """Return a clone of this backend's agconfig."""
+        return self._agconfig.clone()
+
     @staticmethod
     def for_config(agconfig: "agConfig") -> "agllm_backend":
         provider = agconfig.get("agllm_backend", "provider")
