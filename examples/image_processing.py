@@ -31,6 +31,9 @@ cfg = agConfig(
         base_url=os.environ.get("LLM_BASE_URL"),
         model=os.environ.get("LLM_MODEL", ""),
         api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
     )
 )
 

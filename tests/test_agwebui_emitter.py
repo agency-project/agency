@@ -5,8 +5,6 @@ import threading
 import time
 from pathlib import Path
 
-import pytest
-
 from agency.agwebui.emitter import agwebui_emitter, ansi_to_hex, _xterm256_hex
 
 

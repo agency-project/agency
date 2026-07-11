@@ -1,17 +1,22 @@
 """Tests for agllm — LLM client wrapper, streaming call, kwarg building, and compaction."""
 import ssl
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import httpx
 import openai
-import pytest
 
 from agency.agllm import LLMCallResult, agllm
 import json
 
+from agency.agconfig import agConfig
 from agency.agdata import agdata as _agdata, agerror as _agerror
 from agency.agcontext import agcontext
 from agency.agllm import _AgLLMFields
+
+
+def _cfg(**fields) -> agConfig:
+    """Test helper: wrap agllm_backend fields in an agConfig."""
+    return agConfig({"agllm_backend": fields})
 
 _COMPACT_THRESHOLD     = _AgLLMFields.COMPACT_THRESHOLD
 _TAIL_MAX_TOKENS       = _AgLLMFields.TAIL_MAX_TOKENS
@@ -34,7 +39,7 @@ def llm_call(kwargs, cfg, messages, *args, **kwargs2):
 
 LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
 BIG_CTX = 100_000
-LLM_COMPACT = agllm(LLM_COMPACT_CONFIG, context_limit=BIG_CTX)
+LLM_COMPACT = agllm(_cfg(**LLM_COMPACT_CONFIG), context_limit=BIG_CTX)
 
 
 def _make_mock_agent(llm=None, sandbox=None):
@@ -112,7 +117,7 @@ def _tool_chunks(name: str, args: str, call_id: str = "c1") -> list:
 
 def _run_call(chunks, llm_config=None):
     """Run llm_call with mocked OpenAI and return the result."""
-    cfg = llm_config or {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg = llm_config or _cfg(base_url="http://x", api_key="k", model="m")
     msgs: list[dict] = [{"role": "user", "content": "hi"}]
     with patch("agency.agllm.openai.OpenAI") as MockCls:
         MockCls.return_value.chat.completions.create.return_value = iter(chunks)
@@ -129,72 +134,111 @@ def _run_call(chunks, llm_config=None):
 # ---------------------------------------------------------------------------
 
 def test_build_llm_kwargs_includes_model():
-    cfg = {"model": "", "api_key": "x"}
+    cfg = _cfg(model="", api_key="x")
     kw  = build_llm_kwargs(cfg, [], None)
     assert kw["model"] == ""
 
 def test_build_llm_kwargs_default_model():
-    kw = build_llm_kwargs({}, [], None)
+    kw = build_llm_kwargs(_cfg(), [], None)
     assert kw["model"] == ""
 
 def test_build_llm_kwargs_messages_included():
     msgs = [{"role": "user", "content": "hi"}]
-    kw   = build_llm_kwargs({}, msgs, None)
+    kw   = build_llm_kwargs(_cfg(), msgs, None)
     assert kw["messages"] == msgs
 
 def test_build_llm_kwargs_strips_underscore_keys_from_messages():
     msgs = [{"role": "user", "content": "hi", "_thinking": "internal"}]
-    kw   = build_llm_kwargs({}, msgs, None)
+    kw   = build_llm_kwargs(_cfg(), msgs, None)
     assert "_thinking" not in kw["messages"][0]
     assert kw["messages"][0]["content"] == "hi"
 
 def test_build_llm_kwargs_no_tools_key_when_none():
-    kw = build_llm_kwargs({}, [], None)
+    kw = build_llm_kwargs(_cfg(), [], None)
     assert "tools" not in kw
 
 def test_build_llm_kwargs_tools_included():
     tools = [{"type": "function", "function": {"name": "f"}}]
-    kw    = build_llm_kwargs({}, [], tools)
+    kw    = build_llm_kwargs(_cfg(), [], tools)
     assert kw["tools"] == tools
 
 def test_build_llm_kwargs_openai_gen_params_forwarded():
-    cfg = {"model": "m", "temperature": 0.7, "max_completion_tokens": 512}
+    cfg = _cfg(model="m", temperature=0.7, max_completion_tokens=512)
     kw  = build_llm_kwargs(cfg, [], None)
     assert kw["temperature"] == 0.7
     assert kw["max_completion_tokens"] == 512
 
 def test_build_llm_kwargs_max_tokens_translated_with_warning(capsys):
-    kw = build_llm_kwargs({"model": "m", "max_tokens": 256}, [], None)
+    kw = build_llm_kwargs(_cfg(model="m", max_tokens=256), [], None)
     assert kw["max_completion_tokens"] == 256
     assert "max_tokens" not in kw
     assert "deprecated" in capsys.readouterr().out
 
 def test_build_llm_kwargs_max_completion_tokens_wins_when_both_present(capsys):
-    cfg = {"model": "m", "max_tokens": 256, "max_completion_tokens": 512}
+    cfg = _cfg(model="m", max_tokens=256, max_completion_tokens=512)
     kw  = build_llm_kwargs(cfg, [], None)
     assert kw["max_completion_tokens"] == 512
     assert "deprecated" in capsys.readouterr().out
 
 def test_build_llm_kwargs_unknown_params_not_forwarded():
-    cfg = {"model": "m", "custom_param": "ignored"}
+    cfg = _cfg(model="m", custom_param="ignored")
     kw  = build_llm_kwargs(cfg, [], None)
     assert "custom_param" not in kw
 
 def test_build_llm_kwargs_extra_body_params():
-    cfg = {"model": "m", "top_k": 50, "guided_json": {"type": "object"}}
+    cfg = _cfg(model="m", top_k=50, guided_json={"type": "object"})
     kw  = build_llm_kwargs(cfg, [], None)
     assert kw["extra_body"]["top_k"] == 50
     assert kw["extra_body"]["guided_json"] == {"type": "object"}
 
 def test_build_llm_kwargs_explicit_extra_body_merged():
-    cfg = {"model": "m", "extra_body": {"stream_options": True}, "top_k": 10}
+    cfg = _cfg(model="m", extra_body={"stream_options": True}, top_k=10)
     kw  = build_llm_kwargs(cfg, [], None)
     assert kw["extra_body"]["stream_options"] is True
     assert kw["extra_body"]["top_k"] == 10
 
 def test_build_llm_kwargs_no_extra_body_when_empty():
-    kw = build_llm_kwargs({"model": "m"}, [], None)
+    kw = build_llm_kwargs(_cfg(model="m"), [], None)
     assert "extra_body" not in kw
+
+
+# ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+def test_llm_change_config_reaches_backend():
+    """Mutating a cloned agconfig's field alone never reaches llm.backend --
+    change_config is the supported way to push a live update through."""
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    llm.change_config(_cfg(temperature=0.2))
+    assert llm.backend.temperature == 0.2
+
+def test_llm_change_config_clones_given_agconfig():
+    llm = agllm(_cfg(), context_limit=BIG_CTX)
+    new_cfg = _cfg(temperature=0.2)
+    llm.change_config(new_cfg)
+    new_cfg.agllm_backend.temperature = 0.9
+    assert llm.backend.temperature == 0.2
+
+def test_llm_get_config_copy_returns_clone_not_same_object():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    copy = llm.get_config_copy()
+    assert copy is not llm._agconfig
+
+def test_llm_get_config_copy_reflects_current_values():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    assert llm.get_config_copy().agllm_backend.temperature == 0.7
+
+def test_llm_get_config_copy_after_change_config_reflects_new_values():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    llm.change_config(_cfg(temperature=0.2))
+    assert llm.get_config_copy().agllm_backend.temperature == 0.2
+
+def test_mutating_llm_get_config_copy_does_not_affect_llm():
+    llm = agllm(_cfg(temperature=0.7), context_limit=BIG_CTX)
+    copy = llm.get_config_copy()
+    copy.agllm_backend.temperature = 0.1
+    assert llm.backend.temperature == 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -273,17 +317,17 @@ def test_llm_call_result_not_ok_when_context_exceeded():
 # ---------------------------------------------------------------------------
 
 def test_fetch_context_limit_uses_config_key():
-    limit = fetch_context_limit({"context_limit": 65536})
+    limit = fetch_context_limit(_cfg(context_limit=65536))
     assert limit == 65536
 
 def test_fetch_context_limit_int_coercion():
-    limit = fetch_context_limit({"context_limit": "32000"})
+    limit = fetch_context_limit(_cfg(context_limit="32000"))
     assert limit == 32000
 
 def test_fetch_context_limit_falls_back_to_default(capsys):
     with patch("agency.agllm.openai.OpenAI") as MockCls:
         MockCls.return_value.models.list.side_effect = RuntimeError("offline")
-        limit = fetch_context_limit({"model": "m"})
+        limit = fetch_context_limit(_cfg(model="m"))
     assert limit == _AgLLMFields.default_context_limit.default
 
 def test_fetch_context_limit_reads_max_model_len():
@@ -292,7 +336,7 @@ def test_fetch_context_limit_reads_max_model_len():
     mock_model.model_extra = {"max_model_len": 200_000}
     with patch("agency.agllm.openai.OpenAI") as MockCls:
         MockCls.return_value.models.list.return_value = [mock_model]
-        limit = fetch_context_limit({"model": "my-model"})
+        limit = fetch_context_limit(_cfg(model="my-model"))
     assert limit == 200_000
 
 
@@ -307,7 +351,7 @@ def test_fetch_context_limit_reads_max_input_tokens_for_anthropic_provider():
     mock_sdk = MagicMock()
     mock_sdk.Anthropic.return_value.models.list.return_value = [mock_model]
     with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
-        limit = fetch_context_limit({"provider": "anthropic", "model": "claude-sonnet-5"})
+        limit = fetch_context_limit(_cfg(provider="anthropic", model="claude-sonnet-5"))
     assert limit == 1_000_000
 
 
@@ -317,31 +361,31 @@ def test_fetch_context_limit_reads_max_input_tokens_for_anthropic_provider():
 
 def test_agllm_explicit_context_limit_skips_fetch():
     with patch.object(agllm, "fetch_context_limit") as mock_fetch:
-        llm = agllm({"model": "m"}, context_limit=128_000)
+        llm = agllm(_cfg(model="m"), context_limit=128_000)
     mock_fetch.assert_not_called()
     assert llm.context_limit == 128_000
 
 def test_agllm_no_context_limit_calls_fetch():
     with patch.object(agllm, "fetch_context_limit", return_value=32_000) as mock_fetch:
-        llm = agllm({"model": "m"})
+        llm = agllm(_cfg(model="m"))
     mock_fetch.assert_called_once()
     assert llm.context_limit == 32_000
 
 def test_agllm_config_stored():
-    cfg = {"model": "", "temperature": 0.5}
+    cfg = _cfg(model="", temperature=0.5)
     llm = agllm(cfg, context_limit=128_000)
     assert llm.backend.model == ""
     assert llm.backend.temperature == 0.5
 
 def test_agllm_build_kwargs_delegates():
-    llm  = agllm({"model": "m"}, context_limit=128_000)
+    llm  = agllm(_cfg(model="m"), context_limit=128_000)
     msgs = [{"role": "user", "content": "hi"}]
     kw   = llm.build_kwargs(msgs)
     assert kw["model"]    == "m"
     assert kw["messages"] == msgs
 
 def test_agllm_build_kwargs_with_tools():
-    llm   = agllm({"model": "m"}, context_limit=128_000)
+    llm   = agllm(_cfg(model="m"), context_limit=128_000)
     tools = [{"type": "function", "function": {"name": "f"}}]
     kw    = llm.build_kwargs([], tools)
     assert kw["tools"] == tools
@@ -387,7 +431,6 @@ def test_llm_call_tool_call_accumulated():
     assert result.tool_calls_raw[0]["id"] == "call_abc"
 
 def test_llm_call_tool_call_arguments_concatenated():
-    import json
     tc1 = _TCDelta("f", '{"a":', "c1")
     tc2 = _TCDelta("",  '"val"}', "")
     tc2.function.name = ""
@@ -397,7 +440,7 @@ def test_llm_call_tool_call_arguments_concatenated():
 
 def test_llm_call_removes_partial_message_on_success():
     msgs: list[dict] = [{"role": "user", "content": "hi"}]
-    cfg = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg = _cfg(base_url="http://x", api_key="k", model="m")
     with patch("agency.agllm.openai.OpenAI") as MockCls:
         MockCls.return_value.chat.completions.create.return_value = iter(_text_chunks("ok"))
         llm_call(build_llm_kwargs(cfg, msgs, None), cfg, msgs,
@@ -421,7 +464,7 @@ def test_llm_call_token_update_fn_called():
     def _update(inp, out):
         called_with.append((inp, out))
 
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     with patch("agency.agllm.openai.OpenAI") as MockCls:
         MockCls.return_value.chat.completions.create.return_value = iter(
@@ -440,7 +483,7 @@ def test_llm_call_token_update_fn_called():
 # ---------------------------------------------------------------------------
 
 def test_llm_call_context_exceeded_on_bad_request():
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.BadRequestError(
         message="context_length_exceeded: too long",
@@ -457,7 +500,7 @@ def test_llm_call_context_exceeded_on_bad_request():
     assert not result.ok
 
 def test_llm_call_bad_request_not_context_gives_conn_error():
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.BadRequestError(
         message="invalid_request_error",
@@ -474,7 +517,7 @@ def test_llm_call_bad_request_not_context_gives_conn_error():
     assert result.conn_error is err
 
 def test_llm_call_transient_error_retries_and_exhausts():
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = ssl.SSLError("handshake failed")
     with patch("agency.agllm.openai.OpenAI") as MockCls, \
@@ -490,7 +533,7 @@ def test_llm_call_transient_error_retries_and_exhausts():
 def test_llm_call_transient_error_notifies_full_history_fn():
     from agency.agllm import _AgLLMFields
     LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
-    cfg   = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg   = _cfg(base_url="http://x", api_key="k", model="m")
     msgs  = [{"role": "user", "content": "hi"}]
     err   = OSError("connection reset")
     events: list = []
@@ -509,7 +552,7 @@ def test_llm_call_bare_api_error_retries_and_exhausts():
     """A bare openai.APIError (e.g. a mid-stream server error frame with no
     HTTP status to build a more specific subclass from) must retry like any
     other transient error, not propagate uncaught and crash the skill."""
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.APIError(
         "The server had an error while processing your request. Sorry about that!",
@@ -529,7 +572,7 @@ def test_llm_call_bare_api_error_retries_and_exhausts():
 def test_llm_call_bare_api_error_notifies_full_history_fn():
     from agency.agllm import _AgLLMFields
     LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
-    cfg   = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg   = _cfg(base_url="http://x", api_key="k", model="m")
     msgs  = [{"role": "user", "content": "hi"}]
     err   = openai.APIError("server error", httpx.Request("POST", "http://x"), body=None)
     events: list = []
@@ -548,7 +591,7 @@ def test_llm_call_bad_request_still_immediate_despite_being_an_api_error():
     """BadRequestError is itself an openai.APIError subclass — the broadened
     retry-on-APIError clause must not shadow the more specific BadRequestError
     handling (which returns immediately, no retry) since it's checked first."""
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.BadRequestError(
         message="invalid_request_error",
@@ -571,7 +614,7 @@ def test_llm_call_rate_limit_honors_retry_after_header():
     on top, never subtracted, so this asserts a floor rather than equality."""
     from agency.agllm import _AgLLMFields
     LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S = _AgLLMFields.rate_limit_retry_after_jitter_s.default
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
         message="rate_limit_error", response=MagicMock(status_code=429, headers={"retry-after": "3"}), body=None,
@@ -594,7 +637,7 @@ def test_llm_call_rate_limit_retry_after_jitter_decorrelates_calls():
     guaranteed to sleep for the identical duration — otherwise concurrently
     throttled agents sharing one org-wide window would all wake up and
     retry in the same instant."""
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
         message="rate_limit_error", response=MagicMock(status_code=429, headers={"retry-after": "3"}), body=None,
@@ -613,7 +656,7 @@ def test_llm_call_rate_limit_falls_back_to_exponential_backoff_without_header():
     jittered exponential backoff instead of raising a TypeError/ValueError."""
     from agency.agllm import _AgLLMFields
     LLM_RATE_LIMIT_MAX_BACKOFF_S = _AgLLMFields.rate_limit_max_backoff_s.default
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
         message="rate_limit_error", response=MagicMock(status_code=429, headers={}), body=None,
@@ -636,7 +679,7 @@ def test_llm_call_rate_limit_exhausts_retries_without_raising():
     (agskill.py crashing on anthropic.RateLimitError)."""
     from agency.agllm import _AgLLMFields
     LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = openai.RateLimitError(
         message="rate_limit_error", response=MagicMock(status_code=429, headers={"retry-after": "0"}), body=None,
@@ -653,7 +696,7 @@ def test_llm_call_rate_limit_exhausts_retries_without_raising():
     assert mock_sleep.call_count == LLM_MAX_RETRIES - 1
 
 def test_llm_call_partial_placeholder_removed_on_error():
-    cfg  = {"base_url": "http://x", "api_key": "k", "model": "m"}
+    cfg  = _cfg(base_url="http://x", api_key="k", model="m")
     msgs = [{"role": "user", "content": "hi"}]
     err  = ssl.SSLError("fail")
     with patch("agency.agllm.openai.OpenAI") as MockCls, \
@@ -670,7 +713,7 @@ def test_llm_call_partial_placeholder_removed_on_error():
 # ---------------------------------------------------------------------------
 
 def test_agllm_call_returns_llm_call_result():
-    llm  = agllm({"base_url": "http://x", "api_key": "k", "model": "m"}, context_limit=128_000)
+    llm  = agllm(_cfg(base_url="http://x", api_key="k", model="m"), context_limit=128_000)
     msgs = [{"role": "user", "content": "hi"}]
     kw   = llm.build_kwargs(msgs)
     with patch("agency.agllm.openai.OpenAI") as MockCls:
@@ -845,7 +888,7 @@ def test_should_compact_small_model():
 
 def test_fetch_context_limit_model_with_slash_in_name():
     """Model names like 'nvidia/foo' must not trigger a 404 via retrieve()."""
-    cfg = {**LLM_COMPACT_CONFIG, "model": "nvidia/MiniMax-M2.7-NVFP4"}
+    cfg = _cfg(**{**LLM_COMPACT_CONFIG, "model": "nvidia/MiniMax-M2.7-NVFP4"})
     mock_info = MagicMock()
     mock_info.id = "nvidia/MiniMax-M2.7-NVFP4"
     mock_info.model_extra = {"max_model_len": 196000}
@@ -859,7 +902,7 @@ def test_fetch_context_limit_model_with_slash_in_name():
 
 
 def test_fetch_context_limit_config_wins_over_vllm():
-    cfg = {**LLM_COMPACT_CONFIG, "context_limit": 8192}
+    cfg = _cfg(**{**LLM_COMPACT_CONFIG, "context_limit": 8192})
     mock_info = MagicMock()
     mock_info.model_extra = {"max_model_len": 131072}
     mock_client = MagicMock()
@@ -1046,7 +1089,6 @@ def _make_stream(content: str, prompt_tokens: int) -> list:
 
 def test_agskill_triggers_compaction_when_over_threshold():
     from agency.agskill import agskill
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
@@ -1064,14 +1106,13 @@ def test_agskill_triggers_compaction_when_over_threshold():
         MockClient.return_value = MagicMock()
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "done"}', over)
-        skill.execute_react(_make_mock_agent(agllm(LLM_COMPACT_CONFIG, context_limit=limit)), agcontext(), _agdata(task="x"))
+        skill.execute_react(_make_mock_agent(agllm(_cfg(**LLM_COMPACT_CONFIG), context_limit=limit)), agcontext(), _agdata(task="x"))
 
     assert len(compact_calls) == 1
 
 
 def test_agskill_skips_compaction_when_under_threshold():
     from agency.agskill import agskill
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
@@ -1089,7 +1130,7 @@ def test_agskill_skips_compaction_when_under_threshold():
         MockClient.return_value = MagicMock()
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "ok"}', under)
-        skill.execute_react(_make_mock_agent(agllm(LLM_COMPACT_CONFIG, context_limit=limit)), agcontext(), _agdata(task="x"))
+        skill.execute_react(_make_mock_agent(agllm(_cfg(**LLM_COMPACT_CONFIG), context_limit=limit)), agcontext(), _agdata(task="x"))
 
     assert len(compact_calls) == 0
 
@@ -1097,7 +1138,6 @@ def test_agskill_skips_compaction_when_under_threshold():
 def test_agskill_passes_context_limit_to_compact():
     """compact() must receive the context_limit kwarg so tail sizing is correct."""
     from agency.agskill import agskill
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
     limit = BIG_CTX
@@ -1114,7 +1154,7 @@ def test_agskill_passes_context_limit_to_compact():
         MockClient.return_value = MagicMock()
         MockClient.return_value.chat.completions.create.return_value = \
             _make_stream('{"result": "done"}', over)
-        skill.execute_react(_make_mock_agent(agllm(LLM_COMPACT_CONFIG, context_limit=limit)), agcontext(), _agdata(task="x"))
+        skill.execute_react(_make_mock_agent(agllm(_cfg(**LLM_COMPACT_CONFIG), context_limit=limit)), agcontext(), _agdata(task="x"))
 
     assert received_kwargs.get("context_limit") == limit
 
@@ -1218,7 +1258,6 @@ def test_agskill_context_exceeded_triggers_forced_compaction():
     """
     from agency.agskill import agskill
     from agency.agllm import LLMCallResult
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
@@ -1258,7 +1297,6 @@ def test_agskill_context_exceeded_does_not_count_as_retry():
     """context_exceeded compaction must not consume a connection-retry slot."""
     from agency.agskill import agskill
     from agency.agllm import LLMCallResult
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 

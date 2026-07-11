@@ -635,22 +635,28 @@ class agllm_backend(AgLLMBackendFields):
     instantiate a subclass directly.
 
     Inherits AgLLMBackendFields so every concrete backend reads its
-    parameters as plain attributes (self.model, self.api_key, ...). Given an
-    agConfig, it's stored as-is (self._agconfig) -- not copied -- so a
-    caller that mutates it later (`cfg.agllm_backend.temperature = 0.9`)
-    sees the change reflected on the next attribute read, same as any other
-    DynamicConfigParam consumer in the framework. Given a plain dict (for
-    quick/manual construction outside the agconfig-driven path), it's
-    wrapped in a fresh private agConfig -- same attribute-backed reads, just
-    with no caller-visible agConfig to mutate afterwards.
+    parameters as plain attributes (self.model, self.api_key, ...). The
+    given agConfig is cloned (self._agconfig) -- so this backend's own config
+    is independent of the caller's; mutating the caller's original agConfig
+    afterward does not affect this backend. To change this backend's live
+    config, call ``change_config()`` (or, for one-off dynamic fields, mutate
+    ``backend._agconfig`` directly since that object is used fresh on every
+    call).
     """
 
-    def __init__(self, config: "dict | agConfig") -> None:
-        self._agconfig = config if isinstance(config, agConfig) else agConfig({"agllm_backend": dict(config)})
+    def __init__(self, agconfig: "agConfig") -> None:
+        self._agconfig = agconfig.clone()
+
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this backend's agconfig with a clone of the given one."""
+        self._agconfig = agconfig.clone()
+
+    def get_config_copy(self) -> "agConfig":
+        """Return a clone of this backend's agconfig."""
+        return self._agconfig.clone()
 
     @staticmethod
-    def for_config(config: "dict | agConfig") -> "agllm_backend":
-        agconfig = config if isinstance(config, agConfig) else agConfig({"agllm_backend": dict(config)})
+    def for_config(agconfig: "agConfig") -> "agllm_backend":
         provider = agconfig.get("agllm_backend", "provider")
         model = agconfig.get("agllm_backend", "model", "") or ""
         if provider == "bedrock":
@@ -721,8 +727,7 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
         # A Bedrock API key (e.g. "ABSK...") is a single opaque bearer token
         # for the Mantle gateway. AWS access/secret key pairs for SigV4 signing
         # are always "ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]" — the
-        # colon is what distinguishes the two, not any particular prefix
-        # string (real Bedrock API keys don't start with "bedrock-api-key-").
+        # colon is what distinguishes the two.
         if api_key and ":" not in api_key:
             return openai.OpenAI(api_key=api_key, base_url=mantle_url, timeout=timeout)
         if not api_key:

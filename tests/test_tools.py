@@ -5,7 +5,6 @@ live in test_agsandbox.py::TestSandboxedTools which runs against a real
 container.
 """
 import json
-import os
 import threading
 import pytest
 from unittest.mock import patch, MagicMock

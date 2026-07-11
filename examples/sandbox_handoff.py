@@ -32,6 +32,7 @@ from datetime import datetime
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
 from agency.agllm_backend import agVLLMBackendConfig
+from agency.agtype import agpath
 
 # ---------------------------------------------------------------------------
 # LLM config
@@ -43,6 +44,9 @@ cfg = agConfig(
         base_url=os.environ.get("LLM_BASE_URL"),
         model=os.environ.get("LLM_MODEL", ""),
         api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
     )
 )
 FILE_PATH = "/workspace/hello.py"
@@ -57,8 +61,8 @@ write_skill = agskill(
         "You are a code writing assistant. "
         "Use the write tool to create the requested Python file at the given path."
     ),
-    input_schema=agdata(task=str, file_path=str),
-    output_schema=agdata(status=str, path=str),
+    input_schema=agdata(task=str, file_path=agpath),
+    output_schema=agdata(status=str, path=agpath),
 )
 
 fix_skill = agskill(
@@ -69,7 +73,7 @@ fix_skill = agskill(
         "the write tool, then verify your fix by running the file with bash. "
         "Report the corrected output."
     ),
-    input_schema=agdata(task=str, file_path=str),
+    input_schema=agdata(task=str, file_path=agpath),
     output_schema=agdata(status=str, output=str),
 )
 
@@ -170,10 +174,8 @@ def main() -> None:
 
     _run_file(sandbox, "after fix")
 
-    # Sandbox cleanup: agSandbox.__del__ calls destroy() when the object is garbage collected,
-    # and an atexit handler catches anything that survives to interpreter shutdown.
-    # Explicit destroy() is only needed in long-running processes where you want
-    # deterministic container resource release on the host-side rather than waiting for GC.
+    # Sandbox cleanup happens automatically: agSandbox.__del__ calls destroy() on
+    # garbage collection, with an atexit handler as a backstop.
     print("\nDone.")
 
 

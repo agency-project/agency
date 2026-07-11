@@ -45,7 +45,9 @@ Schema fields in `agdata` are plain Python type objects:
 | `[{"key": type, ...}]` | `array` | each item dict validated against template |
 | `agfile` | `string` | must be str (file path); framework reads UTF-8 content after skill ends |
 | `agbinary` | `string` | must be str (file path); framework reads raw bytes after skill ends; caller receives `bytes` |
+| `agpath` | `string` | must be str and look like a path (`_looks_like_path`); passed through unchanged — never read or written by the framework |
 | `agimage` | `string` | must be str (URL or data URL); injected as a multimodal image in the user message |
+| `agrawstring` | `string` | bypasses JSON formatting entirely; must be the only field in its schema |
 
 Any `agtype` subclass is also valid; its `schema_type()` classmethod provides the display hint.
 
@@ -58,6 +60,9 @@ output_schema=agdata(report=agfile)
 
 # agbinary for raw binary outputs (audio, images, compiled artifacts):
 output_schema=agdata(trimmed=agbinary)
+
+# agpath when the value itself must stay a path (not content read from/written to it):
+output_schema=agdata(path=agpath, content=str)
 
 # agimage as input (multimodal):
 input_schema=agdata(question=str, photo=agimage)
@@ -258,7 +263,7 @@ Non-integer or missing `"timeout"` values are silently ignored and the default a
 
 ## Typed field values (`agtype` and `agfile`)
 
-Schema field types can be `agtype` subclasses as well as plain type-name strings.  The built-in subclass is `agfile`.  See [agtype.md](agtype.md) for the full interface and instructions for writing custom field types.
+Schema field types can be `agtype` subclasses as well as plain type-name strings.  Built-in subclasses are `agfile`, `agbinary`, `agpath`, `agimage`, and `agrawstring`.  See [agtype.md](agtype.md) for the full interface and instructions for writing custom field types.
 
 Declare a schema field with `agfile` as its type to make the framework handle file I/O transparently for that field.
 
@@ -321,12 +326,26 @@ All `agfile` files — both input and output — are deleted from the sandbox in
 
 After the skill completes, `agbinary.recover()` reads the raw bytes via `sandbox.read_file_bytes()` (no UTF-8 decode) and the caller receives `bytes`.
 
-### Schema display
+### Output `agpath` fields
 
-In the JSON format sections appended to the system prompt, `agfile` fields are shown as `"file"` and `agbinary` fields as `"binary_file"`:
+`agpath` is for fields whose value **is** a path — not content the framework should read from or write to a file. Unlike `agfile`/`agbinary`, `agpath` never touches the sandbox filesystem: the value passes through `prepare()`/`recover()` unchanged.
+
+**Live validation** only checks the *shape* of the value — does it look like a path (`_looks_like_path`)? If not, the tool call returns an error and the agent gets to correct it:
 
 ```json
-{"background": "file", "audio": "binary_file", "theme": "string"}
+{"error": "field_name 'moved_to': 'here is the content you asked for' does not look like a path. Pass the path string itself, not file content."}
+```
+
+This matters because a plain `str` output field has a convenience fallback: if its value looks like a path, the framework assumes the real content lives in that file and silently reads it back (see the "str field with a sandbox path value" bullet below). That fallback is exactly wrong for a field whose value is meant to stay a path — e.g. `output_schema=agdata(path=str, content=str)`, where a correct `return_path("/data/note.txt")` call gets silently overwritten with the note's own content because `/data/note.txt` "looks like a path" to the same str heuristic meant for `content`. Declare such a field as `agpath` instead of `str` to opt out of that fallback entirely.
+
+**Input validation** works the same way: if the caller passes a value that doesn't look like a path for an `agpath` input field, `validate_input()` rejects it before the skill runs (see [Input validation](#input-validation)).
+
+### Schema display
+
+In the JSON format sections appended to the system prompt, `agfile` fields are shown as `"file"`, `agbinary` fields as `"binary_file"`, and `agpath` fields as `"path"`:
+
+```json
+{"background": "file", "audio": "binary_file", "moved_to": "path", "theme": "string"}
 ```
 
 ---
@@ -356,7 +375,7 @@ Only top-level string fields are auto-offloaded. Non-string values (integers, bo
 
 ## Input validation
 
-Input is validated against `input_schema` before the loop starts. Validation checks that all required fields are present and have the correct Python type. If validation fails, the skill returns immediately with an `agdata(error=...)` without calling the LLM.
+Input is validated against `input_schema` before the loop starts. Validation checks that all required fields are present and have the correct Python type. For `agtype` fields, the check delegates to that class's `validate_input_value()` — the default (used by `agfile`, `agbinary`, `agimage`) just requires a `str`; `agpath` additionally requires the string to look like a path. If validation fails, the skill returns immediately with an `agdata(error=...)` without calling the LLM.
 
 
 ## Output collection via tools
@@ -379,7 +398,8 @@ Each `return_<field>` call is validated immediately against the schema hint. The
 
 - **Type mismatch** → the tool returns `{"error": "field 'X': expected bool, got str"}` inline, and **`TOOL ✗`** is logged to `ag.terminal` and `ag.log` with the raw tool call args and the error message. The model sees the error in the same response turn and can retry just that field without losing any other already-registered outputs.
 - **`agfile` field** → file is read from the sandbox immediately; see [Output `agfile` fields](#output-agfile-fields) for the full set of checks and error messages.
-- **`str` field with a sandbox path value** → if the value looks like a sandbox path (starts with `/`, only word characters, dots, and hyphens per segment), the framework silently reads the file at that path and substitutes its content. If the file is unreadable or its content is itself a path, the original value is kept. This handles the common case where the agent writes a `str` output to a file and returns the path instead of the content.
+- **`agpath` field** → the value is checked against `_looks_like_path` only — no sandbox file is read or written. If it doesn't look like a path, the tool returns an error and the agent retries; see [Output `agpath` fields](#output-agpath-fields).
+- **`str` field with a sandbox path value** → if the value looks like a sandbox path (starts with `/`, only word characters, dots, and hyphens per segment), the framework reads the file at that path and substitutes its content, printing a `[agschema] WARNING` to stderr each time this fires. If the file is unreadable or its content is itself a path, the original value is kept. This handles the common case where the agent writes a `str` output to a file and returns the path instead of the content — but it also means a plain `str` field can never reliably hold a path-shaped value; use `agpath` for fields whose value must stay a path.
 - **Success** → the tool returns `{"result": "✓ 'X' registered. Still needed: [...]"}` (or `"All required fields complete."` on the last one), and **`TOOL ✓`** is logged to `ag.terminal` and `ag.log` with the tool call args.
 
 ### Completeness check and reprompt

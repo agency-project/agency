@@ -100,8 +100,7 @@ _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
 # duration of each subprocess call.  Caps concurrent daemon calls at 16: the
 # daemon serialises most operations internally (GPU init, overlay diff, container
 # teardown), so more than ~16 concurrent calls increase contention without
-# reducing wall-clock time.  A single semaphore replaces the former trio of
-# _startup_semaphore / _commit_semaphore / _shutdown_semaphore.
+# reducing wall-clock time.
 # Tier-1 (global class) config: lazily created on first use so a caller can
 # override the limit via agSandbox.docker_semaphore_limit = N (or
 # cfg.agSandbox.docker_semaphore_limit = N before any agSandbox exists)
@@ -378,7 +377,11 @@ class agSandbox(_AgSandboxFields):
         self._started   = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
-        self._agconfig: "agConfig | None"  = agconfig
+        # Cloned so this sandbox's own agconfig is independent of the
+        # caller's -- mutating the caller's original agConfig afterward does
+        # not affect this sandbox. To change it live, mutate
+        # sandbox._agconfig (or one of its owner views) directly.
+        self._agconfig: "agConfig | None"  = agconfig.clone() if agconfig is not None else None
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
@@ -391,10 +394,23 @@ class agSandbox(_AgSandboxFields):
         self._gpu_flags     = _gpu_flags()
         self._base_image = self.base_image
         self._vol_flags: list[str] = []
-        for host, container, mode in agSandboxConfig(agconfig).mounts.values():
+        for host, container, mode in agSandboxConfig(self._agconfig).mounts.values():
             host_path = Path(host)
             host_path.mkdir(parents=True, exist_ok=True)
             self._vol_flags += ["-v", f"{host_path.resolve()}:{container}:{mode}"]
+
+    def change_config(self, agconfig: "agConfig | None") -> None:
+        """Replace this sandbox's agconfig with a clone of the given one.
+
+        Only affects fields read live (DynamicConfigParam) going forward --
+        the container's image and mounts were resolved once at construction
+        (tier-2, physically fixed once the container exists) and are not
+        re-resolved here."""
+        self._agconfig = agconfig.clone() if agconfig is not None else None
+
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this sandbox's agconfig, or None if it has none."""
+        return self._agconfig.clone() if self._agconfig is not None else None
 
     def __getstate__(self) -> dict:
         # threading.RLock isn't picklable — custom tools with run_in_subprocess=True

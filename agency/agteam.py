@@ -73,8 +73,12 @@ class agteam:
             _wrap_run(cls)
 
     def __init__(self, agconfig: "agConfig | None" = None, **config) -> None:
-        # Instance-level agconfig: explicit arg > class attribute
-        self.agconfig: "agConfig | None" = agconfig if agconfig is not None else type(self).agconfig
+        # Instance-level agconfig: explicit arg > class attribute. Cloned so
+        # this team's own agconfig is independent of whatever source it was
+        # built from -- mutating that source afterward must not silently
+        # change an already-constructed team (or the agents it already spawned).
+        _src_agconfig = agconfig if agconfig is not None else type(self).agconfig
+        self.agconfig: "agConfig | None" = _src_agconfig.clone() if _src_agconfig is not None else None
         # Expose every config kwarg as a plain attribute
         for k, v in config.items():
             setattr(self, k, v)
@@ -88,7 +92,7 @@ class agteam:
         # Log team creation to both terminal and file
         from .agent import agent as _Agent
         from .agname import agname as _agname
-        from .aglog import aglog as _aglog, _ts
+        from .aglog import aglog as _aglog
         import sys
         _base = config.get("name") or f"{type(self).__name__}"
         self.team_name: str = _agname.allocate_agname(_base)
@@ -136,6 +140,20 @@ class agteam:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this team's agconfig with a clone of the given one, and
+        push that same clone down to every agent this team has spawned so
+        far (via ``agent.change_config``). Agents created afterward pick up
+        the new ``self.agconfig`` automatically, the same way they do at
+        construction."""
+        self.agconfig = agconfig.clone()
+        for a in self._agents:
+            a.change_config(self.agconfig)
+
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this team's agconfig, or None if it has none."""
+        return self.agconfig.clone() if self.agconfig is not None else None
 
     @property
     def agents(self) -> list["_Agent"]:

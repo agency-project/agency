@@ -20,6 +20,7 @@ from pathlib import Path
 from agency import agent, agdata, agskill, agteam
 from agency.agconfig import agConfig
 from agency.agllm_backend import agVLLMBackendConfig
+from agency.agtype import agpath
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agConfig(
@@ -27,34 +28,29 @@ cfg = agConfig(
         base_url=os.environ.get("LLM_BASE_URL"),
         model=os.environ.get("LLM_MODEL", ""),
         api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
     )
 )
 
 
-class ContinuationSkill(agskill):
-    def __init__(self, **kwargs):
-        super().__init__(
-            name="continuation",
-            system_prompt="Continue the given text in one sentence.",
-            input_schema=agdata(text=str),
-            output_schema=agdata(continuation=str),
-            replace_tools=[],
-            **kwargs,
-        )
+continuation_skill = agskill(
+    name="continuation",
+    system_prompt="Continue the given text in one sentence.",
+    input_schema=agdata(text=str),
+    output_schema=agdata(continuation=str),
+)
 
-
-class WriterSkill(agskill):
-    def __init__(self, **kwargs):
-        super().__init__(
-            name="writer",
-            system_prompt=(
-                "Write the given content to the given file path using the write tool. "
-                "The path is inside the sandbox container."
-            ),
-            input_schema=agdata(file_path=str, content=str),
-            output_schema=agdata(path=str, status=str),
-            **kwargs,
-        )
+writer_skill = agskill(
+    name="writer",
+    system_prompt=(
+        "Write the given content to the given file path using the write tool. "
+        "The path is inside the sandbox container."
+    ),
+    input_schema=agdata(file_path=agpath, content=str),
+    output_schema=agdata(path=agpath, status=str),
+)
 
 
 def _make_run_dir(name: str) -> Path:
@@ -75,7 +71,7 @@ class SequentialChainTeam(agteam):
     agconfig = cfg
 
     def setup(self) -> None:
-        self.writer = WriterSkill()
+        self.writer = writer_skill
         self.agent = agent()
 
     def run(self) -> None:
@@ -110,7 +106,7 @@ class ForkFanoutTeam(agteam):
     ]
 
     def setup(self) -> None:
-        self.continuation = ContinuationSkill()
+        self.continuation = continuation_skill
         self.parent = agent()
 
     def run(self) -> None:

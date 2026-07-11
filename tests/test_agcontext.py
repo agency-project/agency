@@ -1,8 +1,5 @@
 """Tests for agcontext — conversation state container."""
-import copy
 from concurrent.futures import Future
-
-import pytest
 
 from agency.agcontext import agcontext
 

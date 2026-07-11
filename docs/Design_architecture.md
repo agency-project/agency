@@ -195,7 +195,7 @@ The sandbox is created lazily on the first skill run that needs one. After each 
 
 **Sandbox ownership — no flag, plain attribute**
 
-`agent.sandbox` is a plain instance attribute — no property, no getter/setter, no `is_external_sandbox` flag. There used to be an ownership flag that let a caller "check out" a sandbox (`get_agent_sandbox_as_external_sandbox()` / `set_agent_sandbox_to_external_sandbox()`) so agskill would skip stopping/destroying a container it didn't create. That indirection is gone:
+`agent.sandbox` is a plain instance attribute — no property, no getter/setter, no ownership flag:
 
 - `agskill` always provisions a sandbox when `ag.sandbox is None`, and always calls `sandbox.stop(commit=...)` in its teardown — regardless of whether the sandbox was created by agskill or handed in via `agent(sandbox=...)` / direct assignment (`ag.sandbox = sb`). `stop()` is non-destructive to the Python object: it commits + removes the *container*, and the next access transparently restarts it from that checkpoint.
 - `agent.__del__` has no sandbox-specific logic at all. Once nothing references an `agSandbox` instance (the agent that held it is gone, and no one else kept a reference), Python's refcounting collects it and `agSandbox.__del__` (which calls `destroy()`) runs — see `agsandbox.md`. Sharing a sandbox across agents (e.g. a harness handing the same `agSandbox` to two agents in turn) works by simply assigning `ag.sandbox = sb` on each; whoever drops the last reference triggers the real cleanup.

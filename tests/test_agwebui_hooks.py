@@ -4,7 +4,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -180,10 +180,6 @@ def test_agteam_emits_team_registered(active_webui):
         team._agents = set()
         team.team_name = "MinimalTeam_0000"
         # Directly call the post-setup hook
-        try:
-            from . import agwebui as _agwebui
-        except Exception:
-            pass
         import agency.agwebui as _agwebui2
         if _agwebui2._active is not None:
             _agwebui2._active.emitter.team_registered(

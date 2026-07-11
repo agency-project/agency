@@ -505,8 +505,6 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
 # Checkpointing (requires Docker)
 # ---------------------------------------------------------------------------
 
-import subprocess as _subprocess
-
 _docker_ok = pytest.mark.skipif(
     not (lambda: __import__("subprocess").run(
         ["docker", "info"], capture_output=True, timeout=10
@@ -1020,7 +1018,6 @@ def test_prepare_agtype_inputs_nested_list_agimage(tmp_path):
     assert base64.b64decode(inp._data["batches"][0][0].split(",", 1)[1]) == b"img_a"
 
 def test_prepare_agtype_inputs_dict_of_list_agimage(tmp_path):
-    import base64
     img = tmp_path / "x.jpg"
     img.write_bytes(b"img_x")
     inp = agdata(groups={"g": [str(img)]})
@@ -1257,3 +1254,47 @@ def test_random_offload_agtype_skip_fuzz():
                 )
 
     assert not failures, f"{len(failures)}/100 trials failed:\n" + "\n".join(failures[:20])
+
+
+# ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+def test_agent_change_config_reaches_llm():
+    ag = make_agent()
+    ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
+    assert ag.llm.backend.temperature == 0.2
+
+def test_agent_change_config_clones_given_agconfig():
+    ag = make_agent()
+    new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
+    ag.change_config(new_cfg)
+    new_cfg.agllm_backend.temperature = 0.9
+    assert ag.llm.backend.temperature == 0.2
+
+def test_agent_change_config_updates_agconfig_attr():
+    ag = make_agent()
+    new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
+    ag.change_config(new_cfg)
+    assert ag.agconfig.get("agllm_backend", "temperature") == 0.2
+    assert ag.agconfig is not new_cfg  # cloned, not aliased
+
+def test_agent_get_config_copy_returns_clone_not_same_object():
+    ag = make_agent()
+    copy = ag.get_config_copy()
+    assert copy is not ag.agconfig
+
+def test_agent_get_config_copy_reflects_current_values():
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))
+    assert ag.get_config_copy().agllm_backend.temperature == 0.7
+
+def test_agent_get_config_copy_after_change_config_reflects_new_values():
+    ag = make_agent()
+    ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
+    assert ag.get_config_copy().agllm_backend.temperature == 0.2
+
+def test_mutating_agent_get_config_copy_does_not_affect_agent():
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))
+    copy = ag.get_config_copy()
+    copy.agllm_backend.temperature = 0.1
+    assert ag.agconfig.get("agllm_backend", "temperature") == 0.7

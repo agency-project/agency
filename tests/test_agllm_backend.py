@@ -3,7 +3,6 @@ Anthropic-on-Bedrock adapter (message/tool translation, streaming chunk
 shim, non-streaming shim)."""
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,7 +10,7 @@ import httpx
 import openai
 import pytest
 
-import agency.agllm_backend as agllm_backend_module
+from agency.agconfig import agConfig
 from agency.agllm_backend import (
     BAD_REQUEST_EXCS,
     API_CONN_EXCS,
@@ -36,6 +35,11 @@ try:
     import anthropic as _anthropic_sdk
 except ImportError:
     _anthropic_sdk = None
+
+
+def _cfg(**fields) -> agConfig:
+    """Test helper: wrap agllm_backend fields in an agConfig."""
+    return agConfig({"agllm_backend": fields})
 
 
 # ---------------------------------------------------------------------------
@@ -71,49 +75,43 @@ class TestIsAnthropicBedrockModel:
 
 class TestForConfig:
     def test_plain_config_returns_openai_compatible(self):
-        backend = agllm_backend.for_config({"api_key": "k", "model": ""})
+        backend = agllm_backend.for_config(_cfg(api_key='k', model=''))
         assert isinstance(backend, _OpenAICompatibleBackend)
         assert not isinstance(backend, _OpenAICompatibleBedrockBackend)
 
     def test_no_provider_key_returns_openai_compatible(self):
-        backend = agllm_backend.for_config({"model": ""})
+        backend = agllm_backend.for_config(_cfg(model=''))
         assert isinstance(backend, _OpenAICompatibleBackend)
 
     def test_bedrock_non_anthropic_model_returns_mantle_backend(self):
-        backend = agllm_backend.for_config(
-            {"provider": "bedrock", "region": "us-east-2", "model": "nvidia.nemotron-super-3-120b"}
-        )
+        backend = agllm_backend.for_config(_cfg(provider='bedrock', region='us-east-2', model='nvidia.nemotron-super-3-120b'))
         assert isinstance(backend, _OpenAICompatibleBedrockBackend)
 
     def test_bedrock_anthropic_model_returns_anthropic_backend(self):
-        backend = agllm_backend.for_config(
-            {"provider": "bedrock", "region": "us-east-2", "model": "us.anthropic.claude-sonnet-5"}
-        )
+        backend = agllm_backend.for_config(_cfg(provider='bedrock', region='us-east-2', model='us.anthropic.claude-sonnet-5'))
         assert isinstance(backend, _AnthropicBedrockBackend)
 
     def test_bedrock_anthropic_bare_id_returns_anthropic_backend(self):
-        backend = agllm_backend.for_config(
-            {"provider": "bedrock", "region": "us-east-2", "model": "anthropic.claude-opus-4-8"}
-        )
+        backend = agllm_backend.for_config(_cfg(provider='bedrock', region='us-east-2', model='anthropic.claude-opus-4-8'))
         assert isinstance(backend, _AnthropicBedrockBackend)
 
     def test_config_stored_on_instance(self):
-        cfg = {"model": "some-model"}
+        cfg = _cfg(model="some-model")
         backend = agllm_backend.for_config(cfg)
         assert backend.model == "some-model"
 
     def test_anthropic_provider_returns_anthropic_backend(self):
-        backend = agllm_backend.for_config({"provider": "anthropic", "model": "claude-sonnet-5"})
+        backend = agllm_backend.for_config(_cfg(provider='anthropic', model='claude-sonnet-5'))
         assert isinstance(backend, _AnthropicBackend)
         assert not isinstance(backend, _AnthropicBedrockBackend)
 
     def test_anthropic_aws_provider_returns_anthropic_aws_backend(self):
-        backend = agllm_backend.for_config({"provider": "anthropicAWS", "model": "claude-sonnet-5"})
+        backend = agllm_backend.for_config(_cfg(provider='anthropicAWS', model='claude-sonnet-5'))
         assert isinstance(backend, _AnthropicAWSBackend)
         assert not isinstance(backend, _AnthropicBackend)
 
     def test_anthropic_aws_snake_case_alias(self):
-        backend = agllm_backend.for_config({"provider": "anthropic_aws", "model": "claude-sonnet-5"})
+        backend = agllm_backend.for_config(_cfg(provider='anthropic_aws', model='claude-sonnet-5'))
         assert isinstance(backend, _AnthropicAWSBackend)
 
 
@@ -123,18 +121,18 @@ class TestForConfig:
 
 class TestBaseBackendDefaults:
     def test_make_client_not_implemented(self):
-        backend = agllm_backend({})
+        backend = agllm_backend(_cfg())
         with pytest.raises(NotImplementedError):
             backend.make_client(httpx.Timeout(10.0))
 
     def test_tokenize_url_defaults_to_none(self):
-        assert agllm_backend({}).tokenize_url() is None
+        assert agllm_backend(_cfg()).tokenize_url() is None
 
     def test_known_context_limit_defaults_to_none(self):
-        assert agllm_backend({}).known_context_limit("anything") is None
+        assert agllm_backend(_cfg()).known_context_limit("anything") is None
 
     def test_list_models_delegates_to_make_client(self):
-        backend = agllm_backend({})
+        backend = agllm_backend(_cfg())
         mock_client = MagicMock()
         mock_client.models.list.return_value = ["m1", "m2"]
         with patch.object(backend, "make_client", return_value=mock_client) as mock_make:
@@ -143,10 +141,44 @@ class TestBaseBackendDefaults:
         mock_make.assert_called_once()
 
     def test_list_models_propagates_exceptions(self):
-        backend = agllm_backend({})
+        backend = agllm_backend(_cfg())
         with patch.object(backend, "make_client", side_effect=RuntimeError("offline")):
             with pytest.raises(RuntimeError):
                 backend.list_models()
+
+
+# ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+class TestBackendChangeConfigAndGetConfigCopy:
+    def test_change_config_replaces_agconfig(self):
+        backend = agllm_backend(_cfg(temperature=0.7))
+        backend.change_config(_cfg(temperature=0.2))
+        assert backend.temperature == 0.2
+
+    def test_change_config_clones_given_agconfig(self):
+        backend = agllm_backend(_cfg())
+        new_cfg = _cfg(temperature=0.2)
+        backend.change_config(new_cfg)
+        new_cfg.agllm_backend.temperature = 0.9
+        assert backend.temperature == 0.2
+
+    def test_get_config_copy_returns_clone_not_same_object(self):
+        cfg = _cfg(temperature=0.7)
+        backend = agllm_backend(cfg)
+        copy = backend.get_config_copy()
+        assert copy is not backend._agconfig
+
+    def test_get_config_copy_reflects_current_values(self):
+        backend = agllm_backend(_cfg(temperature=0.7))
+        assert backend.get_config_copy().agllm_backend.temperature == 0.7
+
+    def test_mutating_get_config_copy_does_not_affect_backend(self):
+        backend = agllm_backend(_cfg(temperature=0.7))
+        copy = backend.get_config_copy()
+        copy.agllm_backend.temperature = 0.1
+        assert backend.temperature == 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -155,30 +187,30 @@ class TestBaseBackendDefaults:
 
 class TestOpenAICompatibleBackend:
     def test_make_client_passes_config_through(self):
-        backend = _OpenAICompatibleBackend({"api_key": "k", "base_url": "http://x/v1"})
+        backend = _OpenAICompatibleBackend(_cfg(api_key='k', base_url='http://x/v1'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(api_key="k", base_url="http://x/v1", timeout=httpx.Timeout(5.0))
 
     def test_make_client_defaults_api_key_to_empty(self):
-        backend = _OpenAICompatibleBackend({"base_url": "http://x/v1"})
+        backend = _OpenAICompatibleBackend(_cfg(base_url='http://x/v1'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(api_key="EMPTY", base_url="http://x/v1", timeout=httpx.Timeout(5.0))
 
     def test_tokenize_url_strips_v1_suffix(self):
-        backend = _OpenAICompatibleBackend({"base_url": "http://x:8000/v1"})
+        backend = _OpenAICompatibleBackend(_cfg(base_url='http://x:8000/v1'))
         assert backend.tokenize_url() == "http://x:8000"
 
     def test_tokenize_url_strips_trailing_slash(self):
-        backend = _OpenAICompatibleBackend({"base_url": "http://x:8000/v1/"})
+        backend = _OpenAICompatibleBackend(_cfg(base_url='http://x:8000/v1/'))
         assert backend.tokenize_url() == "http://x:8000"
 
     def test_tokenize_url_none_when_no_base_url(self):
-        assert _OpenAICompatibleBackend({}).tokenize_url() is None
+        assert _OpenAICompatibleBackend(_cfg()).tokenize_url() is None
 
     def test_tokenize_url_preserves_non_v1_path(self):
-        backend = _OpenAICompatibleBackend({"base_url": "http://x:8000/custom"})
+        backend = _OpenAICompatibleBackend(_cfg(base_url='http://x:8000/custom'))
         assert backend.tokenize_url() == "http://x:8000/custom"
 
 
@@ -188,9 +220,7 @@ class TestOpenAICompatibleBackend:
 
 class TestOpenAICompatibleBedrockBackend:
     def test_direct_bedrock_api_key_uses_mantle_url(self):
-        backend = _OpenAICompatibleBedrockBackend({
-            "region": "us-east-2", "api_key": "bedrock-api-key-abc123",
-        })
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-east-2', api_key='bedrock-api-key-abc123'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(
@@ -201,7 +231,7 @@ class TestOpenAICompatibleBedrockBackend:
 
     def test_no_api_key_uses_token_generator_when_available(self, monkeypatch):
         monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
-        backend = _OpenAICompatibleBedrockBackend({"region": "us-west-2"})
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-west-2'))
         fake_token_mod = SimpleNamespace(provide_token=lambda region: "generated-token")
         with patch.dict("sys.modules", {"aws_bedrock_token_generator": fake_token_mod}), \
              patch("agency.agllm_backend.openai.OpenAI") as MockCls:
@@ -214,7 +244,7 @@ class TestOpenAICompatibleBedrockBackend:
 
     def test_falls_back_to_sigv4_when_token_generator_unavailable(self, monkeypatch):
         monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
-        backend = _OpenAICompatibleBedrockBackend({"region": "us-east-1"})
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-east-1'))
         with patch.dict("sys.modules", {"aws_bedrock_token_generator": None}), \
              patch("agency.agllm_backend.openai.OpenAI") as MockCls, \
              patch("agency.agllm_backend._BedrockSigV4Auth") as MockAuth:
@@ -228,9 +258,7 @@ class TestOpenAICompatibleBedrockBackend:
     def test_explicit_colon_delimited_api_key_goes_to_sigv4_path(self):
         """An api_key containing a colon is an ACCESS_KEY_ID:SECRET_ACCESS_KEY
         pair for SigV4 signing, not a Mantle bearer token."""
-        backend = _OpenAICompatibleBedrockBackend({
-            "region": "us-east-1", "api_key": "AKIAEXAMPLE:secretvalue",
-        })
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-east-1', api_key='AKIAEXAMPLE:secretvalue'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls, \
              patch("agency.agllm_backend._BedrockSigV4Auth") as MockAuth:
             backend.make_client(httpx.Timeout(5.0))
@@ -242,9 +270,7 @@ class TestOpenAICompatibleBedrockBackend:
         """Real AWS Bedrock API keys look like 'ABSK...', not
         'bedrock-api-key-...' — they must still be recognized as a direct
         bearer token for Mantle (colon-free), not sent down the SigV4 path."""
-        backend = _OpenAICompatibleBedrockBackend({
-            "region": "us-east-2", "api_key": "ABSKQmVkcm9ja0FQSUtleS1leGFtcGxl",
-        })
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-east-2', api_key='ABSKQmVkcm9ja0FQSUtleS1leGFtcGxl'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(
@@ -255,7 +281,7 @@ class TestOpenAICompatibleBedrockBackend:
 
     def test_reads_aws_bearer_token_bedrock_env_var_when_config_has_no_api_key(self, monkeypatch):
         monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "ABSKfromenv")
-        backend = _OpenAICompatibleBedrockBackend({"region": "us-east-2"})
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-east-2'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(
@@ -266,25 +292,25 @@ class TestOpenAICompatibleBedrockBackend:
 
     def test_config_api_key_takes_priority_over_env_var(self, monkeypatch):
         monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "ABSKfromenv")
-        backend = _OpenAICompatibleBedrockBackend({"region": "us-east-2", "api_key": "ABSKfromconfig"})
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-east-2', api_key='ABSKfromconfig'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         _, kwargs = MockCls.call_args
         assert kwargs["api_key"] == "ABSKfromconfig"
 
     def test_region_defaults_to_us_east_1(self):
-        backend = _OpenAICompatibleBedrockBackend({"api_key": "bedrock-api-key-x"})
+        backend = _OpenAICompatibleBedrockBackend(_cfg(api_key='bedrock-api-key-x'))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         _, kwargs = MockCls.call_args
         assert kwargs["base_url"] == "https://bedrock-mantle.us-east-1.api.aws/v1"
 
     def test_tokenize_url_is_none(self):
-        assert _OpenAICompatibleBedrockBackend({}).tokenize_url() is None
+        assert _OpenAICompatibleBedrockBackend(_cfg()).tokenize_url() is None
 
     def test_inherits_openai_compatible_list_models(self):
         """Mantle exposes an OpenAI-style /v1/models — should reuse the base class."""
-        backend = _OpenAICompatibleBedrockBackend({"region": "us-east-2", "api_key": "bedrock-api-key-x"})
+        backend = _OpenAICompatibleBedrockBackend(_cfg(region='us-east-2', api_key='bedrock-api-key-x'))
         mock_client = MagicMock()
         mock_client.models.list.return_value = ["qwen.qwen3-32b"]
         with patch.object(backend, "make_client", return_value=mock_client):
@@ -297,13 +323,13 @@ class TestOpenAICompatibleBedrockBackend:
 
 class TestAnthropicBedrockBackend:
     def test_make_client_raises_when_anthropic_sdk_missing(self):
-        backend = _AnthropicBedrockBackend({"region": "us-east-2"})
+        backend = _AnthropicBedrockBackend(_cfg(region='us-east-2'))
         with patch("agency.agllm_backend._anthropic_sdk", None):
             with pytest.raises(RuntimeError, match="pip install anthropic"):
                 backend.make_client(httpx.Timeout(5.0))
 
     def test_make_client_constructs_anthropic_bedrock_with_region_and_timeout(self):
-        backend = _AnthropicBedrockBackend({"region": "eu-west-1"})
+        backend = _AnthropicBedrockBackend(_cfg(region='eu-west-1'))
         mock_sdk = MagicMock()
         mock_anthropic_client = MagicMock()
         mock_sdk.AnthropicBedrock.return_value = mock_anthropic_client
@@ -313,20 +339,20 @@ class TestAnthropicBedrockBackend:
         assert isinstance(client, _AnthropicBedrockChatClient)
 
     def test_make_client_defaults_region(self):
-        backend = _AnthropicBedrockBackend({})
+        backend = _AnthropicBedrockBackend(_cfg())
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
         mock_sdk.AnthropicBedrock.assert_called_once_with(aws_region="us-east-1", timeout=httpx.Timeout(5.0))
 
     def test_list_models_returns_empty(self):
-        assert _AnthropicBedrockBackend({}).list_models() == []
+        assert _AnthropicBedrockBackend(_cfg()).list_models() == []
 
     def test_tokenize_url_is_none(self):
-        assert _AnthropicBedrockBackend({}).tokenize_url() is None
+        assert _AnthropicBedrockBackend(_cfg()).tokenize_url() is None
 
     def test_known_context_limit_delegates_to_lookup(self):
-        backend = _AnthropicBedrockBackend({})
+        backend = _AnthropicBedrockBackend(_cfg())
         assert backend.known_context_limit("us.anthropic.claude-sonnet-5") == 1_000_000
         assert backend.known_context_limit("anthropic.claude-nonexistent-model") is None
 
@@ -337,11 +363,7 @@ class TestAnthropicBedrockBackend:
 
 class TestAnthropicAWSBackend:
     def test_make_client_uses_anthropic_aws(self):
-        backend = _AnthropicAWSBackend({
-            "api_key": "aws-api-key",
-            "region": "us-east-2",
-            "workspace_id": "wrkspc_test",
-        })
+        backend = _AnthropicAWSBackend(_cfg(api_key='aws-api-key', region='us-east-2', workspace_id='wrkspc_test'))
         mock_sdk = MagicMock()
         mock_sdk.AnthropicAWS = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
@@ -358,7 +380,7 @@ class TestAnthropicAWSBackend:
         monkeypatch.setenv("ANTHROPIC_AWS_API_KEY", "key-from-env")
         monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_from_env")
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://aws-external-anthropic.us-east-2.api.aws")
-        backend = _AnthropicAWSBackend({})
+        backend = _AnthropicAWSBackend(_cfg())
         mock_sdk = MagicMock()
         mock_sdk.AnthropicAWS = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
@@ -369,7 +391,7 @@ class TestAnthropicAWSBackend:
         assert kwargs["base_url"] == "https://aws-external-anthropic.us-east-2.api.aws"
 
     def test_list_models_calls_anthropic_aws(self):
-        backend = _AnthropicAWSBackend({"api_key": "k", "workspace_id": "w", "base_url": "https://example.test"})
+        backend = _AnthropicAWSBackend(_cfg(api_key='k', workspace_id='w', base_url='https://example.test'))
         mock_sdk = MagicMock()
         mock_raw = MagicMock()
         mock_raw.models.list.return_value = ["claude-sonnet-5"]
@@ -379,10 +401,10 @@ class TestAnthropicAWSBackend:
         assert result == ["claude-sonnet-5"]
 
     def test_tokenize_url_is_none(self):
-        assert _AnthropicAWSBackend({}).tokenize_url() is None
+        assert _AnthropicAWSBackend(_cfg()).tokenize_url() is None
 
     def test_known_context_limit_delegates_to_lookup(self):
-        backend = _AnthropicAWSBackend({})
+        backend = _AnthropicAWSBackend(_cfg())
         assert backend.known_context_limit("claude-sonnet-5") == 1_000_000
 
 
@@ -392,14 +414,14 @@ class TestAnthropicAWSBackend:
 
 class TestAnthropicBackend:
     def test_make_client_raises_when_anthropic_sdk_missing(self):
-        backend = _AnthropicBackend({})
+        backend = _AnthropicBackend(_cfg())
         with patch("agency.agllm_backend._anthropic_sdk", None):
             with pytest.raises(RuntimeError, match="pip install anthropic"):
                 backend.make_client(httpx.Timeout(5.0))
 
     def test_make_client_uses_config_api_key(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID", raising=False)
-        backend = _AnthropicBackend({"api_key": "sk-ant-from-config"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-from-config'))
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             client = backend.make_client(httpx.Timeout(30.0))
@@ -409,7 +431,7 @@ class TestAnthropicBackend:
     def test_make_client_falls_back_to_env_var(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
         monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID", raising=False)
-        backend = _AnthropicBackend({})
+        backend = _AnthropicBackend(_cfg())
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
@@ -418,7 +440,7 @@ class TestAnthropicBackend:
     def test_config_api_key_takes_priority_over_env_var(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
         monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID", raising=False)
-        backend = _AnthropicBackend({"api_key": "sk-ant-from-config"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-from-config'))
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
@@ -426,12 +448,12 @@ class TestAnthropicBackend:
         assert kwargs["api_key"] == "sk-ant-from-config"
 
     def test_list_models_returns_empty_when_sdk_missing(self):
-        backend = _AnthropicBackend({})
+        backend = _AnthropicBackend(_cfg())
         with patch("agency.agllm_backend._anthropic_sdk", None):
             assert backend.list_models() == []
 
     def test_list_models_calls_raw_client_not_chat_wrapper(self):
-        backend = _AnthropicBackend({"api_key": "sk-ant-x"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-x'))
         mock_sdk = MagicMock()
         mock_raw_client = MagicMock()
         mock_raw_client.models.list.return_value = ["claude-sonnet-5"]
@@ -441,10 +463,10 @@ class TestAnthropicBackend:
         assert result == ["claude-sonnet-5"]
 
     def test_tokenize_url_is_none(self):
-        assert _AnthropicBackend({}).tokenize_url() is None
+        assert _AnthropicBackend(_cfg()).tokenize_url() is None
 
     def test_known_context_limit_delegates_to_lookup(self):
-        backend = _AnthropicBackend({})
+        backend = _AnthropicBackend(_cfg())
         assert backend.known_context_limit("claude-sonnet-5") == 1_000_000
         assert backend.known_context_limit("claude-nonexistent-model") is None
 
@@ -453,7 +475,7 @@ class TestAnthropicBackend:
         doesn't use it — omit default_headers entirely rather than sending an
         empty/None header when no workspace ID is configured."""
         monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID", raising=False)
-        backend = _AnthropicBackend({"api_key": "sk-ant-x"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-x'))
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
@@ -465,7 +487,7 @@ class TestAnthropicBackend:
         override) rejects requests with 400 'Missing anthropic-workspace-id
         header' unless this is sent explicitly — the plain client does not
         read ANTHROPIC_WORKSPACE_ID into a header on its own."""
-        backend = _AnthropicBackend({"api_key": "sk-ant-x", "workspace_id": "wrkspc_from_config"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-x', workspace_id='wrkspc_from_config'))
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
@@ -474,7 +496,7 @@ class TestAnthropicBackend:
 
     def test_workspace_id_env_var_fallback(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_from_env")
-        backend = _AnthropicBackend({"api_key": "sk-ant-x"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-x'))
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
@@ -483,7 +505,7 @@ class TestAnthropicBackend:
 
     def test_config_workspace_id_takes_priority_over_env_var(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_from_env")
-        backend = _AnthropicBackend({"api_key": "sk-ant-x", "workspace_id": "wrkspc_from_config"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-x', workspace_id='wrkspc_from_config'))
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
@@ -491,7 +513,7 @@ class TestAnthropicBackend:
         assert kwargs["default_headers"] == {"anthropic-workspace-id": "wrkspc_from_config"}
 
     def test_list_models_also_sends_workspace_header(self):
-        backend = _AnthropicBackend({"api_key": "sk-ant-x", "workspace_id": "wrkspc_from_config"})
+        backend = _AnthropicBackend(_cfg(api_key='sk-ant-x', workspace_id='wrkspc_from_config'))
         mock_sdk = MagicMock()
         mock_sdk.Anthropic.return_value.models.list.return_value = []
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):

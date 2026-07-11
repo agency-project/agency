@@ -393,7 +393,6 @@ class TestGpuMarkers:
 
     def test_non_main_process_name_blocks_allocation(self):
         """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
-        import multiprocessing
         from agency import agresources
         mock_proc = MagicMock()
         mock_proc.name = "ForkPoolWorker-1"
@@ -419,6 +418,55 @@ class TestGpuMarkers:
             capture_output=True, timeout=15,
         )
         assert child.returncode == 0, child.stderr.decode()
+
+
+# ---------------------------------------------------------------------------
+# agSandbox — change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+class TestAgSandboxChangeConfigAndGetConfigCopy:
+    def test_change_config_replaces_agconfig(self):
+        from agency.agconfig import agConfig
+        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        sb.change_config(agConfig({"agllm_backend": {"temperature": 0.2}}))
+        assert sb._agconfig.get("agllm_backend", "temperature") == 0.2
+
+    def test_change_config_clones_given_agconfig(self):
+        from agency.agconfig import agConfig
+        sb = _make_sandbox(agconfig=agConfig())
+        new_cfg = agConfig({"agllm_backend": {"temperature": 0.2}})
+        sb.change_config(new_cfg)
+        new_cfg.agllm_backend.temperature = 0.9
+        assert sb._agconfig.get("agllm_backend", "temperature") == 0.2
+
+    def test_get_config_copy_returns_clone_not_same_object(self):
+        from agency.agconfig import agConfig
+        cfg = agConfig({"agllm_backend": {"temperature": 0.7}})
+        sb = _make_sandbox(agconfig=cfg)
+        copy = sb.get_config_copy()
+        assert copy is not sb._agconfig
+
+    def test_get_config_copy_reflects_current_values(self):
+        from agency.agconfig import agConfig
+        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        assert sb.get_config_copy().agllm_backend.temperature == 0.7
+
+    def test_mutating_get_config_copy_does_not_affect_sandbox(self):
+        from agency.agconfig import agConfig
+        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        copy = sb.get_config_copy()
+        copy.agllm_backend.temperature = 0.1
+        assert sb._agconfig.get("agllm_backend", "temperature") == 0.7
+
+    def test_get_config_copy_none_when_no_agconfig(self):
+        sb = _make_sandbox()
+        assert sb.get_config_copy() is None
+
+    def test_change_config_none_clears_agconfig(self):
+        from agency.agconfig import agConfig
+        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        sb.change_config(None)
+        assert sb.get_config_copy() is None
 
 
 # ---------------------------------------------------------------------------

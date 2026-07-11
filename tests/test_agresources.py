@@ -270,3 +270,49 @@ def test_notify_thread_safe():
     for t in threads: t.join(timeout=5)
     assert not errors
     assert pool.cpus_acquired == 0.0
+
+
+# ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+def test_pool_change_config_replaces_agconfig():
+    from agency.agconfig import agConfig
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
+    pool.change_config(agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
+    assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
+
+def test_pool_change_config_clones_given_agconfig():
+    from agency.agconfig import agConfig
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
+    new_cfg = agConfig({"agResourcePool": {"idle_cpus": 2.0}})
+    pool.change_config(new_cfg)
+    new_cfg.agResourcePool.idle_cpus = 9.0
+    assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
+
+def test_pool_get_config_copy_returns_clone_not_same_object():
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
+    copy = pool.get_config_copy()
+    assert copy is not pool._agconfig
+
+def test_pool_get_config_copy_reflects_current_values():
+    from agency.agconfig import agConfig
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192,
+                           agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
+    assert pool.get_config_copy().agResourcePool.idle_cpus == 2.0
+
+def test_mutating_pool_get_config_copy_does_not_affect_pool():
+    from agency.agconfig import agConfig
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192,
+                           agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
+    copy = pool.get_config_copy()
+    copy.agResourcePool.idle_cpus = 9.0
+    assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
+
+def test_pool_change_config_none_resets_to_default_agconfig():
+    from agency.agconfig import agConfig
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192,
+                           agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
+    pool.change_config(None)
+    # No agconfig -> field falls back to its DynamicConfigParam default, not the old value.
+    assert pool.get_config_copy().agResourcePool.idle_cpus == _AgResourcePoolFields.idle_cpus.default

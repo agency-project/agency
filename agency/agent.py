@@ -132,10 +132,10 @@ class agent:
         sandbox: "agSandbox | None" = None,
         agconfig: "agConfig | None" = None,
     ):
-        self.agconfig: "agConfig | None" = agconfig if agconfig is not None else agent.default_agconfig
+        _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
         if llm is None:
-            if self.agconfig is None or not self.agconfig.data.get("agllm_backend"):
+            if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
                 from ._context import _active_team as _at
                 _t = _at.get(None)
                 if _t is not None and _t.agconfig is not None and _t.agconfig.data.get("agllm_backend"):
@@ -143,13 +143,20 @@ class agent:
                     # fields) -- log_dir/output_dir/sandbox settings etc. should
                     # also come from it, matching "agents inherit the team's
                     # agconfig automatically" (see agteam's docstring).
-                    self.agconfig = _t.agconfig
+                    _src_agconfig = _t.agconfig
                 else:
                     raise TypeError(
                         "agent() requires an agconfig with LLM fields set "
                         "(e.g. cfg.agllm_backend.model = ...), or llm=, "
                         "when called outside an agteam context"
                     )
+
+        # Cloned so this agent's own agconfig is independent of whatever
+        # source it was built from (an explicit agconfig=, agent.default_agconfig,
+        # or the active agteam's agconfig) -- mutating that source afterward
+        # must not silently change an already-constructed agent. Use
+        # ag.change_config(new_cfg) to change it live -- see that method.
+        self.agconfig: "agConfig | None" = _src_agconfig.clone() if _src_agconfig is not None else None
 
         self.agname: _agname = _agname.allocate_agname(agname)
 
@@ -191,6 +198,24 @@ class agent:
             llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             context_limit=self.llm.context_limit,
         )
+
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this agent's agconfig with a clone of the given one, and
+        push that same clone down to every sub-object that holds its own
+        independent copy (``self.llm`` -- and its backend --, ``self.log``,
+        and ``self.sandbox`` if one has been created). Reassigning
+        ``self.agconfig`` alone does not reach those clones, so this is the
+        supported way to change live config (e.g. ``max_completion_tokens``)
+        after construction."""
+        self.agconfig = agconfig.clone()
+        self.llm.change_config(self.agconfig)
+        self.log.change_config(self.agconfig)
+        if self.sandbox is not None:
+            self.sandbox.change_config(self.agconfig)
+
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this agent's agconfig, or None if it has none."""
+        return self.agconfig.clone() if self.agconfig is not None else None
 
     # ------------------------------------------------------------------
     # Properties
@@ -366,7 +391,9 @@ class agent:
         """Return an independent agent forked from *src*."""
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname)
-        ag.agconfig = src.agconfig
+        # Cloned so the fork's own agconfig is independent of src's -- see
+        # the matching comment in __init__.
+        ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.llm = agllm(ag.agconfig)
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()

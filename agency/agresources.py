@@ -208,7 +208,7 @@ class agResourcePool(_AgResourcePoolFields):
         mark_gpus: bool = False,
         agconfig: "agConfig | None" = None,
     ) -> None:
-        self._agconfig = agconfig if agconfig is not None else agConfig()
+        self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
         for _name, _value in (
             ("idle_cpus", idle_cpus), ("idle_memory", idle_memory),
         ):
@@ -228,6 +228,14 @@ class agResourcePool(_AgResourcePoolFields):
             import multiprocessing
             if multiprocessing.current_process().name == "MainProcess":
                 _allocate_gpu_markers(self.gpus)
+
+    def change_config(self, agconfig: "agConfig | None") -> None:
+        """Replace this pool's agconfig with a clone of the given one."""
+        self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
+
+    def get_config_copy(self) -> "agConfig":
+        """Return a clone of this pool's agconfig."""
+        return self._agconfig.clone()
 
     def acquire_gpu(self, timeout: float | None = None) -> int:
         """Block until any GPU is free; return its id."""

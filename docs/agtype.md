@@ -27,6 +27,8 @@ Human-readable type label shown in the JSON format hint appended to the system p
 |---|---|
 | `agtype` (base) | `"str"` |
 | `agfile` | `"file"` |
+| `agbinary` | `"binary_file"` |
+| `agpath` | `"path"` |
 | `agimage` | `"image"` |
 | `agrawstring` | `"str"` |
 
@@ -50,6 +52,18 @@ Default: `(value, [])` — pass through unchanged.
 Called **after** the skill's ReAct loop on output fields.  `value` is whatever the LLM returned for this field (typically a file path or other reference).  Returns `(recovered_value, paths_to_cleanup)`.
 
 Default: `(value, [])` — pass through unchanged.
+
+### `validate_input_value(value) -> str | None`
+
+Called from `agschema.check()`/`check_field()` while validating a *caller-supplied* input value, before the skill runs.  Returns an error string, or `None` if the value is acceptable.
+
+Default: accepts any `str` (every `agtype`'s generic wire representation), rejecting anything else with `"must be a string, got <type>"`.  Override to enforce a stricter input contract — `agpath` overrides this to additionally require the string to look like a path.
+
+### `validate_output(field_name, value, sandbox, exec_timeout) -> str | None`
+
+Called immediately when the agent calls `return_<field_name>` during the skill's ReAct loop, while the agent is still alive to see and correct the error. Returns an error string fed back to the LLM as the tool result, or `None` if the value is valid.
+
+Default: no validation (`None`). Override in subclasses that need sandbox-side checks — `agfile`/`agbinary` check the file exists and is well-formed; `agpath` checks the value looks like a path rather than inline content.
 
 ## Container nesting
 
@@ -222,6 +236,71 @@ The framework:
 5. Deletes both sandbox files in `finally`.
 
 The caller receives `bytes`, not a file path.
+
+## Built-in subclass: `agpath`
+
+`agpath` marks a field as a **path itself**, not content that happens to live in a file. Use it when a skill's input or output is genuinely the location of something (a destination directory, a file to move, a path to hand to another tool) rather than text or bytes the framework should read/write for you.
+
+```python
+from agency import agpath
+```
+
+| Method | Behaviour |
+|---|---|
+| `schema_type()` | `"path"` |
+| `needs_sandbox()` | `False` |
+| `prepare(value, ...)` | Default passthrough — the value is not written anywhere; it stays exactly what the caller passed. |
+| `recover(value, ...)` | Default passthrough — the value is not read from anywhere; the caller gets back exactly what the LLM returned. |
+| `extra_input_prompt` | Tells the agent the field is a path string, not file content. |
+| `extra_output_prompt` | Tells the agent to return the path itself, not the file's content. |
+| `get_return_tool_description(field_name)` | Registers the output as a path string. |
+| `get_return_tool_value_description(field_name)` | Asks for a path — explicitly says not to pass file content. |
+| `validate_output(field_name, value, ...)` | Errors (reprompting the agent) if the returned value doesn't look like a path (`_looks_like_path`). |
+| `validate_input_value(value)` | Errors if the caller-supplied value doesn't look like a path. |
+
+### Why not just use `str`?
+
+A plain `str` output field has a built-in convenience: if the LLM returns something that looks like a sandbox path, the framework assumes the real content lives in that file and reads it back (see `agschema.make_field_handler`'s auto-resolve fallback). This is exactly wrong for a field whose value is *supposed to be* a path — for example `output_schema=agdata(path=str, content=str)`, where the agent correctly writes a file and returns its path for `path`, only to have that path silently replaced with the file's own content because it "looked like a path" to the same heuristic meant for `content`.
+
+`agpath` sidesteps the ambiguity: it never reads or writes sandbox files, and it validates that the value stays a path on both sides of the boundary.
+
+```python
+move_skill = agskill(
+    name="move_file",
+    system_prompt="Move the file to the given destination and confirm.",
+    input_schema=agdata(src=agpath, dest=agpath),
+    output_schema=agdata(moved_to=agpath),
+)
+```
+
+### Input validation
+
+If the caller passes a value for an `agpath` field that doesn't look like a path (per `_looks_like_path` — an absolute, single-line path with no spaces), `agschema.validate_input()` rejects it before the skill runs:
+
+```python
+ag.run(move_skill, agdata(src="not a path at all", dest="/data/out.txt"))
+# -> agerror("input schema error: [\"field 'src' (agpath): 'not a path at all' does not look like a path\"]")
+```
+
+### Output validation and reprompt
+
+If the agent calls `return_moved_to` with a value that doesn't look like a path, the tool call returns an error and the agent gets a chance to correct it — the skill is not immediately failed:
+
+```json
+{"error": "field_name 'moved_to': 'here is the content you asked for' does not look like a path. Pass the path string itself, not file content."}
+```
+
+### Relation to the auto-resolve warning on plain `str` fields
+
+Since the introduction of `agpath`, the plain-`str` auto-resolve fallback (reading a path-looking `str` output's file content back) now prints a warning whenever it fires:
+
+```
+[agschema] WARNING: output field 'X' looked like a path ('/workspace/...') and was auto-resolved
+to that file's contents because its type hint is plain str. If 'X' is meant to hold a path rather
+than content, declare it as agpath instead.
+```
+
+If you see this warning for a field that's meant to hold a path (not content), switch that field's type hint to `agpath`.
 
 ## Built-in subclass: `agimage`
 

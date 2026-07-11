@@ -42,6 +42,11 @@ from agency.agent import agAgentConfig
 from agency.agskill import agSkillConfig
 
 
+def _cfg(**fields) -> agConfig:
+    """Test helper: wrap agllm_backend fields in an agConfig."""
+    return agConfig({"agllm_backend": fields})
+
+
 # ---------------------------------------------------------------------------
 # Test-only owners, registered once at import time. Unique owner names keep
 # these isolated from real framework owners (agllm, agtool, ...) and from
@@ -622,16 +627,22 @@ class TestAgLLMBackendConfig:
 
 class TestBackendOwnsPrivateAgConfig:
     def test_backend_is_agllmbackendfields(self):
-        backend = agllm_backend.for_config({"model": "m"})
+        backend = agllm_backend.for_config(_cfg(model="m"))
         assert isinstance(backend, AgLLMBackendFields)
 
-    def test_backend_has_own_agconfig_instance(self):
-        backend = agllm_backend.for_config({"model": "m"})
-        assert isinstance(backend._agconfig, agConfig)
+    def test_backend_clones_the_given_agconfig(self):
+        """The backend's own agconfig is independent of the caller's --
+        mutating cfg afterward must not affect an already-built backend."""
+        cfg = _cfg(model="m")
+        backend = agllm_backend.for_config(cfg)
+        assert backend._agconfig is not cfg
+        assert backend.model == "m"
+        cfg.agllm_backend.model = "changed"
+        assert backend.model == "m"
 
-    def test_dict_values_readable_as_attributes(self):
+    def test_config_values_readable_as_attributes(self):
         backend = agllm_backend.for_config(
-            {"model": "gpt-x", "api_key": "k", "temperature": 0.5, "top_k": 40}
+            _cfg(model="gpt-x", api_key="k", temperature=0.5, top_k=40)
         )
         assert backend.model == "gpt-x"
         assert backend.api_key == "k"
@@ -639,31 +650,21 @@ class TestBackendOwnsPrivateAgConfig:
         assert backend.top_k == 40
 
     def test_unset_fields_default_to_none(self):
-        backend = agllm_backend.for_config({"model": "m"})
+        backend = agllm_backend.for_config(_cfg(model="m"))
         assert backend.workspace_id is None
         assert backend.extra_body is None
 
-    def test_as_dict_reflects_dict_config(self):
-        cfg = {"model": "m", "api_key": "k"}
+    def test_as_dict_reflects_config(self):
+        cfg = _cfg(model="m", api_key="k")
         backend = agllm_backend.for_config(cfg)
-        assert backend.as_dict() == cfg
+        assert backend.as_dict() == {"model": "m", "api_key": "k"}
 
-    def test_plain_dict_wrapped_in_fresh_private_agconfig(self):
-        """A dict given directly to for_config()/agllm_backend() is a
-        convenience path -- it's wrapped in a private agConfig the caller
-        never sees, unlike an agConfig passed in directly (which is kept
-        as-is, live-mutable by the caller)."""
-        cfg = {"model": "m"}
-        backend = agllm_backend.for_config(cfg)
-        assert backend._agconfig is not cfg
-        assert isinstance(backend._agconfig, agConfig)
-
-    def test_two_backend_instances_have_independent_values(self):
-        """Each backend builds its own private agConfig -- values on one
-        instance must never leak into another, even though the
-        DynamicConfigParam descriptors are shared class attributes."""
-        a = agllm_backend.for_config({"model": "model-a", "api_key": "key-a"})
-        b = agllm_backend.for_config({"model": "model-b", "api_key": "key-b"})
+    def test_two_backend_instances_over_separate_agconfigs_have_independent_values(self):
+        """Each backend is given its own agConfig -- values on one instance
+        must never leak into another, even though the DynamicConfigParam
+        descriptors are shared class attributes."""
+        a = agllm_backend.for_config(_cfg(model="model-a", api_key="key-a"))
+        b = agllm_backend.for_config(_cfg(model="model-b", api_key="key-b"))
         assert a.model == "model-a"
         assert b.model == "model-b"
         assert a.api_key == "key-a"
@@ -671,8 +672,8 @@ class TestBackendOwnsPrivateAgConfig:
         assert a._agconfig is not b._agconfig
 
     def test_setting_attribute_on_one_instance_does_not_affect_another(self):
-        a = agllm_backend.for_config({"model": "model-a"})
-        b = agllm_backend.for_config({"model": "model-b"})
+        a = agllm_backend.for_config(_cfg(model="model-a"))
+        b = agllm_backend.for_config(_cfg(model="model-b"))
         a.model = "changed"
         assert a.model == "changed"
         assert b.model == "model-b"
@@ -686,60 +687,60 @@ class TestGlobalTunables:
     on collection order."""
 
     def test_default_max_tokens_readable_from_any_backend_instance(self):
-        backend = agllm_backend.for_config({"model": "m"})
+        backend = agllm_backend.for_config(_cfg(model="m"))
         assert backend.default_max_tokens == 128000
 
     def test_model_listing_timeout_readable_from_any_backend_instance(self):
-        backend = agllm_backend.for_config({"model": "m"})
+        backend = agllm_backend.for_config(_cfg(model="m"))
         assert backend.model_listing_timeout_seconds == 10.0
 
 
 class TestForConfigDispatch:
     def test_plain_config_returns_openai_compatible(self):
-        assert isinstance(agllm_backend.for_config({"model": "m"}), _OpenAICompatibleBackend)
+        assert isinstance(agllm_backend.for_config(_cfg(model="m")), _OpenAICompatibleBackend)
 
     def test_bedrock_provider_non_anthropic_model(self):
-        backend = agllm_backend.for_config({"provider": "bedrock", "model": "nvidia.x", "region": "us-east-2"})
+        backend = agllm_backend.for_config(_cfg(provider="bedrock", model="nvidia.x", region="us-east-2"))
         assert isinstance(backend, _OpenAICompatibleBedrockBackend)
 
     def test_bedrock_provider_anthropic_model(self):
         backend = agllm_backend.for_config(
-            {"provider": "bedrock", "model": "us.anthropic.claude-sonnet-5", "region": "us-east-2"}
+            _cfg(provider="bedrock", model="us.anthropic.claude-sonnet-5", region="us-east-2")
         )
         assert isinstance(backend, _AnthropicBedrockBackend)
 
     def test_anthropic_provider(self):
         assert isinstance(
-            agllm_backend.for_config({"provider": "anthropic", "model": "claude-sonnet-5"}),
+            agllm_backend.for_config(_cfg(provider="anthropic", model="claude-sonnet-5")),
             _AnthropicBackend,
         )
 
     def test_anthropic_aws_provider(self):
         assert isinstance(
-            agllm_backend.for_config({"provider": "anthropicAWS", "model": "claude-sonnet-5"}),
+            agllm_backend.for_config(_cfg(provider="anthropicAWS", model="claude-sonnet-5")),
             _AnthropicAWSBackend,
         )
 
 
 class TestAttributeBackedClientConstruction:
     def test_openai_compatible_make_client_uses_attributes(self):
-        backend = _OpenAICompatibleBackend({"api_key": "k", "base_url": "http://x/v1"})
+        backend = _OpenAICompatibleBackend(_cfg(api_key="k", base_url="http://x/v1"))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(api_key="k", base_url="http://x/v1", timeout=httpx.Timeout(5.0))
 
     def test_anthropic_backend_uses_api_key_attribute(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID", raising=False)
-        backend = _AnthropicBackend({"api_key": "sk-ant-x"})
+        backend = _AnthropicBackend(_cfg(api_key="sk-ant-x"))
         mock_sdk = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
         mock_sdk.Anthropic.assert_called_once_with(api_key="sk-ant-x", timeout=httpx.Timeout(5.0))
 
     def test_anthropic_aws_backend_uses_credential_attributes(self):
-        backend = _AnthropicAWSBackend({
-            "api_key": "aws-api-key", "region": "us-east-2", "workspace_id": "wrkspc_test",
-        })
+        backend = _AnthropicAWSBackend(_cfg(
+            api_key="aws-api-key", region="us-east-2", workspace_id="wrkspc_test",
+        ))
         mock_sdk = MagicMock()
         mock_sdk.AnthropicAWS = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
@@ -749,19 +750,19 @@ class TestAttributeBackedClientConstruction:
         )
 
 
-class TestAgllmStillUsesPlainDict:
-    def test_agllm_wraps_dict_in_private_agconfig(self):
-        llm = agllm({"model": "gpt-x"}, context_limit=128_000)
+class TestAgllmUsesAgConfig:
+    def test_agllm_reads_backend_from_agconfig(self):
+        llm = agllm(_cfg(model="gpt-x"), context_limit=128_000)
         assert llm.backend.model == "gpt-x"
         assert isinstance(llm.backend, _OpenAICompatibleBackend)
 
-    def test_agllm_backend_attributes_reflect_dict(self):
-        llm = agllm({"model": "claude-sonnet-5", "temperature": 0.3, "provider": "anthropic"}, context_limit=128_000)
+    def test_agllm_backend_attributes_reflect_config(self):
+        llm = agllm(_cfg(model="claude-sonnet-5", temperature=0.3, provider="anthropic"), context_limit=128_000)
         assert llm.backend.model == "claude-sonnet-5"
         assert llm.backend.temperature == 0.3
 
     def test_build_kwargs_unaffected(self):
-        llm = agllm({"model": "claude-sonnet-5", "temperature": 0.3}, context_limit=128_000)
+        llm = agllm(_cfg(model="claude-sonnet-5", temperature=0.3), context_limit=128_000)
         kw = llm.build_kwargs([{"role": "user", "content": "hi"}])
         assert kw["temperature"] == 0.3
         assert kw["model"] == "claude-sonnet-5"

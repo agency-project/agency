@@ -4,16 +4,16 @@ Simple feature examples showing how to use the agency framework.
 
 ## LLM configuration
 
-For vLLM or another local/OpenAI-compatible endpoint, set `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODE` as needed.
+For vLLM endpoint, set `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODE` enviroment variables, and launch the example scripts.
 
 ```bash
 export LLM_BASE_URL="http://localhost:8000/v1"
 export LLM_MODEL="YOUR_SERVED_MODEL"
-export LLM_API_KEY="YOUR_API_KEY"
+export LLM_API_KEY="YOUR_API_KEY" # Empty ("") if unused
 python examples/base_example.py
 ```
 
-Please refer to the main README.md at project root for other LLM APIs.
+Please refer to the main README.md at project root for other LLM APIs, such as OpenAI or Anthropic APIs.
 
 ---
 

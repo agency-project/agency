@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
-    from .agsandbox import agSandbox
 
 from .agtype import agtype
 from .agutil import _camel_to_snake

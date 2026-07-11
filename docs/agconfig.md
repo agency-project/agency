@@ -119,6 +119,8 @@ class DynamicConfigParam(_ConfigParam):
 
 No caching, no locking. Every read hits `agConfig.get(...)` fresh; every write goes straight to `agConfig.set(...)`. Two instances sharing the same `agConfig` see each other's writes immediately; instances with different (or no) `agConfig`s never interfere. This is the tier almost every per-call tunable uses (LLM sampling params, timeouts, retry counts) — anything that's safe to change on a live object because nothing has "already used" the old value in a way that can't be revisited.
 
+In practice, framework classes (`agent`, `agllm`, `agSandbox`, `aglog`, `agResourcePool`, `agteam`, ...) each `.clone()` whatever `agConfig` they're given at construction time rather than storing it as-is — so two framework objects never end up sharing the literal same `agConfig` instance just by being built from a common source, even though the "two instances sharing the same `agConfig`" behavior described above is real if you deliberately hand one `agConfig` object to two constructors that don't clone it (e.g. two test-only classes, or your own custom owner). See [Design_configuration.md](Design_configuration.md#changing-a-dynamic-field-live) for how to update a framework object's config live given this.
+
 ## `FIELD_REGISTRY` — registration without instantiation
 
 ```python
@@ -252,7 +254,7 @@ Each source contributes its data; a later source's field wins over an earlier on
 - anything with an `.agconfig` property — every `agXXXConfig(...)` view qualifies automatically, with no special-casing needed beyond `hasattr(src, "agconfig")`;
 - `None` — skipped, so optional views can be threaded through without an `if` at the call site.
 
-This constructor is *always* how an `agConfig` should be built, whether from one view or several — see "The canonical form" in [`Design_configuration.md`](Design_configuration.md) for why `agConfig(agXXXConfig(...))` is preferred over `agXXXConfig(...).agconfig` even for a single owner.
+This constructor is *always* how an `agConfig` should be built, whether from one view or several — see "The canonical form" in [`Design_configuration.md`](Design_configuration.md).
 
 Merging copies each owner's field dict with `.update(...)` — a shallow copy per owner, not a deep copy of every value. Two `agConfig`s built by merging the same source therefore share any mutable field **value** (e.g. `agSandboxConfig`'s `mounts` dict) until one of them calls `.set(...)` on it, which replaces that owner's dict entry outright rather than mutating it in place — see `agSandboxConfig.add_mount()`'s `{**current, name: (...)}` pattern. In practice this means merging never aliases in a way that lets one merged `agConfig`'s later `.set()` calls leak into another's.
 
@@ -274,6 +276,8 @@ agSandboxConfig(cfg2).add_mount("data", host_dir_2, "/data")  # succeeds
 `clone()` is `agConfig(self.data)` — it goes through the same variadic constructor, so it inherits the "shallow copy per owner" aliasing behavior described above: `cfg2` starts with the same field values as `cfg`, but a `.set()` on either one only ever replaces that instance's own copy of the owner dict, never the other's.
 
 Note that `GlobalConfigParam` locks are **not** per-instance — they live on `agConfig.GLOBAL`, a single process-wide singleton, so `clone()` cannot undo a tier-1 lock. There is no "fresh GLOBAL" to get back to within one process; a tier-1 field really is fixed for the rest of the process once anything has read it.
+
+Every consuming class that holds an `agconfig` (`agent`, `agteam`, `agllm`, `agllm_backend`, `aglog`, `agSandbox`, `agResourcePool`) builds this same `clone()` call into a symmetric pair of public methods: `change_config(new_cfg)` replaces the object's agconfig with a clone of `new_cfg` (propagating to sub-objects where relevant), and `get_config_copy()` returns a clone of the object's current agconfig. See [`Design_configuration.md`](Design_configuration.md#changing-a-dynamic-field-live) for usage.
 
 ## How to add a new owner's config fields
 

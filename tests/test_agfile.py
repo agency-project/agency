@@ -1,16 +1,16 @@
 """Tests for agfile — file-backed agskill schema field."""
 import json
-import pytest
 from unittest.mock import MagicMock, patch
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
+from agency.agconfig import agConfig
 from agency.agschema import agschema
 from agency.agtype import agtype, agfile
 from agency.agskill import agskill
 from agency.agllm import agllm
 
 LLM_CONFIG = {"api_key": "test", "model": ""}
-LLM = agllm(LLM_CONFIG, context_limit=128_000)
+LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
 
 
 def _make_mock_agent(llm=None, sandbox=None):
@@ -246,7 +246,6 @@ def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
 def test_prepare_agtype_inputs_no_schema_returns_empty():
     sandbox = MagicMock()
     inp = agdata(x="hello")
-    from agency.agschema import agschema as _agschema
     paths = []  # no schema = no agtype inputs to prepare
     assert paths == []
     sandbox.write_file.assert_not_called()

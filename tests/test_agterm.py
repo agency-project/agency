@@ -2,15 +2,12 @@
 sandbox container naming / run isolation."""
 from __future__ import annotations
 
-import io
 import re
 import subprocess
 import sys
 import threading
 import uuid
 from unittest.mock import MagicMock
-
-import pytest
 
 
 def _worker_get_run_id():
@@ -89,7 +86,6 @@ class TestColorAssignment:
         assert agterm._color_counter == before + 1
 
     def test_different_agents_get_different_colors_across_palette(self):
-        from agency.agterm import _AGENT_COLORS
         # Create enough agents to cycle through a few palette slots and confirm
         # consecutive agents are assigned different indices.
         colors = [_fresh_agterm()._color for _ in range(5)]

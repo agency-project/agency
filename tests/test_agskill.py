@@ -1,9 +1,9 @@
 """Tests for agskill as a self-contained ReAct skill."""
 import json
-import pytest
 from unittest.mock import patch, MagicMock
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
+from agency.agconfig import agConfig
 from agency.agschema import agschema, _AgSchemaFields
 from agency.agskill import agskill
 from agency.agllm import _AgLLMFields, agllm
@@ -15,7 +15,7 @@ LLM_IDLE_TIMEOUT   = _AgLLMFields.idle_timeout.default
 LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
 
 LLM_CONFIG = {"api_key": "test", "model": ""}
-LLM = agllm(LLM_CONFIG, context_limit=128_000)
+LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
 
 
 def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s=5):
@@ -638,7 +638,6 @@ def test_return_output_agrawstring_unchanged():
 
 def test_return_output_tool_in_openai_tools():
     """When output_schema is set, per-field return_<field> tools appear first in openai_tools."""
-    from agency.agtool import make_return_output_tools
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(summary=str, score=int),
@@ -1069,7 +1068,6 @@ def test_long_output_injects_read_tool_into_openai_tools():
     """When a large output is offloaded, the read tool is added to the tool schema
     passed to the LLM on the next step so the model can actually call it."""
     from agency.agtool import _AgToolFields
-    from agency.tools import make_read
 
     _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "z" * (_eff_thresh + 1)
@@ -1144,7 +1142,6 @@ def test_long_output_no_duplicate_read_when_already_present():
     """If the skill already has the read tool (e.g. via make_sandboxed_tools),
     offloading must not add a second read entry to openai_tools."""
     from agency.agtool import _AgToolFields
-    import agency.tools as _tools_mod
 
     _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "z" * (_eff_thresh + 1)
@@ -1383,40 +1380,45 @@ from agency.agllm import agllm as _agllm_mod
 build_llm_kwargs = _agllm_mod.build_llm_kwargs
 
 
+def _llm_cfg(**fields) -> agConfig:
+    """Test helper: wrap agllm_backend fields in an agConfig."""
+    return agConfig({"agllm_backend": fields})
+
+
 def test_build_llm_kwargs_model_and_messages():
     msgs = [{"role": "user", "content": "hi"}]
-    kw = build_llm_kwargs({"model": ""}, msgs, None)
+    kw = build_llm_kwargs(_llm_cfg(model=""), msgs, None)
     assert kw["model"] == ""
     assert kw["messages"] == msgs
 
 
 def test_build_llm_kwargs_strips_private_keys():
     msgs = [{"role": "assistant", "content": "ok", "_thinking": "secret"}]
-    kw = build_llm_kwargs({"model": "m"}, msgs, None)
+    kw = build_llm_kwargs(_llm_cfg(model="m"), msgs, None)
     assert "_thinking" not in kw["messages"][0]
     assert "content" in kw["messages"][0]
 
 
 def test_build_llm_kwargs_openai_gen_params():
-    kw = build_llm_kwargs({"model": "m", "temperature": 0.7, "max_completion_tokens": 100}, [], None)
+    kw = build_llm_kwargs(_llm_cfg(model="m", temperature=0.7, max_completion_tokens=100), [], None)
     assert kw["temperature"] == 0.7
     assert kw["max_completion_tokens"] == 100
 
 
 def test_build_llm_kwargs_extra_body_vllm_params():
-    kw = build_llm_kwargs({"model": "m", "top_k": 50, "repetition_penalty": 1.1}, [], None)
+    kw = build_llm_kwargs(_llm_cfg(model="m", top_k=50, repetition_penalty=1.1), [], None)
     assert kw["extra_body"]["top_k"] == 50
     assert kw["extra_body"]["repetition_penalty"] == 1.1
 
 
 def test_build_llm_kwargs_tools_included_when_provided():
     tools = [{"type": "function", "function": {"name": "f"}}]
-    kw = build_llm_kwargs({"model": "m"}, [], tools)
+    kw = build_llm_kwargs(_llm_cfg(model="m"), [], tools)
     assert kw["tools"] == tools
 
 
 def test_build_llm_kwargs_no_tools_key_when_none():
-    kw = build_llm_kwargs({"model": "m"}, [], None)
+    kw = build_llm_kwargs(_llm_cfg(model="m"), [], None)
     assert "tools" not in kw
 
 
@@ -2007,7 +2009,6 @@ def test_random_schema_prompt_examples_parseable():
     example that itself validates correctly.
     """
     import random
-    from typing import get_origin, get_args
     from agency.agtype import (
         get_json_example_for_type_hint, type_hint_to_string_type,
         get_return_tool_description_prompt, validate_output_field_against_schema,

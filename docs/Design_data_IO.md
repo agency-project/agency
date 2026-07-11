@@ -104,6 +104,7 @@ stored in the schema (never an instance).  All interface methods are
 agtype
   ├─ agfile        text I/O through sandbox filesystem
   ├─ agbinary      binary I/O through sandbox filesystem
+  ├─ agpath        path-only string -- never reads/writes sandbox files
   ├─ agimage       multimodal image injection
   └─ agrawstring   bypass JSON wrapping entirely
 ```
@@ -121,6 +122,8 @@ agtype
 | `get_return_tool_description(field_name) → str` | Tool spec generation | Description of the `return_<field>` tool |
 | `get_return_tool_value_description(field_name) → str` | Tool spec generation | Description of the `value` parameter |
 | `build_content_prompt(key, value) → tuple[str|None, list[dict]]` | User-message construction | Returns optional JSON placeholder and extra multimodal content blocks (e.g. image_url entries for agimage) |
+| `validate_output(field_name, value, sandbox, exec_timeout) → str|None` | Agent calls `return_<field>` | Sandbox-side checks (file exists, well-formed, ...) run while the agent is still alive to correct an error; default no-op |
+| `validate_input_value(value) → str|None` | `agschema.check()`/`check_field()`, before the skill runs | Validates a caller-supplied input value; default requires `str`, `agpath` additionally requires it to look like a path |
 
 `prepare()` and `recover()` each return `(new_value, cleanup_paths)`.  The
 framework replaces the field value in `_data` with `new_value` and accumulates
@@ -176,9 +179,12 @@ Caller receives: agdata(content="<actual text>")
 
 **str-field path shortcut.** When an output field is typed `str` but the agent
 returns something that looks like a file path (matched by `_looks_like_path`),
-the framework silently reads the file and returns the content. This allows
-agents to write large outputs to files even for plain `str` fields without
-an explicit `agfile` type.
+the framework reads the file and returns the content, printing a
+`[agschema] WARNING` to stderr every time this fires. This allows agents to
+write large outputs to files even for plain `str` fields without an explicit
+`agfile` type — but it also means a plain `str` field can never reliably hold
+a path-shaped *value* (a field genuinely meant to return a path, not content).
+Use `agpath` for those fields instead — see below.
 
 ---
 
@@ -220,6 +226,64 @@ agbinary.recover():
   2. return bytes object
 
 Caller receives: agdata(content=b"<raw bytes>")
+```
+
+---
+
+## `agpath` — path-only string, no sandbox I/O
+
+**Use case.** A field whose value **is** a path — a destination, a location to
+hand to another tool — as opposed to content that happens to be file-backed.
+Unlike every other built-in `agtype`, `agpath` never reads or writes anything
+in the sandbox; `prepare()`/`recover()` are the inherited no-op passthrough.
+Only the *shape* of the value is checked, on both the input and output side.
+
+**Why this type exists.** `agfile`/`agbinary` output fields, and the
+`str`-field path shortcut above, are both built around the assumption that a
+path-looking value is a *pointer to the real content*, which the framework
+should resolve. That assumption breaks for a field whose value is meant to
+stay a path — e.g. `output_schema=agdata(path=str, content=str)`, where the
+agent correctly calls `return_path("/data/note.txt")` and the framework
+"helpfully" replaces `"/data/note.txt"` with the note's own file content,
+because that's indistinguishable from the `content` field's shortcut case.
+`agpath` opts a field out of that resolution entirely.
+
+**Input flow.**
+
+```
+Caller passes: agdata(dest=agpath, value="/data/out.txt")
+
+agpath.prepare(): passthrough, unchanged (inherited default)
+
+LLM receives: {"dest": "/data/out.txt"}
+
+check()/validate_input_value() rejects the call before the skill runs if the
+value doesn't look like a path:
+  "field 'dest' (agpath): 'not a path at all' does not look like a path"
+```
+
+**Output flow.**
+
+```
+LLM calls: return_moved_to("/data/out.txt")
+
+_handle() → agpath.validate_output():
+  - value must look like a path (_looks_like_path) — no file is read
+  - otherwise: {"error": "field_name 'moved_to': '<value>' does not look
+    like a path. Pass the path string itself, not file content."}
+
+agpath.recover(): passthrough, unchanged (inherited default)
+
+Caller receives: agdata(moved_to="/data/out.txt")
+```
+
+```python
+move_skill = agskill(
+    name="move_file",
+    system_prompt="Move the file to the given destination and confirm.",
+    input_schema=agdata(src=agpath, dest=agpath),
+    output_schema=agdata(moved_to=agpath),
+)
 ```
 
 ---
@@ -385,6 +449,7 @@ The fix hint distinguishes the most common mistake:
 - **Type mismatch**: `"Expected format: <example>"`
 - **agfile not found / empty / binary / double-path**: specific diagnostic per case
 - **agbinary not found / empty**: specific diagnostic per case
+- **agpath not path-shaped**: `"'<value>' does not look like a path. Pass the path string itself, not file content."` — no sandbox file is read for this check
 
 The LLM retries up to `max_output_schema_retries` times (default 10) before
 the skill returns an error result.

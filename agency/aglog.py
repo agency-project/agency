@@ -3,7 +3,6 @@ import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from .agdata import agdata
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 
@@ -63,9 +62,17 @@ class aglog(_AgLogFields):
         self._events:  list[dict] = []   # all events (lifecycle + skills)
         self._lock = threading.Lock()
         self._path = Path(path) if path is not None else None
-        self._agconfig = agconfig
+        self._agconfig = agconfig.clone() if agconfig is not None else None
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def change_config(self, agconfig: "agConfig | None") -> None:
+        """Replace this log's agconfig with a clone of the given one."""
+        self._agconfig = agconfig.clone() if agconfig is not None else None
+
+    def get_config_copy(self) -> "agConfig | None":
+        """Return a clone of this log's agconfig, or None if it has none."""
+        return self._agconfig.clone() if self._agconfig is not None else None
 
     # ------------------------------------------------------------------
     # Internal — called by agent

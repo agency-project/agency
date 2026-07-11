@@ -45,13 +45,18 @@ from agency.agresources import agResourcePool, agResourcePoolConfig
 # Constructor kwargs (convenience, equivalent to the agConfig form below):
 pool = agResourcePool(idle_cpus=1.0, idle_memory="1024m")
 
-# agConfig form -- composes with the rest of an agent's config, and can be
-# changed live (it's Dynamic, not locked once read):
+# agConfig form -- composes with the rest of an agent's config. idle_cpus/
+# idle_memory are Dynamic (not locked once read), but agResourcePool clones
+# cfg at construction, so changing cfg afterward does not reach pool --
+# call pool.change_config(new_cfg) instead:
 cfg = agConfig(agResourcePoolConfig(idle_cpus=1.0, idle_memory="1024m"))
 pool = agResourcePool(agconfig=cfg)
+pool.change_config(agConfig(agResourcePoolConfig(idle_cpus=2.0)))   # live update, reaches pool immediately
 ```
 
-`idle_cpus`/`idle_memory` are read from the *sandbox's own* `agconfig` at container-creation time (a throwaway `_AgResourcePoolFields(self._agconfig)` instance in `_ensure_started()`) — set them on whatever `agConfig` you pass to `agent(agconfig=...)`, not necessarily the same object `agent.agresource_pool` was built from, and they'll take effect for that agent's sandboxes.
+`pool.get_config_copy()` returns a clone of the pool's current agconfig (handy as a base for building `new_cfg`). `pool.change_config` and `pool.get_config_copy` are the same pair of methods every other framework object with an `agconfig` exposes — see [Design_configuration.md](Design_configuration.md#changing-a-dynamic-field-live).
+
+`idle_cpus`/`idle_memory` are read from the *sandbox's own* `agconfig` at container-creation time (a throwaway `_AgResourcePoolFields(self._agconfig)` instance in `_ensure_started()`) — that's the sandbox's own cloned `agconfig` (`sandbox._agconfig`), not necessarily `agent.agresource_pool`'s. Set them on the `agConfig` you pass to `agent(agconfig=...)` *before* the agent (and its sandbox) is constructed, or call `ag.sandbox.change_config(new_cfg)` once a sandbox already exists — mutating the original `cfg`/`agent.agresource_pool`'s agconfig afterward will not reach an already-built sandbox.
 
 CPU and memory limits are set by the sandbox on each tool call via `update_limits()` and are not automatically restored by agresources. `release_resources()` is a manual call to reduce an `agSandbox`'s reported resource usage in the pool (e.g. when the sandbox is destroyed externally).
 

@@ -63,7 +63,10 @@ def test_init_multiple_kwargs_all_become_attributes():
 def test_init_agconfig_instance_override_does_not_affect_class(llm_cfg):
     cfg = _llm_agconfig(llm_cfg)
     team = _EchoTeam(agconfig=cfg)
-    assert team.agconfig is cfg
+    # team.agconfig is its own clone of cfg, not cfg itself -- see
+    # docs/Design_configuration.md ("Changing a Dynamic field live").
+    assert team.agconfig is not cfg
+    assert team.agconfig.data.get("agllm_backend") == llm_cfg
     assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
     other = _EchoTeam()
     assert other.agconfig.data.get("agllm_backend") == _ECHO_LLM
@@ -364,7 +367,9 @@ def test_agconfig_overrides_are_independent_per_instance():
     ]
     teams = [_EchoTeam(agconfig=c) for c in cfgs]
     for team, cfg in zip(teams, cfgs):
-        assert team.agconfig is cfg
+        # Each team's agconfig is its own clone, not the source cfg itself.
+        assert team.agconfig is not cfg
+        assert team.agconfig.data.get("agllm_backend") == cfg.data.get("agllm_backend")
     assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
 
 
@@ -396,3 +401,40 @@ def test_agent_created_outside_team_requires_explicit_llm_config():
     from agency.agent import agent
     with pytest.raises(TypeError):
         agent()
+
+
+# ---------------------------------------------------------------------------
+# change_config / get_config_copy
+# ---------------------------------------------------------------------------
+
+def test_team_change_config_replaces_agconfig():
+    team = _EchoTeam()
+    team.change_config(_llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2}))
+    assert team.agconfig.get("agllm_backend", "temperature") == 0.2
+
+def test_team_change_config_clones_given_agconfig():
+    team = _EchoTeam()
+    new_cfg = _llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2})
+    team.change_config(new_cfg)
+    new_cfg.agllm_backend.temperature = 0.9
+    assert team.agconfig.get("agllm_backend", "temperature") == 0.2
+
+def test_team_change_config_propagates_to_spawned_agents():
+    team = _EchoTeam()
+    team.change_config(_llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2}))
+    assert team.agent.llm.backend.temperature == 0.2
+
+def test_team_get_config_copy_returns_clone_not_same_object():
+    team = _EchoTeam()
+    copy = team.get_config_copy()
+    assert copy is not team.agconfig
+
+def test_team_get_config_copy_reflects_current_values():
+    team = _EchoTeam()
+    assert team.get_config_copy().agllm_backend.model == "m"
+
+def test_mutating_team_get_config_copy_does_not_affect_team():
+    team = _EchoTeam()
+    copy = team.get_config_copy()
+    copy.agllm_backend.temperature = 0.9
+    assert team.agconfig.get("agllm_backend", "temperature") is None

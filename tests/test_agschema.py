@@ -1,11 +1,11 @@
 """Tests for agschema — schema wrapper for agskill input/output schemas."""
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from agency.agdata import agdata, agerror
 from agency.agschema import agschema
-from agency.agtype import agfile, agbinary, agimage, agrawstring
+from agency.agtype import agfile, agbinary, agrawstring, agpath
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +81,24 @@ def test_check_agtype_field_rejects_non_string():
     assert errors
 
 
+def test_check_agpath_field_accepts_path():
+    s = agschema(agdata(dest=agpath))
+    assert s.check(agdata(dest="/workspace/out.txt")) == []
+
+
+def test_check_agpath_field_rejects_non_path_string():
+    s = agschema(agdata(dest=agpath))
+    errors = s.check(agdata(dest="not a path at all"))
+    assert errors
+    assert "does not look like a path" in errors[0]
+
+
+def test_check_agpath_field_rejects_non_string():
+    s = agschema(agdata(dest=agpath))
+    errors = s.check(agdata(dest=123))
+    assert errors
+
+
 def test_check_list_of_dicts_schema_valid():
     s = agschema(agdata(items=[{"name": str, "count": int}]))
     assert s.check(agdata(items=[{"name": "a", "count": 1}])) == []
@@ -117,6 +135,16 @@ def test_check_field_agtype_accepts_str():
     assert s.check_field("doc", "/path/to/file") is None
 
 
+def test_check_field_agpath_accepts_path():
+    s = agschema(agdata(dest=agpath))
+    assert s.check_field("dest", "/path/to/file") is None
+
+
+def test_check_field_agpath_rejects_non_path():
+    s = agschema(agdata(dest=agpath))
+    assert s.check_field("dest", "not a path") is not None
+
+
 # ---------------------------------------------------------------------------
 # validate_input
 # ---------------------------------------------------------------------------
@@ -131,6 +159,18 @@ def test_validate_input_missing_field_returns_error():
     err = s.validate_input(agdata())
     assert err is not None
     assert "question" in err
+
+
+def test_validate_input_agpath_valid_returns_none():
+    s = agschema(agdata(dest=agpath))
+    assert s.validate_input(agdata(dest="/data/out.txt")) is None
+
+
+def test_validate_input_agpath_invalid_returns_error():
+    s = agschema(agdata(dest=agpath))
+    err = s.validate_input(agdata(dest="not a path"))
+    assert err is not None
+    assert "does not look like a path" in err
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +213,12 @@ def test_field_desc_agfile():
     assert "file" in desc.lower()
 
 
+def test_field_desc_agpath():
+    s = agschema(agdata(dest=agpath))
+    desc = s.field_desc("dest")
+    assert "path" in desc.lower()
+
+
 def test_field_desc_int():
     s = agschema(agdata(count=int))
     desc = s.field_desc("count")
@@ -200,6 +246,13 @@ def test_get_return_tool_description_prompt_agbinary_mentions_path():
     s = agschema(agdata(audio=agbinary))
     tool_desc, val_desc = s.get_return_tool_descriptions("audio")
     assert "path" in val_desc.lower()
+
+
+def test_get_return_tool_description_prompt_agpath_warns_against_content():
+    s = agschema(agdata(dest=agpath))
+    tool_desc, val_desc = s.get_return_tool_descriptions("dest")
+    assert "path" in val_desc.lower()
+    assert "content" in val_desc.lower()
 
 
 # ---------------------------------------------------------------------------
