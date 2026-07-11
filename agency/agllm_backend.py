@@ -639,10 +639,16 @@ class agllm_backend(AgLLMBackendFields):
     given agConfig is cloned (self._agconfig) -- so this backend's own config
     is independent of the caller's; mutating the caller's original agConfig
     afterward does not affect this backend. To change this backend's live
-    config, mutate backend._agconfig (or one of its owner views) directly.
+    config, call ``change_config()`` (or, for one-off dynamic fields, mutate
+    ``backend._agconfig`` directly since that object is used fresh on every
+    call).
     """
 
     def __init__(self, agconfig: "agConfig") -> None:
+        self._agconfig = agconfig.clone()
+
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this backend's agconfig with a clone of the given one."""
         self._agconfig = agconfig.clone()
 
     @staticmethod

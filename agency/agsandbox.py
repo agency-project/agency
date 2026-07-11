@@ -400,6 +400,15 @@ class agSandbox(_AgSandboxFields):
             host_path.mkdir(parents=True, exist_ok=True)
             self._vol_flags += ["-v", f"{host_path.resolve()}:{container}:{mode}"]
 
+    def change_config(self, agconfig: "agConfig | None") -> None:
+        """Replace this sandbox's agconfig with a clone of the given one.
+
+        Only affects fields read live (DynamicConfigParam) going forward --
+        the container's image and mounts were resolved once at construction
+        (tier-2, physically fixed once the container exists) and are not
+        re-resolved here."""
+        self._agconfig = agconfig.clone() if agconfig is not None else None
+
     def __getstate__(self) -> dict:
         # threading.RLock isn't picklable — custom tools with run_in_subprocess=True
         # (the default) get cloudpickled to a worker process, so this must not crash.

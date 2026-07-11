@@ -134,6 +134,18 @@ class agtype:
         """
         return None
 
+    @classmethod
+    def validate_input_value(cls, value: object) -> "str | None":
+        """Validate a raw input value before the skill runs (called from
+        agschema.check()/check_field()).
+
+        Returns an error string, or None if valid. Default: every agtype's
+        generic wire representation is a plain string. Override in
+        subclasses that need a stricter contract (e.g. agpath requires the
+        string to actually look like a path).
+        """
+        return None if isinstance(value, str) else f"must be a string, got {type(value).__name__}"
+
     @staticmethod
     def walk(type_hint, value, on_leaf):
         """Recursively walk a type type_hint/value pair, calling on_leaf(type_hint, value)
@@ -350,6 +362,95 @@ class agfile(agtype):
                 f"('{content.strip()}'), not real content. "
                 f"Write the actual content to a file and return that file's path."
             )
+        return None
+
+
+class agpath(agtype):
+    """Path-only string field_name for agskill schemas.
+
+    Unlike a plain ``str`` field (where the framework tries to be helpful
+    and auto-resolves a path-looking value to that file's contents — see
+    ``agschema.make_field_handler``) or ``agfile`` (whose output is always
+    resolved to file content), ``agpath`` means the field *is* a path and
+    must stay a path.  Neither prepare() nor recover() touch the sandbox
+    filesystem — the value passes through unchanged; only its shape is
+    checked.
+
+    Input fields
+    ------------
+    The value must look like a path (``_looks_like_path``); anything else
+    fails schema validation before the skill runs.
+
+    Output fields
+    ------------
+    The LLM must return a path string, not inline content. If the value
+    doesn't look like a path, ``validate_output`` feeds back an error so the
+    LLM retries with an actual path.
+
+    Example::
+
+        move_skill = agskill(
+            name="move_file",
+            system_prompt="Move the file to the given destination.",
+            input_schema=agdata(src=agpath, dest=agpath),
+            output_schema=agdata(moved_to=agpath),
+        )
+    """
+
+    @classmethod
+    def schema_type(cls) -> str:
+        return "path"
+
+    @classmethod
+    def needs_sandbox(cls) -> bool:
+        return False
+
+    @classmethod
+    def extra_input_prompt(cls, field_name: str) -> str:
+        return (
+            f"  - Input `{field_name}`: a path string, not file content."
+        )
+
+    @classmethod
+    def extra_output_prompt(cls, field_name: str, skill_name: str) -> str:
+        return (
+            f"  - Output `{field_name}`: return the path itself "
+            f"(e.g. /workspace/outputs/{field_name}.txt) as the field_name value. "
+            f"Do NOT pass file content — pass only the path string."
+        )
+
+    @classmethod
+    def get_return_tool_description(cls, field_name: str) -> str:
+        return f"Register the '{field_name}' output as a path string."
+
+    @classmethod
+    def get_return_tool_value_description(cls, field_name: str) -> str:
+        return (
+            f"Path string for '{field_name}'. "
+            f"Do NOT pass file content — pass only the path."
+        )
+
+    @classmethod
+    def validate_output(
+        cls,
+        field_name: str,
+        value: object,
+        sandbox: "agSandbox",
+        exec_timeout: int,
+    ) -> "str | None":
+        if not isinstance(value, str) or not _looks_like_path(value):
+            return (
+                f"field_name '{field_name}': '{value}' does not look like a path. "
+                f"Pass the path string itself, not file content."
+            )
+        return None
+
+    @classmethod
+    def validate_input_value(cls, value: object) -> "str | None":
+        if not isinstance(value, str):
+            return f"must be a string, got {type(value).__name__}"
+        if not _looks_like_path(value):
+            return f"'{value}' does not look like a path"
         return None
 
 
@@ -770,7 +871,7 @@ def validate_value_against_type_hint(type_hint, value) -> "str | None":
 
     if isinstance(type_hint, type):
         if issubclass(type_hint, agtype):
-            return None if isinstance(value, str) else f"expected str, got {type(value).__name__}"
+            return type_hint.validate_input_value(value)
         if issubclass(type_hint, bool):
             return None if isinstance(value, bool) else f"expected bool, got {type(value).__name__}"
         if issubclass(type_hint, (int, float, str)):

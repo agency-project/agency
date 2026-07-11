@@ -67,6 +67,10 @@ class aglog(_AgLogFields):
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
 
+    def change_config(self, agconfig: "agConfig | None") -> None:
+        """Replace this log's agconfig with a clone of the given one."""
+        self._agconfig = agconfig.clone() if agconfig is not None else None
+
     # ------------------------------------------------------------------
     # Internal — called by agent
     # ------------------------------------------------------------------

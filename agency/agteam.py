@@ -141,6 +141,16 @@ class agteam:
     # Helpers
     # ------------------------------------------------------------------
 
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this team's agconfig with a clone of the given one, and
+        push that same clone down to every agent this team has spawned so
+        far (via ``agent.change_config``). Agents created afterward pick up
+        the new ``self.agconfig`` automatically, the same way they do at
+        construction."""
+        self.agconfig = agconfig.clone()
+        for a in self._agents:
+            a.change_config(self.agconfig)
+
     @property
     def agents(self) -> list["_Agent"]:
         """All agents tracked by this team (setup + dynamic run-time forks)."""

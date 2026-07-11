@@ -229,6 +229,10 @@ class agResourcePool(_AgResourcePoolFields):
             if multiprocessing.current_process().name == "MainProcess":
                 _allocate_gpu_markers(self.gpus)
 
+    def change_config(self, agconfig: "agConfig | None") -> None:
+        """Replace this pool's agconfig with a clone of the given one."""
+        self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
+
     def acquire_gpu(self, timeout: float | None = None) -> int:
         """Block until any GPU is free; return its id."""
         deadline = None if timeout is None else time.monotonic() + timeout

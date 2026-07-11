@@ -175,6 +175,15 @@ class agllm(_AgLLMFields):
         self.backend: agllm_backend = agllm_backend.for_config(self._agconfig)
         self.context_limit: int = context_limit if context_limit is not None else agllm.fetch_context_limit(self.backend)
 
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this llm's agconfig (and its backend's) with a clone of
+        the given one. Mutating ``self._agconfig`` in place does not reach
+        ``self.backend`` -- it holds its own independent clone -- so this is
+        the supported way to push a live config change through to the next
+        LLM call."""
+        self._agconfig = agconfig.clone()
+        self.backend.change_config(self._agconfig)
+
     # ------------------------------------------------------------------
     # Instance methods — delegate to static methods using self.backend
     # ------------------------------------------------------------------

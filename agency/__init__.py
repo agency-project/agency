@@ -1,6 +1,6 @@
 from .agdata import agdata, agerror, AgError
 from .agcontext import agcontext
-from .agtype import agtype, agfile, agbinary, agimage, agrawstring
+from .agtype import agtype, agfile, agbinary, agimage, agrawstring, agpath
 from .agschema import agschema
 from .agskill import agskill
 from .agtool import agtool
@@ -12,6 +12,6 @@ from .agsync import agsync
 from .agsandbox import agSandbox, get_container_runtime
 from .agresources import agResourcePool
 __all__ = [
-    "agdata", "agerror", "agcontext", "agschema", "agtype", "agfile", "agbinary", "agimage", "agrawstring", "AgError", "agskill", "agtool", "aglog", "agterm",
+    "agdata", "agerror", "agcontext", "agschema", "agtype", "agfile", "agbinary", "agimage", "agrawstring", "agpath", "AgError", "agskill", "agtool", "aglog", "agterm",
     "agent", "agteam", "agsync", "agSandbox", "agResourcePool", "get_container_runtime",
 ]

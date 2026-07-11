@@ -4,7 +4,7 @@ import pytest
 from typing import get_origin, get_args
 from unittest.mock import MagicMock
 from agency.agdata import agdata
-from agency.agtype import agtype, agfile, agimage, agbinary, agrawstring
+from agency.agtype import agtype, agfile, agimage, agbinary, agrawstring, agpath
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +32,15 @@ def test_agtype_extra_input_prompt_empty():
 
 def test_agtype_extra_output_prompt_empty():
     assert agtype.extra_output_prompt("x", "skill") == ""
+
+def test_agtype_validate_input_value_accepts_str():
+    assert agtype.validate_input_value("hello") is None
+
+def test_agtype_validate_input_value_rejects_non_str():
+    assert agtype.validate_input_value(123) is not None
+
+def test_agtype_validate_output_default_none():
+    assert agtype.validate_output("x", "anything", None, 5) is None
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +77,19 @@ def test_validate_value_nested_list_agfile():
     # agfile serialises as str; nested list of paths should validate
     assert validate_value_against_type_hint(list[list[agfile]], [["/a.txt", "/b.txt"]]) is None
     assert validate_value_against_type_hint(list[list[agfile]], [[123]]) is not None
+
+def test_validate_value_agpath_accepts_path():
+    from agency.agtype import validate_value_against_type_hint
+    assert validate_value_against_type_hint(agpath, "/workspace/out.txt") is None
+
+def test_validate_value_agpath_rejects_non_path():
+    from agency.agtype import validate_value_against_type_hint
+    assert validate_value_against_type_hint(agpath, "not a path") is not None
+
+def test_validate_value_nested_list_agpath():
+    from agency.agtype import validate_value_against_type_hint
+    assert validate_value_against_type_hint(list[agpath], ["/a.txt", "/b.txt"]) is None
+    assert validate_value_against_type_hint(list[agpath], ["/a.txt", "not a path"]) is not None
 
 def test_validate_value_dict_of_list_str():
     from agency.agtype import validate_value_against_type_hint

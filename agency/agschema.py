@@ -112,8 +112,9 @@ class agschema:
                 continue
             actual = data._data[key]
             if isinstance(hint, type) and issubclass(hint, agtype):
-                if not isinstance(actual, str):
-                    errors.append(f"field '{key}' ({hint.__name__}) must be a string")
+                err = hint.validate_input_value(actual)
+                if err is not None:
+                    errors.append(f"field '{key}' ({hint.__name__}): {err}")
                 continue
             if isinstance(hint, list) and len(hint) == 1 and isinstance(hint[0], dict):
                 item_template = hint[0]
@@ -403,6 +404,12 @@ class agschema:
                 try:
                     resolved = sandbox.read_file(value)
                     if resolved and resolved.strip() and not _looks_like_path(resolved.strip()):
+                        print(
+                            f"[agschema] WARNING: output field '{field_name}' looked like a "
+                            f"path ('{value}') and was auto-resolved to that file's contents "
+                            f"because its type hint is plain str. If '{field_name}' is meant "
+                            f"to hold a path rather than content, declare it as agpath instead."
+                        )
                         value = resolved
                 except Exception:
                     pass

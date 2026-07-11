@@ -154,9 +154,8 @@ class agent:
         # Cloned so this agent's own agconfig is independent of whatever
         # source it was built from (an explicit agconfig=, agent.default_agconfig,
         # or the active agteam's agconfig) -- mutating that source afterward
-        # must not silently change an already-constructed agent. To change this
-        # agent's live config, mutate ag.agconfig (or ag.llm._agconfig, etc.)
-        # directly, or reassign it to a new agConfig outright.
+        # must not silently change an already-constructed agent. Use
+        # ag.change_config(new_cfg) to change it live -- see that method.
         self.agconfig: "agConfig | None" = _src_agconfig.clone() if _src_agconfig is not None else None
 
         self.agname: _agname = _agname.allocate_agname(agname)
@@ -199,6 +198,20 @@ class agent:
             llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             context_limit=self.llm.context_limit,
         )
+
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this agent's agconfig with a clone of the given one, and
+        push that same clone down to every sub-object that holds its own
+        independent copy (``self.llm`` -- and its backend --, ``self.log``,
+        and ``self.sandbox`` if one has been created). Reassigning
+        ``self.agconfig`` alone does not reach those clones, so this is the
+        supported way to change live config (e.g. ``max_completion_tokens``)
+        after construction."""
+        self.agconfig = agconfig.clone()
+        self.llm.change_config(self.agconfig)
+        self.log.change_config(self.agconfig)
+        if self.sandbox is not None:
+            self.sandbox.change_config(self.agconfig)
 
     # ------------------------------------------------------------------
     # Properties
