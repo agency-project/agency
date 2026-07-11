@@ -3,7 +3,6 @@ Anthropic-on-Bedrock adapter (message/tool translation, streaming chunk
 shim, non-streaming shim)."""
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,7 +10,6 @@ import httpx
 import openai
 import pytest
 
-import agency.agllm_backend as agllm_backend_module
 from agency.agconfig import agConfig
 from agency.agllm_backend import (
     BAD_REQUEST_EXCS,

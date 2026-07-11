@@ -1,7 +1,7 @@
 """Tests for agimage — multimodal image input support."""
 import base64
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

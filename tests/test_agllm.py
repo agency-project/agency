@@ -1,10 +1,9 @@
 """Tests for agllm — LLM client wrapper, streaming call, kwarg building, and compaction."""
 import ssl
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import httpx
 import openai
-import pytest
 
 from agency.agllm import LLMCallResult, agllm
 import json
@@ -393,7 +392,6 @@ def test_llm_call_tool_call_accumulated():
     assert result.tool_calls_raw[0]["id"] == "call_abc"
 
 def test_llm_call_tool_call_arguments_concatenated():
-    import json
     tc1 = _TCDelta("f", '{"a":', "c1")
     tc2 = _TCDelta("",  '"val"}', "")
     tc2.function.name = ""
@@ -1052,7 +1050,6 @@ def _make_stream(content: str, prompt_tokens: int) -> list:
 
 def test_agskill_triggers_compaction_when_over_threshold():
     from agency.agskill import agskill
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
@@ -1077,7 +1074,6 @@ def test_agskill_triggers_compaction_when_over_threshold():
 
 def test_agskill_skips_compaction_when_under_threshold():
     from agency.agskill import agskill
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
@@ -1103,7 +1099,6 @@ def test_agskill_skips_compaction_when_under_threshold():
 def test_agskill_passes_context_limit_to_compact():
     """compact() must receive the context_limit kwarg so tail sizing is correct."""
     from agency.agskill import agskill
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
     limit = BIG_CTX
@@ -1224,7 +1219,6 @@ def test_agskill_context_exceeded_triggers_forced_compaction():
     """
     from agency.agskill import agskill
     from agency.agllm import LLMCallResult
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 
@@ -1264,7 +1258,6 @@ def test_agskill_context_exceeded_does_not_count_as_retry():
     """context_exceeded compaction must not consume a connection-retry slot."""
     from agency.agskill import agskill
     from agency.agllm import LLMCallResult
-    from agency.agdata import agdata
 
     skill = agskill(name="test", system_prompt="You are helpful.", replace_tools=[])
 

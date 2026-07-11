@@ -92,7 +92,7 @@ class agteam:
         # Log team creation to both terminal and file
         from .agent import agent as _Agent
         from .agname import agname as _agname
-        from .aglog import aglog as _aglog, _ts
+        from .aglog import aglog as _aglog
         import sys
         _base = config.get("name") or f"{type(self).__name__}"
         self.team_name: str = _agname.allocate_agname(_base)

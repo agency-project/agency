@@ -1,8 +1,6 @@
 """Tests for agrawstring — raw string bypass mode."""
 import json
-from unittest.mock import MagicMock, patch, call
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from agency.agdata import agdata
 from agency.agcontext import agcontext

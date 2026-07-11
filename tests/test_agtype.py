@@ -1,10 +1,7 @@
 """Tests for the agtype base class, agdata serialization, and input offloading."""
 import json
-import pytest
-from typing import get_origin, get_args
-from unittest.mock import MagicMock
 from agency.agdata import agdata
-from agency.agtype import agtype, agfile, agimage, agbinary, agrawstring, agpath
+from agency.agtype import agtype, agfile, agpath
 
 
 # ---------------------------------------------------------------------------

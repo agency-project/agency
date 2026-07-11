@@ -393,7 +393,6 @@ class TestGpuMarkers:
 
     def test_non_main_process_name_blocks_allocation(self):
         """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
-        import multiprocessing
         from agency import agresources
         mock_proc = MagicMock()
         mock_proc.name = "ForkPoolWorker-1"

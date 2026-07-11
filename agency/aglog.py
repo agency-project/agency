@@ -3,7 +3,6 @@ import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from .agdata import agdata
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 

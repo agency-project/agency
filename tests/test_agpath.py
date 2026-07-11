@@ -7,7 +7,6 @@ path-looking value to that file's contents (see agschema.make_field_handler),
 which is wrong for a field whose value is meant to *stay* a path.
 """
 import json
-import pytest
 from unittest.mock import MagicMock, patch
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext

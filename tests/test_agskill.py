@@ -1,6 +1,5 @@
 """Tests for agskill as a self-contained ReAct skill."""
 import json
-import pytest
 from unittest.mock import patch, MagicMock
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
@@ -639,7 +638,6 @@ def test_return_output_agrawstring_unchanged():
 
 def test_return_output_tool_in_openai_tools():
     """When output_schema is set, per-field return_<field> tools appear first in openai_tools."""
-    from agency.agtool import make_return_output_tools
     s = agskill(
         name="s", system_prompt="",
         output_schema=agdata(summary=str, score=int),
@@ -1070,7 +1068,6 @@ def test_long_output_injects_read_tool_into_openai_tools():
     """When a large output is offloaded, the read tool is added to the tool schema
     passed to the LLM on the next step so the model can actually call it."""
     from agency.agtool import _AgToolFields
-    from agency.tools import make_read
 
     _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "z" * (_eff_thresh + 1)
@@ -1145,7 +1142,6 @@ def test_long_output_no_duplicate_read_when_already_present():
     """If the skill already has the read tool (e.g. via make_sandboxed_tools),
     offloading must not add a second read entry to openai_tools."""
     from agency.agtool import _AgToolFields
-    import agency.tools as _tools_mod
 
     _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
     big_output = "z" * (_eff_thresh + 1)
@@ -2013,7 +2009,6 @@ def test_random_schema_prompt_examples_parseable():
     example that itself validates correctly.
     """
     import random
-    from typing import get_origin, get_args
     from agency.agtype import (
         get_json_example_for_type_hint, type_hint_to_string_type,
         get_return_tool_description_prompt, validate_output_field_against_schema,

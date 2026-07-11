@@ -121,7 +121,6 @@ def test_log_history_len_grows():
 # ---------------------------------------------------------------------------
 
 def test_invalid_skill_arg_raises_and_nothing_logged():
-    from agency.agskill import agskill as agskill_cls
     ag = make_agent()
     # Passing a string (old API) or a non-agskill object should raise
     with pytest.raises((TypeError, AttributeError, ValueError)):

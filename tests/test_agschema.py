@@ -1,11 +1,11 @@
 """Tests for agschema — schema wrapper for agskill input/output schemas."""
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from agency.agdata import agdata, agerror
 from agency.agschema import agschema
-from agency.agtype import agfile, agbinary, agimage, agrawstring, agpath
+from agency.agtype import agfile, agbinary, agrawstring, agpath
 
 
 # ---------------------------------------------------------------------------

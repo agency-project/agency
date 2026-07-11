@@ -505,8 +505,6 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
 # Checkpointing (requires Docker)
 # ---------------------------------------------------------------------------
 
-import subprocess as _subprocess
-
 _docker_ok = pytest.mark.skipif(
     not (lambda: __import__("subprocess").run(
         ["docker", "info"], capture_output=True, timeout=10
@@ -1020,7 +1018,6 @@ def test_prepare_agtype_inputs_nested_list_agimage(tmp_path):
     assert base64.b64decode(inp._data["batches"][0][0].split(",", 1)[1]) == b"img_a"
 
 def test_prepare_agtype_inputs_dict_of_list_agimage(tmp_path):
-    import base64
     img = tmp_path / "x.jpg"
     img.write_bytes(b"img_x")
     inp = agdata(groups={"g": [str(img)]})

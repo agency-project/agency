@@ -18,12 +18,10 @@ Run:
     uv run python examples/custom_tools.py "speculative decoding"
     MAX_PAPERS=6 uv run python examples/custom_tools.py "flash attention"
 """
-import io
 import os
 import re
 from pathlib import Path
 
-import fitz
 import html2text
 import httpx
 

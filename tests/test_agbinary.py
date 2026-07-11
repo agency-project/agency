@@ -2,7 +2,6 @@
 import base64
 import json
 import pytest
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from agency.agdata import agdata, agerror
