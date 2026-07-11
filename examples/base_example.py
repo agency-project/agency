@@ -21,6 +21,7 @@ from pathlib import Path
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
 from agency.agllm_backend import agVLLMBackendConfig
+from agency.agtype import agpath
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agConfig(
@@ -28,6 +29,9 @@ cfg = agConfig(
         base_url=os.environ.get("LLM_BASE_URL"),
         model=os.environ.get("LLM_MODEL", ""),
         api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
     )
 )
 
@@ -54,11 +58,11 @@ def main():
         ),
         input_schema=agdata(
             task=str,
-            file_path=str,
+            file_path=agpath, # datatype for passing path in the sandbox
         ),
         output_schema=agdata(
             status=str,
-            path=str,
+            path=agpath, # datatype for passing path in the sandbox
             content=str,
         ),
     )
@@ -76,9 +80,6 @@ def main():
 
     # No tools= argument — uses the default sandboxed tool list
     ag = agent(agconfig=cfg)
-
-    print(f"Tools    : {[t.name for t in (file_skill.replace_tools or file_skill.add_tools or [])]}")
-    print()
 
     print(">> [file_manager] write and verify a note")
     r1 = ag.run(
