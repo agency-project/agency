@@ -46,8 +46,7 @@ cfg = agConfig(
 )
 
 # ---------------------------------------------------------------------------
-# Human interaction helpers — called directly from Python, never delegated
-# to the LLM so approvals cannot be skipped or hallucinated.
+# Human interaction helpers
 # ---------------------------------------------------------------------------
 
 def _is_approved(reply: str) -> bool:
@@ -108,9 +107,8 @@ def main() -> None:
     planner = agent(agconfig=cfg, agname="PlannerAgent")
     writer  = agent(agconfig=cfg, agname="WriterAgent")
 
-    # ask_human_tool runs in-process (run_in_subprocess=False) so it can reach the
-    # live webUI singleton. Calling it directly from Python guarantees the
-    # human is always asked — the LLM cannot skip or hallucinate the call.
+    # ask_human_tool runs in-process (run_in_subprocess=False) so it can reach
+    # the live webUI singleton.
     ask_human_tool = make_ask_human(planner.agname, timeout_s=None)
 
     # ── Skills (pure generation — no human interaction) ───────────────────────

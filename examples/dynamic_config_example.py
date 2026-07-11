@@ -35,6 +35,7 @@ from pathlib import Path
 
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
+from agency.agtype import agpath
 from agency.agllm_backend import agVLLMBackendConfig
 from agency.agsandbox import agSandboxConfig
 
@@ -78,8 +79,8 @@ def main():
             "Write the exact text you're given to the given file path using "
             "the write tool, then read it back to confirm."
         ),
-        input_schema=agdata(text=str, file_path=str),
-        output_schema=agdata(path=str, content=str),
+        input_schema=agdata(text=str, file_path=agpath),
+        output_schema=agdata(path=agpath, content=str),
     )
 
     ag = agent(agconfig=cfg)
@@ -89,8 +90,9 @@ def main():
     time.sleep(3)
     try:
         r1 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=3)
-        print(f"   path    : {r1.path!r}")
-        print(f"   content : {r1.content!r}\n")
+        print(f"Path    : {r1.path!r}\n")
+        print(f"Content : {r1.content!r}\n")
+        print(f"Execution succeeded.\n")
     except Exception as e:
         # Accessing a field on a pending agdata blocks until the task
         # finishes; if the ReAct loop exhausted max_steps without a complete
@@ -114,16 +116,13 @@ def main():
 
     print(">> [call 2] max_completion_tokens=4096")
     print(">> Execution should succeed.")
-    r2 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"))
-    print(f"   path    : {r2.path!r}")
-    print(f"   content : {r2.content!r}\n")
-
-    note = data_dir / "note.txt"
-    content = note.read_text() if note.exists() else None
-    if not note.exists():
-        print(f"FAILURE:   note not found: {note!r}")
-    else:
-        print(f"SUCCESS:   note found: {note!r}  content={content!r}")
+    try:
+        r2 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=3)
+        print(f"Path    : {r2.path!r}\n")
+        print(f"Content : {r2.content!r}\n")
+        print(f"Execution succeeded.\n")
+    except Exception as e:
+        print(f"Failed unexpectedly: {e}\n")
 
 
 if __name__ == "__main__":

@@ -723,8 +723,7 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
         # A Bedrock API key (e.g. "ABSK...") is a single opaque bearer token
         # for the Mantle gateway. AWS access/secret key pairs for SigV4 signing
         # are always "ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]" — the
-        # colon is what distinguishes the two, not any particular prefix
-        # string (real Bedrock API keys don't start with "bedrock-api-key-").
+        # colon is what distinguishes the two.
         if api_key and ":" not in api_key:
             return openai.OpenAI(api_key=api_key, base_url=mantle_url, timeout=timeout)
         if not api_key:

@@ -34,7 +34,7 @@ llm = agllm(cfg)
 
 `agllm` clones whatever `agConfig` it's given (see "How config values are stored internally" below) — passing the *same* `cfg` to two different `agllm(cfg)` calls produces two independent LLM configs, not two views onto one shared config.
 
-`agLLMBackendConfig(**fields)` is a small view over an `agConfig`, scoped to the `agllm_backend` owner — `agConfig(agLLMBackendConfig(**fields))` is equivalent to `agConfig({"agllm_backend": {**fields}})` plus a field-name check (an unknown keyword raises `TypeError` immediately instead of the field silently being ignored). Every other framework class with tunable fields has the same kind of view (`agAgentConfig`, `agSandboxConfig`, ...) — see `_AgConfigViewBase` in `agconfig.py`, and [`agconfig.md`](agconfig.md) for the full implementation. The canonical form is always `agConfig(agXXXConfig(...), ...)`, whether you're setting one owner's fields or composing several — never `agXXXConfig(...).agconfig` directly:
+`agLLMBackendConfig(**fields)` is a small view over an `agConfig`, scoped to the `agllm_backend` owner — `agConfig(agLLMBackendConfig(**fields))` is equivalent to `agConfig({"agllm_backend": {**fields}})` plus a field-name check (an unknown keyword raises `TypeError` immediately instead of the field silently being ignored). Every other framework class with tunable fields has the same kind of view (`agAgentConfig`, `agSandboxConfig`, ...) — see `_AgConfigViewBase` in `agconfig.py`, and [`agconfig.md`](agconfig.md) for the full implementation. The canonical form is always `agConfig(agXXXConfig(...), ...)`, whether you're setting one owner's fields or composing several:
 
 ```python
 from agency.agsandbox import agSandboxConfig

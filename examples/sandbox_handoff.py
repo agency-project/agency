@@ -170,10 +170,8 @@ def main() -> None:
 
     _run_file(sandbox, "after fix")
 
-    # Sandbox cleanup: agSandbox.__del__ calls destroy() when the object is garbage collected,
-    # and an atexit handler catches anything that survives to interpreter shutdown.
-    # Explicit destroy() is only needed in long-running processes where you want
-    # deterministic container resource release on the host-side rather than waiting for GC.
+    # Sandbox cleanup happens automatically: agSandbox.__del__ calls destroy() on
+    # garbage collection, with an atexit handler as a backstop.
     print("\nDone.")
 
 

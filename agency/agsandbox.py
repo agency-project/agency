@@ -100,8 +100,7 @@ _live_sandboxes: weakref.WeakSet["agSandbox"] = weakref.WeakSet()
 # duration of each subprocess call.  Caps concurrent daemon calls at 16: the
 # daemon serialises most operations internally (GPU init, overlay diff, container
 # teardown), so more than ~16 concurrent calls increase contention without
-# reducing wall-clock time.  A single semaphore replaces the former trio of
-# _startup_semaphore / _commit_semaphore / _shutdown_semaphore.
+# reducing wall-clock time.
 # Tier-1 (global class) config: lazily created on first use so a caller can
 # override the limit via agSandbox.docker_semaphore_limit = N (or
 # cfg.agSandbox.docker_semaphore_limit = N before any agSandbox exists)

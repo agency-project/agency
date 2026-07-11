@@ -30,7 +30,7 @@ cfg = agConfig(agVLLMBackendConfig(model="...", api_key="..."))              # o
 cfg = agConfig(agVLLMBackendConfig(model="..."), agAgentConfig(react_max_steps=20))  # several
 ```
 
-**Never** write `agVLLMBackendConfig(model="...").agconfig` — chaining `.agconfig` directly off a view. Both forms produce a working `agConfig`, but only the first scales cleanly from one owner to several without changing shape: adding a second owner to an existing call is a one-line diff (`agConfig(view_a, view_b)`), whereas the `.agconfig` form has no natural way to combine two views at all short of switching to the `agConfig(...)` form anyway. Use one convention everywhere and this question never comes up again.
+Use this `agConfig(...)` form everywhere, even for a single owner — adding a second owner later is then just a one-line diff (`agConfig(view_a, view_b)`).
 
 Each `agXXXConfig(...)` call validates its keyword arguments against that owner's real fields — a typo'd field name raises `TypeError` immediately, naming the bad field, rather than the framework silently reading a default forever:
 
@@ -56,24 +56,20 @@ You can always tell which tier a field is from its behavior, but you don't need 
 
 ### Changing a Dynamic field live
 
-Every framework object that takes `agconfig=` clones it at construction time — `ag.agconfig`, `ag.llm._agconfig`, `ag.sandbox._agconfig`, etc. are each independent copies of whatever you passed in, not the same object. This means mutating your original `cfg` (or even `ag.agconfig`) after construction does **not** reach `ag.llm` — each object only sees writes made through its *own* `agconfig`. This is deliberate: it's what stops two agents built from the same `cfg` from silently changing each other's behavior.
+Every framework object that takes `agconfig=` clones it at construction time — `ag.agconfig`, `ag.llm._agconfig`, `ag.llm.backend._agconfig`, `ag.sandbox._agconfig`, etc. are each independent copies of whatever you passed in, not the same object. This means mutating your original `cfg` (or even `ag.agconfig`) after construction does **not** reach `ag.llm` — each object only sees writes made through its *own* `agconfig`. This is deliberate: it's what stops two agents built from the same `cfg` from silently changing each other's behavior.
 
-To change a Dynamic field live, reach into the specific object whose behavior you want to change:
+Use `ag.change_config(new_cfg)` to replace the whole tree's config in one call — it pushes `new_cfg` down through `ag.llm` (and its backend), `ag.log`, and `ag.sandbox`:
 
 ```python
 ag = agent(agconfig=cfg)
 ag.run(skill, agdata(...))                    # call 1, temperature=0.7 (say)
-ag.llm._agconfig.agllm_backend.temperature = 0.2
+
+new_cfg = agConfig(agVLLMBackendConfig(model="...", api_key="...", temperature=0.2))
+ag.change_config(new_cfg)
 ag.run(skill, agdata(...))                    # call 2, sees temperature=0.2 immediately
 ```
 
-No new agent, no sandbox teardown — the field is re-read from `ag.llm._agconfig` on every LLM call. Mutating `cfg` or `ag.agconfig` instead would have no effect on `ag.llm`, since `ag.llm._agconfig` is its own clone.
-
-You can also replace an object's config wholesale instead of mutating it in place:
-
-```python
-ag.llm._agconfig = agConfig(agVLLMBackendConfig(model="...", temperature=0.2))
-```
+No new agent, no sandbox teardown needed. `agllm`, `aglog`, `agSandbox`, `agResourcePool`, and `agteam` each expose the same `change_config(agconfig)` method; `agteam.change_config` also propagates to every agent it has spawned so far.
 
 See `examples/dynamic_config_example.py` for this pattern end to end.
 
@@ -168,7 +164,7 @@ Anything passed to `update()`/the constructor outside that set raises `TypeError
 |---|---|
 | Set several fields on one owner in one call | `agConfig(agXXXConfig(field=value, ...))` |
 | Set fields on several owners at once | `agConfig(agXXXConfig(...), agYYYConfig(...))` |
-| Change an LLM param, timeout, or similar mid-run | `ag.llm._agconfig.owner.field = value` (target the specific object's own `agconfig`, not `cfg`/`ag.agconfig`) — works immediately if it's Dynamic (most fields are) |
+| Change an LLM param, timeout, or similar mid-run | `ag.change_config(new_cfg)` — works immediately if it's Dynamic (most fields are) |
 | Change a sandbox mount/image after the first sandbox exists | `cfg.clone()`, apply the change to the clone, tear down and let the next `run()` recreate the sandbox from the clone |
 | Set a process-wide tunable (a worker-pool size, ...) | Do it once, early, before constructing anything that might read it |
 | Add a tunable for my own tool/team | Define a `_AgXXXFields` class + a matching `agXXXConfig(_AgConfigViewBase)` with a unique `_OWNER` string, same as any framework owner |

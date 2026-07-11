@@ -254,7 +254,7 @@ Each source contributes its data; a later source's field wins over an earlier on
 - anything with an `.agconfig` property — every `agXXXConfig(...)` view qualifies automatically, with no special-casing needed beyond `hasattr(src, "agconfig")`;
 - `None` — skipped, so optional views can be threaded through without an `if` at the call site.
 
-This constructor is *always* how an `agConfig` should be built, whether from one view or several — see "The canonical form" in [`Design_configuration.md`](Design_configuration.md) for why `agConfig(agXXXConfig(...))` is preferred over `agXXXConfig(...).agconfig` even for a single owner.
+This constructor is *always* how an `agConfig` should be built, whether from one view or several — see "The canonical form" in [`Design_configuration.md`](Design_configuration.md).
 
 Merging copies each owner's field dict with `.update(...)` — a shallow copy per owner, not a deep copy of every value. Two `agConfig`s built by merging the same source therefore share any mutable field **value** (e.g. `agSandboxConfig`'s `mounts` dict) until one of them calls `.set(...)` on it, which replaces that owner's dict entry outright rather than mutating it in place — see `agSandboxConfig.add_mount()`'s `{**current, name: (...)}` pattern. In practice this means merging never aliases in a way that lets one merged `agConfig`'s later `.set()` calls leak into another's.
 
