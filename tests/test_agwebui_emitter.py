@@ -126,6 +126,50 @@ def test_emit_thread_safe(tmp_path):
     assert {e["i"] for e in events} == set(range(N))
 
 
+def test_emit_survives_external_write_lock_longer_than_default_timeout(tmp_path):
+    """Regression test: sqlite3.connect()'s default busy_timeout is only 5s.
+    Under heavy load, _run_prune()'s DELETE (which deliberately runs outside
+    self._lock so it never blocks emit() callers) can hold the write lock
+    longer than that over a large events table. emit()'s connection must use
+    a longer timeout (matching _run_prune()'s own) so it waits out a lock
+    held for, say, 7 seconds instead of failing with "database is locked"
+    and silently dropping the event."""
+    em = agwebui_emitter(tmp_path)
+
+    released_at = [None]
+    lock_taken = threading.Event()
+    HOLD_S = 7  # longer than sqlite3.connect()'s default 5s timeout
+
+    def _hold_lock_then_release():
+        # The blocker connection must be created and used entirely within
+        # this thread -- sqlite3 forbids using a connection from a different
+        # thread than the one that created it.
+        blocker = sqlite3.connect(str(tmp_path / "ui_events.db"))
+        blocker.execute("BEGIN IMMEDIATE")  # takes the write lock without committing
+        lock_taken.set()
+        time.sleep(HOLD_S)
+        released_at[0] = time.time()
+        blocker.commit()
+        blocker.close()
+
+    releaser = threading.Thread(target=_hold_lock_then_release)
+    releaser.start()
+    lock_taken.wait(timeout=5)
+    try:
+        em.emit({"type": "t", "i": 1})  # must not raise, must wait out the lock
+        emitted_at = time.time()
+    finally:
+        releaser.join()
+
+    assert released_at[0] is not None
+    assert emitted_at >= released_at[0] - 0.05, (
+        "emit() returned before the competing lock was released -- "
+        "it should have waited, not failed fast"
+    )
+    events = read_events(tmp_path)
+    assert len(events) == 1
+
+
 def test_emit_non_serialisable_uses_str(tmp_path):
     em = agwebui_emitter(tmp_path)
     em.emit({"type": "x", "val": object()})  # default=str handles it

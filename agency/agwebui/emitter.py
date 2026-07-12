@@ -92,7 +92,7 @@ class agwebui_emitter:
     _PRUNE_BUCKET_S: float = 60.0  # seconds
 
     def _init_db(self) -> None:
-        con = sqlite3.connect(str(self._db_path))
+        con = sqlite3.connect(str(self._db_path), timeout=30)
         con.executescript("""
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
@@ -130,7 +130,15 @@ class agwebui_emitter:
         etype = event.get("type", "")
         agname = event.get("agname")
         with self._lock:
-            con = sqlite3.connect(str(self._db_path))
+            # sqlite3.connect()'s default busy_timeout is only 5s. Under heavy
+            # load, _run_prune()'s DELETE (which deliberately runs outside
+            # self._lock so it never blocks emit() callers) can hold the
+            # write lock longer than that over a large events table, making
+            # this connect()/execute() raise "database is locked" instead of
+            # waiting it out -- silently dropping the event (caught and only
+            # logged as a warning by callers like agent._push_live_messages).
+            # Match _run_prune()'s own generous timeout below.
+            con = sqlite3.connect(str(self._db_path), timeout=30)
             con.execute(
                 "INSERT INTO events(type, agname, ts, data) VALUES(?,?,?,?)",
                 (etype, agname, ts, data),

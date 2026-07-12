@@ -2077,8 +2077,17 @@ def test_run_does_not_mutate_callers_shared_input_object():
     caller passed in -- prepare_inputs_in_sandbox()'s offload rewrite must
     land on a private copy, not the caller's own object."""
     from agency.agschema import agSchemaConfig
+    from agency.agsandbox_backend import agSandboxBackendConfig
 
-    cfg = agConfig(agSchemaConfig(input_offload_chars=10), {"agllm_backend": LLM_CONFIG})
+    # Force the docker sandbox backend: agsandbox_backend's "auto" selection
+    # prefers podman over docker when both are usable, but CI's
+    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
+    # podman has no local image and would try (and fail) to pull one.
+    cfg = agConfig(
+        agSchemaConfig(input_offload_chars=10),
+        agSandboxBackendConfig(backend="docker"),
+        {"agllm_backend": LLM_CONFIG},
+    )
     s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
 
     def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
@@ -2109,8 +2118,17 @@ def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
     ClassificationTeam.run() pattern) must each read back their own
     offloaded file, not race on the shared object's mutation."""
     from agency.agschema import agSchemaConfig
+    from agency.agsandbox_backend import agSandboxBackendConfig
 
-    cfg = agConfig(agSchemaConfig(input_offload_chars=10), {"agllm_backend": LLM_CONFIG})
+    # Force the docker sandbox backend: agsandbox_backend's "auto" selection
+    # prefers podman over docker when both are usable, but CI's
+    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
+    # podman has no local image and would try (and fail) to pull one.
+    cfg = agConfig(
+        agSchemaConfig(input_offload_chars=10),
+        agSandboxBackendConfig(backend="docker"),
+        {"agllm_backend": LLM_CONFIG},
+    )
     s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
 
     def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
