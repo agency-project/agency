@@ -479,7 +479,7 @@ class TestRunIsolation:
         script = (
             "from agency.agsandbox import agSandbox; "
             "sb = agSandbox('DataGen_0000'); "
-            "print(sb._lifecycle_tag())"
+            "print(sb._backend._lifecycle_tag())"
         )
         r1 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
         r2 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)

@@ -33,6 +33,7 @@ from agency.agllm_backend import (
     _AnthropicBedrockBackend,
 )
 from agency.agsandbox import _AgSandboxFields, agSandboxConfig
+from agency.agsandbox_backend import AgSandboxBackendFields
 from agency.agllm import _AgLLMFields, agLLMConfig
 from agency.agtool import _AgToolFields, agToolConfig
 from agency.agresources import _AgResourcePoolFields, agResourcePoolConfig
@@ -1039,7 +1040,7 @@ class TestStaticFieldAcrossOwners:
 _GLOBAL_OWNER_CASES = [
     (_AgLLMFields, "agllm", "call_max_concurrency"),
     (_AgToolFields, "agtool", "pool_max_workers"),
-    (_AgSandboxFields, "agSandbox", "docker_semaphore_limit"),
+    (AgSandboxBackendFields, "agsandbox_backend", "docker_semaphore_limit"),
     (_AgResourcePoolFields, "agResourcePool", "memory_detect_fallback_mb"),
     (_AgUtilFields, "agutil", "idle_check_interval_s"),
     (AgLLMBackendFields, "agllm_backend", "default_max_tokens"),

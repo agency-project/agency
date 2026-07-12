@@ -146,7 +146,7 @@ See [`examples/README.md`](examples/README.md) for more details on each example.
 
 ## Core concepts
 
-**`agent`** — a pure state container: holds an LLM config, sandboxed tools, conversation context (`agcontext`), and a name. It does not own an execution loop. `agent.run(skill, input)` is a thin dispatch call; the scheduling wrapper is `agskill.run()`, which spawns a daemon thread, and the ReAct loop is `agskill.execute_react()`. Each `run()` call is non-blocking and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the context and copies the parent's checkpoint image via `docker tag`; the fork's container is created lazily on its first `run()`.
+**`agent`** — a pure state container: holds an LLM config, sandboxed tools, conversation context (`agcontext`), and a name. It does not own an execution loop. `agent.run(skill, input)` is a thin dispatch call; the scheduling wrapper is `agskill.run()`, which spawns a daemon thread, and the ReAct loop is `agskill.execute_react()`. Each `run()` call is non-blocking and returns a pending `agdata` that resolves lazily. Sequential calls on the same agent are automatically serialised through the history chain. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` deep-copies the context and copies the parent's checkpoint image (via `docker tag`, or a directory copy for a chroot-backed sandbox — see [agsandbox.md](docs/agsandbox.md)); the fork's container/jail is created lazily on its first `run()`.
 
 **`agskill`** — a named skill with its own system prompt, optional input/output schemas, and an optional tool list. `agskill.run()` is a non-blocking scheduling wrapper: it spawns a daemon thread and returns a pending `agdata` immediately. The actual synchronous ReAct loop is `agskill.execute_react()`. The LLM calls tools, inspects results, and iterates until it has registered all required output fields. Output is collected via per-field tools (`return_summary`, `return_score`, etc.) generated dynamically from the output schema — each with a typed `value` parameter — rather than a single JSON blob. Each field is validated immediately on registration; missing fields trigger a targeted reprompt.
 
@@ -207,7 +207,7 @@ Runs the same checks as the `pre-commit` git hook and the CI `pre-commit` job: `
 | [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, `agimage` (multimodal), `agrawstring` (raw bypass), custom subclasses |
 | [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
 | [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
-| [agsandbox.md](docs/agsandbox.md) | Sandbox lifecycle, GPU access, exec wrapper, PID tracking |
+| [agsandbox.md](docs/agsandbox.md) | Backend selection (docker/podman/chroot), sandbox lifecycle, GPU access, exec wrapper, PID tracking |
 | [agresources.md](docs/agresources.md) | GPU/CPU/memory resource pool |
 | [aglog.md](docs/aglog.md) | Structured JSONL log — skills, tools, lifecycle, compaction |
 | [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, webui routing |
