@@ -223,6 +223,16 @@ const $countFinished    = document.getElementById('count-finished');
 const $agentSearch      = document.getElementById('agent-search');
 const $globalTokens     = document.getElementById('global-tokens');
 const $resourceStats    = document.getElementById('resource-stats');
+const $btnPauseToggle   = document.getElementById('btn-pause-toggle');
+const $btnPauseAll      = document.getElementById('btn-pause-all');
+const $btnResumeAll     = document.getElementById('btn-resume-all');
+const $btnUpdateConfig  = document.getElementById('btn-update-config');
+const $configOverlay    = document.getElementById('config-modal-overlay');
+const $configTitle      = document.getElementById('config-modal-title');
+const $configBody       = document.getElementById('config-modal-body');
+const $configCancel     = document.getElementById('config-cancel');
+const $configUpdate     = document.getElementById('config-update');
+const $configUpdateAll  = document.getElementById('config-update-all');
 
 function updateResourceBadge() {
   const r = state.resources;
@@ -314,8 +324,8 @@ function appendLog(line) {
 // Agent list (right panel)
 // ---------------------------------------------------------------------------
 
-function isLive(st)      { return st !== 'inactive' && st !== 'finished' && st !== 'skill'; }
-function isIdle(st)      { return st === 'inactive'; }
+function isLive(st)      { return st !== 'inactive' && st !== 'finished' && st !== 'skill' && st !== 'paused'; }
+function isIdle(st)      { return st === 'inactive' || st === 'paused'; }
 function isFinished(st)  { return st === 'finished'; }
 
 function tabVisible(st) {
@@ -383,6 +393,24 @@ function renderAgentList() {
   }
 
   $agentList.innerHTML = frags.join('');
+  updateAgentActionsBar();
+}
+
+function updateAgentActionsBar() {
+  const agname = currentAgent();
+  if (!agname) {
+    $btnPauseToggle.disabled = true;
+    $btnPauseToggle.textContent = 'Pause';
+    $btnPauseToggle.classList.remove('active');
+    $btnUpdateConfig.disabled = true;
+    return;
+  }
+  const ag = state.agents.get(agname);
+  const paused = ag ? ag.state === 'paused' : false;
+  $btnPauseToggle.disabled = false;
+  $btnPauseToggle.textContent = paused ? 'Resume' : 'Pause';
+  $btnPauseToggle.classList.toggle('active', paused);
+  $btnUpdateConfig.disabled = false;
 }
 
 function renderAgentEntry(agname, ag, indent, isFocused) {
@@ -394,6 +422,9 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
   if (st === 'finished') {
     dot = `<span class="dot-finished">✓</span>`;
     statusHtml = `<span class="status-finished">finished</span>`;
+  } else if (st === 'paused') {
+    dot = `<span class="dot-paused">⏸</span>`;
+    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-paused">paused</span>`;
   } else if (st === 'inactive') {
     dot = `<span class="dot-inactive">○</span>`;
     statusHtml = `<span class="dim">idle</span>`;
@@ -520,8 +551,9 @@ function renderHistory() {
     else if (st === 'tool')      label = `Tool Running: ${ag.tool || ''}…`;
     else if (st === 'proc_wait') label = 'Waiting for processes…';
     else if (st === 'human')     label = 'Input Pending…';
+    else if (st === 'paused')    label = 'Paused';
     else                         label = 'Running…';
-    frags.push(`<div class="msg-running">▶ ${esc(label)}</div>`);
+    frags.push(`<div class="msg-running${st === 'paused' ? ' msg-paused' : ''}">▶ ${esc(label)}</div>`);
   }
 
   // Pending ask_human question
@@ -554,7 +586,7 @@ function handleEvent(ev) {
       if (!state.agents.has(ev.agname)) {
         state.agents.set(ev.agname, {
           color: ev.color || '#d4d4d4',
-          state: 'inactive', skill: null, tool: null,
+          state: 'inactive', skill: null, tool: null, config: {},
         });
         state.agentOrder.push(ev.agname);
       }
@@ -565,6 +597,13 @@ function handleEvent(ev) {
       }
       renderAgentList();
       break;
+
+    case 'agent_config': {
+      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4', state: 'inactive', skill: null, tool: null };
+      state.agents.set(ev.agname, { ...existing, config: ev.config || {} });
+      if (!state.agentOrder.includes(ev.agname)) state.agentOrder.push(ev.agname);
+      break;
+    }
 
     case 'agent_state': {
       const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
@@ -739,6 +778,117 @@ $agentList.addEventListener('click', e => {
     renderAgentList();
     renderHistory();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Pause / resume actions
+// ---------------------------------------------------------------------------
+
+$btnPauseToggle.addEventListener('click', () => {
+  const agname = currentAgent();
+  if (!agname) return;
+  const ag = state.agents.get(agname);
+  const type = (ag && ag.state === 'paused') ? 'resume' : 'pause';
+  ws.send(JSON.stringify({ type, agname }));
+});
+
+$btnPauseAll.addEventListener('click', () => {
+  ws.send(JSON.stringify({ type: 'pause_all' }));
+});
+
+$btnResumeAll.addEventListener('click', () => {
+  ws.send(JSON.stringify({ type: 'resume_all' }));
+});
+
+// ---------------------------------------------------------------------------
+// Config editor modal
+// ---------------------------------------------------------------------------
+
+function renderConfigField(owner, field, value) {
+  const inputId = `cfgfield__${owner}__${field}`;
+  const attrs = `id="${inputId}" data-owner="${esc(owner)}" data-field="${esc(field)}"`;
+  let inputHtml;
+  if (typeof value === 'boolean') {
+    inputHtml = `<input type="checkbox" ${attrs} data-kind="bool" ${value ? 'checked' : ''}>`;
+  } else if (typeof value === 'number') {
+    inputHtml = `<input type="number" step="any" ${attrs} data-kind="number" value="${esc(String(value))}">`;
+  } else if (value === null || typeof value === 'string') {
+    inputHtml = `<input type="text" ${attrs} data-kind="nullable_string" value="${esc(value ?? '')}">`;
+  } else {
+    inputHtml = `<textarea ${attrs} data-kind="json" rows="2">${esc(JSON.stringify(value))}</textarea>`;
+  }
+  return `<div class="config-field">
+    <label for="${inputId}">${esc(field)}</label>
+    ${inputHtml}
+  </div>`;
+}
+
+function openConfigModal(agname) {
+  const ag = state.agents.get(agname);
+  const config = (ag && ag.config) || {};
+  $configTitle.textContent = `Config — ${agname}`;
+
+  const owners = Object.keys(config).sort();
+  const frags = [];
+  for (const owner of owners) {
+    frags.push(`<div class="config-owner">${esc(owner)}</div>`);
+    const fields = config[owner];
+    for (const field of Object.keys(fields).sort()) {
+      frags.push(renderConfigField(owner, field, fields[field]));
+    }
+  }
+  $configBody.innerHTML = frags.join('') || '<div class="dim">No editable config fields.</div>';
+  $configOverlay.dataset.agname = agname;
+  $configOverlay.classList.remove('hidden');
+}
+
+function closeConfigModal() {
+  $configOverlay.classList.add('hidden');
+  delete $configOverlay.dataset.agname;
+}
+
+function collectConfigEdits() {
+  const result = {};
+  $configBody.querySelectorAll('[data-owner]').forEach(el => {
+    const { owner, field, kind } = el.dataset;
+    let value;
+    if      (kind === 'bool')            value = el.checked;
+    else if (kind === 'number')          value = Number(el.value);
+    else if (kind === 'nullable_string') value = el.value === '' ? null : el.value;
+    else /* json */ {
+      try { value = JSON.parse(el.value); }
+      catch (e) { throw new Error(`Invalid JSON for ${owner}.${field}: ${e.message}`); }
+    }
+    (result[owner] = result[owner] || {})[field] = value;
+  });
+  return result;
+}
+
+$btnUpdateConfig.addEventListener('click', () => {
+  const agname = currentAgent();
+  if (agname) openConfigModal(agname);
+});
+
+$configCancel.addEventListener('click', closeConfigModal);
+
+$configOverlay.addEventListener('click', e => {
+  if (e.target === $configOverlay) closeConfigModal();
+});
+
+$configUpdate.addEventListener('click', () => {
+  const agname = $configOverlay.dataset.agname;
+  if (!agname) return;
+  let config;
+  try { config = collectConfigEdits(); } catch (e) { alert(e.message); return; }
+  ws.send(JSON.stringify({ type: 'update_config', agname, config }));
+  closeConfigModal();
+});
+
+$configUpdateAll.addEventListener('click', () => {
+  let config;
+  try { config = collectConfigEdits(); } catch (e) { alert(e.message); return; }
+  ws.send(JSON.stringify({ type: 'update_config_all', config }));
+  closeConfigModal();
 });
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,8 @@ from __future__ import annotations
 import copy
 from typing import TYPE_CHECKING
 
+from . import agpause
+
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
@@ -45,7 +47,8 @@ class agcontext:
         """Block until the pending future resolves and merge its state into self."""
         if self._future is None:
             return
-        prev_ctx = self._future.result()
+        with agpause.note_blocked_on(agpause.producer_of(self._future)):
+            prev_ctx = self._future.result()
         self.messages            = prev_ctx.messages
         self.total_input_tokens  = prev_ctx.total_input_tokens
         self.total_output_tokens = prev_ctx.total_output_tokens

@@ -17,8 +17,10 @@ Usage::
 from __future__ import annotations
 
 import atexit
+import json
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime
@@ -29,6 +31,109 @@ from .emitter import agwebui_emitter
 
 # Module-level singleton — set while agwebui.run() is active.
 _active: "agwebui | None" = None
+
+
+def _merge_config_fields(agconfig: Any, config: dict) -> None:
+    """Mutate *agconfig*'s own data in place, field by field, rather than
+    replacing it with a new object. agConfig.clone() (called by every
+    agent()/agteam() construction) just snapshots whatever is currently in
+    .data -- so anything that hasn't cloned this exact object yet will pick
+    up the change on its next construction, with no cooperation needed from
+    whatever code holds another reference to it (e.g. a user script's own
+    module-level config variable)."""
+    for owner, fields in config.items():
+        for name, value in fields.items():
+            agconfig.set(owner, name, value)
+
+
+def _all_agteam_subclasses(cls):
+    """Every agteam subclass currently defined, at any depth -- found via
+    Python's own subclass tracking (__subclasses__()), not a framework
+    registry. This is how a team class's own agconfig class attribute (e.g.
+    `agconfig = LLM_CONFIG` in a user script) gets reached without the
+    framework needing to know that attribute, or the script, exists."""
+    for sub in cls.__subclasses__():
+        yield sub
+        yield from _all_agteam_subclasses(sub)
+
+
+def _dispatch_command(cmd: dict) -> None:
+    """Apply one pause/resume command written by the webui server process.
+
+    Mirrors the ask_human file-drop pattern (agwebui/emitter.py's
+    _reply_dir), but in the opposite direction: the (isolated, no-agency-
+    imports) server process can only write a plain file describing what it
+    wants; this side -- running inside the execution process, with real
+    agent objects -- is what actually applies it."""
+    from ..agent import agent as _agent_cls
+    from ..agconfig import agConfig as _agConfig_cls
+
+    ctype  = cmd.get("type")
+    agname = cmd.get("agname")
+    if ctype in ("pause", "resume"):
+        for a in _agent_cls.all():
+            if a.agname == agname:
+                (a.pause if ctype == "pause" else a.resume)()
+                break
+    elif ctype in ("pause_all", "resume_all"):
+        for a in _agent_cls.all():
+            (a.pause if ctype == "pause_all" else a.resume)()
+    elif ctype == "update_config":
+        new_cfg = _agConfig_cls(cmd.get("config") or {})
+        for a in _agent_cls.all():
+            if a.agname == agname:
+                a.change_config(new_cfg)
+                break
+    elif ctype == "update_config_all":
+        from ..agteam import agteam as _agteam_cls
+        config  = cmd.get("config") or {}
+        new_cfg = _agConfig_cls(config)
+
+        # 1. Agents that already exist -- each already cloned its own
+        #    agconfig at construction time, so it needs a direct push.
+        for a in _agent_cls.all():
+            a.change_config(new_cfg)
+
+        # 2. Team instances that already exist -- change_config() replaces
+        #    the team's own live agconfig *and* cascades to every agent it
+        #    tracks, covering agents added to this team from here on.
+        for t in _agteam_cls.all():
+            t.change_config(new_cfg)
+
+        # 3. Every agteam subclass's class-level agconfig, mutated in place
+        #    (not replaced) -- so a team constructed *after* this point,
+        #    whose __init__ clones type(self).agconfig fresh, sees the
+        #    update. Reaches a user script's own shared config object (e.g.
+        #    `agconfig = LLM_CONFIG`) without needing to know it exists.
+        for team_cls in _all_agteam_subclasses(_agteam_cls):
+            if team_cls.agconfig is not None:
+                _merge_config_fields(team_cls.agconfig, config)
+
+        # 4. The framework-wide fallback for a bare agent() call made with
+        #    no active team context.
+        if _agent_cls.default_agconfig is not None:
+            _merge_config_fields(_agent_cls.default_agconfig, config)
+
+
+def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
+    command_dir.mkdir(parents=True, exist_ok=True)
+    while not stop_event.is_set():
+        for f in sorted(command_dir.glob("*.json")):
+            try:
+                cmd = json.loads(f.read_text(encoding="utf-8"))
+                _dispatch_command(cmd)
+            except Exception as _e:
+                print(f"[agwebui] WARNING: failed to apply command {f.name}: {_e}")
+            finally:
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    # Command file may already be removed by another actor;
+                    # this cleanup is best-effort.
+                    pass
+                except Exception as _e:
+                    print(f"[agwebui] WARNING: failed to remove command file {f.name}: {_e}")
+        stop_event.wait(0.2)
 
 
 class agwebui:
@@ -128,12 +233,23 @@ class agwebui:
 
         atexit.register(_kill_server)
 
+        # Background thread applying pause/resume (and future) commands the
+        # webui server process writes to run_dir/ui_commands -- the server
+        # process itself has no agency imports and can't call agent.pause()
+        # directly, so this is the execution-process side of that relay.
+        command_stop = threading.Event()
+        threading.Thread(
+            target=_poll_commands, args=(run_dir / "ui_commands", command_stop),
+            daemon=True, name="agwebui-commands",
+        ).start()
+
         try:
             fn(*args, **kwargs)
         except Exception:
             import traceback
             traceback.print_exc()
         finally:
+            command_stop.set()
             ui.emitter.done()
             _active = None
 

@@ -30,9 +30,9 @@ def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) ->
             return None
 
         a = _find_agent()
-        prev_state = dict(a._ui_state) if a else {}
+        prev_state, prev_skill, prev_tool = a._state.snapshot() if a else (None, None, None)
         if a:
-            a._set_ui_state("human", skill=prev_state.get("skill"))
+            a._set_ui_state("human", skill=prev_skill)
 
         from .. import agwebui as _agwebui
         if _agwebui._active is not None:
@@ -59,11 +59,7 @@ def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) ->
             # timeout_s=None blocks forever — Empty is never raised
 
         if a:
-            a._set_ui_state(
-                prev_state.get("state", "skill"),
-                skill=prev_state.get("skill"),
-                tool=prev_state.get("tool"),
-            )
+            a._set_ui_state(prev_state or "skill", skill=prev_skill, tool=prev_tool)
         return agdata(reply=reply)
 
     return agtool(

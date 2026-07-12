@@ -127,6 +127,32 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   padding: 4px 6px;
 }
 
+#agent-actions {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+#agent-actions button {
+  flex: 1;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  padding: 3px 6px;
+  font-family: var(--font);
+  font-size: var(--fs);
+  border-radius: 2px;
+}
+#agent-actions button:hover:not(:disabled) { border-color: var(--border-log); color: var(--cyan); }
+#agent-actions button:disabled { color: var(--dim); cursor: default; opacity: 0.5; }
+
+#btn-pause-toggle.active { border-color: var(--red); color: var(--red); }
+#btn-pause-toggle.active:hover { border-color: var(--red); color: var(--red); }
+
 /* --------------------------------------------------------- Panel titles */
 
 .panel-title {
@@ -226,10 +252,12 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 .dot-inactive  { color: var(--dim); }
 .dot-finished  { color: var(--green); opacity: 0.6; }
+.dot-paused    { color: var(--red); }
 .status-llm    { color: var(--cyan); }
 .status-tool   { color: var(--yellow); }
 .status-human  { color: var(--yellow); }
 .status-finished { color: var(--green); opacity: 0.6; }
+.status-paused { color: var(--red); }
 
 /* ------------------------------------------------------------ Tabs */
 
@@ -293,6 +321,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .msg-assistant  { margin: 3px 0; }
 .msg-tool-result{ color: var(--dim); margin: 2px 0; }
 .msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
+.msg-paused     { color: var(--red); }
 .msg-ask        { color: var(--yellow); margin: 4px 0; border-left: 3px solid var(--yellow); padding-left: 6px; }
 .msg-event      { color: var(--dim); font-size: 11px; margin: 4px 0 1px; }
 .msg-error      { color: var(--red);    margin: 3px 0; border-left: 3px solid var(--red); padding-left: 6px; }
@@ -356,3 +385,101 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 ::-webkit-scrollbar-track        { background: var(--bg); }
 ::-webkit-scrollbar-thumb        { background: #444; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover  { background: #666; }
+
+/* --------------------------------------------------------- Config modal */
+
+.hidden { display: none !important; }
+
+#config-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+#config-modal {
+  width: 480px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+#config-modal-title {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+#config-modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+
+.config-owner {
+  color: var(--cyan);
+  font-weight: bold;
+  font-size: 11px;
+  text-transform: uppercase;
+  margin: 10px 0 4px;
+}
+.config-owner:first-child { margin-top: 0; }
+
+.config-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.config-field label {
+  flex: 1;
+  color: var(--dim);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.config-field input[type="text"],
+.config-field input[type="number"],
+.config-field textarea {
+  flex: 1.4;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--fs);
+  padding: 2px 5px;
+  border-radius: 2px;
+}
+.config-field textarea { resize: vertical; }
+.config-field input[type="text"]:focus,
+.config-field input[type="number"]:focus,
+.config-field textarea:focus { border-color: var(--border-interact); outline: none; }
+
+#config-modal-actions {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+#config-modal-actions button {
+  flex: 1;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 6px;
+  font-family: var(--font);
+  font-size: var(--fs);
+  border-radius: 2px;
+}
+#config-modal-actions button:hover { border-color: var(--border-log); color: var(--cyan); }
+#config-update, #config-update-all { border-color: var(--green); color: var(--green); }
+#config-update:hover, #config-update-all:hover { border-color: var(--green); color: var(--green); }

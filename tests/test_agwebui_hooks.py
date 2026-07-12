@@ -93,9 +93,11 @@ def test_agterm_log_does_not_write_to_stderr(active_webui, capsys):
 def test_agent_set_ui_state_emits_event(active_webui):
     from agency.agent import agent
 
+    from agency.agent import agent_state
+
     ag = agent.__new__(agent)
     ag.agname = "__test_state_agent__"
-    ag._ui_state = {}
+    ag._state = agent_state(ag.agname)
 
     ag._set_ui_state("llm", skill="design", tool=None)
 
@@ -109,9 +111,11 @@ def test_agent_set_ui_state_emits_event(active_webui):
 def test_agent_set_ui_state_inactive(active_webui):
     from agency.agent import agent
 
+    from agency.agent import agent_state
+
     ag = agent.__new__(agent)
     ag.agname = "__test_inactive_agent__"
-    ag._ui_state = {}
+    ag._state = agent_state(ag.agname)
     ag._set_ui_state("inactive")
 
     states = _events_of(active_webui, "agent_state")
@@ -149,6 +153,254 @@ def test_agent_push_live_messages_updates_snapshot(active_webui):
     msgs = [{"role": "system", "content": "sys prompt"}]
     ag._push_live_messages(msgs)
     assert ag._snapshot_messages == msgs
+
+
+# ---------------------------------------------------------------------------
+# agent._emit_config — pushes dynamic_snapshot() to the webui
+# ---------------------------------------------------------------------------
+
+def test_agent_construction_emits_config(active_webui):
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+
+    ag = agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}, "agskill": {"react_max_steps": 3}}))
+
+    configs = _events_of(active_webui, "agent_config")
+    ev = next((e for e in configs if e["agname"] == ag.agname), None)
+    assert ev is not None
+    assert ev["config"]["agskill"]["react_max_steps"] == 3
+
+
+def test_change_config_re_emits_config(active_webui):
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+
+    ag = agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}}))
+    ag.change_config(agConfig({"agskill": {"react_max_steps": 42}}))
+
+    configs = [e for e in _events_of(active_webui, "agent_config") if e["agname"] == ag.agname]
+    assert configs[-1]["config"]["agskill"]["react_max_steps"] == 42
+
+
+# ---------------------------------------------------------------------------
+# agwebui command dispatch — pause/resume/pause_all/resume_all
+# ---------------------------------------------------------------------------
+
+def _make_agent():
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+    return agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}}))
+
+
+def test_dispatch_pause_command_pauses_named_agent():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    _dispatch_command({"type": "pause", "agname": ag.agname})
+    assert not ag._state.run_allowed.is_set()
+
+
+def test_dispatch_resume_command_resumes_named_agent():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    ag.pause()
+    _dispatch_command({"type": "resume", "agname": ag.agname})
+    assert ag._state.run_allowed.is_set()
+
+
+def test_dispatch_pause_command_ignores_unknown_agname():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    _dispatch_command({"type": "pause", "agname": "__no_such_agent__"})
+    assert ag._state.run_allowed.is_set()  # untouched
+
+
+def test_dispatch_pause_all_pauses_every_live_agent():
+    from agency.agwebui import _dispatch_command
+    a, b = _make_agent(), _make_agent()
+    _dispatch_command({"type": "pause_all"})
+    assert not a._state.run_allowed.is_set()
+    assert not b._state.run_allowed.is_set()
+
+
+def test_dispatch_resume_all_resumes_every_live_agent():
+    from agency.agwebui import _dispatch_command
+    a, b = _make_agent(), _make_agent()
+    a.pause()
+    b.pause()
+    _dispatch_command({"type": "resume_all"})
+    assert a._state.run_allowed.is_set()
+    assert b._state.run_allowed.is_set()
+
+
+def test_dispatch_update_config_applies_to_named_agent():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    _dispatch_command({
+        "type": "update_config", "agname": ag.agname,
+        "config": {"agskill": {"react_max_steps": 7}},
+    })
+    assert ag.agconfig.get("agskill", "react_max_steps") == 7
+
+
+def test_dispatch_update_config_ignores_unknown_agname():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    before = ag.agconfig.get("agskill", "react_max_steps")
+    _dispatch_command({
+        "type": "update_config", "agname": "__no_such_agent__",
+        "config": {"agskill": {"react_max_steps": 999}},
+    })
+    assert ag.agconfig.get("agskill", "react_max_steps") == before
+
+
+def test_dispatch_update_config_all_applies_to_every_agent():
+    from agency.agwebui import _dispatch_command
+    a, b = _make_agent(), _make_agent()
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 11}},
+    })
+    assert a.agconfig.get("agskill", "react_max_steps") == 11
+    assert b.agconfig.get("agskill", "react_max_steps") == 11
+
+
+def test_dispatch_update_config_all_mutates_default_agconfig():
+    """A bare agent() with no team context falls back to agent.default_agconfig
+    -- update_config_all must mutate it in place so a future such agent
+    clones fresh data, not just push into agents that already exist."""
+    from agency.agwebui import _dispatch_command
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+
+    saved = agent.default_agconfig
+    try:
+        agent.default_agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        _dispatch_command({
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 123}},
+        })
+        assert agent.default_agconfig.get("agskill", "react_max_steps") == 123
+    finally:
+        agent.default_agconfig = saved
+
+
+def test_dispatch_update_config_all_mutates_team_class_attr_for_future_construction():
+    """A team class's own agconfig class attribute (e.g. a user script's
+    `agconfig = LLM_CONFIG`) must be reached via __subclasses__() and mutated
+    in place, so a team constructed AFTER the update clones fresh data --
+    not just teams/agents that already exist."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+    from agency.agconfig import agConfig
+
+    class _CfgAllTeamA(agteam):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self): pass
+        def run(self): pass
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 77}},
+    })
+    assert _CfgAllTeamA.agconfig.get("agskill", "react_max_steps") == 77
+
+    # Constructed AFTER the update -- clones the now-updated class attribute.
+    team = _CfgAllTeamA()
+    assert team.agconfig.get("agskill", "react_max_steps") == 77
+
+
+def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents():
+    """A team instance that already exists (already cloned its own agconfig
+    at construction) must be reached directly, and that update must cascade
+    to every agent the team already tracks."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+    from agency.agconfig import agConfig
+    from agency.agent import agent as agent_cls
+
+    class _CfgAllTeamB(agteam):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self):
+            self.ag = agent_cls()
+        def run(self): pass
+
+    team = _CfgAllTeamB()  # constructed before the update -- already cloned
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 55}},
+    })
+
+    assert team.agconfig.get("agskill", "react_max_steps") == 55
+    assert team.ag.agconfig.get("agskill", "react_max_steps") == 55
+
+
+def test_dispatch_update_config_all_reaches_grandchild_team_class():
+    """_all_agteam_subclasses() must recurse -- a team class that subclasses
+    another team class (not agteam directly) still has to be reached, since
+    __subclasses__() alone only returns direct subclasses."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+    from agency.agconfig import agConfig
+
+    class _CfgAllTeamMid(agteam):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self): pass
+        def run(self): pass
+
+    class _CfgAllTeamGrandchild(_CfgAllTeamMid):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self): pass
+        def run(self): pass
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 88}},
+    })
+
+    assert _CfgAllTeamMid.agconfig.get("agskill", "react_max_steps") == 88
+    assert _CfgAllTeamGrandchild.agconfig.get("agskill", "react_max_steps") == 88
+
+
+def test_dispatch_update_config_all_skips_team_class_with_no_agconfig():
+    """A team subclass that never overrides agconfig (still None, inherited
+    from the agteam base) must be safely skipped -- not crash, and not
+    somehow acquire a config of its own."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+
+    class _CfgAllTeamNoConfig(agteam):
+        def setup(self): pass
+        def run(self): pass
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 99}},
+    })  # must not raise
+
+    assert _CfgAllTeamNoConfig.agconfig is None
+
+
+def test_poll_commands_applies_and_deletes_command_files(tmp_path):
+    from agency.agwebui import _poll_commands
+
+    ag = _make_agent()
+    cmd_dir = tmp_path / "ui_commands"
+    (cmd_dir).mkdir()
+    (cmd_dir / "c1.json").write_text(json.dumps({"type": "pause", "agname": ag.agname}))
+
+    stop = threading.Event()
+    t = threading.Thread(target=_poll_commands, args=(cmd_dir, stop), daemon=True)
+    t.start()
+    try:
+        deadline = time.time() + 2.0
+        while time.time() < deadline and ag._state.run_allowed.is_set():
+            time.sleep(0.02)
+        assert not ag._state.run_allowed.is_set()
+        assert not list(cmd_dir.glob("*.json"))  # consumed
+    finally:
+        stop.set()
+        t.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------

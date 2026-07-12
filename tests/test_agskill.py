@@ -8,7 +8,7 @@ from agency.agschema import agschema, _AgSchemaFields
 from agency.agskill import agskill
 from agency.agllm import _AgLLMFields, agllm
 from agency.agtool import agtool, _AgToolFields
-from agency.agent import agent as _agent_cls
+from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
 
 LLM_MAX_RETRIES    = _AgLLMFields.max_retries.default
 LLM_IDLE_TIMEOUT   = _AgLLMFields.idle_timeout.default
@@ -28,11 +28,13 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
         poll_interval_s = _poll
         agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
+        _check_pause = _agent_cls._check_pause
 
     ag = _MockAgent()
     ag.llm = llm or LLM
     ag.sandbox = sandbox if sandbox is not None else MagicMock()
     ag.terminal = MagicMock()
+    ag._state = _agent_state_cls("test")
     ag.log = MagicMock()
     ag.log.token_usage = {}
     ag.agname = "test"

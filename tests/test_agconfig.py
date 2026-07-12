@@ -122,6 +122,55 @@ def test_clone_carries_data_but_not_lock_history():
     assert cfg.get("owner", "field", "default") == "value"
 
 
+# ---------------------------------------------------------------------------
+# dynamic_snapshot() — the webui config editor's data source
+# ---------------------------------------------------------------------------
+
+def test_dynamic_snapshot_includes_dynamic_field_with_default():
+    cfg = agConfig()
+    snap = cfg.dynamic_snapshot()
+    assert snap["test_agconfig_a"]["tier3_field"] == "dynamic-default"
+
+
+def test_dynamic_snapshot_reflects_override():
+    cfg = agConfig({"test_agconfig_a": {"tier3_field": "overridden"}})
+    snap = cfg.dynamic_snapshot()
+    assert snap["test_agconfig_a"]["tier3_field"] == "overridden"
+
+
+def test_dynamic_snapshot_excludes_static_and_global_fields():
+    """Static fields cache per-instance at first read, and Global fields
+    always read agConfig.GLOBAL regardless of this agconfig -- editing either
+    through a later change_config() call has no observable effect, so
+    dynamic_snapshot() must not offer them as if they were live-editable."""
+    cfg = agConfig({"test_agconfig_a": {"tier2_field": "x", "tier1_lifecycle": 99}})
+    snap = cfg.dynamic_snapshot()
+    assert "tier2_field" not in snap.get("test_agconfig_a", {})
+    assert "tier1_lifecycle" not in snap.get("test_agconfig_a", {})
+
+
+def test_dynamic_snapshot_skips_non_json_safe_values():
+    cfg = agConfig({"test_agconfig_a": {"tier3_field": object()}})
+    snap = cfg.dynamic_snapshot()
+    assert "tier3_field" not in snap.get("test_agconfig_a", {})
+
+
+def test_dynamic_snapshot_keeps_json_safe_containers():
+    cfg = agConfig({"test_agconfig_a": {"tier3_field": {"a": [1, 2, "x"], "b": None}}})
+    snap = cfg.dynamic_snapshot()
+    assert snap["test_agconfig_a"]["tier3_field"] == {"a": [1, 2, "x"], "b": None}
+
+
+def test_dynamic_snapshot_two_owners_do_not_collide():
+    cfg = agConfig({
+        "test_agconfig_a": {"shared_name": "from-a"},
+        "test_agconfig_b": {"shared_name": "from-b"},
+    })
+    snap = cfg.dynamic_snapshot()
+    assert snap["test_agconfig_a"]["shared_name"] == "from-a"
+    assert snap["test_agconfig_b"]["shared_name"] == "from-b"
+
+
 def test_dict_based_init():
     cfg = agConfig({"owner": {"field": "value", "other": 1}})
     assert cfg.get("owner", "field") == "value"

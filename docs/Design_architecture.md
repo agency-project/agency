@@ -11,7 +11,7 @@ This inversion from the original design eliminates the circular import between a
 ## Module Dependency Order
 
 ```
-agdata / agtype / agutil / agcontext / agname
+agdata / agtype / agutil / agcontext / agname / agpause
         ↓
 agterm / aglog / agresources
         ↓
@@ -45,7 +45,7 @@ Holds all runtime state. No execution logic.
 | `log` | `aglog` | Persistent event log |
 | `agname` | `agname` | Unique allocated agent name |
 | `inbox` | `Queue[str]` | Mid-loop message injection from orchestrators |
-| `_ui_state` | `dict` | Current state pushed to webui |
+| `_state` | `agent_state` | Current display state (`.state`/`.skill`/`.tool`, pushed to webui) *and* the pause-synchronization source of truth (`.run_allowed`/`.paused_ack` Events, `.blocked_on`) — see `agent.md`'s "Pause and resume" |
 | `_full_history` | `list[dict]` | Append-only transcript of all messages |
 
 Methods on `agent` are limited to state manipulation and thin delegation:
@@ -53,7 +53,8 @@ Methods on `agent` are limited to state manipulation and thin delegation:
 - `fork(source)` → deep-copy an existing agent's state into a new instance
 - `_drain_inbox(messages)` — drain queued inbox messages into the conversation
 - `push_token_count_update_to_ui(...)` — push live token counts to webui
-- `_set_ui_state(...)`, `_push_live_messages(...)`, `_append_full_history(...)` — UI/log callbacks called by agskill
+- `_set_ui_state(...)`, `_push_live_messages(...)`, `_append_full_history(...)` — UI/log callbacks called by agskill; `_set_ui_state` is a thin wrapper around `self._state.update_state(...)`
+- `pause()`, `resume()`, `is_paused()`, `is_settled()`, `_check_pause()` — pause/resume coordination; see `agent.md` and `agency/agpause.py` (cross-agent wait/dependency tracking lives in `agpause.py`, not here)
 
 ### `agskill` — execution engine
 
@@ -123,6 +124,15 @@ Accumulates across skill calls. Fields:
 | `_future` | Set when this context is a pending placeholder |
 
 `resolve_prev_dependencies()` blocks until `_future` resolves, then merges the resolved context's state into `self` in-place — so any existing reference to this context object (e.g. `ag.ctx`) automatically sees the resolved state without needing reassignment.
+
+### `agpause` — cross-agent pause/dependency coordination
+
+A leaf module (no agency-internal imports) sitting alongside `agdata`/`agcontext` in the dependency order above — both of those, plus `agent` and `agskill`, import it. Owns:
+- A thread-local mapping the current OS thread to "the agent whose worker thread this is" (set for the lifetime of an `agskill._task()` run), and `tag_producer`/`producer_of` to associate a `concurrent.futures.Future` with the agent that will resolve it.
+- `note_blocked_on()` — a context manager wrapped around every blocking `future.result()` call in `agdata._resolve()` and `agcontext.resolve_prev_dependencies()`, so a cross-agent dependency wait shows up as an observable `agent._state.blocked_on` link rather than an opaque parked thread.
+- `wait_all_paused()` / `wait_all_resumed()` — barriers that recurse through `blocked_on` chains via `agent.is_settled()`, so waiting for a whole dependency graph to pause can't hang on an agent that will never reach its own checkpoint.
+
+`agent_state` itself (the `.state`/`.skill`/`.tool`/`.run_allowed`/`.paused_ack`/`.blocked_on` container, one instance per agent as `ag._state`) is defined in `agent.py`, not here — see the Ownership Map above and `agent.md`'s "Pause and resume" section for the full mechanism.
 
 ### `agschema` — skill I/O contracts
 

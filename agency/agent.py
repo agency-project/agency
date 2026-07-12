@@ -68,6 +68,101 @@ def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_defau
     return classvar_default if agconfig is None else agconfig.get("agent", name, classvar_default)
 
 
+# States that mean "this agent's worker thread will not make forward
+# progress until something external (a resume, or an upstream producer)
+# unblocks it". Used by agent.is_settled() -- the wait_all_* helpers in
+# agpause.py never check it directly, they call is_settled() on each agent.
+_SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
+
+
+class agent_state:
+    """Single owner of one agent's live status: the display fields a human or
+    the webui sees (state/skill/tool), the synchronization primitives pause
+    coordination needs (run_allowed/paused_ack/blocked_on), and the lock that
+    makes every transition atomic. One instance lives on agent._state.
+
+    Lives here rather than in agpause.py because it's the general-purpose
+    status container set on every skill run (every LLM call, every tool
+    dispatch) — pausing is just one consumer of it, via run_allowed/
+    paused_ack/blocked_on. agpause.py's coordination code (_BlockCtx,
+    wait_all_paused, ...) only ever touches these fields through plain
+    attribute access on an agent it's given, so it never needs to import
+    this class at all.
+
+    update_state() is the *only* way to change the display fields — no
+    caller ever takes the lock itself. That matters because a plain "set
+    these fields" swap is atomic under the GIL, but a read-then-conditionally
+    -write sequence is not: pause()'s "relabel to 'pausing' unless already
+    paused/blocked" check used to run outside any lock, so it could read a
+    stale "skill" state right before the worker thread's checkpoint wrote
+    "paused", then overwrite that "paused" back to "pausing" moments later.
+    Folding the guard condition into update_state() itself means the whole
+    check-and-set is one atomic operation, and no future caller can
+    reintroduce that race by forgetting to lock around its own check.
+    """
+
+    def __init__(self, agname: str) -> None:
+        self.agname = agname
+        self.state: str = "inactive"
+        self.skill: "str | None" = None
+        self.tool: "str | None" = None
+        # Set == allowed to run. Cleared by pause(), set by resume().
+        self.run_allowed = threading.Event()
+        self.run_allowed.set()
+        # Set the moment a worker thread actually blocks at a checkpoint —
+        # the real "pause took effect" acknowledgment. is_paused() reads
+        # this directly rather than the (cosmetic, racy) state string.
+        self.paused_ack = threading.Event()
+        # While this agent's worker thread is blocked resolving another
+        # agent's pending future, points at that upstream agent so
+        # is_settled() can recurse through the dependency chain.
+        self.blocked_on: "agent | None" = None
+        self._lock = threading.RLock()
+
+    def snapshot(self) -> "tuple[str, str | None, str | None]":
+        """Atomically read (state, skill, tool) together — reading the three
+        fields one at a time would let a concurrent update_state() call
+        interleave between them and hand back a mismatched combination."""
+        with self._lock:
+            return self.state, self.skill, self.tool
+
+    def update_state(
+        self,
+        new_state: str,
+        skill: "str | None" = None,
+        tool: "str | None" = None,
+        *,
+        unless_in: "tuple[str, ...]" = (),
+    ) -> bool:
+        """Atomically apply (new_state, skill, tool) unless the current state
+        is one of *unless_in* (checked under the same lock as the write, so
+        the guard can never race a concurrent transition). Emits to the
+        webui outside the lock. Returns False if the guard blocked the write."""
+        with self._lock:
+            if self.state in unless_in:
+                return False
+            self.state, self.skill, self.tool = new_state, skill, tool
+        self._emit()
+        return True
+
+    def _emit(self) -> None:
+        try:
+            from . import agwebui as _agwebui
+            if _agwebui._active is not None:
+                from .agterm import agterm as _agterm
+                from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
+                from ._context import _active_team as _at
+                _ansi = _agterm._agname_colors.get(self.agname)
+                _color = _ansi_to_hex(_ansi) if _ansi else None
+                _team = _at.get(None)
+                _team_name = _team.team_name if _team is not None else None
+                _agwebui._active.emitter.agent_state(
+                    self.agname, self.state, self.skill, self.tool, color=_color, team=_team_name
+                )
+        except Exception as _e:
+            print(f"[agent] WARNING: agent_state push failed for {self.agname}: {_e}")
+
+
 class agent:
     """Orchestrator that maintains shared history and delegates to named agskills.
 
@@ -177,7 +272,7 @@ class agent:
 
         self._snapshot_messages: list[dict] = []
         self.inbox: queue.Queue[str] = queue.Queue()
-        self._ui_state: dict = {"state": "inactive", "skill": None, "tool": None}
+        self._state = agent_state(str(self.agname))
 
         _live_agents.add(self)
 
@@ -198,6 +293,7 @@ class agent:
             llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             context_limit=self.llm.context_limit,
         )
+        self._emit_config()
 
     def change_config(self, agconfig: "agConfig") -> None:
         """Replace this agent's agconfig with a clone of the given one, and
@@ -212,6 +308,7 @@ class agent:
         self.log.change_config(self.agconfig)
         if self.sandbox is not None:
             self.sandbox.change_config(self.agconfig)
+        self._emit_config()
 
     def get_config_copy(self) -> "agConfig | None":
         """Return a clone of this agent's agconfig, or None if it has none."""
@@ -273,20 +370,21 @@ class agent:
 
     def _set_ui_state(self, state: str, skill: str | None = None,
                       tool: str | None = None) -> None:
-        self._ui_state = {"state": state, "skill": skill, "tool": tool}
+        self._state.update_state(state, skill, tool)
+
+    def _emit_config(self) -> None:
+        """Push this agent's current dynamic-config snapshot to the webui,
+        so its config editor can show/edit it without a round trip into this
+        (isolated) execution process. Called on construction and after every
+        change_config()."""
+        if self.agconfig is None:
+            return
         try:
             from . import agwebui as _agwebui
             if _agwebui._active is not None:
-                from .agterm import agterm as _agterm
-                from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
-                from ._context import _active_team as _at
-                _ansi = _agterm._agname_colors.get(self.agname)
-                _color = _ansi_to_hex(_ansi) if _ansi else None
-                _team = _at.get(None)
-                _team_name = _team.team_name if _team is not None else None
-                _agwebui._active.emitter.agent_state(self.agname, state, skill, tool, color=_color, team=_team_name)
+                _agwebui._active.emitter.agent_config(self.agname, self.agconfig.dynamic_snapshot())
         except Exception as _e:
-            print(f"[agent] WARNING: agent_state push failed for {self.agname}: {_e}")
+            print(f"[agent] WARNING: agent_config push failed for {self.agname}: {_e}")
 
     def _push_live_messages(self, messages: list) -> None:
         self._snapshot_messages = list(messages)
@@ -322,6 +420,82 @@ class agent:
             if self._append_full_history:
                 self._append_full_history(inbox_msg)
         return had_inbox
+
+    # ------------------------------------------------------------------
+    # Pause / resume
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Request that this agent stop at its next safe checkpoint (the top
+        of its ReAct loop, or before one starts). Non-blocking — the agent
+        may still be mid-LLM-call or mid-tool-call for a while after this
+        returns. Use agpause.wait_all_paused([...]) to confirm it actually
+        stopped."""
+        self._state.run_allowed.clear()
+        self._state.paused_ack.clear()
+        # Relabel to "pausing" unless already paused/blocked/terminal --
+        # update_state()'s unless_in guard makes this check-and-set atomic
+        # against the worker thread's own concurrent transitions (e.g. the
+        # checkpoint writing "paused"), so this can never clobber a state
+        # that already reflects a genuine stop.
+        self._state.update_state(
+            "pausing", skill=self._state.skill, tool=self._state.tool,
+            unless_in=("inactive", "finished", "error", "paused", "blocked_on_dependency"),
+        )
+        self.terminal.log("PAUSE ▶  ", "requested")
+
+    def resume(self) -> None:
+        """Clear a pause request. Non-blocking — use
+        agpause.wait_all_resumed([...]) to confirm execution actually
+        continued past the checkpoint."""
+        self._state.run_allowed.set()
+        self.terminal.log("PAUSE ✓  ", "resumed")
+
+    def is_paused(self) -> bool:
+        """True once this agent has actually stopped at its checkpoint (not
+        merely requested — see pause()). Reads the real synchronization
+        primitive directly rather than the (cosmetic, independently-settable)
+        display state string."""
+        return self._state.paused_ack.is_set()
+
+    def is_settled(self, _seen: "set[str] | None" = None) -> bool:
+        """True if this agent is not making forward progress right now:
+        either it's paused/inactive/finished/errored, or its worker thread is
+        transitively blocked waiting on an upstream agent that is itself
+        settled. The recursive case is what lets wait_all_paused() confirm a
+        whole dependency chain has stopped instead of deadlocking on an agent
+        that will never reach its own checkpoint because an upstream
+        producer it's waiting on is paused first.
+
+        Checks _state.blocked_on first, ahead of the display state string: a
+        pause() request can legitimately relabel the display state (e.g. to
+        "pausing") while the agent is still parked inside a blocking
+        future.result() call — blocked_on is the reliable signal for that,
+        independent of whatever cosmetic label the state string carries."""
+        producer = self._state.blocked_on
+        if producer is not None:
+            _seen = _seen if _seen is not None else set()
+            if producer.agname in _seen:
+                return True  # cycle guard — shouldn't happen, but never hang on one
+            _seen.add(self.agname)
+            return producer.is_settled(_seen)
+        return self._state.state in _SETTLED_LEAF_STATES
+
+    def _check_pause(self, skill: "str | None" = None, tool: "str | None" = None) -> None:
+        """Checkpoint: block here while a pause is in effect. Called once
+        before the ReAct loop starts and again at the top of every iteration
+        — never mid-LLM-call or mid-tool-call, so an in-flight call always
+        finishes before a pause takes effect."""
+        if self._state.run_allowed.is_set():
+            return
+        prev_state, prev_skill, prev_tool = self._state.snapshot()
+        self._state.update_state("paused", skill=skill, tool=tool)
+        self._state.paused_ack.set()
+        self._state.run_allowed.wait()
+        self._state.paused_ack.clear()
+        if prev_state in (None, "pausing", "paused", "blocked_on_dependency"):
+            prev_state = "skill"
+        self._state.update_state(prev_state, skill=prev_skill, tool=prev_tool)
 
     def push_token_count_update_to_ui(self, skill_inp: int, skill_out: int) -> None:
         """Push a live token update to the webui (called from agskill mid-loop)."""
@@ -414,7 +588,7 @@ class agent:
         ag.terminal = agterm(ag.agname)
         ag._snapshot_messages = []
         ag.inbox  = queue.Queue()
-        ag._ui_state = {"state": "inactive", "skill": None, "tool": None}
+        ag._state = agent_state(str(ag.agname))
         _live_agents.add(ag)
 
         from ._context import _active_team
@@ -431,6 +605,7 @@ class agent:
             team=team_name,
             llm_config={k: v for k, v in ag.llm.backend.as_dict().items() if k != "api_key"},
         )
+        ag._emit_config()
         return ag
 
     # ------------------------------------------------------------------
@@ -580,12 +755,13 @@ class agent:
         ag.terminal = agterm(ag.agname)
         ag._snapshot_messages: list[dict] = []
         ag.inbox: queue.Queue = queue.Queue()
-        ag._ui_state: dict = {"state": "inactive", "skill": None, "tool": None}
+        ag._state = agent_state(str(ag.agname))
 
         _live_agents.add(ag)
 
         ag.terminal.log("LOADED   ", f"from {path}")
         ag.log._lifecycle("loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts"))
+        ag._emit_config()
 
         return ag
 

@@ -126,10 +126,28 @@ sandboxs are created lazily — only when a task calls a tool with `run_in_subpr
 
 ## UI callbacks
 
-Three internal callbacks are available for custom monitoring:
+Three internal attributes are available for custom monitoring:
 
 | Attribute | Type | Updated |
 |---|---|---|
-| `ag._ui_state` | `dict` | After every state transition (`inactive`, `skill`, `llm`, `tool`, `proc_wait`, `human`) |
+| `ag._state` | `agent_state` | After every state transition (`inactive`, `skill`, `llm`, `tool`, `proc_wait`, `human`, `paused`, `blocked_on_dependency`, `finished`, `error`) — see [Pause and resume](#pause-and-resume) |
 | `ag._snapshot_messages` | `list[dict]` | After every LLM response and tool result within a skill |
 | `ag.inbox` | `queue.Queue[str]` | Drain to inject a user message before the next LLM call |
+
+`ag._state` (an `agent_state` instance, defined in `agent.py`) is more than a display value — it's also the single source of truth pause/resume coordination reads from: `.state`/`.skill`/`.tool` are what the webui shows, while `.run_allowed`/`.paused_ack` (both `threading.Event`) and `.blocked_on` (an `agent | None`) are real synchronization primitives. The only way to change the display fields is `agent_state.update_state(new_state, skill=None, tool=None, *, unless_in=())`, which applies the whole read-check-write atomically under one lock — never mutate `.state`/`.skill`/`.tool` directly.
+
+## Pause and resume
+
+```python
+ag.pause()                  # request a stop at the next safe checkpoint
+ag.is_paused()              # True once it actually stopped (not merely requested)
+ag.resume()                 # clear the request
+
+from agency import wait_all_paused, wait_all_resumed
+wait_all_paused([ag])       # block until settled (see below), or until timeout=
+wait_all_resumed([ag])
+```
+
+`pause()` is non-blocking and takes effect only at the next ReAct-loop checkpoint (`agent._check_pause()`, called at the top of every iteration in `agskill.execute_react()`, and once before the loop starts) — never mid-LLM-call or mid-tool-call, so an in-flight call always finishes first. `is_paused()` reads `ag._state.paused_ack` directly (the real synchronization primitive), not the cosmetic state string.
+
+`is_settled()` is what makes `wait_all_paused()` deadlock-safe across a dependency chain: an agent whose worker thread is blocked resolving another agent's still-pending result (e.g. via a nested `agdata` field, or `agent.fork()`) is tagged `blocked_on_dependency` with `ag._state.blocked_on` pointing at the upstream agent, and `is_settled()` recurses through that chain — an agent blocked on an already-*paused* upstream counts as settled, so waiting for a whole dependency graph to stop never hangs on an agent that can never reach its own checkpoint. This is unrelated to the future-chain registration-order deadlocks covered in `docs/Design_deadlock.md` — see `agency/agpause.py` for the pause-specific cross-agent coordination (thread-local worker tracking, `wait_all_paused`/`wait_all_resumed`).

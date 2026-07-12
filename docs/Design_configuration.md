@@ -83,6 +83,8 @@ ag.change_config(cfg)
 
 See `examples/dynamic_config_example.py` for this pattern end to end.
 
+`agConfig.dynamic_snapshot()` is the introspection counterpart to all of this: `{owner: {field: value}}` for every registered Dynamic field (Static/Global excluded, since — per this section — nothing reaches them live anyway). This is what `agwebui`'s "Update Config" dashboard button is built on: `agent._emit_config()` pushes `ag.agconfig.dynamic_snapshot()` to the browser so it can show/edit an agent's config, and applying an edit is just `agent.change_config(agConfig(edited_dict))` under the hood — the exact call shown above, just triggered from a button instead of a script. See [agwebui.md](agwebui.md#pause--resume--config-commands) for the full mechanism, including how "Update All" reaches team classes and `agent.default_agconfig` too, not just already-existing agents.
+
 ### Changing a Static field — the clone-and-recreate pattern
 
 A sandbox's mounts (and its base image) are resolved once, when the sandbox container is first created, and then fixed for that container's whole lifetime — a running container's bind mounts genuinely can't change without recreating it, so the framework raises rather than silently ignoring your change:

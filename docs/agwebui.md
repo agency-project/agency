@@ -11,18 +11,25 @@
 │  agwebui.run(fn)                                │
 │    ├── starts server subprocess                 │
 │    ├── sets agwebui._active emitter             │
+│    ├── starts _poll_commands() thread           │
 │    └── calls fn() directly                     │
 │                                                 │
 │  agterm.log()  ──────────────────────────────┐  │
 │  agent._set_ui_state()  ─────────────────────┤  │
 │  agent._push_live_messages()  ───────────────┤  │
+│  agent._emit_config()  ──────────────────────┤  │
 │  agteam.__init__()  ─────────────────────────┤  │
 │  ask_human tool  ────────────────────────────┤  │
 │                           emit to SQLite DB ◄─┘  │
 │               agency/runs/webui_*/               │
 │               ui_events.db  ◄───────────────┐   │
+│                                              │   │
+│  _poll_commands() thread:                        │
+│    reads ui_commands/*.json, calls               │
+│    agent.pause()/resume()/change_config()        │
 └─────────────────────────────────────────────────┘
-                                             │ poll (50 ms)
+        │ poll (50 ms)              ▲ poll (200 ms)
+        ▼                           │
 ┌─────────────────────────────────────────────────┐
 │  Web server process (FastAPI + uvicorn)         │
 │                                                 │
@@ -36,10 +43,18 @@
 │  WebSocket clients receive all events           │
 │  New clients get full history on connect        │
 │                                                 │
-│  WS message {type:"human_reply"} →             │
-│    writes  ui_replies/<ask_id>.txt  ────────────┼──►  unblocks ask_human()
+│  WS {"type":"human_reply", ...} →                │
+│    writes ui_replies/<ask_id>.txt (unblocks       │
+│    ask_human())                                  │
+│                                                 │
+│  WS {"type":"pause"|"resume"|"pause_all"|         │
+│    "resume_all"|"update_config"|                 │
+│    "update_config_all", ...} →                    │
+│    writes ui_commands/<uuid>.json                │
 └─────────────────────────────────────────────────┘
 ```
+
+The `ui_commands/` channel is the mirror image of `ui_events.db`: events flow execution → server (poll every 50 ms, pushed to browsers); commands flow server → execution (poll every 200 ms in `_poll_commands()`, applied via real `agent`/`agteam` calls). Both are plain files/a SQLite DB in the run directory — there is still no shared memory or direct import between the two processes.
 
 ## Usage
 
@@ -84,7 +99,12 @@ agwebui.run(main, linger=False)   # exit immediately when done
 │  ▶ LLM Thinking…                   │                      │
 │                                    │                      │
 │  [←] [1/5] [→]                     │                      │
-│  > _                               │                      │
+│  > _                               │ ┌──────────────────┐ │
+│                                     │ │ Pause             │ │
+│                                     │ │ Pause All          │ │
+│                                     │ │ Resume All         │ │
+│                                     │ │ Update Config      │ │
+│                                     │ └──────────────────┘ │
 └────────────────────────────────────┴──────────────────────┘
 ```
 
@@ -92,7 +112,10 @@ agwebui.run(main, linger=False)   # exit immediately when done
 
 **Left bottom — Interaction pane**: The focused agent's full message history — system prompt, user turns, assistant thinking, tool calls, tool results. Shows a running indicator while the agent is active. Shows pending `ask_human` questions.
 
-**Right — Agent list**: All live agents grouped by team, with state indicators. Click an agent to focus it.
+**Right — Agent list**: All live agents grouped by team, with state indicators. Click an agent to focus it. A button bar pinned to the bottom of this column has four actions:
+- **Pause** — pauses the currently selected agent (relabels to **Resume** once that agent's state is `paused`)
+- **Pause All** / **Resume All** — see [Pause / resume / config commands](#pause--resume--config-commands) below for exactly what "all" reaches
+- **Update Config** — opens a modal showing the selected agent's current dynamic (live-editable) config fields; Cancel discards, Update applies to just that agent, Update All applies the same edited values everywhere "all" reaches
 
 **Input bar**: Type a reply and press Enter to respond to an `ask_human` request from the focused agent.
 
@@ -117,6 +140,9 @@ Tab/Shift-Tab are captured only when the input bar is not focused.
 | `● tool-name` | yellow | tool call in progress |
 | `● Shell Wait` | dim | waiting for shell processes |
 | `● ?` | yellow | `ask_human` waiting for reply |
+| `⏸ paused` | red | stopped at its ReAct-loop checkpoint (`agent.is_paused()` is true) |
+
+An agent's real backend state can also be `blocked_on_dependency` (blocked resolving another agent's pending result — see `agent.md`'s "Pause and resume"), but the dashboard has no dedicated indicator for it yet: it currently falls through to the generic `●  &lt;skill&gt; - running` row and counts as "Live", which is misleading since such an agent is making zero forward progress. Known gap, not yet fixed.
 
 ---
 
@@ -163,7 +189,8 @@ Every event has `type` and `ts`. `agname` is present for per-agent events.
 |---|---|---|---|
 | `log` | yes | `line: str` | `agterm.log()` |
 | `agent_registered` | yes | `color: str` (hex) | `agterm.__init__()` |
-| `agent_state` | yes | `state, skill, tool` | `agent._set_ui_state()` |
+| `agent_state` | yes | `state, skill, tool` — `state` includes `paused`/`blocked_on_dependency` alongside the original `inactive/skill/llm/tool/proc_wait/human/finished/error` | `agent._set_ui_state()` (thin wrapper around `agent._state.update_state(...)`) |
+| `agent_config` | yes | `config: {owner: {field: value}}` — `agConfig.dynamic_snapshot()`, Dynamic-tier fields only | `agent._emit_config()`, called from `__init__`/`fork()`/`load()`/`change_config()` |
 | `team_registered` | no | `team_name, agents: list[str]` | `agteam.__init__()` |
 | `messages_snapshot` | yes | `messages: list[dict]` | `agent._push_live_messages()` |
 | `token_update` | yes | `agent_input, agent_output, global_input, global_output` | `agskill` via `agent.push_token_count_update_to_ui()` after each LLM call completes |
@@ -178,7 +205,8 @@ Every event has `type` and `ts`. `agname` is present for per-agent events.
 |---|---|
 | `log` | Appended to the Shared Log with timestamp and agent colour |
 | `agent_registered` | Adds agent to the agent list; establishes colour used for all its events |
-| `agent_state` | Updates the state indicator (●/○) and skill/tool label next to the agent |
+| `agent_state` | Updates the state indicator (●/○) and skill/tool label next to the agent; also drives the Pause/Resume button's label whenever the currently-selected agent's state changes |
+| `agent_config` | Cached client-side per agent (`state.agents.get(agname).config`); read when the Update Config modal opens — no round trip to the execution process needed |
 | `team_registered` | Creates a team group in the agent list; agents are indented under it |
 | `messages_snapshot` | Replaces the full message history shown in the Interaction pane |
 | `token_update` | Updates the token counter badge in the header |
@@ -255,18 +283,37 @@ When an agent calls `ask_human` while `agwebui` is active:
 
 This path is entirely file-based — no shared memory between the execution process and the web server.
 
+## Pause / resume / config commands
+
+The Pause/Pause All/Resume All/Update Config buttons need the reverse flow: server process → execution process. Since the server has no agency imports and can't call `agent.pause()` directly, it uses the same file-drop idiom as `ask_human`, just in the opposite direction:
+
+1. The browser sends one of `{"type": "pause"|"resume", "agname": "..."}`, `{"type": "pause_all"|"resume_all"}`, or `{"type": "update_config"|"update_config_all", "agname": ..., "config": {...}}` over the existing WebSocket.
+2. The server writes it, unmodified, to `<run_dir>/ui_commands/<uuid>.json`.
+3. A background thread in the execution process (`agwebui._poll_commands()`, started alongside the server subprocess in `agwebui.run()`) polls that directory every 200 ms.
+4. For each file, `agwebui._dispatch_command()` parses it and applies it via real objects: `agent.pause()`/`resume()` (looked up by `agname` via `agent.all()`), `agent.change_config()`, or for `update_config_all`, all four targets described below. The file is then deleted.
+
+`update_config_all` specifically reaches four separate objects, each sitting behind its own `agConfig.clone()` boundary (cloning is a one-time snapshot, so a mutation after the fact only reaches whoever hasn't cloned yet):
+- **Existing agents** (`agent.all()`) — direct `change_config()`.
+- **Existing team instances** (`agteam.all()`) — `agteam.change_config()`, which replaces the team's own live `agconfig` *and* cascades to every agent it tracks.
+- **Every `agteam` subclass's class-level `agconfig`** — found via a recursive walk of `agteam.__subclasses__()` (Python's own subclass tracking, no framework registry needed) and mutated in place field-by-field, so a team constructed *after* the click clones fresh data. This is what reaches a user script's own `agconfig = LLM_CONFIG`-style class attribute without the framework needing to know that variable exists.
+- **`agent.default_agconfig`** — mutated in place if set, for a bare `agent()` call made with no active team context.
+
+`update_config` (single-agent) only touches that one agent — it does not reach team classes or `default_agconfig`, so you can deliberately run mixed backends across agents.
+
 ## Framework hooks
 
-`agwebui` is wired into the framework at four points. All hooks are guarded with `try/except` so they never affect execution if the web UI is not active.
+`agwebui` is wired into the framework at these points. All emit-side hooks are guarded with `try/except` so they never affect execution if the web UI is not active. The command-side hooks (`agent.pause()` etc.) don't need guarding — they're plain methods on `agent`/`agteam` called directly by `_dispatch_command()`, not callbacks invoked from inside those classes.
 
-| Hook location | Event emitted |
+| Hook location | Event emitted / effect |
 |---|---|
 | `agterm.__init__()` | `agent_registered` |
 | `agterm.log()` | `log` (routes instead of stderr) |
 | `agent._set_ui_state()` | `agent_state` |
 | `agent._push_live_messages()` | `messages_snapshot` |
+| `agent._emit_config()` (called from `__init__`/`fork()`/`load()`/`change_config()`) | `agent_config` |
 | `agteam.__init__()` (after `setup()`) | `team_registered` |
 | `ask_human` tool `fn()` | `ask_human`, file-based reply |
+| `agwebui._dispatch_command()` | applies `pause`/`resume`/`pause_all`/`resume_all`/`update_config`/`update_config_all` commands via `agent.pause()`/`resume()`/`change_config()`, `agteam.change_config()` |
 
 ## Dependencies
 

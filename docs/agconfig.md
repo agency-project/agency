@@ -121,6 +121,17 @@ No caching, no locking. Every read hits `agConfig.get(...)` fresh; every write g
 
 In practice, framework classes (`agent`, `agllm`, `agSandbox`, `aglog`, `agResourcePool`, `agteam`, ...) each `.clone()` whatever `agConfig` they're given at construction time rather than storing it as-is — so two framework objects never end up sharing the literal same `agConfig` instance just by being built from a common source, even though the "two instances sharing the same `agConfig`" behavior described above is real if you deliberately hand one `agConfig` object to two constructors that don't clone it (e.g. two test-only classes, or your own custom owner). See [Design_configuration.md](Design_configuration.md#changing-a-dynamic-field-live) for how to update a framework object's config live given this.
 
+#### `dynamic_snapshot()` — every live-editable field, in one call
+
+```python
+def dynamic_snapshot(self) -> dict[str, dict[str, Any]]:
+    """{owner: {field: value}} for every registered DynamicConfigParam field."""
+```
+
+Walks `FIELD_REGISTRY`, keeps only fields whose descriptor is a `DynamicConfigParam`, and reads each one's current effective value (override if set, else the descriptor's `default`) via `self.get(owner, name, knob.default)`. Static and Global fields are deliberately excluded — a value written to either has no observable effect after the fact (Static caches per-instance on first read; Global always reads `agConfig.GLOBAL` regardless of which `agConfig` an object holds — see the two sections above), so surfacing them as if they were editable would be misleading. Values that aren't JSON-safe (not a `str`/`int`/`float`/`bool`/`None`, or a `list`/`dict` composed only of those) are silently skipped, since the one consumer of this method needs to serialize the result.
+
+That consumer is `agwebui`'s config editor: `agent._emit_config()` calls `self.agconfig.dynamic_snapshot()` and pushes it as an `agent_config` event so the dashboard can show/edit an agent's config without a round trip into the (isolated) execution process — see [agwebui.md](agwebui.md#pause--resume--config-commands).
+
 ## `FIELD_REGISTRY` — registration without instantiation
 
 ```python

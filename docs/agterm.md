@@ -35,6 +35,8 @@ Example output from a running agent:
 | `SKILL ▶  ` | bold | Skill started |
 | `SKILL ✓  ` | normal | Skill completed successfully |
 | `SKILL ✗  ` | reverse | Skill failed (exception or schema error) |
+| `PAUSE ▶  ` | — | `agent.pause()` called — request only, not yet honored |
+| `PAUSE ✓  ` | — | `agent.resume()` called |
 | `ERROR ✗  ` | reverse | `agerror(...)` constructed — emitted immediately at creation |
 | `LLM ▶    ` | normal | LLM call dispatched |
 | `LLM ✓    ` | normal | LLM call completed |

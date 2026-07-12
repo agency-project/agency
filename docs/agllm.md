@@ -113,7 +113,7 @@ messages.append(msg)
 | `kwargs` | dict | Pre-built request kwargs from `build_kwargs()`. Must not include `stream`; the method adds it. |
 | `messages` | list[dict] | Full message history. A partial placeholder is appended during streaming and removed before returning. |
 | `term` | agterm or None | Terminal logger for progress lines. |
-| `state_fn` | callable or None | Called as `state_fn("llm", skill=skill_name)` at call start to update UI state. |
+| `state_fn` | callable or None | Called as `state_fn("llm", skill=skill_name)` at call start. In practice this is `agent._set_ui_state`, a thin wrapper around `agent_state.update_state(...)` — it drives the webui display *and* is part of the pause-synchronization state (see `agent.md`'s "Pause and resume"), not just a UI callback. |
 | `live_messages_fn` | callable or None | Called with `messages[1:]` during streaming for live UI updates. Fires at most once per `LIVE_REDRAW_CHAR_THRESHOLD` (100) new characters. |
 | `update_ui_token_count_fn` | callable or None | Called as `fn(total_input, total_output)` after a successful call. |
 | `total_input_tokens` | int | Running input token accumulator; incremented by this call's prompt tokens. |

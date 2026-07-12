@@ -218,6 +218,17 @@ class agwebui_emitter:
             "ts": time.time(),
         })
 
+    def agent_config(self, agname: str, config: dict) -> None:
+        """Push the agent's current dynamic-config snapshot (see
+        agConfig.dynamic_snapshot()) so the webui's config editor can show
+        it without a round trip into the (isolated) execution process."""
+        self.emit({
+            "type": "agent_config",
+            "agname": agname,
+            "config": config,
+            "ts": time.time(),
+        })
+
     def team_registered(self, team_name: str, agent_names: list[str]) -> None:
         ev = {
             "type": "team_registered",
