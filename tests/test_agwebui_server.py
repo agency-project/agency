@@ -352,6 +352,51 @@ def test_websocket_pause_all_resume_all_write_command_file(server, mtype):
     assert cmds == [{"type": mtype, "agname": None}]
 
 
+def test_websocket_update_config_writes_command_file(server):
+    client, run_dir, srv = server
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({
+            "type": "update_config", "agname": "alex_0000",
+            "config": {"agskill": {"react_max_steps": 5}},
+        }))
+        assert _wait_for(lambda: _read_command_files(run_dir))
+
+    cmds = _read_command_files(run_dir)
+    assert cmds == [{
+        "type": "update_config", "agname": "alex_0000",
+        "config": {"agskill": {"react_max_steps": 5}},
+    }]
+
+
+def test_websocket_update_config_all_writes_command_file(server):
+    client, run_dir, srv = server
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 9}},
+        }))
+        assert _wait_for(lambda: _read_command_files(run_dir))
+
+    cmds = _read_command_files(run_dir)
+    assert cmds == [{
+        "type": "update_config_all", "agname": None,
+        "config": {"agskill": {"react_max_steps": 9}},
+    }]
+
+
+def test_websocket_update_config_missing_config_defaults_empty(server):
+    client, run_dir, srv = server
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "update_config", "agname": "a"}))
+        assert _wait_for(lambda: _read_command_files(run_dir))
+
+    cmds = _read_command_files(run_dir)
+    assert cmds == [{"type": "update_config", "agname": "a", "config": {}}]
+
+
 def test_websocket_multiple_pause_commands_each_get_own_file(server):
     """Each command must land in its own file — a single overwritten file
     would silently drop all but the last command between poll cycles."""

@@ -156,6 +156,33 @@ def test_agent_push_live_messages_updates_snapshot(active_webui):
 
 
 # ---------------------------------------------------------------------------
+# agent._emit_config — pushes dynamic_snapshot() to the webui
+# ---------------------------------------------------------------------------
+
+def test_agent_construction_emits_config(active_webui):
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+
+    ag = agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}, "agskill": {"react_max_steps": 3}}))
+
+    configs = _events_of(active_webui, "agent_config")
+    ev = next((e for e in configs if e["agname"] == ag.agname), None)
+    assert ev is not None
+    assert ev["config"]["agskill"]["react_max_steps"] == 3
+
+
+def test_change_config_re_emits_config(active_webui):
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+
+    ag = agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}}))
+    ag.change_config(agConfig({"agskill": {"react_max_steps": 42}}))
+
+    configs = [e for e in _events_of(active_webui, "agent_config") if e["agname"] == ag.agname]
+    assert configs[-1]["config"]["agskill"]["react_max_steps"] == 42
+
+
+# ---------------------------------------------------------------------------
 # agwebui command dispatch — pause/resume/pause_all/resume_all
 # ---------------------------------------------------------------------------
 
@@ -203,6 +230,38 @@ def test_dispatch_resume_all_resumes_every_live_agent():
     _dispatch_command({"type": "resume_all"})
     assert a._state.run_allowed.is_set()
     assert b._state.run_allowed.is_set()
+
+
+def test_dispatch_update_config_applies_to_named_agent():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    _dispatch_command({
+        "type": "update_config", "agname": ag.agname,
+        "config": {"agskill": {"react_max_steps": 7}},
+    })
+    assert ag.agconfig.get("agskill", "react_max_steps") == 7
+
+
+def test_dispatch_update_config_ignores_unknown_agname():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    before = ag.agconfig.get("agskill", "react_max_steps")
+    _dispatch_command({
+        "type": "update_config", "agname": "__no_such_agent__",
+        "config": {"agskill": {"react_max_steps": 999}},
+    })
+    assert ag.agconfig.get("agskill", "react_max_steps") == before
+
+
+def test_dispatch_update_config_all_applies_to_every_agent():
+    from agency.agwebui import _dispatch_command
+    a, b = _make_agent(), _make_agent()
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 11}},
+    })
+    assert a.agconfig.get("agskill", "react_max_steps") == 11
+    assert b.agconfig.get("agskill", "react_max_steps") == 11
 
 
 def test_poll_commands_applies_and_deletes_command_files(tmp_path):

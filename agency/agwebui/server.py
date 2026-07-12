@@ -311,6 +311,10 @@ async def websocket_endpoint(ws: WebSocket):
                     cmd = {"type": mtype, "agname": msg.get("agname")}
                     cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
                     cmd_file.write_text(json.dumps(cmd), encoding="utf-8")
+                elif mtype in ("update_config", "update_config_all"):
+                    cmd = {"type": mtype, "agname": msg.get("agname"), "config": msg.get("config") or {}}
+                    cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
+                    cmd_file.write_text(json.dumps(cmd), encoding="utf-8")
             except Exception:
                 pass
     except WebSocketDisconnect:

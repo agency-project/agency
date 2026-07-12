@@ -42,6 +42,7 @@ def _dispatch_command(cmd: dict) -> None:
     wants; this side -- running inside the execution process, with real
     agent objects -- is what actually applies it."""
     from ..agent import agent as _agent_cls
+    from ..agconfig import agConfig as _agConfig_cls
 
     ctype  = cmd.get("type")
     agname = cmd.get("agname")
@@ -53,6 +54,16 @@ def _dispatch_command(cmd: dict) -> None:
     elif ctype in ("pause_all", "resume_all"):
         for a in _agent_cls.all():
             (a.pause if ctype == "pause_all" else a.resume)()
+    elif ctype == "update_config":
+        new_cfg = _agConfig_cls(cmd.get("config") or {})
+        for a in _agent_cls.all():
+            if a.agname == agname:
+                a.change_config(new_cfg)
+                break
+    elif ctype == "update_config_all":
+        new_cfg = _agConfig_cls(cmd.get("config") or {})
+        for a in _agent_cls.all():
+            a.change_config(new_cfg)
 
 
 def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:

@@ -4,6 +4,16 @@ import threading
 from typing import Any, ClassVar
 
 
+def _is_json_safe(value: Any) -> bool:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_safe(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_safe(v) for k, v in value.items())
+    return False
+
+
 class agConfig:
     """Nested override store: ``data[owner][param] = value``.
 
@@ -110,6 +120,33 @@ class agConfig:
                 )
             self.data.setdefault(owner, {})[name] = value
         return self
+
+    def dynamic_snapshot(self) -> "dict[str, dict[str, Any]]":
+        """Return {owner: {field: value}} for every registered
+        DynamicConfigParam field, using this agConfig's current effective
+        value (its override, or the field's default).
+
+        Dynamic is the only tier where a value written here and later
+        applied via ``agent.change_config()`` has any observable effect at
+        runtime: Static fields are cached per-instance on first read (a new
+        agconfig doesn't invalidate that cache), and Global fields always
+        read ``agConfig.GLOBAL`` regardless of which agconfig an object
+        holds. So this is what's meaningful to expose as "live-editable
+        configuration" (e.g. the webui's config editor).
+
+        Non-JSON-safe values (anything but str/int/float/bool/None, or a
+        list/dict composed only of those) are skipped -- they can't cross
+        the wire to the browser anyway.
+        """
+        result: dict[str, dict[str, Any]] = {}
+        for (owner, name), knob in agConfig.FIELD_REGISTRY.items():
+            if not isinstance(knob, DynamicConfigParam):
+                continue
+            value = self.get(owner, name, knob.default)
+            if not _is_json_safe(value):
+                continue
+            result.setdefault(owner, {})[name] = value
+        return result
 
     def clone(self) -> "agConfig":
         """Return a fresh agConfig with the same current data but no lock

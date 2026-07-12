@@ -287,6 +287,7 @@ class agent:
             llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             context_limit=self.llm.context_limit,
         )
+        self._emit_config()
 
     def change_config(self, agconfig: "agConfig") -> None:
         """Replace this agent's agconfig with a clone of the given one, and
@@ -301,6 +302,7 @@ class agent:
         self.log.change_config(self.agconfig)
         if self.sandbox is not None:
             self.sandbox.change_config(self.agconfig)
+        self._emit_config()
 
     def get_config_copy(self) -> "agConfig | None":
         """Return a clone of this agent's agconfig, or None if it has none."""
@@ -363,6 +365,20 @@ class agent:
     def _set_ui_state(self, state: str, skill: str | None = None,
                       tool: str | None = None) -> None:
         self._state.update_state(state, skill, tool)
+
+    def _emit_config(self) -> None:
+        """Push this agent's current dynamic-config snapshot to the webui,
+        so its config editor can show/edit it without a round trip into this
+        (isolated) execution process. Called on construction and after every
+        change_config()."""
+        if self.agconfig is None:
+            return
+        try:
+            from . import agwebui as _agwebui
+            if _agwebui._active is not None:
+                _agwebui._active.emitter.agent_config(self.agname, self.agconfig.dynamic_snapshot())
+        except Exception as _e:
+            print(f"[agent] WARNING: agent_config push failed for {self.agname}: {_e}")
 
     def _push_live_messages(self, messages: list) -> None:
         self._snapshot_messages = list(messages)
@@ -583,6 +599,7 @@ class agent:
             team=team_name,
             llm_config={k: v for k, v in ag.llm.backend.as_dict().items() if k != "api_key"},
         )
+        ag._emit_config()
         return ag
 
     # ------------------------------------------------------------------
@@ -738,6 +755,7 @@ class agent:
 
         ag.terminal.log("LOADED   ", f"from {path}")
         ag.log._lifecycle("loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts"))
+        ag._emit_config()
 
         return ag
 
