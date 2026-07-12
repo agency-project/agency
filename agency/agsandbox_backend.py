@@ -1547,11 +1547,23 @@ class _ChrootBackend(agsandbox_backend):
 
     def _ensure_started(self) -> None:
         """Create the jail's workspace directory on first use, restoring it
-        from ``_checkpoint_image`` if one was given at construction time."""
+        from ``_checkpoint_image`` if one was given at construction time.
+
+        Ground truth is the workspace directory's existence on disk, not
+        ``self._started``. Tool calls with ``run_in_subprocess=True`` (the
+        default) get a fresh cloudpickled copy of this backend per call, so
+        a worker process's own ``_started`` is unreliable — exactly the
+        problem ``_ContainerBackend._ensure_started()`` documents and solves
+        by querying the docker daemon (``_container_running()``) instead of
+        trusting its own ``_started``. There's no daemon here, so the
+        workspace directory itself is the cross-process source of truth:
+        materializing from a checkpoint every time some worker's copy
+        happens to see ``_started=False`` would wipe out whatever a
+        *different* worker already wrote to it.
+        """
         if self._started:
             return
-        self._workspace.mkdir(parents=True, exist_ok=True)
-        if self._checkpoint_image is not None:
+        if not self._workspace.is_dir():
             self._materialize_workspace(self._checkpoint_image)
         self._started = True  # set before _snapshot_pids() to prevent re-entry via _container_exec
         self._baseline_pids = self._snapshot_pids()
@@ -1559,6 +1571,7 @@ class _ChrootBackend(agsandbox_backend):
     def _materialize_workspace(self, tag: "str | None") -> None:
         """Replace the current workspace contents with a copy of *tag*'s
         snapshot, or an empty workspace if *tag* is None or has no snapshot."""
+        self._root.mkdir(parents=True, exist_ok=True)  # cp -a needs the parent to exist
         if self._workspace.exists():
             shutil.rmtree(self._workspace, ignore_errors=True)
         snapshot_dir = _CHROOT_SNAPSHOTS_DIR / _sanitize_tag(tag) if tag else None
@@ -1637,8 +1650,15 @@ class _ChrootBackend(agsandbox_backend):
 
     def commit(self, tag: str) -> bool:
         """Snapshot the current workspace to *tag*. Returns False if the
-        jail was never started (nothing to snapshot)."""
-        if not self._started or not self._workspace.is_dir():
+        jail was never started (nothing to snapshot).
+
+        Checks the workspace directory's existence on disk rather than
+        ``self._started`` -- this may be called from the orchestrating
+        process on a sandbox whose actual workspace was written to entirely
+        by worker-process tool calls (see _ensure_started()'s docstring),
+        which never touch this process's own ``_started`` flag.
+        """
+        if not self._workspace.is_dir():
             return False
         snapshot_dir = _CHROOT_SNAPSHOTS_DIR / _sanitize_tag(tag)
         snapshot_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1656,13 +1676,21 @@ class _ChrootBackend(agsandbox_backend):
         """ "Stop" the jail: clear PID tracking and either snapshot the
         workspace (commit=True) or revert it to the last checkpoint
         (commit=False), mirroring the container backend's semantics --
-        there is no running process to actually tear down."""
+        there is no running process to actually tear down.
+
+        Checks the workspace directory's existence on disk rather than
+        ``self._started`` -- called from the orchestrating process, which
+        may never have run a single exec() of its own (every tool call ran
+        in a worker process, each with its own cloudpickled copy of this
+        backend). Trusting ``self._started`` here would silently skip
+        committing real work just because *this* process's flag never
+        flipped to True."""
         if self._gpu_virtual and self._gpu_id is not None:
             self._gpu_release_fn(self._gpu_id)
             self._gpu_id = None
         self._watched_pids = {}
         self._baseline_pids = set()
-        if not self._started:
+        if not self._started and not self._workspace.is_dir():
             return
         if commit:
             tag = self._lifecycle_tag()
@@ -1677,8 +1705,13 @@ class _ChrootBackend(agsandbox_backend):
         self._watched_pids = {}
         self._baseline_pids = set()
         self._checkpoint_image = tag
-        self._started = False
-        self._ensure_started()
+        # Materialize explicitly rather than resetting _started and calling
+        # _ensure_started() -- that only restores when the workspace doesn't
+        # exist yet (see its docstring), which would make an explicit
+        # restore() onto an already-materialized workspace a silent no-op.
+        self._materialize_workspace(tag)
+        self._started = True
+        self._baseline_pids = self._snapshot_pids()
 
     def destroy(self) -> None:
         if self._destroyed:

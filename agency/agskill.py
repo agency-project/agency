@@ -310,6 +310,9 @@ class agskill:
             _prev_input_tokens: int = 0
             _prev_output_tokens: int = 0
             sandbox_lock: "threading.RLock | None" = None
+            # Fallback for the final logging step below if an exception hits
+            # before the defensive copy further down is made.
+            local_skill_input = skill_input
             agpause.set_current_worker_agent(ag)
 
             try:
@@ -317,6 +320,19 @@ class agskill:
                 #    then resolve any lazy input futures passed by the caller.
                 prev_ctx.resolve_prev_dependencies()
                 skill_input.resolve_input_dependencies()
+
+                # Defensive shallow copy: prepare_inputs_in_sandbox() (called
+                # below, via execute_react) mutates its skill_input argument
+                # in place (offloading oversized/agtype fields to sandbox
+                # paths). If a caller hands the same agdata object to more
+                # than one concurrent run() call (e.g. one shared input
+                # fanned out to several agents), each run must mutate its
+                # own private copy from here on rather than racing the
+                # others on a shared one. A shallow copy is enough --
+                # prepare_inputs_in_sandbox only ever reassigns top-level
+                # keys on the object it's given, never mutates a nested
+                # value's own contents in place.
+                local_skill_input = agdata(**dict(skill_input._data))
 
                 # ── 1b. Checkpoint — honor a pause requested before this run
                 #    even started, before touching the sandbox.
@@ -347,7 +363,9 @@ class agskill:
                 _prev_input_tokens = prev_ctx.total_input_tokens
                 _prev_output_tokens = prev_ctx.total_output_tokens
 
-                ag.terminal.log("SKILL ▶  ", f"{self.name}  input={list(skill_input._data.keys())}")
+                ag.terminal.log(
+                    "SKILL ▶  ", f"{self.name}  input={list(local_skill_input._data.keys())}"
+                )
                 ag._set_ui_state("skill", skill=self.name)
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
@@ -355,7 +373,7 @@ class agskill:
                 outer_result, updated_ctx, outer_delta = self.execute_react(
                     ag,
                     prev_ctx,
-                    skill_input,
+                    local_skill_input,
                     max_steps,
                 )
 
@@ -380,7 +398,7 @@ class agskill:
             # ── 5. Log result and commit token counts.
             ts_end = _ts()
             assert outer_result is not None
-            input_dict = skill_input.to_dict()
+            input_dict = local_skill_input.to_dict()
             result_dict = outer_result.to_dict()
             if result_dict.get("error"):
                 _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate

@@ -243,6 +243,58 @@ class TestChrootBackendFileIO:
 
 @chroot
 class TestChrootBackendLifecycle:
+    def test_ensure_started_does_not_wipe_workspace_across_worker_processes(self):
+        """Regression test: tool calls with run_in_subprocess=True (the
+        default) each get a fresh cloudpickled copy of the backend, so
+        _started is False in every worker's own copy regardless of what an
+        earlier worker already did. _ensure_started() must use the
+        workspace directory's existence on disk as ground truth, not
+        self._started -- otherwise every worker's first touch re-runs
+        _materialize_workspace() and wipes out whatever a *different*
+        worker already wrote (this exact bug shipped and was caught against
+        a real chroot-backed run: a file written by one tool dispatch was
+        gone by the time the very next dispatch tried to read it back)."""
+        import pickle
+
+        orig = _make_backend()
+        try:
+            worker1 = pickle.loads(pickle.dumps(orig))
+            worker1.write_file("/workspace/inputs/full_text_123.txt", "important content\n")
+
+            worker2 = pickle.loads(pickle.dumps(orig))
+            assert worker2._started is False  # fresh copy, exactly like a real worker process
+            content = worker2.read_file("/workspace/inputs/full_text_123.txt")
+            assert content == "important content\n"
+        finally:
+            orig.destroy()
+
+    def test_stop_commit_true_commits_even_when_this_process_never_started(self):
+        """Same root cause as above, for stop(): the orchestrating process
+        calls stop(commit=True) on a sandbox whose actual workspace content
+        was written entirely by worker-process tool calls, which never
+        touch the orchestrator's own _started flag. stop() must still find
+        and commit that real work rather than silently skip committing."""
+        import pickle
+
+        orig = _make_backend()
+        restored = None
+        try:
+            worker = pickle.loads(pickle.dumps(orig))
+            worker.write_file("/workspace/data.txt", "from-worker\n")
+            assert orig._started is False  # orchestrator's own copy never ran an exec
+
+            orig.stop(commit=True)
+            assert orig._checkpoint_image is not None, "stop(commit=True) must have committed"
+
+            restored = _make_backend(checkpoint_image=orig._checkpoint_image)
+            assert restored.read_file("/workspace/data.txt") == "from-worker\n"
+        finally:
+            if restored is not None:
+                restored.destroy()
+            if orig._checkpoint_image:
+                _ChrootBackend.delete_image(orig._checkpoint_image, force=True)
+            orig.destroy()
+
     def test_commit_then_new_backend_restores_content(self):
         tag = f"agency/lifecycle-test-{uuid.uuid4().hex[:8]}"
         sb1 = _make_backend()
@@ -495,3 +547,120 @@ class TestAgentSaveLoadWithChrootBackend:
             if ag2 is not None and ag2.sandbox is not None:
                 ag2.sandbox.destroy()
                 agname._allocated.discard(str(ag2.agname))
+
+
+# ---------------------------------------------------------------------------
+# Real ProcessPoolExecutor dispatch -- the actual code path a live agent run
+# uses (run_in_subprocess=True, the default), as opposed to calling a
+# backend's methods directly in-process. This is what surfaced the
+# _ensure_started()/stop() worker-vs-main-process bugs fixed above: calling
+# a tool's .fn() directly, or driving the backend object in one process,
+# never exercises cloudpickle sending a fresh copy of the sandbox to a
+# ProcessPoolExecutor worker for every single call.
+# ---------------------------------------------------------------------------
+
+
+@chroot
+class TestChrootSandboxedToolsDispatch:
+    def _make_sandbox(self):
+        from agency.agconfig import agConfig
+        from agency.agsandbox import agSandbox
+        from agency.agsandbox_backend import agSandboxBackendConfig
+
+        cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
+        return agSandbox(str(uuid.uuid4()), agconfig=cfg)
+
+    def test_files_persist_across_process_pool_tool_calls(self):
+        """Files written by the write tool in one worker process must be
+        readable by the read tool in a subsequent, separately-dispatched
+        worker process call -- the chroot-backend analogue of
+        test_agsandbox.py's identically-named container-backend test."""
+        from agency.agdata import agdata, agerror
+        from agency.tools import make_sandboxed_tools
+
+        sb = self._make_sandbox()
+        tools = {t.name: t for t in make_sandboxed_tools(sb)}
+        try:
+            w = tools["write"](agdata(file_path="/workspace/cross.txt", content="cross-worker\n"))
+            assert not isinstance(w, agerror), f"write failed: {w}"
+            r = tools["read"](agdata(file_path="/workspace/cross.txt"))
+            assert not isinstance(r, agerror), f"read failed after cross-worker write: {r}"
+            assert "cross-worker" in r.content
+        finally:
+            sb.destroy()
+
+    def test_bash_then_read_across_process_pool_tool_calls(self):
+        """A file created by the bash tool in one worker process must be
+        readable by the read tool in the next, separately-dispatched call --
+        matches the exact real-world shape of the bug (agfile.prepare()'s
+        sandbox.write_file() in one dispatch, the read tool in the next)."""
+        from agency.agdata import agdata, agerror
+        from agency.tools import make_sandboxed_tools
+
+        sb = self._make_sandbox()
+        tools = {t.name: t for t in make_sandboxed_tools(sb)}
+        try:
+            b = tools["bash"](
+                agdata(
+                    command="mkdir -p /workspace/inputs && echo hi > /workspace/inputs/full_text_1.txt"
+                )
+            )
+            assert not isinstance(b, agerror), f"bash failed: {b}"
+            r = tools["read"](agdata(file_path="/workspace/inputs/full_text_1.txt"))
+            assert not isinstance(r, agerror), f"read failed after cross-worker bash write: {r}"
+            assert "hi" in r.content
+        finally:
+            sb.destroy()
+
+    def test_agent_run_offloads_and_reads_back_large_input(self):
+        """End-to-end: a real agskill run whose input schema triggers
+        agschema's size-based offload (sandbox.write_file in the prepare
+        step, executed in the calling thread) followed by the LLM calling
+        the read tool (a separate ProcessPoolExecutor dispatch) to read it
+        back -- the exact real-world flow that surfaced this bug."""
+        from agency.agconfig import agConfig
+        from agency.agdata import agdata
+        from agency.agskill import agskill
+        from agency.agschema import agSchemaConfig
+        from agency.agsandbox_backend import agSandboxBackendConfig
+        from agency.agent import agent
+
+        cfg = agConfig(
+            agSandboxBackendConfig(backend="chroot"),
+            agSchemaConfig(input_offload_chars=10),  # force offload for a short string
+            {"agllm_backend": {"api_key": "k", "model": "m"}},
+        )
+
+        skill = agskill(name="repro", system_prompt="", input_schema=agdata(text=str))
+
+        def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
+            # Replicate execute_react()'s real step 2 (input prep) explicitly,
+            # since replacing execute_react wholesale also removes that step
+            # -- it isn't called automatically just because ag.sandbox exists.
+            skill.input_schema.prepare_inputs_in_sandbox(
+                skill_input,
+                ag.sandbox,
+                skill.name,
+                context_limit=ag.llm.context_limit,
+                agconfig=ag.agconfig,
+            )
+            # skill_input.text has now been offloaded to a path reference --
+            # read it back via the same tool-dispatch path a real ReAct loop
+            # (running against an LLM) would use.
+            from agency.tools import make_sandboxed_tools
+
+            tools = {t.name: t for t in make_sandboxed_tools(ag.sandbox)}
+            path = skill_input.text.split("saved to ")[1].split(" —")[0]
+            r = tools["read"](agdata(file_path=path))
+            return agdata(answer=r.content), prev_ctx, []
+
+        skill.execute_react = fake_execute_react
+
+        ag = agent(agconfig=cfg)
+        try:
+            long_text = "x" * 100
+            result = ag.run(skill, agdata(text=long_text)).answer
+            assert long_text in result
+        finally:
+            if ag.sandbox is not None:
+                ag.sandbox.destroy()
