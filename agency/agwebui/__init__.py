@@ -128,6 +128,8 @@ def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
                 try:
                     f.unlink()
                 except FileNotFoundError:
+                    # Command file may already be removed by another actor;
+                    # this cleanup is best-effort.
                     pass
                 except Exception as _e:
                     print(f"[agwebui] WARNING: failed to remove command file {f.name}: {_e}")
