@@ -335,6 +335,52 @@ def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents
     assert team.ag.agconfig.get("agskill", "react_max_steps") == 55
 
 
+def test_dispatch_update_config_all_reaches_grandchild_team_class():
+    """_all_agteam_subclasses() must recurse -- a team class that subclasses
+    another team class (not agteam directly) still has to be reached, since
+    __subclasses__() alone only returns direct subclasses."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+    from agency.agconfig import agConfig
+
+    class _CfgAllTeamMid(agteam):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self): pass
+        def run(self): pass
+
+    class _CfgAllTeamGrandchild(_CfgAllTeamMid):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self): pass
+        def run(self): pass
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 88}},
+    })
+
+    assert _CfgAllTeamMid.agconfig.get("agskill", "react_max_steps") == 88
+    assert _CfgAllTeamGrandchild.agconfig.get("agskill", "react_max_steps") == 88
+
+
+def test_dispatch_update_config_all_skips_team_class_with_no_agconfig():
+    """A team subclass that never overrides agconfig (still None, inherited
+    from the agteam base) must be safely skipped -- not crash, and not
+    somehow acquire a config of its own."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+
+    class _CfgAllTeamNoConfig(agteam):
+        def setup(self): pass
+        def run(self): pass
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 99}},
+    })  # must not raise
+
+    assert _CfgAllTeamNoConfig.agconfig is None
+
+
 def test_poll_commands_applies_and_deletes_command_files(tmp_path):
     from agency.agwebui import _poll_commands
 
