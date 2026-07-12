@@ -8,11 +8,6 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
     from .agent import agent
 
-# States that mean "this agent's worker thread will not make forward
-# progress until something external (a resume, or an upstream producer)
-# unblocks it". Used by agent.is_settled() and the wait_all_* helpers below.
-_SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
-
 # Thread-local pointer to "the agent whose worker thread this is", set for
 # the lifetime of an agskill._task() run. Lets agdata/agcontext attribute a
 # blocking future.result() call to the specific agent that's waiting, so a

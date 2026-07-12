@@ -336,9 +336,6 @@ def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents
 
 
 def test_poll_commands_applies_and_deletes_command_files(tmp_path):
-    import json
-    import threading
-    import time
     from agency.agwebui import _poll_commands
 
     ag = _make_agent()

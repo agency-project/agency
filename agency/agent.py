@@ -69,6 +69,13 @@ def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_defau
     return classvar_default if agconfig is None else agconfig.get("agent", name, classvar_default)
 
 
+# States that mean "this agent's worker thread will not make forward
+# progress until something external (a resume, or an upstream producer)
+# unblocks it". Used by agent.is_settled() -- the wait_all_* helpers in
+# agpause.py never check it directly, they call is_settled() on each agent.
+_SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
+
+
 class agent_state:
     """Single owner of one agent's live status: the display fields a human or
     the webui sees (state/skill/tool), the synchronization primitives pause
@@ -473,7 +480,7 @@ class agent:
                 return True  # cycle guard — shouldn't happen, but never hang on one
             _seen.add(self.agname)
             return producer.is_settled(_seen)
-        return self._state.state in agpause._SETTLED_LEAF_STATES
+        return self._state.state in _SETTLED_LEAF_STATES
 
     def _check_pause(self, skill: "str | None" = None, tool: "str | None" = None) -> None:
         """Checkpoint: block here while a pause is in effect. Called once

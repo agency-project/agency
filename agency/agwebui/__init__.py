@@ -127,8 +127,10 @@ def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
             finally:
                 try:
                     f.unlink()
-                except Exception:
+                except FileNotFoundError:
                     pass
+                except Exception as _e:
+                    print(f"[agwebui] WARNING: failed to remove command file {f.name}: {_e}")
         stop_event.wait(0.2)
 
 
