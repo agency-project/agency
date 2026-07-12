@@ -22,7 +22,6 @@ _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 from .agdata import agdata
 from .agcontext import agcontext
-from . import agpause
 from .aglog import aglog, _ts
 from .agterm import agterm
 from .agsandbox import agSandbox, agSandboxConfig
