@@ -58,6 +58,8 @@ r1 = ag.run(search_skill, agdata(query="..."))   # pending
 r2 = ag.run(summarize_skill, agdata(text=r1))    # r1 resolved here inside _task for r2
 ```
 
+Immediately after — before touching the sandbox — `ag._check_pause(self.name)` runs once. This honors a `pause()` requested before this run even started, so an agent paused while idle never provisions a sandbox or makes an LLM call. See `agent.md`'s "Pause and resume" section for the other checkpoint (once per ReAct-loop iteration, 4d below).
+
 ### 3b. Sandbox provisioning and locking
 
 ```python
@@ -122,6 +124,8 @@ finally:
 ```
 
 The `finally` block always runs. It releases any GPU held by the sandbox, unconditionally commits + stops the container (`stop(commit=True)` snapshots the container to the lifecycle image and removes it — the next skill run, on this agent or whichever one next holds this `agSandbox`, will restore from that image), and finally releases the per-sandbox lock acquired in 3b. The lock release is last so nothing else can touch this sandbox until this skill run's own teardown has fully finished.
+
+`"finished"`/`"error"` are both leaf states `agent.is_settled()` treats as trivially settled (alongside `"inactive"` and `"paused"`) — a `wait_all_paused()` call covering this agent won't block once `_task()` reaches this line, regardless of whether `pause()` was ever called.
 
 ### 3e. Logging, token accounting, future resolution
 
@@ -191,9 +195,11 @@ n_before = len(prev_ctx.messages)
 
 The system message is prepended on every call but never stored — `prev_ctx.messages = messages[1:]` strips it before returning.
 
-### 4d. Per-step: inbox drain
+### 4d. Per-step: pause checkpoint and inbox drain
 
-At the start of each step, `ag._drain_inbox(messages)` drains the agent's `inbox: Queue[str]` — any string pushed by an external orchestrator is appended as a user message. When `had_inbox=True` and the LLM produces text (no tool calls), the loop continues rather than treating it as a final answer.
+Before anything else in the loop body — before tool schemas are even built — `ag._check_pause(self.name)` runs. This is the only place (besides once before the loop starts, in 3a) that a `pause()` request can take effect: it's between steps, never mid-LLM-call or mid-tool-call, so whatever the previous step was doing always finishes first. If `pause()` was called, this blocks until `resume()`; see `agent.md`'s "Pause and resume" section.
+
+Then `ag._drain_inbox(messages)` drains the agent's `inbox: Queue[str]` — any string pushed by an external orchestrator is appended as a user message. When `had_inbox=True` and the LLM produces text (no tool calls), the loop continues rather than treating it as a final answer.
 
 ### 4e. Pre-call compaction
 

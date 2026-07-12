@@ -60,6 +60,23 @@ _team_registry:  dict[str, str] = {}   # team_name -> raw JSON string
 # SQLite helpers (synchronous — called via asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically.
+
+    Path.write_text() opens in truncate mode and then writes -- there is a
+    real window between the truncate and the write completing where a
+    concurrent reader (the execution process's _poll_commands() poll loop,
+    or a test polling the same directory) can glob the file and read back
+    an empty or partial string, raising JSONDecodeError. Writing to a
+    sibling temp file and then os.replace()-ing it into place means readers
+    only ever see the file fully absent or fully written, never in between
+    -- os.replace() is atomic on both POSIX and Windows.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _db_path() -> Path:
     return _run_dir / "ui_events.db"
 
@@ -306,15 +323,15 @@ async def websocket_endpoint(ws: WebSocket):
                     ask_id = str(msg.get("ask_id", ""))
                     text   = str(msg.get("text", ""))
                     if ask_id:
-                        (_reply_dir / f"{ask_id}.txt").write_text(text, encoding="utf-8")
+                        _atomic_write_text(_reply_dir / f"{ask_id}.txt", text)
                 elif mtype in ("pause", "resume", "pause_all", "resume_all"):
                     cmd = {"type": mtype, "agname": msg.get("agname")}
                     cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
-                    cmd_file.write_text(json.dumps(cmd), encoding="utf-8")
+                    _atomic_write_text(cmd_file, json.dumps(cmd))
                 elif mtype in ("update_config", "update_config_all"):
                     cmd = {"type": mtype, "agname": msg.get("agname"), "config": msg.get("config") or {}}
                     cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
-                    cmd_file.write_text(json.dumps(cmd), encoding="utf-8")
+                    _atomic_write_text(cmd_file, json.dumps(cmd))
             except Exception:
                 pass
     except WebSocketDisconnect:
