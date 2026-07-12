@@ -50,8 +50,8 @@ if llm_result.context_exceeded:
 After each LLM response in the ReAct loop, `agskill` checks:
 
 ```python
-# _COMPACT_THRESHOLD = 0.70
-if prompt_tokens >= int(context_limit * _COMPACT_THRESHOLD):
+# _AgLLMFields.COMPACT_THRESHOLD = 0.70 (hardcoded, no agconfig override)
+if _AgLLMFields.should_compact(prompt_tokens, context_limit):
     ag.llm.maybe_compact(...)
 ```
 
@@ -100,7 +100,7 @@ The most recent assistant turns are kept verbatim. The tail is sized by token bu
 
 ```
 tail_budget = clamp(usable * 0.25, min=2_000, max=8_000)   # tokens
-usable = int(context_limit * 0.70)   # matches _COMPACT_THRESHOLD
+usable = int(context_limit * 0.70)   # matches _AgLLMFields.COMPACT_THRESHOLD
 ```
 
 Working backwards, turns (one assistant message + its immediately following tool results) are added to the tail until either:
@@ -210,20 +210,20 @@ When pruning fires, a terminal log line is emitted:
 
 This log is emitted via `ag.terminal.log("PRUNE    ", ...)` inside `_task()`.
 
-The pruning threshold is the same as in-flight pruning (`_PRUNE_MIN_FREE_TOKENS = 20_000` tokens of potential savings). If the history does not contain enough large tool outputs to cross that threshold, the pass is a no-op.
+The pruning threshold is the same as in-flight pruning (`_AgLLMFields.PRUNE_MIN_FREE_TOKENS = 20_000` tokens of potential savings). If the history does not contain enough large tool outputs to cross that threshold, the pass is a no-op.
 
 ## Tuning
 
-Constants in `agllm.py`:
+All defined on `_AgLLMFields` in `agllm.py`. Only `tail_turns` is actually adjustable per-agent (it's a `DynamicConfigParam`, settable via `agconfig.set("agllm", "tail_turns", ...)` or `cfg.agllm.tail_turns = ...`); the other five are plain hardcoded class constants with no agconfig override — despite the section title, changing them means editing `agllm.py` itself, not passing a different `agconfig`.
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `TAIL_TURNS` | `2` | Max recent assistant turns to keep verbatim |
-| `_TAIL_FRACTION` | `0.25` | Fraction of usable context budgeted for the tail |
-| `_TAIL_MIN_TOKENS` | `2_000` | Lower bound on tail token budget |
-| `_TAIL_MAX_TOKENS` | `8_000` | Upper bound on tail token budget |
-| `_TOOL_OUTPUT_MAX_CHARS` | `2_000` | Characters above which a tool result is truncated |
-| `_PRUNE_MIN_FREE_TOKENS` | `20_000` | Pruning only runs if it would free at least this many tokens |
+| `_AgLLMFields.tail_turns` (`DynamicConfigParam`, live-configurable) | `2` | Max recent assistant turns to keep verbatim |
+| `_AgLLMFields.TAIL_FRACTION` (hardcoded) | `0.25` | Fraction of usable context budgeted for the tail |
+| `_AgLLMFields.TAIL_MIN_TOKENS` (hardcoded) | `2_000` | Lower bound on tail token budget |
+| `_AgLLMFields.TAIL_MAX_TOKENS` (hardcoded) | `8_000` | Upper bound on tail token budget |
+| `_AgLLMFields.TOOL_OUTPUT_MAX_CHARS` (hardcoded) | `2_000` | Characters above which a tool result is truncated |
+| `_AgLLMFields.PRUNE_MIN_FREE_TOKENS` (hardcoded) | `20_000` | Pruning only runs if it would free at least this many tokens |
 
 ## Logging
 
