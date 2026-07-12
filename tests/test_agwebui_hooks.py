@@ -1,4 +1,5 @@
 """Tests for agwebui framework hooks — agterm, agent, agteam, ask_human."""
+
 import json
 import sqlite3
 import threading
@@ -14,6 +15,7 @@ from agency.agwebui.emitter import agwebui_emitter
 # ---------------------------------------------------------------------------
 # Fixture: activate a real agwebui emitter as the global singleton
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def active_webui(tmp_path):
@@ -52,34 +54,42 @@ def _events_of(run_dir: Path, etype: str) -> list[dict]:
 # agterm — agent_registered
 # ---------------------------------------------------------------------------
 
+
 def test_agterm_emits_agent_registered(active_webui):
     from agency.agterm import agterm
+
     agterm("__test_reg_agent__")
     regs = _events_of(active_webui, "agent_registered")
     assert any(e["agname"] == "__test_reg_agent__" for e in regs)
 
+
 def test_agterm_registered_event_has_hex_color(active_webui):
     from agency.agterm import agterm
+
     agterm("__test_color_agent__")
     regs = _events_of(active_webui, "agent_registered")
     ev = next(e for e in regs if e["agname"] == "__test_color_agent__")
     assert ev["color"].startswith("#")
-    assert len(ev["color"]) in (4, 7)   # #rgb or #rrggbb
+    assert len(ev["color"]) in (4, 7)  # #rgb or #rrggbb
 
 
 # ---------------------------------------------------------------------------
 # agterm — log routing
 # ---------------------------------------------------------------------------
 
+
 def test_agterm_log_routes_to_emitter(active_webui):
     from agency.agterm import agterm
+
     term = agterm("__test_log_agent__")
     term.log("TEST_EV  ", "unique-payload-xyzzy")
     logs = _events_of(active_webui, "log")
     assert any("unique-payload-xyzzy" in e["line"] for e in logs)
 
+
 def test_agterm_log_does_not_write_to_stderr(active_webui, capsys):
     from agency.agterm import agterm
+
     term = agterm("__test_stderr_agent__")
     term.log("TEST_EV  ", "should-not-appear-on-stderr")
     captured = capsys.readouterr()
@@ -89,6 +99,7 @@ def test_agterm_log_does_not_write_to_stderr(active_webui, capsys):
 # ---------------------------------------------------------------------------
 # agent._set_ui_state hook
 # ---------------------------------------------------------------------------
+
 
 def test_agent_set_ui_state_emits_event(active_webui):
     from agency.agent import agent
@@ -106,7 +117,8 @@ def test_agent_set_ui_state_emits_event(active_webui):
     assert ev is not None
     assert ev["state"] == "llm"
     assert ev["skill"] == "design"
-    assert ev["tool"]  is None
+    assert ev["tool"] is None
+
 
 def test_agent_set_ui_state_inactive(active_webui):
     from agency.agent import agent
@@ -128,6 +140,7 @@ def test_agent_set_ui_state_inactive(active_webui):
 # agent._push_live_messages hook
 # ---------------------------------------------------------------------------
 
+
 def test_agent_push_live_messages_emits_snapshot(active_webui):
     from agency.agent import agent
 
@@ -142,6 +155,7 @@ def test_agent_push_live_messages_emits_snapshot(active_webui):
     ev = next((e for e in snaps if e["agname"] == "__test_msgs_agent__"), None)
     assert ev is not None
     assert ev["messages"] == msgs
+
 
 def test_agent_push_live_messages_updates_snapshot(active_webui):
     from agency.agent import agent
@@ -159,11 +173,16 @@ def test_agent_push_live_messages_updates_snapshot(active_webui):
 # agent._emit_config — pushes dynamic_snapshot() to the webui
 # ---------------------------------------------------------------------------
 
+
 def test_agent_construction_emits_config(active_webui):
     from agency.agent import agent
     from agency.agconfig import agConfig
 
-    ag = agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}, "agskill": {"react_max_steps": 3}}))
+    ag = agent(
+        agconfig=agConfig(
+            {"agllm_backend": {"api_key": "k", "model": ""}, "agskill": {"react_max_steps": 3}}
+        )
+    )
 
     configs = _events_of(active_webui, "agent_config")
     ev = next((e for e in configs if e["agname"] == ag.agname), None)
@@ -186,14 +205,17 @@ def test_change_config_re_emits_config(active_webui):
 # agwebui command dispatch — pause/resume/pause_all/resume_all
 # ---------------------------------------------------------------------------
 
+
 def _make_agent():
     from agency.agent import agent
     from agency.agconfig import agConfig
+
     return agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}}))
 
 
 def test_dispatch_pause_command_pauses_named_agent():
     from agency.agwebui import _dispatch_command
+
     ag = _make_agent()
     _dispatch_command({"type": "pause", "agname": ag.agname})
     assert not ag._state.run_allowed.is_set()
@@ -201,6 +223,7 @@ def test_dispatch_pause_command_pauses_named_agent():
 
 def test_dispatch_resume_command_resumes_named_agent():
     from agency.agwebui import _dispatch_command
+
     ag = _make_agent()
     ag.pause()
     _dispatch_command({"type": "resume", "agname": ag.agname})
@@ -209,6 +232,7 @@ def test_dispatch_resume_command_resumes_named_agent():
 
 def test_dispatch_pause_command_ignores_unknown_agname():
     from agency.agwebui import _dispatch_command
+
     ag = _make_agent()
     _dispatch_command({"type": "pause", "agname": "__no_such_agent__"})
     assert ag._state.run_allowed.is_set()  # untouched
@@ -216,6 +240,7 @@ def test_dispatch_pause_command_ignores_unknown_agname():
 
 def test_dispatch_pause_all_pauses_every_live_agent():
     from agency.agwebui import _dispatch_command
+
     a, b = _make_agent(), _make_agent()
     _dispatch_command({"type": "pause_all"})
     assert not a._state.run_allowed.is_set()
@@ -224,6 +249,7 @@ def test_dispatch_pause_all_pauses_every_live_agent():
 
 def test_dispatch_resume_all_resumes_every_live_agent():
     from agency.agwebui import _dispatch_command
+
     a, b = _make_agent(), _make_agent()
     a.pause()
     b.pause()
@@ -234,32 +260,43 @@ def test_dispatch_resume_all_resumes_every_live_agent():
 
 def test_dispatch_update_config_applies_to_named_agent():
     from agency.agwebui import _dispatch_command
+
     ag = _make_agent()
-    _dispatch_command({
-        "type": "update_config", "agname": ag.agname,
-        "config": {"agskill": {"react_max_steps": 7}},
-    })
+    _dispatch_command(
+        {
+            "type": "update_config",
+            "agname": ag.agname,
+            "config": {"agskill": {"react_max_steps": 7}},
+        }
+    )
     assert ag.agconfig.get("agskill", "react_max_steps") == 7
 
 
 def test_dispatch_update_config_ignores_unknown_agname():
     from agency.agwebui import _dispatch_command
+
     ag = _make_agent()
     before = ag.agconfig.get("agskill", "react_max_steps")
-    _dispatch_command({
-        "type": "update_config", "agname": "__no_such_agent__",
-        "config": {"agskill": {"react_max_steps": 999}},
-    })
+    _dispatch_command(
+        {
+            "type": "update_config",
+            "agname": "__no_such_agent__",
+            "config": {"agskill": {"react_max_steps": 999}},
+        }
+    )
     assert ag.agconfig.get("agskill", "react_max_steps") == before
 
 
 def test_dispatch_update_config_all_applies_to_every_agent():
     from agency.agwebui import _dispatch_command
+
     a, b = _make_agent(), _make_agent()
-    _dispatch_command({
-        "type": "update_config_all",
-        "config": {"agskill": {"react_max_steps": 11}},
-    })
+    _dispatch_command(
+        {
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 11}},
+        }
+    )
     assert a.agconfig.get("agskill", "react_max_steps") == 11
     assert b.agconfig.get("agskill", "react_max_steps") == 11
 
@@ -275,10 +312,12 @@ def test_dispatch_update_config_all_mutates_default_agconfig():
     saved = agent.default_agconfig
     try:
         agent.default_agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
-        _dispatch_command({
-            "type": "update_config_all",
-            "config": {"agskill": {"react_max_steps": 123}},
-        })
+        _dispatch_command(
+            {
+                "type": "update_config_all",
+                "config": {"agskill": {"react_max_steps": 123}},
+            }
+        )
         assert agent.default_agconfig.get("agskill", "react_max_steps") == 123
     finally:
         agent.default_agconfig = saved
@@ -295,13 +334,19 @@ def test_dispatch_update_config_all_mutates_team_class_attr_for_future_construct
 
     class _CfgAllTeamA(agteam):
         agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
-        def setup(self): pass
-        def run(self): pass
 
-    _dispatch_command({
-        "type": "update_config_all",
-        "config": {"agskill": {"react_max_steps": 77}},
-    })
+        def setup(self):
+            pass
+
+        def run(self):
+            pass
+
+    _dispatch_command(
+        {
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 77}},
+        }
+    )
     assert _CfgAllTeamA.agconfig.get("agskill", "react_max_steps") == 77
 
     # Constructed AFTER the update -- clones the now-updated class attribute.
@@ -320,16 +365,21 @@ def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents
 
     class _CfgAllTeamB(agteam):
         agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+
         def setup(self):
             self.ag = agent_cls()
-        def run(self): pass
+
+        def run(self):
+            pass
 
     team = _CfgAllTeamB()  # constructed before the update -- already cloned
 
-    _dispatch_command({
-        "type": "update_config_all",
-        "config": {"agskill": {"react_max_steps": 55}},
-    })
+    _dispatch_command(
+        {
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 55}},
+        }
+    )
 
     assert team.agconfig.get("agskill", "react_max_steps") == 55
     assert team.ag.agconfig.get("agskill", "react_max_steps") == 55
@@ -345,18 +395,28 @@ def test_dispatch_update_config_all_reaches_grandchild_team_class():
 
     class _CfgAllTeamMid(agteam):
         agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
-        def setup(self): pass
-        def run(self): pass
+
+        def setup(self):
+            pass
+
+        def run(self):
+            pass
 
     class _CfgAllTeamGrandchild(_CfgAllTeamMid):
         agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
-        def setup(self): pass
-        def run(self): pass
 
-    _dispatch_command({
-        "type": "update_config_all",
-        "config": {"agskill": {"react_max_steps": 88}},
-    })
+        def setup(self):
+            pass
+
+        def run(self):
+            pass
+
+    _dispatch_command(
+        {
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 88}},
+        }
+    )
 
     assert _CfgAllTeamMid.agconfig.get("agskill", "react_max_steps") == 88
     assert _CfgAllTeamGrandchild.agconfig.get("agskill", "react_max_steps") == 88
@@ -370,13 +430,18 @@ def test_dispatch_update_config_all_skips_team_class_with_no_agconfig():
     from agency.agteam import agteam
 
     class _CfgAllTeamNoConfig(agteam):
-        def setup(self): pass
-        def run(self): pass
+        def setup(self):
+            pass
 
-    _dispatch_command({
-        "type": "update_config_all",
-        "config": {"agskill": {"react_max_steps": 99}},
-    })  # must not raise
+        def run(self):
+            pass
+
+    _dispatch_command(
+        {
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 99}},
+        }
+    )  # must not raise
 
     assert _CfgAllTeamNoConfig.agconfig is None
 
@@ -407,6 +472,7 @@ def test_poll_commands_applies_and_deletes_command_files(tmp_path):
 # agteam — team_registered
 # ---------------------------------------------------------------------------
 
+
 def test_agteam_emits_team_registered(active_webui):
     import agency.agwebui as agwebui_mod
 
@@ -422,17 +488,23 @@ def test_agteam_emits_team_registered(active_webui):
     from agency.agteam import agteam as agteam_cls
 
     class _MinimalTeam(agteam_cls):
-        def setup(self): pass
-        def run(self): pass
+        def setup(self):
+            pass
 
-    with patch("agency.agname.agname.allocate_agname", return_value="MinimalTeam_0000"), \
-         patch("agency.aglog.aglog.__init__", return_value=None), \
-         patch("agency.aglog.aglog._lifecycle", return_value=None):
+        def run(self):
+            pass
+
+    with (
+        patch("agency.agname.agname.allocate_agname", return_value="MinimalTeam_0000"),
+        patch("agency.aglog.aglog.__init__", return_value=None),
+        patch("agency.aglog.aglog._lifecycle", return_value=None),
+    ):
         team = _MinimalTeam.__new__(_MinimalTeam)
         team._agents = set()
         team.team_name = "MinimalTeam_0000"
         # Directly call the post-setup hook
         import agency.agwebui as _agwebui2
+
         if _agwebui2._active is not None:
             _agwebui2._active.emitter.team_registered(
                 team.team_name,
@@ -446,6 +518,7 @@ def test_agteam_emits_team_registered(active_webui):
 # ---------------------------------------------------------------------------
 # ask_human tool — web UI path
 # ---------------------------------------------------------------------------
+
 
 def test_ask_human_uses_file_reply_when_webui_active(active_webui):
     from agency.tools.human import make_ask_human
@@ -469,6 +542,7 @@ def test_ask_human_uses_file_reply_when_webui_active(active_webui):
     threading.Thread(target=_write_reply, daemon=True).start()
     result = tool.fn(agdata(question="Use the file path?"))
     assert result.reply == "file reply"
+
 
 def test_ask_human_emits_ask_event(active_webui):
     from agency.tools.human import make_ask_human

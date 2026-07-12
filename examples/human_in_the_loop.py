@@ -23,6 +23,7 @@ Usage:
     uv run python examples/human_in_the_loop.py
     LLM_MODEL=gpt-4o uv run python examples/human_in_the_loop.py
 """
+
 from __future__ import annotations
 
 import os
@@ -52,6 +53,7 @@ cfg = agConfig(
 # Human interaction helpers
 # ---------------------------------------------------------------------------
 
+
 def _is_approved(reply: str) -> bool:
     """Strict approval check — only 'yes' or 'y' counts, nothing else."""
     return reply.strip().lower() in ("yes", "y")
@@ -66,11 +68,12 @@ def _ask(ask_human_tool, question: str) -> str:
 # File helpers — overwrite a scene's section in place
 # ---------------------------------------------------------------------------
 
+
 def _update_section(path: Path, marker: str, content: str) -> None:
     """Insert or replace a marked section in a file."""
-    block   = f"{marker}\n\n{content.strip()}\n\n"
+    block = f"{marker}\n\n{content.strip()}\n\n"
     pattern = rf"{re.escape(marker)}.*?(?={re.escape('## Scene ') if '##' in marker else re.escape('=== Scene ')}|\Z)"
-    text    = path.read_text(encoding="utf-8") if path.exists() else ""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
     if marker in text:
         text = re.sub(pattern, block, text, flags=re.DOTALL)
     else:
@@ -90,12 +93,13 @@ def save_scene(path: Path, scene_num: int, text: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
-    ts      = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_human_in_the_loop"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    agent.log_dir    = run_dir / "logs"
+    agent.log_dir = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
 
     plans_path = run_dir / "plans.md"
@@ -108,7 +112,7 @@ def main() -> None:
     # ── Agents ───────────────────────────────────────────────────────────────
 
     planner = agent(agconfig=cfg, agname="PlannerAgent")
-    writer  = agent(agconfig=cfg, agname="WriterAgent")
+    writer = agent(agconfig=cfg, agname="WriterAgent")
 
     # ask_human_tool runs in-process (run_in_subprocess=False) so it can reach
     # the live webUI singleton.
@@ -158,7 +162,7 @@ def main() -> None:
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
-    scene_num      = 1
+    scene_num = 1
     previous_story = ""
 
     while True:
@@ -167,7 +171,9 @@ def main() -> None:
         print(f"{'─' * 60}")
 
         # ── Step 1: Ask human for scene description (Python-level) ───────────
-        print(f"[Scene {scene_num}] Waiting for scene description from human... (Please use the webUI to interact with the agent.)")
+        print(
+            f"[Scene {scene_num}] Waiting for scene description from human... (Please use the webUI to interact with the agent.)"
+        )
         scene_description = _ask(
             ask_human_tool,
             f"What scene would you like written next? "
@@ -186,8 +192,11 @@ def main() -> None:
         plan_feedback = ""
         plan = ""
         while True:
-            print(f"[Scene {scene_num}] Generating plan"
-                  + (" (with revision feedback)" if plan_feedback else "") + "...")
+            print(
+                f"[Scene {scene_num}] Generating plan"
+                + (" (with revision feedback)" if plan_feedback else "")
+                + "..."
+            )
             plan_result = planner.run(
                 plan_skill,
                 agdata(

@@ -28,6 +28,7 @@ See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 Run:
     uv run python examples/config_example.py
 """
+
 import os
 import time
 from datetime import datetime
@@ -95,7 +96,7 @@ def main():
         r1 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=3)
         print(f"Path    : {r1.path!r}\n")
         print(f"Content : {r1.content!r}\n")
-        print(f"Execution succeeded.\n")
+        print("Execution succeeded.\n")
     except Exception as e:
         # Accessing a field on a pending agdata blocks until the task
         # finishes; if the ReAct loop exhausted max_steps without a complete
@@ -105,7 +106,9 @@ def main():
     # ag.llm.backend re-reads max_completion_tokens fresh on every call, so
     # ag.change_config(new_cfg) makes the bump visible on the very next LLM
     # call -- no new agent, no sandbox teardown needed.
-    print("Bumping max_completion_tokens: 32 -> 4096 (dynamic update via ag.change_config, same agent)\n")
+    print(
+        "Bumping max_completion_tokens: 32 -> 4096 (dynamic update via ag.change_config, same agent)\n"
+    )
     new_cfg = agConfig(
         agVLLMBackendConfig(
             base_url=os.environ.get("LLM_BASE_URL"),
@@ -126,11 +129,12 @@ def main():
         r2 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=3)
         print(f"Path    : {r2.path!r}\n")
         print(f"Content : {r2.content!r}\n")
-        print(f"Execution succeeded.\n")
+        print("Execution succeeded.\n")
     except Exception as e:
         print(f"Failed unexpectedly: {e}\n")
 
 
 if __name__ == "__main__":
     from agency.agwebui import agwebui
+
     agwebui.run(main, port=8003)

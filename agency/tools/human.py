@@ -24,6 +24,7 @@ def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) ->
 
         def _find_agent():
             from ..agent import agent as Agent
+
             for a in Agent.all():
                 if a.agname == agname:
                     return a
@@ -35,11 +36,14 @@ def make_ask_human(agname: str, timeout_s: float | None = _DEFAULT_TIMEOUT_S) ->
             a._set_ui_state("human", skill=prev_skill)
 
         from .. import agwebui as _agwebui
+
         if _agwebui._active is not None:
             import uuid as _uuid
+
             ask_id = _uuid.uuid4().hex[:ASK_ID_HEX_LENGTH]
-            reply = _agwebui._active.emitter.ask_human(agname, ask_id, question,
-                                                       timeout_s=timeout_s)
+            reply = _agwebui._active.emitter.ask_human(
+                agname, ask_id, question, timeout_s=timeout_s
+            )
         else:
             print(f"\n[{agname}] asks: {question}")
             q: queue.SimpleQueue[str] = queue.SimpleQueue()

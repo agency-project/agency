@@ -1,4 +1,5 @@
 """Tests for agfile — file-backed agskill schema field."""
+
 import json
 from unittest.mock import MagicMock, patch
 from agency.agdata import agdata, agerror
@@ -15,6 +16,7 @@ LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
 
 def _make_mock_agent(llm=None, sandbox=None):
     from agency.agent import agent as _agent_cls
+
     class _Cls:
         agresource_pool = MagicMock()
         ping_interval_s = 300
@@ -22,8 +24,10 @@ def _make_mock_agent(llm=None, sandbox=None):
         agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
         _check_pause = _agent_cls._check_pause
+
     ag = _Cls()
     from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
+
     ag._state = _agent_state_cls("test")
     ag.llm = llm or LLM
     ag.sandbox = sandbox if sandbox is not None else MagicMock()
@@ -43,6 +47,7 @@ def _make_mock_agent(llm=None, sandbox=None):
 # Streaming mock helpers
 # ---------------------------------------------------------------------------
 
+
 class _Delta:
     def __init__(self, content=None, tool_calls=None):
         self.content = content
@@ -50,16 +55,23 @@ class _Delta:
         self.model_extra = {}
         self.reasoning_content = None
 
+
 class _Choice:
-    def __init__(self, delta): self.delta = delta
+    def __init__(self, delta):
+        self.delta = delta
+
 
 class _Usage:
     prompt_tokens = 5
 
+
 class _Chunk:
     def __init__(self, content=None, tool_calls=None, usage=None):
-        self.choices = [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        self.choices = (
+            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        )
         self.usage = usage
+
 
 class _TCDelta:
     def __init__(self, name, args_json, call_id):
@@ -67,11 +79,16 @@ class _TCDelta:
         self.index = 0
         self.function = _TCFnDelta(name, args_json)
 
+
 class _TCFnDelta:
-    def __init__(self, name, args): self.name = name; self.arguments = args
+    def __init__(self, name, args):
+        self.name = name
+        self.arguments = args
+
 
 def _direct(content: str):
     return [_Chunk(content=content), _Chunk(usage=_Usage())]
+
 
 def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
     tc = _TCDelta(name, json.dumps(args), call_id)
@@ -82,19 +99,24 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
 # agfile class
 # ---------------------------------------------------------------------------
 
+
 def test_agfile_is_agtype_subclass():
     assert issubclass(agfile, agtype)
+
 
 def test_agfile_schema_type():
     assert agfile.schema_type() == "file"
 
+
 def test_agfile_needs_sandbox():
     assert agfile.needs_sandbox() is True
+
 
 def test_agfile_extra_input_prompt_mentions_read_tool():
     prompt = agfile.extra_input_prompt("background")
     assert "background" in prompt
     assert "read tool" in prompt
+
 
 def test_agfile_extra_output_prompt_mentions_write():
     prompt = agfile.extra_output_prompt("report", "design")
@@ -102,18 +124,19 @@ def test_agfile_extra_output_prompt_mentions_write():
     assert "write" in prompt.lower()
     assert "report.txt" in prompt
 
+
 def test_agfile_extra_output_prompt_mentions_chunked_writes():
     prompt = agfile.extra_output_prompt("doc", "write")
     assert "multiple" in prompt.lower() or "append" in prompt.lower() or "chunk" in prompt.lower()
 
+
 def test_agfile_prepare_writes_to_sandbox_and_returns_path():
     sandbox = MagicMock()
     val, paths = agfile.prepare("file content", sandbox, "miskill", "myfield")
-    sandbox.write_file.assert_called_once_with(
-        "/workspace/inputs/myfield.txt", "file content"
-    )
+    sandbox.write_file.assert_called_once_with("/workspace/inputs/myfield.txt", "file content")
     assert val == "/workspace/inputs/myfield.txt"
     assert paths == ["/workspace/inputs/myfield.txt"]
+
 
 def test_agfile_prepare_non_string_passthrough():
     sandbox = MagicMock()
@@ -122,12 +145,14 @@ def test_agfile_prepare_non_string_passthrough():
     assert val == 42
     assert paths == []
 
+
 def test_agfile_prepare_sandbox_failure_leaves_value_unchanged():
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("disk full")
     val, paths = agfile.prepare("content", sandbox, "skill", "field")
     assert val == "content"
     assert paths == []
+
 
 def test_agfile_recover_reads_from_sandbox_and_returns_content():
     sandbox = MagicMock()
@@ -137,12 +162,14 @@ def test_agfile_recover_reads_from_sandbox_and_returns_content():
     assert val == "recovered content"
     assert paths == ["/workspace/outputs/skill_field.txt"]
 
+
 def test_agfile_recover_non_string_passthrough():
     sandbox = MagicMock()
     val, paths = agfile.recover(None, sandbox)
     sandbox.read_file.assert_not_called()
     assert val is None
     assert paths == []
+
 
 def test_agfile_recover_sandbox_failure_leaves_path_unchanged():
     sandbox = MagicMock()
@@ -156,6 +183,7 @@ def test_agfile_recover_sandbox_failure_leaves_path_unchanged():
 # agdata serialization
 # ---------------------------------------------------------------------------
 
+
 def test_agdata_serializes_agfile_as_file():
     d = agdata(doc=agfile)
     assert json.loads(d.to_json()) == {"doc": "file"}
@@ -165,8 +193,10 @@ def test_agdata_serializes_agfile_as_file():
 # agskill.check_schema — agfile hints
 # ---------------------------------------------------------------------------
 
+
 def test_check_schema_agfile_hint_accepts_string():
     assert agschema(agdata(doc=agfile)).check(agdata(doc="/workspace/out.txt")) == []
+
 
 def test_check_schema_agfile_hint_rejects_non_string():
     errors = agschema(agdata(doc=agfile)).check(agdata(doc=123))
@@ -178,9 +208,11 @@ def test_check_schema_agfile_hint_rejects_non_string():
 # agskill._build_system_prompt — agfile prompts injected
 # ---------------------------------------------------------------------------
 
+
 def test_system_prompt_includes_agfile_input_instructions():
     sk = agskill(
-        "design", "Do stuff.",
+        "design",
+        "Do stuff.",
         input_schema=agdata(background=agfile),
         output_schema=agdata(result=str),
     )
@@ -189,9 +221,11 @@ def test_system_prompt_includes_agfile_input_instructions():
     assert "background" in prompt
     assert "read tool" in prompt
 
+
 def test_system_prompt_includes_agfile_output_instructions():
     sk = agskill(
-        "design", "Do stuff.",
+        "design",
+        "Do stuff.",
         input_schema=agdata(theme=str),
         output_schema=agdata(report=agfile),
     )
@@ -200,10 +234,12 @@ def test_system_prompt_includes_agfile_output_instructions():
     assert "report" in prompt
     assert "write" in prompt.lower()
 
+
 def test_system_prompt_no_agfile_fields_no_file_backed_warning():
     sk = agskill("t", "Do stuff.", input_schema=agdata(x=str), output_schema=agdata(y=int))
     prompt = sk._build_system_prompt()
     assert "File-backed" not in prompt
+
 
 def test_system_prompt_agfile_type_shown_as_file():
     sk = agskill("t", "", input_schema=agdata(doc=agfile))
@@ -214,6 +250,7 @@ def test_system_prompt_agfile_type_shown_as_file():
 # ---------------------------------------------------------------------------
 # agskill ReAct loop — agfile output schema accepts path string
 # ---------------------------------------------------------------------------
+
 
 def test_skill_with_agfile_output_schema_validates_path_string():
     sk = agskill("write", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
@@ -234,6 +271,7 @@ def test_skill_with_agfile_output_schema_validates_path_string():
 # _prepare_agtype_inputs / _recover_agtype_outputs
 # ---------------------------------------------------------------------------
 
+
 def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
     sandbox = MagicMock()
     inp = agdata(theme="space opera", background="long background text")
@@ -246,12 +284,13 @@ def test_prepare_agtype_inputs_calls_prepare_on_agfile_fields():
     assert inp._data["theme"] == "space opera"
     assert len(paths) == 1
 
+
 def test_prepare_agtype_inputs_no_schema_returns_empty():
     sandbox = MagicMock()
-    inp = agdata(x="hello")
     paths = []  # no schema = no agtype inputs to prepare
     assert paths == []
     sandbox.write_file.assert_not_called()
+
 
 def test_recover_agtype_outputs_reads_file_and_replaces_path():
     sandbox = MagicMock()
@@ -262,6 +301,7 @@ def test_recover_agtype_outputs_reads_file_and_replaces_path():
     assert result._data["report"] == "report content"
     assert paths == ["/workspace/outputs/design_report.txt"]
 
+
 def test_recover_agtype_outputs_skips_error_result():
     sandbox = MagicMock()
     result = agerror("something went wrong")
@@ -270,9 +310,9 @@ def test_recover_agtype_outputs_skips_error_result():
     sandbox.read_file.assert_not_called()
     assert paths == []
 
+
 def test_recover_agtype_outputs_no_schema_returns_empty():
     sandbox = MagicMock()
-    result = agdata(report="/some/path.txt")
     # no schema = no recovery needed
     paths = []
     assert paths == []
@@ -282,6 +322,7 @@ def test_recover_agtype_outputs_no_schema_returns_empty():
 # ---------------------------------------------------------------------------
 # return_<field> tool — agfile validation during the tool call
 # ---------------------------------------------------------------------------
+
 
 def _run_skill_with_sandbox(skill, responses, sandbox):
     """Helper: run skill with mocked LLM and a provided sandbox."""
@@ -378,6 +419,7 @@ def test_return_agfile_valid_content_is_accepted():
 # return_<field> tool — str auto-resolution of path values
 # ---------------------------------------------------------------------------
 
+
 def test_return_str_with_path_auto_resolves_to_content():
     """return_code called with a file path should silently resolve to file content."""
     sandbox = MagicMock()
@@ -437,8 +479,10 @@ def test_return_str_resolved_content_that_is_itself_a_path_is_not_substituted():
 # _looks_like_path
 # ---------------------------------------------------------------------------
 
+
 def test_looks_like_path_detects_workspace_paths():
     from agency.agutil import _looks_like_path
+
     assert _looks_like_path("/workspace/core.py")
     assert _looks_like_path("/workspace/outputs/report.txt")
     assert _looks_like_path("/tmp/scratch.py")
@@ -448,12 +492,14 @@ def test_looks_like_path_detects_workspace_paths():
 
 def test_looks_like_path_rejects_multiline():
     from agency.agutil import _looks_like_path
+
     assert not _looks_like_path("def main():\n    pass\n")
     assert not _looks_like_path("/workspace/file.py\nextra content")
 
 
 def test_looks_like_path_rejects_non_absolute():
     from agency.agutil import _looks_like_path
+
     assert not _looks_like_path("relative/path.py")
     assert not _looks_like_path("just some text")
     assert not _looks_like_path("")
@@ -461,6 +507,7 @@ def test_looks_like_path_rejects_non_absolute():
 
 def test_looks_like_path_rejects_paths_with_spaces():
     from agency.agutil import _looks_like_path
+
     # Old heuristic would accept these; new regex rejects them
     assert not _looks_like_path("/this is not a path")
     assert not _looks_like_path("/workspace/file.py extra text")
@@ -469,10 +516,9 @@ def test_looks_like_path_rejects_paths_with_spaces():
 
 def test_looks_like_path_single_segment():
     from agency.agutil import _looks_like_path
+
     assert _looks_like_path("/bin")
     assert _looks_like_path("/a")
     assert _looks_like_path("/tmp")
     assert _looks_like_path("/tmp/file.txt")
     assert _looks_like_path("/a/b/c")
-
-

@@ -12,7 +12,9 @@ _MAX_TIMEOUT = 120
 def _run(arg: agdata) -> agdata:
     url: str = str(arg.url)  # type: ignore[arg-type]
     fmt: str = str(getattr(arg, "format", "markdown") or "markdown")
-    timeout: int = min(int(getattr(arg, "timeout", _DEFAULT_TIMEOUT) or _DEFAULT_TIMEOUT), _MAX_TIMEOUT)
+    timeout: int = min(
+        int(getattr(arg, "timeout", _DEFAULT_TIMEOUT) or _DEFAULT_TIMEOUT), _MAX_TIMEOUT
+    )
 
     if not url.startswith(("http://", "https://")):
         return agerror("URL must start with http:// or https://")
@@ -67,7 +69,10 @@ webfetch = agtool(
                 "enum": ["markdown", "text", "html"],
                 "description": "Output format (default: markdown)",
             },
-            "timeout": {"type": "integer", "description": "Timeout in seconds (max 120, default 30)"},
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds (max 120, default 30)",
+            },
         },
         "required": ["url"],
     },

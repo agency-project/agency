@@ -4,6 +4,7 @@ Users write ``agdata(task=str)`` at call sites (making it clear that skills
 receive/return ``agdata``).  ``agskill.__init__`` converts these to ``agschema``
 internally.  All internal schema operations use ``agschema``.
 """
+
 from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Callable
@@ -87,9 +88,7 @@ class agschema:
         elif isinstance(source, agdata):
             self._data = dict(source._data)
         else:
-            raise TypeError(
-                f"agschema requires agdata or agschema, got {type(source).__name__}"
-            )
+            raise TypeError(f"agschema requires agdata or agschema, got {type(source).__name__}")
 
     # ------------------------------------------------------------------
     # Serialization helpers (used by agskill system prompt)
@@ -123,12 +122,16 @@ class agschema:
                     continue
                 for i, item in enumerate(actual):
                     if not isinstance(item, dict):
-                        errors.append(f"field '{key}[{i}]': expected dict, got {type(item).__name__}")
+                        errors.append(
+                            f"field '{key}[{i}]': expected dict, got {type(item).__name__}"
+                        )
                         continue
                     for item_key, item_type in item_template.items():
                         if item_key not in item:
                             errors.append(f"field '{key}[{i}]': missing key '{item_key}'")
-                        elif isinstance(item_type, type) and not isinstance(item[item_key], item_type):
+                        elif isinstance(item_type, type) and not isinstance(
+                            item[item_key], item_type
+                        ):
                             errors.append(
                                 f"field '{key}[{i}].{item_key}': expected {item_type.__name__}, "
                                 f"got {type(item[item_key]).__name__}"
@@ -190,7 +193,14 @@ class agschema:
         _schema_fields = _AgSchemaFields(agconfig)
         _input_offload_chars = _schema_fields.input_offload_chars
         _threshold = (
-            min(_input_offload_chars, int(context_limit * _schema_fields.offload_context_fraction * _schema_fields.chars_per_token))
+            min(
+                _input_offload_chars,
+                int(
+                    context_limit
+                    * _schema_fields.offload_context_fraction
+                    * _schema_fields.chars_per_token
+                ),
+            )
             if context_limit
             else _input_offload_chars
         )
@@ -204,8 +214,11 @@ class agschema:
                     try:
                         return h.prepare(v, sandbox, skill_name, _key, suffix=suffix)
                     except Exception as _e:
-                        print(f"[agent] WARNING: {h.__name__}.prepare failed for field '{_key}': {_e}")
+                        print(
+                            f"[agent] WARNING: {h.__name__}.prepare failed for field '{_key}': {_e}"
+                        )
                         return v, []
+
                 new_val, written = agtype.walk(hint, data._data.get(key), on_leaf)
                 if written or new_val is not data._data.get(key):
                     data._data[key] = new_val
@@ -224,7 +237,9 @@ class agschema:
                             all_paths.append(path)
                             auto_offloaded_fields.append(key)
                         except Exception as _e:
-                            print(f"[agent] WARNING: failed to offload input field '{key}' to {path}: {_e}")
+                            print(
+                                f"[agent] WARNING: failed to offload input field '{key}' to {path}: {_e}"
+                            )
                 elif isinstance(val, list):
                     new_vals = list(val)
                     offloaded_any = False
@@ -238,7 +253,9 @@ class agschema:
                             all_paths.append(path)
                             offloaded_any = True
                         except Exception as _e:
-                            print(f"[agent] WARNING: failed to offload input list field '{key}[{i}]' to {path}: {_e}")
+                            print(
+                                f"[agent] WARNING: failed to offload input list field '{key}[{i}]' to {path}: {_e}"
+                            )
                     if offloaded_any:
                         data._data[key] = new_vals
                         auto_offloaded_fields.append(key)
@@ -260,12 +277,14 @@ class agschema:
             return []
         paths: list[str] = []
         for key, hint in self._data.items():
+
             def on_leaf(h, v, _key=key):
                 try:
                     return h.recover(v, sandbox)
                 except Exception as _e:
                     print(f"[agent] WARNING: {h.__name__}.recover failed for field '{_key}': {_e}")
                     return v, []
+
             new_val, written = agtype.walk(hint, data._data.get(key), on_leaf)
             if written or new_val is not data._data.get(key):
                 data._data[key] = new_val
@@ -333,17 +352,27 @@ class agschema:
             json_type = type_hint_to_string_type(hint)
             tool_desc, value_desc = get_return_tool_description_prompt(field, hint)
             value_schema: dict = {"type": json_type, "description": value_desc}
-            handler = self.make_field_handler(field, sandbox, collected_outputs, required_fields, exec_timeout)
+            handler = self.make_field_handler(
+                field, sandbox, collected_outputs, required_fields, exec_timeout
+            )
+
             def _fn(arg, _h=handler):
                 return agdata.from_json(_h(arg._data))
-            tools.append(_agtool(
-                name=f"return_{field}",
-                description=tool_desc,
-                fn=_fn,
-                params={"type": "object", "properties": {field: value_schema}, "required": [field]},
-                log_fn=_return_log_fn,
-                run_in_subprocess=False,
-            ))
+
+            tools.append(
+                _agtool(
+                    name=f"return_{field}",
+                    description=tool_desc,
+                    fn=_fn,
+                    params={
+                        "type": "object",
+                        "properties": {field: value_schema},
+                        "required": [field],
+                    },
+                    log_fn=_return_log_fn,
+                    run_in_subprocess=False,
+                )
+            )
         return tools
 
     def make_return_output_tools(self) -> list[dict]:
@@ -353,18 +382,20 @@ class agschema:
             json_type = type_hint_to_string_type(hint)
             tool_desc, value_desc = get_return_tool_description_prompt(field, hint)
             value_schema: dict = {"type": json_type, "description": value_desc}
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": f"return_{field}",
-                    "description": tool_desc,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {field: value_schema},
-                        "required": [field],
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": f"return_{field}",
+                        "description": tool_desc,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {field: value_schema},
+                            "required": [field],
+                        },
                     },
-                },
-            })
+                }
+            )
         return tools
 
     # ------------------------------------------------------------------
@@ -388,12 +419,14 @@ class agschema:
 
             err = self.check_field(field_name, value)
             if err is not None:
-                return json.dumps({
-                    "error": (
-                        f"field_name '{field_name}': {err}. "
-                        f"{_type_error_fix(field_name, type_hint, value)}"
-                    )
-                })
+                return json.dumps(
+                    {
+                        "error": (
+                            f"field_name '{field_name}': {err}. "
+                            f"{_type_error_fix(field_name, type_hint, value)}"
+                        )
+                    }
+                )
 
             if agtype_cls is not None:
                 err = agtype_cls.validate_output(field_name, value, sandbox, exec_timeout)
@@ -420,14 +453,22 @@ class agschema:
             remaining = required_fields - set(collected_outputs)
             if remaining:
                 _remaining_tools = ", ".join(f"return_{f}" for f in sorted(remaining))
-                return json.dumps({"result": (
-                    f"[HARNESS SYSTEM] ✓ '{field_name}' registered. "
-                    f"Still needed: {sorted(remaining)}, call {_remaining_tools} tool(s)."
-                )})
-            return json.dumps({"result": (
-                f"[HARNESS SYSTEM] ✓ '{field_name}' registered. "
-                f"All required fields complete, please end your response now."
-            )})
+                return json.dumps(
+                    {
+                        "result": (
+                            f"[HARNESS SYSTEM] ✓ '{field_name}' registered. "
+                            f"Still needed: {sorted(remaining)}, call {_remaining_tools} tool(s)."
+                        )
+                    }
+                )
+            return json.dumps(
+                {
+                    "result": (
+                        f"[HARNESS SYSTEM] ✓ '{field_name}' registered. "
+                        f"All required fields complete, please end your response now."
+                    )
+                }
+            )
 
         return _handle
 

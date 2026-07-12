@@ -4,6 +4,7 @@ The execution process calls these methods; the standalone web server polls
 the database and pushes events to connected browsers.  No agency imports here
 so this module can be imported from both sides if needed.
 """
+
 from __future__ import annotations
 
 import json
@@ -18,18 +19,34 @@ from pathlib import Path
 # ANSI → hex colour conversion (mirrors agterm's palette)
 # ---------------------------------------------------------------------------
 
+
 def _xterm256_hex(n: int) -> str:
     if n < 16:
         _ANSI16 = [
-            "#000000", "#aa0000", "#00aa00", "#aa8800",
-            "#0000aa", "#aa00aa", "#00aaaa", "#aaaaaa",
-            "#555555", "#ff5555", "#55ff55", "#ffff55",
-            "#5555ff", "#ff55ff", "#55ffff", "#ffffff",
+            "#000000",
+            "#aa0000",
+            "#00aa00",
+            "#aa8800",
+            "#0000aa",
+            "#aa00aa",
+            "#00aaaa",
+            "#aaaaaa",
+            "#555555",
+            "#ff5555",
+            "#55ff55",
+            "#ffff55",
+            "#5555ff",
+            "#ff55ff",
+            "#55ffff",
+            "#ffffff",
         ]
         return _ANSI16[n]
     if n < 232:
         idx = n - 16
-        def _c(lvl: int) -> int: return 0 if lvl == 0 else 55 + 40 * lvl
+
+        def _c(lvl: int) -> int:
+            return 0 if lvl == 0 else 55 + 40 * lvl
+
         return f"#{_c(idx // 36):02x}{_c((idx // 6) % 6):02x}{_c(idx % 6):02x}"
     v = 8 + (n - 232) * 10
     return f"#{v:02x}{v:02x}{v:02x}"
@@ -47,11 +64,12 @@ def ansi_to_hex(ansi: str) -> str:
 # Emitter
 # ---------------------------------------------------------------------------
 
+
 class agwebui_emitter:
     """Thread-safe SQLite event writer for the web UI."""
 
     def __init__(self, run_dir: Path) -> None:
-        self._db_path   = run_dir / "ui_events.db"
+        self._db_path = run_dir / "ui_events.db"
         self._reply_dir = run_dir / "ui_replies"
         self._reply_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -60,18 +78,18 @@ class agwebui_emitter:
         # Latest cumulative token counts per agent; flushed again on done().
         self._token_state: dict[str, tuple[int, int, int, int]] = {}
         # Registration state re-emitted in done() for late-joining clients.
-        self._agent_registry: dict[str, dict] = {}   # agname -> event dict
-        self._team_registry:  dict[str, dict] = {}   # team_name -> event dict
+        self._agent_registry: dict[str, dict] = {}  # agname -> event dict
+        self._team_registry: dict[str, dict] = {}  # team_name -> event dict
         self._init_db()
 
     # High-frequency event types that are upserted into state tables AND
     # pruned from the append log to keep the database small.
-    _STATE_TYPES  = frozenset({"token_update", "messages_snapshot", "resource_update"})
-    _PRUNE_EVERY  = 500   # prune after this many inserts into events
+    _STATE_TYPES = frozenset({"token_update", "messages_snapshot", "resource_update"})
+    _PRUNE_EVERY = 500  # prune after this many inserts into events
     # Time-bucket size for downsampling: keep the last event per
     # (type, agname, floor(ts / bucket)) so scrubbing always finds a sample
     # within one bucket of any position.
-    _PRUNE_BUCKET_S: float = 60.0   # seconds
+    _PRUNE_BUCKET_S: float = 60.0  # seconds
 
     def _init_db(self) -> None:
         con = sqlite3.connect(str(self._db_path))
@@ -107,8 +125,8 @@ class agwebui_emitter:
     # ------------------------------------------------------------------
 
     def emit(self, event: dict) -> None:
-        data  = json.dumps(event, ensure_ascii=False, default=str)
-        ts    = float(event.get("ts") or time.time())
+        data = json.dumps(event, ensure_ascii=False, default=str)
+        ts = float(event.get("ts") or time.time())
         etype = event.get("type", "")
         agname = event.get("agname")
         with self._lock:
@@ -142,8 +160,7 @@ class agwebui_emitter:
             con.close()
         # Run pruning outside the emit lock so it never blocks concurrent emit() callers.
         if should_prune:
-            threading.Thread(target=self._run_prune, daemon=True,
-                             name="emitter-prune").start()
+            threading.Thread(target=self._run_prune, daemon=True, name="emitter-prune").start()
 
     def _flush_prune(self) -> None:
         """Block until any in-flight background prune has completed. For tests only."""
@@ -204,30 +221,39 @@ class agwebui_emitter:
         self.emit(ev)
 
     def agent_state(
-        self, agname: str, state: str, skill: str | None, tool: str | None,
-        color: str | None = None, team: str | None = None,
+        self,
+        agname: str,
+        state: str,
+        skill: str | None,
+        tool: str | None,
+        color: str | None = None,
+        team: str | None = None,
     ) -> None:
-        self.emit({
-            "type": "agent_state",
-            "agname": agname,
-            "state": state,
-            "skill": skill,
-            "tool": tool,
-            "color": color,
-            "team": team,
-            "ts": time.time(),
-        })
+        self.emit(
+            {
+                "type": "agent_state",
+                "agname": agname,
+                "state": state,
+                "skill": skill,
+                "tool": tool,
+                "color": color,
+                "team": team,
+                "ts": time.time(),
+            }
+        )
 
     def agent_config(self, agname: str, config: dict) -> None:
         """Push the agent's current dynamic-config snapshot (see
         agConfig.dynamic_snapshot()) so the webui's config editor can show
         it without a round trip into the (isolated) execution process."""
-        self.emit({
-            "type": "agent_config",
-            "agname": agname,
-            "config": config,
-            "ts": time.time(),
-        })
+        self.emit(
+            {
+                "type": "agent_config",
+                "agname": agname,
+                "config": config,
+                "ts": time.time(),
+            }
+        )
 
     def team_registered(self, team_name: str, agent_names: list[str]) -> None:
         ev = {
@@ -245,34 +271,45 @@ class agwebui_emitter:
             json.dumps(messages)
         except Exception:
             return
-        self.emit({
-            "type": "messages_snapshot",
-            "agname": agname,
-            "messages": messages,
-            "ts": time.time(),
-        })
+        self.emit(
+            {
+                "type": "messages_snapshot",
+                "agname": agname,
+                "messages": messages,
+                "ts": time.time(),
+            }
+        )
 
     _ASK_TIMEOUT_REPLY = "[no human available — timed out]"
 
-    def ask_human(self, agname: str, ask_id: str, question: str,
-                  timeout_s: float | None = 300) -> str:
+    def ask_human(
+        self, agname: str, ask_id: str, question: str, timeout_s: float | None = 300
+    ) -> str:
         """Emit ask event then block-poll until the web UI delivers a reply or timeout.
 
         Pass ``timeout_s=None`` to wait indefinitely (for interactive use cases).
         """
-        self.emit({
-            "type": "ask_human",
-            "agname": agname,
-            "ask_id": ask_id,
-            "question": question,
-            "ts": time.time(),
-        })
+        self.emit(
+            {
+                "type": "ask_human",
+                "agname": agname,
+                "ask_id": ask_id,
+                "question": question,
+                "ts": time.time(),
+            }
+        )
         reply_file = self._reply_dir / f"{ask_id}.txt"
         deadline = (time.time() + timeout_s) if timeout_s is not None else None
         while not reply_file.exists():
             if deadline is not None and time.time() >= deadline:
-                self.emit({"type": "human_reply", "ask_id": ask_id,
-                           "agname": agname, "reply": self._ASK_TIMEOUT_REPLY})
+                self.emit(
+                    {
+                        "type": "human_reply",
+                        "ask_id": ask_id,
+                        "agname": agname,
+                        "reply": self._ASK_TIMEOUT_REPLY,
+                    }
+                )
                 return self._ASK_TIMEOUT_REPLY
             time.sleep(0.2)
         text = reply_file.read_text(encoding="utf-8").strip()
@@ -293,15 +330,17 @@ class agwebui_emitter:
         """Emit cumulative token counts for one agent and the framework total."""
         with self._lock:
             self._token_state[agname] = (agent_input, agent_output, global_input, global_output)
-        self.emit({
-            "type":         "token_update",
-            "agname":       agname,
-            "agent_input":  agent_input,
-            "agent_output": agent_output,
-            "global_input": global_input,
-            "global_output": global_output,
-            "ts": time.time(),
-        })
+        self.emit(
+            {
+                "type": "token_update",
+                "agname": agname,
+                "agent_input": agent_input,
+                "agent_output": agent_output,
+                "global_input": global_input,
+                "global_output": global_output,
+                "ts": time.time(),
+            }
+        )
 
     def resource_update(
         self,
@@ -313,37 +352,41 @@ class agwebui_emitter:
         memory_total_mb: int,
     ) -> None:
         """Emit current resource acquisition counts for the dashboard badge."""
-        self.emit({
-            "type":                "resource_update",
-            "gpus_acquired":       gpus_acquired,
-            "gpus_total":          gpus_total,
-            "cpus_acquired":       round(cpus_acquired, 1),
-            "cpus_total":          cpus_total,
-            "memory_acquired_mb":  memory_acquired_mb,
-            "memory_total_mb":     memory_total_mb,
-            "ts": time.time(),
-        })
+        self.emit(
+            {
+                "type": "resource_update",
+                "gpus_acquired": gpus_acquired,
+                "gpus_total": gpus_total,
+                "cpus_acquired": round(cpus_acquired, 1),
+                "cpus_total": cpus_total,
+                "memory_acquired_mb": memory_acquired_mb,
+                "memory_total_mb": memory_total_mb,
+                "ts": time.time(),
+            }
+        )
 
     def done(self) -> None:
         # Re-emit registration and token state so that late-joining clients
         # always receive a complete roster and current token counts.
         with self._lock:
-            agents  = list(self._agent_registry.values())
-            teams   = list(self._team_registry.values())
-            tokens  = dict(self._token_state)
+            agents = list(self._agent_registry.values())
+            teams = list(self._team_registry.values())
+            tokens = dict(self._token_state)
         now = time.time()
         for ev in agents:
             self.emit({**ev, "ts": now})
         for ev in teams:
             self.emit({**ev, "ts": now})
         for agname, (ai, ao, gi, go) in tokens.items():
-            self.emit({
-                "type":         "token_update",
-                "agname":       agname,
-                "agent_input":  ai,
-                "agent_output": ao,
-                "global_input": gi,
-                "global_output": go,
-                "ts": now,
-            })
+            self.emit(
+                {
+                    "type": "token_update",
+                    "agname": agname,
+                    "agent_input": ai,
+                    "agent_output": ao,
+                    "global_input": gi,
+                    "global_output": go,
+                    "ts": now,
+                }
+            )
         self.emit({"type": "done", "ts": now})

@@ -1,4 +1,5 @@
 """Tests for agresources — GPU/CPU/memory pool and host detection."""
+
 import os
 import threading
 from unittest.mock import patch, MagicMock
@@ -18,6 +19,7 @@ from agency.agresources import (
 # ---------------------------------------------------------------------------
 # _cvd_filter
 # ---------------------------------------------------------------------------
+
 
 def test_cvd_filter_no_env_passes_all(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -52,6 +54,7 @@ def test_cvd_filter_id_not_in_pool_excluded(monkeypatch):
 # ---------------------------------------------------------------------------
 # detect_gpus
 # ---------------------------------------------------------------------------
+
 
 def test_detect_gpus_returns_list():
     result = detect_gpus()
@@ -95,6 +98,7 @@ def test_detect_gpus_cvd_filters_nvidia_output(monkeypatch):
 # detect_cpus
 # ---------------------------------------------------------------------------
 
+
 def test_detect_cpus_returns_positive_int():
     result = detect_cpus()
     assert isinstance(result, int)
@@ -109,6 +113,7 @@ def test_detect_cpus_os_cpu_count_none_returns_one(monkeypatch):
 # ---------------------------------------------------------------------------
 # detect_memory_mb
 # ---------------------------------------------------------------------------
+
 
 def test_detect_memory_mb_returns_positive_int():
     result = detect_memory_mb()
@@ -127,6 +132,7 @@ def test_detect_memory_mb_fallback_when_proc_missing(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # agResourcePool construction
 # ---------------------------------------------------------------------------
+
 
 def test_pool_explicit_gpus():
     pool = agResourcePool(gpus=[0, 1], total_cpus=8, total_memory_mb=16384)
@@ -165,6 +171,7 @@ def test_pool_repr():
 # GPU acquire / release
 # ---------------------------------------------------------------------------
 
+
 def test_single_gpu_acquire_release():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
     gpu_id = pool.acquire_gpu()
@@ -187,7 +194,6 @@ def test_acquire_blocks_until_release():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
     pool.acquire_gpu()
 
-    released = threading.Event()
     acquired_after = threading.Event()
 
     def waiter():
@@ -197,7 +203,9 @@ def test_acquire_blocks_until_release():
     t = threading.Thread(target=waiter, daemon=True)
     t.start()
 
-    import time; time.sleep(0.05)
+    import time
+
+    time.sleep(0.05)
     assert not acquired_after.is_set()
     pool.release_gpu(0)
     acquired_after.wait(timeout=2.0)
@@ -230,6 +238,7 @@ def test_release_double_release_warns(capsys):
 # ---------------------------------------------------------------------------
 # CPU / memory notify
 # ---------------------------------------------------------------------------
+
 
 def test_notify_cpu_acquired_adds():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=16384)
@@ -266,8 +275,10 @@ def test_notify_thread_safe():
             errors.append(e)
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=5)
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
     assert not errors
     assert pool.cpus_acquired == 0.0
 
@@ -276,43 +287,68 @@ def test_notify_thread_safe():
 # change_config / get_config_copy
 # ---------------------------------------------------------------------------
 
+
 def test_pool_change_config_replaces_agconfig():
     from agency.agconfig import agConfig
+
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
     pool.change_config(agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
     assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
 
+
 def test_pool_change_config_clones_given_agconfig():
     from agency.agconfig import agConfig
+
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
     new_cfg = agConfig({"agResourcePool": {"idle_cpus": 2.0}})
     pool.change_config(new_cfg)
     new_cfg.agResourcePool.idle_cpus = 9.0
     assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
 
+
 def test_pool_get_config_copy_returns_clone_not_same_object():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
     copy = pool.get_config_copy()
     assert copy is not pool._agconfig
 
+
 def test_pool_get_config_copy_reflects_current_values():
     from agency.agconfig import agConfig
-    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192,
-                           agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
+
+    pool = agResourcePool(
+        gpus=[],
+        total_cpus=8,
+        total_memory_mb=8192,
+        agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}),
+    )
     assert pool.get_config_copy().agResourcePool.idle_cpus == 2.0
+
 
 def test_mutating_pool_get_config_copy_does_not_affect_pool():
     from agency.agconfig import agConfig
-    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192,
-                           agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
+
+    pool = agResourcePool(
+        gpus=[],
+        total_cpus=8,
+        total_memory_mb=8192,
+        agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}),
+    )
     copy = pool.get_config_copy()
     copy.agResourcePool.idle_cpus = 9.0
     assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
 
+
 def test_pool_change_config_none_resets_to_default_agconfig():
     from agency.agconfig import agConfig
-    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192,
-                           agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
+
+    pool = agResourcePool(
+        gpus=[],
+        total_cpus=8,
+        total_memory_mb=8192,
+        agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}),
+    )
     pool.change_config(None)
     # No agconfig -> field falls back to its DynamicConfigParam default, not the old value.
-    assert pool.get_config_copy().agResourcePool.idle_cpus == _AgResourcePoolFields.idle_cpus.default
+    assert (
+        pool.get_config_copy().agResourcePool.idle_cpus == _AgResourcePoolFields.idle_cpus.default
+    )

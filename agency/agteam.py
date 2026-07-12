@@ -78,7 +78,9 @@ class agteam:
         # built from -- mutating that source afterward must not silently
         # change an already-constructed team (or the agents it already spawned).
         _src_agconfig = agconfig if agconfig is not None else type(self).agconfig
-        self.agconfig: "agConfig | None" = _src_agconfig.clone() if _src_agconfig is not None else None
+        self.agconfig: "agConfig | None" = (
+            _src_agconfig.clone() if _src_agconfig is not None else None
+        )
         # Expose every config kwarg as a plain attribute
         for k, v in config.items():
             setattr(self, k, v)
@@ -94,9 +96,10 @@ class agteam:
         from .agname import agname as _agname
         from .aglog import aglog as _aglog
         import sys
+
         _base = config.get("name") or f"{type(self).__name__}"
         self.team_name: str = _agname.allocate_agname(_base)
-        parent_team_name    = parent.team_name if parent is not None else None
+        parent_team_name = parent.team_name if parent is not None else None
         log_dir = _Agent.log_dir
         self._log = _aglog(log_dir / "_teams.jsonl" if log_dir else None)
         self._log._lifecycle(
@@ -107,7 +110,8 @@ class agteam:
         if parent_team_name is not None:
             print(
                 f"  [agteam] {self.team_name} created inside {parent_team_name}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
 
         token = _active_team.set(self)
@@ -118,6 +122,7 @@ class agteam:
 
         try:
             from . import agwebui as _agwebui
+
             if _agwebui._active is not None:
                 _agwebui._active.emitter.team_registered(
                     self.team_name,
@@ -181,10 +186,13 @@ def _wrap_run(cls) -> None:
     @functools.wraps(original)
     def _async_run(self, *args, **kwargs):
         from .agdata import agdata
+
         future: Future = Future()
 
         def _task() -> None:
-            import sys, traceback
+            import sys
+            import traceback
+
             token = _active_team.set(self)
             try:
                 result = original(self, *args, **kwargs)

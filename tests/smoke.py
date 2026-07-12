@@ -1,4 +1,5 @@
 """Smoke check: end-to-end agent + agskill + tools with mocked LLM."""
+
 import json
 from unittest.mock import patch
 from agency.agdata import agdata
@@ -15,25 +16,36 @@ LLM_AGCONFIG = agConfig({"agllm_backend": LLM_CONFIG})
 # Streaming mock helpers (agskill uses stream=True)
 # ---------------------------------------------------------------------------
 
+
 class _Delta:
     def __init__(self, content=None, tool_calls=None):
-        self.content = content; self.tool_calls = tool_calls
-        self.model_extra = {}; self.reasoning_content = None
+        self.content = content
+        self.tool_calls = tool_calls
+        self.model_extra = {}
+        self.reasoning_content = None
+
 
 class _Choice:
-    def __init__(self, delta): self.delta = delta
+    def __init__(self, delta):
+        self.delta = delta
+
 
 class _Usage:
     prompt_tokens = 5
 
+
 class _Chunk:
     def __init__(self, content=None, tool_calls=None, usage=None):
         self.usage = usage
-        self.choices = [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        self.choices = (
+            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        )
+
 
 class _TCDelta:
     def __init__(self, name, args_json, call_id):
-        self.id = call_id; self.index = 0
+        self.id = call_id
+        self.index = 0
         self.function = type("F", (), {"name": name, "arguments": args_json})()
 
 
@@ -49,6 +61,7 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
 # ---------------------------------------------------------------------------
 # Module-level tool functions (must be picklable — no lambdas, no closures)
 # ---------------------------------------------------------------------------
+
 
 def _skill_tool_fn(arg: agdata) -> agdata:
     return agdata(r=1)
@@ -134,6 +147,7 @@ if __name__ == "__main__":
             passed += 1
         except Exception as e:
             import traceback
+
             print(f"  FAIL: {name} — {e}")
             traceback.print_exc()
             failed += 1

@@ -15,9 +15,15 @@ def _ts() -> str:
 # inherits from this below, so self.dump_content_truncate_len etc. work via
 # the inherited ConfigParam descriptors exactly as if declared directly on aglog.
 class _AgLogFields:
-    dump_tool_args_truncate_len = DynamicConfigParam("aglog", default=60)     # Max chars of tool call arguments shown in dump() human-readable summary
-    dump_content_truncate_len = DynamicConfigParam("aglog", default=120)     # Max chars of message content shown per history delta line in dump() output
-    dump_tool_call_id_prefix_len = DynamicConfigParam("aglog", default=8)    # Number of leading chars of tool_call_id shown in dump() output
+    dump_tool_args_truncate_len = DynamicConfigParam(
+        "aglog", default=60
+    )  # Max chars of tool call arguments shown in dump() human-readable summary
+    dump_content_truncate_len = DynamicConfigParam(
+        "aglog", default=120
+    )  # Max chars of message content shown per history delta line in dump() output
+    dump_tool_call_id_prefix_len = DynamicConfigParam(
+        "aglog", default=8
+    )  # Number of leading chars of tool_call_id shown in dump() output
 
 
 class agLogConfig(_AgConfigViewBase):
@@ -57,9 +63,11 @@ class aglog(_AgLogFields):
       parent_agname : (forked only) agname of the source agent
     """
 
-    def __init__(self, path: "Path | str | None" = None, agconfig: "agConfig | None" = None) -> None:
-        self._entries: list[dict] = []   # skill calls only
-        self._events:  list[dict] = []   # all events (lifecycle + skills)
+    def __init__(
+        self, path: "Path | str | None" = None, agconfig: "agConfig | None" = None
+    ) -> None:
+        self._entries: list[dict] = []  # skill calls only
+        self._events: list[dict] = []  # all events (lifecycle + skills)
         self._lock = threading.Lock()
         self._path = Path(path) if path is not None else None
         self._agconfig = agconfig.clone() if agconfig is not None else None
@@ -92,17 +100,17 @@ class aglog(_AgLogFields):
         output_tokens: int = 0,
     ) -> None:
         entry = {
-            "type":           "skill",
-            "ts_start":       ts_start,
-            "ts_end":         ts_end,
-            "skill":          skill,
-            "input":          input_dict,
-            "output":         output_dict,
-            "history_len":    history_len,
+            "type": "skill",
+            "ts_start": ts_start,
+            "ts_end": ts_end,
+            "skill": skill,
+            "input": input_dict,
+            "output": output_dict,
+            "history_len": history_len,
             "history_before": history_before if history_before is not None else [],
-            "history_delta":  history_delta  if history_delta  is not None else [],
-            "input_tokens":   input_tokens,
-            "output_tokens":  output_tokens,
+            "history_delta": history_delta if history_delta is not None else [],
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         }
         with self._lock:
             self._entries.append(entry)
@@ -118,11 +126,11 @@ class aglog(_AgLogFields):
     ) -> None:
         """Record a single tool invocation."""
         entry = {
-            "type":       "tool",
-            "ts":         _ts(),
-            "tool":       tool,
-            "input":      input_dict,
-            "output":     output_dict,
+            "type": "tool",
+            "ts": _ts(),
+            "tool": tool,
+            "input": input_dict,
+            "output": output_dict,
             "elapsed_ms": elapsed_ms,
         }
         with self._lock:
@@ -159,7 +167,7 @@ class aglog(_AgLogFields):
         Returns {"input_tokens": int, "output_tokens": int, "total_tokens": int}.
         """
         with self._lock:
-            inp = sum(e.get("input_tokens",  0) for e in self._entries)
+            inp = sum(e.get("input_tokens", 0) for e in self._entries)
             out = sum(e.get("output_tokens", 0) for e in self._entries)
         return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
 
@@ -184,32 +192,30 @@ class aglog(_AgLogFields):
                 extra = ""
                 if "parent_agname" in e:
                     extra = f"  ← forked from {e['parent_agname']}"
-                lines.append(
-                    f"[{i}] {e['event'].upper()}  {e['ts']}  agname={e['agname']}{extra}"
-                )
+                lines.append(f"[{i}] {e['event'].upper()}  {e['ts']}  agname={e['agname']}{extra}")
             else:
                 delta_lines = []
                 for m in e.get("history_delta", []):
                     role = m.get("role", "?")
                     if m.get("tool_calls"):
                         calls = ", ".join(
-                            f"{tc['function']['name']}({tc['function']['arguments'][:self.dump_tool_args_truncate_len]})"
+                            f"{tc['function']['name']}({tc['function']['arguments'][: self.dump_tool_args_truncate_len]})"
                             for tc in m["tool_calls"]
                         )
                         delta_lines.append(f"      [{role}] tool_calls: {calls}")
                     elif role == "tool":
                         delta_lines.append(
-                            f"      [tool/{m.get('tool_call_id','')[:self.dump_tool_call_id_prefix_len]}] "
-                            f"{str(m.get('content',''))[:self.dump_content_truncate_len]}"
+                            f"      [tool/{m.get('tool_call_id', '')[: self.dump_tool_call_id_prefix_len]}] "
+                            f"{str(m.get('content', ''))[: self.dump_content_truncate_len]}"
                         )
                     else:
                         delta_lines.append(
-                            f"      [{role}] {str(m.get('content',''))[:self.dump_content_truncate_len]}"
+                            f"      [{role}] {str(m.get('content', ''))[: self.dump_content_truncate_len]}"
                         )
                 delta_str = ("\n" + "\n".join(delta_lines)) if delta_lines else " (none)"
-                inp = e.get("input_tokens",  0)
+                inp = e.get("input_tokens", 0)
                 out = e.get("output_tokens", 0)
-                tok_str = f"in={inp}  out={out}  total={inp+out}" if (inp or out) else "n/a"
+                tok_str = f"in={inp}  out={out}  total={inp + out}" if (inp or out) else "n/a"
                 lines.append(
                     f"[{i}] {e['skill']}  {e['ts_start']} → {e['ts_end']}\n"
                     f"    in      : {e['input']}\n"

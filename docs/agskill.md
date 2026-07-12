@@ -538,4 +538,3 @@ class PaperCrawlerTeam(agteam):
         self.compile_report  = CompileReportSkill()
         self.agent           = agent()
 ```
-

@@ -20,6 +20,7 @@ _WRITE_PARAMS = {
 
 def make_write(sandbox: "agSandbox") -> agtool:
     """Return a write tool that writes files inside *sandbox*'s container."""
+
     def _run_sandboxed(arg: agdata) -> agdata:
         file_path = str(arg.file_path)  # type: ignore[arg-type]
         content: str = str(arg.content)  # type: ignore[arg-type]
@@ -37,7 +38,7 @@ def make_write(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        path  = str(arg._data.get("file_path", "?"))
+        path = str(arg._data.get("file_path", "?"))
         rdata = result._data
         if "error" in rdata:
             tool._term.log("TOOL ✗   ", f"write  {path}  error: {rdata['error']}  ({elapsed_ms}ms)")

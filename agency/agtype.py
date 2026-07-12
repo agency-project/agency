@@ -155,7 +155,7 @@ class agtype:
         on_leaf must handle its own exceptions and always return (value, []).
         """
         origin = get_origin(type_hint)
-        args   = get_args(type_hint)
+        args = get_args(type_hint)
 
         if isinstance(type_hint, type) and issubclass(type_hint, agtype):
             return on_leaf(type_hint, value)
@@ -199,7 +199,7 @@ class agtype:
         if isinstance(type_hint, type) and issubclass(type_hint, agtype):
             return not issubclass(type_hint, agrawstring)
         origin = get_origin(type_hint)
-        args   = get_args(type_hint)
+        args = get_args(type_hint)
         if origin is list and args:
             return agtype.in_hint(args[0])
         if origin is dict and len(args) == 2:
@@ -407,9 +407,7 @@ class agpath(agtype):
 
     @classmethod
     def extra_input_prompt(cls, field_name: str) -> str:
-        return (
-            f"  - Input `{field_name}`: a path string, not file content."
-        )
+        return f"  - Input `{field_name}`: a path string, not file content."
 
     @classmethod
     def extra_output_prompt(cls, field_name: str, skill_name: str) -> str:
@@ -425,10 +423,7 @@ class agpath(agtype):
 
     @classmethod
     def get_return_tool_value_description(cls, field_name: str) -> str:
-        return (
-            f"Path string for '{field_name}'. "
-            f"Do NOT pass file content — pass only the path."
-        )
+        return f"Path string for '{field_name}'. Do NOT pass file content — pass only the path."
 
     @classmethod
     def validate_output(
@@ -742,20 +737,30 @@ class agrawstring(agtype):
 # Type-type_hint inspection and schema helpers
 # ---------------------------------------------------------------------------
 
+
 def type_hint_to_string_type(type_hint) -> str:
     """Map a schema type_hint to a JSON Schema type string for tool parameter specs."""
     if isinstance(type_hint, type):
-        if issubclass(type_hint, bool):   return "boolean"   # bool before int (bool is subclass of int)
-        if issubclass(type_hint, int):    return "integer"
-        if issubclass(type_hint, float):  return "number"
-        if issubclass(type_hint, agtype): return "string"
-        if issubclass(type_hint, (list, tuple)): return "array"
-        if issubclass(type_hint, dict):   return "object"
+        if issubclass(type_hint, bool):
+            return "boolean"  # bool before int (bool is subclass of int)
+        if issubclass(type_hint, int):
+            return "integer"
+        if issubclass(type_hint, float):
+            return "number"
+        if issubclass(type_hint, agtype):
+            return "string"
+        if issubclass(type_hint, (list, tuple)):
+            return "array"
+        if issubclass(type_hint, dict):
+            return "object"
         return "string"
     origin = get_origin(type_hint)
-    if origin is list or origin is tuple: return "array"
-    if origin is dict:                    return "object"
-    if isinstance(type_hint, list):            return "array"   # [{"key": type, ...}] literal
+    if origin is list or origin is tuple:
+        return "array"
+    if origin is dict:
+        return "object"
+    if isinstance(type_hint, list):
+        return "array"  # [{"key": type, ...}] literal
     return "string"
 
 
@@ -764,22 +769,38 @@ def get_json_example_for_type_hint(type_hint) -> str:
 
     Every returned string is parseable by json.loads.
     """
-    if type_hint is bool:  return "true"
-    if type_hint is int:   return "42"
-    if type_hint is float: return "3.14"
-    if type_hint is str:   return '"The capital of France is Paris."'
+    if type_hint is bool:
+        return "true"
+    if type_hint is int:
+        return "42"
+    if type_hint is float:
+        return "3.14"
+    if type_hint is str:
+        return '"The capital of France is Paris."'
     origin = get_origin(type_hint)
-    args   = get_args(type_hint)
+    args = get_args(type_hint)
     if type_hint is list or origin is list:
         return f"[{get_json_example_for_type_hint(args[0])}]" if args else "[]"
     if type_hint is dict or origin is dict:
         if args and len(args) == 2:
-            return "{" + f"{get_json_example_for_type_hint(args[0])}: {get_json_example_for_type_hint(args[1])}" + "}"
+            return (
+                "{"
+                + f"{get_json_example_for_type_hint(args[0])}: {get_json_example_for_type_hint(args[1])}"
+                + "}"
+            )
         return "{}"
     if type_hint is tuple or origin is tuple:
-        return "[" + ", ".join(get_json_example_for_type_hint(t) for t in args) + "]" if args else "[]"
+        return (
+            "[" + ", ".join(get_json_example_for_type_hint(t) for t in args) + "]" if args else "[]"
+        )
     if isinstance(type_hint, list) and len(type_hint) == 1 and isinstance(type_hint[0], dict):
-        obj = "{" + ", ".join(f'"{k}": {get_json_example_for_type_hint(t)}' for k, t in type_hint[0].items()) + "}"
+        obj = (
+            "{"
+            + ", ".join(
+                f'"{k}": {get_json_example_for_type_hint(t)}' for k, t in type_hint[0].items()
+            )
+            + "}"
+        )
         return f"[{obj}]"
     if isinstance(type_hint, type) and issubclass(type_hint, agtype):
         return '"value"'
@@ -789,8 +810,8 @@ def get_json_example_for_type_hint(type_hint) -> str:
 def get_value_format_prompt_for_type_hint(field_name: str, type_hint) -> str:
     """Return a value description with a concrete format example and a 'pass directly' note."""
     origin = get_origin(type_hint)
-    args   = get_args(type_hint)
-    ex     = get_json_example_for_type_hint(type_hint)
+    args = get_args(type_hint)
+    ex = get_json_example_for_type_hint(type_hint)
     direct = "Pass directly — do not JSON-encode into a string."
 
     if type_hint is str:
@@ -808,10 +829,7 @@ def get_value_format_prompt_for_type_hint(field_name: str, type_hint) -> str:
         if args:
             elem_type = args[0]
             elem_name = getattr(elem_type, "__name__", repr(elem_type))
-            return (
-                f"JSON array of {elem_name} values for '{field_name}'. "
-                f"Example: {ex}. {direct}"
-            )
+            return f"JSON array of {elem_name} values for '{field_name}'. Example: {ex}. {direct}"
         return f"JSON array for '{field_name}'. Example: {ex}. {direct}"
     if type_hint is dict or origin is dict:
         if args and len(args) == 2:
@@ -832,7 +850,13 @@ def get_value_format_prompt_for_type_hint(field_name: str, type_hint) -> str:
         return f"JSON array for '{field_name}'. Example: {ex}. {direct}"
     if isinstance(type_hint, list) and len(type_hint) == 1 and isinstance(type_hint[0], dict):
         keys = ", ".join(f'"{k}"' for k in type_hint[0])
-        obj_ex = "{" + ", ".join(f'"{k}": {get_json_example_for_type_hint(t)}' for k, t in type_hint[0].items()) + "}"
+        obj_ex = (
+            "{"
+            + ", ".join(
+                f'"{k}": {get_json_example_for_type_hint(t)}' for k, t in type_hint[0].items()
+            )
+            + "}"
+        )
         return (
             f"JSON array of objects for '{field_name}'. Each object must have keys: {keys}. "
             f"Example: [{obj_ex}]. {direct}"
@@ -850,7 +874,9 @@ def get_return_tool_description_prompt(field_name: str, type_hint) -> "tuple[str
     )
     # agtype subclass — delegate to its classmethods
     if isinstance(type_hint, type) and issubclass(type_hint, agtype):
-        return type_hint.get_return_tool_description(field_name), type_hint.get_return_tool_value_description(field_name)
+        return type_hint.get_return_tool_description(
+            field_name
+        ), type_hint.get_return_tool_value_description(field_name)
     # list[agtype] — delegate to the inner type, but include a JSON array example
     if get_origin(type_hint) is list:
         args = get_args(type_hint)
@@ -859,7 +885,8 @@ def get_return_tool_description_prompt(field_name: str, type_hint) -> "tuple[str
             ex = get_json_example_for_type_hint(type_hint)
             return (
                 inner.get_return_tool_description(field_name) + " (as a JSON array)",
-                inner.get_return_tool_value_description(field_name) + f" Provide as a JSON array. Example: {ex}.",
+                inner.get_return_tool_value_description(field_name)
+                + f" Provide as a JSON array. Example: {ex}.",
             )
     return tool_desc, get_value_format_prompt_for_type_hint(field_name, type_hint)
 
@@ -867,7 +894,7 @@ def get_return_tool_description_prompt(field_name: str, type_hint) -> "tuple[str
 def validate_value_against_type_hint(type_hint, value) -> "str | None":
     """Recursively validate value against type_hint. Returns an error string or None."""
     origin = get_origin(type_hint)
-    args   = get_args(type_hint)
+    args = get_args(type_hint)
 
     if isinstance(type_hint, type):
         if issubclass(type_hint, agtype):
@@ -882,10 +909,18 @@ def validate_value_against_type_hint(type_hint, value) -> "str | None":
             return f"expected {type_hint.__name__}, got {type(value).__name__}"
         # bare list/tuple/dict without type args
         if issubclass(type_hint, (list, tuple)):
-            return None if isinstance(value, (list, tuple)) else f"expected array, got {type(value).__name__}"
+            return (
+                None
+                if isinstance(value, (list, tuple))
+                else f"expected array, got {type(value).__name__}"
+            )
         if issubclass(type_hint, dict):
             return None if isinstance(value, dict) else f"expected dict, got {type(value).__name__}"
-        return None if isinstance(value, type_hint) else f"expected {type_hint.__name__}, got {type(value).__name__}"
+        return (
+            None
+            if isinstance(value, type_hint)
+            else f"expected {type_hint.__name__}, got {type(value).__name__}"
+        )
 
     if origin is list:
         if not isinstance(value, list):
@@ -964,7 +999,3 @@ def output_field_desc(type_hint: object) -> str:
         inner = output_field_desc(args[0]) if args else "any"
         return f"array of {inner}"
     return str(type_hint)
-
-
-
-    return _handle

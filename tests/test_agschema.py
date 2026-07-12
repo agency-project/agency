@@ -1,4 +1,5 @@
 """Tests for agschema — schema wrapper for agskill input/output schemas."""
+
 import json
 import pytest
 from unittest.mock import MagicMock
@@ -11,6 +12,7 @@ from agency.agtype import agfile, agbinary, agrawstring, agpath
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------
+
 
 def test_construction_from_agdata():
     s = agschema(agdata(task=str, count=int))
@@ -42,6 +44,7 @@ def test_repr():
 # to_json
 # ---------------------------------------------------------------------------
 
+
 def test_to_json_round_trips():
     s = agschema(agdata(question=str, count=int))
     parsed = json.loads(s.to_json())
@@ -52,6 +55,7 @@ def test_to_json_round_trips():
 # ---------------------------------------------------------------------------
 # check
 # ---------------------------------------------------------------------------
+
 
 def test_check_valid_data_returns_empty():
     s = agschema(agdata(x=int, name=str))
@@ -120,6 +124,7 @@ def test_check_list_of_dicts_schema_wrong_item_type():
 # check_field
 # ---------------------------------------------------------------------------
 
+
 def test_check_field_valid_returns_none():
     s = agschema(agdata(x=int))
     assert s.check_field("x", 5) is None
@@ -149,6 +154,7 @@ def test_check_field_agpath_rejects_non_path():
 # validate_input
 # ---------------------------------------------------------------------------
 
+
 def test_validate_input_valid_returns_none():
     s = agschema(agdata(question=str))
     assert s.validate_input(agdata(question="hi")) is None
@@ -177,6 +183,7 @@ def test_validate_input_agpath_invalid_returns_error():
 # raw_key
 # ---------------------------------------------------------------------------
 
+
 def test_raw_key_single_agrawstring_returns_key():
     s = agschema(agdata(content=agrawstring))
     assert s.raw_key() == "content"
@@ -200,6 +207,7 @@ def test_raw_key_none_on_empty():
 # ---------------------------------------------------------------------------
 # field_desc
 # ---------------------------------------------------------------------------
+
 
 def test_field_desc_str():
     s = agschema(agdata(answer=str))
@@ -228,6 +236,7 @@ def test_field_desc_int():
 # ---------------------------------------------------------------------------
 # get_return_tool_descriptions
 # ---------------------------------------------------------------------------
+
 
 def test_get_return_tool_description_prompt_returns_two_strings():
     s = agschema(agdata(answer=str))
@@ -259,6 +268,7 @@ def test_get_return_tool_description_prompt_agpath_warns_against_content():
 # make_return_output_tools
 # ---------------------------------------------------------------------------
 
+
 def test_make_return_output_tools_one_per_field():
     s = agschema(agdata(answer=str, score=int))
     tools = s.make_return_output_tools()
@@ -287,6 +297,7 @@ def test_make_return_output_tools_empty_schema():
 # ---------------------------------------------------------------------------
 # make_field_handler
 # ---------------------------------------------------------------------------
+
 
 def _make_sandbox():
     sb = MagicMock()
@@ -341,8 +352,10 @@ def test_make_field_handler_all_fields_complete_message():
 # prepare_inputs_in_sandbox — size offload
 # ---------------------------------------------------------------------------
 
+
 def test_prepare_inputs_in_sandbox_replaces_long_string():
     from agency.agschema import _AgSchemaFields
+
     s = agschema(agdata(text=str))
     sb = MagicMock()
     data = agdata(text="x" * (_AgSchemaFields.input_offload_chars.default + 1))
@@ -359,10 +372,10 @@ def test_prepare_inputs_in_sandbox_skips_short_strings():
     assert paths == [] and fields == []
 
 
-
 # ---------------------------------------------------------------------------
 # prepare_inputs_in_sandbox — agtype fields
 # ---------------------------------------------------------------------------
+
 
 def test_prepare_inputs_in_sandbox_calls_prepare_on_agfile_field():
     s = agschema(agdata(doc=agfile))

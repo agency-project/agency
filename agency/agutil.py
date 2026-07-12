@@ -16,7 +16,7 @@ _T = TypeVar("_T")
 # monkeypatches this by name (`monkeypatch.setattr(_agutil_module,
 # "_BATCH_INTERVAL_S", 0.0)`) to speed up streaming tests; a descriptor would
 # silently break that.
-_BATCH_INTERVAL_S: float = 0.1       # main thread drains stream every 100 ms
+_BATCH_INTERVAL_S: float = 0.1  # main thread drains stream every 100 ms
 
 
 # Exists only to register agutil's config fields (via __set_name__ at import
@@ -25,7 +25,9 @@ _BATCH_INTERVAL_S: float = 0.1       # main thread drains stream every 100 ms
 # throwaway instance and GlobalConfigParam ignores it anyway, always routing
 # to agConfig.GLOBAL.
 class _AgUtilFields:
-    idle_check_interval_s = GlobalConfigParam("agutil", default=1.0)  # how often to check idle timeout
+    idle_check_interval_s = GlobalConfigParam(
+        "agutil", default=1.0
+    )  # how often to check idle timeout
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
@@ -43,7 +45,7 @@ class agUtilConfig(_AgConfigViewBase):
 
 
 _THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
-_PATH_RE     = re.compile(r"^(/[\w.\-]+)+$")
+_PATH_RE = re.compile(r"^(/[\w.\-]+)+$")
 _CAMEL_CASE_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 # Lowercase alphanumeric alphabet for agent ID suffixes.
@@ -54,6 +56,7 @@ _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
+
 
 def format_exception(e: BaseException) -> str:
     """Return the full traceback + exception message as a single string.
@@ -74,6 +77,7 @@ class _LLMIdleTimeout(Exception):
 # ---------------------------------------------------------------------------
 # Iteration helpers
 # ---------------------------------------------------------------------------
+
 
 def _iter_batched(
     iterable: Iterable[_T],
@@ -161,6 +165,7 @@ def _iter_batched(
 # Text helpers
 # ---------------------------------------------------------------------------
 
+
 def _strip_thinking(content: str) -> str:
     """Remove <think>…</think> / <thinking>…</thinking> blocks from model output."""
     return _THINKING_RE.sub("", content).strip()
@@ -189,6 +194,7 @@ def _camel_to_snake(key: str) -> str:
 # ---------------------------------------------------------------------------
 # Agent name helpers
 # ---------------------------------------------------------------------------
+
 
 def _b36_suffix(n: int, width: int = 4) -> str:
     """Encode *n* as a fixed-width base-36 string (0000…0009, 000a…)."""

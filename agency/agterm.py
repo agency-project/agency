@@ -10,12 +10,14 @@ Usage:
 Output format:
     HH:MM:SS.mmm  [uuid8]  [EVENT   ]  message          (file.py:lineno)
 """
+
 from __future__ import annotations
 import random as _random
 import sys
 import inspect
 import threading
 from datetime import datetime
+
 
 # ---------------------------------------------------------------------------
 # Colour palette — ~54 visually distinct xterm-256 colours, randomised once
@@ -32,9 +34,9 @@ def _make_color_palette() -> list[str]:
     for r in _LEVELS:
         for g in _LEVELS:
             for b in _LEVELS:
-                if r == g == b:       # cube grey diagonal
+                if r == g == b:  # cube grey diagonal
                     continue
-                if max(r, g, b) <= 2: # near-black (brightest component ≤ 135)
+                if max(r, g, b) <= 2:  # near-black (brightest component ≤ 135)
                     continue
                 indices.append(16 + 36 * r + 6 * g + b)
     colors = [f"\033[38;5;{idx}m" for idx in indices]
@@ -46,26 +48,28 @@ _AGENT_COLORS: list[str] = _make_color_palette()
 
 # Fixed greyscale styles for event tags — colours are reserved for agent IDs
 _EVENT_STYLES: dict[str, str] = {
-    "CREATED  ": "\033[1m",    # bold
-    "FORKED   ": "\033[1m",    # bold
-    "DESTROYED": "\033[2m",    # dim
-    "SKILL ▶  ": "\033[1m",    # bold
-    "SKILL ✓  ": "\033[0m",    # normal
-    "SKILL ✗  ": "\033[7m",    # reverse video  (visible without colour)
-    "ERROR ✗  ": "\033[7m",    # reverse video  (agdata-level errors)
-    "LLM ▶    ": "\033[0m",    # normal
-    "LLM ✓    ": "\033[0m",    # normal
-    "TOOL     ": "\033[0m",    # normal
+    "CREATED  ": "\033[1m",  # bold
+    "FORKED   ": "\033[1m",  # bold
+    "DESTROYED": "\033[2m",  # dim
+    "SKILL ▶  ": "\033[1m",  # bold
+    "SKILL ✓  ": "\033[0m",  # normal
+    "SKILL ✗  ": "\033[7m",  # reverse video  (visible without colour)
+    "ERROR ✗  ": "\033[7m",  # reverse video  (agdata-level errors)
+    "LLM ▶    ": "\033[0m",  # normal
+    "LLM ✓    ": "\033[0m",  # normal
+    "TOOL     ": "\033[0m",  # normal
 }
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-EVENT_TAG_WIDTH = 9  # Fixed column width for event tag display in log lines (e.g. 'DESTROYED' is 9 chars)
+EVENT_TAG_WIDTH = (
+    9  # Fixed column width for event tag display in log lines (e.g. 'DESTROYED' is 9 chars)
+)
 
 _RESET = "\033[0m"
-_BOLD  = "\033[1m"
-_DIM   = "\033[2m"
+_BOLD = "\033[1m"
+_DIM = "\033[2m"
 
 
 class agterm:
@@ -74,6 +78,7 @@ class agterm:
     Class-level settings:
         agterm.enabled = False   silence all output
     """
+
     enabled: bool = True
     _lock: threading.Lock = threading.Lock()
     _color_counter: int = 0
@@ -89,12 +94,16 @@ class agterm:
         agterm._agname_colors[self._id] = self._color  # register for cross-agent colorization
         try:
             from . import agwebui as _agwebui
+
             if _agwebui._active is not None:
                 from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
                 from ._context import _active_team as _at
+
                 _team = _at.get(None)
                 _team_name = _team.team_name if _team is not None else None
-                _agwebui._active.emitter.agent_registered(self._id, _ansi_to_hex(self._color), team=_team_name)
+                _agwebui._active.emitter.agent_registered(
+                    self._id, _ansi_to_hex(self._color), team=_team_name
+                )
         except Exception as _e:
             print(f"[agterm] WARNING: agent_registered push failed for {self._id}: {_e}")
 
@@ -126,23 +135,23 @@ class agterm:
         for _ in range(depth):
             if frame is not None:
                 frame = frame.f_back
-        filename = (frame.f_code.co_filename.rsplit("/", 1)[-1]
-                    if frame is not None else "?")
-        lineno   = frame.f_lineno if frame is not None else 0
+        filename = frame.f_code.co_filename.rsplit("/", 1)[-1] if frame is not None else "?"
+        lineno = frame.f_lineno if frame is not None else 0
 
-        ts        = f"{_DIM}{datetime.now().strftime('%H:%M:%S.%f')[:-3]}{_RESET}"
+        ts = f"{_DIM}{datetime.now().strftime('%H:%M:%S.%f')[:-3]}{_RESET}"
         agent_tag = f"{self._color}{_BOLD}[{self._id}]{_RESET}"
-        ev_key    = event.ljust(EVENT_TAG_WIDTH)[:EVENT_TAG_WIDTH]
-        ev_style  = _EVENT_STYLES.get(ev_key, "")
-        ev_tag    = f"{ev_style}[{ev_key}]{_RESET}"
-        tok_tag   = f"  {_DIM}({self._tokens} toks){_RESET}" if self._tokens is not None else ""
-        src       = f"{_DIM}({filename}:{lineno}){_RESET}"
+        ev_key = event.ljust(EVENT_TAG_WIDTH)[:EVENT_TAG_WIDTH]
+        ev_style = _EVENT_STYLES.get(ev_key, "")
+        ev_tag = f"{ev_style}[{ev_key}]{_RESET}"
+        tok_tag = f"  {_DIM}({self._tokens} toks){_RESET}" if self._tokens is not None else ""
+        src = f"{_DIM}({filename}:{lineno}){_RESET}"
 
         line = f"{ts}  {agent_tag}  {ev_tag}  {agterm._colorize_agnames(msg)}{tok_tag}  {src}"
         _is_error = "✗" in event
         with agterm._lock:
             try:
                 from . import agwebui as _agwebui
+
                 if _agwebui._active is not None:
                     _agwebui._active.emitter.log(line)
                     if not _is_error:

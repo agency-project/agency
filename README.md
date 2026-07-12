@@ -25,7 +25,9 @@ uv venv --python 3.12 --seed --managed-python
 source .venv/bin/activate
 
 uv pip install -e .
-uv pip install -e ".[dev]"   # dev dependencies (pytest etc.)
+uv pip install -e ".[dev]"   # dev dependencies (pytest, ruff, pre-commit)
+
+pre-commit install   # one-time; runs ruff (lint + format) and hygiene checks on every commit
 ```
 
 The sandbox image comes with `torch torchvision transformers datasets accelerate numpy scipy matplotlib` pre-installed, and the `Qwen/Qwen3.5-4B` model weights and `wikitext-2-raw-v1` dataset pre-cached. Run `python /opt/model_smoke.py` inside any container to verify the setup.
@@ -59,7 +61,7 @@ cfg = agConfig(
     agVLLMBackendConfig(
         base_url="http://localhost:8000/v1", # Your serving API URL
         model="YOUR_SERVED_MODEL",
-        api_key="YOUR_API_KEY" # Leave blank ("") if unused 
+        api_key="YOUR_API_KEY" # Leave blank ("") if unused
     )
 )
 
@@ -104,8 +106,8 @@ cfg = agConfig(
 ag = agent(agconfig=cfg)
 ```
 
-Requires the `anthropic` package (`pip install anthropic`). 
-For Claude on Bedrock, use `agBedrockBackendConfig` instead (see below) — it's picked automatically for `anthropic.*` model IDs. 
+Requires the `anthropic` package (`pip install anthropic`).
+For Claude on Bedrock, use `agBedrockBackendConfig` instead (see below) — it's picked automatically for `anthropic.*` model IDs.
 For Claude via AWS's direct Anthropic-on-AWS API, use the generic `agLLMBackendConfig(provider="anthropicAWS", ...)` — there's no dedicated class for it yet.
 
 **Amazon Bedrock**
@@ -167,6 +169,14 @@ pytest
 ```
 
 Most tests mock the OpenAI client and run entirely in-process (no container needed). Tests that require a live container are marked and skipped if Docker/Podman is unavailable. Tool calls run through the real process pool in all tests — the same code path as production.
+
+## Linting
+
+```bash
+pre-commit run --all-files
+```
+
+Runs the same checks as the `pre-commit` git hook and the CI `pre-commit` job: `ruff check --fix` (unused imports/variables, undefined names), `ruff format`, and hygiene hooks (trailing whitespace, end-of-file, YAML/TOML syntax, merge-conflict markers). Config lives in `.pre-commit-config.yaml` and `pyproject.toml`'s `[tool.ruff]`.
 
 ## Docs
 

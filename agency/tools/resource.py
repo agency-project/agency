@@ -16,9 +16,9 @@ def _parse_memory_mb(mem: "str | None") -> int:
         return 0
     s = str(mem).lower().strip()
     try:
-        if s.endswith('g'):
+        if s.endswith("g"):
             return int(float(s[:-1]) * 1024)
-        if s.endswith('m'):
+        if s.endswith("m"):
             return int(float(s[:-1]))
         return int(s) // (1024 * 1024)
     except (ValueError, AttributeError):
@@ -32,12 +32,15 @@ def make_gpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     inside sandbox.exec() the moment a bash command is actually run, and is
     released automatically once all spawned processes finish.
     """
+
     def _run(arg: agdata) -> agdata:
         if not pool.gpus:
-            return agdata(warning=(
-                "No GPUs are available on this machine. "
-                "Bash commands will run without GPU acceleration."
-            ))
+            return agdata(
+                warning=(
+                    "No GPUs are available on this machine. "
+                    "Bash commands will run without GPU acceleration."
+                )
+            )
         if sandbox._gpu_virtual:
             return agdata(message="GPU already acquired — use cuda:0 in your scripts")
         sandbox._gpu_virtual = True
@@ -91,8 +94,8 @@ def make_cpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
                 memory=memory,
             )
             acquired_cpus = float(cpus) if cpus is not None else 0.0
-            acquired_mb   = _parse_memory_mb(memory)
-            sandbox._cpu_acquired       += acquired_cpus
+            acquired_mb = _parse_memory_mb(memory)
+            sandbox._cpu_acquired += acquired_cpus
             sandbox._memory_acquired_mb += acquired_mb
             pool.notify_cpu_acquired(acquired_cpus, acquired_mb)
             return agdata(
@@ -131,9 +134,9 @@ def make_cpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
         try:
             held_cpus = sandbox._cpu_acquired
-            held_mb   = sandbox._memory_acquired_mb
+            held_mb = sandbox._memory_acquired_mb
             sandbox.update_limits(cpus=pool.idle_cpus, memory=pool.idle_memory)
-            sandbox._cpu_acquired       = 0.0
+            sandbox._cpu_acquired = 0.0
             sandbox._memory_acquired_mb = 0
             pool.notify_cpu_released(held_cpus, held_mb)
             return agdata(
@@ -162,6 +165,7 @@ def make_daemon_release(sandbox: "agSandbox") -> agtool:
     descendants will continue running in the sandbox but will never block the
     outer monitoring loop.
     """
+
     def _run(arg: agdata) -> agdata:
         pid_val = getattr(arg, "pid", None)
         if pid_val is None:
@@ -185,7 +189,10 @@ def make_daemon_release(sandbox: "agSandbox") -> agtool:
         params={
             "type": "object",
             "properties": {
-                "pid": {"type": "integer", "description": "PID of the process to release as a daemon"},
+                "pid": {
+                    "type": "integer",
+                    "description": "PID of the process to release as a daemon",
+                },
             },
             "required": ["pid"],
         },

@@ -4,6 +4,7 @@ Sandboxed tool integration tests (bash, read, write, edit, glob, grep)
 live in test_agsandbox.py::TestSandboxedTools which runs against a real
 container.
 """
+
 import json
 import threading
 import pytest
@@ -16,9 +17,11 @@ from agency.agdata import agdata, agerror
 # edit — _replace fuzzy logic (pure Python, no container)
 # ---------------------------------------------------------------------------
 
+
 class TestEditLogic:
     def setup_method(self):
         from agency.tools.edit import _replace
+
         self._replace = _replace
 
     def test_simple_replace(self):
@@ -51,9 +54,11 @@ class TestEditLogic:
 # webfetch
 # ---------------------------------------------------------------------------
 
+
 class TestWebfetch:
     def setup_method(self):
         from agency.tools.webfetch import webfetch
+
         # Call .fn() directly: tests fetch/convert logic in-process with mocked
         # httpx. The process-pool mechanism is covered by test_agtool.py.
         self.fn = webfetch.fn
@@ -84,6 +89,7 @@ class TestWebfetch:
 
     def test_http_error(self):
         import httpx as _httpx
+
         mock_resp = MagicMock()
         mock_resp.status_code = 404
         exc = _httpx.HTTPStatusError("404", request=MagicMock(), response=mock_resp)
@@ -96,11 +102,14 @@ class TestWebfetch:
 # todowrite
 # ---------------------------------------------------------------------------
 
+
 class TestTodowrite:
     def setup_method(self):
         import agency.tools.todowrite as m
+
         m._store = []
         from agency.tools.todowrite import todowrite
+
         self.tool = todowrite
 
     def test_set_todos(self):
@@ -114,7 +123,9 @@ class TestTodowrite:
 
     def test_overwrite(self):
         self.tool(agdata(todos=[{"content": "old", "status": "pending", "priority": "low"}]))
-        result = self.tool(agdata(todos=[{"content": "new", "status": "in_progress", "priority": "high"}]))
+        result = self.tool(
+            agdata(todos=[{"content": "new", "status": "in_progress", "priority": "high"}])
+        )
         assert result.count == 1
         assert result.todos[0]["content"] == "new"
 
@@ -133,12 +144,14 @@ class TestTodowrite:
 # _log functions must not raise on agerror results
 # ---------------------------------------------------------------------------
 
+
 class TestToolLogOnErrorResult:
     """Verify that _log functions in sandboxed tools never raise when the
     tool returns an error result (regression: AgError propagation in log)."""
 
     def _make_term(self):
         from unittest.mock import MagicMock
+
         term = MagicMock()
         term.log = MagicMock()
         return term
@@ -151,6 +164,7 @@ class TestToolLogOnErrorResult:
     def test_read_log_does_not_raise_on_error(self):
         from agency.tools.read import make_read
         from unittest.mock import MagicMock
+
         sb = MagicMock()
         tool = make_read(sb)
         tool, term = self._make_tool_with_term(tool)
@@ -165,6 +179,7 @@ class TestToolLogOnErrorResult:
     def test_write_log_does_not_raise_on_error(self):
         from agency.tools.write import make_write
         from unittest.mock import MagicMock
+
         sb = MagicMock()
         tool = make_write(sb)
         tool, term = self._make_tool_with_term(tool)
@@ -177,6 +192,7 @@ class TestToolLogOnErrorResult:
     def test_bash_log_does_not_raise_on_error(self):
         from agency.tools.bash import make_bash
         from unittest.mock import MagicMock
+
         sb = MagicMock()
         tool = make_bash(sb)
         tool, term = self._make_tool_with_term(tool)
@@ -187,6 +203,7 @@ class TestToolLogOnErrorResult:
     def test_glob_log_does_not_raise_on_error(self):
         from agency.tools.glob import make_glob
         from unittest.mock import MagicMock
+
         sb = MagicMock()
         tool = make_glob(sb)
         tool, term = self._make_tool_with_term(tool)
@@ -197,6 +214,7 @@ class TestToolLogOnErrorResult:
     def test_grep_log_does_not_raise_on_error(self):
         from agency.tools.grep import make_grep
         from unittest.mock import MagicMock
+
         sb = MagicMock()
         tool = make_grep(sb)
         tool, term = self._make_tool_with_term(tool)
@@ -224,16 +242,17 @@ class TestToolLogOnErrorResult:
 # worker process.
 # ---------------------------------------------------------------------------
 
+
 class TestSandboxToolsRunInSubprocessFalse:
     """Regression tests for the run_in_subprocess=False requirement on all sandbox tools."""
 
     SANDBOX_TOOL_FACTORIES = [
-        ("bash",   "make_bash",   ("bash.py",   "make_bash")),
-        ("read",   "make_read",   ("read.py",   "make_read")),
-        ("write",  "make_write",  ("write.py",  "make_write")),
-        ("edit",   "make_edit",   ("edit.py",   "make_edit")),
-        ("glob",   "make_glob",   ("glob.py",   "make_glob")),
-        ("grep",   "make_grep",   ("grep.py",   "make_grep")),
+        ("bash", "make_bash", ("bash.py", "make_bash")),
+        ("read", "make_read", ("read.py", "make_read")),
+        ("write", "make_write", ("write.py", "make_write")),
+        ("edit", "make_edit", ("edit.py", "make_edit")),
+        ("glob", "make_glob", ("glob.py", "make_glob")),
+        ("grep", "make_grep", ("grep.py", "make_grep")),
     ]
 
     def _make_sandbox_mock(self):
@@ -245,11 +264,13 @@ class TestSandboxToolsRunInSubprocessFalse:
         pool = MagicMock()
         real_sem = threading.Semaphore(1)
         pool._gpu_semaphore = real_sem
+
         # Bind acquire_gpu to a method that uses the real semaphore so that
         # cloudpickle would have to serialise it.
         def _acquire():
             real_sem.acquire()
             return 0
+
         pool.acquire_gpu = _acquire
         pool.release_gpu = MagicMock()
         pool.gpus = [0]
@@ -259,6 +280,7 @@ class TestSandboxToolsRunInSubprocessFalse:
     def test_run_in_subprocess_is_false(self, tool_name, factory_name, _):
         """Every sandbox tool must have run_in_subprocess=False."""
         import importlib
+
         mod = importlib.import_module(f"agency.tools.{tool_name}")
         factory = getattr(mod, factory_name)
         tool = factory(self._make_sandbox_mock())
@@ -332,9 +354,11 @@ class TestSandboxToolsRunInSubprocessFalse:
         tool_tid_box: list[int] = []
 
         sb = MagicMock()
+
         def _exec_capture(cmd, workdir="/workspace", timeout=120):
             tool_tid_box.append(threading.get_ident())
             return ("ok\n", 0)
+
         sb.exec.side_effect = _exec_capture
 
         bash = make_bash(sb)

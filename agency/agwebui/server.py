@@ -6,6 +6,7 @@ Run via:
 
     python -m agency.agwebui.server --run-dir <path> --port 7860
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,7 +19,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 # Seconds east of UTC for the server's local timezone (accounts for DST).
-_TZ_OFFSET: int = -(_time.altzone if _time.daylight and _time.localtime().tm_isdst else _time.timezone)
+_TZ_OFFSET: int = -(
+    _time.altzone if _time.daylight and _time.localtime().tm_isdst else _time.timezone
+)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -30,35 +33,36 @@ _STATIC = Path(__file__).parent / "static"
 # Config
 # ---------------------------------------------------------------------------
 
-TAIL_EVENTS    = 500          # events replayed to new clients on connect
-INDEX_INTERVAL = 1_000        # events between sample points in the timeline index
+TAIL_EVENTS = 500  # events replayed to new clients on connect
+INDEX_INTERVAL = 1_000  # events between sample points in the timeline index
 
 # ---------------------------------------------------------------------------
 # Mutable globals — set in __main__ before uvicorn starts
 # ---------------------------------------------------------------------------
 
-_run_dir:     Path = Path(".")
-_reply_dir:   Path = Path(".")
+_run_dir: Path = Path(".")
+_reply_dir: Path = Path(".")
 _command_dir: Path = Path(".")
 
 # Highest event id seen so far; 0 means nothing read yet.
-_last_event_id:  int   = 0
-_event_count:    int   = 0
-_first_ts:       float | None = None
-_last_ts:        float | None = None
+_last_event_id: int = 0
+_event_count: int = 0
+_first_ts: float | None = None
+_last_ts: float | None = None
 
 _clients: set[WebSocket] = set()
-_lock:    asyncio.Lock | None = None   # created at startup
+_lock: asyncio.Lock | None = None  # created at startup
 
 # In-memory registry rebuilt from the database on startup and updated live.
 # Used to inject a "state preamble" for clients that connect mid-run.
-_agent_registry: dict[str, str] = {}   # agname -> raw JSON string
-_team_registry:  dict[str, str] = {}   # team_name -> raw JSON string
+_agent_registry: dict[str, str] = {}  # agname -> raw JSON string
+_team_registry: dict[str, str] = {}  # team_name -> raw JSON string
 
 
 # ---------------------------------------------------------------------------
 # SQLite helpers (synchronous — called via asyncio.to_thread)
 # ---------------------------------------------------------------------------
+
 
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* atomically.
@@ -93,7 +97,7 @@ def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None, dic
     Returns (last_event_id, event_count, first_ts, last_ts, agent_reg, team_reg).
     """
     agent_reg: dict[str, str] = {}
-    team_reg:  dict[str, str] = {}
+    team_reg: dict[str, str] = {}
     if not path.exists():
         return 0, 0, None, None, agent_reg, team_reg
     try:
@@ -103,7 +107,7 @@ def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None, dic
         ):
             try:
                 ev = json.loads(data)
-                t  = ev.get("type")
+                t = ev.get("type")
                 if t == "agent_registered":
                     agn = ev.get("agname")
                     if agn:
@@ -114,9 +118,7 @@ def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None, dic
                         team_reg[tn] = data
             except Exception:
                 pass
-        row = con.execute(
-            "SELECT MAX(id), COUNT(*), MIN(ts), MAX(ts) FROM events"
-        ).fetchone()
+        row = con.execute("SELECT MAX(id), COUNT(*), MIN(ts), MAX(ts) FROM events").fetchone()
         con.close()
         if row and row[0] is not None:
             return row[0], row[1], row[2], row[3], agent_reg, team_reg
@@ -132,9 +134,7 @@ def _fetch_state_preamble(path: Path) -> list[str]:
     rows: list[str] = []
     try:
         con = _open_db(path)
-        for (tokens, messages) in con.execute(
-            "SELECT tokens, messages FROM agent_state"
-        ):
+        for tokens, messages in con.execute("SELECT tokens, messages FROM agent_state"):
             if tokens:
                 rows.append(tokens)
             if messages:
@@ -170,8 +170,8 @@ def _fetch_tail_events(path: Path, n: int = TAIL_EVENTS) -> list[str]:
     try:
         con = _open_db(path)
         rows = con.execute(
-            "SELECT data FROM (SELECT id, data FROM events ORDER BY id DESC LIMIT ?) "
-            "ORDER BY id", (n,)
+            "SELECT data FROM (SELECT id, data FROM events ORDER BY id DESC LIMIT ?) ORDER BY id",
+            (n,),
         ).fetchall()
         con.close()
         return [r[0] for r in rows]
@@ -185,9 +185,7 @@ def _fetch_timeline(path: Path) -> dict:
         return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
     try:
         con = _open_db(path)
-        row = con.execute(
-            "SELECT MIN(ts), MAX(ts), COUNT(*) FROM events"
-        ).fetchone()
+        row = con.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM events").fetchone()
         first_ts, last_ts, count = row if row else (None, None, 0)
         if not count:
             con.close()
@@ -195,15 +193,15 @@ def _fetch_timeline(path: Path) -> dict:
         # Sample up to 500 evenly spaced points across the event stream.
         step = max(1, count // 500)
         raw_samples = con.execute(
-            f"SELECT ts FROM events WHERE (id % ?) = 1 ORDER BY id", (step,)
+            "SELECT ts FROM events WHERE (id % ?) = 1 ORDER BY id", (step,)
         ).fetchall()
         con.close()
         samples = [[i, r[0]] for i, r in enumerate(raw_samples)]
         return {
             "index_len": len(samples),
-            "first_ts":  first_ts,
-            "last_ts":   last_ts,
-            "samples":   samples,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "samples": samples,
         }
     except Exception:
         return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
@@ -228,6 +226,7 @@ def _fetch_events_range(path: Path, start_ts: float, end_ts: float) -> list[str]
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -260,6 +259,7 @@ async def health():
 # Timeline API
 # ---------------------------------------------------------------------------
 
+
 @app.get("/api/timeline")
 async def api_timeline():
     """Return sample points and metadata for the timeline scrubber."""
@@ -280,23 +280,26 @@ async def api_events(start_ts: float = 0.0, end_ts: float = 0.0):
 # WebSocket
 # ---------------------------------------------------------------------------
 
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     assert _lock is not None
 
     # Fetch tail and state outside lock — read-only DB queries.
-    tail_lines    = await asyncio.to_thread(_fetch_tail_events, _db_path())
+    tail_lines = await asyncio.to_thread(_fetch_tail_events, _db_path())
     state_preamble = await asyncio.to_thread(_fetch_state_preamble, _db_path())
 
     async with _lock:
-        sync = json.dumps({
-            "type":      "timeline_sync",
-            "index_len": max(0, _event_count // INDEX_INTERVAL),
-            "first_ts":  _first_ts,
-            "last_ts":   _last_ts,
-            "tz_offset": _TZ_OFFSET,
-        })
+        sync = json.dumps(
+            {
+                "type": "timeline_sync",
+                "index_len": max(0, _event_count // INDEX_INTERVAL),
+                "first_ts": _first_ts,
+                "last_ts": _last_ts,
+                "tz_offset": _TZ_OFFSET,
+            }
+        )
         reg_preamble = list(_agent_registry.values()) + list(_team_registry.values())
         try:
             await ws.send_text(sync)
@@ -321,7 +324,7 @@ async def websocket_endpoint(ws: WebSocket):
                 mtype = msg.get("type")
                 if mtype == "human_reply":
                     ask_id = str(msg.get("ask_id", ""))
-                    text   = str(msg.get("text", ""))
+                    text = str(msg.get("text", ""))
                     if ask_id:
                         _atomic_write_text(_reply_dir / f"{ask_id}.txt", text)
                 elif mtype in ("pause", "resume", "pause_all", "resume_all"):
@@ -329,7 +332,11 @@ async def websocket_endpoint(ws: WebSocket):
                     cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
                     _atomic_write_text(cmd_file, json.dumps(cmd))
                 elif mtype in ("update_config", "update_config_all"):
-                    cmd = {"type": mtype, "agname": msg.get("agname"), "config": msg.get("config") or {}}
+                    cmd = {
+                        "type": mtype,
+                        "agname": msg.get("agname"),
+                        "config": msg.get("config") or {},
+                    }
                     cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
                     _atomic_write_text(cmd_file, json.dumps(cmd))
             except Exception:
@@ -342,6 +349,7 @@ async def websocket_endpoint(ws: WebSocket):
 # ---------------------------------------------------------------------------
 # Poll loop
 # ---------------------------------------------------------------------------
+
 
 async def _tail_events() -> None:
     global _last_event_id, _event_count, _first_ts, _last_ts
@@ -360,10 +368,10 @@ async def _tail_events() -> None:
                 async with _lock:
                     for event_id, data in rows:
                         _last_event_id = event_id
-                        _event_count  += 1
+                        _event_count += 1
                         try:
                             ev = json.loads(data)
-                            t  = ev.get("type")
+                            t = ev.get("type")
                             if t == "agent_registered":
                                 agn = ev.get("agname")
                                 if agn:
@@ -396,11 +404,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="agwebui standalone server")
     parser.add_argument("--run-dir", required=True, help="Directory containing ui_events.db")
-    parser.add_argument("--port",    type=int, default=7860)
+    parser.add_argument("--port", type=int, default=7860)
     parsed = parser.parse_args()
 
-    _run_dir     = Path(parsed.run_dir)
-    _reply_dir   = _run_dir / "ui_replies"
+    _run_dir = Path(parsed.run_dir)
+    _reply_dir = _run_dir / "ui_replies"
     _command_dir = _run_dir / "ui_commands"
     _reply_dir.mkdir(parents=True, exist_ok=True)
     _command_dir.mkdir(parents=True, exist_ok=True)

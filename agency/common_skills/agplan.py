@@ -49,7 +49,7 @@ class agplan(agskill):
             name=name,
             system_prompt=_BASE_PROMPT + system_prompt,
             add_tools=add_tools,
-            replace_tools=None,   # _build_tools handles tool selection
+            replace_tools=None,  # _build_tools handles tool selection
             input_schema=input_schema,
             output_schema=output_schema,
             max_output_schema_retries=max_output_schema_retries,
@@ -57,6 +57,7 @@ class agplan(agskill):
 
     def _build_tools(self, sandbox, pool, term, log, _ensure_read: bool = False):
         from ..tools import make_read, make_grep, make_glob, webfetch
+
         if sandbox is not None:
             active_tools: list[agtool] = [
                 make_read(sandbox),

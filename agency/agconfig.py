@@ -64,7 +64,9 @@ class agConfig:
     FIELD_REGISTRY: ClassVar[dict[tuple[str, str], "_ConfigParam"]] = {}
     _registry_lock: ClassVar[threading.Lock] = threading.Lock()
 
-    def __init__(self, *sources: "agConfig | dict[str, dict[str, Any]] | _AgConfigViewBase") -> None:
+    def __init__(
+        self, *sources: "agConfig | dict[str, dict[str, Any]] | _AgConfigViewBase"
+    ) -> None:
         """Each source contributes its data, later sources winning on a
         conflicting (owner, name) -- same semantics as ``{**a, **b}``. A
         source may be a plain nested dict (the original single-argument
@@ -172,6 +174,7 @@ agConfig.GLOBAL = agConfig()
 # parent objects to children.
 # ---------------------------------------------------------------------------
 
+
 class _ConfigParam:
     def __init__(self, owner: str, default: Any) -> None:
         self.owner = owner
@@ -229,7 +232,9 @@ class StaticConfigParam(_ConfigParam):
         if self.name not in cache:
             agconfig = getattr(obj, "_agconfig", None)
             cache[self.name] = (
-                agconfig.get_static(self.owner, self.name, self.default) if agconfig is not None else self.default
+                agconfig.get_static(self.owner, self.name, self.default)
+                if agconfig is not None
+                else self.default
             )
         return cache[self.name]
 
@@ -256,7 +261,9 @@ class DynamicConfigParam(_ConfigParam):
     def __set__(self, obj: Any, value: Any) -> None:
         agconfig = getattr(obj, "_agconfig", None)
         if agconfig is None:
-            raise AttributeError(f"{self.owner}.{self.name} can't be set -- this instance has no agconfig")
+            raise AttributeError(
+                f"{self.owner}.{self.name} can't be set -- this instance has no agconfig"
+            )
         agconfig.set(self.owner, self.name, value)
 
 
@@ -285,7 +292,9 @@ class _OwnerView:
         if knob is None:
             raise AttributeError(f"{self._owner} has no registered field {name!r}")
         if isinstance(knob, GlobalConfigParam):
-            agConfig.GLOBAL.set(self._owner, name, value)  # same shared target regardless of which agconfig this is
+            agConfig.GLOBAL.set(
+                self._owner, name, value
+            )  # same shared target regardless of which agconfig this is
         else:
             self._agconfig.set(self._owner, name, value)
 
@@ -341,7 +350,11 @@ class _AgConfigViewBase:
         # which agConfig this view wraps -- writing it onto self._agconfig
         # instead would silently create a dead override nothing ever reads,
         # since GlobalConfigParam.__get__ only ever consults agConfig.GLOBAL.
-        known = {name: knob for (owner, name), knob in agConfig.FIELD_REGISTRY.items() if owner == self._OWNER}
+        known = {
+            name: knob
+            for (owner, name), knob in agConfig.FIELD_REGISTRY.items()
+            if owner == self._OWNER
+        }
         if self._ALLOWED_FIELDS is not None:
             known = {name: knob for name, knob in known.items() if name in self._ALLOWED_FIELDS}
         unknown = set(fields) - set(known)

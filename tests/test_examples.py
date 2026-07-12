@@ -7,6 +7,7 @@ Two tiers:
     are set, since examples need a live LLM endpoint and a real sandbox
     container to actually execute.
 """
+
 import importlib.util
 import os
 import runpy
@@ -20,7 +21,9 @@ EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 EXAMPLE_FILES = sorted(EXAMPLES_DIR.glob("*.py"))
 
 LIVE_LLM = bool(os.environ.get("VLLM_BASE_URL")) and bool(os.environ.get("VLLM_API_KEY"))
-LIVE_SKIP_REASON = "set VLLM_BASE_URL and VLLM_API_KEY to run examples end-to-end against a live LLM"
+LIVE_SKIP_REASON = (
+    "set VLLM_BASE_URL and VLLM_API_KEY to run examples end-to-end against a live LLM"
+)
 
 
 @pytest.mark.parametrize("path", EXAMPLE_FILES, ids=[p.stem for p in EXAMPLE_FILES])
@@ -39,6 +42,8 @@ def test_example_runs_live(path):
     # Bypass the dashboard and just call fn() directly so the test can complete.
     # Also reset sys.argv so examples that read sys.argv[1:] (e.g. for an
     # optional topic/image path) don't pick up pytest's own CLI args.
-    with patch("agency.agwebui.agwebui.run", side_effect=lambda fn, *a, **kw: fn()), \
-         patch.object(sys, "argv", [str(path)]):
+    with (
+        patch("agency.agwebui.agwebui.run", side_effect=lambda fn, *a, **kw: fn()),
+        patch.object(sys, "argv", [str(path)]),
+    ):
         runpy.run_path(str(path), run_name="__main__")

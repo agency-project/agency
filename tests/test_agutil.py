@@ -1,4 +1,5 @@
 """Tests for agutil utility helpers."""
+
 from agency.agutil import _strip_thinking, _extract_thinking
 
 

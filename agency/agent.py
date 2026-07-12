@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import ClassVar
 
 # Single run-level ID for the default log directory.
-_RUN_ID  = _uuid_mod.uuid4().hex[:12]
-_RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+_RUN_ID = _uuid_mod.uuid4().hex[:12]
+_RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 _DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
 
 # Global weak registry of all live agent instances.
@@ -148,10 +148,12 @@ class agent_state:
     def _emit(self) -> None:
         try:
             from . import agwebui as _agwebui
+
             if _agwebui._active is not None:
                 from .agterm import agterm as _agterm
                 from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
                 from ._context import _active_team as _at
+
                 _ansi = _agterm._agname_colors.get(self.agname)
                 _color = _ansi_to_hex(_ansi) if _ansi else None
                 _team = _at.get(None)
@@ -187,28 +189,28 @@ class agent:
         agent.max_outer_iters = 144
     """
 
-    log_dir:          ClassVar[Path | None]          = None
-    output_dir:       ClassVar[Path | None]          = None
-    agresource_pool:  ClassVar[agResourcePool]       = agResourcePool(mark_gpus=False)
-    ping_interval_s:  ClassVar[int]                  = 300
-    poll_interval_s:  ClassVar[int]                  = 5
-    max_outer_iters:  ClassVar[int]                  = 144
+    log_dir: ClassVar[Path | None] = None
+    output_dir: ClassVar[Path | None] = None
+    agresource_pool: ClassVar[agResourcePool] = agResourcePool(mark_gpus=False)
+    ping_interval_s: ClassVar[int] = 300
+    poll_interval_s: ClassVar[int] = 5
+    max_outer_iters: ClassVar[int] = 144
 
     # Tier-1-style fallback: agent(agconfig=...) not given -> use this if set.
     # Same "set once before creating agents" convention as the ClassVars
     # above, so scripts that construct agents directly (agent(agname=...),
     # with no agconfig= kwarg) still pick up a run-wide agConfig.
-    default_agconfig: "ClassVar[agConfig | None]"    = None
+    default_agconfig: "ClassVar[agConfig | None]" = None
 
     # Global token counter — accumulates across all agents and skill calls.
-    _global_input_tokens:  ClassVar[int]             = 0
-    _global_output_tokens: ClassVar[int]             = 0
-    _global_token_lock:    ClassVar[threading.Lock]  = threading.Lock()
+    _global_input_tokens: ClassVar[int] = 0
+    _global_output_tokens: ClassVar[int] = 0
+    _global_token_lock: ClassVar[threading.Lock] = threading.Lock()
 
     @classmethod
     def _add_global_tokens(cls, inp: int, out: int) -> None:
         with cls._global_token_lock:
-            cls._global_input_tokens  += inp
+            cls._global_input_tokens += inp
             cls._global_output_tokens += out
 
     @classmethod
@@ -232,8 +234,13 @@ class agent:
         if llm is None:
             if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
                 from ._context import _active_team as _at
+
                 _t = _at.get(None)
-                if _t is not None and _t.agconfig is not None and _t.agconfig.data.get("agllm_backend"):
+                if (
+                    _t is not None
+                    and _t.agconfig is not None
+                    and _t.agconfig.data.get("agllm_backend")
+                ):
                     # Adopt the team's agconfig outright (not just for the LLM
                     # fields) -- log_dir/output_dir/sandbox settings etc. should
                     # also come from it, matching "agents inherit the team's
@@ -251,20 +258,22 @@ class agent:
         # or the active agteam's agconfig) -- mutating that source afterward
         # must not silently change an already-constructed agent. Use
         # ag.change_config(new_cfg) to change it live -- see that method.
-        self.agconfig: "agConfig | None" = _src_agconfig.clone() if _src_agconfig is not None else None
+        self.agconfig: "agConfig | None" = (
+            _src_agconfig.clone() if _src_agconfig is not None else None
+        )
 
         self.agname: _agname = _agname.allocate_agname(agname)
 
-        self.llm: agllm                = llm if llm is not None else agllm(self.agconfig)
-        self.ctx: agcontext            = agcontext()
+        self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
+        self.ctx: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
 
         _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
-        log_dir  = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
+        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{self.agname}_timeline.jsonl"
-        self.log  = aglog(path=log_path, agconfig=self.agconfig)
+        self.log = aglog(path=log_path, agconfig=self.agconfig)
         self._full_history: list[dict] = []
         self._full_history_path: Path = log_dir / f"{self.agname}_history.jsonl"
         self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -277,13 +286,16 @@ class agent:
         _live_agents.add(self)
 
         from ._context import _active_team
+
         _team = _active_team.get(None)
         if _team is not None:
             _team._agents.add(self)
 
         team_name = _team.team_name if _team is not None else None
 
-        ctx = f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
+        ctx = (
+            f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
+        )
         team_tag = f"  team={team_name}" if team_name else ""
         self.terminal.log("CREATED  ", f"model={self.llm.backend.model or '?'}{ctx}{team_tag}")
         self.log._lifecycle(
@@ -368,8 +380,7 @@ class agent:
         if "role" not in msg:
             self._push_live_messages(self._snapshot_messages)
 
-    def _set_ui_state(self, state: str, skill: str | None = None,
-                      tool: str | None = None) -> None:
+    def _set_ui_state(self, state: str, skill: str | None = None, tool: str | None = None) -> None:
         self._state.update_state(state, skill, tool)
 
     def _emit_config(self) -> None:
@@ -381,6 +392,7 @@ class agent:
             return
         try:
             from . import agwebui as _agwebui
+
             if _agwebui._active is not None:
                 _agwebui._active.emitter.agent_config(self.agname, self.agconfig.dynamic_snapshot())
         except Exception as _e:
@@ -390,11 +402,10 @@ class agent:
         self._snapshot_messages = list(messages)
         try:
             from . import agwebui as _agwebui
+
             if _agwebui._active is not None:
                 event_entries = [e for e in getattr(self, "_full_history", []) if "role" not in e]
-                _agwebui._active.emitter.push_messages(
-                    self.agname, list(messages) + event_entries
-                )
+                _agwebui._active.emitter.push_messages(self.agname, list(messages) + event_entries)
         except Exception as _e:
             print(f"[agent] WARNING: push_messages failed for {self.agname}: {_e}")
 
@@ -439,7 +450,9 @@ class agent:
         # checkpoint writing "paused"), so this can never clobber a state
         # that already reflects a genuine stop.
         self._state.update_state(
-            "pausing", skill=self._state.skill, tool=self._state.tool,
+            "pausing",
+            skill=self._state.skill,
+            tool=self._state.tool,
             unless_in=("inactive", "finished", "error", "paused", "blocked_on_dependency"),
         )
         self.terminal.log("PAUSE ▶  ", "requested")
@@ -501,13 +514,14 @@ class agent:
         """Push a live token update to the webui (called from agskill mid-loop)."""
         try:
             from . import agwebui as _agwebui
+
             if _agwebui._active is None:
                 return
             _gl = agent.global_token_usage()
             _before = self.log.token_usage
             _agwebui._active.emitter.token_update(
                 self.agname,
-                _before["input_tokens"]  + skill_inp,
+                _before["input_tokens"] + skill_inp,
                 _before["output_tokens"] + skill_out,
                 _gl["input_tokens"],
                 _gl["output_tokens"],
@@ -537,6 +551,7 @@ class agent:
     ) -> "agdata":
         """Async wrapper around run() for use in asyncio event loops."""
         import asyncio
+
         loop = asyncio.get_event_loop()
         pending = self.run(skill, skill_input, max_steps)
         await loop.run_in_executor(None, pending._resolve)
@@ -577,21 +592,24 @@ class agent:
         if _out is not None:
             sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
             agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
-        ag.sandbox = src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
+        ag.sandbox = (
+            src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
+        )
         _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", cls.log_dir)
-        log_dir  = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
+        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
         log_path = log_dir / f"{ag.agname}_timeline.jsonl"
-        ag.log   = aglog(path=log_path, agconfig=ag.agconfig)
+        ag.log = aglog(path=log_path, agconfig=ag.agconfig)
         ag._full_history = []
         ag._full_history_path = log_dir / f"{ag.agname}_history.jsonl"
         ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
         ag.terminal = agterm(ag.agname)
         ag._snapshot_messages = []
-        ag.inbox  = queue.Queue()
+        ag.inbox = queue.Queue()
         ag._state = agent_state(str(ag.agname))
         _live_agents.add(ag)
 
         from ._context import _active_team
+
         _team = _active_team.get(None)
         if _team is not None:
             _team._agents.add(ag)
@@ -644,7 +662,9 @@ class agent:
 
             if agname in live_names:
                 existing = live_names[agname]
-                existing.terminal.log("CKPT     ", f"load_all: {agname} already live, skipping {ckpt.name}")
+                existing.terminal.log(
+                    "CKPT     ", f"load_all: {agname} already live, skipping {ckpt.name}"
+                )
                 restored.append(existing)
             else:
                 ag = cls.load(ckpt, agconfig=agconfig)
@@ -666,10 +686,10 @@ class agent:
         self.ctx.resolve_prev_dependencies()
 
         state = {
-            "agname":     self.agname,
+            "agname": self.agname,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
-            "history":    self.ctx.messages,
-            "ts":         _ts(),
+            "history": self.ctx.messages,
+            "ts": _ts(),
         }
         state_bytes = json.dumps(state, indent=2).encode()
 
@@ -715,8 +735,10 @@ class agent:
         image_tag = f"agency/ckpt-restore-{_uuid_mod.uuid4().hex[:8]}"
 
         with tarfile.open(path, "r:gz") as tar:
-            state       = json.loads(tar.extractfile("state.json").read())
-            container_member = next((m for m in tar.getmembers() if m.name == "container.tar"), None)
+            state = json.loads(tar.extractfile("state.json").read())
+            container_member = next(
+                (m for m in tar.getmembers() if m.name == "container.tar"), None
+            )
             image_bytes = tar.extractfile(container_member).read() if container_member else None
 
         checkpoint: str | None = None
@@ -729,26 +751,32 @@ class agent:
             checkpoint = image_tag
 
         ag: agent = cls.__new__(cls)
-        ag.agname        = _agname.claim_unique_agname(state["agname"])
-        _base_agconfig   = agconfig if agconfig is not None else agent.default_agconfig
-        ag.agconfig      = _base_agconfig.clone() if _base_agconfig is not None else agConfig()
-        _already_set     = _base_agconfig.data.get("agllm_backend", {}) if _base_agconfig is not None else {}
+        ag.agname = _agname.claim_unique_agname(state["agname"])
+        _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
+        ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agConfig()
+        _already_set = (
+            _base_agconfig.data.get("agllm_backend", {}) if _base_agconfig is not None else {}
+        )
         for k, v in state.get("llm_config", {}).items():
             if k not in _already_set:
                 ag.agconfig.set("agllm_backend", k, v)
-        ag.llm           = agllm(ag.agconfig)
-        ag.ctx           = agcontext(messages=list(state.get("history", [])))
+        ag.llm = agllm(ag.agconfig)
+        ag.ctx = agcontext(messages=list(state.get("history", [])))
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
         if _out is not None:
             sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
             agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
-        ag.sandbox       = agSandbox(ag.agname, checkpoint_image=checkpoint, agconfig=sb_cfg) if checkpoint else None
+        ag.sandbox = (
+            agSandbox(ag.agname, checkpoint_image=checkpoint, agconfig=sb_cfg)
+            if checkpoint
+            else None
+        )
 
         _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", agent.log_dir)
-        log_dir  = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        ag.log   = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl", agconfig=ag.agconfig)
+        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
+        ag.log = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl", agconfig=ag.agconfig)
         ag._full_history: list[dict] = []
         ag._full_history_path: Path = log_dir / f"{ag.agname}_history.jsonl"
         ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -760,7 +788,9 @@ class agent:
         _live_agents.add(ag)
 
         ag.terminal.log("LOADED   ", f"from {path}")
-        ag.log._lifecycle("loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts"))
+        ag.log._lifecycle(
+            "loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts")
+        )
         ag._emit_config()
 
         return ag

@@ -24,6 +24,8 @@ dev = [
     "pytest",
     "pytest-mock",
     "pytest-timeout",
+    "pre-commit",
+    "ruff",
 ]
 
 [build-system]
@@ -32,6 +34,22 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agency"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Deliberately just pyflakes (F): unused imports/variables, undefined names,
+# redefinitions -- real-bug detectors with no stylistic judgment calls.
+# pycodestyle (E) was tried and dropped for now: E402 (import not at top)
+# flags several intentional patterns (agent.py/agwebui/server.py define
+# module-level constants before their imports on purpose), and E501/E701/
+# E702/E741/E731 are pure style on a codebase that's never been linted --
+# ruff-format (below) already owns whitespace/line-wrapping. Widen this
+# deliberately later rather than fixing/suppressing a wall of pre-existing
+# style findings just to turn a rule on.
+select = ["F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

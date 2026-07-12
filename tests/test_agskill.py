@@ -1,4 +1,5 @@
 """Tests for agskill as a self-contained ReAct skill."""
+
 import json
 from unittest.mock import patch, MagicMock
 from agency.agdata import agdata, agerror
@@ -10,8 +11,8 @@ from agency.agllm import _AgLLMFields, agllm
 from agency.agtool import agtool, _AgToolFields
 from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
 
-LLM_MAX_RETRIES    = _AgLLMFields.max_retries.default
-LLM_IDLE_TIMEOUT   = _AgLLMFields.idle_timeout.default
+LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
+LLM_IDLE_TIMEOUT = _AgLLMFields.idle_timeout.default
 LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
 
 LLM_CONFIG = {"api_key": "test", "model": ""}
@@ -46,13 +47,13 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
     return ag
 
 
-
 def _noop(arg: agdata) -> agdata:
     return agdata()
 
 
 def _noop_r1(arg: agdata) -> agdata:
     return agdata(r=1)
+
 
 # ---------------------------------------------------------------------------
 # Streaming mock helpers
@@ -61,6 +62,7 @@ def _noop_r1(arg: agdata) -> agdata:
 # multiple calls (e.g. retry tests).
 # ---------------------------------------------------------------------------
 
+
 class _Delta:
     def __init__(self, content=None, tool_calls=None):
         self.content = content
@@ -68,16 +70,23 @@ class _Delta:
         self.model_extra = {}
         self.reasoning_content = None
 
+
 class _Choice:
-    def __init__(self, delta): self.delta = delta
+    def __init__(self, delta):
+        self.delta = delta
+
 
 class _Usage:
     prompt_tokens = 5
 
+
 class _Chunk:
     def __init__(self, content=None, tool_calls=None, usage=None):
         self.usage = usage
-        self.choices = [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        self.choices = (
+            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        )
+
 
 class _TCDelta:
     def __init__(self, name, args_json, call_id):
@@ -85,8 +94,11 @@ class _TCDelta:
         self.index = 0
         self.function = _TCFnDelta(name, args_json)
 
+
 class _TCFnDelta:
-    def __init__(self, name, args): self.name = name; self.arguments = args
+    def __init__(self, name, args):
+        self.name = name
+        self.arguments = args
 
 
 def _direct(content: str) -> list:
@@ -113,6 +125,7 @@ def make_skill(name="summarise", add_tools=None, replace_tools=None) -> agskill:
 # Basic API
 # ---------------------------------------------------------------------------
 
+
 def test_name_and_repr():
     s = make_skill()
     assert s.name == "summarise"
@@ -123,7 +136,9 @@ def test_run_returns_agdata_and_history():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"summary": "ok"}')
-        result, ctx, delta = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(text="hello"))
+        result, ctx, delta = s.execute_react(
+            make_mock_agent(LLM), agcontext(), agdata(text="hello")
+        )
     assert isinstance(result, agdata)
     assert isinstance(ctx, agcontext)
     assert isinstance(delta, list)
@@ -149,8 +164,10 @@ def test_run_plain_text_fallback():
 # agskill.check_schema — Python type object hints
 # ---------------------------------------------------------------------------
 
+
 def test_check_schema_accepts_python_type_objects():
     assert agschema(agdata(x=int, name=str)).check(agdata(x=5, name="hi")) == []
+
 
 def test_check_schema_type_mismatch_with_type_object():
     errors = agschema(agdata(x=int)).check(agdata(x="bad"))
@@ -158,31 +175,37 @@ def test_check_schema_type_mismatch_with_type_object():
     assert "x" in errors[0]
     assert "int" in errors[0]
 
+
 def test_system_prompt_type_names_shown_correctly():
     from agency.agtype import agfile
+
     sk = agskill(
-        "t", "",
+        "t",
+        "",
         input_schema=agdata(n=int, s=str, doc=agfile),
         output_schema=agdata(result=float),
     )
     prompt = sk._build_system_prompt()
-    assert '"n": "int"' in prompt       # input schema still uses to_json()
+    assert '"n": "int"' in prompt  # input schema still uses to_json()
     assert '"s": "str"' in prompt
     assert '"doc": "file"' in prompt
-    assert "result" in prompt            # output field listed by name
-    assert "float" in prompt             # output field type shown as "float"
+    assert "result" in prompt  # output field listed by name
+    assert "float" in prompt  # output field type shown as "float"
 
 
 # ---------------------------------------------------------------------------
 # System prompt is sent but NOT stored in history
 # ---------------------------------------------------------------------------
 
+
 def test_system_prompt_prepended_to_llm_call():
     s = make_skill()
     captured = {}
+
     def capture(*args, **kwargs):
         captured["messages"] = kwargs.get("messages", [])
         return _direct("{}")
+
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
@@ -201,11 +224,15 @@ def test_system_prompt_not_in_returned_history():
 
 def test_existing_history_included_in_call():
     s = make_skill()
-    prior = agcontext(messages=[{"role": "user", "content": "prior"}, {"role": "assistant", "content": "ok"}])
+    prior = agcontext(
+        messages=[{"role": "user", "content": "prior"}, {"role": "assistant", "content": "ok"}]
+    )
     captured = {}
+
     def capture(*args, **kwargs):
         captured["messages"] = list(kwargs.get("messages", []))  # snapshot before list is mutated
         return _direct("{}")
+
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
         s.execute_react(make_mock_agent(LLM), prior, agdata(x=1))
@@ -218,12 +245,17 @@ def test_existing_history_included_in_call():
 # Tool call path
 # ---------------------------------------------------------------------------
 
+
 def test_tool_call_executes_and_continues():
     def fn(arg: agdata) -> agdata:
         return agdata(val=arg.x * 10)
 
-    t = agtool(name="calc", description="", fn=fn,
-             params={"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]})
+    t = agtool(
+        name="calc",
+        description="",
+        fn=fn,
+        params={"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]},
+    )
 
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("calc", {"x": 7}), _direct('{"result": 70}')]
@@ -251,7 +283,9 @@ def test_unknown_tool_error_in_history():
 def test_max_steps_exceeded():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = lambda **kw: _tool_call("x", {})
+        MockClient.return_value.chat.completions.create.side_effect = lambda **kw: _tool_call(
+            "x", {}
+        )
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1), max_steps=3)
     assert result.error == "max_steps exceeded"
 
@@ -260,14 +294,17 @@ def test_max_steps_exceeded():
 # replace_tools / add_tools
 # ---------------------------------------------------------------------------
 
+
 def test_replace_tools_overrides_defaults():
     """replace_tools replaces the tool list entirely; no sandbox tools included."""
     my_tool = agtool(name="mt", description="my tool", fn=_noop_r1)
     s = agskill(name="s", system_prompt="", replace_tools=[my_tool])
     captured = {}
+
     def capture(**kwargs):
         captured["tools"] = kwargs.get("tools")
         return _direct("{}")
+
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
@@ -280,9 +317,11 @@ def test_replace_tools_empty_list_gives_no_tools():
     """replace_tools=[] means no tools at all."""
     s = agskill(name="s", system_prompt="", replace_tools=[])
     captured = {}
+
     def capture(**kwargs):
         captured["tools"] = kwargs.get("tools")
         return _direct("{}")
+
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = capture
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
@@ -295,14 +334,21 @@ def test_add_tools_extends_sandbox_defaults():
     s = agskill(name="s", system_prompt="", add_tools=[extra])
     captured = {}
     fake_default = agtool(name="bash", description="", fn=_noop_r1)
+
     def fake_make_sandboxed(sandbox, pool):
         return [fake_default]
+
     import agency.tools as _tools_mod
-    with patch("openai.OpenAI") as MockClient, \
-         patch.object(_tools_mod, "make_sandboxed_tools", side_effect=fake_make_sandboxed):
+
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch.object(_tools_mod, "make_sandboxed_tools", side_effect=fake_make_sandboxed),
+    ):
+
         def capture(**kwargs):
             captured["tools"] = kwargs.get("tools")
             return _direct("{}")
+
         MockClient.return_value.chat.completions.create.side_effect = capture
         sb = MagicMock()
         sb.get_live_pids.return_value = set()
@@ -318,9 +364,11 @@ def test_add_tools_extends_sandbox_defaults():
 # input_schema and output_schema
 # ---------------------------------------------------------------------------
 
+
 def test_input_schema_missing_field_returns_error():
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         input_schema=agdata(question=str, context=str),
     )
     result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(question="hi"))
@@ -330,7 +378,8 @@ def test_input_schema_missing_field_returns_error():
 
 def test_input_schema_type_error_returns_error():
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         input_schema=agdata(count=int),
     )
     result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(count="not-an-int"))
@@ -340,7 +389,8 @@ def test_input_schema_type_error_returns_error():
 
 def test_input_schema_valid_proceeds():
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         input_schema=agdata(text=str),
     )
     with patch("openai.OpenAI") as MockClient:
@@ -352,7 +402,8 @@ def test_input_schema_valid_proceeds():
 def test_input_schema_description_value_only_checks_presence():
     """Non-type-name values (descriptions) only trigger a missing-key error."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         input_schema=agdata(query="the search query"),
     )
     with patch("openai.OpenAI") as MockClient:
@@ -364,14 +415,15 @@ def test_input_schema_description_value_only_checks_presence():
 def test_output_schema_missing_field_triggers_retry():
     """Model doesn't call return_<field> first attempt; re-prompted; correct on retry."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(summary=str),
         max_output_schema_retries=2,
     )
     responses = [
-        _direct("I'm done."),                             # no return_summary → reprompt
+        _direct("I'm done."),  # no return_summary → reprompt
         _tool_call("return_summary", {"summary": "good"}),  # field provided
-        _direct(""),                                       # done
+        _direct(""),  # done
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
@@ -381,13 +433,16 @@ def test_output_schema_missing_field_triggers_retry():
 
 def test_output_schema_retry_exhausted_returns_error():
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(answer=str),
         max_output_schema_retries=2,
     )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"wrong": 1}')
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="hi"), max_steps=10)
+        result, _, _ = s.execute_react(
+            make_mock_agent(LLM), agcontext(), agdata(q="hi"), max_steps=10
+        )
     assert result.error is not None
     assert "output schema error" in result.error
 
@@ -395,15 +450,16 @@ def test_output_schema_retry_exhausted_returns_error():
 def test_output_schema_type_mismatch_triggers_retry():
     """return_<field> with wrong type returns error; reprompt on missing field; correct on retry."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(count=int),
         max_output_schema_retries=2,
     )
     responses = [
         _tool_call("return_count", {"count": "not-an-int"}),  # type error
-        _direct(""),                                           # stops → reprompt
-        _tool_call("return_count", {"count": 5}),             # correct
-        _direct(""),                                           # done
+        _direct(""),  # stops → reprompt
+        _tool_call("return_count", {"count": 5}),  # correct
+        _direct(""),  # done
     ]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
@@ -414,15 +470,16 @@ def test_output_schema_type_mismatch_triggers_retry():
 def test_correction_message_appended_on_retry():
     """The missing-fields reprompt is appended before the next LLM call."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(answer=str),
         max_output_schema_retries=1,
     )
     call_messages: list[list[dict]] = []
     call_idx = 0
     responses = [
-        _direct("I'm done."),                              # no return_answer → correction injected
-        _tool_call("return_answer", {"answer": "fixed"})   # provide field → done
+        _direct("I'm done."),  # no return_answer → correction injected
+        _tool_call("return_answer", {"answer": "fixed"}),  # provide field → done
     ]
 
     def side_effect(**kwargs):
@@ -441,8 +498,7 @@ def test_correction_message_appended_on_retry():
     # Second call should have the missing-fields reprompt as a user message
     second_msgs = call_messages[1]
     assert any(
-        "missing" in m.get("content", "").lower()
-        for m in second_msgs if m["role"] == "user"
+        "missing" in m.get("content", "").lower() for m in second_msgs if m["role"] == "user"
     )
 
 
@@ -459,7 +515,7 @@ def test_schemas_appended_to_system_prompt():
     assert '"text"' in prompt
     assert "return_summary" in prompt
     assert "summary" in prompt
-    assert "string" in prompt   # per-field description for str output
+    assert "string" in prompt  # per-field description for str output
 
 
 def test_no_schemas_system_prompt_unchanged():
@@ -471,10 +527,12 @@ def test_no_schemas_system_prompt_unchanged():
 # return_output tool-based output collection
 # ---------------------------------------------------------------------------
 
+
 def test_return_output_all_fields_correct():
     """Model calls return_<field> for every field; result agdata assembled correctly."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(summary=str, is_duplicate=bool, score=int),
     )
     responses = [
@@ -494,7 +552,8 @@ def test_return_output_all_fields_correct():
 def test_return_output_type_error_immediate_feedback():
     """Wrong type for a return_<field> call: tool returns error, model can retry."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(count=int),
         max_output_schema_retries=2,
     )
@@ -503,14 +562,15 @@ def test_return_output_type_error_immediate_feedback():
     call_idx = 0
     responses = [
         _tool_call("return_count", {"count": "not-int"}),  # error
-        _tool_call("return_count", {"count": 42}),          # correct
+        _tool_call("return_count", {"count": 42}),  # correct
         _direct(""),
     ]
 
     def side_effect(**kwargs):
         nonlocal call_idx
         all_messages.append(list(kwargs.get("messages", [])))
-        r = responses[call_idx]; call_idx += 1
+        r = responses[call_idx]
+        call_idx += 1
         return r
 
     with patch("openai.OpenAI") as MockClient:
@@ -527,6 +587,7 @@ def test_return_output_unknown_field_error():
     """Calling a non-existent return_<field> tool name gets 'unknown tool' feedback."""
     from agency.agtool import make_return_output_tools
     from agency.agdata import agdata
+
     schema = agdata(summary=str)
     tools = make_return_output_tools(schema)
     assert len(tools) == 1
@@ -534,20 +595,22 @@ def test_return_output_unknown_field_error():
     assert tools[0]["function"]["parameters"]["properties"]["summary"]["type"] == "string"
 
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(summary=str),
         max_output_schema_retries=2,
     )
     call_idx = 0
     responses = [
-        _tool_call("return_WRONG", {"WRONG": "oops"}),    # unknown → "unknown tool" feedback
+        _tool_call("return_WRONG", {"WRONG": "oops"}),  # unknown → "unknown tool" feedback
         _tool_call("return_summary", {"summary": "correct"}),
         _direct(""),
     ]
 
     def side_effect(**kwargs):
         nonlocal call_idx
-        r = responses[call_idx]; call_idx += 1
+        r = responses[call_idx]
+        call_idx += 1
         return r
 
     with patch("openai.OpenAI") as MockClient:
@@ -559,7 +622,8 @@ def test_return_output_unknown_field_error():
 def test_return_output_list_of_dicts():
     """list-of-dicts schema field is validated and assembled correctly."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(papers=[{"title": str, "url": str}]),
     )
     papers = [{"title": "A", "url": "http://a"}, {"title": "B", "url": "http://b"}]
@@ -576,7 +640,8 @@ def test_return_output_list_of_dicts():
 def test_return_output_list_str():
     """list[str] schema field is validated per-element."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(tags=list[str]),
     )
     responses = [
@@ -592,6 +657,7 @@ def test_return_output_list_str():
 def test_return_output_bare_list():
     """bare list type maps to JSON array and accepts any list value."""
     from agency.agtool import make_return_output_tools
+
     schema = agdata(items=list)
     tools = make_return_output_tools(schema)
     assert tools[0]["function"]["parameters"]["properties"]["items"]["type"] == "array"
@@ -610,6 +676,7 @@ def test_return_output_bare_list():
 def test_return_output_bare_dict():
     """bare dict type maps to JSON object and the LLM can return a dict value."""
     from agency.agtool import make_return_output_tools
+
     schema = agdata(meta=dict)
     tools = make_return_output_tools(schema)
     assert tools[0]["function"]["parameters"]["properties"]["meta"]["type"] == "object"
@@ -628,8 +695,10 @@ def test_return_output_bare_dict():
 def test_return_output_agrawstring_unchanged():
     """agrawstring output schema bypasses return_output entirely."""
     from agency.agtype import agrawstring
+
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(text=agrawstring),
     )
     with patch("openai.OpenAI") as MockClient:
@@ -641,15 +710,18 @@ def test_return_output_agrawstring_unchanged():
 def test_return_output_tool_in_openai_tools():
     """When output_schema is set, per-field return_<field> tools appear first in openai_tools."""
     s = agskill(
-        name="s", system_prompt="",
+        name="s",
+        system_prompt="",
         output_schema=agdata(summary=str, score=int),
     )
     captured_kwargs: list[dict] = []
-    responses_iter = iter([
-        _tool_call("return_summary", {"summary": "x"}),
-        _tool_call("return_score", {"score": 1}),
-        _direct(""),
-    ])
+    responses_iter = iter(
+        [
+            _tool_call("return_summary", {"summary": "x"}),
+            _tool_call("return_score", {"score": 1}),
+            _direct(""),
+        ]
+    )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = lambda **kw: (
             captured_kwargs.append(kw) or next(responses_iter)
@@ -662,20 +734,30 @@ def test_return_output_tool_in_openai_tools():
     # Per-field tools come first; one per schema field with typed value parameter.
     assert "return_summary" in names
     assert "return_score" in names
-    assert names.index("return_summary") < names.index("return_score") or True  # order matches schema
+    assert (
+        names.index("return_summary") < names.index("return_score") or True
+    )  # order matches schema
     # Verify the value parameters are correctly typed.
     by_name = {t["function"]["name"]: t for t in first_tools}
-    assert by_name["return_summary"]["function"]["parameters"]["properties"]["summary"]["type"] == "string"
-    assert by_name["return_score"]["function"]["parameters"]["properties"]["score"]["type"] == "integer"
+    assert (
+        by_name["return_summary"]["function"]["parameters"]["properties"]["summary"]["type"]
+        == "string"
+    )
+    assert (
+        by_name["return_score"]["function"]["parameters"]["properties"]["score"]["type"]
+        == "integer"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Return tool parameter naming and logging
 # ---------------------------------------------------------------------------
 
+
 def test_return_tool_parameter_named_after_field():
     """Each return_<field> tool has a single parameter named after the field, not 'value'."""
     from agency.agtool import make_return_output_tools
+
     schema = agdata(title=str, count=int, passed=bool)
     tools = make_return_output_tools(schema)
     by_name = {t["function"]["name"]: t for t in tools}
@@ -732,11 +814,12 @@ def test_return_tool_logs_success_to_term():
 
 def test_return_tool_logs_validation_error_to_term():
     """A type-mismatched return_<field> call emits TOOL ✗ with the tool call args."""
-    s = agskill(name="s", system_prompt="", output_schema=agdata(count=int),
-                max_output_schema_retries=1)
+    s = agskill(
+        name="s", system_prompt="", output_schema=agdata(count=int), max_output_schema_retries=1
+    )
     responses = [
         _tool_call("return_count", {"count": "not-an-int"}),  # type error → logged
-        _tool_call("return_count", {"count": 42}),             # correct on retry
+        _tool_call("return_count", {"count": 42}),  # correct on retry
         _direct(""),
     ]
     mock_term = MagicMock()
@@ -773,6 +856,7 @@ def test_semaphore_released_after_success():
 
 def test_semaphore_released_after_timeout():
     from agency.agutil import _LLMIdleTimeout as _IdleTimeout
+
     s = make_skill()
     before = _sem._value
 
@@ -780,8 +864,7 @@ def test_semaphore_released_after_timeout():
         raise _IdleTimeout("no chunk received")
         yield  # makes this a generator function
 
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _timeout_iter):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _timeout_iter):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -812,8 +895,10 @@ def test_semaphore_limits_concurrency():
 # Exponential backoff timeout
 # ---------------------------------------------------------------------------
 
+
 def test_timeout_retries_all_attempts_then_error():
     from agency.agutil import _LLMIdleTimeout as _IdleTimeout
+
     s = make_skill()
     call_count = 0
 
@@ -823,8 +908,7 @@ def test_timeout_retries_all_attempts_then_error():
         raise _IdleTimeout("no chunk received")
         yield
 
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _timeout_iter):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _timeout_iter):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -842,6 +926,7 @@ def test_timeout_values_fixed_on_retry():
     mid-stream timeout (stream_timeout) is separately configurable and constant.
     """
     from agency.agutil import _LLMIdleTimeout as _IdleTimeout
+
     captured = []
 
     def _capture_iter(iterable, idle_timeout=None, stream_timeout=None):
@@ -850,26 +935,34 @@ def test_timeout_values_fixed_on_retry():
         yield
 
     s = make_skill()
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _capture_iter):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _capture_iter):
         MockClient.return_value.chat.completions.create.return_value = []
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
-    assert len(captured) == LLM_MAX_RETRIES, f"expected {LLM_MAX_RETRIES} attempts, got {len(captured)}"
-    idle_vals   = [t[0] for t in captured]
+    assert len(captured) == LLM_MAX_RETRIES, (
+        f"expected {LLM_MAX_RETRIES} attempts, got {len(captured)}"
+    )
+    idle_vals = [t[0] for t in captured]
     stream_vals = [t[1] for t in captured]
     # idle_timeout must be fixed across all attempts — no longer doubling
-    assert len(set(idle_vals)) == 1,   f"idle_timeout should be fixed across retries: {idle_vals}"
-    assert idle_vals[0] == LLM_IDLE_TIMEOUT, f"idle_timeout should be {LLM_IDLE_TIMEOUT} s: {idle_vals}"
+    assert len(set(idle_vals)) == 1, f"idle_timeout should be fixed across retries: {idle_vals}"
+    assert idle_vals[0] == LLM_IDLE_TIMEOUT, (
+        f"idle_timeout should be {LLM_IDLE_TIMEOUT} s: {idle_vals}"
+    )
     # stream_timeout must also be fixed
-    assert len(set(stream_vals)) == 1, f"stream_timeout should be fixed across retries: {stream_vals}"
-    assert stream_vals[0] == LLM_STREAM_TIMEOUT, f"stream_timeout should be {LLM_STREAM_TIMEOUT} s: {stream_vals}"
+    assert len(set(stream_vals)) == 1, (
+        f"stream_timeout should be fixed across retries: {stream_vals}"
+    )
+    assert stream_vals[0] == LLM_STREAM_TIMEOUT, (
+        f"stream_timeout should be {LLM_STREAM_TIMEOUT} s: {stream_vals}"
+    )
 
 
 def test_timeout_succeeds_after_retry():
     """If a later attempt succeeds, result is returned normally."""
     from agency.agutil import _LLMIdleTimeout as _IdleTimeout
     from agency.agutil import _iter_batched as _real_iter_batched
+
     call_count = 0
 
     def _maybe_timeout(iterable, idle_timeout=None, stream_timeout=None):
@@ -879,11 +972,12 @@ def test_timeout_succeeds_after_retry():
             raise _IdleTimeout("no chunk received")
             yield  # makes this a generator function
         else:
-            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout)
+            yield from _real_iter_batched(
+                iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout
+            )
 
     s = make_skill()
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _maybe_timeout):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _maybe_timeout):
         MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -896,8 +990,10 @@ def test_timeout_succeeds_after_retry():
 # SSL / OSError connection error retries
 # ---------------------------------------------------------------------------
 
+
 def test_ssl_error_retries_all_attempts_then_error():
     import ssl
+
     s = make_skill()
     call_count = 0
 
@@ -907,8 +1003,7 @@ def test_ssl_error_retries_all_attempts_then_error():
         raise ssl.SSLError("record layer failure")
         yield
 
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _ssl_error_iter):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _ssl_error_iter):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -927,8 +1022,7 @@ def test_oserror_retries_all_attempts_then_error():
         raise OSError("connection reset by peer")
         yield
 
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _oserror_iter):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _oserror_iter):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -939,6 +1033,7 @@ def test_oserror_retries_all_attempts_then_error():
 
 def test_ssl_error_releases_semaphore():
     import ssl
+
     s = make_skill()
     before = _sem._value
 
@@ -946,8 +1041,7 @@ def test_ssl_error_releases_semaphore():
         raise ssl.SSLError("record layer failure")
         yield
 
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _ssl_error_iter):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _ssl_error_iter):
         MockClient.return_value.chat.completions.create.return_value = []
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -957,6 +1051,7 @@ def test_ssl_error_releases_semaphore():
 def test_ssl_error_succeeds_after_retry():
     import ssl
     from agency.agutil import _iter_batched as _real_iter_batched
+
     call_count = 0
 
     def _maybe_ssl(iterable, idle_timeout=None, stream_timeout=None):
@@ -966,11 +1061,12 @@ def test_ssl_error_succeeds_after_retry():
             raise ssl.SSLError("record layer failure")
             yield
         else:
-            yield from _real_iter_batched(iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout)
+            yield from _real_iter_batched(
+                iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout
+            )
 
     s = make_skill()
-    with patch("openai.OpenAI") as MockClient, \
-         patch("agency.agllm._iter_batched", _maybe_ssl):
+    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _maybe_ssl):
         MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -982,6 +1078,7 @@ def test_ssl_error_succeeds_after_retry():
 # ---------------------------------------------------------------------------
 # Long tool output offloading
 # ---------------------------------------------------------------------------
+
 
 def _make_sandbox(written=None):
     """Return a mock sandbox that records write_file calls."""
@@ -1010,10 +1107,18 @@ def test_short_tool_output_not_offloaded():
 
 def test_long_tool_output_offloaded_to_file():
     from agency.agtool import _AgToolFields
+
     written = {}
     sandbox = _make_sandbox(written)
 
-    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
+    _eff_thresh = max(
+        _AgToolFields.output_offload_chars.default,
+        int(
+            LLM.context_limit
+            * _AgSchemaFields.offload_context_fraction.default
+            * _AgSchemaFields.chars_per_token.default
+        ),
+    )
     big_output = "x" * (_eff_thresh + 1)
 
     def fn(arg: agdata) -> agdata:
@@ -1044,7 +1149,14 @@ def test_long_tool_output_offloaded_to_file():
 def test_long_tool_output_offloaded_to_sandbox():
     from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
+    _eff_thresh = max(
+        _AgToolFields.output_offload_chars.default,
+        int(
+            LLM.context_limit
+            * _AgSchemaFields.offload_context_fraction.default
+            * _AgSchemaFields.chars_per_token.default
+        ),
+    )
     big_output = "y" * (_eff_thresh + 1)
 
     def fn(arg: agdata) -> agdata:
@@ -1071,7 +1183,14 @@ def test_long_output_injects_read_tool_into_openai_tools():
     passed to the LLM on the next step so the model can actually call it."""
     from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
+    _eff_thresh = max(
+        _AgToolFields.output_offload_chars.default,
+        int(
+            LLM.context_limit
+            * _AgSchemaFields.offload_context_fraction.default
+            * _AgSchemaFields.chars_per_token.default
+        ),
+    )
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1085,9 +1204,11 @@ def test_long_output_injects_read_tool_into_openai_tools():
     responses = [_tool_call("fetcher", {}, "call-abc"), _direct('{"ok": 1}')]
 
     with patch("openai.OpenAI") as MockClient:
+
         def capturing_create(*args, **kwargs):
             recorded_tool_schemas.append(kwargs.get("tools") or [])
             return iter(responses.pop(0))
+
         MockClient.return_value.chat.completions.create.side_effect = capturing_create
         s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
@@ -1106,7 +1227,14 @@ def test_long_output_read_tool_persists_for_skill_run():
     LLM calls — it is not removed between iterations."""
     from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
+    _eff_thresh = max(
+        _AgToolFields.output_offload_chars.default,
+        int(
+            LLM.context_limit
+            * _AgSchemaFields.offload_context_fraction.default
+            * _AgSchemaFields.chars_per_token.default
+        ),
+    )
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1120,15 +1248,19 @@ def test_long_output_read_tool_persists_for_skill_run():
     # Three LLM calls: fetch (offloads) → read → done
     responses = [
         _tool_call("fetcher", {}, "call-001"),
-        _tool_call("read", {"path": "/workspace/long_tool_call_outputs/fetcher_call001.txt"}, "call-002"),
+        _tool_call(
+            "read", {"path": "/workspace/long_tool_call_outputs/fetcher_call001.txt"}, "call-002"
+        ),
         _direct('{"ok": 1}'),
     ]
 
     with patch("openai.OpenAI") as MockClient:
         resp_iter = iter(responses)
+
         def capturing_create(*args, **kwargs):
             recorded_tool_schemas.append(kwargs.get("tools") or [])
             return iter(next(resp_iter))
+
         MockClient.return_value.chat.completions.create.side_effect = capturing_create
         # read tool in tool_map needs to return something non-empty
         sandbox.read_file.return_value = "file content"
@@ -1145,7 +1277,14 @@ def test_long_output_no_duplicate_read_when_already_present():
     offloading must not add a second read entry to openai_tools."""
     from agency.agtool import _AgToolFields
 
-    _eff_thresh = max(_AgToolFields.output_offload_chars.default, int(LLM.context_limit * _AgSchemaFields.offload_context_fraction.default * _AgSchemaFields.chars_per_token.default))
+    _eff_thresh = max(
+        _AgToolFields.output_offload_chars.default,
+        int(
+            LLM.context_limit
+            * _AgSchemaFields.offload_context_fraction.default
+            * _AgSchemaFields.chars_per_token.default
+        ),
+    )
     big_output = "z" * (_eff_thresh + 1)
     recorded_tool_schemas = []
 
@@ -1161,9 +1300,11 @@ def test_long_output_no_duplicate_read_when_already_present():
     responses = [_tool_call("fetcher", {}, "call-dup"), _direct('{"ok": 1}')]
 
     with patch("openai.OpenAI") as MockClient:
+
         def capturing_create(*args, **kwargs):
             recorded_tool_schemas.append(kwargs.get("tools") or [])
             return iter(responses.pop(0))
+
         MockClient.return_value.chat.completions.create.side_effect = capturing_create
         s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
@@ -1175,6 +1316,7 @@ def test_long_output_no_duplicate_read_when_already_present():
 # ---------------------------------------------------------------------------
 # Tool call failure handling and checkpoint revert
 # ---------------------------------------------------------------------------
+
 
 def _make_sandbox_with_tracking():
     """Return a sandbox mock that records stop() calls."""
@@ -1242,6 +1384,7 @@ def test_tool_failure_adds_workspace_reverted_note():
 
 def test_tool_failure_no_restore_without_sandbox():
     """When agent_sandbox=MagicMock(), a tool error is passed through as-is with no stop attempt."""
+
     def fn(arg: agdata) -> agdata:
         return agerror("nope")
 
@@ -1306,10 +1449,17 @@ def test_dispatch_tools_accepts_camel_case_llm_arguments():
         return agdata(result="ok")
 
     t = agtool(
-        name="camel_tool", description="", fn=fn, run_in_subprocess=False,
-        params={"type": "object", "properties": {
-            "file_path": {"type": "string"}, "old_string": {"type": "string"},
-        }},
+        name="camel_tool",
+        description="",
+        fn=fn,
+        run_in_subprocess=False,
+        params={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+            },
+        },
     )
     s = make_skill(replace_tools=[t])
     responses = [
@@ -1336,12 +1486,16 @@ def test_tool_timeout_uses_agent_provided_value():
     def fn(arg: agdata) -> agdata:
         return agdata(result="ok")
 
-    t = agtool(name="slow", description="", fn=fn, run_in_subprocess=False,
-               params={"type": "object", "properties": {"timeout": {"type": "integer"}}})
+    t = agtool(
+        name="slow",
+        description="",
+        fn=fn,
+        run_in_subprocess=False,
+        params={"type": "object", "properties": {"timeout": {"type": "integer"}}},
+    )
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("slow", {"timeout": 120}, "c7"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient, \
-         patch.object(agtool, "__call__", patched_call):
+    with patch("openai.OpenAI") as MockClient, patch.object(agtool, "__call__", patched_call):
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1366,8 +1520,7 @@ def test_tool_timeout_ignored_if_not_int():
     t = agtool(name="slow", description="", fn=fn, run_in_subprocess=False)
     s = make_skill(replace_tools=[t])
     responses = [_tool_call("slow", {"timeout": "forever"}, "c8"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient, \
-         patch.object(agtool, "__call__", patched_call):
+    with patch("openai.OpenAI") as MockClient, patch.object(agtool, "__call__", patched_call):
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1379,6 +1532,7 @@ def test_tool_timeout_ignored_if_not_int():
 # ---------------------------------------------------------------------------
 
 from agency.agllm import agllm as _agllm_mod
+
 build_llm_kwargs = _agllm_mod.build_llm_kwargs
 
 
@@ -1470,6 +1624,7 @@ def test_build_assistant_msg_tool_calls_sorted_by_index():
 # _drain_inbox
 # ---------------------------------------------------------------------------
 
+
 def test_drain_inbox_empty_queue_returns_false():
     ag = make_mock_agent()
     ag._next_inbox_msg = MagicMock(return_value=None)
@@ -1522,6 +1677,7 @@ from agency.agsandbox import agSandbox
 
 def _make_real_sandbox(watched_pids=None):
     """Minimal sandbox stub with real _watched_pids dict for process monitoring tests."""
+
     class _FakeSandbox:
         def __init__(self):
             self._watched_pids = dict(watched_pids or {})
@@ -1531,6 +1687,7 @@ def _make_real_sandbox(watched_pids=None):
 
         def pid_status_summary(self):
             return ", ".join(f"PID {p}" for p in self._watched_pids)
+
     return _FakeSandbox()
 
 
@@ -1540,12 +1697,15 @@ def test_wait_for_processes_clean_sandbox_returns_none():
 
 
 def test_wait_for_processes_no_watched_pids_attr_returns_none():
-    class NoPids: pass
+    class NoPids:
+        pass
+
     assert agSandbox.wait_for_processes(NoPids(), "skill", None, None, "", 300, 5) is None
 
 
 def test_wait_for_processes_mock_sandbox_returns_none():
     from unittest.mock import MagicMock
+
     sb = MagicMock()
     assert agSandbox.wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
 
@@ -1568,7 +1728,9 @@ def test_wait_for_processes_completes_quickly_returns_completed_msg():
             return "PID 1234"
 
     sb = _FakeSandbox()
-    result = agSandbox.wait_for_processes(sb, "skill", None, None, "", ping_interval_s=30, poll_interval_s=0.01)
+    result = agSandbox.wait_for_processes(
+        sb, "skill", None, None, "", ping_interval_s=30, poll_interval_s=0.01
+    )
     assert result is not None
     assert "completed" in result.lower() or "Background processes have completed" in result
 
@@ -1585,7 +1747,9 @@ def test_wait_for_processes_still_running_returns_update_msg():
             return "PID 1234"
 
     sb = _FakeSandbox()
-    result = agSandbox.wait_for_processes(sb, "skill", None, None, "", ping_interval_s=0.02, poll_interval_s=0.01)
+    result = agSandbox.wait_for_processes(
+        sb, "skill", None, None, "", ping_interval_s=0.02, poll_interval_s=0.01
+    )
     assert result is not None
     assert "still running" in result.lower() or "Background processes are still running" in result
 
@@ -1603,11 +1767,20 @@ def test_wait_for_processes_calls_state_fn():
                 return set()
             return {1}
 
-        def pid_status_summary(self): return "PID 1"
+        def pid_status_summary(self):
+            return "PID 1"
 
     states = []
-    agSandbox.wait_for_processes(_FakeSandbox(), "myskill", None, None, "", 30, 0.01,
-                        state_fn=lambda state, **kw: states.append(state))
+    agSandbox.wait_for_processes(
+        _FakeSandbox(),
+        "myskill",
+        None,
+        None,
+        "",
+        30,
+        0.01,
+        state_fn=lambda state, **kw: states.append(state),
+    )
     assert "proc_wait" in states
 
 
@@ -1632,6 +1805,7 @@ def test_validate_input_schema_mismatch_returns_error():
 # agskill._build_initial_messages
 # ---------------------------------------------------------------------------
 
+
 def test_build_initial_messages_structure():
     s = make_skill()
     history = agcontext(messages=[{"role": "user", "content": "prior"}])
@@ -1645,16 +1819,16 @@ def test_build_initial_messages_structure():
 def test_build_initial_messages_fires_live_fn():
     s = make_skill()
     live_calls = []
-    s._build_initial_messages(agdata(), agcontext(), None,
-                              lambda m: live_calls.append(m), None)
+    s._build_initial_messages(agdata(), agcontext(), None, lambda m: live_calls.append(m), None)
     assert len(live_calls) == 1
 
 
 def test_build_initial_messages_fires_full_history_fn():
     s = make_skill()
     history_items = []
-    s._build_initial_messages(agdata(q="test"), agcontext(), None, None,
-                              lambda m: history_items.append(m["role"]))
+    s._build_initial_messages(
+        agdata(q="test"), agcontext(), None, None, lambda m: history_items.append(m["role"])
+    )
     assert "system" in history_items
     assert "user" in history_items
 
@@ -1662,6 +1836,7 @@ def test_build_initial_messages_fires_full_history_fn():
 # ---------------------------------------------------------------------------
 # run() — sandbox process monitoring
 # ---------------------------------------------------------------------------
+
 
 def test_run_continues_loop_when_sandbox_has_live_pids():
     """When sandbox has live PIDs after final answer, loop re-enters."""
@@ -1680,13 +1855,17 @@ def test_run_continues_loop_when_sandbox_has_live_pids():
         def pid_status_summary(self):
             return "PID 9999"
 
-        def commit(self, *a): return False
+        def commit(self, *a):
+            return False
 
-        def restore(self, *a): pass
+        def restore(self, *a):
+            pass
 
-        def write_file(self, *a): pass
+        def write_file(self, *a):
+            pass
 
-        def remove_files(self, *a): pass
+        def remove_files(self, *a):
+            pass
 
     sb = _TrackedSandbox()
 
@@ -1700,19 +1879,24 @@ def test_run_continues_loop_when_sandbox_has_live_pids():
         return _direct('{"done": true}')
 
     # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
-    s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
+    s = agskill(
+        name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[]
+    )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = create_side_effect
         result, _, _ = s.execute_react(
-            make_mock_agent(LLM, sb, ping_interval_s=0.05, poll_interval_s=0.01), agcontext(), agdata(x=1),
+            make_mock_agent(LLM, sb, ping_interval_s=0.05, poll_interval_s=0.01),
+            agcontext(),
+            agdata(x=1),
         )
 
-    assert call_count[0] == 2   # loop re-entered once
+    assert call_count[0] == 2  # loop re-entered once
     assert result.result == '{"done": true}'
 
 
 def test_run_injects_process_completed_message():
     """The continuation message injected when processes complete contains expected text."""
+
     # The sandbox starts with live PIDs. After the first LLM response, wait_for_processes
     # polls and sees them finish, then injects the "Background processes have completed"
     # message. The second LLM call then receives that message and returns the final answer.
@@ -1730,15 +1914,20 @@ def test_run_injects_process_completed_message():
                 return set()
             return {1}
 
-        def pid_status_summary(self): return "PID 1"
+        def pid_status_summary(self):
+            return "PID 1"
 
-        def commit(self, *a): return False
+        def commit(self, *a):
+            return False
 
-        def restore(self, *a): pass
+        def restore(self, *a):
+            pass
 
-        def write_file(self, *a): pass
+        def write_file(self, *a):
+            pass
 
-        def remove_files(self, *a): pass
+        def remove_files(self, *a):
+            pass
 
     sb = _TrackedSandbox()
     all_messages_per_call: list[list[dict]] = []
@@ -1748,39 +1937,62 @@ def test_run_injects_process_completed_message():
         return _direct('{"ok": 1}')
 
     # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
-    s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
+    s = agskill(
+        name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[]
+    )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = create_side_effect
-        s.execute_react(make_mock_agent(LLM, sb, ping_interval_s=30, poll_interval_s=0.01), agcontext(), agdata(x=1))
+        s.execute_react(
+            make_mock_agent(LLM, sb, ping_interval_s=30, poll_interval_s=0.01),
+            agcontext(),
+            agdata(x=1),
+        )
 
     # The second LLM call should have the injected proc message in its user messages
     assert len(all_messages_per_call) == 2
-    second_call_contents = [m.get("content", "") for m in all_messages_per_call[1] if m.get("role") == "user"]
-    assert any("Background processes" in c or "completed" in c.lower() for c in second_call_contents)
+    second_call_contents = [
+        m.get("content", "") for m in all_messages_per_call[1] if m.get("role") == "user"
+    ]
+    assert any(
+        "Background processes" in c or "completed" in c.lower() for c in second_call_contents
+    )
 
 
 def test_run_clean_sandbox_returns_immediately():
     """Sandbox with no PIDs does not delay return at all."""
+
     class _CleanSandbox:
         _watched_pids: dict = {}
 
-        def get_live_pids(self): return set()
+        def get_live_pids(self):
+            return set()
 
-        def pid_status_summary(self): return ""
+        def pid_status_summary(self):
+            return ""
 
-        def commit(self, *a): return False
+        def commit(self, *a):
+            return False
 
-        def restore(self, *a): pass
+        def restore(self, *a):
+            pass
 
-        def write_file(self, *a): pass
+        def write_file(self, *a):
+            pass
 
-        def remove_files(self, *a): pass
+        def remove_files(self, *a):
+            pass
 
     # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
-    s = agskill(name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[])
+    s = agskill(
+        name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[]
+    )
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": 1}')
-        result, _, _ = s.execute_react(make_mock_agent(LLM, _CleanSandbox(), ping_interval_s=0.01, poll_interval_s=0.001), agcontext(), agdata(x=1))
+        result, _, _ = s.execute_react(
+            make_mock_agent(LLM, _CleanSandbox(), ping_interval_s=0.01, poll_interval_s=0.001),
+            agcontext(),
+            agdata(x=1),
+        )
     assert result.result == '{"ok": 1}'
 
 
@@ -1789,24 +2001,40 @@ def test_run_clean_sandbox_returns_immediately():
 # run() — thinking extraction from stream
 # ---------------------------------------------------------------------------
 
+
 def test_run_extracts_thinking_from_think_tag():
     s = make_skill()
 
     class _ThinkChunk:
         usage = None
-        choices = [type("C", (), {"delta": type("D", (), {
-            "content": "<think>internal reasoning</think>final answer",
-            "tool_calls": None,
-            "model_extra": {},
-            "reasoning_content": None,
-        })()})()]
+        choices = [
+            type(
+                "C",
+                (),
+                {
+                    "delta": type(
+                        "D",
+                        (),
+                        {
+                            "content": "<think>internal reasoning</think>final answer",
+                            "tool_calls": None,
+                            "model_extra": {},
+                            "reasoning_content": None,
+                        },
+                    )()
+                },
+            )()
+        ]
 
     class _UsageChunk:
         usage = _Usage()
         choices = []
 
     with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = [_ThinkChunk(), _UsageChunk()]
+        MockClient.return_value.chat.completions.create.return_value = [
+            _ThinkChunk(),
+            _UsageChunk(),
+        ]
         _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
     assistant_msgs = [m for m in ctx.messages if m.get("role") == "assistant"]
@@ -1817,10 +2045,11 @@ def test_run_extracts_thinking_from_think_tag():
 # run() — token accumulation
 # ---------------------------------------------------------------------------
 
+
 def test_run_returns_token_counts():
     s = make_skill()
     with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct('{}')
+        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
         _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
     # _Usage stub reports prompt_tokens=5
     assert ctx.total_input_tokens == 5
@@ -1829,6 +2058,7 @@ def test_run_returns_token_counts():
 # ---------------------------------------------------------------------------
 # plan_mode
 # ---------------------------------------------------------------------------
+
 
 def test_plan_mode_sets_replace_tools_empty():
     """plan_mode=True sets replace_tools to [] regardless of default."""
@@ -1870,6 +2100,7 @@ def test_plan_mode_no_tools_sent_to_llm():
 # Randomised nested-schema fuzz: type_hint_to_string_type + JSON round-trip + validation
 # ---------------------------------------------------------------------------
 
+
 def test_random_nested_schema_roundtrip():
     """100 randomly generated nested schemas exercising every container/leaf combination.
 
@@ -1907,13 +2138,16 @@ def test_random_nested_schema_roundtrip():
         return tuple[inners] if len(inners) > 1 else tuple[inners[0]]
 
     def rand_value(hint):
-        if hint is bool:   return rng.choice([True, False])
-        if hint is int:    return rng.randint(-9, 9)
-        if hint is float:  return round(rng.uniform(-9.0, 9.0), 1)
+        if hint is bool:
+            return rng.choice([True, False])
+        if hint is int:
+            return rng.randint(-9, 9)
+        if hint is float:
+            return round(rng.uniform(-9.0, 9.0), 1)
         if hint is str or (isinstance(hint, type) and issubclass(hint, agtype)):
             return rng.choice(["a", "bb", "ccc"])
         origin = get_origin(hint)
-        args   = get_args(hint)
+        args = get_args(hint)
         if origin is list:
             return [rand_value(args[0]) for _ in range(rng.randint(1, 4))]
         if origin is dict:
@@ -1922,36 +2156,44 @@ def test_random_nested_schema_roundtrip():
             # Serialise as list — JSON has no tuple type
             return [rand_value(t) for t in args]
         # bare container types
-        if hint is list:   return [rng.randint(0, 5) for _ in range(rng.randint(1, 4))]
-        if hint is dict:   return {f"k{i}": rng.randint(0, 5) for i in range(rng.randint(1, 4))}
-        if hint is tuple:  return [rng.randint(0, 5) for _ in range(rng.randint(1, 4))]
+        if hint is list:
+            return [rng.randint(0, 5) for _ in range(rng.randint(1, 4))]
+        if hint is dict:
+            return {f"k{i}": rng.randint(0, 5) for i in range(rng.randint(1, 4))}
+        if hint is tuple:
+            return [rng.randint(0, 5) for _ in range(rng.randint(1, 4))]
         return "?"
 
     def ground_truth_json_type(hint) -> str:
         if isinstance(hint, type):
-            if issubclass(hint, bool):          return "boolean"
-            if issubclass(hint, int):           return "integer"
-            if issubclass(hint, float):         return "number"
-            if issubclass(hint, (list, tuple)): return "array"
-            if issubclass(hint, dict):          return "object"
-            return "string"   # str and agtype subclasses
+            if issubclass(hint, bool):
+                return "boolean"
+            if issubclass(hint, int):
+                return "integer"
+            if issubclass(hint, float):
+                return "number"
+            if issubclass(hint, (list, tuple)):
+                return "array"
+            if issubclass(hint, dict):
+                return "object"
+            return "string"  # str and agtype subclasses
         origin = get_origin(hint)
-        if origin in (list, tuple): return "array"
-        if origin is dict:          return "object"
+        if origin in (list, tuple):
+            return "array"
+        if origin is dict:
+            return "object"
         return "string"
 
     failures = []
     for trial in range(100):
-        hint  = rand_hint(0)
+        hint = rand_hint(0)
         value = rand_value(hint)
-        exp   = ground_truth_json_type(hint)
+        exp = ground_truth_json_type(hint)
 
         # -- Python → JSON Schema type --
         got = type_hint_to_string_type(hint)
         if got != exp:
-            failures.append(
-                f"[{trial}] type_hint_to_string_type({hint!r}) = {got!r}, want {exp!r}"
-            )
+            failures.append(f"[{trial}] type_hint_to_string_type({hint!r}) = {got!r}, want {exp!r}")
             continue
 
         # -- Python value → JSON string --
@@ -1990,8 +2232,8 @@ def test_random_nested_schema_roundtrip():
         wrong = {"__wrong__": 1} if exp == "array" else [1, 2] if exp == "object" else None
         if wrong is not None:
             validates_top_level = (
-                isinstance(hint, type)                     # bare list / dict / tuple
-                or get_origin(hint) in (list, tuple, dict) # generic list[T] / dict[K,V] / tuple[T]
+                isinstance(hint, type)  # bare list / dict / tuple
+                or get_origin(hint) in (list, tuple, dict)  # generic list[T] / dict[K,V] / tuple[T]
             )
             if validates_top_level:
                 err2 = _validate_output_field_against_schema("v", wrong, schema)
@@ -2012,8 +2254,10 @@ def test_random_schema_prompt_examples_parseable():
     """
     import random
     from agency.agtype import (
-        get_json_example_for_type_hint, type_hint_to_string_type,
-        get_return_tool_description_prompt, validate_output_field_against_schema,
+        get_json_example_for_type_hint,
+        type_hint_to_string_type,
+        get_return_tool_description_prompt,
+        validate_output_field_against_schema,
     )
     from agency.agtype import agrawstring, agtype, agfile, agbinary, agimage
 
@@ -2048,7 +2292,9 @@ def test_random_schema_prompt_examples_parseable():
         try:
             ex_val = json.loads(ex_str)
         except (ValueError, TypeError) as exc:
-            failures.append(f"[{trial}] get_json_example_for_type_hint({hint!r}) = {ex_str!r} is not valid JSON: {exc}")
+            failures.append(
+                f"[{trial}] get_json_example_for_type_hint({hint!r}) = {ex_str!r} is not valid JSON: {exc}"
+            )
             continue
 
         # -- that example must pass validate_output_field_against_schema --
@@ -2065,20 +2311,18 @@ def test_random_schema_prompt_examples_parseable():
         if not isinstance(hint, type) or not issubclass(hint, agtype):
             # agtype delegates to its own classmethods; skip appearance check there
             if ex_str not in vd:
-                failures.append(
-                    f"[{trial}] example {ex_str!r} not found in value_desc {vd!r}"
-                )
+                failures.append(f"[{trial}] example {ex_str!r} not found in value_desc {vd!r}")
                 continue
 
         # -- the tool JSON Schema type must match the example's top-level type --
         json_type = type_hint_to_string_type(hint)
         type_ok = (
-            (json_type == "array"   and isinstance(ex_val, list))   or
-            (json_type == "object"  and isinstance(ex_val, dict))   or
-            (json_type == "string"  and isinstance(ex_val, str))    or
-            (json_type == "integer" and isinstance(ex_val, int) and not isinstance(ex_val, bool)) or
-            (json_type == "number"  and isinstance(ex_val, float))  or
-            (json_type == "boolean" and isinstance(ex_val, bool))
+            (json_type == "array" and isinstance(ex_val, list))
+            or (json_type == "object" and isinstance(ex_val, dict))
+            or (json_type == "string" and isinstance(ex_val, str))
+            or (json_type == "integer" and isinstance(ex_val, int) and not isinstance(ex_val, bool))
+            or (json_type == "number" and isinstance(ex_val, float))
+            or (json_type == "boolean" and isinstance(ex_val, bool))
         )
         if not type_ok:
             failures.append(

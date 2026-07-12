@@ -17,6 +17,7 @@ multimodal model, e.g. Qwen/Qwen2.5-VL-7B-Instruct.
 Run:
     uv run python examples/image_processing.py /path/to/image.jpg [/path/to/image2.jpg]
 """
+
 import os
 import sys
 from pathlib import Path
@@ -64,8 +65,7 @@ compare_skill = agskill(
 analyse_url_skill = agskill(
     name="analyse_url_image",
     system_prompt=(
-        "You are a visual analysis assistant. "
-        "Analyse the image and answer the user's question."
+        "You are a visual analysis assistant. Analyse the image and answer the user's question."
     ),
     input_schema=agdata(question=str, image_url=agimage),
     output_schema=agdata(answer=str),
@@ -75,6 +75,7 @@ analyse_url_skill = agskill(
 # ---------------------------------------------------------------------------
 # Teams
 # ---------------------------------------------------------------------------
+
 
 class SingleImageTeam(agteam):
     """Describe a single local image file."""
@@ -87,10 +88,13 @@ class SingleImageTeam(agteam):
     def run(self) -> agdata:
         image_path = getattr(self, "image_path", "")
         print(f"\n[SingleImage] Describing: {image_path}")
-        return self.ag.run(describe_skill, agdata(
-            question="Please describe this image in detail.",
-            photo=image_path,
-        ))
+        return self.ag.run(
+            describe_skill,
+            agdata(
+                question="Please describe this image in detail.",
+                photo=image_path,
+            ),
+        )
 
 
 class MultiImageTeam(agteam):
@@ -104,10 +108,13 @@ class MultiImageTeam(agteam):
     def run(self) -> agdata:
         paths = getattr(self, "image_paths", [])
         print(f"\n[MultiImage] Comparing {len(paths)} images")
-        return self.ag.run(compare_skill, agdata(
-            question="What is similar and what differs between these images?",
-            frames=paths,
-        ))
+        return self.ag.run(
+            compare_skill,
+            agdata(
+                question="What is similar and what differs between these images?",
+                frames=paths,
+            ),
+        )
 
 
 class UrlImageTeam(agteam):
@@ -122,10 +129,13 @@ class UrlImageTeam(agteam):
         url = getattr(self, "url", "")
         question = getattr(self, "question", "What does this image show?")
         print(f"\n[UrlImage] Analysing: {url}")
-        return self.ag.run(analyse_url_skill, agdata(
-            question=question,
-            image_url=url,
-        ))
+        return self.ag.run(
+            analyse_url_skill,
+            agdata(
+                question=question,
+                image_url=url,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +148,13 @@ if __name__ == "__main__":
 
     args = sys.argv[1:]
 
-    run_dir = Path(__file__).parent.parent / "runs" / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_image_processing"
+    run_dir = (
+        Path(__file__).parent.parent
+        / "runs"
+        / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_image_processing"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
-    agent.log_dir    = run_dir / "logs"
+    agent.log_dir = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
 
     def _script() -> None:
@@ -173,6 +187,7 @@ if __name__ == "__main__":
         agsync(*[t for t, _, _ in teams])
 
         from agency import AgError
+
         for _, result, field in teams:
             try:
                 val = getattr(result, field)
@@ -180,5 +195,4 @@ if __name__ == "__main__":
                 val = f"ERROR: {e}"
             print(f"\n[{field}]\n{val}")
 
-    from agency.agwebui import agwebui
     agwebui.run(_script, port=8005)

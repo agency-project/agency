@@ -54,9 +54,7 @@ def agsync(*targets) -> None:
         elif isinstance(t, _agteam_cls):
             teams.append(t)
         else:
-            raise TypeError(
-                f"agsync: expected agent or agteam, got {type(t).__name__!r}"
-            )
+            raise TypeError(f"agsync: expected agent or agteam, got {type(t).__name__!r}")
 
     # Join ALL team threads before raising any exception, so that no team is
     # abandoned mid-run. Collect exceptions and re-raise after everything joins.
@@ -77,6 +75,4 @@ def agsync(*targets) -> None:
     if errors:
         if len(errors) == 1:
             raise errors[0]
-        raise ExceptionGroup(
-            f"agsync: {len(errors)} team(s) failed", errors
-        )
+        raise ExceptionGroup(f"agsync: {len(errors)} team(s) failed", errors)
