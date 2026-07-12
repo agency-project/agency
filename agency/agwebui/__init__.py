@@ -33,6 +33,30 @@ from .emitter import agwebui_emitter
 _active: "agwebui | None" = None
 
 
+def _merge_config_fields(agconfig: Any, config: dict) -> None:
+    """Mutate *agconfig*'s own data in place, field by field, rather than
+    replacing it with a new object. agConfig.clone() (called by every
+    agent()/agteam() construction) just snapshots whatever is currently in
+    .data -- so anything that hasn't cloned this exact object yet will pick
+    up the change on its next construction, with no cooperation needed from
+    whatever code holds another reference to it (e.g. a user script's own
+    module-level config variable)."""
+    for owner, fields in config.items():
+        for name, value in fields.items():
+            agconfig.set(owner, name, value)
+
+
+def _all_agteam_subclasses(cls):
+    """Every agteam subclass currently defined, at any depth -- found via
+    Python's own subclass tracking (__subclasses__()), not a framework
+    registry. This is how a team class's own agconfig class attribute (e.g.
+    `agconfig = LLM_CONFIG` in a user script) gets reached without the
+    framework needing to know that attribute, or the script, exists."""
+    for sub in cls.__subclasses__():
+        yield sub
+        yield from _all_agteam_subclasses(sub)
+
+
 def _dispatch_command(cmd: dict) -> None:
     """Apply one pause/resume command written by the webui server process.
 
@@ -61,9 +85,34 @@ def _dispatch_command(cmd: dict) -> None:
                 a.change_config(new_cfg)
                 break
     elif ctype == "update_config_all":
-        new_cfg = _agConfig_cls(cmd.get("config") or {})
+        from ..agteam import agteam as _agteam_cls
+        config  = cmd.get("config") or {}
+        new_cfg = _agConfig_cls(config)
+
+        # 1. Agents that already exist -- each already cloned its own
+        #    agconfig at construction time, so it needs a direct push.
         for a in _agent_cls.all():
             a.change_config(new_cfg)
+
+        # 2. Team instances that already exist -- change_config() replaces
+        #    the team's own live agconfig *and* cascades to every agent it
+        #    tracks, covering agents added to this team from here on.
+        for t in _agteam_cls.all():
+            t.change_config(new_cfg)
+
+        # 3. Every agteam subclass's class-level agconfig, mutated in place
+        #    (not replaced) -- so a team constructed *after* this point,
+        #    whose __init__ clones type(self).agconfig fresh, sees the
+        #    update. Reaches a user script's own shared config object (e.g.
+        #    `agconfig = LLM_CONFIG`) without needing to know it exists.
+        for team_cls in _all_agteam_subclasses(_agteam_cls):
+            if team_cls.agconfig is not None:
+                _merge_config_fields(team_cls.agconfig, config)
+
+        # 4. The framework-wide fallback for a bare agent() call made with
+        #    no active team context.
+        if _agent_cls.default_agconfig is not None:
+            _merge_config_fields(_agent_cls.default_agconfig, config)
 
 
 def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:

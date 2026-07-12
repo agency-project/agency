@@ -264,6 +264,77 @@ def test_dispatch_update_config_all_applies_to_every_agent():
     assert b.agconfig.get("agskill", "react_max_steps") == 11
 
 
+def test_dispatch_update_config_all_mutates_default_agconfig():
+    """A bare agent() with no team context falls back to agent.default_agconfig
+    -- update_config_all must mutate it in place so a future such agent
+    clones fresh data, not just push into agents that already exist."""
+    from agency.agwebui import _dispatch_command
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+
+    saved = agent.default_agconfig
+    try:
+        agent.default_agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        _dispatch_command({
+            "type": "update_config_all",
+            "config": {"agskill": {"react_max_steps": 123}},
+        })
+        assert agent.default_agconfig.get("agskill", "react_max_steps") == 123
+    finally:
+        agent.default_agconfig = saved
+
+
+def test_dispatch_update_config_all_mutates_team_class_attr_for_future_construction():
+    """A team class's own agconfig class attribute (e.g. a user script's
+    `agconfig = LLM_CONFIG`) must be reached via __subclasses__() and mutated
+    in place, so a team constructed AFTER the update clones fresh data --
+    not just teams/agents that already exist."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+    from agency.agconfig import agConfig
+
+    class _CfgAllTeamA(agteam):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self): pass
+        def run(self): pass
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 77}},
+    })
+    assert _CfgAllTeamA.agconfig.get("agskill", "react_max_steps") == 77
+
+    # Constructed AFTER the update -- clones the now-updated class attribute.
+    team = _CfgAllTeamA()
+    assert team.agconfig.get("agskill", "react_max_steps") == 77
+
+
+def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents():
+    """A team instance that already exists (already cloned its own agconfig
+    at construction) must be reached directly, and that update must cascade
+    to every agent the team already tracks."""
+    from agency.agwebui import _dispatch_command
+    from agency.agteam import agteam
+    from agency.agconfig import agConfig
+    from agency.agent import agent as agent_cls
+
+    class _CfgAllTeamB(agteam):
+        agconfig = agConfig({"agllm_backend": {"api_key": "k", "model": ""}})
+        def setup(self):
+            self.ag = agent_cls()
+        def run(self): pass
+
+    team = _CfgAllTeamB()  # constructed before the update -- already cloned
+
+    _dispatch_command({
+        "type": "update_config_all",
+        "config": {"agskill": {"react_max_steps": 55}},
+    })
+
+    assert team.agconfig.get("agskill", "react_max_steps") == 55
+    assert team.ag.agconfig.get("agskill", "react_max_steps") == 55
+
+
 def test_poll_commands_applies_and_deletes_command_files(tmp_path):
     import json
     import threading
