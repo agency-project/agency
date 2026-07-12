@@ -1,6 +1,7 @@
 """Tests for pause/resume execution control (agpause) — including deadlock-safety
 of wait_all_paused() across agents blocked on each other's futures at various
 points in the ReAct loop / dependency chain, and randomized fuzz coverage."""
+
 import random
 import threading
 import time
@@ -28,13 +29,16 @@ def make_agent() -> agent:
 # agpause primitives — tag_producer / producer_of / note_blocked_on
 # ---------------------------------------------------------------------------
 
+
 def test_producer_of_returns_none_when_untagged():
     from concurrent.futures import Future
+
     assert agpause.producer_of(Future()) is None
 
 
 def test_tag_producer_and_producer_of_roundtrip():
     from concurrent.futures import Future
+
     f = Future()
     ag = make_agent()
     agpause.tag_producer(f, ag)
@@ -45,6 +49,7 @@ def test_producer_of_returns_none_after_producer_gc():
     """The tag is a weakref -- it must not keep the producer agent alive."""
     from concurrent.futures import Future
     import gc
+
     f = Future()
 
     def _make_and_tag():
@@ -93,6 +98,7 @@ def test_note_blocked_on_tags_and_restores_state():
 # ---------------------------------------------------------------------------
 # agent.pause() / resume() / is_paused()
 # ---------------------------------------------------------------------------
+
 
 def test_pause_clears_run_allowed():
     ag = make_agent()
@@ -144,12 +150,15 @@ def test_check_pause_blocks_until_resumed():
 # agent.is_settled() — recursive settle-check
 # ---------------------------------------------------------------------------
 
+
 class _FakeAgent:
     is_settled = agent.is_settled
 
     def __init__(self, name, state="skill", blocked_on=None, paused=False):
         self.agname = name
-        self._state = SimpleNamespace(state=state, blocked_on=blocked_on, paused_ack=threading.Event())
+        self._state = SimpleNamespace(
+            state=state, blocked_on=blocked_on, paused_ack=threading.Event()
+        )
         if paused:
             self._state.paused_ack.set()
         self.terminal = MagicMock()
@@ -214,6 +223,7 @@ def test_is_settled_blocked_with_no_producer_is_not_settled():
 # wait_all_paused / wait_all_resumed — API-level behavior
 # ---------------------------------------------------------------------------
 
+
 def test_wait_all_paused_empty_list_returns_immediately():
     assert agpause.wait_all_paused([], timeout=1) == []
 
@@ -227,7 +237,9 @@ def test_wait_all_paused_already_settled_returns_fast():
 
 def test_wait_all_paused_times_out_with_pending_names():
     running = _FakeAgent("stuck", state="skill")
-    pending = agpause.wait_all_paused([running], timeout=0.15, poll_interval=0.02, warn_after_s=None)
+    pending = agpause.wait_all_paused(
+        [running], timeout=0.15, poll_interval=0.02, warn_after_s=None
+    )
     assert pending == ["stuck"]
 
 
@@ -254,7 +266,9 @@ def test_wait_all_resumed_succeeds_once_state_leaves_paused():
 def test_wait_all_paused_warns_when_upstream_not_in_requested_set():
     upstream = _FakeAgent("up", state="skill")
     downstream = _FakeAgent("down", state="blocked_on_dependency", blocked_on=upstream)
-    pending = agpause.wait_all_paused([downstream], timeout=0.2, poll_interval=0.02, warn_after_s=0.05)
+    pending = agpause.wait_all_paused(
+        [downstream], timeout=0.2, poll_interval=0.02, warn_after_s=0.05
+    )
     assert pending == ["down"]
     assert downstream.terminal.log.called
     logged = " ".join(str(c) for c in downstream.terminal.log.call_args_list)
@@ -266,6 +280,7 @@ def test_wait_all_paused_warns_when_upstream_not_in_requested_set():
 # following the same convention as tests/test_agent.py's fork/concurrency
 # tests) -- exercises the real _task() checkpoint plumbing end to end.
 # ---------------------------------------------------------------------------
+
 
 def make_looping_skill(name: str, counter: list, steps: int = 200, step_delay: float = 0.001):
     """A skill whose execute_react calls the real ag._check_pause() every
@@ -340,7 +355,11 @@ def test_pause_before_run_blocks_before_execute_react_starts():
 def test_wait_all_paused_settles_immediately_for_finished_agent():
     ag = make_agent()
     skill = agskill("s", "")
-    skill.execute_react = lambda a, prev_ctx, inp, max_steps=None, **_: (agdata(ok=True), prev_ctx, [])
+    skill.execute_react = lambda a, prev_ctx, inp, max_steps=None, **_: (
+        agdata(ok=True),
+        prev_ctx,
+        [],
+    )
     result = ag.run(skill, agdata())
     result.wait()
     ag.pause()  # pausing an already-finished agent is a no-op in practice
@@ -465,10 +484,14 @@ def test_fuzz_is_settled_never_hangs_on_random_graphs():
         expected_pending = {node.agname for node in nodes if not node.is_settled()}
 
         t0 = time.monotonic()
-        pending = agpause.wait_all_paused(nodes, timeout=0.01, poll_interval=0.005, warn_after_s=None)
+        pending = agpause.wait_all_paused(
+            nodes, timeout=0.01, poll_interval=0.005, warn_after_s=None
+        )
         elapsed = time.monotonic() - t0
 
-        assert set(pending) == expected_pending, f"trial {trial} mismatch: {pending} vs {expected_pending}"
+        assert set(pending) == expected_pending, (
+            f"trial {trial} mismatch: {pending} vs {expected_pending}"
+        )
         assert elapsed < 0.5, f"trial {trial}: wait_all_paused took {elapsed:.2f}s -- possible hang"
 
 
@@ -478,6 +501,7 @@ def test_fuzz_is_settled_never_hangs_on_random_graphs():
 # background threads, real checkpoints) never deadlocks regardless of shape
 # or race timing.
 # ---------------------------------------------------------------------------
+
 
 def _make_dag_skill(name: str, idx: int, rng: random.Random):
     sk = agskill(name, "")
@@ -510,9 +534,11 @@ def test_fuzz_random_dag_pause_never_deadlocks(trial):
     rng.shuffle(order)
     pausers = []
     for i in order:
+
         def _pause_after(idx=i):
             time.sleep(rng.uniform(0, 0.02))
             agents[idx].pause()
+
         th = threading.Thread(target=_pause_after, daemon=True)
         th.start()
         pausers.append(th)

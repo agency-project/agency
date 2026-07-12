@@ -14,6 +14,7 @@ from agency.agconfig import agConfig
 # Streaming mock helpers (agskill uses stream=True)
 # ---------------------------------------------------------------------------
 
+
 class _Delta:
     def __init__(self, content=None, tool_calls=None):
         self.content = content
@@ -21,24 +22,35 @@ class _Delta:
         self.model_extra = {}
         self.reasoning_content = None
 
+
 class _Choice:
-    def __init__(self, delta): self.delta = delta
+    def __init__(self, delta):
+        self.delta = delta
+
 
 class _Usage:
     prompt_tokens = 5
 
+
 class _Chunk:
     def __init__(self, content=None, tool_calls=None, usage=None):
         self.usage = usage
-        self.choices = [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        self.choices = (
+            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        )
+
 
 class _TCDelta:
     def __init__(self, name, args_json, call_id):
-        self.id = call_id; self.index = 0
+        self.id = call_id
+        self.index = 0
         self.function = _TCFnDelta(name, args_json)
 
+
 class _TCFnDelta:
-    def __init__(self, name, args): self.name = name; self.arguments = args
+    def __init__(self, name, args):
+        self.name = name
+        self.arguments = args
 
 
 def _noop(arg: agdata) -> agdata:
@@ -66,21 +78,25 @@ def make_agent() -> agent:
 # Basic routing
 # ---------------------------------------------------------------------------
 
+
 def test_run_returns_pending_agdata():
     """run() is non-blocking — result fields resolve lazily."""
     skill = agskill(name="s", system_prompt="")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(done=True), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
     result = ag.run(skill, agdata())
     assert isinstance(result, agdata)
-    assert result.done is True   # field access blocks until task finishes
+    assert result.done is True  # field access blocks until task finishes
 
 
 def test_run_calls_named_agskill():
     called = []
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         called.append(inp.to_dict())
         return agdata(done=True), prev_ctx, []
@@ -90,13 +106,11 @@ def test_run_calls_named_agskill():
 
     ag = make_agent()
     result = ag.run(skill, agdata(task="go"))
-    assert result.done is True   # blocks until done
+    assert result.done is True  # blocks until done
     assert called == [{"task": "go"}]
 
 
 def test_repr():
-    skill_a = agskill("a", "")
-    skill_b = agskill("b", "")
     ag = make_agent()
     assert repr(ag) is not None  # agent repr works without owned skills
 
@@ -105,8 +119,10 @@ def test_repr():
 # History is updated and serialized on the same agent
 # ---------------------------------------------------------------------------
 
+
 def test_history_updated_after_run():
     skill = agskill(name="s", system_prompt="")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         new_msgs = list(prev_ctx.messages) + [
             {"role": "user", "content": inp.to_json()},
@@ -118,10 +134,10 @@ def test_history_updated_after_run():
     ag = make_agent()
 
     ag.run(skill, agdata(turn=1))
-    assert len(ag.history.messages) == 2   # ag.history blocks until done
+    assert len(ag.history.messages) == 2  # ag.history blocks until done
 
     ag.run(skill, agdata(turn=2))
-    assert len(ag.history.messages) == 4   # chain: step2 waited for step1
+    assert len(ag.history.messages) == 4  # chain: step2 waited for step1
 
 
 def test_sequential_calls_serialize_via_history_chain():
@@ -131,11 +147,13 @@ def test_sequential_calls_serialize_via_history_chain():
 
     def make_skill(name):
         sk = agskill(name, "")
+
         def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
             with lock:
                 order.append(name)
             new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
             return agdata(name=name), agcontext(messages=new_msgs), []
+
         sk.execute_react = fake_execute_react
         return sk
 
@@ -144,7 +162,7 @@ def test_sequential_calls_serialize_via_history_chain():
     ag = make_agent()
     ag.run(skill_first, agdata())
     ag.run(skill_second, agdata())
-    _ = ag.history   # wait for both to finish
+    _ = ag.history  # wait for both to finish
 
     assert order == ["first", "second"]
 
@@ -155,13 +173,15 @@ def test_history_passed_to_agskill():
     ag.history = agdata(messages=[{"role": "user", "content": "prior"}])
 
     received = {}
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         received["hist"] = prev_ctx
         return agdata(), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag.run(skill, agdata(x=1))
-    _ = ag.history   # sync
+    _ = ag.history  # sync
     assert received["hist"].messages[0]["content"] == "prior"
 
 
@@ -169,14 +189,17 @@ def test_history_passed_to_agskill():
 # Tools live on skills, not agents
 # ---------------------------------------------------------------------------
 
+
 def test_skill_replace_tools_used_in_run():
     """replace_tools on the skill replaces the full tool list."""
     t = agtool(name="t1", description="", fn=_noop)
     skill = agskill("s", "", replace_tools=[t])
     captured = {}
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         captured["replace_tools"] = skill.replace_tools
         return agdata(), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
@@ -189,14 +212,17 @@ def test_skill_replace_tools_used_in_run():
 # End-to-end with mocked OpenAI
 # ---------------------------------------------------------------------------
 
+
 def test_end_to_end_direct_answer():
     skill = agskill(name="qa", system_prompt="Answer questions.")
     ag = make_agent()
 
     with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "Paris"}')
+        MockClient.return_value.chat.completions.create.return_value = _direct(
+            '{"answer": "Paris"}'
+        )
         result = ag.run(skill, agdata(question="Capital of France?"))
-        assert result.result == '{"answer": "Paris"}'   # resolve inside the patch context
+        assert result.result == '{"answer": "Paris"}'  # resolve inside the patch context
 
 
 def test_end_to_end_with_tool():
@@ -207,7 +233,11 @@ def test_end_to_end_with_tool():
         name="add",
         description="Add two numbers.",
         fn=calc_fn,
-        params={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]},
+        params={
+            "type": "object",
+            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+            "required": ["a", "b"],
+        },
     )
     skill = agskill(name="math", system_prompt="You are a calculator.", add_tools=[calc])
     ag = make_agent()
@@ -225,6 +255,7 @@ def test_multiple_agskills_coexist():
 
     def fake_a(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(from_skill="a"), prev_ctx, []
+
     def fake_b(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(from_skill="b"), prev_ctx, []
 
@@ -243,6 +274,7 @@ def test_multiple_agskills_coexist():
 # Copy constructor
 # ---------------------------------------------------------------------------
 
+
 def test_fork_inherits_config():
     ag = make_agent()
 
@@ -257,7 +289,7 @@ def test_fork_deep_copies_history():
     forked = agent.fork(ag)
     forked.history.messages.append({"role": "assistant", "content": "new"})
 
-    assert len(ag.history.messages) == 1   # parent unaffected
+    assert len(ag.history.messages) == 1  # parent unaffected
 
 
 def test_fork_copies_history_and_config():
@@ -273,15 +305,17 @@ def test_fork_copies_history_and_config():
 def test_fork_waits_for_inflight_task():
     """agent.fork(src) blocks until src's current task finishes before copying history."""
     skill = agskill("s", "")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         new_ctx = agcontext(messages=[{"role": "user", "content": str(inp.v)}])
         return agdata(v=inp.v), new_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
-    ag.run(skill, agdata(v=42))        # non-blocking, in-flight
+    ag.run(skill, agdata(v=42))  # non-blocking, in-flight
 
-    forked = agent.fork(ag)            # blocks until the run completes
+    forked = agent.fork(ag)  # blocks until the run completes
     assert len(forked.history.messages) == 1
     assert forked.history.messages[0]["content"] == "42"
 
@@ -290,18 +324,21 @@ def test_fork_waits_for_inflight_task():
 # Parallel execution via copy constructor
 # ---------------------------------------------------------------------------
 
+
 def test_fork_runs_do_not_update_parent_history():
     skill = agskill("s", "")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         new_ctx = agcontext(messages=[{"role": "user", "content": "fork_msg"}])
         return agdata(ok=True), new_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "original"}])
 
     r = agent.fork(ag).run(skill, agdata())
-    _ = r.ok   # wait for fork to finish
+    _ = r.ok  # wait for fork to finish
 
     assert len(ag.history.messages) == 1
     assert ag.history.messages[0]["content"] == "original"
@@ -311,9 +348,11 @@ def test_fork_runs_in_parallel():
     """Multiple forks reach the barrier together, proving concurrent execution."""
     barrier = threading.Barrier(3)
     skill = agskill("s", "")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         barrier.wait(timeout=5)
         return agdata(n=inp.n), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
@@ -324,9 +363,11 @@ def test_fork_runs_in_parallel():
 def test_fork_sees_parent_history_at_fork_time():
     seen = {}
     skill = agskill("s", "")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         seen["hist"] = list(prev_ctx.messages)
         return agdata(), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
@@ -341,14 +382,18 @@ def test_fork_sees_parent_history_at_fork_time():
 # Pending agdata as input — auto-resolved before skill runs
 # ---------------------------------------------------------------------------
 
+
 def test_run_accepts_pending_agdata_as_input():
     from concurrent.futures import Future
+
     received = {}
 
     skill = agskill("s", "")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         received["inp"] = inp.to_dict()
         return agdata(ok=True), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
@@ -364,12 +409,15 @@ def test_run_accepts_pending_agdata_as_input():
 
 def test_run_resolves_list_of_pending_in_input():
     from concurrent.futures import Future
+
     received = {}
 
     skill = agskill("s", "")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         received["items"] = inp.items
         return agdata(ok=True), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = make_agent()
@@ -389,16 +437,18 @@ def test_chained_run_output_as_next_input():
     """Output of one run() passed directly as input to the next — resolved automatically."""
     skill = agskill("s", "")
     received_inputs = []
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         received_inputs.append(dict(inp._data))
         return agdata(done=True), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag1 = make_agent()
     ag2 = make_agent()
 
     r1 = ag1.run(skill, agdata(x=5))  # pending agdata, resolves to agdata(done=True)
-    r2 = ag2.run(skill, r1)           # r1 passed as input; resolved before ag2's skill runs
+    r2 = ag2.run(skill, r1)  # r1 passed as input; resolved before ag2's skill runs
     r2._resolve()
 
     # ag2 received the resolved r1 as its input
@@ -408,6 +458,7 @@ def test_chained_run_output_as_next_input():
 # ---------------------------------------------------------------------------
 # Agent registry
 # ---------------------------------------------------------------------------
+
 
 def test_agent_all_tracks_live_agents():
     ag1 = make_agent()
@@ -419,12 +470,15 @@ def test_agent_all_tracks_live_agents():
 
 def test_agent_all_excludes_destroyed():
     import gc
+
     ag1 = make_agent()
     ag2 = make_agent()
     ag2_name = ag2.agname
     del ag2
     gc.collect()
-    assert ag2_name not in [a.agname for a in agent.all()]
+    live_names = [a.agname for a in agent.all()]
+    assert ag2_name not in live_names
+    assert ag1.agname in live_names
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +490,7 @@ def test_agent_all_excludes_destroyed():
 # lightweight stand-in that mirrors agSandbox's destroy-on-GC contract
 # (idempotent destroy() invoked from __del__) without touching Docker.
 # ---------------------------------------------------------------------------
+
 
 class _GCSandbox:
     def __init__(self, on_destroy):
@@ -467,13 +522,13 @@ def test_agent_internal_sandbox_destroyed_only_after_agent_is_gone():
     del sb
     gc.collect()
 
-    assert ref() is not None       # still alive — ag.sandbox holds it
-    assert destroyed == []         # not destroyed just because ag exists
+    assert ref() is not None  # still alive — ag.sandbox holds it
+    assert destroyed == []  # not destroyed just because ag exists
 
     del ag
     gc.collect()
 
-    assert ref() is None           # collected once its last owner is gone
+    assert ref() is None  # collected once its last owner is gone
     assert destroyed == [True]
 
 
@@ -491,13 +546,13 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
     del ag
     gc.collect()
 
-    assert ref() is not None       # our own reference keeps it alive
+    assert ref() is not None  # our own reference keeps it alive
     assert destroyed == []
 
     del sb
     gc.collect()
 
-    assert ref() is None           # only now, with no references left
+    assert ref() is None  # only now, with no references left
     assert destroyed == [True]
 
 
@@ -506,9 +561,14 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
 # ---------------------------------------------------------------------------
 
 _docker_ok = pytest.mark.skipif(
-    not (lambda: __import__("subprocess").run(
-        ["docker", "info"], capture_output=True, timeout=10
-    ).returncode == 0)(),
+    not (
+        lambda: (
+            __import__("subprocess")
+            .run(["docker", "info"], capture_output=True, timeout=10)
+            .returncode
+            == 0
+        )
+    )(),
     reason="Docker not available",
 )
 
@@ -516,14 +576,15 @@ _docker_ok = pytest.mark.skipif(
 @_docker_ok
 def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     import subprocess as _sp
-    
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
     skill_write = agskill(name="write", system_prompt="")
+
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
         new_ctx = agcontext(messages=[{"role": "assistant", "content": "42"}])
         return agdata(answer="42"), new_ctx, []
+
     skill_write.execute_react = fake_write
 
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
@@ -562,10 +623,8 @@ def _make_ckpt_subprocess_mock(real_run):
         ops = ("save", "tag", "rmi")
         # Intercept ckpt-related save/tag/rmi AND any bare "load" call (docker load
         # receives our fake image bytes as stdin so must also be mocked).
-        is_ckpt_op = (
-            ("ckpt" in cmd_str and any(op in cmd_str for op in ops))
-            or ("load" in cmd_str and "ckpt" not in cmd_str
-                and kwargs.get("input") == _FAKE_IMAGE)
+        is_ckpt_op = ("ckpt" in cmd_str and any(op in cmd_str for op in ops)) or (
+            "load" in cmd_str and "ckpt" not in cmd_str and kwargs.get("input") == _FAKE_IMAGE
         )
         if not is_ckpt_op:
             return real_run(cmd, *args, **kwargs)
@@ -580,16 +639,17 @@ def _make_ckpt_subprocess_mock(real_run):
 def test_save_all_and_load_all(tmp_path, monkeypatch):
     import gc
     import subprocess as _sp
-    
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
     saved_names = set()
 
     skill_write = agskill(name="write", system_prompt="")
+
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
         ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
         return agdata(ok=True), prev_ctx, []
+
     skill_write.execute_react = fake_write
 
     def _create_and_save():
@@ -624,13 +684,14 @@ def test_save_all_and_load_all(tmp_path, monkeypatch):
 def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
     import gc
     import subprocess as _sp
-    
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
     skill = agskill(name="s", system_prompt="")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(ok=True), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag1 = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
@@ -668,13 +729,14 @@ def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
 @_docker_ok
 def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
     import subprocess as _sp
-    
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
     skill = agskill(name="s", system_prompt="")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(done=True), prev_ctx, []
+
     skill.execute_react = fake_execute_react
 
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
@@ -691,6 +753,7 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
 # UI state transitions
 # ---------------------------------------------------------------------------
 
+
 def test_ui_state_error_when_skill_returns_error():
     """_ui_state is set to 'error' when the skill returns agerror(...)."""
     skill = agskill(name="s", system_prompt="")
@@ -701,7 +764,7 @@ def test_ui_state_error_when_skill_returns_error():
     skill.execute_react = fake_execute_react
     ag = make_agent()
     result = ag.run(skill, agdata())
-    _ = result.error   # resolve
+    _ = result.error  # resolve
     assert ag._state.state == "error"
 
 
@@ -715,7 +778,7 @@ def test_ui_state_finished_on_success():
     skill.execute_react = fake_execute_react
     ag = make_agent()
     result = ag.run(skill, agdata())
-    _ = result.answer   # resolve
+    _ = result.answer  # resolve
     assert ag._state.state == "finished"
 
 
@@ -729,7 +792,7 @@ def test_ui_state_error_on_skill_exception():
     skill.execute_react = fake_execute_react
     ag = make_agent()
     result = ag.run(skill, agdata())
-    _ = result.error   # resolve (will contain the formatted exception)
+    _ = result.error  # resolve (will contain the formatted exception)
     assert ag._state.state == "error"
 
 
@@ -744,10 +807,13 @@ from agency.agschema import agschema as _agschema
 
 def test_prepare_inputs_in_sandbox_replaces_long_string():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(text=long_val, small="hi")
-    paths, fields = _agschema(agdata(text=str, small=str)).prepare_inputs_in_sandbox(inp, sandbox, "mskill")
+    paths, fields = _agschema(agdata(text=str, small=str)).prepare_inputs_in_sandbox(
+        inp, sandbox, "mskill"
+    )
     sandbox.write_file.assert_called_once()
     assert "text" in fields
     assert "small" not in fields
@@ -755,6 +821,7 @@ def test_prepare_inputs_in_sandbox_replaces_long_string():
     assert "mskill_text" in paths[0]
     assert "content saved to" in inp._data["text"]
     assert inp._data["small"] == "hi"
+
 
 def test_prepare_inputs_in_sandbox_skips_short_strings():
     sandbox = MagicMock()
@@ -764,6 +831,7 @@ def test_prepare_inputs_in_sandbox_skips_short_strings():
     assert paths == []
     assert fields == []
 
+
 def test_prepare_inputs_in_sandbox_skips_non_string_scalars():
     sandbox = MagicMock()
     inp = agdata(n=42)
@@ -771,8 +839,10 @@ def test_prepare_inputs_in_sandbox_skips_non_string_scalars():
     sandbox.write_file.assert_not_called()
     assert paths == []
 
+
 def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
     long_val = "y" * (_AgSchemaFields.input_offload_chars.default + 1)
@@ -782,8 +852,10 @@ def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
     assert fields == []
     assert inp._data["text"] == long_val
 
+
 def test_prepare_inputs_in_sandbox_list_large_strings_replaced_with_paths():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_a = "a" * (_AgSchemaFields.input_offload_chars.default + 1)
     long_b = "b" * (_AgSchemaFields.input_offload_chars.default + 1)
@@ -798,6 +870,7 @@ def test_prepare_inputs_in_sandbox_list_large_strings_replaced_with_paths():
     assert result[0] == paths[0]
     assert result[1] == paths[1]
 
+
 def test_prepare_inputs_in_sandbox_list_short_strings_unchanged():
     sandbox = MagicMock()
     inp = agdata(items=["short", "also short"])
@@ -807,8 +880,10 @@ def test_prepare_inputs_in_sandbox_list_short_strings_unchanged():
     assert fields == []
     assert inp._data["items"] == ["short", "also short"]
 
+
 def test_prepare_inputs_in_sandbox_list_mixed_only_large_replaced():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(items=["short", long_val])
@@ -818,6 +893,7 @@ def test_prepare_inputs_in_sandbox_list_mixed_only_large_replaced():
     assert result[0] == "short"
     assert result[1] == paths[0]
 
+
 def test_prepare_inputs_in_sandbox_list_non_string_elements_skipped():
     sandbox = MagicMock()
     inp = agdata(items=[42, None, {"key": "val"}])
@@ -825,8 +901,10 @@ def test_prepare_inputs_in_sandbox_list_non_string_elements_skipped():
     sandbox.write_file.assert_not_called()
     assert paths == []
 
+
 def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
     long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
@@ -836,8 +914,10 @@ def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged
     assert fields == []
     assert inp._data["items"] == [long_val]
 
+
 def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     data_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(frames=[data_url, data_url])
@@ -847,8 +927,10 @@ def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
     assert paths == []
     assert inp._data["frames"] == [data_url, data_url]
 
+
 def test_prepare_inputs_in_sandbox_skips_single_agtype_field():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     data_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(photo=data_url)
@@ -857,8 +939,10 @@ def test_prepare_inputs_in_sandbox_skips_single_agtype_field():
     sandbox.write_file.assert_not_called()
     assert inp._data["photo"] == data_url
 
+
 def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     # After agbinary.prepare() the value is a short sandbox path, but the skip
     # should fire on the schema hint alone — verify with a long string too.
@@ -870,8 +954,10 @@ def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
     assert paths == []
     assert inp._data["audio"] == long_path
 
+
 def test_prepare_inputs_in_sandbox_skips_agbinary_list_fields():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_path = "/workspace/inputs/" + "b" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(clips=[long_path, long_path])
@@ -880,6 +966,7 @@ def test_prepare_inputs_in_sandbox_skips_agbinary_list_fields():
     sandbox.write_file.assert_not_called()
     assert paths == []
     assert inp._data["clips"] == [long_path, long_path]
+
 
 def test_prepare_inputs_in_sandbox_processes_agfile_field_via_prepare():
     sandbox = MagicMock()
@@ -890,8 +977,10 @@ def test_prepare_inputs_in_sandbox_processes_agfile_field_via_prepare():
     assert len(paths) == 1
     assert "doc" in paths[0]
 
+
 def test_prepare_inputs_in_sandbox_offloads_agrawstring_when_long():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_text = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(prompt=long_text)
@@ -902,6 +991,7 @@ def test_prepare_inputs_in_sandbox_offloads_agrawstring_when_long():
     assert "prompt" in fields
     assert "sk_prompt" in inp._data["prompt"]
 
+
 def test_prepare_inputs_in_sandbox_preserves_short_agrawstring():
     sandbox = MagicMock()
     inp = agdata(prompt="short")
@@ -911,8 +1001,10 @@ def test_prepare_inputs_in_sandbox_preserves_short_agrawstring():
     assert paths == []
     assert inp._data["prompt"] == "short"
 
+
 def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_val = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(images={"a": long_val})
@@ -922,8 +1014,10 @@ def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
     assert paths == []
     assert inp._data["images"] == {"a": long_val}
 
+
 def test_prepare_inputs_in_sandbox_skips_tuple_agtype_field():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_val = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(pair=(long_val, "label"))
@@ -938,8 +1032,10 @@ def test_prepare_inputs_in_sandbox_skips_tuple_agtype_field():
 # _prepare_agtype_inputs — dict and tuple
 # ---------------------------------------------------------------------------
 
+
 def test_prepare_agtype_inputs_dict_agimage_encodes_values(tmp_path):
     import base64
+
     img_a = tmp_path / "a.jpg"
     img_b = tmp_path / "b.jpg"
     img_a.write_bytes(b"bytes_a")
@@ -952,8 +1048,10 @@ def test_prepare_agtype_inputs_dict_agimage_encodes_values(tmp_path):
     assert inp._data["images"]["y"].startswith("data:image/jpeg;base64,")
     assert base64.b64decode(inp._data["images"]["x"].split(",", 1)[1]) == b"bytes_a"
 
+
 def test_prepare_agtype_inputs_tuple_encodes_agtype_positions(tmp_path):
     import base64
+
     img = tmp_path / "img.png"
     img.write_bytes(b"png_bytes")
     inp = agdata(pair=(str(img), "label"))
@@ -969,8 +1067,10 @@ def test_prepare_agtype_inputs_tuple_encodes_agtype_positions(tmp_path):
 # _recover_agtype_outputs — list, dict, tuple
 # ---------------------------------------------------------------------------
 
+
 def test_recover_agtype_outputs_list_agfile_reads_each():
     from agency.agdata import agdata as _agdata
+
     sandbox = MagicMock()
     sandbox.read_file.side_effect = ["content_a", "content_b"]
     result = _agdata(docs=["/workspace/a.txt", "/workspace/b.txt"])
@@ -979,8 +1079,10 @@ def test_recover_agtype_outputs_list_agfile_reads_each():
     assert result._data["docs"] == ["content_a", "content_b"]
     assert sandbox.read_file.call_count == 2
 
+
 def test_recover_agtype_outputs_dict_agfile_reads_values():
     from agency.agdata import agdata as _agdata
+
     sandbox = MagicMock()
     sandbox.read_file.side_effect = ["content_x", "content_y"]
     result = _agdata(docs={"x": "/workspace/x.txt", "y": "/workspace/y.txt"})
@@ -988,8 +1090,10 @@ def test_recover_agtype_outputs_dict_agfile_reads_values():
     _agschema(schema).recover_outputs(result, sandbox)
     assert result._data["docs"] == {"x": "content_x", "y": "content_y"}
 
+
 def test_recover_agtype_outputs_tuple_recovers_agtype_positions():
     from agency.agdata import agdata as _agdata
+
     sandbox = MagicMock()
     sandbox.read_file.return_value = "file_content"
     result = _agdata(pair=["/workspace/out.txt", 42])
@@ -1004,8 +1108,10 @@ def test_recover_agtype_outputs_tuple_recovers_agtype_positions():
 # Deep nesting — _prepare_agtype_inputs and _recover_agtype_outputs
 # ---------------------------------------------------------------------------
 
+
 def test_prepare_agtype_inputs_nested_list_agimage(tmp_path):
     import base64
+
     img_a = tmp_path / "a.jpg"
     img_b = tmp_path / "b.jpg"
     img_a.write_bytes(b"img_a")
@@ -1017,6 +1123,7 @@ def test_prepare_agtype_inputs_nested_list_agimage(tmp_path):
     assert inp._data["batches"][1][0].startswith("data:image/jpeg;base64,")
     assert base64.b64decode(inp._data["batches"][0][0].split(",", 1)[1]) == b"img_a"
 
+
 def test_prepare_agtype_inputs_dict_of_list_agimage(tmp_path):
     img = tmp_path / "x.jpg"
     img.write_bytes(b"img_x")
@@ -1025,8 +1132,10 @@ def test_prepare_agtype_inputs_dict_of_list_agimage(tmp_path):
     _agschema(schema).prepare_inputs_in_sandbox(inp, MagicMock(), "sk")
     assert inp._data["groups"]["g"][0].startswith("data:image/jpeg;base64,")
 
+
 def test_recover_agtype_outputs_nested_list_agfile():
     from agency.agdata import agdata as _agdata
+
     sandbox = MagicMock()
     sandbox.read_file.side_effect = ["content_a", "content_b"]
     result = _agdata(batches=[["/workspace/a.txt"], ["/workspace/b.txt"]])
@@ -1034,8 +1143,10 @@ def test_recover_agtype_outputs_nested_list_agfile():
     _agschema(schema).recover_outputs(result, sandbox)
     assert result._data["batches"] == [["content_a"], ["content_b"]]
 
+
 def test_recover_agtype_outputs_dict_of_list_agfile():
     from agency.agdata import agdata as _agdata
+
     sandbox = MagicMock()
     sandbox.read_file.side_effect = ["content_x", "content_y"]
     result = _agdata(groups={"g": ["/workspace/x.txt", "/workspace/y.txt"]})
@@ -1048,8 +1159,10 @@ def test_recover_agtype_outputs_dict_of_list_agfile():
 # Deep nesting — _offload_large_fields skip
 # ---------------------------------------------------------------------------
 
+
 def test_offload_skips_nested_list_agimage():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(batches=[[long_url], [long_url]])
@@ -1058,8 +1171,10 @@ def test_offload_skips_nested_list_agimage():
     sandbox.write_file.assert_not_called()
     assert paths == []
 
+
 def test_offload_skips_dict_of_list_agimage():
     from agency.agschema import _AgSchemaFields
+
     sandbox = MagicMock()
     long_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
     inp = agdata(groups={"g": [long_url]})
@@ -1072,6 +1187,7 @@ def test_offload_skips_dict_of_list_agimage():
 # ---------------------------------------------------------------------------
 # Fuzz: _prepare_agtype_inputs — random nested schemas
 # ---------------------------------------------------------------------------
+
 
 def test_random_prepare_agtype_inputs_fuzz():
     """100 randomly generated nested schemas: _prepare_agtype_inputs must not
@@ -1086,8 +1202,8 @@ def test_random_prepare_agtype_inputs_fuzz():
     # agimage uses URL passthrough (no sandbox); agfile/agbinary use sandbox writes;
     # agrawstring is a no-op prepare.
     AGTYPE_LEAVES = [agimage, agfile, agbinary, agrawstring]
-    PLAIN_LEAVES  = [str, int, float, bool]
-    ALL_LEAVES    = AGTYPE_LEAVES + PLAIN_LEAVES
+    PLAIN_LEAVES = [str, int, float, bool]
+    ALL_LEAVES = AGTYPE_LEAVES + PLAIN_LEAVES
 
     def rand_hint(depth):
         if depth >= 3 or (depth > 0 and rng.random() < 0.4 * depth):
@@ -1102,14 +1218,22 @@ def test_random_prepare_agtype_inputs_fuzz():
         return tuple[inners] if len(inners) > 1 else tuple[inners[0]]
 
     def rand_value(hint):
-        if hint is bool:        return rng.choice([True, False])
-        if hint is int:         return rng.randint(-9, 9)
-        if hint is float:       return round(rng.uniform(-9.0, 9.0), 1)
-        if hint is str:         return rng.choice(["hello", "world"])
-        if hint is agimage:     return f"https://example.com/img{rng.randint(0,9)}.jpg"
-        if hint is agfile:      return rng.choice(["some text", "more text"])
-        if hint is agbinary:    return b"raw bytes"
-        if hint is agrawstring: return rng.choice(["raw", "text"])
+        if hint is bool:
+            return rng.choice([True, False])
+        if hint is int:
+            return rng.randint(-9, 9)
+        if hint is float:
+            return round(rng.uniform(-9.0, 9.0), 1)
+        if hint is str:
+            return rng.choice(["hello", "world"])
+        if hint is agimage:
+            return f"https://example.com/img{rng.randint(0, 9)}.jpg"
+        if hint is agfile:
+            return rng.choice(["some text", "more text"])
+        if hint is agbinary:
+            return b"raw bytes"
+        if hint is agrawstring:
+            return rng.choice(["raw", "text"])
         origin, args = get_origin(hint), get_args(hint)
         if origin is list:
             return [rand_value(args[0]) for _ in range(rng.randint(1, 3))]
@@ -1134,11 +1258,11 @@ def test_random_prepare_agtype_inputs_fuzz():
 
     failures = []
     for trial in range(100):
-        hint  = rand_hint(0)
+        hint = rand_hint(0)
         value = rand_value(hint)
         sandbox = MagicMock()
 
-        inp    = agdata(f=value)
+        inp = agdata(f=value)
         schema = agdata(f=hint)
 
         try:
@@ -1177,6 +1301,7 @@ def test_random_prepare_agtype_inputs_fuzz():
 # Fuzz: _offload_large_fields — agtype fields skipped, plain/agrawstring offloaded
 # ---------------------------------------------------------------------------
 
+
 def test_random_offload_agtype_skip_fuzz():
     """100 randomly generated single-field schemas: _offload_large_fields must
     skip fields whose hint contains any non-agrawstring agtype at any nesting
@@ -1190,7 +1315,7 @@ def test_random_offload_agtype_skip_fuzz():
     rng = random.Random(20240629)
 
     NON_RAW_AGTYPES = [agimage, agfile, agbinary]
-    ALL_LEAVES      = NON_RAW_AGTYPES + [agrawstring, str, int, float, bool]
+    ALL_LEAVES = NON_RAW_AGTYPES + [agrawstring, str, int, float, bool]
 
     def rand_hint(depth):
         if depth >= 3 or (depth > 0 and rng.random() < 0.4 * depth):
@@ -1220,10 +1345,10 @@ def test_random_offload_agtype_skip_fuzz():
 
     failures = []
     for trial in range(100):
-        hint    = rand_hint(0)
+        hint = rand_hint(0)
         sandbox = MagicMock()
-        inp     = agdata(f=long_str)
-        schema  = agdata(f=hint)
+        inp = agdata(f=long_str)
+        schema = agdata(f=hint)
 
         try:
             paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1249,9 +1374,7 @@ def test_random_offload_agtype_skip_fuzz():
             # The offloader checks the actual value type, not the hint — our value
             # IS a long string, so write_file must always be called here.
             if not sandbox.write_file.called:
-                failures.append(
-                    f"[{trial}] write_file NOT called for hint={hint!r}"
-                )
+                failures.append(f"[{trial}] write_file NOT called for hint={hint!r}")
 
     assert not failures, f"{len(failures)}/100 trials failed:\n" + "\n".join(failures[:20])
 
@@ -1260,10 +1383,12 @@ def test_random_offload_agtype_skip_fuzz():
 # change_config / get_config_copy
 # ---------------------------------------------------------------------------
 
+
 def test_agent_change_config_reaches_llm():
     ag = make_agent()
     ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
     assert ag.llm.backend.temperature == 0.2
+
 
 def test_agent_change_config_clones_given_agconfig():
     ag = make_agent()
@@ -1272,6 +1397,7 @@ def test_agent_change_config_clones_given_agconfig():
     new_cfg.agllm_backend.temperature = 0.9
     assert ag.llm.backend.temperature == 0.2
 
+
 def test_agent_change_config_updates_agconfig_attr():
     ag = make_agent()
     new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
@@ -1279,19 +1405,23 @@ def test_agent_change_config_updates_agconfig_attr():
     assert ag.agconfig.get("agllm_backend", "temperature") == 0.2
     assert ag.agconfig is not new_cfg  # cloned, not aliased
 
+
 def test_agent_get_config_copy_returns_clone_not_same_object():
     ag = make_agent()
     copy = ag.get_config_copy()
     assert copy is not ag.agconfig
 
+
 def test_agent_get_config_copy_reflects_current_values():
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))
     assert ag.get_config_copy().agllm_backend.temperature == 0.7
+
 
 def test_agent_get_config_copy_after_change_config_reflects_new_values():
     ag = make_agent()
     ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
     assert ag.get_config_copy().agllm_backend.temperature == 0.2
+
 
 def test_mutating_agent_get_config_copy_does_not_affect_agent():
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))

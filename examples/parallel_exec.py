@@ -13,6 +13,7 @@ Demonstrates the two natural parallelism patterns enabled by a single run() meth
 Run:
     uv run python examples/parallel_exec.py
 """
+
 import os
 import time
 from pathlib import Path
@@ -55,6 +56,7 @@ writer_skill = agskill(
 
 def _make_run_dir(name: str) -> Path:
     from datetime import datetime
+
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +66,7 @@ def _make_run_dir(name: str) -> Path:
 # ---------------------------------------------------------------------------
 # Team 1: sequential chain
 # ---------------------------------------------------------------------------
+
 
 class SequentialChainTeam(agteam):
     """One agent runs two file-write tasks sequentially via the history chain."""
@@ -80,18 +83,25 @@ class SequentialChainTeam(agteam):
         print("=" * 60)
 
         t0 = time.perf_counter()
-        r1 = self.agent.run(self.writer, agdata(file_path="/workspace/out.txt", content="first write"))
-        r2 = self.agent.run(self.writer, agdata(file_path="/workspace/out.txt", content="second write"))
+        r1 = self.agent.run(
+            self.writer, agdata(file_path="/workspace/out.txt", content="first write")
+        )
+        r2 = self.agent.run(
+            self.writer, agdata(file_path="/workspace/out.txt", content="second write")
+        )
         elapsed = time.perf_counter() - t0
 
         print(f"  r1 status={r1.status!r}  r2 status={r2.status!r}")
-        print(f"  total history: {len(self.agent.history.messages)} messages  elapsed {elapsed:.2f}s")
+        print(
+            f"  total history: {len(self.agent.history.messages)} messages  elapsed {elapsed:.2f}s"
+        )
         print()
 
 
 # ---------------------------------------------------------------------------
 # Team 2: fork fan-out
 # ---------------------------------------------------------------------------
+
 
 class ForkFanoutTeam(agteam):
     """Forks one agent per text; all summaries run concurrently."""
@@ -117,10 +127,7 @@ class ForkFanoutTeam(agteam):
         texts = getattr(self, "texts", self._default_texts)
 
         t0 = time.perf_counter()
-        pending = [
-            agent.fork(self.parent).run(self.continuation, agdata(text=t))
-            for t in texts
-        ]
+        pending = [agent.fork(self.parent).run(self.continuation, agdata(text=t)) for t in texts]
         elapsed_submit = time.perf_counter() - t0
 
         for i, r in enumerate(pending):
@@ -140,7 +147,7 @@ if __name__ == "__main__":
     from agency import AgError, agsync
 
     run_dir = _make_run_dir("parallel_exec")
-    agent.log_dir    = run_dir / "logs"
+    agent.log_dir = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
 
     def _script() -> None:
@@ -156,4 +163,5 @@ if __name__ == "__main__":
             print(f"\nERROR: {e}")
 
     from agency.agwebui import agwebui
+
     agwebui.run(_script, port=8006)

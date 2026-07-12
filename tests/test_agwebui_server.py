@@ -1,4 +1,5 @@
 """Tests for agwebui server — FastAPI endpoints and WebSocket streaming."""
+
 import json
 import sqlite3
 import threading
@@ -11,6 +12,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _write_events(db_path: Path, events: list[dict]) -> None:
     """Insert events directly into the SQLite database."""
@@ -39,6 +41,7 @@ def _write_events(db_path: Path, events: list[dict]) -> None:
 # Fixture: isolated server app with its own run_dir
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture()
 def server(tmp_path):
     """Yield (TestClient, run_dir, srv_module) with a fresh server state."""
@@ -46,45 +49,45 @@ def server(tmp_path):
     from fastapi.testclient import TestClient
 
     # Snapshot all module-level globals before the app starts
-    old_run_dir      = srv._run_dir
-    old_reply_dir    = srv._reply_dir
-    old_command_dir  = srv._command_dir
-    old_clients      = srv._clients
-    old_last_id      = srv._last_event_id
-    old_event_count  = srv._event_count
-    old_first_ts     = srv._first_ts
-    old_last_ts      = srv._last_ts
-    old_agent_reg    = srv._agent_registry
-    old_team_reg     = srv._team_registry
+    old_run_dir = srv._run_dir
+    old_reply_dir = srv._reply_dir
+    old_command_dir = srv._command_dir
+    old_clients = srv._clients
+    old_last_id = srv._last_event_id
+    old_event_count = srv._event_count
+    old_first_ts = srv._first_ts
+    old_last_ts = srv._last_ts
+    old_agent_reg = srv._agent_registry
+    old_team_reg = srv._team_registry
 
     # Point the server at a fresh temp directory
-    srv._run_dir        = tmp_path
-    srv._reply_dir      = tmp_path / "ui_replies"
+    srv._run_dir = tmp_path
+    srv._reply_dir = tmp_path / "ui_replies"
     srv._reply_dir.mkdir()
-    srv._command_dir    = tmp_path / "ui_commands"
+    srv._command_dir = tmp_path / "ui_commands"
     srv._command_dir.mkdir()
-    srv._clients        = set()
-    srv._last_event_id  = 0
-    srv._event_count    = 0
-    srv._first_ts       = None
-    srv._last_ts        = None
+    srv._clients = set()
+    srv._last_event_id = 0
+    srv._event_count = 0
+    srv._first_ts = None
+    srv._last_ts = None
     srv._agent_registry = {}
-    srv._team_registry  = {}
+    srv._team_registry = {}
 
     with TestClient(srv.app) as client:
         yield client, tmp_path, srv
 
     # Restore so subsequent tests see a clean state
-    srv._run_dir        = old_run_dir
-    srv._reply_dir      = old_reply_dir
-    srv._command_dir    = old_command_dir
-    srv._clients        = old_clients
-    srv._last_event_id  = old_last_id
-    srv._event_count    = old_event_count
-    srv._first_ts       = old_first_ts
-    srv._last_ts        = old_last_ts
+    srv._run_dir = old_run_dir
+    srv._reply_dir = old_reply_dir
+    srv._command_dir = old_command_dir
+    srv._clients = old_clients
+    srv._last_event_id = old_last_id
+    srv._event_count = old_event_count
+    srv._first_ts = old_first_ts
+    srv._last_ts = old_last_ts
     srv._agent_registry = old_agent_reg
-    srv._team_registry  = old_team_reg
+    srv._team_registry = old_team_reg
 
 
 def _wait_for(condition, timeout=3.0, interval=0.05):
@@ -101,11 +104,13 @@ def _wait_for(condition, timeout=3.0, interval=0.05):
 # HTTP endpoints
 # ---------------------------------------------------------------------------
 
+
 def test_health(server):
     client, _, _ = server
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
 
 def test_index_returns_html(server):
     client, _, _ = server
@@ -114,10 +119,12 @@ def test_index_returns_html(server):
     assert "text/html" in resp.headers["content-type"]
     assert b"Agency Web UI" in resp.content
 
+
 def test_static_css_served(server):
     client, _, _ = server
     resp = client.get("/static/style.css")
     assert resp.status_code == 200
+
 
 def test_static_js_served(server):
     client, _, _ = server
@@ -129,14 +136,16 @@ def test_static_js_served(server):
 # Tail task — reads ui_events.db and updates globals
 # ---------------------------------------------------------------------------
 
+
 def test_tail_task_reads_events_db(server):
     """Tail task must read ui_events.db and advance _last_event_id."""
     client, run_dir, srv = server
     db_path = run_dir / "ui_events.db"
     _write_events(db_path, [{"type": "log", "line": "hello", "ts": 1.0}])
 
-    assert _wait_for(lambda: srv._last_event_id > 0), \
+    assert _wait_for(lambda: srv._last_event_id > 0), (
         "tail task did not process ui_events.db within 3 s"
+    )
 
 
 def test_tail_task_appends_new_events(server):
@@ -145,19 +154,20 @@ def test_tail_task_appends_new_events(server):
     db_path = run_dir / "ui_events.db"
 
     _write_events(db_path, [{"type": "log", "line": "first", "ts": 1.0}])
-    assert _wait_for(lambda: srv._last_event_id > 0), \
-        "tail task did not pick up first event"
+    assert _wait_for(lambda: srv._last_event_id > 0), "tail task did not pick up first event"
     first_id = srv._last_event_id
 
     _write_events(db_path, [{"type": "done", "ts": 2.0}])
 
-    assert _wait_for(lambda: srv._last_event_id > first_id), \
+    assert _wait_for(lambda: srv._last_event_id > first_id), (
         "tail task did not pick up second event"
+    )
 
 
 # ---------------------------------------------------------------------------
 # WebSocket helpers
 # ---------------------------------------------------------------------------
+
 
 def _recv_n(ws, n, timeout=5.0):
     """Receive exactly n messages from ws using a background thread with timeout."""
@@ -199,6 +209,7 @@ def _recv_skipping_sync(ws, n, timeout=5.0):
 # WebSocket — initial timeline_sync on connect
 # ---------------------------------------------------------------------------
 
+
 def test_websocket_sends_timeline_sync_on_connect(server):
     """First message on every WebSocket connection must be timeline_sync."""
     client, _, _ = server
@@ -212,19 +223,24 @@ def test_websocket_sends_timeline_sync_on_connect(server):
 # WebSocket — historical replay
 # ---------------------------------------------------------------------------
 
+
 def test_websocket_replays_history_on_connect(server):
     """Client connecting after events exist should receive full replay."""
     client, run_dir, srv = server
     db_path = run_dir / "ui_events.db"
 
-    _write_events(db_path, [
-        {"type": "log",              "line": "line one", "ts": 1.0},
-        {"type": "agent_registered", "agname": "Bot", "color": "#f00", "ts": 2.0},
-    ])
+    _write_events(
+        db_path,
+        [
+            {"type": "log", "line": "line one", "ts": 1.0},
+            {"type": "agent_registered", "agname": "Bot", "color": "#f00", "ts": 2.0},
+        ],
+    )
 
     # Wait for tail task to index the DB so the WebSocket can replay it
-    assert _wait_for(lambda: srv._last_event_id > 0), \
+    assert _wait_for(lambda: srv._last_event_id > 0), (
         "tail task did not process DB before WebSocket connect"
+    )
 
     with client.websocket_connect("/ws") as ws:
         received = _recv_skipping_sync(ws, 2)
@@ -240,12 +256,8 @@ def test_websocket_new_client_sees_all_history(server):
     client, run_dir, srv = server
     db_path = run_dir / "ui_events.db"
 
-    _write_events(db_path, [
-        {"type": "log", "line": f"msg{i}", "ts": float(i)}
-        for i in range(3)
-    ])
-    assert _wait_for(lambda: srv._last_event_id > 0), \
-        "tail task did not process DB"
+    _write_events(db_path, [{"type": "log", "line": f"msg{i}", "ts": float(i)} for i in range(3)])
+    assert _wait_for(lambda: srv._last_event_id > 0), "tail task did not process DB"
 
     with client.websocket_connect("/ws") as ws:
         received = _recv_skipping_sync(ws, 3)
@@ -256,6 +268,7 @@ def test_websocket_new_client_sees_all_history(server):
 # ---------------------------------------------------------------------------
 # WebSocket — live broadcast to connected clients
 # ---------------------------------------------------------------------------
+
 
 def test_websocket_receives_live_events(server):
     """Events written to the DB after a client connects are pushed live."""
@@ -280,18 +293,23 @@ def test_websocket_receives_live_events(server):
 # WebSocket — human_reply handling
 # ---------------------------------------------------------------------------
 
+
 def test_websocket_human_reply_writes_file(server):
     client, run_dir, srv = server
 
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({
-            "type": "human_reply",
-            "ask_id": "testask01",
-            "text": "my answer",
-        }))
-        assert _wait_for(
-            lambda: (run_dir / "ui_replies" / "testask01.txt").exists()
-        ), "reply file was not written"
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "human_reply",
+                    "ask_id": "testask01",
+                    "text": "my answer",
+                }
+            )
+        )
+        assert _wait_for(lambda: (run_dir / "ui_replies" / "testask01.txt").exists()), (
+            "reply file was not written"
+        )
 
     reply_file = run_dir / "ui_replies" / "testask01.txt"
     assert reply_file.read_text() == "my answer"
@@ -312,6 +330,7 @@ def test_websocket_human_reply_empty_ask_id_ignored(server):
 # WebSocket — pause/resume command handling
 # ---------------------------------------------------------------------------
 
+
 def _read_command_files(run_dir: Path) -> list[dict]:
     return [json.loads(f.read_text()) for f in (run_dir / "ui_commands").glob("*.json")]
 
@@ -321,8 +340,7 @@ def test_websocket_pause_writes_command_file(server):
 
     with client.websocket_connect("/ws") as ws:
         ws.send_text(json.dumps({"type": "pause", "agname": "alex_0000"}))
-        assert _wait_for(lambda: _read_command_files(run_dir)), \
-            "pause command file was not written"
+        assert _wait_for(lambda: _read_command_files(run_dir)), "pause command file was not written"
 
     cmds = _read_command_files(run_dir)
     assert len(cmds) == 1
@@ -356,34 +374,49 @@ def test_websocket_update_config_writes_command_file(server):
     client, run_dir, srv = server
 
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({
-            "type": "update_config", "agname": "alex_0000",
-            "config": {"agskill": {"react_max_steps": 5}},
-        }))
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "update_config",
+                    "agname": "alex_0000",
+                    "config": {"agskill": {"react_max_steps": 5}},
+                }
+            )
+        )
         assert _wait_for(lambda: _read_command_files(run_dir))
 
     cmds = _read_command_files(run_dir)
-    assert cmds == [{
-        "type": "update_config", "agname": "alex_0000",
-        "config": {"agskill": {"react_max_steps": 5}},
-    }]
+    assert cmds == [
+        {
+            "type": "update_config",
+            "agname": "alex_0000",
+            "config": {"agskill": {"react_max_steps": 5}},
+        }
+    ]
 
 
 def test_websocket_update_config_all_writes_command_file(server):
     client, run_dir, srv = server
 
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({
-            "type": "update_config_all",
-            "config": {"agskill": {"react_max_steps": 9}},
-        }))
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "update_config_all",
+                    "config": {"agskill": {"react_max_steps": 9}},
+                }
+            )
+        )
         assert _wait_for(lambda: _read_command_files(run_dir))
 
     cmds = _read_command_files(run_dir)
-    assert cmds == [{
-        "type": "update_config_all", "agname": None,
-        "config": {"agskill": {"react_max_steps": 9}},
-    }]
+    assert cmds == [
+        {
+            "type": "update_config_all",
+            "agname": None,
+            "config": {"agskill": {"react_max_steps": 9}},
+        }
+    ]
 
 
 def test_websocket_update_config_missing_config_defaults_empty(server):
@@ -427,6 +460,7 @@ def test_websocket_malformed_json_ignored(server):
 # /api/timeline endpoint
 # ---------------------------------------------------------------------------
 
+
 def test_api_timeline_empty(server):
     """Timeline endpoint returns empty metadata when no DB exists."""
     client, _, _ = server
@@ -442,30 +476,37 @@ def test_api_timeline_with_events(server):
     """Timeline endpoint returns event count and timestamp range."""
     client, run_dir, _ = server
     db_path = run_dir / "ui_events.db"
-    _write_events(db_path, [
-        {"type": "log", "line": "a", "ts": 10.0},
-        {"type": "log", "line": "b", "ts": 20.0},
-    ])
+    _write_events(
+        db_path,
+        [
+            {"type": "log", "line": "a", "ts": 10.0},
+            {"type": "log", "line": "b", "ts": 20.0},
+        ],
+    )
     resp = client.get("/api/timeline")
     assert resp.status_code == 200
     j = resp.json()
     assert j["first_ts"] == pytest.approx(10.0)
-    assert j["last_ts"]  == pytest.approx(20.0)
+    assert j["last_ts"] == pytest.approx(20.0)
 
 
 # ---------------------------------------------------------------------------
 # /api/events endpoint
 # ---------------------------------------------------------------------------
 
+
 def test_api_events_range(server):
     """Events endpoint returns events in the requested time range."""
     client, run_dir, _ = server
     db_path = run_dir / "ui_events.db"
-    _write_events(db_path, [
-        {"type": "log", "line": "early", "ts": 1.0},
-        {"type": "log", "line": "mid",   "ts": 5.0},
-        {"type": "log", "line": "late",  "ts": 9.0},
-    ])
+    _write_events(
+        db_path,
+        [
+            {"type": "log", "line": "early", "ts": 1.0},
+            {"type": "log", "line": "mid", "ts": 5.0},
+            {"type": "log", "line": "late", "ts": 9.0},
+        ],
+    )
     resp = client.get("/api/events?start_ts=3.0&end_ts=7.0")
     assert resp.status_code == 200
     j = resp.json()

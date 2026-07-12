@@ -18,6 +18,7 @@ Run:
     uv run python examples/custom_tools.py "speculative decoding"
     MAX_PAPERS=6 uv run python examples/custom_tools.py "flash attention"
 """
+
 import os
 import re
 from pathlib import Path
@@ -64,11 +65,11 @@ def _search_papers(arg: agdata) -> agdata:
         return agdata(error=_fmt_exc(e), papers=[])
     papers = []
     for item in data:
-        paper    = item.get("paper", item) if isinstance(item, dict) else {}
-        title    = paper.get("title", "").strip()
+        paper = item.get("paper", item) if isinstance(item, dict) else {}
+        title = paper.get("title", "").strip()
         abstract = paper.get("summary", "")[:600]
         arxiv_id = paper.get("id", "")
-        url      = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+        url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
         if title:
             papers.append({"title": title, "url": url, "abstract": abstract})
     return agdata(papers=papers, count=len(papers))
@@ -82,8 +83,11 @@ search_papers = agtool(
     params={
         "type": "object",
         "properties": {
-            "query":       {"type": "string",  "description": "Search query string"},
-            "max_results": {"type": "integer", "description": f"Max results (default {MAX_PAPERS})"},
+            "query": {"type": "string", "description": "Search query string"},
+            "max_results": {
+                "type": "integer",
+                "description": f"Max results (default {MAX_PAPERS})",
+            },
         },
         "required": ["query"],
     },
@@ -148,8 +152,14 @@ fetch_paper = agtool(
     params={
         "type": "object",
         "properties": {
-            "url":    {"type": "string",  "description": "The arxiv paper URL (abs, pdf, or html form)"},
-            "offset": {"type": "integer", "description": "Character offset to start reading from (default 0)"},
+            "url": {
+                "type": "string",
+                "description": "The arxiv paper URL (abs, pdf, or html form)",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Character offset to start reading from (default 0)",
+            },
         },
         "required": ["url"],
     },
@@ -189,6 +199,7 @@ compile_report_skill = agskill(
 
 def _make_run_dir(name: str) -> Path:
     from datetime import datetime
+
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +209,7 @@ def _make_run_dir(name: str) -> Path:
 # ---------------------------------------------------------------------------
 # Team definition
 # ---------------------------------------------------------------------------
+
 
 class PaperCrawlerTeam(agteam):
     """Self-contained paper-crawling team.
@@ -222,9 +234,9 @@ class PaperCrawlerTeam(agteam):
     agconfig = cfg
 
     def setup(self) -> None:
-        self.find_papers     = find_papers_skill
+        self.find_papers = find_papers_skill
         self.summarise_paper = summarise_paper_skill
-        self.compile_report  = compile_report_skill
+        self.compile_report = compile_report_skill
 
         self.main_agent = agent()
 
@@ -283,20 +295,24 @@ if __name__ == "__main__":
     from agency import AgError
     import sys
 
-    topic   = " ".join(sys.argv[1:]) or "KV cache quantization"
+    topic = " ".join(sys.argv[1:]) or "KV cache quantization"
     run_dir = _make_run_dir("custom_tools")
 
     agent.log_dir = run_dir / "logs"
-    reports_dir   = run_dir / "reports"
+    reports_dir = run_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     def _script() -> None:
         print(f"Run dir  : {run_dir}\n")
         try:
-            topics = [topic] if topic != "KV cache quantization" else [
-                "KV cache quantization",
-                "speculative decoding",
-            ]
+            topics = (
+                [topic]
+                if topic != "KV cache quantization"
+                else [
+                    "KV cache quantization",
+                    "speculative decoding",
+                ]
+            )
             teams = [PaperCrawlerTeam(topic=t) for t in topics]
             pending = [t.run(output_dir=reports_dir) for t in teams]  # all start immediately
             agsync(teams)
@@ -306,4 +322,5 @@ if __name__ == "__main__":
             print(f"\nERROR: {e}")
 
     from agency.agwebui import agwebui
+
     agwebui.run(_script, port=8002)

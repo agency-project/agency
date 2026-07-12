@@ -3,7 +3,11 @@ import atexit
 import threading
 import time
 import multiprocessing as _mp
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as _FutureTimeoutError, BrokenExecutor
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    TimeoutError as _FutureTimeoutError,
+    BrokenExecutor,
+)
 import json
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
@@ -22,12 +26,13 @@ if TYPE_CHECKING:
 # to match concurrent demand (one worker per in-flight tool call, up to 256).
 # Uses "spawn" start method to avoid fork-in-multithreaded-process deadlocks.
 # ---------------------------------------------------------------------------
-_pool:      ProcessPoolExecutor | None = None
-_pool_lock: threading.Lock             = threading.Lock()
+_pool: ProcessPoolExecutor | None = None
+_pool_lock: threading.Lock = threading.Lock()
 
 
 def _ignore_sigint_in_worker() -> None:
     import signal
+
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
@@ -40,12 +45,20 @@ def _ignore_sigint_in_worker() -> None:
 # does nothing but (optionally) store an agconfig; there's no persistent
 # agtool instance to hang descriptors on for reading.
 class _AgToolFields:
-    pool_max_workers     = GlobalConfigParam("agtool", default=256)  # Max worker processes in the tool executor pool; one per in-flight tool call.
-    timeout_s            = DynamicConfigParam("agtool", default=1800)  # Default ceiling on tool execution time (seconds). Prevents a crashed or
-                                                                        # hung worker process from blocking an agent thread forever via future.result();
-                                                                        # agents can pass "timeout": <seconds> in tool arguments to override per-call.
-    output_offload_chars = DynamicConfigParam("agtool", default=40_000)  # minimum floor for tool-output offloading
-    offload_id_prefix_len = DynamicConfigParam("agtool", default=12)  # Chars of the tool_call_id kept when naming an offloaded-output file.
+    pool_max_workers = GlobalConfigParam(
+        "agtool", default=256
+    )  # Max worker processes in the tool executor pool; one per in-flight tool call.
+    timeout_s = DynamicConfigParam(
+        "agtool", default=1800
+    )  # Default ceiling on tool execution time (seconds). Prevents a crashed or
+    # hung worker process from blocking an agent thread forever via future.result();
+    # agents can pass "timeout": <seconds> in tool arguments to override per-call.
+    output_offload_chars = DynamicConfigParam(
+        "agtool", default=40_000
+    )  # minimum floor for tool-output offloading
+    offload_id_prefix_len = DynamicConfigParam(
+        "agtool", default=12
+    )  # Chars of the tool_call_id kept when naming an offloaded-output file.
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
@@ -92,8 +105,9 @@ def _process_worker(fn_bytes: bytes, arg_bytes: bytes) -> bytes:
     """Worker entry-point: unpickle the tool fn and call it."""
     import cloudpickle
     import pickle
-    fn:  Callable[[agdata], agdata] = cloudpickle.loads(fn_bytes)
-    arg: agdata                     = pickle.loads(arg_bytes)
+
+    fn: Callable[[agdata], agdata] = cloudpickle.loads(fn_bytes)
+    arg: agdata = pickle.loads(arg_bytes)
     return pickle.dumps(fn(arg))
 
 
@@ -121,13 +135,13 @@ class agtool:
         log_fn: "Callable[[agtool, agdata, agdata, int], None] | None" = None,
         run_in_subprocess: bool = True,
     ):
-        self.name         = name
-        self.description  = description
-        self.fn           = fn
-        self.params       = params or {"type": "object", "properties": {}}
-        self._log_fn      = log_fn
+        self.name = name
+        self.description = description
+        self.fn = fn
+        self.params = params or {"type": "object", "properties": {}}
+        self._log_fn = log_fn
         self.run_in_subprocess = run_in_subprocess
-        self._term:  "agterm | None" = None
+        self._term: "agterm | None" = None
         self._aglog: "aglog  | None" = None
 
     # ------------------------------------------------------------------
@@ -137,18 +151,18 @@ class agtool:
 
     def __getstate__(self) -> dict:
         return {
-            "name":         self.name,
-            "description":  self.description,
-            "fn":           self.fn,
-            "params":       self.params,
-            "_log_fn":      self._log_fn,
+            "name": self.name,
+            "description": self.description,
+            "fn": self.fn,
+            "params": self.params,
+            "_log_fn": self._log_fn,
             "run_in_subprocess": self.run_in_subprocess,
         }
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self.run_in_subprocess = state.get("run_in_subprocess", True)
-        self._term  = None
+        self._term = None
         self._aglog = None
 
     # ------------------------------------------------------------------
@@ -157,7 +171,7 @@ class agtool:
 
     def attach_logger(self, term: "agterm", aglog: "aglog") -> None:
         """Wire up terminal and structured file logging for this tool."""
-        self._term  = term
+        self._term = term
         self._aglog = aglog
 
     # ------------------------------------------------------------------
@@ -176,16 +190,14 @@ class agtool:
             self._log_fn(self, arg, result, elapsed_ms)
             return
         if self._term is not None:
-            in_keys  = list(arg._data.keys())
+            in_keys = list(arg._data.keys())
             out_keys = list(result._data.keys())
             self._term.log(
                 "TOOL ✓   ",
                 f"{self.name}  in={in_keys}  out={out_keys}  ({elapsed_ms}ms)",
             )
         if self._aglog is not None:
-            self._aglog._tool_call(
-                self.name, arg.to_dict(), result.to_dict(), elapsed_ms
-            )
+            self._aglog._tool_call(self.name, arg.to_dict(), result.to_dict(), elapsed_ms)
 
     # ------------------------------------------------------------------
     # Invocation
@@ -207,11 +219,16 @@ class agtool:
 
         import cloudpickle
         import pickle
-        fn_bytes         = cloudpickle.dumps(self.fn)
-        arg_bytes        = pickle.dumps(arg)
+
+        fn_bytes = cloudpickle.dumps(self.fn)
+        arg_bytes = pickle.dumps(arg)
         effective_timeout = timeout if timeout is not None else _AgToolFields.timeout_s.default
         try:
-            result_bytes = _get_pool().submit(_process_worker, fn_bytes, arg_bytes).result(timeout=effective_timeout)
+            result_bytes = (
+                _get_pool()
+                .submit(_process_worker, fn_bytes, arg_bytes)
+                .result(timeout=effective_timeout)
+            )
         except _FutureTimeoutError:
             elapsed = int((time.monotonic() - t0) * 1000)
             result = agerror(f"tool timed out after {effective_timeout}s")
@@ -235,9 +252,9 @@ class agtool:
         return {
             "type": "function",
             "function": {
-                "name":        self.name,
+                "name": self.name,
                 "description": self.description,
-                "parameters":  self.params,
+                "parameters": self.params,
             },
         }
 
@@ -248,6 +265,7 @@ class agtool:
 # ---------------------------------------------------------------------------
 # Return-output tool builders
 # ---------------------------------------------------------------------------
+
 
 def make_return_output_tools(schema) -> list[dict]:
     """Build one typed tool per output field from the schema.
@@ -261,18 +279,20 @@ def make_return_output_tools(schema) -> list[dict]:
         json_type = type_hint_to_string_type(hint)
         tool_desc, value_desc = get_return_tool_description_prompt(field, hint)
         value_schema: dict = {"type": json_type, "description": value_desc}
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": f"return_{field}",
-                "description": tool_desc,
-                "parameters": {
-                    "type": "object",
-                    "properties": {field: value_schema},
-                    "required": [field],
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": f"return_{field}",
+                    "description": tool_desc,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {field: value_schema},
+                        "required": [field],
+                    },
                 },
-            },
-        })
+            }
+        )
     return tools
 
 
@@ -284,6 +304,7 @@ def _make_return_output_tool(schema) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Tool dispatch
 # ---------------------------------------------------------------------------
+
 
 def dispatch_tools(
     tool_calls: list[dict],
@@ -305,9 +326,9 @@ def dispatch_tools(
     toolkit each iteration, so the injection is automatically visible to the LLM.
     """
     _state_fn = state_fn
-    _live_fn  = live_messages_fn
-    _hist_fn  = full_history_fn
-    _term     = term
+    _live_fn = live_messages_fn
+    _hist_fn = full_history_fn
+    _term = term
     _fields = _AgToolFields(agconfig)
     if tool_offload_chars is None:
         tool_offload_chars = _fields.output_offload_chars
@@ -316,7 +337,7 @@ def dispatch_tools(
     for tc in tool_calls:
         fn_name = tc["function"]["name"]
         fn_args = tc["function"]["arguments"]
-        tc_id   = tc["id"]
+        tc_id = tc["id"]
         # Ensure arguments is valid JSON before it goes back into history.
         # A malformed string (truncated generation, Python repr, etc.) causes
         # vLLM to crash on the next request when it re-parses the history.
@@ -354,7 +375,7 @@ def dispatch_tools(
                 # run_in_subprocess=False but can still produce huge outputs that
                 # bloat the context.
                 if len(result_content) > tool_offload_chars:
-                    safe_id = tc_id.replace("-", "")[:_fields.offload_id_prefix_len]
+                    safe_id = tc_id.replace("-", "")[: _fields.offload_id_prefix_len]
                     offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
                     try:
                         try:
@@ -362,17 +383,22 @@ def dispatch_tools(
                         except (json.JSONDecodeError, AttributeError):
                             file_body = result_content
                         sandbox.write_file(offload_path, file_body)
-                        result_content = json.dumps({
-                            "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
-                        })
+                        result_content = json.dumps(
+                            {
+                                "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
+                            }
+                        )
                         # Inject read into the toolkit so the LLM can access the file.
                         # The caller derives wire-format schemas from the toolkit each
                         # iteration, so this is automatically visible on the next step.
                         if "read" not in toolkit:
                             from .tools import make_read as _make_read
+
                             toolkit["read"] = _make_read(sandbox)
                     except Exception as _e:
-                        print(f"[agtool] WARNING: failed to offload large tool output to {offload_path}: {_e}")
+                        print(
+                            f"[agtool] WARNING: failed to offload large tool output to {offload_path}: {_e}"
+                        )
                 if t.run_in_subprocess:
                     # A tool may signal failure via agdata(error=...) without raising —
                     # treat that the same as an exception: discard dirty state.
@@ -406,8 +432,7 @@ def dispatch_tools(
                     try:
                         _result_obj = json.loads(result_content)
                         _result_obj["workspace_reverted"] = (
-                            "The workspace has been reverted to the state "
-                            "before this tool call."
+                            "The workspace has been reverted to the state before this tool call."
                         )
                         result_content = json.dumps(_result_obj)
                     except (json.JSONDecodeError, TypeError):

@@ -10,13 +10,21 @@ from typing import TYPE_CHECKING, Callable
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
 from .agutil import _iter_batched, _strip_thinking, _extract_thinking, _LLMIdleTimeout
-from .agllm_backend import agllm_backend, AgLLMBackendFields, BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS, API_ERROR_EXCS
+from .agllm_backend import (
+    agllm_backend,
+    AgLLMBackendFields,
+    BAD_REQUEST_EXCS,
+    API_CONN_EXCS,
+    RATE_LIMIT_EXCS,
+    API_ERROR_EXCS,
+)
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
 if TYPE_CHECKING:
     from .agterm import agterm
     from .aglog import aglog
     from .agcontext import agcontext
+
 
 # Exists to register agllm's config fields (via __set_name__ at import time)
 # and hold their hardcoded defaults as plain class attributes -- agllm
@@ -26,24 +34,40 @@ class _AgLLMFields:
     # Kept as plain (non-descriptor) class attributes because other code in
     # this file reads them directly in a @staticmethod, where there's no
     # instance/agconfig to read a ConfigParam descriptor through.
-    CHARS_PER_TOKEN          = 4      # Rough chars-per-token ratio for char-count token estimates.
+    CHARS_PER_TOKEN = 4  # Rough chars-per-token ratio for char-count token estimates.
     TOKENIZE_TIMEOUT_SECONDS = 5.0
-    COMPACT_THRESHOLD        = 0.70   # Fraction of context_limit that triggers compaction.
-    TAIL_FRACTION            = 0.25
-    TAIL_MIN_TOKENS          = 2_000
-    TAIL_MAX_TOKENS          = 8_000
-    TOOL_OUTPUT_MAX_CHARS    = 2_000
-    PRUNE_MIN_FREE_TOKENS    = 20_000
+    COMPACT_THRESHOLD = 0.70  # Fraction of context_limit that triggers compaction.
+    TAIL_FRACTION = 0.25
+    TAIL_MIN_TOKENS = 2_000
+    TAIL_MAX_TOKENS = 8_000
+    TOOL_OUTPUT_MAX_CHARS = 2_000
+    PRUNE_MIN_FREE_TOKENS = 20_000
 
-    call_max_concurrency = GlobalConfigParam("agllm", default=256)  # Max simultaneous in-flight LLM streaming calls across all skills.
+    call_max_concurrency = GlobalConfigParam(
+        "agllm", default=256
+    )  # Max simultaneous in-flight LLM streaming calls across all skills.
     max_retries = DynamicConfigParam("agllm", default=10)
-    idle_timeout = DynamicConfigParam("agllm", default=300.0)     # seconds to wait for first chunk (server dead?)
-    stream_timeout = DynamicConfigParam("agllm", default=1800.0)  # seconds to wait between chunks mid-stream
-    retry_sleep_s = DynamicConfigParam("agllm", default=2)        # seconds to wait after a connection/SSL error before retrying
-    http_connect_timeout = DynamicConfigParam("agllm", default=10.0)  # seconds for httpx to establish a TCP/TLS connection
-    http_write_timeout = DynamicConfigParam("agllm", default=10.0)    # seconds for httpx to finish writing the request body
-    http_pool_timeout = DynamicConfigParam("agllm", default=10.0)     # seconds httpx waits to acquire a connection from the pool
-    live_redraw_char_threshold = DynamicConfigParam("agllm", default=100)  # min new combined content+thinking chars before a UI redraw
+    idle_timeout = DynamicConfigParam(
+        "agllm", default=300.0
+    )  # seconds to wait for first chunk (server dead?)
+    stream_timeout = DynamicConfigParam(
+        "agllm", default=1800.0
+    )  # seconds to wait between chunks mid-stream
+    retry_sleep_s = DynamicConfigParam(
+        "agllm", default=2
+    )  # seconds to wait after a connection/SSL error before retrying
+    http_connect_timeout = DynamicConfigParam(
+        "agllm", default=10.0
+    )  # seconds for httpx to establish a TCP/TLS connection
+    http_write_timeout = DynamicConfigParam(
+        "agllm", default=10.0
+    )  # seconds for httpx to finish writing the request body
+    http_pool_timeout = DynamicConfigParam(
+        "agllm", default=10.0
+    )  # seconds httpx waits to acquire a connection from the pool
+    live_redraw_char_threshold = DynamicConfigParam(
+        "agllm", default=100
+    )  # min new combined content+thinking chars before a UI redraw
     # 429 rate-limit backoff: prefer the server's Retry-After header (it knows exactly
     # when the org's per-minute window resets); exponential-with-jitter is only a
     # fallback for the rare case the header is missing. Uncapped exponential growth
@@ -55,7 +79,9 @@ class _AgLLMFields:
     # receive the same Retry-After, which would otherwise make them all wake up and
     # retry in the same instant.
     rate_limit_retry_after_jitter_s = DynamicConfigParam("agllm", default=5.0)
-    default_context_limit = DynamicConfigParam("agllm", default=128_000)  # Fallback context window size when model reports none.
+    default_context_limit = DynamicConfigParam(
+        "agllm", default=128_000
+    )  # Fallback context window size when model reports none.
     summary_task_input_max_chars = DynamicConfigParam("agllm", default=400)
     summary_assistant_content_max_chars = DynamicConfigParam("agllm", default=400)
     summary_role_content_max_chars = DynamicConfigParam("agllm", default=600)
@@ -89,6 +115,7 @@ def _get_llm_call_semaphore() -> threading.Semaphore:
                 limit = _AgLLMFields().call_max_concurrency
                 _llm_call_semaphore = threading.Semaphore(limit)
     return _llm_call_semaphore
+
 
 _SUMMARY_SYSTEM = """\
 You are a conversation summariser. Produce a concise structured summary of \
@@ -127,6 +154,7 @@ that must be respected going forward>
 # Semaphore slot context manager
 # ---------------------------------------------------------------------------
 
+
 @contextmanager
 def _llm_call_semaphore_slot():
     sem = _get_llm_call_semaphore()
@@ -140,6 +168,7 @@ def _llm_call_semaphore_slot():
 # ---------------------------------------------------------------------------
 # Result dataclass
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LLMCallResult:
@@ -162,6 +191,7 @@ class LLMCallResult:
 # agllm class
 # ---------------------------------------------------------------------------
 
+
 class agllm(_AgLLMFields):
     """Encapsulates an LLM configuration and provides methods for building
     requests and executing streaming calls against that configuration."""
@@ -173,7 +203,9 @@ class agllm(_AgLLMFields):
     ) -> None:
         self._agconfig: agConfig = agconfig.clone()
         self.backend: agllm_backend = agllm_backend.for_config(self._agconfig)
-        self.context_limit: int = context_limit if context_limit is not None else agllm.fetch_context_limit(self.backend)
+        self.context_limit: int = (
+            context_limit if context_limit is not None else agllm.fetch_context_limit(self.backend)
+        )
 
     def change_config(self, agconfig: "agConfig") -> None:
         """Replace this llm's agconfig (and its backend's) with a clone of
@@ -218,9 +250,9 @@ class agllm(_AgLLMFields):
         kwargs["stream"] = True
         kwargs["stream_options"] = {"include_usage": True}
 
-        _initial_input_tokens  = total_input_tokens
+        _initial_input_tokens = total_input_tokens
         _initial_output_tokens = total_output_tokens
-        _llm_elapsed_ms        = 0
+        _llm_elapsed_ms = 0
 
         _PARTIAL_THINK_RE = re.compile(
             r"<think(?:ing)?>(.*?)(?:</think(?:ing)?>|$)", re.DOTALL | re.IGNORECASE
@@ -231,18 +263,26 @@ class agllm(_AgLLMFields):
             reasoning_parts: list[str] = []
             tool_calls_raw: dict[int, dict] = {}
             prompt_tokens: int | None = None
-            total_input_tokens  = _initial_input_tokens
+            total_input_tokens = _initial_input_tokens
             total_output_tokens = _initial_output_tokens
             _retry_err: "Exception | None" = None
             _retry_sleep_s: float = self.retry_sleep_s
 
             with _llm_call_semaphore_slot():
                 client = self.backend.make_client(
-                    httpx.Timeout(connect=self.http_connect_timeout, read=None, write=self.http_write_timeout, pool=self.http_pool_timeout),
+                    httpx.Timeout(
+                        connect=self.http_connect_timeout,
+                        read=None,
+                        write=self.http_write_timeout,
+                        pool=self.http_pool_timeout,
+                    ),
                 )
 
                 if term:
-                    term.log("LLM ▶    ", f"model={(backend.model or '?')}  messages={len(messages)}  idle_timeout={self.idle_timeout:.0f}s  stream_timeout={self.stream_timeout:.0f}s")
+                    term.log(
+                        "LLM ▶    ",
+                        f"model={(backend.model or '?')}  messages={len(messages)}  idle_timeout={self.idle_timeout:.0f}s  stream_timeout={self.stream_timeout:.0f}s",
+                    )
                 if state_fn:
                     state_fn("llm", skill=skill_name)
 
@@ -255,12 +295,18 @@ class agllm(_AgLLMFields):
                 _live_chars = 0
 
                 try:
-                    for batch in _iter_batched(client.chat.completions.create(**kwargs), idle_timeout=self.idle_timeout, stream_timeout=self.stream_timeout):
+                    for batch in _iter_batched(
+                        client.chat.completions.create(**kwargs),
+                        idle_timeout=self.idle_timeout,
+                        stream_timeout=self.stream_timeout,
+                    ):
                         for chunk in batch:
                             if chunk.usage is not None:
                                 prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
-                                total_input_tokens  += prompt_tokens
-                                total_output_tokens += getattr(chunk.usage, "completion_tokens", 0) or 0
+                                total_input_tokens += prompt_tokens
+                                total_output_tokens += (
+                                    getattr(chunk.usage, "completion_tokens", 0) or 0
+                                )
                                 if term is not None:
                                     term._tokens = prompt_tokens
                             if not chunk.choices:
@@ -287,23 +333,34 @@ class agllm(_AgLLMFields):
                                 else:
                                     partial_msg["content"] = raw
 
-                            new_chars = len(partial_msg.get("content", "")) + len(partial_msg.get("_thinking", ""))
-                            if live_messages_fn and new_chars - _live_chars >= self.live_redraw_char_threshold:
+                            new_chars = len(partial_msg.get("content", "")) + len(
+                                partial_msg.get("_thinking", "")
+                            )
+                            if (
+                                live_messages_fn
+                                and new_chars - _live_chars >= self.live_redraw_char_threshold
+                            ):
                                 live_messages_fn(messages[1:])
                                 _live_chars = new_chars
                             if delta.tool_calls:
                                 for tc_delta in delta.tool_calls:
-                                    slot = tool_calls_raw.setdefault(tc_delta.index, {
-                                        "id": "", "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    })
+                                    slot = tool_calls_raw.setdefault(
+                                        tc_delta.index,
+                                        {
+                                            "id": "",
+                                            "type": "function",
+                                            "function": {"name": "", "arguments": ""},
+                                        },
+                                    )
                                     if tc_delta.id:
                                         slot["id"] = tc_delta.id
                                     if tc_delta.function:
                                         if tc_delta.function.name:
                                             slot["function"]["name"] += tc_delta.function.name
                                         if tc_delta.function.arguments:
-                                            slot["function"]["arguments"] += tc_delta.function.arguments
+                                            slot["function"]["arguments"] += (
+                                                tc_delta.function.arguments
+                                            )
 
                 except BAD_REQUEST_EXCS as _bad_req:
                     try:
@@ -313,13 +370,26 @@ class agllm(_AgLLMFields):
                     messages.pop()
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
                     _err_str = str(_bad_req).lower()
-                    if any(kw in _err_str for kw in ("context_length_exceeded", "maximum context length",
-                                                      "context length", "too long", "reduce the length")):
+                    if any(
+                        kw in _err_str
+                        for kw in (
+                            "context_length_exceeded",
+                            "maximum context length",
+                            "context length",
+                            "too long",
+                            "reduce the length",
+                        )
+                    ):
                         if term:
-                            term.log("LLM ✗    ", f"model={(backend.model or '?')}  context length exceeded — will compact and retry")
+                            term.log(
+                                "LLM ✗    ",
+                                f"model={(backend.model or '?')}  context length exceeded — will compact and retry",
+                            )
                         return LLMCallResult(context_exceeded=True, elapsed_ms=_llm_elapsed_ms)
                     if term:
-                        term.log("LLM ✗    ", f"model={(backend.model or '?')}  bad request: {_bad_req}")
+                        term.log(
+                            "LLM ✗    ", f"model={(backend.model or '?')}  bad request: {_bad_req}"
+                        )
                     return LLMCallResult(conn_error=_bad_req, elapsed_ms=_llm_elapsed_ms)
 
                 except RATE_LIMIT_EXCS as _rate_err:
@@ -329,28 +399,45 @@ class agllm(_AgLLMFields):
                         pass
                     messages.pop()
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-                    _retry_after = getattr(getattr(_rate_err, "response", None), "headers", {}).get("retry-after")
+                    _retry_after = getattr(getattr(_rate_err, "response", None), "headers", {}).get(
+                        "retry-after"
+                    )
                     try:
                         # Jitter is added on top, never subtracted — the header is a floor,
                         # not a target, so we never retry sooner than the server said to.
-                        _retry_sleep_s = float(_retry_after) + random.uniform(0, self.rate_limit_retry_after_jitter_s)
+                        _retry_sleep_s = float(_retry_after) + random.uniform(
+                            0, self.rate_limit_retry_after_jitter_s
+                        )
                     except (TypeError, ValueError):
                         # No (or unparseable) Retry-After header — exponential backoff with
                         # full jitter so many concurrently-throttled skills don't all wake
                         # up and retry in the same instant (thundering herd).
-                        _backoff = min(self.rate_limit_max_backoff_s, self.rate_limit_base_backoff_s * (2 ** attempt))
+                        _backoff = min(
+                            self.rate_limit_max_backoff_s,
+                            self.rate_limit_base_backoff_s * (2**attempt),
+                        )
                         _retry_sleep_s = random.uniform(0, _backoff)
                     if attempt < self.max_retries - 1:
                         if term:
-                            term.log("LLM ✗    ", f"model={(backend.model or '?')}  rate limited: {_rate_err}  "
-                                                    f"retry {attempt + 1}/{self.max_retries - 1} in {_retry_sleep_s:.1f}s")
+                            term.log(
+                                "LLM ✗    ",
+                                f"model={(backend.model or '?')}  rate limited: {_rate_err}  "
+                                f"retry {attempt + 1}/{self.max_retries - 1} in {_retry_sleep_s:.1f}s",
+                            )
                         _retry_err = _rate_err
                     else:
                         if term:
-                            term.log("LLM ✗    ", f"model={(backend.model or '?')}  rate limited: {_rate_err}  all retries exhausted")
+                            term.log(
+                                "LLM ✗    ",
+                                f"model={(backend.model or '?')}  rate limited: {_rate_err}  all retries exhausted",
+                            )
                         return LLMCallResult(conn_error=_rate_err, elapsed_ms=_llm_elapsed_ms)
 
-                except (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError) + API_CONN_EXCS + API_ERROR_EXCS as _conn_err:
+                except (
+                    (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError)
+                    + API_CONN_EXCS
+                    + API_ERROR_EXCS
+                ) as _conn_err:
                     try:
                         client.close()
                     except Exception:
@@ -365,11 +452,17 @@ class agllm(_AgLLMFields):
                         _err_desc = str(_conn_err)
                     if attempt < self.max_retries - 1:
                         if term:
-                            term.log("LLM ✗    ", f"model={(backend.model or '?')}  {_err_desc}  retry {attempt + 1}/{self.max_retries - 1}")
+                            term.log(
+                                "LLM ✗    ",
+                                f"model={(backend.model or '?')}  {_err_desc}  retry {attempt + 1}/{self.max_retries - 1}",
+                            )
                         _retry_err = _conn_err
                     else:
                         if term:
-                            term.log("LLM ✗    ", f"model={(backend.model or '?')}  {_err_desc}  all retries exhausted")
+                            term.log(
+                                "LLM ✗    ",
+                                f"model={(backend.model or '?')}  {_err_desc}  all retries exhausted",
+                            )
                         return LLMCallResult(conn_error=_conn_err, elapsed_ms=_llm_elapsed_ms)
 
                 else:
@@ -378,7 +471,9 @@ class agllm(_AgLLMFields):
 
             if _retry_err is not None:
                 if full_history_fn:
-                    full_history_fn({"type": "llm_retry", "error": str(_retry_err), "attempt": attempt + 1})
+                    full_history_fn(
+                        {"type": "llm_retry", "error": str(_retry_err), "attempt": attempt + 1}
+                    )
                 time.sleep(_retry_sleep_s)
                 continue
             break  # success
@@ -404,10 +499,35 @@ class agllm(_AgLLMFields):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_llm_kwargs(llm_config: "agConfig | AgLLMBackendFields", messages: list[dict], openai_tools: "list | None") -> dict:
-        backend = llm_config if isinstance(llm_config, AgLLMBackendFields) else agllm_backend.for_config(llm_config)
-        _OPENAI_GEN_PARAMS = {"temperature", "max_completion_tokens", "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed"}
-        _EXTRA_BODY_GEN_PARAMS = {"top_k", "repetition_penalty", "min_p", "min_tokens", "guided_json", "guided_regex"}
+    def build_llm_kwargs(
+        llm_config: "agConfig | AgLLMBackendFields",
+        messages: list[dict],
+        openai_tools: "list | None",
+    ) -> dict:
+        backend = (
+            llm_config
+            if isinstance(llm_config, AgLLMBackendFields)
+            else agllm_backend.for_config(llm_config)
+        )
+        _OPENAI_GEN_PARAMS = {
+            "temperature",
+            "max_completion_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "n",
+            "stop",
+            "logprobs",
+            "seed",
+        }
+        _EXTRA_BODY_GEN_PARAMS = {
+            "top_k",
+            "repetition_penalty",
+            "min_p",
+            "min_tokens",
+            "guided_json",
+            "guided_regex",
+        }
         wire_messages: list[dict] = []
         for m in messages:
             wire_msg = {k: v for k, v in m.items() if not k.startswith("_")}
@@ -423,7 +543,9 @@ class agllm(_AgLLMFields):
             if val is not None:
                 kwargs[_p] = val
         if backend.max_tokens is not None:
-            print("[agllm] WARNING: llm_config['max_tokens'] is deprecated; use 'max_completion_tokens' instead.")
+            print(
+                "[agllm] WARNING: llm_config['max_tokens'] is deprecated; use 'max_completion_tokens' instead."
+            )
             kwargs.setdefault("max_completion_tokens", backend.max_tokens)
         _extra_body: dict = dict(backend.extra_body or {})
         for _p in _EXTRA_BODY_GEN_PARAMS:
@@ -470,7 +592,11 @@ class agllm(_AgLLMFields):
            which has no model-listing API at all)
         4. ``_AgLLMFields.default_context_limit.default`` — safe fallback so compaction always runs
         """
-        backend = llm_config if isinstance(llm_config, AgLLMBackendFields) else agllm_backend.for_config(llm_config)
+        backend = (
+            llm_config
+            if isinstance(llm_config, AgLLMBackendFields)
+            else agllm_backend.for_config(llm_config)
+        )
         if backend.context_limit is not None:
             return int(backend.context_limit)
         model_id = backend.model or ""
@@ -489,7 +615,9 @@ class agllm(_AgLLMFields):
         known = backend.known_context_limit(model_id)
         if known is not None:
             return known
-        print(f"[agllm] WARNING: context limit unknown, falling back to {_AgLLMFields.default_context_limit.default}")
+        print(
+            f"[agllm] WARNING: context limit unknown, falling back to {_AgLLMFields.default_context_limit.default}"
+        )
         return _AgLLMFields.default_context_limit.default
 
     # ------------------------------------------------------------------
@@ -504,14 +632,18 @@ class agllm(_AgLLMFields):
     @staticmethod
     def _estimate_tokens(msg: dict) -> int:
         chars = len(msg.get("content") or "")
-        for tc in (msg.get("tool_calls") or []):
+        for tc in msg.get("tool_calls") or []:
             chars += len(tc.get("function", {}).get("arguments", ""))
         return max(1, chars // _AgLLMFields.CHARS_PER_TOKEN)
 
     @staticmethod
     def count_messages_tokens(messages: list[dict], llm_config: "agConfig | agllm_backend") -> int:
         """Token count via the vLLM /tokenize endpoint, falling back to char estimate."""
-        backend = llm_config if isinstance(llm_config, AgLLMBackendFields) else agllm_backend.for_config(llm_config)
+        backend = (
+            llm_config
+            if isinstance(llm_config, AgLLMBackendFields)
+            else agllm_backend.for_config(llm_config)
+        )
         root = backend.tokenize_url()
         if root:
             try:
@@ -519,8 +651,9 @@ class agllm(_AgLLMFields):
                     f"{root}/tokenize",
                     json={
                         "model": backend.model or "",
-                        "messages": [{k: v for k, v in m.items() if not k.startswith("_")}
-                                     for m in messages],
+                        "messages": [
+                            {k: v for k, v in m.items() if not k.startswith("_")} for m in messages
+                        ],
                     },
                     timeout=_AgLLMFields.TOKENIZE_TIMEOUT_SECONDS,
                 )
@@ -539,13 +672,16 @@ class agllm(_AgLLMFields):
         return prompt_tokens >= int(context_limit * _AgLLMFields.COMPACT_THRESHOLD)
 
     @staticmethod
-    def _tail_start(conv: list[dict], context_limit: int,
-                    tail_turns: int = _AgLLMFields.tail_turns.default) -> int:
+    def _tail_start(
+        conv: list[dict], context_limit: int, tail_turns: int = _AgLLMFields.tail_turns.default
+    ) -> int:
         if not conv:
             return 0
         usable = int(context_limit * _AgLLMFields.COMPACT_THRESHOLD)
-        tail_budget = max(_AgLLMFields.TAIL_MIN_TOKENS, min(_AgLLMFields.TAIL_MAX_TOKENS,
-                                                int(usable * _AgLLMFields.TAIL_FRACTION)))
+        tail_budget = max(
+            _AgLLMFields.TAIL_MIN_TOKENS,
+            min(_AgLLMFields.TAIL_MAX_TOKENS, int(usable * _AgLLMFields.TAIL_FRACTION)),
+        )
         turns_kept = 0
         tokens_kept = 0
         result = len(conv)
@@ -572,7 +708,8 @@ class agllm(_AgLLMFields):
         savings_chars = sum(
             len(m.get("content") or "") - _AgLLMFields.TOOL_OUTPUT_MAX_CHARS
             for m in messages
-            if m["role"] == "tool" and len(m.get("content") or "") > _AgLLMFields.TOOL_OUTPUT_MAX_CHARS
+            if m["role"] == "tool"
+            and len(m.get("content") or "") > _AgLLMFields.TOOL_OUTPUT_MAX_CHARS
         )
         if savings_chars // 4 < _AgLLMFields.PRUNE_MIN_FREE_TOKENS:
             return messages
@@ -581,7 +718,10 @@ class agllm(_AgLLMFields):
             if m["role"] == "tool":
                 content = m.get("content") or ""
                 if len(content) > _AgLLMFields.TOOL_OUTPUT_MAX_CHARS:
-                    m = {**m, "content": content[:_AgLLMFields.TOOL_OUTPUT_MAX_CHARS] + "\n[truncated]"}
+                    m = {
+                        **m,
+                        "content": content[: _AgLLMFields.TOOL_OUTPUT_MAX_CHARS] + "\n[truncated]",
+                    }
             result.append(m)
         return result
 
@@ -599,7 +739,11 @@ class agllm(_AgLLMFields):
         # see a later agconfig override. Resolve it here instead.
         if tail_turns is None:
             tail_turns = self.tail_turns
-        cl = context_limit if context_limit is not None else (self.context_limit or self.default_context_limit)
+        cl = (
+            context_limit
+            if context_limit is not None
+            else (self.context_limit or self.default_context_limit)
+        )
         if messages and messages[0]["role"] == "system":
             sys_msg: list[dict] = [messages[0]]
             conv = messages[1:]
@@ -622,7 +766,9 @@ class agllm(_AgLLMFields):
         else:
             lines.append("Conversation to summarise:")
         if task_input:
-            lines.append(f"[task input]: {(task_input[0].get('content') or '')[:self.summary_task_input_max_chars]}")
+            lines.append(
+                f"[task input]: {(task_input[0].get('content') or '')[: self.summary_task_input_max_chars]}"
+            )
         for m in head:
             role = m.get("role", "?")
             content = (m.get("content") or "").strip()
@@ -631,17 +777,17 @@ class agllm(_AgLLMFields):
                 names = ", ".join(tc["function"]["name"] for tc in tool_calls)
                 lines.append(f"[assistant → tools: {names}]")
                 if content:
-                    lines.append(f"  {content[:self.summary_assistant_content_max_chars]}")
+                    lines.append(f"  {content[: self.summary_assistant_content_max_chars]}")
             elif role == "tool":
-                lines.append(f"[tool result]: {content[:_AgLLMFields.TOOL_OUTPUT_MAX_CHARS]}")
+                lines.append(f"[tool result]: {content[: _AgLLMFields.TOOL_OUTPUT_MAX_CHARS]}")
             elif content:
-                lines.append(f"[{role}]: {content[:self.summary_role_content_max_chars]}")
+                lines.append(f"[{role}]: {content[: self.summary_role_content_max_chars]}")
         client = self.backend.make_client(httpx.Timeout(120.0))
         compact_kwargs: dict = dict(
             model=self.backend.model or "",
             messages=[
                 {"role": "system", "content": _SUMMARY_SYSTEM},
-                {"role": "user",   "content": "\n".join(lines)},
+                {"role": "user", "content": "\n".join(lines)},
             ],
         )
         compact_kwargs["max_completion_tokens"] = self.summary_max_tokens

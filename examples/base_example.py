@@ -16,6 +16,7 @@ OpenAI-compatible API example::
         uv run python example.py
         LLM_BASE_URL="http://localhost:8000/v1" uv run python example.py
 """
+
 import os
 from pathlib import Path
 from agency import agent, agskill, agdata
@@ -35,16 +36,19 @@ cfg = agConfig(
     )
 )
 
+
 def _make_run_dir(name: str):
     from datetime import datetime
+
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
+
 def main():
     run_dir = _make_run_dir("base_example")
-    agent.log_dir    = run_dir / "logs"
+    agent.log_dir = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
     print(f"Run dir  : {run_dir}\n")
 
@@ -58,11 +62,11 @@ def main():
         ),
         input_schema=agdata(
             task=str,
-            file_path=agpath, # datatype for passing path in the sandbox
+            file_path=agpath,  # datatype for passing path in the sandbox
         ),
         output_schema=agdata(
             status=str,
-            path=agpath, # datatype for passing path in the sandbox
+            path=agpath,  # datatype for passing path in the sandbox
             content=str,
         ),
     )
@@ -104,6 +108,8 @@ def main():
 
     print(f"Shared history : {len(ag.history.messages)} messages total")
 
+
 if __name__ == "__main__":
     from agency.agwebui import agwebui
+
     agwebui.run(main, port=8001)

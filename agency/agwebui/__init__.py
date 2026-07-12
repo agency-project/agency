@@ -14,6 +14,7 @@ Usage::
     agwebui.run(main_fn, port=8080)
     agwebui.run(main_fn, linger=False)  # exit immediately when done
 """
+
 from __future__ import annotations
 
 import atexit
@@ -68,7 +69,7 @@ def _dispatch_command(cmd: dict) -> None:
     from ..agent import agent as _agent_cls
     from ..agconfig import agConfig as _agConfig_cls
 
-    ctype  = cmd.get("type")
+    ctype = cmd.get("type")
     agname = cmd.get("agname")
     if ctype in ("pause", "resume"):
         for a in _agent_cls.all():
@@ -86,7 +87,8 @@ def _dispatch_command(cmd: dict) -> None:
                 break
     elif ctype == "update_config_all":
         from ..agteam import agteam as _agteam_cls
-        config  = cmd.get("config") or {}
+
+        config = cmd.get("config") or {}
         new_cfg = _agConfig_cls(config)
 
         # 1. Agents that already exist -- each already cloned its own
@@ -147,7 +149,7 @@ class agwebui:
     def __init__(self, run_dir: Path, port: int) -> None:
         self.emitter = agwebui_emitter(run_dir)
         self._run_dir = run_dir
-        self._port    = port
+        self._port = port
         self._server_proc: subprocess.Popen | None = None
         self._server_log = None
 
@@ -171,6 +173,7 @@ class agwebui:
 
         # Fail fast if the port is already occupied (before creating any dirs).
         import socket
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
             _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if _s.connect_ex(("127.0.0.1", port)) == 0:
@@ -180,7 +183,7 @@ class agwebui:
                 )
 
         if run_dir is None:
-            ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_dir = Path("runs") / f"webui_{ts}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -190,9 +193,13 @@ class agwebui:
         ui._server_log = server_log
         ui._server_proc = subprocess.Popen(
             [
-                sys.executable, "-m", "agency.agwebui.server",
-                "--run-dir", str(run_dir),
-                "--port",    str(port),
+                sys.executable,
+                "-m",
+                "agency.agwebui.server",
+                "--run-dir",
+                str(run_dir),
+                "--port",
+                str(port),
             ],
             stdout=server_log,
             stderr=server_log,
@@ -207,7 +214,9 @@ class agwebui:
             except Exception:
                 time.sleep(0.2)
         else:
-            print(f"[agwebui] Warning: server may not be ready at http://localhost:{port}", flush=True)
+            print(
+                f"[agwebui] Warning: server may not be ready at http://localhost:{port}", flush=True
+            )
 
         _active = ui
         print(f"[agwebui] Web UI: http://localhost:{port}", flush=True)
@@ -216,6 +225,7 @@ class agwebui:
         # capacity immediately without waiting for the first acquire/release.
         try:
             from ..agent import agent as _agent_cls
+
             _pool = _agent_cls.agresource_pool
             if _pool is not None:
                 _pool._emit_resource()
@@ -239,14 +249,17 @@ class agwebui:
         # directly, so this is the execution-process side of that relay.
         command_stop = threading.Event()
         threading.Thread(
-            target=_poll_commands, args=(run_dir / "ui_commands", command_stop),
-            daemon=True, name="agwebui-commands",
+            target=_poll_commands,
+            args=(run_dir / "ui_commands", command_stop),
+            daemon=True,
+            name="agwebui-commands",
         ).start()
 
         try:
             fn(*args, **kwargs)
         except Exception:
             import traceback
+
             traceback.print_exc()
         finally:
             command_stop.set()

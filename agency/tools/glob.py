@@ -22,6 +22,7 @@ _GLOB_PARAMS = {
 
 def make_glob(sandbox: "agSandbox") -> agtool:
     """Return a glob tool that searches for files inside *sandbox*'s container."""
+
     def _run_sandboxed(arg: agdata) -> agdata:
         pattern: str = str(arg.pattern)  # type: ignore[arg-type]
         path: str = str(getattr(arg, "path", "/workspace") or "/workspace")
@@ -40,9 +41,9 @@ def make_glob(sandbox: "agSandbox") -> agtool:
         if tool._term is None:
             return
         pattern = str(arg._data.get("pattern", "?"))
-        rdata   = result._data
-        count   = rdata.get("count", "?")
-        trunc   = " [truncated]" if rdata.get("truncated", False) else ""
+        rdata = result._data
+        count = rdata.get("count", "?")
+        trunc = " [truncated]" if rdata.get("truncated", False) else ""
         tool._term.log("TOOL ✓   ", f"glob  {pattern!r}  → {count} files{trunc}  ({elapsed_ms}ms)")
         if tool._aglog is not None:
             tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)

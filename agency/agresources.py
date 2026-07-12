@@ -8,6 +8,7 @@ import time
 
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
+
 # Exists to register agResourcePool's config fields (via __set_name__ at
 # import time). The detection/gating tunables are tier 1 (global): read once
 # at process-wide resource-detection time, shared regardless of which
@@ -18,11 +19,21 @@ from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfig
 # agconfig -- see agsandbox.py's _ensure_started(), which also applies these
 # as the container's starting limits, not just its idle-reset limits).
 class _AgResourcePoolFields:
-    gpu_detect_timeout_s = GlobalConfigParam("agResourcePool", default=10)          # Seconds to wait for nvidia-smi/rocm-smi before giving up
-    sysctl_detect_timeout_s = GlobalConfigParam("agResourcePool", default=5)        # Seconds to wait for sysctl hw.memsize on macOS
-    memory_detect_fallback_mb = GlobalConfigParam("agResourcePool", default=4096)   # Safe fallback total RAM in MB when detection fails on both Linux and macOS
-    gpu_acquire_poll_interval_s = GlobalConfigParam("agResourcePool", default=0.25)  # Seconds between polls waiting for a free GPU semaphore
-    marker_mb = GlobalConfigParam("agResourcePool", default=128)  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
+    gpu_detect_timeout_s = GlobalConfigParam(
+        "agResourcePool", default=10
+    )  # Seconds to wait for nvidia-smi/rocm-smi before giving up
+    sysctl_detect_timeout_s = GlobalConfigParam(
+        "agResourcePool", default=5
+    )  # Seconds to wait for sysctl hw.memsize on macOS
+    memory_detect_fallback_mb = GlobalConfigParam(
+        "agResourcePool", default=4096
+    )  # Safe fallback total RAM in MB when detection fails on both Linux and macOS
+    gpu_acquire_poll_interval_s = GlobalConfigParam(
+        "agResourcePool", default=0.25
+    )  # Seconds between polls waiting for a free GPU semaphore
+    marker_mb = GlobalConfigParam(
+        "agResourcePool", default=128
+    )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
 
     # CPU/memory limit applied both when a sandbox container is first created
     # (docker run) and whenever it's reset to idle (docker update, via
@@ -106,7 +117,9 @@ def detect_gpus() -> list[int]:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=_timeout,
+            capture_output=True,
+            text=True,
+            timeout=_timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             ids = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
@@ -116,7 +129,9 @@ def detect_gpus() -> list[int]:
     try:
         result = subprocess.run(
             ["rocm-smi", "--showid", "--csv"],
-            capture_output=True, text=True, timeout=_timeout,
+            capture_output=True,
+            text=True,
+            timeout=_timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             ids = []
@@ -154,13 +169,14 @@ def detect_memory_mb() -> int:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) // 1024   # kB → MB
+                    return int(line.split()[1]) // 1024  # kB → MB
     except Exception:
         pass
     try:
         result = subprocess.run(
             ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
             timeout=_AgResourcePoolFields().sysctl_detect_timeout_s,
         )
         if result.returncode == 0:
@@ -210,13 +226,16 @@ class agResourcePool(_AgResourcePoolFields):
     ) -> None:
         self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
         for _name, _value in (
-            ("idle_cpus", idle_cpus), ("idle_memory", idle_memory),
+            ("idle_cpus", idle_cpus),
+            ("idle_memory", idle_memory),
         ):
             if _value is not None:
                 self._agconfig.set("agResourcePool", _name, _value)
         self.gpus = list(gpus) if gpus is not None else detect_gpus()
         self.total_cpus = total_cpus if total_cpus is not None else detect_cpus()
-        self.total_memory_mb = total_memory_mb if total_memory_mb is not None else detect_memory_mb()
+        self.total_memory_mb = (
+            total_memory_mb if total_memory_mb is not None else detect_memory_mb()
+        )
         self._gpu_locks: dict[int, threading.Semaphore] = {
             gpu_id: threading.Semaphore(1) for gpu_id in self.gpus
         }
@@ -226,6 +245,7 @@ class agResourcePool(_AgResourcePoolFields):
         self.memory_acquired_mb: int = 0
         if mark_gpus and self.gpus:
             import multiprocessing
+
             if multiprocessing.current_process().name == "MainProcess":
                 _allocate_gpu_markers(self.gpus)
 
@@ -250,10 +270,7 @@ class agResourcePool(_AgResourcePoolFields):
                     self._emit_resource()
                     return gpu_id
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"No GPU available within {timeout}s "
-                    f"(pool: {self.gpus})"
-                )
+                raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
             time.sleep(poll)
 
     def release_gpu(self, gpu_id: int) -> None:
@@ -262,7 +279,9 @@ class agResourcePool(_AgResourcePoolFields):
             try:
                 sem.release()
             except ValueError as _e:
-                print(f"[agresources] WARNING: GPU semaphore double-release for gpu_id={gpu_id}: {_e}")
+                print(
+                    f"[agresources] WARNING: GPU semaphore double-release for gpu_id={gpu_id}: {_e}"
+                )
             with self._res_lock:
                 self._gpus_acquired = max(0, self._gpus_acquired - 1)
             self._emit_resource()
@@ -284,6 +303,7 @@ class agResourcePool(_AgResourcePoolFields):
     def _emit_resource(self) -> None:
         try:
             from . import agwebui as _agwebui
+
             if _agwebui._active is not None:
                 _agwebui._active.emitter.resource_update(
                     gpus_acquired=self._gpus_acquired,

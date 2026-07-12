@@ -1,9 +1,11 @@
 """Tests for agwebui_emitter — the execution-side event writer."""
+
 import json
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from agency.agwebui.emitter import agwebui_emitter, ansi_to_hex, _xterm256_hex
 
@@ -11,6 +13,7 @@ from agency.agwebui.emitter import agwebui_emitter, ansi_to_hex, _xterm256_hex
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def read_events(run_dir: Path) -> list[dict]:
     db = run_dir / "ui_events.db"
@@ -33,7 +36,7 @@ def read_agent_state(run_dir: Path) -> dict:
     result = {}
     for agname, tokens, messages in rows:
         result[agname] = {
-            "tokens":   json.loads(tokens)   if tokens   else None,
+            "tokens": json.loads(tokens) if tokens else None,
             "messages": json.loads(messages) if messages else None,
         }
     return result
@@ -53,9 +56,11 @@ def read_resource_state(run_dir: Path) -> dict | None:
 # ansi_to_hex / _xterm256_hex
 # ---------------------------------------------------------------------------
 
+
 def test_xterm256_system_colors():
-    assert _xterm256_hex(0)  == "#000000"
+    assert _xterm256_hex(0) == "#000000"
     assert _xterm256_hex(15) == "#ffffff"
+
 
 def test_xterm256_cube():
     # index 16 = black cube corner
@@ -63,15 +68,18 @@ def test_xterm256_cube():
     # index 231 = white cube corner
     assert _xterm256_hex(231) == "#ffffff"
 
+
 def test_xterm256_greyscale():
     grey = _xterm256_hex(232)
     assert grey == "#080808"
     assert _xterm256_hex(255) == "#eeeeee"
 
+
 def test_ansi_to_hex_38_5():
     # \033[38;5;214m → xterm-256 index 214
     result = ansi_to_hex("\033[38;5;214m")
     assert result == _xterm256_hex(214)
+
 
 def test_ansi_to_hex_fallback():
     assert ansi_to_hex("") == "#d4d4d4"
@@ -82,12 +90,14 @@ def test_ansi_to_hex_fallback():
 # emit — core writer
 # ---------------------------------------------------------------------------
 
+
 def test_emit_creates_file(tmp_path):
     em = agwebui_emitter(tmp_path)
     em.emit({"type": "test", "val": 42})
     events = read_events(tmp_path)
     assert len(events) == 1
     assert events[0] == {"type": "test", "val": 42}
+
 
 def test_emit_appends_lines(tmp_path):
     em = agwebui_emitter(tmp_path)
@@ -96,6 +106,7 @@ def test_emit_appends_lines(tmp_path):
     em.emit({"type": "c"})
     events = read_events(tmp_path)
     assert [e["type"] for e in events] == ["a", "b", "c"]
+
 
 def test_emit_thread_safe(tmp_path):
     em = agwebui_emitter(tmp_path)
@@ -114,9 +125,10 @@ def test_emit_thread_safe(tmp_path):
     assert len(events) == N
     assert {e["i"] for e in events} == set(range(N))
 
+
 def test_emit_non_serialisable_uses_str(tmp_path):
     em = agwebui_emitter(tmp_path)
-    em.emit({"type": "x", "val": object()})   # default=str handles it
+    em.emit({"type": "x", "val": object()})  # default=str handles it
     events = read_events(tmp_path)
     assert events[0]["type"] == "x"
 
@@ -124,6 +136,7 @@ def test_emit_non_serialisable_uses_str(tmp_path):
 # ---------------------------------------------------------------------------
 # Typed emitters
 # ---------------------------------------------------------------------------
+
 
 def test_log(tmp_path):
     em = agwebui_emitter(tmp_path)
@@ -133,45 +146,51 @@ def test_log(tmp_path):
     assert ev["line"] == "hello world"
     assert "ts" in ev
 
+
 def test_agent_registered(tmp_path):
     em = agwebui_emitter(tmp_path)
     em.agent_registered("MyAgent", "#ff8800")
     ev = read_events(tmp_path)[0]
-    assert ev["type"]   == "agent_registered"
+    assert ev["type"] == "agent_registered"
     assert ev["agname"] == "MyAgent"
-    assert ev["color"]  == "#ff8800"
+    assert ev["color"] == "#ff8800"
+
 
 def test_agent_state(tmp_path):
     em = agwebui_emitter(tmp_path)
     em.agent_state("A", "llm", "design", None)
     ev = read_events(tmp_path)[0]
-    assert ev["type"]  == "agent_state"
+    assert ev["type"] == "agent_state"
     assert ev["state"] == "llm"
     assert ev["skill"] == "design"
-    assert ev["tool"]  is None
+    assert ev["tool"] is None
+
 
 def test_team_registered(tmp_path):
     em = agwebui_emitter(tmp_path)
     em.team_registered("MyTeam", ["AgA", "AgB"])
     ev = read_events(tmp_path)[0]
-    assert ev["type"]      == "team_registered"
+    assert ev["type"] == "team_registered"
     assert ev["team_name"] == "MyTeam"
-    assert ev["agents"]    == ["AgA", "AgB"]
+    assert ev["agents"] == ["AgA", "AgB"]
+
 
 def test_push_messages(tmp_path):
     em = agwebui_emitter(tmp_path)
     msgs = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
     em.push_messages("AgX", msgs)
     ev = read_events(tmp_path)[0]
-    assert ev["type"]     == "messages_snapshot"
-    assert ev["agname"]   == "AgX"
+    assert ev["type"] == "messages_snapshot"
+    assert ev["agname"] == "AgX"
     assert ev["messages"] == msgs
+
 
 def test_push_messages_skips_non_serialisable(tmp_path):
     em = agwebui_emitter(tmp_path)
     em.push_messages("AgX", [{"role": "user", "content": object()}])
     # Should write nothing (silently skipped)
     assert read_events(tmp_path) == []
+
 
 def test_done(tmp_path):
     em = agwebui_emitter(tmp_path)
@@ -183,6 +202,7 @@ def test_done(tmp_path):
 # ---------------------------------------------------------------------------
 # ask_human — file-based request/reply
 # ---------------------------------------------------------------------------
+
 
 def test_ask_human_returns_reply(tmp_path):
     em = agwebui_emitter(tmp_path)
@@ -196,6 +216,7 @@ def test_ask_human_returns_reply(tmp_path):
     result = em.ask_human("Bot", "abc123", "Which option?")
     assert result == reply_text
 
+
 def test_ask_human_emits_event(tmp_path):
     em = agwebui_emitter(tmp_path)
 
@@ -207,10 +228,11 @@ def test_ask_human_emits_event(tmp_path):
     em.ask_human("Bot", "id99", "Continue?")
 
     ev = read_events(tmp_path)[0]
-    assert ev["type"]     == "ask_human"
-    assert ev["agname"]   == "Bot"
-    assert ev["ask_id"]   == "id99"
+    assert ev["type"] == "ask_human"
+    assert ev["agname"] == "Bot"
+    assert ev["ask_id"] == "id99"
     assert ev["question"] == "Continue?"
+
 
 def test_ask_human_removes_reply_file(tmp_path):
     em = agwebui_emitter(tmp_path)
@@ -228,6 +250,7 @@ def test_ask_human_removes_reply_file(tmp_path):
 # ---------------------------------------------------------------------------
 # State tables — upsert and pruning
 # ---------------------------------------------------------------------------
+
 
 def test_token_update_upserts_agent_state(tmp_path):
     em = agwebui_emitter(tmp_path)
@@ -256,6 +279,7 @@ def test_resource_update_upserts_resource_state(tmp_path):
     # Only one row in resource_state
     db = tmp_path / "ui_events.db"
     import sqlite3 as _sq
+
     con = _sq.connect(str(db))
     count = con.execute("SELECT COUNT(*) FROM resource_state").fetchone()[0]
     con.close()
@@ -264,10 +288,10 @@ def test_resource_update_upserts_resource_state(tmp_path):
 
 def test_pruning_removes_old_high_freq_events(tmp_path):
     em = agwebui_emitter(tmp_path)
-    orig_every  = agwebui_emitter._PRUNE_EVERY
+    orig_every = agwebui_emitter._PRUNE_EVERY
     orig_bucket = agwebui_emitter._PRUNE_BUCKET_S
-    agwebui_emitter._PRUNE_EVERY    = 10
-    agwebui_emitter._PRUNE_BUCKET_S = 1.0   # 1-second buckets
+    agwebui_emitter._PRUNE_EVERY = 10
+    agwebui_emitter._PRUNE_BUCKET_S = 1.0  # 1-second buckets
     try:
         # All 10 token_updates have the same ts (within the same second bucket)
         # → prune collapses them to 1 row (the last one).
@@ -277,18 +301,19 @@ def test_pruning_removes_old_high_freq_events(tmp_path):
         events = read_events(tmp_path)
         token_rows = [e for e in events if e["type"] == "token_update"]
         assert len(token_rows) == 1, f"expected 1 after prune, got {len(token_rows)}"
-        assert token_rows[0]["agent_input"] == 9   # last value kept
+        assert token_rows[0]["agent_input"] == 9  # last value kept
     finally:
-        agwebui_emitter._PRUNE_EVERY    = orig_every
+        agwebui_emitter._PRUNE_EVERY = orig_every
         agwebui_emitter._PRUNE_BUCKET_S = orig_bucket
 
 
 def test_pruning_preserves_separate_time_buckets(tmp_path):
     import sqlite3 as _sq
+
     em = agwebui_emitter(tmp_path)
-    orig_every  = agwebui_emitter._PRUNE_EVERY
+    orig_every = agwebui_emitter._PRUNE_EVERY
     orig_bucket = agwebui_emitter._PRUNE_BUCKET_S
-    agwebui_emitter._PRUNE_EVERY    = 10
+    agwebui_emitter._PRUNE_EVERY = 10
     agwebui_emitter._PRUNE_BUCKET_S = 60.0
     try:
         # Insert 5 events in bucket 0 (ts 0-59) and 5 in bucket 1 (ts 60-119).
@@ -296,19 +321,33 @@ def test_pruning_preserves_separate_time_buckets(tmp_path):
         db = tmp_path / "ui_events.db"
         for i in range(5):
             con = _sq.connect(str(db))
-            con.execute("INSERT INTO events(type,agname,ts,data) VALUES(?,?,?,?)",
-                        ("token_update","AgZ", float(i),
-                         f'{{"type":"token_update","agname":"AgZ","agent_input":{i}}}'))
-            con.commit(); con.close()
+            con.execute(
+                "INSERT INTO events(type,agname,ts,data) VALUES(?,?,?,?)",
+                (
+                    "token_update",
+                    "AgZ",
+                    float(i),
+                    f'{{"type":"token_update","agname":"AgZ","agent_input":{i}}}',
+                ),
+            )
+            con.commit()
+            con.close()
         for i in range(5):
             con = _sq.connect(str(db))
-            con.execute("INSERT INTO events(type,agname,ts,data) VALUES(?,?,?,?)",
-                        ("token_update","AgZ", float(60 + i),
-                         f'{{"type":"token_update","agname":"AgZ","agent_input":{10+i}}}'))
-            con.commit(); con.close()
+            con.execute(
+                "INSERT INTO events(type,agname,ts,data) VALUES(?,?,?,?)",
+                (
+                    "token_update",
+                    "AgZ",
+                    float(60 + i),
+                    f'{{"type":"token_update","agname":"AgZ","agent_input":{10 + i}}}',
+                ),
+            )
+            con.commit()
+            con.close()
         # Trigger prune by emitting via emitter (its insert_count wraps at _PRUNE_EVERY)
         em._insert_count = em._PRUNE_EVERY - 1
-        em.log("trigger")   # this is the Nth insert → prune fires
+        em.log("trigger")  # this is the Nth insert → prune fires
         em._flush_prune()
         events = read_events(tmp_path)
         token_rows = [e for e in events if e["type"] == "token_update"]
@@ -317,28 +356,33 @@ def test_pruning_preserves_separate_time_buckets(tmp_path):
         inputs = sorted(e["agent_input"] for e in token_rows)
         assert inputs == [4, 14]
     finally:
-        agwebui_emitter._PRUNE_EVERY    = orig_every
+        agwebui_emitter._PRUNE_EVERY = orig_every
         agwebui_emitter._PRUNE_BUCKET_S = orig_bucket
 
 
 def test_pruning_preserves_log_events(tmp_path):
     em = agwebui_emitter(tmp_path)
-    orig_every  = agwebui_emitter._PRUNE_EVERY
+    orig_every = agwebui_emitter._PRUNE_EVERY
     orig_bucket = agwebui_emitter._PRUNE_BUCKET_S
-    agwebui_emitter._PRUNE_EVERY    = 10
+    agwebui_emitter._PRUNE_EVERY = 10
     agwebui_emitter._PRUNE_BUCKET_S = 1.0
     try:
-        # 5 logs + 5 token_updates = 10 inserts → prune fires; logs must survive
-        for i in range(5):
-            em.log(f"line{i}")
-        for i in range(5):
-            em.token_update("AgZ", i, 0, i, 0)
+        # 5 logs + 5 token_updates = 10 inserts → prune fires; logs must survive.
+        # Freeze time.time() so all 5 token_updates land in the same 1-second
+        # bucket deterministically -- without this, real wall-clock emission
+        # (5 SQLite inserts under _lock) can cross the bucket boundary under
+        # load, letting more than one row survive and making this test flaky.
+        with patch("time.time", return_value=1_000_000.0):
+            for i in range(5):
+                em.log(f"line{i}")
+            for i in range(5):
+                em.token_update("AgZ", i, 0, i, 0)
         em._flush_prune()
         events = read_events(tmp_path)
-        log_rows   = [e for e in events if e["type"] == "log"]
+        log_rows = [e for e in events if e["type"] == "log"]
         token_rows = [e for e in events if e["type"] == "token_update"]
         assert len(log_rows) == 5
         assert len(token_rows) == 1
     finally:
-        agwebui_emitter._PRUNE_EVERY    = orig_every
+        agwebui_emitter._PRUNE_EVERY = orig_every
         agwebui_emitter._PRUNE_BUCKET_S = orig_bucket

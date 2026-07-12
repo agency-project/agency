@@ -121,6 +121,7 @@ def _block_anchor(content: str, find: str) -> Generator[str, None, None]:
 
 def _whitespace_normalized(content: str, find: str) -> Generator[str, None, None]:
     import re
+
     norm = lambda t: re.sub(r"\s+", " ", t).strip()
     nf = norm(find)
     lines = content.split("\n")
@@ -159,10 +160,21 @@ def _indentation_flexible(content: str, find: str) -> Generator[str, None, None]
 
 
 def _escape_normalized(content: str, find: str) -> Generator[str, None, None]:
-    _esc = {"n": "\n", "t": "\t", "r": "\r", "'": "'", '"': '"', "`": "`", "\\": "\\", "\n": "\n", "$": "$"}
+    _esc = {
+        "n": "\n",
+        "t": "\t",
+        "r": "\r",
+        "'": "'",
+        '"': '"',
+        "`": "`",
+        "\\": "\\",
+        "\n": "\n",
+        "$": "$",
+    }
 
     def unescape(s: str) -> str:
         import re
+
         return re.sub(r"\\(.)", lambda m: _esc.get(m.group(1), m.group(0)), s)
 
     uf = unescape(find)
@@ -205,9 +217,16 @@ def _context_aware(content: str, find: str) -> Generator[str, None, None]:
             if orig[j].strip() == last:
                 block = orig[i : j + 1]
                 if len(block) == len(find_lines):
-                    mid_non_empty = [(block[k].strip(), find_lines[k].strip()) for k in range(1, len(block) - 1)
-                                     if block[k].strip() or find_lines[k].strip()]
-                    if not mid_non_empty or sum(a == b for a, b in mid_non_empty) / len(mid_non_empty) >= CONTEXT_AWARE_MATCH_RATIO:
+                    mid_non_empty = [
+                        (block[k].strip(), find_lines[k].strip())
+                        for k in range(1, len(block) - 1)
+                        if block[k].strip() or find_lines[k].strip()
+                    ]
+                    if (
+                        not mid_non_empty
+                        or sum(a == b for a, b in mid_non_empty) / len(mid_non_empty)
+                        >= CONTEXT_AWARE_MATCH_RATIO
+                    ):
                         yield "\n".join(block)
                 break
 
@@ -251,7 +270,7 @@ def _replace(content: str, old: str, new: str, replace_all: bool = False) -> str
             last_idx = content.rfind(candidate)
             if idx != last_idx:
                 continue
-            return content[:idx] + new + content[idx + len(candidate):]
+            return content[:idx] + new + content[idx + len(candidate) :]
 
     if not_found:
         raise ValueError(
@@ -270,10 +289,14 @@ _EDIT_PARAMS = {
         "file_path": {"type": "string", "description": "Absolute path to the file to edit"},
         "old_string": {"type": "string", "description": "The text to replace"},
         "new_string": {"type": "string", "description": "The replacement text"},
-        "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)"},
+        "replace_all": {
+            "type": "boolean",
+            "description": "Replace all occurrences (default false)",
+        },
     },
     "required": ["file_path", "old_string", "new_string"],
 }
+
 
 def make_edit(sandbox: "agSandbox") -> agtool:
     """Return an edit tool that edits files inside *sandbox*'s container.
@@ -281,6 +304,7 @@ def make_edit(sandbox: "agSandbox") -> agtool:
     Reads the file via ``sandbox.read_file``, applies the existing ``_replace``
     fuzzy-match pipeline in Python, then writes back via ``sandbox.write_file``.
     """
+
     def _run_sandboxed(arg: agdata) -> agdata:
         file_path = str(arg.file_path)  # type: ignore[arg-type]
         old_string: str = str(arg.old_string)  # type: ignore[arg-type]
@@ -305,7 +329,7 @@ def make_edit(sandbox: "agSandbox") -> agtool:
         if tool._term is None:
             return
         path = str(getattr(arg, "file_path", "?"))
-        ok   = not isinstance(result, agerror)
+        ok = not isinstance(result, agerror)
         status = "✓" if ok else f"✗ {result.error}"
         tool._term.log("TOOL ✓   ", f"edit  {path}  {status}  ({elapsed_ms}ms)")
         if tool._aglog is not None:

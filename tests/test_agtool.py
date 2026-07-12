@@ -1,4 +1,5 @@
 """Tests for the agtool class."""
+
 import importlib
 import os
 from unittest.mock import MagicMock, patch
@@ -76,14 +77,15 @@ def test_default_params():
 # Pickle / serialisation — loggers must be excluded
 # ---------------------------------------------------------------------------
 
+
 def test_getstate_excludes_loggers():
     t = make_tool()
     mock_term = MagicMock()
-    mock_log  = MagicMock()
+    mock_log = MagicMock()
     t.attach_logger(mock_term, mock_log)
 
     state = t.__getstate__()
-    assert "_term"  not in state
+    assert "_term" not in state
     assert "_aglog" not in state
     assert state["name"] == "echo"
     assert state["fn"] is _echo
@@ -93,14 +95,15 @@ def test_setstate_restores_none_loggers():
     t = make_tool()
     t2 = agtool.__new__(agtool)
     t2.__setstate__(t.__getstate__())
-    assert t2._term  is None
+    assert t2._term is None
     assert t2._aglog is None
-    assert t2.name   == "echo"
+    assert t2.name == "echo"
 
 
 def test_pickle_round_trip():
     """Tool and its fn survive a pickle serialisation cycle."""
     import pickle
+
     t = make_tool()
     restored = pickle.loads(pickle.dumps(t))
     result = restored.fn(agdata(message="ping"))
@@ -110,6 +113,7 @@ def test_pickle_round_trip():
 # ---------------------------------------------------------------------------
 # Process pool — run_in_subprocess=True runs in a separate worker process
 # ---------------------------------------------------------------------------
+
 
 def test_process_pool_runs_in_different_pid():
     """run_in_subprocess=True (default) offloads fn to a worker process (different PID)."""
@@ -121,6 +125,7 @@ def test_process_pool_runs_in_different_pid():
 # ---------------------------------------------------------------------------
 # run_in_subprocess=False — runs in-process, in the calling thread
 # ---------------------------------------------------------------------------
+
 
 def test_no_sandbox_runs_in_same_pid():
     """run_in_subprocess=False runs fn directly in the calling thread (same PID)."""
@@ -142,6 +147,7 @@ def test_no_sandbox_sees_host_state():
 
     def _read_sentinel(arg: agdata) -> agdata:
         import agency.agtool as _m
+
         return agdata(value=getattr(_m, "_TEST_SENTINEL", None))
 
     try:
@@ -154,6 +160,7 @@ def test_no_sandbox_sees_host_state():
 
 def test_no_sandbox_exception_returns_error_agdata():
     """run_in_subprocess=False catches exceptions and returns agdata(error=...) like sandboxed tools."""
+
     def _boom(arg: agdata) -> agdata:
         raise ValueError("intentional failure")
 
@@ -182,11 +189,13 @@ def test_no_sandbox_timeout_not_enforced():
 # Process pool lifecycle — SIGINT-ignoring workers, explicit shutdown
 # ---------------------------------------------------------------------------
 
+
 def test_ignore_sigint_in_worker_sets_sig_ign():
     """The pool initializer makes workers ignore SIGINT so Ctrl+C doesn't kill
     a tool call mid-flight; call it directly rather than actually changing
     this process's signal disposition."""
     import signal
+
     with patch("signal.signal") as mock_signal:
         _agtool_mod._ignore_sigint_in_worker()
     mock_signal.assert_called_once_with(signal.SIGINT, signal.SIG_IGN)

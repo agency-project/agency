@@ -91,6 +91,7 @@ class agdata:
             return obj.__name__
         # Handle generic aliases like list[agimage] → "list[image]"
         import typing
+
         origin = typing.get_origin(obj)
         if origin is list:
             args = typing.get_args(obj)
@@ -135,9 +136,7 @@ class agdata:
         if name in data:
             return data[name]
         available = list(data.keys())
-        raise AttributeError(
-            f"agdata has no field {name!r}. Available fields: {available}"
-        )
+        raise AttributeError(f"agdata has no field {name!r}. Available fields: {available}")
 
     def __setattr__(self, name: str, value):
         object.__getattribute__(self, "_data")[name] = value
@@ -181,12 +180,11 @@ class agerror(agdata):
 
     def __init__(self, message: str):
         if not isinstance(message, str):
-            raise TypeError(
-                f"agerror message must be a str, got {type(message).__name__}"
-            )
+            raise TypeError(f"agerror message must be a str, got {type(message).__name__}")
         object.__setattr__(self, "_future", None)
         object.__setattr__(self, "_data", {"error": message})
         from .agterm import agterm as _agterm_cls
+
         if not hasattr(agerror, "_term"):
             agerror._term = _agterm_cls("agerror")
         agerror._term.log("ERROR ✗  ", message, depth=2)

@@ -1,5 +1,6 @@
 """Tests for agterm — color assignment, log formatting, thread safety, and
 sandbox container naming / run isolation."""
+
 from __future__ import annotations
 
 import re
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock
 def _worker_get_run_id():
     """Top-level so ProcessPoolExecutor can pickle it."""
     from agency.agsandbox import _RUN_ID
+
     return _RUN_ID
 
 
@@ -20,9 +22,11 @@ def _worker_get_run_id():
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _fresh_agterm(agname: str | None = None):
     """Return an agterm instance with a guaranteed-unique agname."""
     from agency.agterm import agterm
+
     return agterm(agname or f"test-{uuid.uuid4().hex[:8]}")
 
 
@@ -30,33 +34,39 @@ def _fresh_agterm(agname: str | None = None):
 # Color palette
 # ---------------------------------------------------------------------------
 
+
 class TestColorPalette:
     def test_palette_has_at_least_54_colors(self):
         from agency.agterm import _AGENT_COLORS
+
         assert len(_AGENT_COLORS) >= 54
 
     def test_palette_entries_are_ansi_escape_sequences(self):
         from agency.agterm import _AGENT_COLORS
+
         for color in _AGENT_COLORS:
             assert color.startswith("\033["), f"not an ANSI escape: {color!r}"
 
     def test_palette_entries_are_unique(self):
         from agency.agterm import _AGENT_COLORS
+
         assert len(set(_AGENT_COLORS)) == len(_AGENT_COLORS)
 
     def test_make_color_palette_excludes_greys(self):
         from agency.agterm import _make_color_palette
+
         palette = _make_color_palette()
         # xterm-256 grey diagonal: index = 16 + 36r + 6r + r = 16 + 43r
         grey_indices = {16 + 43 * r for r in range(6)}
-        codes = {int(re.search(r'\d+', c).group()) for c in palette}
+        codes = {int(re.search(r"\d+", c).group()) for c in palette}
         assert not codes & grey_indices
 
     def test_make_color_palette_excludes_near_black(self):
         from agency.agterm import _make_color_palette
+
         palette = _make_color_palette()
         for color in palette:
-            idx = int(re.search(r'\d+', color).group())
+            idx = int(re.search(r"\d+", color).group())
             r = (idx - 16) // 36
             g = ((idx - 16) % 36) // 6
             b = (idx - 16) % 6
@@ -67,6 +77,7 @@ class TestColorPalette:
 # Color assignment
 # ---------------------------------------------------------------------------
 
+
 class TestColorAssignment:
     def test_each_agent_gets_a_color(self):
         term = _fresh_agterm()
@@ -75,12 +86,14 @@ class TestColorAssignment:
 
     def test_agname_registered_in_class_dict(self):
         from agency.agterm import agterm
+
         name = f"reg-{uuid.uuid4().hex[:8]}"
         _fresh_agterm(name)
         assert name in agterm._agname_colors
 
     def test_color_counter_increments(self):
         from agency.agterm import agterm
+
         before = agterm._color_counter
         _fresh_agterm()
         assert agterm._color_counter == before + 1
@@ -98,9 +111,11 @@ class TestColorAssignment:
 # _colorize_agnames
 # ---------------------------------------------------------------------------
 
+
 class TestColorizeAgnames:
     def test_registered_agname_in_message_is_wrapped(self):
         from agency.agterm import agterm
+
         name = f"colorize-{uuid.uuid4().hex[:8]}"
         _fresh_agterm(name)
         result = agterm._colorize_agnames(f"agent {name} finished")
@@ -109,12 +124,14 @@ class TestColorizeAgnames:
 
     def test_unknown_agname_not_modified(self):
         from agency.agterm import agterm
+
         msg = "no-agent-here-xyz"
         assert agterm._colorize_agnames(msg) == msg
 
     def test_colorize_does_not_mutate_during_concurrent_registration(self):
         """Snapshot via list() prevents RuntimeError on dict resize."""
         from agency.agterm import agterm
+
         errors: list[Exception] = []
 
         def _register():
@@ -130,8 +147,10 @@ class TestColorizeAgnames:
 
         t1 = threading.Thread(target=_register)
         t2 = threading.Thread(target=_colorize)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
         assert not errors, f"RuntimeError during concurrent iteration: {errors[0]}"
 
@@ -140,9 +159,11 @@ class TestColorizeAgnames:
 # log() — output and format
 # ---------------------------------------------------------------------------
 
+
 class TestLog:
     def test_log_writes_to_stderr_when_no_webui(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
@@ -155,6 +176,7 @@ class TestLog:
 
     def test_log_contains_agname(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
@@ -168,6 +190,7 @@ class TestLog:
 
     def test_log_contains_event_tag(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
@@ -180,6 +203,7 @@ class TestLog:
 
     def test_log_contains_source_location(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
@@ -187,13 +211,14 @@ class TestLog:
             term.log("TOOL     ", "loc-check")
             captured = capsys.readouterr()
             # source location format: (filename.py:lineno)
-            assert re.search(r'\(\w+\.py:\d+\)', captured.err)
+            assert re.search(r"\(\w+\.py:\d+\)", captured.err)
         finally:
             agwebui_mod._active = old
 
     def test_log_silent_when_disabled(self, capsys):
         import agency.agwebui as agwebui_mod
         from agency.agterm import agterm
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         old_enabled = agterm.enabled
@@ -209,6 +234,7 @@ class TestLog:
 
     def test_log_token_tag_absent_when_none(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
@@ -222,6 +248,7 @@ class TestLog:
 
     def test_log_token_tag_present_when_set(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
@@ -235,13 +262,16 @@ class TestLog:
 
     def test_log_depth_affects_source_file(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
             term = _fresh_agterm()
+
             # depth=1 → this file; depth=2 → one frame up (also this file in a wrapper)
             def _wrapper():
                 term.log("TOOL     ", "depth-test", depth=2)
+
             _wrapper()
             captured = capsys.readouterr()
             assert "test_agterm.py" in captured.err
@@ -252,6 +282,7 @@ class TestLog:
 # ---------------------------------------------------------------------------
 # log() — webui active: errors to stderr, non-errors to webui only
 # ---------------------------------------------------------------------------
+
 
 class TestLogWebui:
     """When webui is active, only error events (✗) should reach stderr."""
@@ -264,6 +295,7 @@ class TestLogWebui:
 
     def test_non_error_event_goes_to_webui_only_not_stderr(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = self._make_mock_webui()
         try:
@@ -277,6 +309,7 @@ class TestLogWebui:
 
     def test_error_event_goes_to_both_webui_and_stderr(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = self._make_mock_webui()
         try:
@@ -290,6 +323,7 @@ class TestLogWebui:
 
     def test_prune_error_event_also_reaches_stderr(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = self._make_mock_webui()
         try:
@@ -302,6 +336,7 @@ class TestLogWebui:
 
     def test_non_error_events_with_webui_do_not_clutter_stderr(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = self._make_mock_webui()
         try:
@@ -318,9 +353,11 @@ class TestLogWebui:
 # Thread safety of log()
 # ---------------------------------------------------------------------------
 
+
 class TestLogThreadSafety:
     def test_concurrent_log_calls_do_not_interleave_lines(self, capsys):
         import agency.agwebui as agwebui_mod
+
         old = agwebui_mod._active
         agwebui_mod._active = None
         try:
@@ -333,8 +370,10 @@ class TestLogThreadSafety:
                     term.log("TOOL     ", f"msg-{i}")
 
             threads = [threading.Thread(target=_spam, args=(t,)) for t in terms]
-            for th in threads: th.start()
-            for th in threads: th.join()
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
 
             captured = capsys.readouterr()
             lines = [ln for ln in captured.err.splitlines() if ln.strip()]
@@ -349,31 +388,37 @@ class TestLogThreadSafety:
 # Sandbox container naming and run isolation
 # ---------------------------------------------------------------------------
 
+
 class TestSandboxNaming:
     def test_container_name_includes_run_id(self):
         from agency.agsandbox import agSandbox, _RUN_ID
+
         sb = agSandbox("myagent")
         assert _RUN_ID in sb._name
 
     def test_container_name_includes_agname(self):
         from agency.agsandbox import agSandbox
+
         sb = agSandbox("myagent")
         assert "myagent" in sb._name
 
     def test_container_name_format(self):
         from agency.agsandbox import agSandbox, _RUN_ID
+
         sb = agSandbox("myagent")
         assert sb._name == f"sandbox-{_RUN_ID}-myagent"
 
     def test_two_sandboxes_same_agname_same_run_share_name(self):
         """Within a run, agname uniquely identifies the container."""
         from agency.agsandbox import agSandbox
+
         sb1 = agSandbox("shared-agent")
         sb2 = agSandbox("shared-agent")
         assert sb1._name == sb2._name
 
     def test_two_sandboxes_different_agnames_differ(self):
         from agency.agsandbox import agSandbox
+
         sb1 = agSandbox("agent-alpha")
         sb2 = agSandbox("agent-beta")
         assert sb1._name != sb2._name
@@ -382,11 +427,13 @@ class TestSandboxNaming:
         """_RUN_ID must not be the current PID (we switched to UUID)."""
         import os
         from agency.agsandbox import _RUN_ID
+
         assert str(os.getpid()) not in _RUN_ID
 
     def test_run_id_format(self):
         """_RUN_ID must be 'r' followed by 8 hex chars."""
         from agency.agsandbox import _RUN_ID
+
         assert re.fullmatch(r"r[0-9a-f]{8}", _RUN_ID), f"unexpected _RUN_ID: {_RUN_ID!r}"
 
 
@@ -396,11 +443,13 @@ class TestRunIsolation:
         script = "from agency.agsandbox import _RUN_ID; print(_RUN_ID)"
         r1 = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         r2 = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         id1 = r1.stdout.strip()
         id2 = r2.stdout.strip()
@@ -422,8 +471,7 @@ class TestRunIsolation:
         name2 = r2.stdout.strip()
         assert name1 and name2
         assert name1 != name2, (
-            f"Same container name across two runs: {name1!r} — "
-            "cross-run isolation is broken"
+            f"Same container name across two runs: {name1!r} — cross-run isolation is broken"
         )
 
     def test_checkpoint_image_tag_differs_across_runs(self):

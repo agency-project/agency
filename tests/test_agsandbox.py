@@ -3,6 +3,7 @@
 Sandbox tests that create real containers are marked with @pytest.mark.docker
 and skipped automatically when Docker/Podman is unavailable.
 """
+
 from __future__ import annotations
 
 import os
@@ -23,6 +24,7 @@ def _worker_import_agent():
     """Top-level so ProcessPoolExecutor can pickle it."""
     from agency.agent import agent  # noqa: F401
     import multiprocessing
+
     return multiprocessing.current_process().name
 
 
@@ -30,37 +32,31 @@ def _worker_import_agent():
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _docker_available() -> bool:
     try:
-        result = subprocess.run(
-            ["docker", "info"], capture_output=True, timeout=10
-        )
+        result = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
         return result.returncode == 0
     except Exception:
         return False
 
 
-docker = pytest.mark.skipif(
-    not _docker_available(), reason="Docker daemon not reachable"
-)
+docker = pytest.mark.skipif(not _docker_available(), reason="Docker daemon not reachable")
 
 
 def _nvidia_smi_available() -> bool:
     try:
-        return subprocess.run(
-            ["nvidia-smi"], capture_output=True, timeout=10
-        ).returncode == 0
+        return subprocess.run(["nvidia-smi"], capture_output=True, timeout=10).returncode == 0
     except Exception:
         return False
 
 
-nvidia_smi = pytest.mark.skipif(
-    not _nvidia_smi_available(), reason="nvidia-smi not available"
-)
+nvidia_smi = pytest.mark.skipif(not _nvidia_smi_available(), reason="nvidia-smi not available")
 
 
 def _make_sandbox(**kwargs):
     from agency.agsandbox import agSandbox
+
     uid = str(uuid.uuid4())
     return agSandbox(uid, **kwargs)
 
@@ -70,6 +66,7 @@ def _agconfig_with_output_dir(output_dir):
     old output_dir= constructor kwarg."""
     from agency.agconfig import agConfig
     from agency.agsandbox import agSandboxConfig
+
     cfg = agConfig()
     agSandboxConfig(cfg).add_mount("agent_output", output_dir, "/agent_output")
     return cfg
@@ -79,21 +76,27 @@ def _agconfig_with_output_dir(output_dir):
 # detect_gpus
 # ---------------------------------------------------------------------------
 
+
 class TestDetectGpus:
     def test_returns_list(self):
         from agency.agresources import detect_gpus
+
         gpus = detect_gpus()
         assert isinstance(gpus, list)
         assert all(isinstance(g, int) for g in gpus)
 
     def test_nvidia_smi_unavailable_returns_empty(self, monkeypatch):
         from agency.agresources import detect_gpus
-        monkeypatch.setattr("subprocess.run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError()))
+
+        monkeypatch.setattr(
+            "subprocess.run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
+        )
         assert detect_gpus() == []
 
     def test_nvidia_smi_nonzero_exit_returns_empty(self, monkeypatch):
         from unittest.mock import MagicMock
         from agency.agresources import detect_gpus
+
         mock = MagicMock()
         mock.returncode = 1
         mock.stdout = ""
@@ -103,6 +106,7 @@ class TestDetectGpus:
     def test_nvidia_smi_parses_indices(self, monkeypatch):
         from unittest.mock import MagicMock
         from agency.agresources import detect_gpus
+
         mock = MagicMock()
         mock.returncode = 0
         mock.stdout = "0\n1\n2\n"
@@ -116,6 +120,7 @@ class TestDetectGpus:
     def test_cvd_filter_applied_to_nvidia_smi_output(self, monkeypatch):
         from unittest.mock import MagicMock
         from agency.agresources import detect_gpus
+
         mock = MagicMock()
         mock.returncode = 0
         mock.stdout = "0\n1\n2\n3\n"
@@ -126,6 +131,7 @@ class TestDetectGpus:
     def test_cvd_unset_returns_all_from_nvidia_smi(self, monkeypatch):
         from unittest.mock import MagicMock
         from agency.agresources import detect_gpus
+
         mock = MagicMock()
         mock.returncode = 0
         mock.stdout = "0\n1\n2\n"
@@ -138,51 +144,61 @@ class TestDetectGpus:
 # _cvd_filter
 # ---------------------------------------------------------------------------
 
+
 class TestCvdFilter:
     def test_no_env_var_passes_all(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         assert _cvd_filter([0, 1, 2, 3]) == [0, 1, 2, 3]
 
     def test_filters_to_allowed_subset(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,3,5,7")
         assert _cvd_filter([0, 1, 2, 3, 4, 5, 6, 7]) == [0, 3, 5, 7]
 
     def test_single_gpu(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
         assert _cvd_filter([0, 1, 2, 3]) == [3]
 
     def test_empty_string_passes_all(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_nodevfiles_passes_all(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "NoDevFiles")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_none_string_passes_all(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "none")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_cvd_id_not_in_pool_ignored(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         # CVD says GPU 9 is allowed but nvidia-smi only reported [0,1,2]
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,9")
         assert _cvd_filter([0, 1, 2]) == [0]
 
     def test_preserves_order_from_pool_list(self, monkeypatch):
         from agency.agresources import _cvd_filter
+
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,3,1")
         # Order follows the pool list, not CVD order
         assert _cvd_filter([0, 1, 2, 3, 4, 5]) == [1, 3, 5]
 
     def test_pool_auto_detect_respects_cvd(self, monkeypatch):
         from unittest.mock import MagicMock
+
         mock = MagicMock()
         mock.returncode = 0
         mock.stdout = "0\n1\n2\n3\n"
@@ -196,12 +212,14 @@ class TestCvdFilter:
 class TestDetectCpus:
     def test_returns_positive_int(self):
         from agency.agresources import detect_cpus
+
         cpus = detect_cpus()
         assert isinstance(cpus, int)
         assert cpus >= 1
 
     def test_os_cpu_count_none_returns_one(self, monkeypatch):
         from agency.agresources import detect_cpus
+
         monkeypatch.setattr("os.cpu_count", lambda: None)
         assert detect_cpus() == 1
 
@@ -209,6 +227,7 @@ class TestDetectCpus:
 class TestDetectMemoryMb:
     def test_returns_positive_int(self):
         from agency.agresources import detect_memory_mb
+
         mb = detect_memory_mb()
         assert isinstance(mb, int)
         assert mb > 0
@@ -216,17 +235,19 @@ class TestDetectMemoryMb:
     def test_fallback_when_proc_missing(self, monkeypatch, tmp_path):
         from unittest.mock import MagicMock
         from agency.agresources import detect_memory_mb
+
         # Point /proc/meminfo to a non-existent path and make sysctl fail
         monkeypatch.setattr("builtins.open", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
         mock = MagicMock()
         mock.returncode = 1
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock)
-        assert detect_memory_mb() == 4096   # safe fallback
+        assert detect_memory_mb() == 4096  # safe fallback
 
 
 class TestPoolAutoDetect:
     def test_pool_auto_detects_gpus(self, monkeypatch):
         from unittest.mock import MagicMock
+
         mock = MagicMock()
         mock.returncode = 0
         mock.stdout = "0\n1\n"
@@ -251,6 +272,7 @@ class TestPoolAutoDetect:
 
     def test_agent_has_default_pool(self):
         from agency.agent import agent
+
         assert agent.agresource_pool is not None
         assert isinstance(agent.agresource_pool.total_cpus, int)
         assert isinstance(agent.agresource_pool.total_memory_mb, int)
@@ -259,6 +281,7 @@ class TestPoolAutoDetect:
 # ---------------------------------------------------------------------------
 # agResourcePool
 # ---------------------------------------------------------------------------
+
 
 class TestAgResourcePool:
     def test_single_gpu_acquire_release(self):
@@ -287,24 +310,24 @@ class TestAgResourcePool:
         t = threading.Thread(target=_waiter)
         t.start()
         time.sleep(0.1)
-        assert acquired == []          # still blocked
+        assert acquired == []  # still blocked
         pool.release_gpu(0)
         t.join(timeout=2)
         assert acquired == [0]
 
     def test_acquire_timeout_raises(self):
         pool = agResourcePool(gpus=[0])
-        pool.acquire_gpu()             # exhaust pool
+        pool.acquire_gpu()  # exhaust pool
         with pytest.raises(TimeoutError):
             pool.acquire_gpu(timeout=0.2)
 
     def test_release_unowned_gpu_is_safe(self):
         pool = agResourcePool(gpus=[0])
-        pool.release_gpu(0)            # never acquired — should not raise
+        pool.release_gpu(0)  # never acquired — should not raise
 
     def test_release_unknown_gpu_is_safe(self):
         pool = agResourcePool(gpus=[0])
-        pool.release_gpu(99)           # not in pool — should not raise
+        pool.release_gpu(99)  # not in pool — should not raise
 
     def test_repr(self):
         pool = agResourcePool(gpus=[0, 1], idle_cpus=1.0, idle_memory="1g")
@@ -319,29 +342,34 @@ class TestAgResourcePool:
 # GPU presence markers
 # ---------------------------------------------------------------------------
 
+
 class TestGpuMarkers:
     """GPU markers are now allocated in-process via ctypes (no subprocesses)."""
 
     def test_mark_gpus_false_does_not_call_allocate(self):
         from agency import agresources
+
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[0, 1], mark_gpus=False)
         mock_alloc.assert_not_called()
 
     def test_mark_gpus_true_empty_gpu_list_does_not_call_allocate(self):
         from agency import agresources
+
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[], mark_gpus=True)
         mock_alloc.assert_not_called()
 
     def test_mark_gpus_true_calls_allocate_with_gpu_list(self):
         from agency import agresources
+
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[0, 1], mark_gpus=True)
         mock_alloc.assert_called_once_with([0, 1])
 
     def test_mark_gpus_true_single_gpu_calls_allocate(self):
         from agency import agresources
+
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[2], mark_gpus=True)
         mock_alloc.assert_called_once_with([2])
@@ -357,12 +385,14 @@ class TestGpuMarkers:
     def test_allocate_gpu_markers_skips_on_no_libcuda(self):
         from agency.agresources import _allocate_gpu_markers
         import ctypes
+
         with patch.object(ctypes, "CDLL", side_effect=OSError("libcuda.so.1 not found")):
             _allocate_gpu_markers([0, 1])  # must not raise
 
     def test_allocate_gpu_markers_skips_on_cuinit_failure(self):
         from agency.agresources import _allocate_gpu_markers
         import ctypes
+
         mock_cuda = MagicMock()
         mock_cuda.cuInit.return_value = 1  # CUDA_ERROR_NOT_INITIALIZED
         with patch.object(ctypes, "CDLL", return_value=mock_cuda):
@@ -375,17 +405,16 @@ class TestGpuMarkers:
         exact bug that caused markers to be missing on GPUs 3 and 5."""
         from agency.agresources import _allocate_gpu_markers
         import ctypes
+
         mock_cuda = MagicMock()
-        mock_cuda.cuInit.return_value = 0       # success
+        mock_cuda.cuInit.return_value = 0  # success
         mock_cuda.cuCtxCreate_v2.return_value = 0
         mock_cuda.cuMemAlloc_v2.return_value = 0
         with patch.object(ctypes, "CDLL", return_value=mock_cuda):
             with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,3,5,7"}):
                 _allocate_gpu_markers([0, 3, 5, 7])
         # Extract the device argument (3rd positional arg) from each call
-        called_devs = [
-            call.args[2] for call in mock_cuda.cuCtxCreate_v2.call_args_list
-        ]
+        called_devs = [call.args[2] for call in mock_cuda.cuCtxCreate_v2.call_args_list]
         assert called_devs == [0, 1, 2, 3], (
             f"Expected CUDA device indices [0,1,2,3], got {called_devs}. "
             "Physical GPU IDs were passed directly instead of being remapped."
@@ -394,6 +423,7 @@ class TestGpuMarkers:
     def test_non_main_process_name_blocks_allocation(self):
         """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
         from agency import agresources
+
         mock_proc = MagicMock()
         mock_proc.name = "ForkPoolWorker-1"
         with patch("multiprocessing.current_process", return_value=mock_proc):
@@ -415,7 +445,8 @@ class TestGpuMarkers:
         )
         child = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, timeout=15,
+            capture_output=True,
+            timeout=15,
         )
         assert child.returncode == 0, child.stderr.decode()
 
@@ -424,15 +455,18 @@ class TestGpuMarkers:
 # agSandbox — change_config / get_config_copy
 # ---------------------------------------------------------------------------
 
+
 class TestAgSandboxChangeConfigAndGetConfigCopy:
     def test_change_config_replaces_agconfig(self):
         from agency.agconfig import agConfig
+
         sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
         sb.change_config(agConfig({"agllm_backend": {"temperature": 0.2}}))
         assert sb._agconfig.get("agllm_backend", "temperature") == 0.2
 
     def test_change_config_clones_given_agconfig(self):
         from agency.agconfig import agConfig
+
         sb = _make_sandbox(agconfig=agConfig())
         new_cfg = agConfig({"agllm_backend": {"temperature": 0.2}})
         sb.change_config(new_cfg)
@@ -441,6 +475,7 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
 
     def test_get_config_copy_returns_clone_not_same_object(self):
         from agency.agconfig import agConfig
+
         cfg = agConfig({"agllm_backend": {"temperature": 0.7}})
         sb = _make_sandbox(agconfig=cfg)
         copy = sb.get_config_copy()
@@ -448,11 +483,13 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
 
     def test_get_config_copy_reflects_current_values(self):
         from agency.agconfig import agConfig
+
         sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
         assert sb.get_config_copy().agllm_backend.temperature == 0.7
 
     def test_mutating_get_config_copy_does_not_affect_sandbox(self):
         from agency.agconfig import agConfig
+
         sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
         copy = sb.get_config_copy()
         copy.agllm_backend.temperature = 0.1
@@ -464,6 +501,7 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
 
     def test_change_config_none_clears_agconfig(self):
         from agency.agconfig import agConfig
+
         sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
         sb.change_config(None)
         assert sb.get_config_copy() is None
@@ -473,10 +511,12 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
 # agSandbox — container lifecycle
 # ---------------------------------------------------------------------------
 
+
 class TestAgSandboxLifecycle:
     def test_lifecycle_tag_is_lowercase(self):
         """_lifecycle_tag() must be fully lowercase — Docker rejects uppercase repository names."""
         from agency.agsandbox import agSandbox
+
         sb = agSandbox.__new__(agSandbox)
         sb._name = "GenerationAgent_4816622_0000"
         tag = sb._lifecycle_tag()
@@ -485,6 +525,7 @@ class TestAgSandboxLifecycle:
 
     def test_lifecycle_tag_format(self):
         from agency.agsandbox import agSandbox
+
         sb = agSandbox.__new__(agSandbox)
         sb._name = "myagent_0000"
         assert sb._lifecycle_tag() == "agency/lifecycle-myagent_0000"
@@ -497,13 +538,15 @@ class TestAgSandboxLifecycle:
         sb.exec("true")
         result = subprocess.run(
             ["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert name in result.stdout
         sb.destroy()
         result2 = subprocess.run(
             ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert name not in result2.stdout
 
@@ -517,7 +560,8 @@ class TestAgSandboxLifecycle:
             # Image should exist
             result = subprocess.run(
                 ["docker", "images", "-q", tag],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert result.stdout.strip() != ""
         finally:
@@ -532,9 +576,10 @@ class TestAgSandboxLifecycle:
         Simulated by creating two sandbox objects with the same agname: sb_worker starts
         the container, sb_main (with _started=False) tries to commit it."""
         from agency.agsandbox import agSandbox
+
         agname = str(uuid.uuid4())
-        sb_worker = agSandbox(agname)   # "worker" — starts the container
-        sb_main   = agSandbox(agname)   # "main process" — same name, _started=False
+        sb_worker = agSandbox(agname)  # "worker" — starts the container
+        sb_main = agSandbox(agname)  # "main process" — same name, _started=False
         tag = f"agency/test-commit-started-false-{agname[:8]}"
         try:
             # Worker starts container and writes a file.
@@ -545,7 +590,8 @@ class TestAgSandboxLifecycle:
             assert sb_main.commit(tag) is True
             result = subprocess.run(
                 ["docker", "images", "-q", tag],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert result.stdout.strip() != "", "image must exist even when _started was False"
         finally:
@@ -562,7 +608,8 @@ class TestAgSandboxLifecycle:
         # No image should have been created.
         result = subprocess.run(
             ["docker", "images", "-q", tag],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert result.stdout.strip() == ""
 
@@ -592,6 +639,7 @@ class TestAgSandboxLifecycle:
         the cross-worker container-destruction bug)."""
         sb = _make_sandbox()
         from agency.tools import make_sandboxed_tools
+
         tools = {t.name: t for t in make_sandboxed_tools(sb)}
         try:
             # write runs in a process-pool worker
@@ -657,13 +705,15 @@ class TestAgSandboxLifecycle:
             # Container must be gone
             result = subprocess.run(
                 ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert name not in result.stdout, "container must be removed after stop()"
             # Lifecycle image must exist
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert img.stdout.strip() != "", "lifecycle image must exist after stop(commit=True)"
             # _checkpoint_image must be set
@@ -685,7 +735,8 @@ class TestAgSandboxLifecycle:
             # Container must be gone
             result = subprocess.run(
                 ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert name not in result.stdout, "container must be removed after stop()"
             # _checkpoint_image must not have changed
@@ -693,7 +744,8 @@ class TestAgSandboxLifecycle:
             # No lifecycle image should have been created
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert img.stdout.strip() == "", "stop(commit=False) must not create a lifecycle image"
         finally:
@@ -750,14 +802,16 @@ class TestAgSandboxLifecycle:
         # Confirm image exists before destroy
         img = subprocess.run(
             ["docker", "images", "-q", lifecycle_tag],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert img.stdout.strip() != "", "lifecycle image must exist before destroy()"
         sb.destroy()
         # Image must be gone
         img2 = subprocess.run(
             ["docker", "images", "-q", lifecycle_tag],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert img2.stdout.strip() == "", "destroy() must remove the lifecycle image"
 
@@ -786,14 +840,17 @@ class TestAgSandboxLifecycle:
         # Container must actually be gone after the successful retry
         result = subprocess.run(
             ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert name not in result.stdout
 
     @docker
     def test_stop_emits_warning_after_all_retries_fail(self):
         """stop() emits a WARNING to stderr when rm -f fails all 3 attempts."""
-        import io, sys
+        import io
+        import sys
+
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
 
@@ -850,8 +907,9 @@ class TestAgSandboxLifecycle:
         _docker_semaphore.release = counting_release
         try:
             # stop(commit=True) exercises commit + rm -f; both must go through the semaphore.
-            threads = [threading.Thread(target=sb.stop, kwargs={"commit": True})
-                       for sb in sandboxes]
+            threads = [
+                threading.Thread(target=sb.stop, kwargs={"commit": True}) for sb in sandboxes
+            ]
             for t in threads:
                 t.start()
             for t in threads:
@@ -864,7 +922,9 @@ class TestAgSandboxLifecycle:
             for sb in sandboxes:
                 sb.destroy()
 
-        assert peak[0] <= 16, f"peak concurrent docker calls {peak[0]} exceeded semaphore limit of 16"
+        assert peak[0] <= 16, (
+            f"peak concurrent docker calls {peak[0]} exceeded semaphore limit of 16"
+        )
 
     @docker
     def test_ensure_started_removes_created_state_container(self):
@@ -875,11 +935,13 @@ class TestAgSandboxLifecycle:
             # Manually create a container in 'Created' state (no --detach run, just create).
             subprocess.run(
                 ["docker", "create", "--name", name, sb.base_image, "tail", "-f", "/dev/null"],
-                capture_output=True, check=True,
+                capture_output=True,
+                check=True,
             )
             status = subprocess.run(
                 ["docker", "inspect", "--format", "{{.State.Status}}", name],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert status.stdout.strip() == "created"
             # _ensure_started() must remove the stuck container and start fresh.
@@ -915,7 +977,8 @@ class TestAgSandboxLifecycle:
             assert sb._started is False
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert img.stdout.strip() != "", "lifecycle image must exist after successful retry"
         finally:
@@ -927,6 +990,7 @@ class TestAgSandboxLifecycle:
         """stop(commit=True) emits a WARNING to stderr when all 3 commit attempts fail;
         _checkpoint_image is not updated so the next start restores from the prior checkpoint."""
         import io
+
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
         previous_lifecycle = sb._checkpoint_image
@@ -952,7 +1016,6 @@ class TestAgSandboxLifecycle:
         assert "WARNING" in captured.getvalue()
         assert sb._checkpoint_image == previous_lifecycle  # not updated on all-retry failure
         assert sb._started is False
-
 
     @docker
     def test_ensure_started_removes_exited_container(self):
@@ -984,6 +1047,7 @@ class TestAgSandboxLifecycle:
 # ---------------------------------------------------------------------------
 # agSandbox — exec
 # ---------------------------------------------------------------------------
+
 
 class TestAgSandboxExec:
     @docker
@@ -1024,6 +1088,7 @@ class TestAgSandboxExec:
 # ---------------------------------------------------------------------------
 # agSandbox — file I/O
 # ---------------------------------------------------------------------------
+
 
 class TestAgSandboxFileIO:
     @docker
@@ -1072,12 +1137,14 @@ class TestAgSandboxReadFileUnit:
 
     def _make_sb(self):
         from agency.agsandbox import agSandbox
+
         sb = agSandbox.__new__(agSandbox)
         sb._started = True
         return sb
 
     def test_read_file_returns_text_content(self):
         import base64
+
         sb = self._make_sb()
         b64 = base64.b64encode(b"hello world\n").decode()
         with patch.object(sb, "_container_exec", return_value=(b64, 0)):
@@ -1099,6 +1166,7 @@ class TestAgSandboxReadFileUnit:
 
     def test_read_file_binary_raises_unicode_decode_error(self):
         import base64
+
         sb = self._make_sb()
         raw = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])  # PNG header
         b64 = base64.b64encode(raw).decode()
@@ -1108,6 +1176,7 @@ class TestAgSandboxReadFileUnit:
 
     def test_read_file_valid_utf8_succeeds(self):
         import base64
+
         sb = self._make_sb()
         content = "def main():\n    pass\n"
         b64 = base64.b64encode(content.encode("utf-8")).decode()
@@ -1118,6 +1187,7 @@ class TestAgSandboxReadFileUnit:
 # ---------------------------------------------------------------------------
 # agSandbox — PID tracking
 # ---------------------------------------------------------------------------
+
 
 class TestAgSandboxPIDTracking:
     @docker
@@ -1135,21 +1205,27 @@ class TestAgSandboxPIDTracking:
     def test_foreground_spawned_child_tracked(self):
         # A foreground command that internally forks a child and exits.
         # The child escapes jobs -p but must still be captured via /proc diffing.
-        self.sb.write_file("/workspace/spawner.py", (
-            "import subprocess, time\n"
-            "subprocess.Popen(['sleep', '30'])\n"   # detached child, not waited on
-        ))
+        self.sb.write_file(
+            "/workspace/spawner.py",
+            (
+                "import subprocess, time\n"
+                "subprocess.Popen(['sleep', '30'])\n"  # detached child, not waited on
+            ),
+        )
         self.sb.exec("python3 /workspace/spawner.py")
         assert len(self.sb._watched_pids) > 0
 
     def test_parent_exits_child_survives_still_tracked(self):
         # Parent spawns a child then exits. Child is reparented to PID 1 and
         # escapes any BFS from the original PID. Baseline diff must find it.
-        self.sb.write_file("/workspace/spawner.py", (
-            "import subprocess, os\n"
-            "subprocess.Popen(['sleep', '30'])\n"  # child detaches
-            "os._exit(0)\n"                        # parent exits immediately
-        ))
+        self.sb.write_file(
+            "/workspace/spawner.py",
+            (
+                "import subprocess, os\n"
+                "subprocess.Popen(['sleep', '30'])\n"  # child detaches
+                "os._exit(0)\n"  # parent exits immediately
+            ),
+        )
         self.sb.exec("python3 /workspace/spawner.py")
         live = self.sb.get_live_pids()
         # Parent is gone; the orphaned sleep child must still be tracked
@@ -1158,16 +1234,19 @@ class TestAgSandboxPIDTracking:
     def test_process_tree_descendants_tracked(self):
         # A process is tracked; it later spawns children of its own.
         # get_live_pids() must expand the tree and include those grandchildren.
-        self.sb.write_file("/workspace/parent.py", (
-            "import subprocess, time\n"
-            "# Spawn two long-lived children after a brief pause\n"
-            "time.sleep(0.2)\n"
-            "subprocess.Popen(['sleep', '30'])\n"
-            "subprocess.Popen(['sleep', '30'])\n"
-            "time.sleep(30)\n"   # parent also stays alive
-        ))
+        self.sb.write_file(
+            "/workspace/parent.py",
+            (
+                "import subprocess, time\n"
+                "# Spawn two long-lived children after a brief pause\n"
+                "time.sleep(0.2)\n"
+                "subprocess.Popen(['sleep', '30'])\n"
+                "subprocess.Popen(['sleep', '30'])\n"
+                "time.sleep(30)\n"  # parent also stays alive
+            ),
+        )
         self.sb.exec("python3 /workspace/parent.py &")
-        time.sleep(0.5)          # let the parent spawn its children
+        time.sleep(0.5)  # let the parent spawn its children
         live = self.sb.get_live_pids()
         # parent + 2 children = at least 3 live PIDs
         assert len(live) >= 3
@@ -1175,14 +1254,17 @@ class TestAgSandboxPIDTracking:
     def test_double_forked_daemon_tracked(self):
         # Classic Unix double-fork: grandchild is reparented to PID 1 and
         # completely detached from the shell's job table.
-        self.sb.write_file("/workspace/daemon.py", (
-            "import os, time\n"
-            "if os.fork() == 0:\n"          # first fork
-            "    if os.fork() == 0:\n"      # second fork — grandchild
-            "        time.sleep(30)\n"      # grandchild runs in background
-            "    os._exit(0)\n"             # intermediate child exits
-            "os.wait()\n"                   # parent waits for intermediate child
-        ))
+        self.sb.write_file(
+            "/workspace/daemon.py",
+            (
+                "import os, time\n"
+                "if os.fork() == 0:\n"  # first fork
+                "    if os.fork() == 0:\n"  # second fork — grandchild
+                "        time.sleep(30)\n"  # grandchild runs in background
+                "    os._exit(0)\n"  # intermediate child exits
+                "os.wait()\n"  # parent waits for intermediate child
+            ),
+        )
         self.sb.exec("python3 /workspace/daemon.py")
         assert len(self.sb._watched_pids) > 0
 
@@ -1211,18 +1293,17 @@ class TestAgSandboxPIDTracking:
 
     def test_daemon_children_also_excluded(self):
         # Release a parent as daemon; children it spawns later must also be excluded.
-        self.sb.write_file("/workspace/daemon_parent.py", (
-            "import subprocess, time\n"
-            "subprocess.Popen(['sleep', '30'])\n"
-            "time.sleep(30)\n"
-        ))
+        self.sb.write_file(
+            "/workspace/daemon_parent.py",
+            ("import subprocess, time\nsubprocess.Popen(['sleep', '30'])\ntime.sleep(30)\n"),
+        )
         self.sb.exec("python3 /workspace/daemon_parent.py &")
         live = self.sb.get_live_pids()
         assert len(live) > 0
         # Release the parent; its child (sleep 30) should also be excluded
         for pid in list(live):
             self.sb.release_daemon(pid)
-        time.sleep(0.3)   # let the child spawn
+        time.sleep(0.3)  # let the child spawn
         assert self.sb.get_live_pids() == set()
 
     def test_pid_status_summary_no_processes(self):
@@ -1239,6 +1320,7 @@ class TestAgSandboxPIDTracking:
 # ---------------------------------------------------------------------------
 # agSandbox — resource limits
 # ---------------------------------------------------------------------------
+
 
 class TestAgSandboxResourceLimits:
     @docker
@@ -1279,11 +1361,13 @@ class TestAgSandboxResourceLimits:
 # Sandboxed tool factories
 # ---------------------------------------------------------------------------
 
+
 class TestSandboxedTools:
     @docker
     def setup_method(self, _):
         self.sb = _make_sandbox()
         from agency.tools import make_sandboxed_tools
+
         self.tools = {t.name: t for t in make_sandboxed_tools(self.sb)}
 
     @docker
@@ -1313,11 +1397,13 @@ class TestSandboxedTools:
 
     def test_edit_tool_replaces_content(self):
         self.tools["write"].fn(agdata(file_path="/workspace/edit_me.txt", content="foo bar\n"))
-        self.tools["edit"].fn(agdata(
-            file_path="/workspace/edit_me.txt",
-            old_string="foo",
-            new_string="baz",
-        ))
+        self.tools["edit"].fn(
+            agdata(
+                file_path="/workspace/edit_me.txt",
+                old_string="foo",
+                new_string="baz",
+            )
+        )
         r = self.tools["read"].fn(agdata(file_path="/workspace/edit_me.txt"))
         assert "baz" in r.content
         assert "foo" not in r.content
@@ -1348,6 +1434,7 @@ class TestResourceTools:
         self.sb = _make_sandbox()
         self.pool = agResourcePool(gpus=[0, 1], idle_cpus=1.0, idle_memory="1024m")
         from agency.tools import make_sandboxed_tools
+
         self.tools = {t.name: t for t in make_sandboxed_tools(self.sb, self.pool)}
 
     @docker
@@ -1375,6 +1462,7 @@ class TestResourceTools:
     def test_reserve_gpu_no_gpus_warns_and_does_not_set_flag(self):
         """reserve_gpu returns a warning and leaves _gpu_virtual False when pool has no GPUs."""
         from agency.tools.resource import make_gpu_reserve
+
         pool_empty = agResourcePool(gpus=[])
         tool = make_gpu_reserve(self.sb, pool_empty)
         result = tool.fn(agdata())
@@ -1466,7 +1554,7 @@ class TestResourceTools:
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("sleep 0.1 &")
         time.sleep(1.0)
-        self.sb.get_live_pids()   # triggers release since alive set is now empty
+        self.sb.get_live_pids()  # triggers release since alive set is now empty
         assert self.sb._gpu_id is None
         assert self.pool._gpus_acquired == 0
         assert self.sb._gpu_virtual is True  # virtual reservation persists
@@ -1476,28 +1564,29 @@ class TestResourceTools:
     def test_exec_blocks_until_pool_gpu_is_freed(self):
         """exec() waits indefinitely for a physical GPU and unblocks once one is released."""
         from agency.tools.resource import make_gpu_reserve
+
         pool1 = agResourcePool(gpus=[0])
-        pool1.acquire_gpu()   # exhaust the only GPU
+        pool1.acquire_gpu()  # exhaust the only GPU
 
         sb2 = _make_sandbox()
         tool = make_gpu_reserve(sb2, pool1)
-        tool.fn(agdata())     # virtual reservation
+        tool.fn(agdata())  # virtual reservation
 
         exec_started = threading.Event()
-        exec_done    = threading.Event()
+        exec_done = threading.Event()
 
         def _run():
             exec_started.set()
-            sb2.exec("echo hello")   # blocks inside exec() until GPU freed
+            sb2.exec("echo hello")  # blocks inside exec() until GPU freed
             exec_done.set()
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         exec_started.wait()
         time.sleep(0.2)
-        assert not exec_done.is_set()   # still waiting
-        pool1.release_gpu(0)            # free the GPU
-        exec_done.wait(timeout=60)      # container startup (docker run) can take >5 s
+        assert not exec_done.is_set()  # still waiting
+        pool1.release_gpu(0)  # free the GPU
+        exec_done.wait(timeout=60)  # container startup (docker run) can take >5 s
         assert exec_done.is_set()
         sb2.destroy()
 
@@ -1571,6 +1660,7 @@ class TestResourceTools:
 # Dangling image auto-cleanup (eager rmi on commit)
 # ---------------------------------------------------------------------------
 
+
 class TestDanglingImageEagerCleanup:
     """Tests for the eager old-image deletion in stop(commit=True)."""
 
@@ -1584,7 +1674,6 @@ class TestDanglingImageEagerCleanup:
         import agency.agsandbox as _mod
 
         sb = _make_sandbox()
-        tag = sb._lifecycle_tag()
 
         run_calls = []
         fake_old_id = "sha256:deadbeef0000"
@@ -1692,33 +1781,43 @@ class TestDanglingImageEagerCleanup:
     def test_repeated_commits_leave_no_dangling_images(self):
         """stop(commit=True) called 3 times to the same tag must leave 0 new dangling images."""
         name = f"test-eager-{uuid.uuid4().hex[:8]}"
-        tag  = f"agency/lifecycle-{name}"
+        tag = f"agency/lifecycle-{name}"
 
         def _dangling_ids():
             r = subprocess.run(
                 ["docker", "images", "-f", "dangling=true", "-q"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             return set(ln.strip() for ln in r.stdout.splitlines() if ln.strip())
 
         subprocess.run(
-            ["docker", "run", "-d", "--name", name, "agency-sandbox:latest",
-             "tail", "-f", "/dev/null"],
-            capture_output=True, check=True,
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "agency-sandbox:latest",
+                "tail",
+                "-f",
+                "/dev/null",
+            ],
+            capture_output=True,
+            check=True,
         )
         try:
             before = _dangling_ids()
             for _ in range(3):
                 old_id_r = subprocess.run(
                     ["docker", "inspect", "--format={{.Id}}", tag],
-                    capture_output=True, text=True,
+                    capture_output=True,
+                    text=True,
                 )
                 old_id = old_id_r.stdout.strip() if old_id_r.returncode == 0 else None
-                subprocess.run(["docker", "commit", name, tag],
-                               capture_output=True, check=True)
+                subprocess.run(["docker", "commit", name, tag], capture_output=True, check=True)
                 if old_id:
-                    subprocess.run(["docker", "rmi", old_id],
-                                   capture_output=True)
+                    subprocess.run(["docker", "rmi", old_id], capture_output=True)
             after = _dangling_ids()
             new_dangling = after - before
             assert len(new_dangling) == 0, (
@@ -1732,6 +1831,7 @@ class TestDanglingImageEagerCleanup:
 # ---------------------------------------------------------------------------
 # _rm_container / _rmi helpers
 # ---------------------------------------------------------------------------
+
 
 class TestDockerCommandHelpers:
     """Unit tests for _rm_container and _rmi — no real Docker required."""
@@ -1754,6 +1854,7 @@ class TestDockerCommandHelpers:
             return OK()
 
         import agency.agsandbox as _mod
+
         with patch.object(_mod.agSandbox, "_run", fake_run):
             sb._rm_container("my-container")
 
@@ -1766,6 +1867,7 @@ class TestDockerCommandHelpers:
         sb = self._sb()
 
         import agency.agsandbox as _mod
+
         with patch.object(_mod.agSandbox, "_run", side_effect=RuntimeError("rm failed")):
             with pytest.raises(RuntimeError, match="rm failed"):
                 sb._rm_container("bad-container")
@@ -1785,6 +1887,7 @@ class TestDockerCommandHelpers:
             return OK()
 
         import agency.agsandbox as _mod
+
         with patch.object(_mod.agSandbox, "_run", fake_run):
             sb._rmi("sha256:abc123")
 
@@ -1807,6 +1910,7 @@ class TestDockerCommandHelpers:
             return OK()
 
         import agency.agsandbox as _mod
+
         with patch.object(_mod.agSandbox, "_run", fake_run):
             sb._rmi("myimage:tag", force=True)
 
@@ -1816,6 +1920,7 @@ class TestDockerCommandHelpers:
         sb = self._sb()
 
         import agency.agsandbox as _mod
+
         with patch.object(_mod.agSandbox, "_run", side_effect=RuntimeError("rmi failed")):
             with pytest.raises(RuntimeError, match="rmi failed"):
                 sb._rmi("sha256:deadbeef")
@@ -1836,6 +1941,7 @@ class TestDockerCommandHelpers:
             return OK()
 
         import agency.agsandbox as _mod
+
         with patch.object(_mod.agSandbox, "_run", fake_run):
             # status returns "" → no leftover container
             with patch.object(sb, "_container_running", return_value=False):
@@ -1860,6 +1966,7 @@ class TestDockerCommandHelpers:
             return OK()
 
         import agency.agsandbox as _mod
+
         with patch.object(_mod.agSandbox, "_run", fake_run):
             with patch.object(sb, "_container_running", return_value=False):
                 with patch.object(sb, "_container_status", return_value="exited"):
@@ -1892,14 +1999,16 @@ class TestDockerCommandHelpers:
             return OK()
 
         released = []
-        real_release = _mod._container_semaphore.release
 
         with patch.object(_mod.agSandbox, "_run", fake_run):
             with patch.object(sb, "_started", True):
                 with patch.object(sb, "_container_running", return_value=True):
                     with patch.object(sb, "_container_status", return_value="running"):
-                        with patch.object(_mod._container_semaphore, "release",
-                                          side_effect=lambda: released.append(1)):
+                        with patch.object(
+                            _mod._container_semaphore,
+                            "release",
+                            side_effect=lambda: released.append(1),
+                        ):
                             with pytest.raises(RuntimeError, match="rm exploded"):
                                 sb.destroy()
 

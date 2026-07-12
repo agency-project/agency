@@ -11,10 +11,12 @@ lives here instead of being duplicated at each call site.
 Every backend's client exposes the same surface agllm.call()/.compact() use:
 `.chat.completions.create(**kwargs)` (streaming or not) and `.close()`.
 """
+
 from __future__ import annotations
 import json
 import os
 import re
+from typing import ClassVar
 import httpx
 import openai
 
@@ -50,11 +52,14 @@ except ImportError:
 # (GlobalConfigParam), exactly as before.
 # ---------------------------------------------------------------------------
 
+
 class AgLLMBackendFields:
     """Every LLM config field used by any backend, as DynamicConfigParam
     descriptors, plus the tier-1 tunables for the backend machinery itself."""
 
-    model_listing_timeout_seconds = GlobalConfigParam("agllm_backend", default=10.0)  # httpx timeout for the best-effort /v1/models lookup.
+    model_listing_timeout_seconds = GlobalConfigParam(
+        "agllm_backend", default=10.0
+    )  # httpx timeout for the best-effort /v1/models lookup.
     # Anthropic requires max_tokens; 4096 was too small — a call with no explicit
     # max_tokens (i.e. no "max_tokens" key in llm_config) could truncate mid-tool-call
     # on a large structured tool argument, silently dropping the call entirely (see
@@ -71,7 +76,9 @@ class AgLLMBackendFields:
     context_limit = DynamicConfigParam("agllm_backend", default=None)
     temperature = DynamicConfigParam("agllm_backend", default=None)
     max_completion_tokens = DynamicConfigParam("agllm_backend", default=None)
-    max_tokens = DynamicConfigParam("agllm_backend", default=None)  # deprecated alias for max_completion_tokens
+    max_tokens = DynamicConfigParam(
+        "agllm_backend", default=None
+    )  # deprecated alias for max_completion_tokens
     top_p = DynamicConfigParam("agllm_backend", default=None)
     frequency_penalty = DynamicConfigParam("agllm_backend", default=None)
     presence_penalty = DynamicConfigParam("agllm_backend", default=None)
@@ -94,12 +101,35 @@ class AgLLMBackendFields:
     aws_region = DynamicConfigParam("agllm_backend", default=None)
 
     _FIELD_NAMES: "tuple[str, ...]" = (
-        "model", "api_key", "base_url", "provider", "region", "context_limit",
-        "temperature", "max_completion_tokens", "max_tokens", "top_p",
-        "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed",
-        "extra_body", "top_k", "repetition_penalty", "min_p", "min_tokens",
-        "guided_json", "guided_regex", "workspace_id", "aws_access_key",
-        "aws_secret_key", "aws_session_token", "aws_profile", "aws_region",
+        "model",
+        "api_key",
+        "base_url",
+        "provider",
+        "region",
+        "context_limit",
+        "temperature",
+        "max_completion_tokens",
+        "max_tokens",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "n",
+        "stop",
+        "logprobs",
+        "seed",
+        "extra_body",
+        "top_k",
+        "repetition_penalty",
+        "min_p",
+        "min_tokens",
+        "guided_json",
+        "guided_regex",
+        "workspace_id",
+        "aws_access_key",
+        "aws_secret_key",
+        "aws_session_token",
+        "aws_profile",
+        "aws_region",
     )
 
     def as_dict(self) -> dict:
@@ -132,14 +162,31 @@ class agLLMBackendConfig(_AgConfigViewBase):
 # _OPENAI_GEN_PARAMS). vLLM (and other OpenAI-compatible servers with
 # sampling extensions) additionally accept _VLLM_EXTRA_GEN_FIELDS via
 # extra_body -- real OpenAI's API does not.
-_OPENAI_GEN_FIELDS = frozenset({
-    "temperature", "max_completion_tokens", "max_tokens", "top_p",
-    "frequency_penalty", "presence_penalty", "n", "stop", "logprobs", "seed",
-    "extra_body",
-})
-_VLLM_EXTRA_GEN_FIELDS = frozenset({
-    "top_k", "repetition_penalty", "min_p", "min_tokens", "guided_json", "guided_regex",
-})
+_OPENAI_GEN_FIELDS = frozenset(
+    {
+        "temperature",
+        "max_completion_tokens",
+        "max_tokens",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "n",
+        "stop",
+        "logprobs",
+        "seed",
+        "extra_body",
+    }
+)
+_VLLM_EXTRA_GEN_FIELDS = frozenset(
+    {
+        "top_k",
+        "repetition_penalty",
+        "min_p",
+        "min_tokens",
+        "guided_json",
+        "guided_regex",
+    }
+)
 
 
 class _AgProviderBackendConfig(agLLMBackendConfig):
@@ -168,7 +215,11 @@ class agVLLMBackendConfig(_AgProviderBackendConfig):
     sent via extra_body. `provider` is fixed to "vllm"."""
 
     _PROVIDER = "vllm"
-    _ALLOWED_FIELDS = frozenset({"model", "api_key", "base_url", "context_limit"}) | _OPENAI_GEN_FIELDS | _VLLM_EXTRA_GEN_FIELDS
+    _ALLOWED_FIELDS = (
+        frozenset({"model", "api_key", "base_url", "context_limit"})
+        | _OPENAI_GEN_FIELDS
+        | _VLLM_EXTRA_GEN_FIELDS
+    )
 
 
 class agOpenAIBackendConfig(_AgProviderBackendConfig):
@@ -179,7 +230,9 @@ class agOpenAIBackendConfig(_AgProviderBackendConfig):
     those in extra_body. `provider` is fixed to "openai"."""
 
     _PROVIDER = "openai"
-    _ALLOWED_FIELDS = frozenset({"model", "api_key", "base_url", "context_limit"}) | _OPENAI_GEN_FIELDS
+    _ALLOWED_FIELDS = (
+        frozenset({"model", "api_key", "base_url", "context_limit"}) | _OPENAI_GEN_FIELDS
+    )
 
 
 class agAnthropicBackendConfig(_AgProviderBackendConfig):
@@ -193,10 +246,20 @@ class agAnthropicBackendConfig(_AgProviderBackendConfig):
     `provider` is fixed to "anthropic"."""
 
     _PROVIDER = "anthropic"
-    _ALLOWED_FIELDS = frozenset({
-        "model", "api_key", "base_url", "context_limit", "workspace_id",
-        "temperature", "top_p", "max_completion_tokens", "max_tokens", "extra_body",
-    })
+    _ALLOWED_FIELDS = frozenset(
+        {
+            "model",
+            "api_key",
+            "base_url",
+            "context_limit",
+            "workspace_id",
+            "temperature",
+            "top_p",
+            "max_completion_tokens",
+            "max_tokens",
+            "extra_body",
+        }
+    )
 
 
 class agBedrockBackendConfig(_AgProviderBackendConfig):
@@ -210,7 +273,11 @@ class agBedrockBackendConfig(_AgProviderBackendConfig):
     silently ignoring the rest. `provider` is fixed to "bedrock"."""
 
     _PROVIDER = "bedrock"
-    _ALLOWED_FIELDS = frozenset({"model", "api_key", "region", "context_limit"}) | _OPENAI_GEN_FIELDS | _VLLM_EXTRA_GEN_FIELDS
+    _ALLOWED_FIELDS = (
+        frozenset({"model", "api_key", "region", "context_limit"})
+        | _OPENAI_GEN_FIELDS
+        | _VLLM_EXTRA_GEN_FIELDS
+    )
 
 
 # Exception-translation tuples so callers (agllm.call()) can catch both
@@ -230,9 +297,7 @@ RATE_LIMIT_EXCS: tuple = (openai.RateLimitError,) + (
 # not special-cased above (e.g. InternalServerError). Callers should check the
 # more specific tuples above first — BadRequestError/RateLimitError/connection
 # errors are all subclasses of these and get their own handling.
-API_ERROR_EXCS: tuple = (openai.APIError,) + (
-    (_anthropic_sdk.APIError,) if _anthropic_sdk else ()
-)
+API_ERROR_EXCS: tuple = (openai.APIError,) + ((_anthropic_sdk.APIError,) if _anthropic_sdk else ())
 
 _ANTHROPIC_BEDROCK_MODEL_RE = re.compile(r"^(?:(?:us|eu|apac|global)\.)?anthropic\.")
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
@@ -264,12 +329,14 @@ _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
 # AWS Bedrock SigV4 auth
 # ---------------------------------------------------------------------------
 
+
 class _BedrockSigV4Auth(httpx.Auth):
     """httpx auth handler that signs requests with AWS SigV4 for Amazon Bedrock."""
 
     def __init__(self, region: str, api_key: str | None = None) -> None:
         import boto3
         from botocore.credentials import Credentials
+
         self._region = region
         if api_key:
             parts = api_key.split(":", 2)
@@ -302,10 +369,15 @@ class _BedrockSigV4Auth(httpx.Auth):
             method=request.method,
             url=str(request.url),
             data=request.content or b"",
-            headers={k: v for k, v in request.headers.items()
-                     if k.lower() not in ("host", "content-length")},
+            headers={
+                k: v
+                for k, v in request.headers.items()
+                if k.lower() not in ("host", "content-length")
+            },
         )
-        botocore.auth.SigV4Auth(self._creds.get_frozen_credentials(), "bedrock", self._region).add_auth(aws_req)
+        botocore.auth.SigV4Auth(
+            self._creds.get_frozen_credentials(), "bedrock", self._region
+        ).add_auth(aws_req)
         for k, v in aws_req.headers.items():
             request.headers[k] = v
         yield request
@@ -329,6 +401,7 @@ class _BedrockSigV4Auth(httpx.Auth):
 # compaction logic needs no changes to support Claude-on-Bedrock.
 # ---------------------------------------------------------------------------
 
+
 def _is_anthropic_bedrock_model(model: str) -> bool:
     return bool(_ANTHROPIC_BEDROCK_MODEL_RE.match(model or ""))
 
@@ -350,18 +423,20 @@ def _openai_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
             blocks: list[dict] = []
             if content:
                 blocks.append({"type": "text", "text": content})
-            for tc in (m.get("tool_calls") or []):
+            for tc in m.get("tool_calls") or []:
                 fn = tc.get("function", {})
                 try:
                     tool_input = json.loads(fn.get("arguments") or "{}")
                 except ValueError:
                     tool_input = {}
-                blocks.append({
-                    "type": "tool_use",
-                    "id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "input": tool_input,
-                })
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": tool_input,
+                    }
+                )
             out.append({"role": "assistant", "content": blocks or content})
         elif role == "tool":
             result_block = {
@@ -384,11 +459,13 @@ def _openai_tools_to_anthropic(tools: "list[dict] | None") -> "list[dict] | None
     converted = []
     for t in tools:
         fn = t.get("function", t)
-        converted.append({
-            "name": fn.get("name", ""),
-            "description": fn.get("description", ""),
-            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
-        })
+        converted.append(
+            {
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+            }
+        )
     return converted
 
 
@@ -474,7 +551,9 @@ def _anthropic_stream_to_openai_chunks(stream):
             if kind == "text_delta":
                 yield _FakeChunk(choices=[_FakeChoice(_FakeDelta(content=delta.text))])
             elif kind == "thinking_delta":
-                yield _FakeChunk(choices=[_FakeChoice(_FakeDelta(reasoning_content=delta.thinking))])
+                yield _FakeChunk(
+                    choices=[_FakeChoice(_FakeDelta(reasoning_content=delta.thinking))]
+                )
             elif kind == "input_json_delta":
                 block = tool_blocks.get(event.index)
                 if block is not None:
@@ -482,12 +561,22 @@ def _anthropic_stream_to_openai_chunks(stream):
         elif etype == "content_block_stop":
             block = tool_blocks.pop(event.index, None)
             if block is not None:
-                yield _FakeChunk(choices=[_FakeChoice(_FakeDelta(tool_calls=[
-                    _FakeToolCallDelta(
-                        index=event.index, id=block["id"], name=block["name"],
-                        arguments="".join(block["json_parts"]),
-                    )
-                ]))])
+                yield _FakeChunk(
+                    choices=[
+                        _FakeChoice(
+                            _FakeDelta(
+                                tool_calls=[
+                                    _FakeToolCallDelta(
+                                        index=event.index,
+                                        id=block["id"],
+                                        name=block["name"],
+                                        arguments="".join(block["json_parts"]),
+                                    )
+                                ]
+                            )
+                        )
+                    ]
+                )
         elif etype == "message_delta":
             usage = getattr(event, "usage", None)
             if usage is not None:
@@ -506,12 +595,22 @@ def _anthropic_stream_to_openai_chunks(stream):
             f"(id={block['id']}) truncated mid-stream (likely hit max_tokens) "
             f"— flushing partial arguments instead of dropping the call"
         )
-        yield _FakeChunk(choices=[_FakeChoice(_FakeDelta(tool_calls=[
-            _FakeToolCallDelta(
-                index=index, id=block["id"], name=block["name"],
-                arguments="".join(block["json_parts"]),
-            )
-        ]))])
+        yield _FakeChunk(
+            choices=[
+                _FakeChoice(
+                    _FakeDelta(
+                        tool_calls=[
+                            _FakeToolCallDelta(
+                                index=index,
+                                id=block["id"],
+                                name=block["name"],
+                                arguments="".join(block["json_parts"]),
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
 
     yield _FakeChunk(usage=_FakeUsage(input_tokens, output_tokens))
 
@@ -534,6 +633,7 @@ class _AnthropicNonStreamResponse:
     """Mimics openai.types.chat.ChatCompletion's `.choices[0].message.content`
     surface for a non-streaming Anthropic Messages API response — used by
     agllm.compact(), which doesn't stream."""
+
     __slots__ = ("choices",)
 
     def __init__(self, anthropic_message) -> None:
@@ -563,9 +663,18 @@ class _AnthropicBedrockCompletions:
         self._client = anthropic_client
 
     def create(
-        self, *, model, messages, stream=False, stream_options=None,
-        max_tokens=None, temperature=None, top_p=None, tools=None,
-        extra_body=None, **_ignored,
+        self,
+        *,
+        model,
+        messages,
+        stream=False,
+        stream_options=None,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        tools=None,
+        extra_body=None,
+        **_ignored,
     ):
         system, anthropic_messages = _openai_messages_to_anthropic(messages)
         kwargs: dict = dict(
@@ -595,7 +704,9 @@ class _AnthropicBedrockCompletions:
             # standard multi-turn caching pattern. Earlier breakpoints don't
             # need to be resent; they remain valid read points.
             anthropic_messages[-1] = dict(anthropic_messages[-1])
-            anthropic_messages[-1]["content"] = _with_cache_control(anthropic_messages[-1]["content"])
+            anthropic_messages[-1]["content"] = _with_cache_control(
+                anthropic_messages[-1]["content"]
+            )
 
         if not stream:
             return _AnthropicNonStreamResponse(self._client.messages.create(**kwargs))
@@ -627,6 +738,7 @@ class _AnthropicBedrockChatClient:
 # ---------------------------------------------------------------------------
 # Backend classes
 # ---------------------------------------------------------------------------
+
 
 class agllm_backend(AgLLMBackendFields):
     """One backend instance per agconfig — knows how to build a client and
@@ -720,9 +832,9 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
     every Bedrock model except Anthropic's own (see module docstring above)."""
 
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
-        region  = self.region or "us-east-1"
+        region = self.region or "us-east-1"
         api_key = self.api_key or os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or None
-        mantle_url  = f"https://bedrock-mantle.{region}.api.aws/v1"
+        mantle_url = f"https://bedrock-mantle.{region}.api.aws/v1"
         runtime_url = f"https://bedrock-runtime.{region}.amazonaws.com"
         # A Bedrock API key (e.g. "ABSK...") is a single opaque bearer token
         # for the Mantle gateway. AWS access/secret key pairs for SigV4 signing
@@ -733,6 +845,7 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
         if not api_key:
             try:
                 from aws_bedrock_token_generator import provide_token as _provide_token
+
                 os.environ.setdefault("AWS_DEFAULT_REGION", region)
                 token = _provide_token(region=region)
                 return openai.OpenAI(api_key=token, base_url=mantle_url, timeout=timeout)
@@ -772,8 +885,7 @@ class _AnthropicBedrockBackend(agllm_backend):
     def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
         if _anthropic_sdk is None:
             raise RuntimeError(
-                "Anthropic models on Bedrock require the 'anthropic' package: "
-                "pip install anthropic"
+                "Anthropic models on Bedrock require the 'anthropic' package: pip install anthropic"
             )
         region = self.region or "us-east-1"
         anthropic_client = _anthropic_sdk.AnthropicBedrock(aws_region=region, timeout=timeout)
@@ -888,7 +1000,9 @@ class _AnthropicBackend(agllm_backend):
         # the real /v1/models listing is only on the raw anthropic client.
         if _anthropic_sdk is None:
             return []
-        client = _anthropic_sdk.Anthropic(**self._client_kwargs(httpx.Timeout(self.model_listing_timeout_seconds)))
+        client = _anthropic_sdk.Anthropic(
+            **self._client_kwargs(httpx.Timeout(self.model_listing_timeout_seconds))
+        )
         return list(client.models.list())
 
     def tokenize_url(self) -> "str | None":

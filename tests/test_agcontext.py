@@ -1,4 +1,5 @@
 """Tests for agcontext — conversation state container."""
+
 from concurrent.futures import Future
 
 from agency.agcontext import agcontext
@@ -7,6 +8,7 @@ from agency.agcontext import agcontext
 # ---------------------------------------------------------------------------
 # Construction and defaults
 # ---------------------------------------------------------------------------
+
 
 def test_default_construction():
     ctx = agcontext()
@@ -19,8 +21,9 @@ def test_default_construction():
 
 def test_construction_with_values():
     msgs = [{"role": "user", "content": "hi"}]
-    ctx = agcontext(messages=msgs, total_input_tokens=10, total_output_tokens=5,
-                    compaction_summary="summary")
+    ctx = agcontext(
+        messages=msgs, total_input_tokens=10, total_output_tokens=5, compaction_summary="summary"
+    )
     assert ctx.messages is msgs
     assert ctx.total_input_tokens == 10
     assert ctx.total_output_tokens == 5
@@ -38,6 +41,7 @@ def test_messages_default_is_empty_list_not_shared():
 # is_pending
 # ---------------------------------------------------------------------------
 
+
 def test_is_pending_false_when_no_future():
     assert agcontext().is_pending() is False
 
@@ -51,8 +55,11 @@ def test_is_pending_true_when_future_set():
 def test_is_pending_false_after_resolve():
     f: Future[agcontext] = Future()
     ctx = agcontext(_future=f)
-    resolved = agcontext(messages=[{"role": "user", "content": "resolved"}],
-                         total_input_tokens=7, total_output_tokens=3)
+    resolved = agcontext(
+        messages=[{"role": "user", "content": "resolved"}],
+        total_input_tokens=7,
+        total_output_tokens=3,
+    )
     f.set_result(resolved)
     ctx.resolve_prev_dependencies()
     assert ctx.is_pending() is False
@@ -61,6 +68,7 @@ def test_is_pending_false_after_resolve():
 # ---------------------------------------------------------------------------
 # resolve_prev_dependencies
 # ---------------------------------------------------------------------------
+
 
 def test_resolve_no_op_when_not_pending():
     ctx = agcontext(messages=[{"role": "user", "content": "x"}], total_input_tokens=1)
@@ -98,12 +106,14 @@ def test_resolve_clears_future():
 
 def test_resolve_blocks_until_future_set():
     import threading
+
     f: Future[agcontext] = Future()
     ctx = agcontext(_future=f)
-    result = []
 
     def setter():
-        import time; time.sleep(0.05)
+        import time
+
+        time.sleep(0.05)
         f.set_result(agcontext(total_input_tokens=99))
 
     t = threading.Thread(target=setter, daemon=True)
@@ -125,6 +135,7 @@ def test_resolve_is_idempotent():
 # ---------------------------------------------------------------------------
 # copy
 # ---------------------------------------------------------------------------
+
 
 def test_copy_returns_new_instance():
     ctx = agcontext(messages=[{"role": "user", "content": "a"}], total_input_tokens=3)
@@ -174,6 +185,7 @@ def test_copy_does_not_carry_future():
 # ---------------------------------------------------------------------------
 # __repr__
 # ---------------------------------------------------------------------------
+
 
 def test_repr_not_pending():
     ctx = agcontext(

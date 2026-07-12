@@ -1,4 +1,5 @@
 """Tests for aglog — automatic skill call logging on agent."""
+
 import pytest
 from agency.agdata import agdata
 from agency.agskill import agskill
@@ -17,10 +18,13 @@ def make_agent(tools=None) -> agent:
 
 def make_skill(name: str = "s", out: dict | None = None):
     from agency.agcontext import agcontext
+
     sk = agskill(name, "")
+
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
         return agdata(**(out or {"ok": True})), agcontext(messages=new_msgs), []
+
     sk.execute_react = fake_execute_react
     return sk
 
@@ -28,6 +32,7 @@ def make_skill(name: str = "s", out: dict | None = None):
 # ---------------------------------------------------------------------------
 # Basic structure
 # ---------------------------------------------------------------------------
+
 
 def test_agent_has_log():
     ag = make_agent()
@@ -48,7 +53,7 @@ def test_log_records_after_run():
     skill = make_skill("search")
     ag = make_agent()
     result = ag.run(skill, agdata(query="test"))
-    _ = result.ok   # wait for completion
+    _ = result.ok  # wait for completion
     assert len(ag.log) == 1
 
 
@@ -62,19 +67,20 @@ def test_log_entry_fields():
     assert entry["skill"] == "s"
     assert entry["input"] == {"x": 1}
     assert entry["output"] == {"value": 42}
-    assert entry["history_len"] == 1   # one message appended
+    assert entry["history_len"] == 1  # one message appended
     assert "ts_start" in entry
     assert "ts_end" in entry
 
 
 def test_log_timestamps_are_iso8601():
     from datetime import datetime
+
     skill = make_skill()
     ag = make_agent()
     _ = ag.run(skill, agdata()).ok
 
     e = ag.log.entries[0]
-    datetime.fromisoformat(e["ts_start"])   # raises if invalid
+    datetime.fromisoformat(e["ts_start"])  # raises if invalid
     datetime.fromisoformat(e["ts_end"])
 
 
@@ -91,13 +97,14 @@ def test_log_ts_end_after_ts_start():
 # Multiple calls accumulate in order
 # ---------------------------------------------------------------------------
 
+
 def test_log_accumulates_multiple_calls():
     skill_a = make_skill("a")
     skill_b = make_skill("b")
     ag = make_agent()
     ag.run(skill_a, agdata(step=1))
     ag.run(skill_b, agdata(step=2))
-    _ = ag.history   # wait for both
+    _ = ag.history  # wait for both
 
     assert len(ag.log) == 2
     assert ag.log.entries[0]["skill"] == "a"
@@ -113,12 +120,13 @@ def test_log_history_len_grows():
 
     lens = [e["history_len"] for e in ag.log.entries]
     assert lens[0] == 1
-    assert lens[1] == 2   # history grows with each call
+    assert lens[1] == 2  # history grows with each call
 
 
 # ---------------------------------------------------------------------------
 # Error path is also logged
 # ---------------------------------------------------------------------------
+
 
 def test_invalid_skill_arg_raises_and_nothing_logged():
     ag = make_agent()
@@ -132,22 +140,24 @@ def test_invalid_skill_arg_raises_and_nothing_logged():
 # Fork gets a fresh empty log
 # ---------------------------------------------------------------------------
 
+
 def test_fork_has_independent_log():
     skill = make_skill("s")
     ag = make_agent()
-    _ = ag.run(skill, agdata()).ok   # parent logs one call
+    _ = ag.run(skill, agdata()).ok  # parent logs one call
 
     fork = agent.fork(ag)
-    assert len(fork.log) == 0   # fork starts fresh
+    assert len(fork.log) == 0  # fork starts fresh
 
     _ = fork.run(skill, agdata()).ok
     assert len(fork.log) == 1
-    assert len(ag.log) == 1   # parent unaffected
+    assert len(ag.log) == 1  # parent unaffected
 
 
 # ---------------------------------------------------------------------------
 # dump() output
 # ---------------------------------------------------------------------------
+
 
 def test_dump_empty():
     ag = make_agent()
@@ -165,6 +175,7 @@ def test_dump_contains_skill_name():
 # ---------------------------------------------------------------------------
 # Lifecycle events
 # ---------------------------------------------------------------------------
+
 
 def test_created_event_logged():
     ag = make_agent()
@@ -192,7 +203,7 @@ def test_forked_agent_has_own_agname():
 
 def test_destroyed_event_logged():
     ag = make_agent()
-    log = ag.log          # keep a reference to the log after the agent dies
+    log = ag.log  # keep a reference to the log after the agent dies
     del ag
     events = log.events
     assert events[-1]["event"] == "destroyed"
@@ -203,7 +214,7 @@ def test_events_includes_skill_and_lifecycle():
     ag = make_agent()
     _ = ag.run(skill, agdata()).ok
     types = [e["type"] for e in ag.log.events]
-    assert "lifecycle" in types   # at least the "created" event
+    assert "lifecycle" in types  # at least the "created" event
     assert "skill" in types
 
 
@@ -228,10 +239,12 @@ def test_dump_shows_lifecycle_and_skills():
 # change_config / get_config_copy
 # ---------------------------------------------------------------------------
 
+
 def test_log_change_config_replaces_agconfig():
     log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
     log.change_config(agConfig({"agllm_backend": {"temperature": 0.2}}))
     assert log._agconfig.get("agllm_backend", "temperature") == 0.2
+
 
 def test_log_change_config_clones_given_agconfig():
     log = aglog(agconfig=agConfig())
@@ -240,15 +253,18 @@ def test_log_change_config_clones_given_agconfig():
     new_cfg.agllm_backend.temperature = 0.9
     assert log._agconfig.get("agllm_backend", "temperature") == 0.2
 
+
 def test_log_get_config_copy_returns_clone_not_same_object():
     cfg = agConfig({"agllm_backend": {"temperature": 0.7}})
     log = aglog(agconfig=cfg)
     copy = log.get_config_copy()
     assert copy is not log._agconfig
 
+
 def test_log_get_config_copy_reflects_current_values():
     log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
     assert log.get_config_copy().agllm_backend.temperature == 0.7
+
 
 def test_mutating_log_get_config_copy_does_not_affect_log():
     log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
@@ -256,9 +272,11 @@ def test_mutating_log_get_config_copy_does_not_affect_log():
     copy.agllm_backend.temperature = 0.1
     assert log._agconfig.get("agllm_backend", "temperature") == 0.7
 
+
 def test_log_get_config_copy_none_when_no_agconfig():
     log = aglog()
     assert log.get_config_copy() is None
+
 
 def test_log_change_config_none_clears_agconfig():
     log = aglog(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))

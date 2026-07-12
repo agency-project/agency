@@ -30,11 +30,11 @@ class agcontext:
         compaction_summary: "str | None" = None,
         _future: "Future[agcontext] | None" = None,
     ) -> None:
-        self.messages            = messages if messages is not None else []
-        self.total_input_tokens  = total_input_tokens
+        self.messages = messages if messages is not None else []
+        self.total_input_tokens = total_input_tokens
         self.total_output_tokens = total_output_tokens
-        self.compaction_summary  = compaction_summary
-        self._future             = _future
+        self.compaction_summary = compaction_summary
+        self._future = _future
 
     # ------------------------------------------------------------------
     # Future / lazy-resolution support
@@ -49,11 +49,11 @@ class agcontext:
             return
         with agpause.note_blocked_on(agpause.producer_of(self._future)):
             prev_ctx = self._future.result()
-        self.messages            = prev_ctx.messages
-        self.total_input_tokens  = prev_ctx.total_input_tokens
+        self.messages = prev_ctx.messages
+        self.total_input_tokens = prev_ctx.total_input_tokens
         self.total_output_tokens = prev_ctx.total_output_tokens
-        self.compaction_summary  = prev_ctx.compaction_summary
-        self._future             = None
+        self.compaction_summary = prev_ctx.compaction_summary
+        self._future = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -72,10 +72,10 @@ class agcontext:
         """Return a deep copy of the resolved context (blocks if pending)."""
         self.resolve_prev_dependencies()
         return agcontext(
-            messages            = copy.deepcopy(self.messages),
-            total_input_tokens  = self.total_input_tokens,
-            total_output_tokens = self.total_output_tokens,
-            compaction_summary  = self.compaction_summary,
+            messages=copy.deepcopy(self.messages),
+            total_input_tokens=self.total_input_tokens,
+            total_output_tokens=self.total_output_tokens,
+            compaction_summary=self.compaction_summary,
         )
 
     def __repr__(self) -> str:

@@ -3,6 +3,7 @@
 Includes agLLMBackendConfig/agllm_backend tests (formerly test_agllmconfig.py
 -- moved here since it's the same config system, just exercised through a
 real framework owner instead of test-only ones)."""
+
 import httpx
 import pytest
 from unittest.mock import MagicMock, patch
@@ -54,16 +55,17 @@ def _cfg(**fields) -> agConfig:
 # process-wide FIELD_REGISTRY / GLOBAL singleton.
 # ---------------------------------------------------------------------------
 
+
 class _OwnerA:
     # Each GlobalConfigParam field below is touched by exactly one test --
     # tier-1 fields lock process-wide on first read, so reusing a field
     # across tests would make results depend on test execution order.
-    tier1_lifecycle       = GlobalConfigParam("test_agconfig_a", default=1)
-    tier1_shared          = GlobalConfigParam("test_agconfig_a", default=2)
+    tier1_lifecycle = GlobalConfigParam("test_agconfig_a", default=1)
+    tier1_shared = GlobalConfigParam("test_agconfig_a", default=2)
     tier1_ownerview_route = GlobalConfigParam("test_agconfig_a", default=3)
-    tier2_field           = StaticConfigParam("test_agconfig_a", default="static-default")
-    tier3_field           = DynamicConfigParam("test_agconfig_a", default="dynamic-default")
-    shared_name           = DynamicConfigParam("test_agconfig_a", default="a-default")
+    tier2_field = StaticConfigParam("test_agconfig_a", default="static-default")
+    tier3_field = DynamicConfigParam("test_agconfig_a", default="dynamic-default")
+    shared_name = DynamicConfigParam("test_agconfig_a", default="a-default")
 
     def __init__(self, agconfig: "agConfig | None" = None) -> None:
         self._agconfig = agconfig
@@ -72,6 +74,7 @@ class _OwnerA:
 class _OwnerB:
     """A second owner with a field of the same name as _OwnerA's, to prove
     no collision/ambiguity across owners."""
+
     shared_name = DynamicConfigParam("test_agconfig_b", default="b-default")
 
     def __init__(self, agconfig: "agConfig | None" = None) -> None:
@@ -81,6 +84,7 @@ class _OwnerB:
 # ---------------------------------------------------------------------------
 # Storage primitives: get / get_static / set / clone
 # ---------------------------------------------------------------------------
+
 
 def test_get_returns_default_and_never_locks():
     cfg = agConfig()
@@ -126,6 +130,7 @@ def test_clone_carries_data_but_not_lock_history():
 # dynamic_snapshot() — the webui config editor's data source
 # ---------------------------------------------------------------------------
 
+
 def test_dynamic_snapshot_includes_dynamic_field_with_default():
     cfg = agConfig()
     snap = cfg.dynamic_snapshot()
@@ -162,10 +167,12 @@ def test_dynamic_snapshot_keeps_json_safe_containers():
 
 
 def test_dynamic_snapshot_two_owners_do_not_collide():
-    cfg = agConfig({
-        "test_agconfig_a": {"shared_name": "from-a"},
-        "test_agconfig_b": {"shared_name": "from-b"},
-    })
+    cfg = agConfig(
+        {
+            "test_agconfig_a": {"shared_name": "from-a"},
+            "test_agconfig_b": {"shared_name": "from-b"},
+        }
+    )
     snap = cfg.dynamic_snapshot()
     assert snap["test_agconfig_a"]["shared_name"] == "from-a"
     assert snap["test_agconfig_b"]["shared_name"] == "from-b"
@@ -190,6 +197,7 @@ def test_dict_based_init_does_not_alias_input():
 # no instance of the owning class required.
 # ---------------------------------------------------------------------------
 
+
 def test_fields_registered_without_constructing_any_instance():
     assert ("test_agconfig_a", "tier1_lifecycle") in agConfig.FIELD_REGISTRY
     assert ("test_agconfig_a", "tier2_field") in agConfig.FIELD_REGISTRY
@@ -204,6 +212,7 @@ def test_fields_registered_without_constructing_any_instance():
 
 def test_duplicate_registration_raises_at_class_definition_time():
     with pytest.raises(ValueError, match="already registered"):
+
         class _Colliding:
             tier2_field = StaticConfigParam("test_agconfig_a", default="oops")
 
@@ -219,6 +228,7 @@ def test_class_level_descriptor_access_returns_descriptor_itself():
 # ---------------------------------------------------------------------------
 # Tier 1: GlobalConfigParam
 # ---------------------------------------------------------------------------
+
 
 def test_global_write_before_read_then_locks_after_read():
     # A GlobalConfigParam ignores whichever agconfig the instance holds --
@@ -257,6 +267,7 @@ def test_all_three_tiers_are_configparam_subclasses():
 # Tier 2: StaticConfigParam
 # ---------------------------------------------------------------------------
 
+
 def test_static_resolves_default_with_no_agconfig():
     obj = _OwnerA()
     assert obj.tier2_field == "static-default"
@@ -293,6 +304,7 @@ def test_static_different_instances_can_resolve_different_values():
 # Tier 3: DynamicConfigParam
 # ---------------------------------------------------------------------------
 
+
 def test_dynamic_live_read_reflects_later_writes():
     cfg = agConfig()
     obj = _OwnerA(agconfig=cfg)
@@ -319,6 +331,7 @@ def test_dynamic_without_agconfig_reads_default_and_set_raises():
 # ---------------------------------------------------------------------------
 # _OwnerView / cfg.owner.field nested syntax
 # ---------------------------------------------------------------------------
+
 
 def test_ownerview_returned_for_known_owner():
     cfg = agConfig()
@@ -374,7 +387,10 @@ def test_ownerview_global_field_write_routes_to_global_not_cfg():
     cfg.test_agconfig_a.tier1_ownerview_route = 77
     # Routed straight to GLOBAL -- cfg itself never stored it.
     assert agConfig.GLOBAL.get("test_agconfig_a", "tier1_ownerview_route") == 77
-    assert cfg.get("test_agconfig_a", "tier1_ownerview_route", "unset-on-cfg-itself") == "unset-on-cfg-itself"
+    assert (
+        cfg.get("test_agconfig_a", "tier1_ownerview_route", "unset-on-cfg-itself")
+        == "unset-on-cfg-itself"
+    )
     # Reading through the view (on this or any other agConfig instance)
     # also routes to GLOBAL and sees the same value.
     assert cfg.test_agconfig_a.tier1_ownerview_route == 77
@@ -387,9 +403,10 @@ def test_ownerview_global_field_write_routes_to_global_not_cfg():
 # these don't collide with real framework owners or with _OwnerA/_OwnerB above.
 # ---------------------------------------------------------------------------
 
+
 class _ViewOwnerFields:
-    v_global  = GlobalConfigParam("test_agconfig_view_owner", default="g-default")
-    v_static  = StaticConfigParam("test_agconfig_view_owner", default="s-default")
+    v_global = GlobalConfigParam("test_agconfig_view_owner", default="g-default")
+    v_static = StaticConfigParam("test_agconfig_view_owner", default="s-default")
     v_dynamic = DynamicConfigParam("test_agconfig_view_owner", default="d-default")
 
 
@@ -476,6 +493,7 @@ def test_two_different_view_subclasses_do_not_collide_on_same_agconfig():
 # agConfig(*sources) -- variadic merge constructor
 # ---------------------------------------------------------------------------
 
+
 def test_agconfig_no_args_is_empty():
     cfg = agConfig()
     assert cfg.data == {}
@@ -559,6 +577,7 @@ def test_clone_still_works_under_variadic_constructor():
 # real agVLLMBackendConfig/agAnthropicBackendConfig/... classes use).
 # ---------------------------------------------------------------------------
 
+
 class _RestrictedViewOwnerConfig(_ViewOwnerConfig):
     _ALLOWED_FIELDS = frozenset({"v_dynamic"})
 
@@ -595,6 +614,7 @@ def test_unrestricted_parent_view_still_accepts_everything():
 # system above (formerly test_agllmconfig.py).
 # ---------------------------------------------------------------------------
 
+
 class TestAgLLMBackendFieldDescriptors:
     def test_model_is_dynamic_config_param(self):
         assert isinstance(AgLLMBackendFields.__dict__["model"], DynamicConfigParam)
@@ -603,7 +623,9 @@ class TestAgLLMBackendFieldDescriptors:
         assert isinstance(AgLLMBackendFields.__dict__["api_key"], DynamicConfigParam)
 
     def test_model_listing_timeout_is_global_config_param(self):
-        assert isinstance(AgLLMBackendFields.__dict__["model_listing_timeout_seconds"], GlobalConfigParam)
+        assert isinstance(
+            AgLLMBackendFields.__dict__["model_listing_timeout_seconds"], GlobalConfigParam
+        )
 
     def test_default_max_tokens_is_global_config_param(self):
         assert isinstance(AgLLMBackendFields.__dict__["default_max_tokens"], GlobalConfigParam)
@@ -749,7 +771,9 @@ class TestForConfigDispatch:
         assert isinstance(agllm_backend.for_config(_cfg(model="m")), _OpenAICompatibleBackend)
 
     def test_bedrock_provider_non_anthropic_model(self):
-        backend = agllm_backend.for_config(_cfg(provider="bedrock", model="nvidia.x", region="us-east-2"))
+        backend = agllm_backend.for_config(
+            _cfg(provider="bedrock", model="nvidia.x", region="us-east-2")
+        )
         assert isinstance(backend, _OpenAICompatibleBedrockBackend)
 
     def test_bedrock_provider_anthropic_model(self):
@@ -776,7 +800,9 @@ class TestAttributeBackedClientConstruction:
         backend = _OpenAICompatibleBackend(_cfg(api_key="k", base_url="http://x/v1"))
         with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
-        MockCls.assert_called_once_with(api_key="k", base_url="http://x/v1", timeout=httpx.Timeout(5.0))
+        MockCls.assert_called_once_with(
+            api_key="k", base_url="http://x/v1", timeout=httpx.Timeout(5.0)
+        )
 
     def test_anthropic_backend_uses_api_key_attribute(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID", raising=False)
@@ -787,15 +813,22 @@ class TestAttributeBackedClientConstruction:
         mock_sdk.Anthropic.assert_called_once_with(api_key="sk-ant-x", timeout=httpx.Timeout(5.0))
 
     def test_anthropic_aws_backend_uses_credential_attributes(self):
-        backend = _AnthropicAWSBackend(_cfg(
-            api_key="aws-api-key", region="us-east-2", workspace_id="wrkspc_test",
-        ))
+        backend = _AnthropicAWSBackend(
+            _cfg(
+                api_key="aws-api-key",
+                region="us-east-2",
+                workspace_id="wrkspc_test",
+            )
+        )
         mock_sdk = MagicMock()
         mock_sdk.AnthropicAWS = MagicMock()
         with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(30.0))
         mock_sdk.AnthropicAWS.assert_called_once_with(
-            timeout=httpx.Timeout(30.0), api_key="aws-api-key", aws_region="us-east-2", workspace_id="wrkspc_test",
+            timeout=httpx.Timeout(30.0),
+            api_key="aws-api-key",
+            aws_region="us-east-2",
+            workspace_id="wrkspc_test",
         )
 
 
@@ -806,7 +839,10 @@ class TestAgllmUsesAgConfig:
         assert isinstance(llm.backend, _OpenAICompatibleBackend)
 
     def test_agllm_backend_attributes_reflect_config(self):
-        llm = agllm(_cfg(model="claude-sonnet-5", temperature=0.3, provider="anthropic"), context_limit=128_000)
+        llm = agllm(
+            _cfg(model="claude-sonnet-5", temperature=0.3, provider="anthropic"),
+            context_limit=128_000,
+        )
         assert llm.backend.model == "claude-sonnet-5"
         assert llm.backend.temperature == 0.3
 
@@ -822,6 +858,7 @@ class TestAgllmUsesAgConfig:
 # auto-set (non-overridable), _ALLOWED_FIELDS restriction, and for_config()
 # dispatch actually landing on the matching backend.
 # ---------------------------------------------------------------------------
+
 
 class TestProviderBackendConfigClasses:
     def test_vllm_config_fixes_provider(self):
@@ -847,7 +884,9 @@ class TestProviderBackendConfigClasses:
             agVLLMBackendConfig(provider="bedrock")
 
     def test_vllm_config_accepts_sampling_extensions(self):
-        cfg = agConfig(agVLLMBackendConfig(model="m", top_k=40, repetition_penalty=1.1, guided_json="{}"))
+        cfg = agConfig(
+            agVLLMBackendConfig(model="m", top_k=40, repetition_penalty=1.1, guided_json="{}")
+        )
         assert cfg.agllm_backend.top_k == 40
         assert cfg.agllm_backend.repetition_penalty == 1.1
 
@@ -861,14 +900,22 @@ class TestProviderBackendConfigClasses:
                 agAnthropicBackendConfig(model="m", **{bad_field: 1})
 
     def test_anthropic_config_accepts_the_fields_its_adapter_uses(self):
-        cfg = agConfig(agAnthropicBackendConfig(
-            model="claude-sonnet-5", api_key="k", workspace_id="w", temperature=0.5, max_completion_tokens=1000,
-        ))
+        cfg = agConfig(
+            agAnthropicBackendConfig(
+                model="claude-sonnet-5",
+                api_key="k",
+                workspace_id="w",
+                temperature=0.5,
+                max_completion_tokens=1000,
+            )
+        )
         assert cfg.agllm_backend.temperature == 0.5
         assert cfg.agllm_backend.workspace_id == "w"
 
     def test_bedrock_config_accepts_region_and_full_generation_surface(self):
-        cfg = agConfig(agBedrockBackendConfig(model="minimax.minimax-m2", region="us-east-1", top_k=40))
+        cfg = agConfig(
+            agBedrockBackendConfig(model="minimax.minimax-m2", region="us-east-1", top_k=40)
+        )
         assert cfg.agllm_backend.region == "us-east-1"
         assert cfg.agllm_backend.top_k == 40
 
@@ -894,7 +941,9 @@ class TestProviderBackendConfigClasses:
         assert isinstance(agllm_backend.for_config(cfg), _OpenAICompatibleBedrockBackend)
 
     def test_bedrock_config_routes_to_anthropic_bedrock_for_anthropic_model(self):
-        cfg = agConfig(agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5", region="us-east-1"))
+        cfg = agConfig(
+            agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5", region="us-east-1")
+        )
         assert isinstance(agllm_backend.for_config(cfg), _AnthropicBedrockBackend)
 
     def test_two_provider_configs_composed_stay_independent(self):
@@ -919,14 +968,14 @@ class TestProviderBackendConfigClasses:
 # ---------------------------------------------------------------------------
 
 _DYNAMIC_OWNER_CASES = [
-    (agLogConfig,        "aglog",         "dump_content_truncate_len", 999),
-    (agAgentConfig,      "agent",         "checkpoint_save_timeout_s", 111),
-    (agSkillConfig,      "agskill",       "react_max_steps",           7),
-    (agLLMConfig,        "agllm",         "max_retries",                1),
-    (agSchemaConfig,     "agschema",      "input_offload_chars",        123),
-    (agToolConfig,       "agtool",        "timeout_s",                  45),
-    (agLLMBackendConfig, "agllm_backend", "model",                      "sweep-model"),
-    (agResourcePoolConfig, "agResourcePool", "idle_cpus",                2.0),
+    (agLogConfig, "aglog", "dump_content_truncate_len", 999),
+    (agAgentConfig, "agent", "checkpoint_save_timeout_s", 111),
+    (agSkillConfig, "agskill", "react_max_steps", 7),
+    (agLLMConfig, "agllm", "max_retries", 1),
+    (agSchemaConfig, "agschema", "input_offload_chars", 123),
+    (agToolConfig, "agtool", "timeout_s", 45),
+    (agLLMBackendConfig, "agllm_backend", "model", "sweep-model"),
+    (agResourcePoolConfig, "agResourcePool", "idle_cpus", 2.0),
 ]
 
 
@@ -946,7 +995,9 @@ class TestDynamicFieldSweepAcrossOwners:
         config_cls(cfg).update(**{field: value})
         assert cfg.get(owner, field) == value
 
-    def test_composes_alongside_a_different_owner_in_one_call(self, config_cls, owner, field, value):
+    def test_composes_alongside_a_different_owner_in_one_call(
+        self, config_cls, owner, field, value
+    ):
         cfg = agConfig(config_cls(**{field: value}), agUtilConfig())
         assert cfg.get(owner, field) == value
 
@@ -955,6 +1006,7 @@ class TestDynamicFieldSweepAcrossOwners:
 # Static field (agSandbox.base_image is the only one in the framework) --
 # fresh agConfig per case, since Static locks per-instance, not process-wide.
 # ---------------------------------------------------------------------------
+
 
 class TestStaticFieldAcrossOwners:
     def test_base_image_settable_before_any_read(self):
@@ -985,12 +1037,12 @@ class TestStaticFieldAcrossOwners:
 # ---------------------------------------------------------------------------
 
 _GLOBAL_OWNER_CASES = [
-    (_AgLLMFields,          "agllm",          "call_max_concurrency"),
-    (_AgToolFields,         "agtool",         "pool_max_workers"),
-    (_AgSandboxFields,      "agSandbox",      "docker_semaphore_limit"),
+    (_AgLLMFields, "agllm", "call_max_concurrency"),
+    (_AgToolFields, "agtool", "pool_max_workers"),
+    (_AgSandboxFields, "agSandbox", "docker_semaphore_limit"),
     (_AgResourcePoolFields, "agResourcePool", "memory_detect_fallback_mb"),
-    (_AgUtilFields,         "agutil",         "idle_check_interval_s"),
-    (AgLLMBackendFields,    "agllm_backend",  "default_max_tokens"),
+    (_AgUtilFields, "agutil", "idle_check_interval_s"),
+    (AgLLMBackendFields, "agllm_backend", "default_max_tokens"),
 ]
 
 
@@ -1013,6 +1065,7 @@ class TestGlobalFieldSweepAcrossOwners:
 # instead of a separate constant -- verify that accessor still resolves to
 # the expected value for every field this session's refactor touched.
 # ---------------------------------------------------------------------------
+
 
 def test_sandbox_base_image_default_accessor():
     assert _AgSandboxFields.base_image.default == "agency-sandbox:latest"

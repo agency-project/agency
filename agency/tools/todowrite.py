@@ -39,7 +39,10 @@ todowrite = agtool(
                     "type": "object",
                     "properties": {
                         "content": {"type": "string", "description": "Task description"},
-                        "status": {"type": "string", "description": "pending | in_progress | completed | cancelled"},
+                        "status": {
+                            "type": "string",
+                            "description": "pending | in_progress | completed | cancelled",
+                        },
                         "priority": {"type": "string", "description": "high | medium | low"},
                     },
                     "required": ["content", "status", "priority"],

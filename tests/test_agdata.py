@@ -39,7 +39,9 @@ def test_from_json():
 def test_from_json_normalizes_camel_case_keys():
     """Some LLMs emit tool-call arguments in camelCase even when the tool
     schema declares snake_case params -- from_json() tolerates this."""
-    d = agdata.from_json('{"filePath": "/tmp/x.txt", "oldString": "a", "newString": "b", "replaceAll": true}')
+    d = agdata.from_json(
+        '{"filePath": "/tmp/x.txt", "oldString": "a", "newString": "b", "replaceAll": true}'
+    )
     assert d.file_path == "/tmp/x.txt"
     assert d.old_string == "a"
     assert d.new_string == "b"
@@ -107,8 +109,10 @@ def test_messages_pattern():
 # Pending state
 # ---------------------------------------------------------------------------
 
+
 def test_pending_agdata_resolves_on_field_access():
     from concurrent.futures import Future
+
     f: Future[agdata] = Future()
     pending = agdata(_future=f)
     assert pending.is_pending() is True
@@ -120,6 +124,7 @@ def test_pending_agdata_resolves_on_field_access():
 
 def test_pending_agdata_resolves_on_to_dict():
     from concurrent.futures import Future
+
     f: Future[agdata] = Future()
     f.set_result(agdata(x=1, y=2))
     pending = agdata(_future=f)
@@ -128,16 +133,19 @@ def test_pending_agdata_resolves_on_to_dict():
 
 def test_pending_agdata_resolves_on_to_json():
     from concurrent.futures import Future
+
     f: Future[agdata] = Future()
     f.set_result(agdata(val="hello"))
     pending = agdata(_future=f)
     import json as _json
+
     assert _json.loads(pending.to_json()) == {"val": "hello"}
 
 
 # ---------------------------------------------------------------------------
 # Error emission
 # ---------------------------------------------------------------------------
+
 
 class TestErrorEmission:
     def test_error_string_prints_to_stderr(self):
@@ -150,6 +158,7 @@ class TestErrorEmission:
     def test_error_string_contains_timestamp(self):
         """Emitted line includes a HH:MM:SS timestamp."""
         import re
+
         buf = io.StringIO()
         with patch("agency.agterm.sys.stderr", buf):
             agerror("ts check")
@@ -211,6 +220,7 @@ class TestErrorEmission:
 
 def test_pending_repr_before_resolution():
     from concurrent.futures import Future
+
     f: Future[agdata] = Future()
     pending = agdata(_future=f)
     assert "pending" in repr(pending)
@@ -218,6 +228,7 @@ def test_pending_repr_before_resolution():
 
 def test_pending_repr_after_resolution():
     from concurrent.futures import Future
+
     f: Future[agdata] = Future()
     f.set_result(agdata(x=99))
     pending = agdata(_future=f)
@@ -227,6 +238,7 @@ def test_pending_repr_after_resolution():
 
 def test_pending_equality_resolves_both():
     from concurrent.futures import Future
+
     f1: Future[agdata] = Future()
     f2: Future[agdata] = Future()
     f1.set_result(agdata(v=1))
@@ -237,4 +249,3 @@ def test_pending_equality_resolves_both():
 def test_normal_agdata_pending_is_false():
     d = agdata(x=1)
     assert d.is_pending() is False
-

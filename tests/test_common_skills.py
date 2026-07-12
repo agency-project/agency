@@ -1,4 +1,5 @@
 """Tests for agency/common_skills/ (agplan and agbuild)."""
+
 from agency.common_skills.agplan import agplan
 from agency.common_skills.agbuild import agbuild
 

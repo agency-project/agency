@@ -25,6 +25,7 @@ Run:
     uv run python examples/sandbox_handoff.py
     LLM_MODEL=gpt-4o uv run python examples/sandbox_handoff.py
 """
+
 import os
 from pathlib import Path
 from datetime import datetime
@@ -81,6 +82,7 @@ fix_skill = agskill(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _sep(title: str) -> None:
     print(f"\n{'─' * 60}")
     print(f"  {title}")
@@ -97,7 +99,7 @@ def _run_file(sandbox, label: str) -> None:
 def main() -> None:
     run_dir = Path("runs") / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_sandbox_handoff"
     run_dir.mkdir(parents=True, exist_ok=True)
-    agent.log_dir    = run_dir / "logs"
+    agent.log_dir = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
 
     print(f"Run dir : {run_dir}\n")
@@ -120,7 +122,7 @@ def main() -> None:
     # ── Step 2: harness gets the sandbox and runs the file ───────────────────
     _sep("Step 2 — harness takes the sandbox and runs hello.py")
 
-    sandbox = agent_a.sandbox    # ← the sandbox agent_a's skill run just used
+    sandbox = agent_a.sandbox  # ← the sandbox agent_a's skill run just used
     assert sandbox is not None, "sandbox not started — did the skill run complete?"
 
     content_before = sandbox.read_file(FILE_PATH)
@@ -135,8 +137,7 @@ def main() -> None:
     # with                       print(Hello External World)
     # — the string is no longer quoted, which is a SyntaxError.
     patch_cmd = (
-        r"""sed -i "s/print(['\"]Hello World['\"])/print(Hello External World)/g" """
-        + FILE_PATH
+        r"""sed -i "s/print(['\"]Hello World['\"])/print(Hello External World)/g" """ + FILE_PATH
     )
     _, rc = sandbox.exec(patch_cmd)
     print(f"  sed exit code  : {rc}")
@@ -181,4 +182,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     from agency.agwebui import agwebui
+
     agwebui.run(main, port=8007)

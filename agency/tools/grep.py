@@ -12,7 +12,9 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-GREP_EXEC_TIMEOUT_SECS = 30  # Maximum seconds to wait for the rg command to complete inside the sandbox container.
+GREP_EXEC_TIMEOUT_SECS = (
+    30  # Maximum seconds to wait for the rg command to complete inside the sandbox container.
+)
 
 _LIMIT = 100
 _MAX_LINE_LEN = 2000
@@ -21,7 +23,10 @@ _GREP_PARAMS = {
     "type": "object",
     "properties": {
         "pattern": {"type": "string", "description": "Regex pattern to search for"},
-        "path": {"type": "string", "description": "File or directory to search (defaults to /workspace)"},
+        "path": {
+            "type": "string",
+            "description": "File or directory to search (defaults to /workspace)",
+        },
         "include": {"type": "string", "description": "File glob filter (e.g. '*.py')"},
     },
     "required": ["pattern"],
@@ -30,6 +35,7 @@ _GREP_PARAMS = {
 
 def make_grep(sandbox: "agSandbox") -> agtool:
     """Return a grep tool that searches file contents inside *sandbox*'s container."""
+
     def _run_sandboxed(arg: agdata) -> agdata:
         pattern: str = str(arg.pattern)  # type: ignore[arg-type]
         path: str = str(getattr(arg, "path", "/workspace") or "/workspace")
@@ -51,11 +57,13 @@ def make_grep(sandbox: "agSandbox") -> agtool:
             if obj.get("type") != "match":
                 continue
             data = obj["data"]
-            matches.append({
-                "path": data["path"]["text"],
-                "line": data["line_number"],
-                "text": data["lines"]["text"],
-            })
+            matches.append(
+                {
+                    "path": data["path"]["text"],
+                    "line": data["line_number"],
+                    "text": data["lines"]["text"],
+                }
+            )
 
         truncated = len(matches) > _LIMIT
         matches = matches[:_LIMIT]
@@ -69,10 +77,12 @@ def make_grep(sandbox: "agSandbox") -> agtool:
         if tool._term is None:
             return
         pattern = str(arg._data.get("pattern", "?"))
-        rdata   = result._data
-        count   = rdata.get("count", "?")
-        trunc   = " [truncated]" if rdata.get("truncated", False) else ""
-        tool._term.log("TOOL ✓   ", f"grep  {pattern!r}  → {count} matches{trunc}  ({elapsed_ms}ms)")
+        rdata = result._data
+        count = rdata.get("count", "?")
+        trunc = " [truncated]" if rdata.get("truncated", False) else ""
+        tool._term.log(
+            "TOOL ✓   ", f"grep  {pattern!r}  → {count} matches{trunc}  ({elapsed_ms}ms)"
+        )
         if tool._aglog is not None:
             tool._aglog._tool_call(tool.name, arg.to_dict(), result.to_dict(), elapsed_ms)
 

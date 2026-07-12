@@ -17,6 +17,7 @@ from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
 from .aglog import _ts
 
+
 # Exists only to register agskill's config fields (via __set_name__ at import
 # time). Constants are plain class attributes (not descriptors) so other code
 # in this file needing the same hardcoded value can reference it directly.
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 # Skill class
 # ---------------------------------------------------------------------------
 
+
 class agskill:
     """A named skill with its own system prompt and a self-contained ReAct loop.
 
@@ -85,7 +87,7 @@ class agskill:
         self.system_prompt = system_prompt
         self.add_tools = add_tools
         self.replace_tools = [] if plan_mode else replace_tools
-        self.input_schema  = agschema(input_schema)  if input_schema  else None
+        self.input_schema = agschema(input_schema) if input_schema else None
         self.output_schema = agschema(output_schema) if output_schema else None
         self.max_output_schema_retries = max_output_schema_retries
 
@@ -100,13 +102,13 @@ class agskill:
         # lines describing how the LLM should handle that field (e.g. file paths,
         # binary encoding).  Collect these for both input and output schemas.
         extra_lines: list[str] = []
-        for key, hint in (self.input_schema._data.items() if self.input_schema else []):
+        for key, hint in self.input_schema._data.items() if self.input_schema else []:
             cls = agtype.from_hint(hint)
             if cls is not None:
                 line = cls.extra_input_prompt(key)
                 if line:
                     extra_lines.append(line)
-        for key, hint in (self.output_schema._data.items() if self.output_schema else []):
+        for key, hint in self.output_schema._data.items() if self.output_schema else []:
             cls = agtype.from_hint(hint)
             if cls is not None:
                 line = cls.extra_output_prompt(key, self.name)
@@ -117,8 +119,7 @@ class agskill:
         if extra_lines:
             parts.append(
                 "\nFile-backed fields — WARNING: these files are temporary and will "
-                "be automatically deleted after this task ends:\n"
-                + "\n".join(extra_lines)
+                "be automatically deleted after this task ends:\n" + "\n".join(extra_lines)
             )
 
         # Caller-supplied extra prompt (e.g. compaction summary injection).
@@ -133,15 +134,14 @@ class agskill:
         if self.output_schema is not None:
             if self.output_schema.raw_key() is not None:
                 # agrawstring output — model must reply with plain text, not a tool call.
-                parts.append("\nRespond with plain text only — no JSON wrapping, no markdown code fences.")
+                parts.append(
+                    "\nRespond with plain text only — no JSON wrapping, no markdown code fences."
+                )
             else:
                 # Structured output — model must call one return_<field> tool per output field.
-                field_tools = ", ".join(
-                    f"return_{f}" for f in self.output_schema._data
-                )
+                field_tools = ", ".join(f"return_{f}" for f in self.output_schema._data)
                 field_lines = "\n".join(
-                    f"  - {f}: {self.output_schema.field_desc(f)}"
-                    for f in self.output_schema._data
+                    f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
                 )
                 parts.append(
                     f"\nTo return your results, call the appropriate return_<field> tool "
@@ -217,6 +217,7 @@ class agskill:
             active_tools: list[agtool] = list(self.replace_tools)
         else:
             from .tools import make_sandboxed_tools, make_read
+
             active_tools = make_sandboxed_tools(agent_sandbox, resource_pool)
             if self.add_tools:
                 active_tools.extend(self.add_tools)
@@ -224,15 +225,21 @@ class agskill:
         if _ensure_read:
             if not any(getattr(t, "name", None) == "read" for t in active_tools):
                 from .tools import make_read
+
                 active_tools.append(make_read(agent_sandbox))
 
         collected_outputs: dict = {}
         required_fields: set[str] = set()
         if self.output_schema is not None and self.output_schema.raw_key() is None:
             required_fields = set(self.output_schema._data.keys())
-            active_tools.extend(self.output_schema.make_return_output_agtool(
-                agent_sandbox, collected_outputs, required_fields, _agbinary_validate_exec_timeout
-            ))
+            active_tools.extend(
+                self.output_schema.make_return_output_agtool(
+                    agent_sandbox,
+                    collected_outputs,
+                    required_fields,
+                    _agbinary_validate_exec_timeout,
+                )
+            )
 
         for t in active_tools:
             t.attach_logger(agent_terminal, agent_log)
@@ -320,7 +327,8 @@ class agskill:
                 if ag.sandbox is None:
                     _out_dir = (
                         ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
-                        if ag.agconfig is not None else type(ag).output_dir
+                        if ag.agconfig is not None
+                        else type(ag).output_dir
                     )
                     _out = Path(_out_dir) / ag.agname if _out_dir else None
                     sb_cfg = ag.agconfig
@@ -345,7 +353,10 @@ class agskill:
 
                 # ── 3. Run the ReAct loop.
                 outer_result, updated_ctx, outer_delta = self.execute_react(
-                    ag, prev_ctx, skill_input, max_steps,
+                    ag,
+                    prev_ctx,
+                    skill_input,
+                    max_steps,
                 )
 
             except Exception as exc:
@@ -369,30 +380,40 @@ class agskill:
             # ── 5. Log result and commit token counts.
             ts_end = _ts()
             assert outer_result is not None
-            input_dict  = skill_input.to_dict()
+            input_dict = skill_input.to_dict()
             result_dict = outer_result.to_dict()
             if result_dict.get("error"):
                 _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate
-                ag.terminal.log("SKILL ✗  ", f"{self.name}  error={str(result_dict['error'])[:_error_log_truncate]}")
-                ag._append_full_history({"type": "skill_error", "skill": self.name,
-                                         "error": str(result_dict["error"])})
+                ag.terminal.log(
+                    "SKILL ✗  ",
+                    f"{self.name}  error={str(result_dict['error'])[:_error_log_truncate]}",
+                )
+                ag._append_full_history(
+                    {"type": "skill_error", "skill": self.name, "error": str(result_dict["error"])}
+                )
             else:
                 ag.terminal.log("SKILL ✓  ", f"{self.name}  output={list(result_dict.keys())}")
-            outer_input_tokens  = updated_ctx.total_input_tokens  - _prev_input_tokens
+            outer_input_tokens = updated_ctx.total_input_tokens - _prev_input_tokens
             outer_output_tokens = updated_ctx.total_output_tokens - _prev_output_tokens
             try:
-                ag.log._record(self.name, ts_start, ts_end,
-                               input_dict, result_dict,
-                               len(updated_ctx.messages),
-                               history_before=history_before,
-                               history_delta=outer_delta,
-                               input_tokens=outer_input_tokens,
-                               output_tokens=outer_output_tokens)
+                ag.log._record(
+                    self.name,
+                    ts_start,
+                    ts_end,
+                    input_dict,
+                    result_dict,
+                    len(updated_ctx.messages),
+                    history_before=history_before,
+                    history_delta=outer_delta,
+                    input_tokens=outer_input_tokens,
+                    output_tokens=outer_output_tokens,
+                )
                 type(ag)._add_global_tokens(outer_input_tokens, outer_output_tokens)
                 _ag_usage = ag.log.token_usage
                 _gl_usage = type(ag).global_token_usage()
                 try:
                     from . import agwebui as _agwebui
+
                     if _agwebui._active is not None:
                         _agwebui._active.emitter.token_update(
                             ag.agname,
@@ -402,7 +423,9 @@ class agskill:
                             _gl_usage["output_tokens"],
                         )
                 except Exception as _e:
-                    print(f"[agskill] WARNING: post-skill token_update push failed for {ag.agname}: {_e}")
+                    print(
+                        f"[agskill] WARNING: post-skill token_update push failed for {ag.agname}: {_e}"
+                    )
             except Exception as log_exc:
                 ag.terminal.log("SKILL ✗  ", f"[log error] {log_exc}")
 
@@ -415,7 +438,9 @@ class agskill:
                 pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages)
                 if pruned_msgs is not updated_ctx.messages:
                     updated_ctx.messages = pruned_msgs
-                    ag.terminal.log("PRUNE    ", f"{self.name}  history pruned to {len(pruned_msgs)} msgs")
+                    ag.terminal.log(
+                        "PRUNE    ", f"{self.name}  history pruned to {len(pruned_msgs)} msgs"
+                    )
             except Exception as prune_exc:
                 ag.terminal.log("PRUNE ✗  ", f"{self.name}  pruning failed: {prune_exc}")
 
@@ -439,6 +464,7 @@ class agskill:
     ) -> agdata:
         """Async wrapper around run() for use in asyncio event loops."""
         import asyncio
+
         loop = asyncio.get_event_loop()
         pending = self.run(ag, skill_input, max_steps)
         await loop.run_in_executor(None, pending._resolve)
@@ -460,7 +486,9 @@ class agskill:
             max_steps = _AgSkillFields(ag.agconfig).react_max_steps
 
         # ── 1. Validate input against the skill's input schema.
-        input_error = self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
+        input_error = (
+            self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
+        )
         if input_error is not None:
             sys_msg = {"role": "system", "content": self._build_system_prompt()}
             return agerror(input_error), prev_ctx, [sys_msg]
@@ -469,8 +497,11 @@ class agskill:
         _input_suffix = f"_{int(time.time() * 1000)}"
         _offloaded_paths, auto_fields = (
             self.input_schema.prepare_inputs_in_sandbox(
-                skill_input, ag.sandbox, self.name,
-                suffix=_input_suffix, context_limit=ag.llm.context_limit,
+                skill_input,
+                ag.sandbox,
+                self.name,
+                suffix=_input_suffix,
+                context_limit=ag.llm.context_limit,
                 agconfig=ag.agconfig,
             )
             if self.input_schema is not None
@@ -491,18 +522,25 @@ class agskill:
 
         # ── 3. Build toolkit with return_<field> tools for structured output.
         toolkit, _collected_outputs, _required_fields = self._build_toolkit(
-            ag.sandbox, type(ag).agresource_pool, ag.terminal, ag.log,
-            _ensure_read=bool(_offloaded_paths), agconfig=ag.agconfig,
+            ag.sandbox,
+            type(ag).agresource_pool,
+            ag.terminal,
+            ag.log,
+            _ensure_read=bool(_offloaded_paths),
+            agconfig=ag.agconfig,
         )
         _use_return_output = bool(_required_fields)
 
         # ── 5. Build the initial message list (system prompt + history + user turn).
         messages, n_before = self._build_initial_messages(
-            skill_input, prev_ctx, _extra_system,
-            ag._push_live_messages, ag._append_full_history,
+            skill_input,
+            prev_ctx,
+            _extra_system,
+            ag._push_live_messages,
+            ag._append_full_history,
         )
         output_schema_retries_left = self.max_output_schema_retries
-        _skill_tokens_in_start  = prev_ctx.total_input_tokens
+        _skill_tokens_in_start = prev_ctx.total_input_tokens
         _skill_tokens_out_start = prev_ctx.total_output_tokens
 
         # ── 6. ReAct loop — each iteration is one LLM call + tool dispatch cycle.
@@ -521,10 +559,14 @@ class agskill:
 
             # 6b. Compact history if needed.
             messages, _pre_estimate = ag.llm.maybe_compact(
-                prev_ctx, messages, None,
-                term=ag.terminal, log=ag.log,
+                prev_ctx,
+                messages,
+                None,
+                term=ag.terminal,
+                log=ag.log,
                 _live_messages_fn=ag._push_live_messages,
-                skill_name=self.name, agname=str(ag.agname),
+                skill_name=self.name,
+                agname=str(ag.agname),
             )
 
             ag.push_token_count_update_to_ui(
@@ -540,20 +582,30 @@ class agskill:
 
             # 6c. Call the LLM (with internal retry on transient errors).
             llm_result = ag.llm.call(
-                kwargs, messages,
-                ag.terminal, ag._set_ui_state, ag._push_live_messages,
+                kwargs,
+                messages,
+                ag.terminal,
+                ag._set_ui_state,
+                ag._push_live_messages,
                 ag.push_token_count_update_to_ui,
-                prev_ctx.total_input_tokens, prev_ctx.total_output_tokens, self.name,
+                prev_ctx.total_input_tokens,
+                prev_ctx.total_output_tokens,
+                self.name,
                 full_history_fn=ag._append_full_history,
             )
             if llm_result.context_exceeded:
                 if ag._append_full_history:
                     ag._append_full_history({"type": "llm_context_exceeded"})
                 messages, _ = ag.llm.maybe_compact(
-                    prev_ctx, messages, None,
-                    term=ag.terminal, log=ag.log,
+                    prev_ctx,
+                    messages,
+                    None,
+                    term=ag.terminal,
+                    log=ag.log,
                     _live_messages_fn=ag._push_live_messages,
-                    skill_name=self.name, agname=str(ag.agname), force=True,
+                    skill_name=self.name,
+                    agname=str(ag.agname),
+                    force=True,
                 )
                 continue
             if not llm_result.ok:
@@ -562,25 +614,38 @@ class agskill:
                     ag._append_full_history({"type": "llm_error", "error": _err_msg})
                 ag.sandbox.remove_files(_offloaded_paths)
                 return agerror(_err_msg), prev_ctx, []
-            prev_ctx.total_input_tokens  = llm_result.total_input_tokens
+            prev_ctx.total_input_tokens = llm_result.total_input_tokens
             prev_ctx.total_output_tokens = llm_result.total_output_tokens
             if ag.terminal:
                 _ctx_str = f"/{ag.llm.context_limit}" if ag.llm.context_limit else ""
-                _tok_str = f"  tokens={llm_result.prompt_tokens}{_ctx_str}" if llm_result.prompt_tokens else ""
-                ag.terminal.log("LLM ✓    ", f"model={ag.llm.backend.model or '?'}  ({llm_result.elapsed_ms}ms){_tok_str}")
+                _tok_str = (
+                    f"  tokens={llm_result.prompt_tokens}{_ctx_str}"
+                    if llm_result.prompt_tokens
+                    else ""
+                )
+                ag.terminal.log(
+                    "LLM ✓    ",
+                    f"model={ag.llm.backend.model or '?'}  ({llm_result.elapsed_ms}ms){_tok_str}",
+                )
             if ag._set_ui_state:
                 ag._set_ui_state("skill", skill=self.name)
 
             # 6d. Post-response compaction.
             messages, _ = ag.llm.maybe_compact(
-                prev_ctx, messages, llm_result.prompt_tokens,
-                term=ag.terminal, log=ag.log,
+                prev_ctx,
+                messages,
+                llm_result.prompt_tokens,
+                term=ag.terminal,
+                log=ag.log,
                 _live_messages_fn=ag._push_live_messages,
-                skill_name=self.name, agname=str(ag.agname),
+                skill_name=self.name,
+                agname=str(ag.agname),
             )
 
             # 6e. Append the assistant turn to the message list.
-            msg_dict: dict = agllm.build_assistant_msg(llm_result.content_parts, llm_result.reasoning_parts, llm_result.tool_calls_raw)
+            msg_dict: dict = agllm.build_assistant_msg(
+                llm_result.content_parts, llm_result.reasoning_parts, llm_result.tool_calls_raw
+            )
             messages.append(msg_dict)
             if ag._push_live_messages:
                 ag._push_live_messages(messages[1:])
@@ -592,11 +657,26 @@ class agskill:
                 _base_offload_chars = _AgToolFields(ag.agconfig).output_offload_chars
                 _schema_fields = _AgSchemaFields(ag.agconfig)
                 dispatch_tools(
-                    msg_dict["tool_calls"], toolkit, messages, ag.sandbox, self.name,
-                    ag._set_ui_state, ag._push_live_messages, ag._append_full_history, ag.terminal,
+                    msg_dict["tool_calls"],
+                    toolkit,
+                    messages,
+                    ag.sandbox,
+                    self.name,
+                    ag._set_ui_state,
+                    ag._push_live_messages,
+                    ag._append_full_history,
+                    ag.terminal,
                     tool_offload_chars=(
-                        max(_base_offload_chars, int(ag.llm.context_limit * _schema_fields.offload_context_fraction * _schema_fields.chars_per_token))
-                        if ag.llm.context_limit else _base_offload_chars
+                        max(
+                            _base_offload_chars,
+                            int(
+                                ag.llm.context_limit
+                                * _schema_fields.offload_context_fraction
+                                * _schema_fields.chars_per_token
+                            ),
+                        )
+                        if ag.llm.context_limit
+                        else _base_offload_chars
                     ),
                     agconfig=ag.agconfig,
                 )
@@ -616,9 +696,7 @@ class agskill:
                     # 7a. Missing fields — reprompt the model up to the retry limit.
                     if output_schema_retries_left > 0:
                         output_schema_retries_left -= 1
-                        _missing_tools = " and ".join(
-                            f"return_{f}" for f in sorted(missing)
-                        )
+                        _missing_tools = " and ".join(f"return_{f}" for f in sorted(missing))
                         reprompt = {
                             "role": "user",
                             "content": (
@@ -661,8 +739,14 @@ class agskill:
                 # 7b. All fields collected — wait for any background sandbox processes.
                 result = agdata(**_collected_outputs)
                 proc_msg = agSandbox.wait_for_processes(
-                    ag.sandbox, self.name, ag.terminal, ag.log,
-                    str(ag.agname), type(ag).ping_interval_s, type(ag).poll_interval_s, ag._set_ui_state,
+                    ag.sandbox,
+                    self.name,
+                    ag.terminal,
+                    ag.log,
+                    str(ag.agname),
+                    type(ag).ping_interval_s,
+                    type(ag).poll_interval_s,
+                    ag._set_ui_state,
                 )
                 if proc_msg is not None:
                     messages.append({"role": "user", "content": proc_msg})
@@ -689,8 +773,14 @@ class agskill:
             out_key = self.output_schema.raw_key() if self.output_schema is not None else "result"
             result = agdata(**{out_key: msg_dict.get("content") or ""})
             proc_msg = agSandbox.wait_for_processes(
-                ag.sandbox, self.name, ag.terminal, ag.log,
-                str(ag.agname), type(ag).ping_interval_s, type(ag).poll_interval_s, ag._set_ui_state,
+                ag.sandbox,
+                self.name,
+                ag.terminal,
+                ag.log,
+                str(ag.agname),
+                type(ag).ping_interval_s,
+                type(ag).poll_interval_s,
+                ag._set_ui_state,
             )
             if proc_msg is not None:
                 messages.append({"role": "user", "content": proc_msg})

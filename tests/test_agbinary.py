@@ -1,4 +1,5 @@
 """Tests for agbinary — binary file-backed agskill schema field."""
+
 import base64
 import json
 import pytest
@@ -17,6 +18,7 @@ LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
 
 def _make_mock_agent(llm=None, sandbox=None):
     from agency.agent import agent as _agent_cls
+
     class _Cls:
         agresource_pool = MagicMock()
         ping_interval_s = 300
@@ -24,8 +26,10 @@ def _make_mock_agent(llm=None, sandbox=None):
         agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
         _check_pause = _agent_cls._check_pause
+
     ag = _Cls()
     from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
+
     ag._state = _agent_state_cls("test")
     ag.llm = llm or LLM
     ag.sandbox = sandbox if sandbox is not None else MagicMock()
@@ -40,12 +44,14 @@ def _make_mock_agent(llm=None, sandbox=None):
     ag.push_token_count_update_to_ui = MagicMock()
     return ag
 
+
 PNG_MAGIC = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 
 
 # ---------------------------------------------------------------------------
 # Streaming mock helpers (same pattern as test_agfile.py)
 # ---------------------------------------------------------------------------
+
 
 class _Delta:
     def __init__(self, content=None, tool_calls=None):
@@ -54,16 +60,23 @@ class _Delta:
         self.model_extra = {}
         self.reasoning_content = None
 
+
 class _Choice:
-    def __init__(self, delta): self.delta = delta
+    def __init__(self, delta):
+        self.delta = delta
+
 
 class _Usage:
     prompt_tokens = 5
 
+
 class _Chunk:
     def __init__(self, content=None, tool_calls=None, usage=None):
-        self.choices = [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        self.choices = (
+            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
+        )
         self.usage = usage
+
 
 class _TCDelta:
     def __init__(self, name, args_json, call_id):
@@ -71,11 +84,16 @@ class _TCDelta:
         self.index = 0
         self.function = _TCFnDelta(name, args_json)
 
+
 class _TCFnDelta:
-    def __init__(self, name, args): self.name = name; self.arguments = args
+    def __init__(self, name, args):
+        self.name = name
+        self.arguments = args
+
 
 def _direct(content: str):
     return [_Chunk(content=content), _Chunk(usage=_Usage())]
+
 
 def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
     tc = _TCDelta(name, json.dumps(args), call_id)
@@ -93,11 +111,14 @@ def _run_skill_with_sandbox(skill, responses, sandbox):
 # agbinary class interface
 # ---------------------------------------------------------------------------
 
+
 def test_agbinary_is_agtype_subclass():
     assert issubclass(agbinary, agtype)
 
+
 def test_agbinary_schema_type():
     assert agbinary.schema_type() == "binary_file"
+
 
 def test_agbinary_needs_sandbox():
     assert agbinary.needs_sandbox() is True
@@ -107,9 +128,11 @@ def test_agbinary_needs_sandbox():
 # agbinary._to_bytes
 # ---------------------------------------------------------------------------
 
+
 def test_to_bytes_from_bytes():
     raw = b"\x89PNG"
     assert agbinary._to_bytes(raw) == raw
+
 
 def test_to_bytes_from_data_url():
     raw = b"\x89PNG"
@@ -117,10 +140,12 @@ def test_to_bytes_from_data_url():
     data_url = f"data:image/png;base64,{b64}"
     assert agbinary._to_bytes(data_url) == raw
 
+
 def test_to_bytes_from_local_path(tmp_path):
     f = tmp_path / "test.bin"
     f.write_bytes(PNG_MAGIC)
     assert agbinary._to_bytes(str(f)) == PNG_MAGIC
+
 
 def test_to_bytes_invalid_type_raises():
     with pytest.raises(TypeError):
@@ -131,33 +156,31 @@ def test_to_bytes_invalid_type_raises():
 # agbinary.prepare
 # ---------------------------------------------------------------------------
 
+
 def test_prepare_writes_bytes_to_sandbox():
     sandbox = MagicMock()
     val, paths = agbinary.prepare(PNG_MAGIC, sandbox, "process", "audio")
-    sandbox.write_file_bytes.assert_called_once_with(
-        "/workspace/inputs/audio.bin", PNG_MAGIC
-    )
+    sandbox.write_file_bytes.assert_called_once_with("/workspace/inputs/audio.bin", PNG_MAGIC)
     assert val == "/workspace/inputs/audio.bin"
     assert paths == ["/workspace/inputs/audio.bin"]
+
 
 def test_prepare_accepts_data_url():
     sandbox = MagicMock()
     b64 = base64.b64encode(PNG_MAGIC).decode()
     data_url = f"data:image/png;base64,{b64}"
     val, paths = agbinary.prepare(data_url, sandbox, "skill", "img")
-    sandbox.write_file_bytes.assert_called_once_with(
-        "/workspace/inputs/img.bin", PNG_MAGIC
-    )
+    sandbox.write_file_bytes.assert_called_once_with("/workspace/inputs/img.bin", PNG_MAGIC)
     assert val == "/workspace/inputs/img.bin"
+
 
 def test_prepare_local_path(tmp_path):
     f = tmp_path / "clip.wav"
     f.write_bytes(PNG_MAGIC)
     sandbox = MagicMock()
     val, paths = agbinary.prepare(str(f), sandbox, "skill", "audio")
-    sandbox.write_file_bytes.assert_called_once_with(
-        "/workspace/inputs/audio.bin", PNG_MAGIC
-    )
+    sandbox.write_file_bytes.assert_called_once_with("/workspace/inputs/audio.bin", PNG_MAGIC)
+
 
 def test_prepare_unsupported_type_passthrough():
     sandbox = MagicMock()
@@ -165,6 +188,7 @@ def test_prepare_unsupported_type_passthrough():
     sandbox.write_file_bytes.assert_not_called()
     assert val == 42
     assert paths == []
+
 
 def test_prepare_sandbox_failure_leaves_value_unchanged():
     sandbox = MagicMock()
@@ -178,6 +202,7 @@ def test_prepare_sandbox_failure_leaves_value_unchanged():
 # agbinary.recover
 # ---------------------------------------------------------------------------
 
+
 def test_recover_reads_bytes_from_sandbox():
     sandbox = MagicMock()
     sandbox.read_file_bytes.return_value = PNG_MAGIC
@@ -186,12 +211,14 @@ def test_recover_reads_bytes_from_sandbox():
     assert val == PNG_MAGIC
     assert paths == ["/workspace/outputs/trimmed.bin"]
 
+
 def test_recover_non_string_passthrough():
     sandbox = MagicMock()
     val, paths = agbinary.recover(None, sandbox)
     sandbox.read_file_bytes.assert_not_called()
     assert val is None
     assert paths == []
+
 
 def test_recover_sandbox_failure_leaves_path_unchanged():
     sandbox = MagicMock()
@@ -205,9 +232,11 @@ def test_recover_sandbox_failure_leaves_path_unchanged():
 # System prompt — agbinary prompts injected
 # ---------------------------------------------------------------------------
 
+
 def test_system_prompt_includes_agbinary_input_instructions():
     sk = agskill(
-        "process", "Do stuff.",
+        "process",
+        "Do stuff.",
         input_schema=agdata(audio=agbinary),
         output_schema=agdata(result=str),
     )
@@ -216,9 +245,11 @@ def test_system_prompt_includes_agbinary_input_instructions():
     assert "audio" in prompt
     assert "binary" in prompt.lower()
 
+
 def test_system_prompt_includes_agbinary_output_instructions():
     sk = agskill(
-        "process", "Do stuff.",
+        "process",
+        "Do stuff.",
         output_schema=agdata(trimmed=agbinary),
     )
     prompt = sk._build_system_prompt()
@@ -226,10 +257,12 @@ def test_system_prompt_includes_agbinary_output_instructions():
     assert "trimmed" in prompt
     assert "binary" in prompt.lower()
 
+
 def test_system_prompt_agbinary_type_shown_as_binary_file():
     sk = agskill("t", "", input_schema=agdata(data=agbinary))
     prompt = sk._build_system_prompt()
     assert '"data": "binary_file"' in prompt
+
 
 def test_agdata_serializes_agbinary_as_binary_file():
     d = agdata(payload=agbinary)
@@ -240,10 +273,12 @@ def test_agdata_serializes_agbinary_as_binary_file():
 # return_<field> tool — agbinary return tool descriptions
 # ---------------------------------------------------------------------------
 
+
 def test_return_tool_description_mentions_binary():
     desc = agbinary.get_return_tool_description("audio")
     assert "audio" in desc
     assert "binary" in desc.lower()
+
 
 def test_return_value_description_mentions_path_not_content():
     desc = agbinary.get_return_tool_value_description("audio")
@@ -254,6 +289,7 @@ def test_return_value_description_mentions_path_not_content():
 # ---------------------------------------------------------------------------
 # return_<field> validation — sandbox existence checks
 # ---------------------------------------------------------------------------
+
 
 def _make_exec_side_effect(*responses):
     """Return a side_effect list for _container_exec calls."""
@@ -323,9 +359,11 @@ def test_return_agbinary_valid_file_is_accepted():
 # agsandbox.read_file_bytes and write_file_bytes (unit, no Docker)
 # ---------------------------------------------------------------------------
 
+
 class TestAgSandboxBinaryIO:
     def _make_sb(self):
         from agency.agsandbox import agSandbox
+
         sb = agSandbox.__new__(agSandbox)
         sb._started = True
         return sb

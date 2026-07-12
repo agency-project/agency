@@ -12,14 +12,19 @@ _MAX_BYTES = 50 * 1024
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BASH_DEFAULT_TIMEOUT_SECONDS = 120  # Default timeout (seconds) for a bash tool invocation when the caller does not supply one
+BASH_DEFAULT_TIMEOUT_SECONDS = (
+    120  # Default timeout (seconds) for a bash tool invocation when the caller does not supply one
+)
 BASH_LOG_CMD_MAX_CHARS = 100  # Maximum characters of the shell command shown in the log line to avoid flooding the terminal
 
 _BASH_PARAMS = {
     "type": "object",
     "properties": {
         "command": {"type": "string", "description": "The shell command to execute"},
-        "timeout": {"type": "integer", "description": "Timeout in seconds (default 120). For long-running commands pass this here — do NOT use the shell timeout command, which has no effect on the tool watchdog."},
+        "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds (default 120). For long-running commands pass this here — do NOT use the shell timeout command, which has no effect on the tool watchdog.",
+        },
         "workdir": {"type": "string", "description": "Working directory (optional)"},
     },
     "required": ["command"],
@@ -33,6 +38,7 @@ def make_bash(sandbox: "agSandbox") -> agtool:
     will not resolve until all such processes exit or are released as daemons.
     The default working directory is ``/workspace`` inside the container.
     """
+
     def _run_sandboxed(arg: agdata) -> agdata:
         command: str = arg.command  # type: ignore[assignment]
         timeout: int = getattr(arg, "timeout", BASH_DEFAULT_TIMEOUT_SECONDS)
@@ -49,9 +55,9 @@ def make_bash(sandbox: "agSandbox") -> agtool:
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:
             return
-        cmd   = str(arg._data.get("command", ""))[:BASH_LOG_CMD_MAX_CHARS]
+        cmd = str(arg._data.get("command", ""))[:BASH_LOG_CMD_MAX_CHARS]
         rdata = result._data
-        rc    = rdata.get("exit_code", "?")
+        rc = rdata.get("exit_code", "?")
         trunc = " [truncated]" if rdata.get("truncated", False) else ""
         tool._term.log("TOOL ✓   ", f"bash  rc={rc}  ({elapsed_ms}ms){trunc}  $ {cmd}")
         if tool._aglog is not None:
