@@ -13,6 +13,7 @@ import asyncio
 import json
 import sqlite3
 import time as _time
+import uuid as _uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -36,8 +37,9 @@ INDEX_INTERVAL = 1_000        # events between sample points in the timeline ind
 # Mutable globals — set in __main__ before uvicorn starts
 # ---------------------------------------------------------------------------
 
-_run_dir:   Path = Path(".")
-_reply_dir: Path = Path(".")
+_run_dir:     Path = Path(".")
+_reply_dir:   Path = Path(".")
+_command_dir: Path = Path(".")
 
 # Highest event id seen so far; 0 means nothing read yet.
 _last_event_id:  int   = 0
@@ -299,11 +301,16 @@ async def websocket_endpoint(ws: WebSocket):
             data = await ws.receive_text()
             try:
                 msg = json.loads(data)
-                if msg.get("type") == "human_reply":
+                mtype = msg.get("type")
+                if mtype == "human_reply":
                     ask_id = str(msg.get("ask_id", ""))
                     text   = str(msg.get("text", ""))
                     if ask_id:
                         (_reply_dir / f"{ask_id}.txt").write_text(text, encoding="utf-8")
+                elif mtype in ("pause", "resume", "pause_all", "resume_all"):
+                    cmd = {"type": mtype, "agname": msg.get("agname")}
+                    cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
+                    cmd_file.write_text(json.dumps(cmd), encoding="utf-8")
             except Exception:
                 pass
     except WebSocketDisconnect:
@@ -371,8 +378,10 @@ if __name__ == "__main__":
     parser.add_argument("--port",    type=int, default=7860)
     parsed = parser.parse_args()
 
-    _run_dir   = Path(parsed.run_dir)
-    _reply_dir = _run_dir / "ui_replies"
+    _run_dir     = Path(parsed.run_dir)
+    _reply_dir   = _run_dir / "ui_replies"
+    _command_dir = _run_dir / "ui_commands"
     _reply_dir.mkdir(parents=True, exist_ok=True)
+    _command_dir.mkdir(parents=True, exist_ok=True)
 
     uvicorn.run(app, host="0.0.0.0", port=parsed.port, log_level="error")

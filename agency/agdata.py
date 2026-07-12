@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
+from . import agpause
 from .agtype import agtype
 from .agutil import _camel_to_snake
 
@@ -36,7 +37,8 @@ class agdata:
         f = object.__getattribute__(self, "_future")
         if f is None:
             return
-        resolved = f.result()
+        with agpause.note_blocked_on(agpause.producer_of(f)):
+            resolved = f.result()
         resolved._resolve()  # chain: future may resolve to another pending agdata
         object.__setattr__(self, "_data", object.__getattribute__(resolved, "_data"))
         object.__setattr__(self, "_future", None)

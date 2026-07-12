@@ -28,7 +28,10 @@ def _make_mock_agent(llm=None, sandbox=None):
         poll_interval_s = 5
         agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
+        _check_pause = _agent_cls._check_pause
     ag = _Cls()
+    from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
+    ag._state = _agent_state_cls("test")
     ag.llm = llm or LLM
     ag.sandbox = sandbox if sandbox is not None else MagicMock()
     ag.terminal = MagicMock()

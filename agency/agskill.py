@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agtype import agtype
+from . import agpause
 from .agschema import agschema, _AgSchemaFields
 from .agcontext import agcontext
 from .agtool import agtool, dispatch_tools, _AgToolFields
@@ -289,6 +290,8 @@ class agskill:
         prev_ctx = ag.ctx
         result_future: Future[agdata] = Future()
         ctx_future: Future[agcontext] = Future()
+        agpause.tag_producer(result_future, ag)
+        agpause.tag_producer(ctx_future, ag)
         ts_start = _ts()
         resource_pool = type(ag).agresource_pool
 
@@ -300,12 +303,17 @@ class agskill:
             _prev_input_tokens: int = 0
             _prev_output_tokens: int = 0
             sandbox_lock: "threading.RLock | None" = None
+            agpause.set_current_worker_agent(ag)
 
             try:
                 # ── 1. Unblock: wait for any in-flight predecessor to finish,
                 #    then resolve any lazy input futures passed by the caller.
                 prev_ctx.resolve_prev_dependencies()
                 skill_input.resolve_input_dependencies()
+
+                # ── 1b. Checkpoint — honor a pause requested before this run
+                #    even started, before touching the sandbox.
+                ag._check_pause(self.name)
 
                 # ── 2. Provision sandbox — created once on first run and reused
                 #    across subsequent runs via its internal checkpoint image.
@@ -356,6 +364,7 @@ class agskill:
                     ag.sandbox.stop(commit=True)
                 if sandbox_lock is not None:
                     sandbox_lock.release()
+                agpause.set_current_worker_agent(None)
 
             # ── 5. Log result and commit token counts.
             ts_end = _ts()
@@ -412,6 +421,12 @@ class agskill:
 
             ctx_future.set_result(updated_ctx)
 
+        # Set synchronously, before the thread even starts, so there is no
+        # window where a run is genuinely in flight but ui_state still reads
+        # "inactive" -- is_settled() treats "inactive" as trivially settled,
+        # which would otherwise let wait_all_paused() race past a run that
+        # hasn't had a chance to update its own state yet.
+        ag._set_ui_state("skill", skill=self.name)
         threading.Thread(target=_task, daemon=True).start()
         ag.ctx = agcontext(_future=ctx_future)
         return agdata(_future=result_future)
@@ -492,6 +507,10 @@ class agskill:
 
         # ── 6. ReAct loop — each iteration is one LLM call + tool dispatch cycle.
         for _ in range(max_steps):
+            # 6-checkpoint. Block here while a pause is in effect — always
+            # between steps, never mid-LLM-call or mid-tool-call.
+            ag._check_pause(self.name)
+
             # Derive wire-format tool schemas fresh each iteration — the toolkit dict
             # may grow mid-loop (e.g. read injected on large output offload).
             _tool_schemas = [t.to_openai_tool() for t in toolkit.values()] or None

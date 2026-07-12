@@ -93,9 +93,11 @@ def test_agterm_log_does_not_write_to_stderr(active_webui, capsys):
 def test_agent_set_ui_state_emits_event(active_webui):
     from agency.agent import agent
 
+    from agency.agent import agent_state
+
     ag = agent.__new__(agent)
     ag.agname = "__test_state_agent__"
-    ag._ui_state = {}
+    ag._state = agent_state(ag.agname)
 
     ag._set_ui_state("llm", skill="design", tool=None)
 
@@ -109,9 +111,11 @@ def test_agent_set_ui_state_emits_event(active_webui):
 def test_agent_set_ui_state_inactive(active_webui):
     from agency.agent import agent
 
+    from agency.agent import agent_state
+
     ag = agent.__new__(agent)
     ag.agname = "__test_inactive_agent__"
-    ag._ui_state = {}
+    ag._state = agent_state(ag.agname)
     ag._set_ui_state("inactive")
 
     states = _events_of(active_webui, "agent_state")
@@ -149,6 +153,81 @@ def test_agent_push_live_messages_updates_snapshot(active_webui):
     msgs = [{"role": "system", "content": "sys prompt"}]
     ag._push_live_messages(msgs)
     assert ag._snapshot_messages == msgs
+
+
+# ---------------------------------------------------------------------------
+# agwebui command dispatch — pause/resume/pause_all/resume_all
+# ---------------------------------------------------------------------------
+
+def _make_agent():
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+    return agent(agconfig=agConfig({"agllm_backend": {"api_key": "k", "model": ""}}))
+
+
+def test_dispatch_pause_command_pauses_named_agent():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    _dispatch_command({"type": "pause", "agname": ag.agname})
+    assert not ag._state.run_allowed.is_set()
+
+
+def test_dispatch_resume_command_resumes_named_agent():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    ag.pause()
+    _dispatch_command({"type": "resume", "agname": ag.agname})
+    assert ag._state.run_allowed.is_set()
+
+
+def test_dispatch_pause_command_ignores_unknown_agname():
+    from agency.agwebui import _dispatch_command
+    ag = _make_agent()
+    _dispatch_command({"type": "pause", "agname": "__no_such_agent__"})
+    assert ag._state.run_allowed.is_set()  # untouched
+
+
+def test_dispatch_pause_all_pauses_every_live_agent():
+    from agency.agwebui import _dispatch_command
+    a, b = _make_agent(), _make_agent()
+    _dispatch_command({"type": "pause_all"})
+    assert not a._state.run_allowed.is_set()
+    assert not b._state.run_allowed.is_set()
+
+
+def test_dispatch_resume_all_resumes_every_live_agent():
+    from agency.agwebui import _dispatch_command
+    a, b = _make_agent(), _make_agent()
+    a.pause()
+    b.pause()
+    _dispatch_command({"type": "resume_all"})
+    assert a._state.run_allowed.is_set()
+    assert b._state.run_allowed.is_set()
+
+
+def test_poll_commands_applies_and_deletes_command_files(tmp_path):
+    import json
+    import threading
+    import time
+    from agency.agwebui import _poll_commands
+
+    ag = _make_agent()
+    cmd_dir = tmp_path / "ui_commands"
+    (cmd_dir).mkdir()
+    (cmd_dir / "c1.json").write_text(json.dumps({"type": "pause", "agname": ag.agname}))
+
+    stop = threading.Event()
+    t = threading.Thread(target=_poll_commands, args=(cmd_dir, stop), daemon=True)
+    t.start()
+    try:
+        deadline = time.time() + 2.0
+        while time.time() < deadline and ag._state.run_allowed.is_set():
+            time.sleep(0.02)
+        assert not ag._state.run_allowed.is_set()
+        assert not list(cmd_dir.glob("*.json"))  # consumed
+    finally:
+        stop.set()
+        t.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------

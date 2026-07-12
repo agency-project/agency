@@ -702,7 +702,7 @@ def test_ui_state_error_when_skill_returns_error():
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.error   # resolve
-    assert ag._ui_state["state"] == "error"
+    assert ag._state.state == "error"
 
 
 def test_ui_state_finished_on_success():
@@ -716,7 +716,7 @@ def test_ui_state_finished_on_success():
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.answer   # resolve
-    assert ag._ui_state["state"] == "finished"
+    assert ag._state.state == "finished"
 
 
 def test_ui_state_error_on_skill_exception():
@@ -730,7 +730,7 @@ def test_ui_state_error_on_skill_exception():
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.error   # resolve (will contain the formatted exception)
-    assert ag._ui_state["state"] == "error"
+    assert ag._state.state == "error"
 
 
 # ---------------------------------------------------------------------------

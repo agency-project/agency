@@ -17,8 +17,10 @@ Usage::
 from __future__ import annotations
 
 import atexit
+import json
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime
@@ -29,6 +31,45 @@ from .emitter import agwebui_emitter
 
 # Module-level singleton — set while agwebui.run() is active.
 _active: "agwebui | None" = None
+
+
+def _dispatch_command(cmd: dict) -> None:
+    """Apply one pause/resume command written by the webui server process.
+
+    Mirrors the ask_human file-drop pattern (agwebui/emitter.py's
+    _reply_dir), but in the opposite direction: the (isolated, no-agency-
+    imports) server process can only write a plain file describing what it
+    wants; this side -- running inside the execution process, with real
+    agent objects -- is what actually applies it."""
+    from ..agent import agent as _agent_cls
+
+    ctype  = cmd.get("type")
+    agname = cmd.get("agname")
+    if ctype in ("pause", "resume"):
+        for a in _agent_cls.all():
+            if a.agname == agname:
+                (a.pause if ctype == "pause" else a.resume)()
+                break
+    elif ctype in ("pause_all", "resume_all"):
+        for a in _agent_cls.all():
+            (a.pause if ctype == "pause_all" else a.resume)()
+
+
+def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
+    command_dir.mkdir(parents=True, exist_ok=True)
+    while not stop_event.is_set():
+        for f in sorted(command_dir.glob("*.json")):
+            try:
+                cmd = json.loads(f.read_text(encoding="utf-8"))
+                _dispatch_command(cmd)
+            except Exception as _e:
+                print(f"[agwebui] WARNING: failed to apply command {f.name}: {_e}")
+            finally:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        stop_event.wait(0.2)
 
 
 class agwebui:
@@ -128,12 +169,23 @@ class agwebui:
 
         atexit.register(_kill_server)
 
+        # Background thread applying pause/resume (and future) commands the
+        # webui server process writes to run_dir/ui_commands -- the server
+        # process itself has no agency imports and can't call agent.pause()
+        # directly, so this is the execution-process side of that relay.
+        command_stop = threading.Event()
+        threading.Thread(
+            target=_poll_commands, args=(run_dir / "ui_commands", command_stop),
+            daemon=True, name="agwebui-commands",
+        ).start()
+
         try:
             fn(*args, **kwargs)
         except Exception:
             import traceback
             traceback.print_exc()
         finally:
+            command_stop.set()
             ui.emitter.done()
             _active = None
 

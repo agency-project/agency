@@ -48,6 +48,7 @@ def server(tmp_path):
     # Snapshot all module-level globals before the app starts
     old_run_dir      = srv._run_dir
     old_reply_dir    = srv._reply_dir
+    old_command_dir  = srv._command_dir
     old_clients      = srv._clients
     old_last_id      = srv._last_event_id
     old_event_count  = srv._event_count
@@ -60,6 +61,8 @@ def server(tmp_path):
     srv._run_dir        = tmp_path
     srv._reply_dir      = tmp_path / "ui_replies"
     srv._reply_dir.mkdir()
+    srv._command_dir    = tmp_path / "ui_commands"
+    srv._command_dir.mkdir()
     srv._clients        = set()
     srv._last_event_id  = 0
     srv._event_count    = 0
@@ -74,6 +77,7 @@ def server(tmp_path):
     # Restore so subsequent tests see a clean state
     srv._run_dir        = old_run_dir
     srv._reply_dir      = old_reply_dir
+    srv._command_dir    = old_command_dir
     srv._clients        = old_clients
     srv._last_event_id  = old_last_id
     srv._event_count    = old_event_count
@@ -302,6 +306,64 @@ def test_websocket_human_reply_empty_ask_id_ignored(server):
         time.sleep(0.1)
 
     assert not any((run_dir / "ui_replies").iterdir())
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — pause/resume command handling
+# ---------------------------------------------------------------------------
+
+def _read_command_files(run_dir: Path) -> list[dict]:
+    return [json.loads(f.read_text()) for f in (run_dir / "ui_commands").glob("*.json")]
+
+
+def test_websocket_pause_writes_command_file(server):
+    client, run_dir, srv = server
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "pause", "agname": "alex_0000"}))
+        assert _wait_for(lambda: _read_command_files(run_dir)), \
+            "pause command file was not written"
+
+    cmds = _read_command_files(run_dir)
+    assert len(cmds) == 1
+    assert cmds[0] == {"type": "pause", "agname": "alex_0000"}
+
+
+def test_websocket_resume_writes_command_file(server):
+    client, run_dir, srv = server
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "resume", "agname": "alex_0000"}))
+        assert _wait_for(lambda: _read_command_files(run_dir))
+
+    cmds = _read_command_files(run_dir)
+    assert cmds == [{"type": "resume", "agname": "alex_0000"}]
+
+
+@pytest.mark.parametrize("mtype", ["pause_all", "resume_all"])
+def test_websocket_pause_all_resume_all_write_command_file(server, mtype):
+    client, run_dir, srv = server
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": mtype}))
+        assert _wait_for(lambda: _read_command_files(run_dir))
+
+    cmds = _read_command_files(run_dir)
+    assert cmds == [{"type": mtype, "agname": None}]
+
+
+def test_websocket_multiple_pause_commands_each_get_own_file(server):
+    """Each command must land in its own file — a single overwritten file
+    would silently drop all but the last command between poll cycles."""
+    client, run_dir, srv = server
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "pause", "agname": "a"}))
+        ws.send_text(json.dumps({"type": "pause", "agname": "b"}))
+        assert _wait_for(lambda: len(_read_command_files(run_dir)) == 2)
+
+    agnames = {c["agname"] for c in _read_command_files(run_dir)}
+    assert agnames == {"a", "b"}
 
 
 def test_websocket_malformed_json_ignored(server):

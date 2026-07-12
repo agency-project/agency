@@ -223,6 +223,9 @@ const $countFinished    = document.getElementById('count-finished');
 const $agentSearch      = document.getElementById('agent-search');
 const $globalTokens     = document.getElementById('global-tokens');
 const $resourceStats    = document.getElementById('resource-stats');
+const $btnPauseToggle   = document.getElementById('btn-pause-toggle');
+const $btnPauseAll      = document.getElementById('btn-pause-all');
+const $btnResumeAll     = document.getElementById('btn-resume-all');
 
 function updateResourceBadge() {
   const r = state.resources;
@@ -314,8 +317,8 @@ function appendLog(line) {
 // Agent list (right panel)
 // ---------------------------------------------------------------------------
 
-function isLive(st)      { return st !== 'inactive' && st !== 'finished' && st !== 'skill'; }
-function isIdle(st)      { return st === 'inactive'; }
+function isLive(st)      { return st !== 'inactive' && st !== 'finished' && st !== 'skill' && st !== 'paused'; }
+function isIdle(st)      { return st === 'inactive' || st === 'paused'; }
 function isFinished(st)  { return st === 'finished'; }
 
 function tabVisible(st) {
@@ -383,6 +386,22 @@ function renderAgentList() {
   }
 
   $agentList.innerHTML = frags.join('');
+  updateAgentActionsBar();
+}
+
+function updateAgentActionsBar() {
+  const agname = currentAgent();
+  if (!agname) {
+    $btnPauseToggle.disabled = true;
+    $btnPauseToggle.textContent = 'Pause';
+    $btnPauseToggle.classList.remove('active');
+    return;
+  }
+  const ag = state.agents.get(agname);
+  const paused = ag ? ag.state === 'paused' : false;
+  $btnPauseToggle.disabled = false;
+  $btnPauseToggle.textContent = paused ? 'Resume' : 'Pause';
+  $btnPauseToggle.classList.toggle('active', paused);
 }
 
 function renderAgentEntry(agname, ag, indent, isFocused) {
@@ -394,6 +413,9 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
   if (st === 'finished') {
     dot = `<span class="dot-finished">✓</span>`;
     statusHtml = `<span class="status-finished">finished</span>`;
+  } else if (st === 'paused') {
+    dot = `<span class="dot-paused">⏸</span>`;
+    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-paused">paused</span>`;
   } else if (st === 'inactive') {
     dot = `<span class="dot-inactive">○</span>`;
     statusHtml = `<span class="dim">idle</span>`;
@@ -520,8 +542,9 @@ function renderHistory() {
     else if (st === 'tool')      label = `Tool Running: ${ag.tool || ''}…`;
     else if (st === 'proc_wait') label = 'Waiting for processes…';
     else if (st === 'human')     label = 'Input Pending…';
+    else if (st === 'paused')    label = 'Paused';
     else                         label = 'Running…';
-    frags.push(`<div class="msg-running">▶ ${esc(label)}</div>`);
+    frags.push(`<div class="msg-running${st === 'paused' ? ' msg-paused' : ''}">▶ ${esc(label)}</div>`);
   }
 
   // Pending ask_human question
@@ -739,6 +762,26 @@ $agentList.addEventListener('click', e => {
     renderAgentList();
     renderHistory();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Pause / resume actions
+// ---------------------------------------------------------------------------
+
+$btnPauseToggle.addEventListener('click', () => {
+  const agname = currentAgent();
+  if (!agname) return;
+  const ag = state.agents.get(agname);
+  const type = (ag && ag.state === 'paused') ? 'resume' : 'pause';
+  ws.send(JSON.stringify({ type, agname }));
+});
+
+$btnPauseAll.addEventListener('click', () => {
+  ws.send(JSON.stringify({ type: 'pause_all' }));
+});
+
+$btnResumeAll.addEventListener('click', () => {
+  ws.send(JSON.stringify({ type: 'resume_all' }));
 });
 
 // ---------------------------------------------------------------------------
