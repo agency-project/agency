@@ -19,6 +19,7 @@ import time
 import uuid as _uuid
 from pathlib import Path
 
+from ..agconfig import agConfig
 from ..agresources import detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend
 

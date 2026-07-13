@@ -1682,5 +1682,3 @@ class TestResourceTools:
         assert not isinstance(result, agerror)
         assert "1.0" in result.message
         assert "1024m" in result.message
-
-

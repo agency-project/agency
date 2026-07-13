@@ -29,9 +29,18 @@ import os
 import httpx
 import openai
 
-from .base import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS, _VLLM_EXTRA_GEN_FIELDS, agllm_backend
+from .base import (
+    _AgProviderBackendConfig,
+    _OPENAI_GEN_FIELDS,
+    _VLLM_EXTRA_GEN_FIELDS,
+    agllm_backend,
+)
 from .openai import _OpenAICompatibleBackend
-from .anthropic import _AnthropicBedrockChatClient, _ANTHROPIC_BEDROCK_MODEL_RE, _known_anthropic_context_window
+from .anthropic import (
+    _AnthropicBedrockChatClient,
+    _ANTHROPIC_BEDROCK_MODEL_RE,
+    _known_anthropic_context_window,
+)
 
 try:
     import anthropic as _anthropic_sdk

@@ -13,7 +13,11 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agllm_backends.base import agllm_backend, BAD_REQUEST_EXCS, API_CONN_EXCS
 from agency.agllm_backends.openai import _OpenAICompatibleBackend
-from agency.agllm_backends.bedrock import _OpenAICompatibleBedrockBackend, _AnthropicBedrockBackend, _AnthropicAWSBackend
+from agency.agllm_backends.bedrock import (
+    _OpenAICompatibleBedrockBackend,
+    _AnthropicBedrockBackend,
+    _AnthropicAWSBackend,
+)
 from agency.agllm_backends.anthropic import _AnthropicBackend
 
 try:

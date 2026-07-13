@@ -37,6 +37,7 @@ import threading
 import uuid as _uuid
 from pathlib import Path
 
+from ..agconfig import agConfig
 from .base import AgSandboxBackendFields, agsandbox_backend
 
 _chroot_available_cache: "bool | None" = None
@@ -287,7 +288,16 @@ class _ChrootBackend(agsandbox_backend):
         """Run a raw shell command inside the chroot jail."""
         self._ensure_started()
         script = self._build_jail_script(sh_cmd, workdir=workdir, shell=shell)
-        args = [*_chroot_unshare_prefix(), "--user", "--map-root-user", "--mount", "--", "bash", "-c", script]
+        args = [
+            *_chroot_unshare_prefix(),
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--",
+            "bash",
+            "-c",
+            script,
+        ]
         try:
             proc = subprocess.run(args, input=stdin, capture_output=True, timeout=timeout)
             output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")

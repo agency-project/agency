@@ -264,7 +264,12 @@ class agllm_backend(AgLLMBackendFields):
 
     @staticmethod
     def for_config(agconfig: "agConfig") -> "agllm_backend":
-        from .bedrock import _is_anthropic_bedrock_model, _AnthropicBedrockBackend, _OpenAICompatibleBedrockBackend, _AnthropicAWSBackend
+        from .bedrock import (
+            _is_anthropic_bedrock_model,
+            _AnthropicBedrockBackend,
+            _OpenAICompatibleBedrockBackend,
+            _AnthropicAWSBackend,
+        )
         from .anthropic import _AnthropicBackend
         from .openai import _OpenAICompatibleBackend
 

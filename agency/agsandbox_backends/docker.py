@@ -17,9 +17,7 @@ just threads within one process.
 from __future__ import annotations
 
 import multiprocessing
-from pathlib import Path
 
-from .base import AgSandboxBackendFields
 from .container import _ContainerBackendBase, _docker_container_limit
 
 

@@ -85,7 +85,9 @@ class TestBackendSelection:
 
         cfg = agConfig(agSandboxBackendConfig(backend="docker"))
         with patch("agency.agsandbox_backends.container._runtime_works", return_value=True):
-            with patch("agency.agsandbox_backends.base.shutil.which", return_value="/usr/bin/docker"):
+            with patch(
+                "agency.agsandbox_backends.base.shutil.which", return_value="/usr/bin/docker"
+            ):
                 backend = agsandbox_backend.for_config(
                     cfg,
                     agname="a",
@@ -103,7 +105,9 @@ class TestBackendSelection:
 
         cfg = agConfig(agSandboxBackendConfig(backend="podman"))
         with patch("agency.agsandbox_backends.container._runtime_works", return_value=True):
-            with patch("agency.agsandbox_backends.base.shutil.which", return_value="/usr/bin/podman"):
+            with patch(
+                "agency.agsandbox_backends.base.shutil.which", return_value="/usr/bin/podman"
+            ):
                 backend = agsandbox_backend.for_config(
                     cfg,
                     agname="a",
@@ -117,7 +121,9 @@ class TestBackendSelection:
     def test_auto_prefers_podman_then_docker_then_chroot(self):
         from agency.agsandbox_backends.base import _auto_detect_runtime
 
-        with patch("agency.agsandbox_backends.container.get_container_runtime", return_value="podman"):
+        with patch(
+            "agency.agsandbox_backends.container.get_container_runtime", return_value="podman"
+        ):
             assert _auto_detect_runtime() == "podman"
 
     def test_auto_falls_back_to_chroot_when_no_container_runtime(self):

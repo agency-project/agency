@@ -28,7 +28,11 @@ from agency.agllm_backends import (
     agBedrockBackendConfig,
 )
 from agency.agllm_backends.openai import _OpenAICompatibleBackend
-from agency.agllm_backends.bedrock import _OpenAICompatibleBedrockBackend, _AnthropicAWSBackend, _AnthropicBedrockBackend
+from agency.agllm_backends.bedrock import (
+    _OpenAICompatibleBedrockBackend,
+    _AnthropicAWSBackend,
+    _AnthropicBedrockBackend,
+)
 from agency.agllm_backends.anthropic import _AnthropicBackend
 from agency.agsandbox import _AgSandboxFields, agSandboxConfig
 from agency.agsandbox_backends import AgSandboxBackendFields
