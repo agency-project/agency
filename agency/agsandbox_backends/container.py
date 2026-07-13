@@ -23,6 +23,13 @@ from ..agconfig import agConfig
 from ..agresources import detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend
 
+# _RUN_ID is never read within this module itself -- it's defined here and
+# imported by agsandbox_backends/__init__.py (which re-exports it for
+# agsandbox.py's container-naming and a battery of tests/test_agterm.py
+# cases). Declared here explicitly so static analysis recognizes it as an
+# intentional export rather than a dead global.
+__all__ = ["_RUN_ID"]
+
 
 class _ContainerAlreadyRunning(Exception):
     """Raised by _run_with_conflict_retry when another process has already

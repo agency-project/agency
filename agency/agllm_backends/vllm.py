@@ -13,7 +13,14 @@ rejects.
 from __future__ import annotations
 
 from .base import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS, _VLLM_EXTRA_GEN_FIELDS
-from .openai import _OpenAICompatibleBackend  # noqa: F401  (re-exported for callers)
+from .openai import _OpenAICompatibleBackend
+
+# _OpenAICompatibleBackend isn't used below -- it's re-exported so callers
+# that expect every agllm_backends.<provider> module to expose its own
+# backend class (matching .openai/.anthropic/.bedrock) can still find one
+# here, even though vLLM has no backend class of its own (see module
+# docstring above).
+__all__ = ["agVLLMBackendConfig", "_OpenAICompatibleBackend"]
 
 
 class agVLLMBackendConfig(_AgProviderBackendConfig):

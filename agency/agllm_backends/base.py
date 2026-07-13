@@ -30,6 +30,20 @@ try:
 except ImportError:
     _anthropic_sdk = None
 
+# _OPENAI_GEN_FIELDS/_VLLM_EXTRA_GEN_FIELDS and the exception tuples below are
+# never read within this module itself -- they exist for .openai/.vllm/
+# .anthropic/.bedrock (the constants) and agllm.py (the exception tuples) to
+# import. Declared here explicitly so static analysis recognizes them as
+# intentional exports rather than dead globals.
+__all__ = [
+    "_OPENAI_GEN_FIELDS",
+    "_VLLM_EXTRA_GEN_FIELDS",
+    "BAD_REQUEST_EXCS",
+    "API_CONN_EXCS",
+    "RATE_LIMIT_EXCS",
+    "API_ERROR_EXCS",
+]
+
 
 # ---------------------------------------------------------------------------
 # Class-based LLM config -- every per-call LLM request parameter (model,
