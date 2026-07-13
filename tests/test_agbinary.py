@@ -362,9 +362,9 @@ def test_return_agbinary_valid_file_is_accepted():
 
 class TestAgSandboxBinaryIO:
     def _make_sb(self):
-        from agency.agsandbox_backend import _ContainerBackend
+        from agency.agsandbox_backends.container import _ContainerBackendBase
 
-        sb = _ContainerBackend.__new__(_ContainerBackend)
+        sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
         sb._started = True
         return sb
 

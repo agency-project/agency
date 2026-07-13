@@ -1,9 +1,8 @@
-"""Unit and integration tests for the chroot sandbox backend and backend
-selection logic in agsandbox_backend.py.
+"""Unit and integration tests for the chroot sandbox backend.
 
 Tests that actually chroot are marked with @chroot and skipped automatically
 when unprivileged user namespaces aren't usable on this host (see
-agsandbox_backend.chroot_available())."""
+agency.agsandbox_backends.chroot.chroot_available())."""
 
 from __future__ import annotations
 
@@ -11,10 +10,8 @@ import shutil
 import uuid
 
 import pytest
-from unittest.mock import patch
 
-from agency.agsandbox_backend import (
-    agsandbox_backend,
+from agency.agsandbox_backends.chroot import (
     chroot_available,
     _ChrootBackend,
     _CHROOT_STATE_ROOT,
@@ -60,105 +57,6 @@ class TestSanitizeTag:
 
     def test_distinct_tags_stay_distinct(self):
         assert _sanitize_tag("a/b") != _sanitize_tag("a-b")
-
-
-# ---------------------------------------------------------------------------
-# Backend selection (agsandbox_backend.for_config) -- no chroot/docker
-# execution required, just routing logic.
-# ---------------------------------------------------------------------------
-
-
-class TestBackendSelection:
-    def test_unknown_backend_raises_value_error(self):
-        from agency.agconfig import agConfig
-        from agency.agsandbox_backend import agSandboxBackendConfig
-
-        cfg = agConfig(agSandboxBackendConfig(backend="not-a-real-backend"))
-        with pytest.raises(ValueError, match="Unknown agsandbox_backend.backend"):
-            agsandbox_backend.for_config(
-                cfg,
-                agname="a",
-                name="a",
-                checkpoint_image=None,
-                base_image="x",
-                mounts={},
-            )
-
-    def test_explicit_docker_raises_when_unusable(self):
-        from agency.agconfig import agConfig
-        from agency.agsandbox_backend import agSandboxBackendConfig
-
-        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
-        with patch("agency.agsandbox_backend.shutil.which", return_value=None):
-            with pytest.raises(RuntimeError, match="docker"):
-                agsandbox_backend.for_config(
-                    cfg,
-                    agname="a",
-                    name="a",
-                    checkpoint_image=None,
-                    base_image="x",
-                    mounts={},
-                )
-
-    def test_explicit_chroot_raises_when_unavailable(self):
-        from agency.agconfig import agConfig
-        from agency.agsandbox_backend import agSandboxBackendConfig
-
-        cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
-        with patch("agency.agsandbox_backend.chroot_available", return_value=False):
-            with pytest.raises(RuntimeError, match="chroot"):
-                agsandbox_backend.for_config(
-                    cfg,
-                    agname="a",
-                    name="a",
-                    checkpoint_image=None,
-                    base_image="x",
-                    mounts={},
-                )
-
-    def test_explicit_chroot_builds_chroot_backend(self):
-        from agency.agconfig import agConfig
-        from agency.agsandbox_backend import agSandboxBackendConfig
-
-        cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
-        with patch("agency.agsandbox_backend.chroot_available", return_value=True):
-            backend = agsandbox_backend.for_config(
-                cfg,
-                agname="a",
-                name="chroot-select-test",
-                checkpoint_image=None,
-                base_image="x",
-                mounts={},
-            )
-        assert isinstance(backend, _ChrootBackend)
-        backend.destroy()
-
-    def test_auto_prefers_podman_then_docker_then_chroot(self):
-        from agency.agsandbox_backend import _auto_detect_runtime
-
-        with patch("agency.agsandbox_backend.get_container_runtime", return_value="podman"):
-            assert _auto_detect_runtime() == "podman"
-
-    def test_auto_falls_back_to_chroot_when_no_container_runtime(self):
-        from agency.agsandbox_backend import _auto_detect_runtime
-
-        with patch(
-            "agency.agsandbox_backend.get_container_runtime",
-            side_effect=RuntimeError("no docker/podman"),
-        ):
-            with patch("agency.agsandbox_backend.chroot_available", return_value=True):
-                assert _auto_detect_runtime() == "chroot"
-
-    def test_auto_raises_when_nothing_usable(self):
-        from agency.agsandbox_backend import _auto_detect_runtime
-
-        with patch(
-            "agency.agsandbox_backend.get_container_runtime",
-            side_effect=RuntimeError("no docker/podman"),
-        ):
-            with patch("agency.agsandbox_backend.chroot_available", return_value=False):
-                with pytest.raises(RuntimeError, match="No usable sandbox backend"):
-                    _auto_detect_runtime()
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +328,7 @@ class TestFacadeWithChrootBackend:
     def _make_sandbox(self, **kwargs):
         from agency.agconfig import agConfig
         from agency.agsandbox import agSandbox
-        from agency.agsandbox_backend import agSandboxBackendConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig
 
         cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
         uid = str(uuid.uuid4())
@@ -488,7 +386,7 @@ class TestFacadeWithChrootBackend:
 class TestAgentSaveLoadWithChrootBackend:
     def _make_agconfig(self):
         from agency.agconfig import agConfig
-        from agency.agsandbox_backend import agSandboxBackendConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig
 
         return agConfig(
             agSandboxBackendConfig(backend="chroot"),
@@ -565,7 +463,7 @@ class TestChrootSandboxedToolsDispatch:
     def _make_sandbox(self):
         from agency.agconfig import agConfig
         from agency.agsandbox import agSandbox
-        from agency.agsandbox_backend import agSandboxBackendConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig
 
         cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
         return agSandbox(str(uuid.uuid4()), agconfig=cfg)
@@ -574,7 +472,7 @@ class TestChrootSandboxedToolsDispatch:
         """Files written by the write tool in one worker process must be
         readable by the read tool in a subsequent, separately-dispatched
         worker process call -- the chroot-backend analogue of
-        test_agsandbox.py's identically-named container-backend test."""
+        test_docker.py's identically-named container-backend test."""
         from agency.agdata import agdata, agerror
         from agency.tools import make_sandboxed_tools
 
@@ -622,7 +520,7 @@ class TestChrootSandboxedToolsDispatch:
         from agency.agdata import agdata
         from agency.agskill import agskill
         from agency.agschema import agSchemaConfig
-        from agency.agsandbox_backend import agSandboxBackendConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig
         from agency.agent import agent
 
         cfg = agConfig(

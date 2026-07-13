@@ -32,7 +32,7 @@ from datetime import datetime
 
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
-from agency.agllm_backend import agVLLMBackendConfig
+from agency.agllm_backends import agVLLMBackendConfig
 from agency.agtype import agpath
 
 # ---------------------------------------------------------------------------

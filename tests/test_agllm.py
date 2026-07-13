@@ -400,15 +400,15 @@ def test_fetch_context_limit_reads_max_model_len():
 
 def test_fetch_context_limit_reads_max_input_tokens_for_anthropic_provider():
     """The first-party Anthropic API exposes max_input_tokens as a typed
-    field (not a model_extra vLLM-style extension) — see agllm_backend.py's
-    _AnthropicBackend.list_models()."""
+    field (not a model_extra vLLM-style extension) — see
+    agllm_backends/anthropic.py's _AnthropicBackend.list_models()."""
     mock_model = MagicMock()
     mock_model.id = "claude-sonnet-5"
     mock_model.model_extra = {}
     mock_model.max_input_tokens = 1_000_000
     mock_sdk = MagicMock()
     mock_sdk.Anthropic.return_value.models.list.return_value = [mock_model]
-    with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
+    with patch("agency.agllm_backends.anthropic._anthropic_sdk", mock_sdk):
         limit = fetch_context_limit(_cfg(provider="anthropic", model="claude-sonnet-5"))
     assert limit == 1_000_000
 

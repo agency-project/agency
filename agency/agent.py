@@ -25,7 +25,7 @@ from .agcontext import agcontext
 from .aglog import aglog, _ts
 from .agterm import agterm
 from .agsandbox import agSandbox, agSandboxConfig
-from .agsandbox_backend import agSandboxBackendConfig
+from .agsandbox_backends import agSandboxBackendConfig
 from .agresources import agResourcePool
 from .agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase

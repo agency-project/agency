@@ -2,63 +2,15 @@
 
 > **Lifecycle warning:** `agSandbox` wraps a live sandbox backend (a Docker/Podman container, or a chroot jail — see "Backend selection" below). Cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. There's no ownership flag to manage — sharing a sandbox between agents is just `ag.sandbox = sb` (or `agent(sandbox=sb)`) on each; `agskill` provisions/stops any sandbox it finds on `ag.sandbox` the same way regardless of where it came from, and the object itself is cleaned up once nothing references it anymore (see "Concurrent access" below).
 
-All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a sandbox, never directly on the host. `agSandbox` (in `agsandbox.py`) is a thin facade: it resolves the image/mounts vocabulary that's meaningful regardless of backend, then builds and delegates every operation to an `agsandbox_backend` (in `agsandbox_backend.py`) chosen by `agSandboxBackendConfig.backend`. Two backends exist today:
+All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a sandbox, never directly on the host. `agSandbox` (in `agsandbox.py`) is a thin facade: it resolves the image/mounts vocabulary that's meaningful regardless of backend, then builds and delegates every operation to an `agsandbox_backend` chosen by `agSandboxBackendConfig.backend`. Three backends exist today, each a real subclass in its own module under `agsandbox_backends/` — see **[agsandbox_backends/base.md](agsandbox_backends/base.md)** for backend selection, and [container.md](agsandbox_backends/container.md)/[docker.md](agsandbox_backends/docker.md)/[podman.md](agsandbox_backends/podman.md)/[chroot.md](agsandbox_backends/chroot.md) for how each one actually works. Everything below describes the facade — construction, the `agSandbox` API, concurrent access, GPU accounting at the facade level, the exec wrapper, file I/O, and config — regardless of which backend is behind it.
 
-- **Container backend** (`_ContainerBackend`) — a Docker or Podman container. Containers are created lazily: one starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state. Everything below through "Custom base image and mounts" describes this backend specifically (it's still the default and the only one with full GPU/resource-limit/checkpoint-image support) — see "Chroot backend" further down for what differs there.
-- **Chroot backend** (`_ChrootBackend`) — a per-agent directory chrooted into via an unprivileged `unshare --user --map-root-user --mount`, needing no root/sudo/setcap. Lighter weight, but a narrower isolation guarantee (filesystem containment only) — see "Chroot backend" below.
+## GPU device access
 
-## Backend selection
+`--gpus all` is passed to `run` when `nvidia-smi` detects GPUs on the host, mounting the NVIDIA device files into the container. On CPU-only hosts the flag is omitted.
 
-`agSandboxBackendConfig.backend` picks the backend: `"auto"` (default), `"podman"`, `"docker"`, or `"chroot"`.
+Even with `--gpus all`, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES=""` when no virtual reservation is active, making all GPUs invisible to CUDA. Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken. When `exec()` runs a bash command and the virtual flag is set, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected. After a foreground exec with no background processes, the physical GPU is returned to the pool immediately — freeing it for other agents while the LLM thinks. When background processes are alive, the GPU is held until `get_live_pids()` finds them all finished.
 
-```python
-from agency.agconfig import agConfig
-from agency.agsandbox_backend import agSandboxBackendConfig
-
-cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
-sb = agSandbox("myagent", agconfig=cfg)
-```
-
-`"auto"` (`agsandbox_backend._auto_detect_runtime()`) probes in this order: **podman → docker → chroot**, first usable one wins.
-
-- Podman/docker usability: the binary is on `PATH` and `<runtime> info` succeeds (`agsandbox_backend._runtime_works()`), cached for the process lifetime in `_RUNTIME`.
-- Chroot usability (`agsandbox_backend.chroot_available()`, also cached): `/proc/sys/kernel/unprivileged_userns_clone` isn't explicitly disabled (the file doesn't exist on distros that ship it enabled upstream) **and** a live `unshare --user --map-root-user --mount true` actually succeeds — the sysctl alone can false-positive on hosts where AppArmor/seccomp additionally restrict unprivileged user namespaces.
-
-An explicit `backend="docker"|"podman"|"chroot"` raises immediately with a clear error if that specific backend isn't usable, rather than silently falling through to another one.
-
-## Building the sandbox image
-
-```bash
-GPU_TYPE=cpu ./images/build.sh   # or nvidia/rocm; auto-detected if omitted
-```
-
-`build.sh` builds `agency-sandbox:latest` for **every container runtime installed on the host, podman first** — matching `agsandbox_backend`'s auto-selection order (see "Backend selection" above). An image built only for docker would leave podman's separate image store empty, so podman would try (and fail) to pull the image from a registry instead of finding it locally; building for both keeps whichever one auto-selection picks actually usable. Podman's build is tagged `localhost/agency-sandbox:latest` (the `localhost/` prefix it requires to resolve an unqualified name to its own local store instead of a registry); docker's is tagged bare. Each build gets its own smoke test (`import torch`) run against the runtime that built it.
-
-If `HF_TOKEN` is set, it's passed as a `--secret` for gated model downloads during the build. This is written to a private temp file and passed as `--secret id=hf_token,src=<file>` for both runtimes — docker buildx's `--secret id=...,env=VAR` shorthand is **not** portable to podman's buildah, which rejects it ("incorrect secret flag format: should be `--secret id=foo,src=bar`"); the file-based form is the one both accept.
-
-The `images/Dockerfile` installs `ripgrep` on top of `python:3.12-slim`. `Dockerfile.nvidia`/`Dockerfile.rocm` are used instead when `GPU_TYPE` is `nvidia`/`rocm`.
-
-## Container lifecycle
-
-*This section, and everything through "Custom base image and mounts" below, describes the container backend (`_ContainerBackend`) specifically. See "Chroot backend" further down for how the chroot backend's lifecycle differs.*
-
-The container exists only during active tool execution. Between tool calls the container is removed, releasing the Linux session keyring and any held GPU so concurrent agents can use those resources.
-
-| Event | What happens |
-|---|---|
-| `agSandbox.__init__` | No container created — cheap object; `_lifecycle_image=None` |
-| Any `run_in_subprocess=True` tool call | `_ensure_started()` runs lazily: if container is already running, reuse it; otherwise `docker rm -f` any leftover zombie, then `docker run` from `_lifecycle_image` (or `base_image` on first use) |
-| After **successful** sandbox tool call | `sandbox.stop(commit=True)`: `docker commit → agency/lifecycle-<name>`; `docker rm -f` (retried up to 3×); `_lifecycle_image` updated |
-| After **failed** sandbox tool call | `sandbox.stop(commit=False)`: `docker rm -f` without commit; dirty state discarded; next start restores from previous `_lifecycle_image` |
-| Any non-running container detected at startup | Force-removed with `docker rm -f` before `docker run` — covers "Exited", "Created" (partial docker run), and "Dead" states |
-| `sandbox.destroy()` | `docker rm -f` (no-op if already removed); `docker rmi agency/lifecycle-<name>`; any `pretool-*` images cleaned up |
-| `atexit` | All live containers removed (guard against hard-killed processes) |
-
-**Failure revert**: when a tool errors, `stop(commit=False)` discards the container with its partial state. The next tool call recreates from the last successful `_lifecycle_image`, so the agent's workspace is automatically rolled back to the last known-good state. The agent receives `workspace_reverted` in the error response to know this happened.
-
-**Container naming**: each container is named `sandbox-{RUN_ID}-{agname}`, where `_RUN_ID` is a per-process UUID prefix. This prevents cross-run name collisions when an agent crashes without cleanup and is restarted with the same `agname`. The lifecycle image name is produced by `_lifecycle_tag()`, which lowercases the Docker image name — Docker requires all repository names to be lowercase.
-
-**`stop()` reliability**: `docker rm -f` is retried up to 3 times. Each attempt goes through `_run()`, which holds `_docker_semaphore` (caps all concurrent daemon calls at 16). If all retries fail, a `WARNING` is emitted to stderr and the framework continues — `_started` is cleared regardless so the next tool call can attempt a fresh container.
+See [agsandbox_backends/container.md](agsandbox_backends/container.md) for the container-runtime-level mechanics (the actual `--gpus all`/`--device` flags passed to `run`) behind this.
 
 ## Concurrent access
 
@@ -67,12 +19,6 @@ Each `agSandbox` allocates `self._lock = threading.RLock()` in `__init__`. It ex
 The lock is **not self-enforcing** — `agSandbox`'s own methods don't acquire it. Instead, `agskill.py`'s `_task()` acquires `ag.sandbox._lock` right after provisioning and holds it for the *entire* skill run, releasing it only after the final teardown `stop()`. This makes "one skill run owns this sandbox at a time" an invariant enforced by the caller (agskill), not by `agSandbox` itself. Code that drives a shared `agSandbox` outside of an agskill run (harness scripts, custom orchestration) must coordinate its own access if it needs the same guarantee — see `Design_architecture.md`'s "Per-sandbox mutex" section for the full rationale.
 
 Because `threading.RLock` isn't picklable, `agSandbox` defines `__getstate__`/`__setstate__` to drop `_lock` before pickling and allocate a fresh one on unpickling. This matters because custom tools with `run_in_subprocess=True` (the default) get `cloudpickle`d to a worker process — without this, capturing a sandbox in such a tool's closure would raise `TypeError: cannot pickle '_thread.RLock' object`. All built-in tools (bash, read, write, grep, glob, …) use `run_in_subprocess=False` and never hit this path.
-
-## GPU device access
-
-`--gpus all` is passed to `run` when `nvidia-smi` detects GPUs on the host, mounting the NVIDIA device files into the container. On CPU-only hosts the flag is omitted.
-
-Even with `--gpus all`, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES=""` when no virtual reservation is active, making all GPUs invisible to CUDA. Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken. When `exec()` runs a bash command and the virtual flag is set, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected. After a foreground exec with no background processes, the physical GPU is returned to the pool immediately — freeing it for other agents while the LLM thinks. When background processes are alive, the GPU is held until `get_live_pids()` finds them all finished.
 
 ## Shared output directory
 
@@ -92,7 +38,7 @@ parent.sandbox._checkpoint_image ──tag_image──▶ agency/lifecycle-<fork
                                      (consumed by fork's first _task())
 ```
 
-Forking copies the parent's checkpoint image tag to a new tag for the fork via `type(parent.sandbox._backend).tag_image(...)` — dispatched to whichever backend class actually produced the checkpoint (`docker tag`/`podman tag` for the container backend, a directory copy for chroot — see "Chroot backend" below), not a bare docker-only call, since a chroot snapshot directory and a docker image tag are unrelated formats. No container/jail is created at fork time — that happens lazily when the fork's first `_task()` runs, restoring from the copied tag.
+Forking copies the parent's checkpoint image tag to a new tag for the fork via `type(parent.sandbox._backend).tag_image(...)` — dispatched to whichever backend class actually produced the checkpoint (`docker tag`/`podman tag` for the container backends, a directory copy for chroot — see [agsandbox_backends/chroot.md](agsandbox_backends/chroot.md)), not a bare docker-only call, since a chroot snapshot directory and a docker/podman image tag are unrelated formats. No container/jail is created at fork time — that happens lazily when the fork's first `_task()` runs, restoring from the copied tag.
 
 Because forks wait for `src.ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
@@ -188,22 +134,7 @@ sb.destroy()            # tear down the backend + delete its checkpoint image/sn
 sb.image_kind -> str    # "container" or "chroot" -- which backend produced sb._checkpoint_image
 ```
 
-Every method above is a one-line delegate from the `agSandbox` facade to `sb._backend` (an `agsandbox_backend` subclass — see "Backend selection"). `sb._backend` is the thing that actually knows how to talk to Docker/Podman or run `unshare`+`chroot`; the facade only owns what's backend-agnostic (config resolution, the `_lock`, GPU/CPU pool bookkeeping).
-
-## Chroot backend
-
-`_ChrootBackend` (in `agsandbox_backend.py`) trades Docker/Podman's full isolation for a much lighter mechanism, for the case where you just want each agent to see only its own files and its own installed packages, with no access to the host filesystem, and don't need network/process/resource isolation:
-
-- **Mechanism**: every `exec()` call runs inside a fresh `unshare --user --map-root-user --mount` (an unprivileged user + mount namespace — no root, sudo, or `setcap` needed) followed by `chroot` into a per-agent directory. The mount namespace (and everything bind-mounted into it) is torn down automatically when that one process exits — there's no long-lived daemon to exec into the way `docker exec` has a container to attach to.
-- **Directory layout**: `<tmp>/agency-chroot-sandboxes/jails/<sandbox-name>/` is the jail root. `workspace/` inside it is a plain host directory (no bind mount needed, since chroot just repoints `/` — `/workspace` inside the jail *is* that directory) and is the only thing that persists across execs. `bin`, `sbin`, `lib`, `lib32`, `lib64`, `usr`, `etc` are bind-mounted read-only from the host on every exec (so the jail gets the host's own interpreters/system libraries without needing a separate image), and `dev` is bind-mounted read-write (unscoped — see below) since most programs assume `/dev/null`, `/dev/urandom`, etc. exist and are writable. A fresh `procfs` is also mounted so PID tracking (below) keeps working.
-- **Checkpointing**: `commit`/`restore`/`stop(commit=...)`/`fork`/`tag_image`/`export_image`/`import_image` all operate on the `workspace/` directory instead of a container filesystem. A commit is `cp -a --reflink=auto <workspace> <tmp>/agency-chroot-sandboxes/snapshots/<sanitized-tag>` — a true point-in-time copy (using a filesystem reflink where available, a full copy otherwise), not a hardlink clone that a later in-place write to the live workspace would silently corrupt. `export_image`/`import_image` tar/untar that snapshot directory.
-- **Cross-process safety**: tool calls with `run_in_subprocess=True` (the default) each get a *fresh* cloudpickled copy of the backend dispatched to a `ProcessPoolExecutor` worker, so a worker's own `self._started` is unreliable — it reflects whatever the object looked like at the *original* process's last pickle, not what a different worker already did. `_ensure_started()`/`commit()`/`stop()` therefore check the workspace directory's existence on disk as their ground truth instead of trusting `self._started`, exactly analogous to how the container backend falls back to `_container_running()` (querying the docker daemon) instead of trusting its own `_started` in the same situation — there's no daemon here, so the workspace directory itself is the cross-process source of truth. Getting this wrong previously caused a real bug: a file written by one worker was wiped by the very next worker's `_ensure_started()` re-materializing from the last checkpoint, because that worker's own (stale) view said nothing had started yet.
-- **What it does *not* isolate**, by design (matches the scope this backend was built for — filesystem containment + independent per-agent installs, not containment against adversarial code):
-  - **Network** — the jailed process shares the host's network stack; there is no network namespace.
-  - **Processes** — there is no PID namespace. The fresh `procfs` mounted into the jail reflects the *host's* real process table, so a command running inside the jail can *see* every host process (though signalling/killing them still goes through the kernel's normal permission checks against the real, unprivileged host uid the mapped "root" resolves to — it can't act on processes it doesn't own).
-  - **CPU/memory** — no cgroup of its own; `update_limits()` is a no-op.
-  - **GPU device scoping** — `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` are still exported the same way as the container backend, but nothing stops a process from seeing every `/dev` entry the host user can.
-- **Cross-process checkpoints**: `agent.save()` records which backend produced a checkpoint (`state["sandbox_image_kind"]`, either `"container"` or `"chroot"`) and `agent.load()` routes `import_image`/`tag_image`/`delete_image` to the matching backend class via `agSandbox.backend_for_image_kind(kind)`, forcing the reconstructed sandbox's `backend` config to `"chroot"` when needed — auto-detection (which prefers podman/docker when available) would otherwise pick a backend that can't make sense of a chroot snapshot's tag.
+Every method above is a one-line delegate from the `agSandbox` facade to `sb._backend` (an `agsandbox_backend` subclass — see [agsandbox_backends/base.md](agsandbox_backends/base.md)). `sb._backend` is the thing that actually knows how to talk to Docker/Podman or run `unshare`+`chroot`; the facade only owns what's backend-agnostic (config resolution, the `_lock`, GPU/CPU pool bookkeeping). See [agsandbox_backends/chroot.md](agsandbox_backends/chroot.md) for the chroot backend's own mechanics (mount namespace, directory layout, checkpointing, and what it deliberately doesn't isolate).
 
 ## Custom base image and mounts
 
@@ -230,7 +161,7 @@ so the same override can also be spelled as nested attribute access on the
 cfg.agSandbox.base_image = "my-registry/custom-image:latest"
 ```
 
-`base_image` and `mounts` (the `host` side of each mount) are resolved by the facade and handed to whichever backend is selected — `_ContainerBackend` uses `base_image` for `docker run`/`podman run`; `_ChrootBackend` ignores it entirely (there's no image concept — see "Chroot backend" above) but still bind-mounts configured `mounts` into the jail at their `container` path.
+`base_image` and `mounts` (the `host` side of each mount) are resolved by the facade and handed to whichever backend is selected — `_DockerBackend`/`_PodmanBackend` use `base_image` for `docker run`/`podman run`; `_ChrootBackend` ignores it entirely (there's no image concept — see [agsandbox_backends/chroot.md](agsandbox_backends/chroot.md)) but still bind-mounts configured `mounts` into the jail at their `container` path.
 
 ## `change_config` / `get_config_copy`
 

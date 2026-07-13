@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
-from .agsandbox_backend import agsandbox_backend, backend_for_image_kind, _RUN_ID
+from .agsandbox_backends import agsandbox_backend, backend_for_image_kind, _RUN_ID
 
 if TYPE_CHECKING:
     from .agresources import agResourcePool
@@ -457,8 +457,8 @@ class agSandbox(_AgSandboxFields):
 
 
 # Re-exported for callers that imported these directly from agsandbox before
-# the docker/podman mechanics moved to agsandbox_backend.py.
-from .agsandbox_backend import (  # noqa: E402,F401
+# the docker/podman mechanics moved to agsandbox_backends/.
+from .agsandbox_backends import (  # noqa: E402,F401
     get_container_runtime,
     seed_cache_from_image,
     keyring_quota,

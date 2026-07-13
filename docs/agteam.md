@@ -30,7 +30,7 @@ Configuration specific to the team (topic, file paths, limits, …) is passed as
 from agency import agteam, agent, agskill, agdata, agsync
 from agency.agtool import agtool
 from agency.agconfig import agConfig
-from agency.agllm_backend import agLLMBackendConfig
+from agency.agllm_backends import agLLMBackendConfig
 
 cfg = agConfig(agLLMBackendConfig(base_url="...", model="...", api_key="..."))
 
@@ -157,7 +157,7 @@ Declaring `agconfig` at the class level provides a default shared by all instanc
 
 ```python
 from agency.agconfig import agConfig
-from agency.agllm_backend import agLLMBackendConfig
+from agency.agllm_backends import agLLMBackendConfig
 
 _cfg = agConfig(agLLMBackendConfig(
     base_url="https://my-vllm/v1",

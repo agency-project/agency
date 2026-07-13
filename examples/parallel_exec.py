@@ -20,7 +20,7 @@ from pathlib import Path
 
 from agency import agent, agdata, agskill, agteam
 from agency.agconfig import agConfig
-from agency.agllm_backend import agVLLMBackendConfig
+from agency.agllm_backends import agVLLMBackendConfig
 from agency.agtype import agpath
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
