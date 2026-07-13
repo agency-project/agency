@@ -1699,7 +1699,7 @@ class TestDanglingImageEagerCleanup:
 
     def test_stop_commit_deletes_old_image(self):
         """stop(commit=True) must delete the image that previously held the tag."""
-        import agency.agsandbox_backend as _mod
+        from agency.agsandbox_backend import _ContainerBackend
 
         sb = _make_sandbox()
 
@@ -1723,7 +1723,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+        with patch.object(_ContainerBackend, "_run", fake_run):
             with patch.object(sb._backend, "_started", True):
                 with patch.object(sb._backend, "_container_running", return_value=True):
                     with patch.object(sb._backend, "_gpu_virtual", False):
@@ -1773,7 +1773,7 @@ class TestDanglingImageEagerCleanup:
         after every tool call, so a hard failure here would be far worse than
         the disk-space cost of an occasional dangling image."""
         import io
-        import agency.agsandbox_backend as _mod
+        from agency import agsandbox_backend as _mod
 
         sb = _make_sandbox()
         fake_old_id = "sha256:cafebabe1234"
@@ -1881,9 +1881,9 @@ class TestDockerCommandHelpers:
             calls.append((args, check))
             return OK()
 
-        import agency.agsandbox_backend as _mod
+        from agency.agsandbox_backend import _ContainerBackend
 
-        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+        with patch.object(_ContainerBackend, "_run", fake_run):
             sb._backend._rm_container("my-container")
 
         assert len(calls) == 1
@@ -1894,9 +1894,9 @@ class TestDockerCommandHelpers:
     def test_rm_container_raises_on_failure(self):
         sb = self._sb()
 
-        import agency.agsandbox_backend as _mod
+        from agency.agsandbox_backend import _ContainerBackend
 
-        with patch.object(_mod._ContainerBackend, "_run", side_effect=RuntimeError("rm failed")):
+        with patch.object(_ContainerBackend, "_run", side_effect=RuntimeError("rm failed")):
             with pytest.raises(RuntimeError, match="rm failed"):
                 sb._backend._rm_container("bad-container")
 

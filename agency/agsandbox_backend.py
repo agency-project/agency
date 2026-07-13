@@ -315,6 +315,8 @@ def _probe_chroot_available() -> bool:
         if sysctl_path.exists() and sysctl_path.read_text().strip() == "0":
             return False
     except OSError:
+        # Ignore sysctl read errors and fall back to the live `unshare` probe
+        # below, which is the authoritative capability check.
         pass
     try:
         proc = subprocess.run(
@@ -606,6 +608,8 @@ class agsandbox_backend(AgSandboxBackendFields):
                     try:
                         self._watched_pids[int(pid_s)] = now
                     except ValueError:
+                        # Ignore malformed PID tokens in __BGPIDS__ output.
+                        # PID capture is best-effort and should not fail exec().
                         pass
         else:
             clean_output = output
@@ -1229,8 +1233,12 @@ class _ContainerBackend(agsandbox_backend):
                 )
                 if result and result.returncode == 0:
                     old_image_id = result.stdout.decode("utf-8", errors="replace").strip() or None
-            except Exception:
-                pass
+            except Exception as _e:
+                print(
+                    f"[agsandbox_backend] WARNING: could not inspect existing image for tag {tag}: {_e}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
             for _attempt in range(self.commit_retry_attempts):
                 try:
                     self._run(
