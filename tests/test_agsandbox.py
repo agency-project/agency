@@ -55,10 +55,22 @@ nvidia_smi = pytest.mark.skipif(not _nvidia_smi_available(), reason="nvidia-smi 
 
 
 def _make_sandbox(**kwargs):
+    """Build an agSandbox for these tests, always forcing the docker backend.
+
+    This test file verifies container lifecycle by shelling out to the
+    ``docker`` CLI directly (docker ps/images/rmi/...), so it needs every
+    sandbox it builds to actually be a docker container regardless of the
+    process-wide auto-detected default (which now prefers podman when both
+    are usable -- see agsandbox_backend.agsandbox_backend.for_config()).
+    """
+    from agency.agconfig import agConfig
     from agency.agsandbox import agSandbox
+    from agency.agsandbox_backend import agSandboxBackendConfig
 
     uid = str(uuid.uuid4())
-    return agSandbox(uid, **kwargs)
+    agconfig = kwargs.pop("agconfig", None)
+    cfg = agConfig(agSandboxBackendConfig(backend="docker"), agconfig)
+    return agSandbox(uid, agconfig=cfg, **kwargs)
 
 
 def _agconfig_with_output_dir(output_dir):
@@ -495,9 +507,17 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
         copy.agllm_backend.temperature = 0.1
         assert sb._agconfig.get("agllm_backend", "temperature") == 0.7
 
+    @docker
     def test_get_config_copy_none_when_no_agconfig(self):
-        sb = _make_sandbox()
-        assert sb.get_config_copy() is None
+        # Bypasses _make_sandbox()'s forced backend="docker" agconfig on purpose --
+        # this test is specifically about the truly-no-agconfig-at-all pathway.
+        from agency.agsandbox import agSandbox
+
+        sb = agSandbox(str(uuid.uuid4()))
+        try:
+            assert sb.get_config_copy() is None
+        finally:
+            sb.destroy()
 
     def test_change_config_none_clears_agconfig(self):
         from agency.agconfig import agConfig
@@ -515,25 +535,25 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
 class TestAgSandboxLifecycle:
     def test_lifecycle_tag_is_lowercase(self):
         """_lifecycle_tag() must be fully lowercase — Docker rejects uppercase repository names."""
-        from agency.agsandbox import agSandbox
+        from agency.agsandbox_backend import _ContainerBackend
 
-        sb = agSandbox.__new__(agSandbox)
-        sb._name = "GenerationAgent_4816622_0000"
-        tag = sb._lifecycle_tag()
+        backend = _ContainerBackend.__new__(_ContainerBackend)
+        backend._name = "GenerationAgent_4816622_0000"
+        tag = backend._lifecycle_tag()
         assert tag == tag.lower(), f"lifecycle tag must be lowercase, got {tag!r}"
         assert "generationagent" in tag
 
     def test_lifecycle_tag_format(self):
-        from agency.agsandbox import agSandbox
+        from agency.agsandbox_backend import _ContainerBackend
 
-        sb = agSandbox.__new__(agSandbox)
-        sb._name = "myagent_0000"
-        assert sb._lifecycle_tag() == "agency/lifecycle-myagent_0000"
+        backend = _ContainerBackend.__new__(_ContainerBackend)
+        backend._name = "myagent_0000"
+        assert backend._lifecycle_tag() == "agency/lifecycle-myagent_0000"
 
     @docker
     def test_container_starts_and_destroys(self):
         sb = _make_sandbox()
-        name = sb._container_name()
+        name = sb._backend._container_name()
         # Container is started lazily on first use
         sb.exec("true")
         result = subprocess.run(
@@ -575,11 +595,14 @@ class TestAgSandboxLifecycle:
 
         Simulated by creating two sandbox objects with the same agname: sb_worker starts
         the container, sb_main (with _started=False) tries to commit it."""
+        from agency.agconfig import agConfig
         from agency.agsandbox import agSandbox
+        from agency.agsandbox_backend import agSandboxBackendConfig
 
         agname = str(uuid.uuid4())
-        sb_worker = agSandbox(agname)  # "worker" — starts the container
-        sb_main = agSandbox(agname)  # "main process" — same name, _started=False
+        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
+        sb_worker = agSandbox(agname, agconfig=cfg)  # "worker" — starts the container
+        sb_main = agSandbox(agname, agconfig=cfg)  # "main process" — same name, _started=False
         tag = f"agency/test-commit-started-false-{agname[:8]}"
         try:
             # Worker starts container and writes a file.
@@ -625,7 +648,7 @@ class TestAgSandboxLifecycle:
         # _started is False but the container is still running in Docker.
         sb._started = False
         # _ensure_started() must detect the running container and reuse it.
-        sb._ensure_started()
+        sb._backend._ensure_started()
         assert sb._started is True
         # The file written before the reset must still be present.
         content = sb.read_file("/workspace/persist.txt")
@@ -697,8 +720,8 @@ class TestAgSandboxLifecycle:
     def test_stop_commit_true_creates_checkpoint_image_and_removes_container(self):
         """stop(commit=True) commits state to agency/lifecycle-<name> and removes the container."""
         sb = _make_sandbox()
-        name = sb._container_name()
-        lifecycle_tag = sb._lifecycle_tag()
+        name = sb._backend._container_name()
+        lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             sb.write_file("/workspace/marker.txt", "lifecycle\n")
             sb.stop(commit=True)
@@ -726,8 +749,8 @@ class TestAgSandboxLifecycle:
     def test_stop_commit_false_removes_container_without_image(self):
         """stop(commit=False) removes the container but does not create a lifecycle image."""
         sb = _make_sandbox()
-        name = sb._container_name()
-        lifecycle_tag = sb._lifecycle_tag()
+        name = sb._backend._container_name()
+        lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             sb.write_file("/workspace/dirty.txt", "dirty\n")
             previous_lifecycle = sb._checkpoint_image  # None on first call
@@ -756,7 +779,7 @@ class TestAgSandboxLifecycle:
     def test_checkpoint_image_restores_workspace_on_next_start(self):
         """After stop(commit=True), _ensure_started() restores /workspace from the lifecycle image."""
         sb = _make_sandbox()
-        lifecycle_tag = sb._lifecycle_tag()
+        lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             sb.write_file("/workspace/persistent.txt", "saved\n")
             sb.stop(commit=True)
@@ -773,7 +796,7 @@ class TestAgSandboxLifecycle:
     def test_stop_commit_false_reverts_to_last_checkpoint(self):
         """stop(commit=False) discards dirty state; next start restores from last lifecycle image."""
         sb = _make_sandbox()
-        lifecycle_tag = sb._lifecycle_tag()
+        lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             # First successful tool call: write file and commit.
             sb.write_file("/workspace/good.txt", "good\n")
@@ -796,7 +819,7 @@ class TestAgSandboxLifecycle:
     def test_destroy_removes_checkpoint_image(self):
         """destroy() cleans up the lifecycle image created by stop(commit=True)."""
         sb = _make_sandbox()
-        lifecycle_tag = sb._lifecycle_tag()
+        lifecycle_tag = sb._backend._lifecycle_tag()
         sb.write_file("/workspace/x.txt", "x\n")
         sb.stop(commit=True)
         # Confirm image exists before destroy
@@ -820,10 +843,10 @@ class TestAgSandboxLifecycle:
         """stop() retries docker rm -f up to 3 times; succeeds if a later attempt works."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
-        name = sb._container_name()
+        name = sb._backend._container_name()
 
         call_count = [0]
-        real_run = sb._run
+        real_run = sb._backend._run
 
         def flaky_run(cmd, **kwargs):
             if "rm" in cmd and "-f" in cmd and name in cmd:
@@ -832,7 +855,7 @@ class TestAgSandboxLifecycle:
                     raise RuntimeError("simulated rm -f failure")
             return real_run(cmd, **kwargs)
 
-        sb._run = flaky_run
+        sb._backend._run = flaky_run
         sb.stop(commit=False)
 
         assert call_count[0] == 2, "expected one failure then one success"
@@ -854,14 +877,14 @@ class TestAgSandboxLifecycle:
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
 
-        real_run = sb._run
+        real_run = sb._backend._run
 
         def always_fail_rm(cmd, **kwargs):
             if "rm" in cmd and "-f" in cmd:
                 raise RuntimeError("simulated persistent failure")
             return real_run(cmd, **kwargs)
 
-        sb._run = always_fail_rm
+        sb._backend._run = always_fail_rm
         captured = io.StringIO()
         old_stderr = sys.stderr
         sys.stderr = captured
@@ -870,7 +893,7 @@ class TestAgSandboxLifecycle:
         finally:
             sys.stderr = old_stderr
             # Force cleanup bypassing our mock
-            sb._run = real_run
+            sb._backend._run = real_run
             sb.destroy()
 
         assert "WARNING" in captured.getvalue()
@@ -879,10 +902,10 @@ class TestAgSandboxLifecycle:
     @docker
     def test_concurrent_docker_calls_gated_by_docker_semaphore(self):
         """All docker calls go through _run() which holds _docker_semaphore; peak concurrency <= 8."""
-        from agency.agsandbox import _docker_semaphore
+        from agency.agsandbox_backend import _docker_semaphore
 
         sandboxes = [_make_sandbox() for _ in range(4)]
-        lifecycle_tags = [sb._lifecycle_tag() for sb in sandboxes]
+        lifecycle_tags = [sb._backend._lifecycle_tag() for sb in sandboxes]
         for sb in sandboxes:
             sb.write_file("/workspace/x.txt", "x\n")
 
@@ -930,7 +953,7 @@ class TestAgSandboxLifecycle:
     def test_ensure_started_removes_created_state_container(self):
         """_ensure_started() force-removes a container stuck in 'Created' state before docker run."""
         sb = _make_sandbox()
-        name = sb._container_name()
+        name = sb._backend._container_name()
         try:
             # Manually create a container in 'Created' state (no --detach run, just create).
             subprocess.run(
@@ -945,7 +968,7 @@ class TestAgSandboxLifecycle:
             )
             assert status.stdout.strip() == "created"
             # _ensure_started() must remove the stuck container and start fresh.
-            sb._ensure_started()
+            sb._backend._ensure_started()
             assert sb._started is True
             out, rc = sb.exec("echo ok")
             assert rc == 0 and "ok" in out
@@ -957,10 +980,10 @@ class TestAgSandboxLifecycle:
         """stop(commit=True) retries docker commit up to 3 times; succeeds if a later attempt works."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
-        lifecycle_tag = sb._lifecycle_tag()
+        lifecycle_tag = sb._backend._lifecycle_tag()
 
         call_count = [0]
-        real_run = sb._run
+        real_run = sb._backend._run
 
         def flaky_run(cmd, **kwargs):
             if "commit" in cmd:
@@ -969,7 +992,7 @@ class TestAgSandboxLifecycle:
                     raise RuntimeError("simulated commit failure")
             return real_run(cmd, **kwargs)
 
-        sb._run = flaky_run
+        sb._backend._run = flaky_run
         try:
             sb.stop(commit=True)
             assert call_count[0] == 2, "expected one failure then one success"
@@ -995,14 +1018,14 @@ class TestAgSandboxLifecycle:
         sb.write_file("/workspace/x.txt", "x\n")
         previous_lifecycle = sb._checkpoint_image
 
-        real_run = sb._run
+        real_run = sb._backend._run
 
         def always_fail_commit(cmd, **kwargs):
             if "commit" in cmd:
                 raise RuntimeError("simulated persistent commit failure")
             return real_run(cmd, **kwargs)
 
-        sb._run = always_fail_commit
+        sb._backend._run = always_fail_commit
         captured = io.StringIO()
         old_stderr = sys.stderr
         sys.stderr = captured
@@ -1010,7 +1033,7 @@ class TestAgSandboxLifecycle:
             sb.stop(commit=True)
         finally:
             sys.stderr = old_stderr
-            sb._run = real_run
+            sb._backend._run = real_run
             sb.destroy()
 
         assert "WARNING" in captured.getvalue()
@@ -1026,14 +1049,14 @@ class TestAgSandboxLifecycle:
         removed so the name is free for a fresh docker run.
         """
         sb = _make_sandbox()
-        name = sb._container_name()
+        name = sb._backend._container_name()
         try:
             sb.write_file("/workspace/exited.txt", "still-here\n")
             # Externally stop (not remove) the container — puts it in exited state.
             subprocess.run(["docker", "stop", "-t", "0", name], capture_output=True)
             sb._started = False
             # _ensure_started() must remove the exited container and do a fresh docker run.
-            sb._ensure_started()
+            sb._backend._ensure_started()
             assert sb._started is True
             # The fresh container has no /workspace/exited.txt — the exited container
             # was force-removed.  State would only survive if stop(commit=True) had been
@@ -1133,12 +1156,17 @@ class TestAgSandboxFileIO:
 
 
 class TestAgSandboxReadFileUnit:
-    """Unit tests for read_file error cases — no Docker required."""
+    """Unit tests for read_file error cases — no Docker required.
+
+    read_file()'s base64-decode/error-mapping logic lives on _ContainerBackend
+    (agsandbox_backend.py), so these unit tests exercise it directly rather
+    than through the agSandbox facade.
+    """
 
     def _make_sb(self):
-        from agency.agsandbox import agSandbox
+        from agency.agsandbox_backend import _ContainerBackend
 
-        sb = agSandbox.__new__(agSandbox)
+        sb = _ContainerBackend.__new__(_ContainerBackend)
         sb._started = True
         return sb
 
@@ -1671,7 +1699,7 @@ class TestDanglingImageEagerCleanup:
 
     def test_stop_commit_deletes_old_image(self):
         """stop(commit=True) must delete the image that previously held the tag."""
-        import agency.agsandbox as _mod
+        from agency.agsandbox_backend import _ContainerBackend
 
         sb = _make_sandbox()
 
@@ -1695,10 +1723,10 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            with patch.object(sb, "_started", True):
-                with patch.object(sb, "_container_running", return_value=True):
-                    with patch.object(sb, "_gpu_virtual", False):
+        with patch.object(_ContainerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_started", True):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
                         sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
@@ -1709,7 +1737,7 @@ class TestDanglingImageEagerCleanup:
 
     def test_stop_commit_skips_rmi_when_no_old_image(self):
         """If the tag does not exist yet (first commit), no rmi call is made."""
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
         sb = _make_sandbox()
 
@@ -1726,10 +1754,10 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted(stdout=b"", returncode=1)  # tag not found
             return FakeCompleted()
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            with patch.object(sb, "_started", True):
-                with patch.object(sb, "_container_running", return_value=True):
-                    with patch.object(sb, "_gpu_virtual", False):
+        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_started", True):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
                         sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
@@ -1745,7 +1773,7 @@ class TestDanglingImageEagerCleanup:
         after every tool call, so a hard failure here would be far worse than
         the disk-space cost of an occasional dangling image."""
         import io
-        import agency.agsandbox as _mod
+        from agency import agsandbox_backend as _mod
 
         sb = _make_sandbox()
         fake_old_id = "sha256:cafebabe1234"
@@ -1766,10 +1794,10 @@ class TestDanglingImageEagerCleanup:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(_mod.agSandbox, "_run", fake_run):
-                with patch.object(sb, "_started", True):
-                    with patch.object(sb, "_container_running", return_value=True):
-                        with patch.object(sb, "_gpu_virtual", False):
+            with patch.object(_mod._ContainerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_started", True):
+                    with patch.object(sb._backend, "_container_running", return_value=True):
+                        with patch.object(sb._backend, "_gpu_virtual", False):
                             sb.stop(commit=True)  # must not raise
         finally:
             sys.stderr = old_stderr
@@ -1853,10 +1881,10 @@ class TestDockerCommandHelpers:
             calls.append((args, check))
             return OK()
 
-        import agency.agsandbox as _mod
+        from agency.agsandbox_backend import _ContainerBackend
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            sb._rm_container("my-container")
+        with patch.object(_ContainerBackend, "_run", fake_run):
+            sb._backend._rm_container("my-container")
 
         assert len(calls) == 1
         args, check = calls[0]
@@ -1866,11 +1894,11 @@ class TestDockerCommandHelpers:
     def test_rm_container_raises_on_failure(self):
         sb = self._sb()
 
-        import agency.agsandbox as _mod
+        from agency.agsandbox_backend import _ContainerBackend
 
-        with patch.object(_mod.agSandbox, "_run", side_effect=RuntimeError("rm failed")):
+        with patch.object(_ContainerBackend, "_run", side_effect=RuntimeError("rm failed")):
             with pytest.raises(RuntimeError, match="rm failed"):
-                sb._rm_container("bad-container")
+                sb._backend._rm_container("bad-container")
 
     # --- _rmi ---
 
@@ -1886,10 +1914,10 @@ class TestDockerCommandHelpers:
             calls.append((args, check))
             return OK()
 
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            sb._rmi("sha256:abc123")
+        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+            sb._backend._rmi("sha256:abc123")
 
         assert len(calls) == 1
         args, check = calls[0]
@@ -1909,21 +1937,21 @@ class TestDockerCommandHelpers:
             calls.append(args)
             return OK()
 
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            sb._rmi("myimage:tag", force=True)
+        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+            sb._backend._rmi("myimage:tag", force=True)
 
         assert "-f" in calls[0]
 
     def test_rmi_raises_on_failure(self):
         sb = self._sb()
 
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
-        with patch.object(_mod.agSandbox, "_run", side_effect=RuntimeError("rmi failed")):
+        with patch.object(_mod._ContainerBackend, "_run", side_effect=RuntimeError("rmi failed")):
             with pytest.raises(RuntimeError, match="rmi failed"):
-                sb._rmi("sha256:deadbeef")
+                sb._backend._rmi("sha256:deadbeef")
 
     # --- _ensure_started pre-cleanup guard ---
 
@@ -1940,14 +1968,14 @@ class TestDockerCommandHelpers:
             calls.append(args)
             return OK()
 
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
+        with patch.object(_mod._ContainerBackend, "_run", fake_run):
             # status returns "" → no leftover container
-            with patch.object(sb, "_container_running", return_value=False):
-                with patch.object(sb, "_container_status", return_value=""):
-                    with patch.object(sb, "_run_with_conflict_retry"):
-                        sb._ensure_started()
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                with patch.object(sb._backend, "_container_status", return_value=""):
+                    with patch.object(sb._backend, "_run_with_conflict_retry"):
+                        sb._backend._ensure_started()
 
         rm_calls = [a for a in calls if "rm" in a]
         assert not rm_calls, f"expected no rm call; got {rm_calls}"
@@ -1965,13 +1993,13 @@ class TestDockerCommandHelpers:
             calls.append((args, check))
             return OK()
 
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            with patch.object(sb, "_container_running", return_value=False):
-                with patch.object(sb, "_container_status", return_value="exited"):
-                    with patch.object(sb, "_run_with_conflict_retry"):
-                        sb._ensure_started()
+        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                with patch.object(sb._backend, "_container_status", return_value="exited"):
+                    with patch.object(sb._backend, "_run_with_conflict_retry"):
+                        sb._backend._ensure_started()
 
         rm_calls = [(a, c) for (a, c) in calls if "rm" in a]
         assert rm_calls, "expected rm call for leftover container"
@@ -1981,7 +2009,7 @@ class TestDockerCommandHelpers:
 
     def test_destroy_releases_semaphore_even_when_rm_raises(self):
         """_container_semaphore must be released in finally even if rm fails."""
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
         sb = self._sb()
 
@@ -2000,10 +2028,10 @@ class TestDockerCommandHelpers:
 
         released = []
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            with patch.object(sb, "_started", True):
-                with patch.object(sb, "_container_running", return_value=True):
-                    with patch.object(sb, "_container_status", return_value="running"):
+        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_started", True):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_container_status", return_value="running"):
                         with patch.object(
                             _mod._container_semaphore,
                             "release",
@@ -2016,7 +2044,7 @@ class TestDockerCommandHelpers:
 
     def test_destroy_skips_rm_when_container_absent(self):
         """destroy() must not call rm when the container does not exist."""
-        import agency.agsandbox as _mod
+        import agency.agsandbox_backend as _mod
 
         sb = self._sb()
         calls = []
@@ -2029,10 +2057,10 @@ class TestDockerCommandHelpers:
             calls.append(args)
             return OK()
 
-        with patch.object(_mod.agSandbox, "_run", fake_run):
-            with patch.object(sb, "_started", False):
-                with patch.object(sb, "_container_running", return_value=False):
-                    with patch.object(sb, "_container_status", return_value=""):
+        with patch.object(_mod._ContainerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_started", False):
+                with patch.object(sb._backend, "_container_running", return_value=False):
+                    with patch.object(sb._backend, "_container_status", return_value=""):
                         sb.destroy()
 
         rm_calls = [a for a in calls if "rm" in a and "rmi" not in a]

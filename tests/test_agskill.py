@@ -2056,6 +2056,112 @@ def test_run_returns_token_counts():
 
 
 # ---------------------------------------------------------------------------
+# run() defensively copies skill_input before mutating it
+# ---------------------------------------------------------------------------
+#
+# prepare_inputs_in_sandbox() (called from execute_react(), itself called from
+# run()'s _task()) mutates its skill_input argument in place -- offloaded
+# agtype/oversized fields get overwritten with a sandbox path reference. If a
+# caller hands the *same* agdata object to more than one concurrently-running
+# agent.run() call (a real pattern: fanning one shared input out to several
+# agents, e.g. autoresearch's ClassificationTeam.run()), those calls race on
+# that shared mutation -- whichever run finishes its offload last clobbers the
+# field with its own path, leaving every other run trying to read a file that
+# only exists in that one run's own sandbox. _task() must give each run its
+# own private copy from the moment it starts, regardless of what the caller
+# does with the object it passed in.
+
+
+def test_run_does_not_mutate_callers_shared_input_object():
+    """Regression test: run() must not mutate the skill_input object the
+    caller passed in -- prepare_inputs_in_sandbox()'s offload rewrite must
+    land on a private copy, not the caller's own object."""
+    from agency.agschema import agSchemaConfig
+    from agency.agsandbox_backend import agSandboxBackendConfig
+
+    # Force the docker sandbox backend: agsandbox_backend's "auto" selection
+    # prefers podman over docker when both are usable, but CI's
+    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
+    # podman has no local image and would try (and fail) to pull one.
+    cfg = agConfig(
+        agSchemaConfig(input_offload_chars=10),
+        agSandboxBackendConfig(backend="docker"),
+        {"agllm_backend": LLM_CONFIG},
+    )
+    s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
+
+    def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
+        s.input_schema.prepare_inputs_in_sandbox(
+            skill_input,
+            ag.sandbox,
+            s.name,
+            context_limit=ag.llm.context_limit,
+            agconfig=ag.agconfig,
+        )
+        return agdata(answer=skill_input.text), prev_ctx, []
+
+    s.execute_react = fake_execute_react
+
+    shared_input = agdata(text="x" * 100)
+    ag = _agent_cls(agconfig=cfg)
+    try:
+        result = ag.run(s, shared_input)
+        assert "saved to" in result.answer  # this run's own copy WAS offloaded
+        assert shared_input.text == "x" * 100  # the caller's object was not
+    finally:
+        if ag.sandbox is not None:
+            ag.sandbox.destroy()
+
+
+def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
+    """Two agents' run() calls sharing one input agdata (the exact
+    ClassificationTeam.run() pattern) must each read back their own
+    offloaded file, not race on the shared object's mutation."""
+    from agency.agschema import agSchemaConfig
+    from agency.agsandbox_backend import agSandboxBackendConfig
+
+    # Force the docker sandbox backend: agsandbox_backend's "auto" selection
+    # prefers podman over docker when both are usable, but CI's
+    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
+    # podman has no local image and would try (and fail) to pull one.
+    cfg = agConfig(
+        agSchemaConfig(input_offload_chars=10),
+        agSandboxBackendConfig(backend="docker"),
+        {"agllm_backend": LLM_CONFIG},
+    )
+    s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
+
+    def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
+        s.input_schema.prepare_inputs_in_sandbox(
+            skill_input,
+            ag.sandbox,
+            s.name,
+            context_limit=ag.llm.context_limit,
+            agconfig=ag.agconfig,
+        )
+        from agency.tools import make_sandboxed_tools
+
+        tools = {t.name: t for t in make_sandboxed_tools(ag.sandbox)}
+        path = skill_input.text.split("saved to ")[1].split(" —")[0]
+        r = tools["read"](agdata(file_path=path))
+        return agdata(answer=r.content), prev_ctx, []
+
+    s.execute_react = fake_execute_react
+
+    shared_input = agdata(text="x" * 100)
+    agents = [_agent_cls(agconfig=cfg) for _ in range(2)]
+    try:
+        pending = [a.run(s, shared_input) for a in agents]
+        for p in pending:
+            assert "x" * 100 in p.answer
+        assert shared_input.text == "x" * 100
+    finally:
+        for a in agents:
+            if a.sandbox is not None:
+                a.sandbox.destroy()
+
+
+# ---------------------------------------------------------------------------
 # plan_mode
 # ---------------------------------------------------------------------------
 

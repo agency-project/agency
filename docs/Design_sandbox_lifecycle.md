@@ -1,5 +1,7 @@
 # Execution: Process Control
 
+> This document describes the **container backend** (`_ContainerBackend` in `agsandbox_backend.py`, wrapping Docker/Podman) specifically. `agSandbox` itself (in `agsandbox.py`) is a thin facade over a selectable `agsandbox_backend` — see `agsandbox.md`'s "Backend selection" and "Chroot backend" sections for the lighter chroot-based alternative and how it differs (no PID namespace, so process tracking/background-job semantics below don't carry over the same way; no cgroup, so there's nothing analogous to the keyring/semaphore concurrency controls below).
+
 This document traces what happens in each process-spawning scenario from the moment a bash tool call is made through to the end of the agent run.
 
 ---

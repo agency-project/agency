@@ -92,7 +92,7 @@ class agwebui_emitter:
     _PRUNE_BUCKET_S: float = 60.0  # seconds
 
     def _init_db(self) -> None:
-        con = sqlite3.connect(str(self._db_path))
+        con = sqlite3.connect(str(self._db_path), timeout=30)
         con.executescript("""
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
@@ -130,7 +130,15 @@ class agwebui_emitter:
         etype = event.get("type", "")
         agname = event.get("agname")
         with self._lock:
-            con = sqlite3.connect(str(self._db_path))
+            # sqlite3.connect()'s default busy_timeout is only 5s. Under heavy
+            # load, _run_prune()'s DELETE (which deliberately runs outside
+            # self._lock so it never blocks emit() callers) can hold the
+            # write lock longer than that over a large events table, making
+            # this connect()/execute() raise "database is locked" instead of
+            # waiting it out -- silently dropping the event (caught and only
+            # logged as a warning by callers like agent._push_live_messages).
+            # Match _run_prune()'s own generous timeout below.
+            con = sqlite3.connect(str(self._db_path), timeout=30)
             con.execute(
                 "INSERT INTO events(type, agname, ts, data) VALUES(?,?,?,?)",
                 (etype, agname, ts, data),
@@ -158,7 +166,10 @@ class agwebui_emitter:
             should_prune = self._insert_count % self._PRUNE_EVERY == 0
             con.commit()
             con.close()
-        # Run pruning outside the emit lock so it never blocks concurrent emit() callers.
+        # Dispatched on a background thread so emit() itself doesn't block
+        # for the whole prune -- but _run_prune() below still serializes its
+        # actual DELETE through self._lock, the same lock emit() uses (see
+        # its docstring for why).
         if should_prune:
             threading.Thread(target=self._run_prune, daemon=True, name="emitter-prune").start()
 
@@ -168,34 +179,51 @@ class agwebui_emitter:
             pass
 
     def _run_prune(self) -> None:
-        """Background worker: delete old high-frequency events outside the emit lock.
+        """Background worker: delete old high-frequency events.
 
         Uses a try-lock so at most one prune runs at a time; excess triggers are
         dropped rather than queued, which is fine because the next scheduled prune
         will clean up any remaining rows.
+
+        The actual DELETE holds self._lock -- the same lock emit() holds for its
+        own connection -- so this connection and emit()'s are never open and
+        writing to the db file at the same time. Two separate sqlite3
+        connections both able to write concurrently (this used to run on its
+        own connection outside self._lock, specifically so it wouldn't block
+        emit() callers) both touch page 1 (the file header -- schema cookie,
+        page count, freelist pointers) on nearly every write; letting that
+        happen from two connections at once, coordinated only by SQLite's own
+        cross-connection locking, is exactly the kind of window a real
+        corruption of that page (confirmed live: header bytes replaced by
+        garbage, but every other page -- and all real event data -- still
+        intact and recoverable) would come from. Fully serializing every
+        writer in this process removes that risk; the cost is emit() callers
+        occasionally waiting for a prune's DELETE to finish, which is
+        infrequent (every _PRUNE_EVERY inserts) and fast.
         """
         if not self._prune_lock.acquire(blocking=False):
             return
         try:
-            # Keep the last event per (type, agname, time-bucket).
-            # This guarantees at most one sample per bucket per agent,
-            # so timeline scrubbing always finds a sample within
-            # _PRUNE_BUCKET_S seconds of any scrub position.
-            con = sqlite3.connect(str(self._db_path), timeout=120)
-            con.execute(
-                """
-                DELETE FROM events
-                WHERE type IN ('token_update','messages_snapshot','resource_update')
-                  AND id NOT IN (
-                    SELECT MAX(id) FROM events
+            with self._lock:
+                # Keep the last event per (type, agname, time-bucket).
+                # This guarantees at most one sample per bucket per agent,
+                # so timeline scrubbing always finds a sample within
+                # _PRUNE_BUCKET_S seconds of any scrub position.
+                con = sqlite3.connect(str(self._db_path), timeout=120)
+                con.execute(
+                    """
+                    DELETE FROM events
                     WHERE type IN ('token_update','messages_snapshot','resource_update')
-                    GROUP BY type, agname, CAST(ts / ? AS INTEGER)
-                  )
-                """,
-                (self._PRUNE_BUCKET_S,),
-            )
-            con.commit()
-            con.close()
+                      AND id NOT IN (
+                        SELECT MAX(id) FROM events
+                        WHERE type IN ('token_update','messages_snapshot','resource_update')
+                        GROUP BY type, agname, CAST(ts / ? AS INTEGER)
+                      )
+                    """,
+                    (self._PRUNE_BUCKET_S,),
+                )
+                con.commit()
+                con.close()
         except Exception:
             pass
         finally:

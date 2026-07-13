@@ -1,26 +1,46 @@
-# Container Sandboxing
+# Sandboxing
 
-> **Lifecycle warning:** `agSandbox` wraps a live Docker/Podman container. Cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. There's no ownership flag to manage — sharing a sandbox between agents is just `ag.sandbox = sb` (or `agent(sandbox=sb)`) on each; `agskill` provisions/stops any sandbox it finds on `ag.sandbox` the same way regardless of where it came from, and the object itself is cleaned up once nothing references it anymore (see "Concurrent access" below).
+> **Lifecycle warning:** `agSandbox` wraps a live sandbox backend (a Docker/Podman container, or a chroot jail — see "Backend selection" below). Cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. There's no ownership flag to manage — sharing a sandbox between agents is just `ag.sandbox = sb` (or `agent(sandbox=sb)`) on each; `agskill` provisions/stops any sandbox it finds on `ag.sandbox` the same way regardless of where it came from, and the object itself is cleaned up once nothing references it anymore (see "Concurrent access" below).
 
-All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a Docker or Podman container, never on the host. Containers are created lazily: a container starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
+All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a sandbox, never directly on the host. `agSandbox` (in `agsandbox.py`) is a thin facade: it resolves the image/mounts vocabulary that's meaningful regardless of backend, then builds and delegates every operation to an `agsandbox_backend` (in `agsandbox_backend.py`) chosen by `agSandboxBackendConfig.backend`. Two backends exist today:
 
-## Runtime detection
+- **Container backend** (`_ContainerBackend`) — a Docker or Podman container. Containers are created lazily: one starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state. Everything below through "Custom base image and mounts" describes this backend specifically (it's still the default and the only one with full GPU/resource-limit/checkpoint-image support) — see "Chroot backend" further down for what differs there.
+- **Chroot backend** (`_ChrootBackend`) — a per-agent directory chrooted into via an unprivileged `unshare --user --map-root-user --mount`, needing no root/sudo/setcap. Lighter weight, but a narrower isolation guarantee (filesystem containment only) — see "Chroot backend" below.
 
-`get_container_runtime()` in `agsandbox.py` prefers Docker when both are installed and reachable, falling back to Podman. The result is cached for the process lifetime.
+## Backend selection
+
+`agSandboxBackendConfig.backend` picks the backend: `"auto"` (default), `"podman"`, `"docker"`, or `"chroot"`.
+
+```python
+from agency.agconfig import agConfig
+from agency.agsandbox_backend import agSandboxBackendConfig
+
+cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
+sb = agSandbox("myagent", agconfig=cfg)
+```
+
+`"auto"` (`agsandbox_backend._auto_detect_runtime()`) probes in this order: **podman → docker → chroot**, first usable one wins.
+
+- Podman/docker usability: the binary is on `PATH` and `<runtime> info` succeeds (`agsandbox_backend._runtime_works()`), cached for the process lifetime in `_RUNTIME`.
+- Chroot usability (`agsandbox_backend.chroot_available()`, also cached): `/proc/sys/kernel/unprivileged_userns_clone` isn't explicitly disabled (the file doesn't exist on distros that ship it enabled upstream) **and** a live `unshare --user --map-root-user --mount true` actually succeeds — the sysctl alone can false-positive on hosts where AppArmor/seccomp additionally restrict unprivileged user namespaces.
+
+An explicit `backend="docker"|"podman"|"chroot"` raises immediately with a clear error if that specific backend isn't usable, rather than silently falling through to another one.
 
 ## Building the sandbox image
 
 ```bash
-# Docker
-docker build -t agency-sandbox:latest images/
-
-# Podman (requires localhost/ prefix)
-podman build -t localhost/agency-sandbox:latest images/
+GPU_TYPE=cpu ./images/build.sh   # or nvidia/rocm; auto-detected if omitted
 ```
 
-The `images/Dockerfile` installs `ripgrep` on top of `python:3.12-slim`. Both runtimes use the same Dockerfile.
+`build.sh` builds `agency-sandbox:latest` for **every container runtime installed on the host, podman first** — matching `agsandbox_backend`'s auto-selection order (see "Backend selection" above). An image built only for docker would leave podman's separate image store empty, so podman would try (and fail) to pull the image from a registry instead of finding it locally; building for both keeps whichever one auto-selection picks actually usable. Podman's build is tagged `localhost/agency-sandbox:latest` (the `localhost/` prefix it requires to resolve an unqualified name to its own local store instead of a registry); docker's is tagged bare. Each build gets its own smoke test (`import torch`) run against the runtime that built it.
+
+If `HF_TOKEN` is set, it's passed as a `--secret` for gated model downloads during the build. This is written to a private temp file and passed as `--secret id=hf_token,src=<file>` for both runtimes — docker buildx's `--secret id=...,env=VAR` shorthand is **not** portable to podman's buildah, which rejects it ("incorrect secret flag format: should be `--secret id=foo,src=bar`"); the file-based form is the one both accept.
+
+The `images/Dockerfile` installs `ripgrep` on top of `python:3.12-slim`. `Dockerfile.nvidia`/`Dockerfile.rocm` are used instead when `GPU_TYPE` is `nvidia`/`rocm`.
 
 ## Container lifecycle
+
+*This section, and everything through "Custom base image and mounts" below, describes the container backend (`_ContainerBackend`) specifically. See "Chroot backend" further down for how the chroot backend's lifecycle differs.*
 
 The container exists only during active tool execution. Between tool calls the container is removed, releasing the Linux session keyring and any held GPU so concurrent agents can use those resources.
 
@@ -67,12 +87,12 @@ All agents can write to `/agent_output/<own-agname>/` inside the container; file
 ## Forking
 
 ```
-parent.sandbox._checkpoint_image ──docker tag──▶ agency/lifecycle-<fork-agname>
+parent.sandbox._checkpoint_image ──tag_image──▶ agency/lifecycle-<fork-agname>
                                             │
                                      (consumed by fork's first _task())
 ```
 
-Forking copies the parent's checkpoint image tag to a new tag for the fork via `docker tag`. No container is created at fork time — the fork's container is created lazily when the fork's first `_task()` runs, restoring from the copied tag.
+Forking copies the parent's checkpoint image tag to a new tag for the fork via `type(parent.sandbox._backend).tag_image(...)` — dispatched to whichever backend class actually produced the checkpoint (`docker tag`/`podman tag` for the container backend, a directory copy for chroot — see "Chroot backend" below), not a bare docker-only call, since a chroot snapshot directory and a docker image tag are unrelated formats. No container/jail is created at fork time — that happens lazily when the fork's first `_task()` runs, restoring from the copied tag.
 
 Because forks wait for `src.ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
@@ -144,9 +164,10 @@ The `__BGPIDS__` annotation is stripped before output is returned to the LLM. PI
 ```python
 sb = agSandbox(agname)
 sb = agSandbox(agname, agconfig=agConfig(agSandboxConfig().add_mount("out", Path("runs/agent_output"), "/agent_output")))
-sb = agSandbox(agname, lifecycle_image="agency/lifecycle-myagent")
+sb = agSandbox(agname, checkpoint_image="agency/lifecycle-myagent")
 
-# Construction is cheap — no Docker calls until _ensure_started() runs.
+# Construction is cheap — the backend does no real work until _ensure_started() runs
+# (a docker/podman run, or just an mkdir for chroot).
 sb._ensure_started()    # called automatically on first exec(); idempotent
 
 sb._lock  # threading.RLock; held by agskill for the whole skill run — see "Concurrent access" above
@@ -156,15 +177,33 @@ sb.read_file(path) -> str           # UTF-8 text; raises UnicodeDecodeError for 
 sb.read_file_bytes(path) -> bytes   # raw bytes; no decode attempt
 sb.write_file(path, content)        # UTF-8 text via stdin pipe
 sb.write_file_bytes(path, data)     # raw bytes via base64 round-trip
-sb.commit(tag) -> bool  # False if container doesn't exist; True after docker commit (works on running or stopped containers)
-sb.stop(commit=False)   # remove container; if commit=True, snapshot to agency/lifecycle-<name> first
-sb.update_limits(cpus=4.0, memory="8g")
+sb.commit(tag) -> bool  # False if backend was never started; True after a successful snapshot
+sb.stop(commit=False)   # tear down; if commit=True, snapshot to agency/lifecycle-<name> first
+sb.update_limits(cpus=4.0, memory="8g")   # no-op on the chroot backend -- no cgroup of its own
 sb.get_live_pids() -> set[int]
 sb.pid_status_summary() -> str
 sb.release_daemon(pid)
 sb.release_resources(pool)
-sb.destroy()            # rm container + rmi lifecycle image + rmi any pretool images
+sb.destroy()            # tear down the backend + delete its checkpoint image/snapshot
+sb.image_kind -> str    # "container" or "chroot" -- which backend produced sb._checkpoint_image
 ```
+
+Every method above is a one-line delegate from the `agSandbox` facade to `sb._backend` (an `agsandbox_backend` subclass — see "Backend selection"). `sb._backend` is the thing that actually knows how to talk to Docker/Podman or run `unshare`+`chroot`; the facade only owns what's backend-agnostic (config resolution, the `_lock`, GPU/CPU pool bookkeeping).
+
+## Chroot backend
+
+`_ChrootBackend` (in `agsandbox_backend.py`) trades Docker/Podman's full isolation for a much lighter mechanism, for the case where you just want each agent to see only its own files and its own installed packages, with no access to the host filesystem, and don't need network/process/resource isolation:
+
+- **Mechanism**: every `exec()` call runs inside a fresh `unshare --user --map-root-user --mount` (an unprivileged user + mount namespace — no root, sudo, or `setcap` needed) followed by `chroot` into a per-agent directory. The mount namespace (and everything bind-mounted into it) is torn down automatically when that one process exits — there's no long-lived daemon to exec into the way `docker exec` has a container to attach to.
+- **Directory layout**: `<tmp>/agency-chroot-sandboxes/jails/<sandbox-name>/` is the jail root. `workspace/` inside it is a plain host directory (no bind mount needed, since chroot just repoints `/` — `/workspace` inside the jail *is* that directory) and is the only thing that persists across execs. `bin`, `sbin`, `lib`, `lib32`, `lib64`, `usr`, `etc` are bind-mounted read-only from the host on every exec (so the jail gets the host's own interpreters/system libraries without needing a separate image), and `dev` is bind-mounted read-write (unscoped — see below) since most programs assume `/dev/null`, `/dev/urandom`, etc. exist and are writable. A fresh `procfs` is also mounted so PID tracking (below) keeps working.
+- **Checkpointing**: `commit`/`restore`/`stop(commit=...)`/`fork`/`tag_image`/`export_image`/`import_image` all operate on the `workspace/` directory instead of a container filesystem. A commit is `cp -a --reflink=auto <workspace> <tmp>/agency-chroot-sandboxes/snapshots/<sanitized-tag>` — a true point-in-time copy (using a filesystem reflink where available, a full copy otherwise), not a hardlink clone that a later in-place write to the live workspace would silently corrupt. `export_image`/`import_image` tar/untar that snapshot directory.
+- **Cross-process safety**: tool calls with `run_in_subprocess=True` (the default) each get a *fresh* cloudpickled copy of the backend dispatched to a `ProcessPoolExecutor` worker, so a worker's own `self._started` is unreliable — it reflects whatever the object looked like at the *original* process's last pickle, not what a different worker already did. `_ensure_started()`/`commit()`/`stop()` therefore check the workspace directory's existence on disk as their ground truth instead of trusting `self._started`, exactly analogous to how the container backend falls back to `_container_running()` (querying the docker daemon) instead of trusting its own `_started` in the same situation — there's no daemon here, so the workspace directory itself is the cross-process source of truth. Getting this wrong previously caused a real bug: a file written by one worker was wiped by the very next worker's `_ensure_started()` re-materializing from the last checkpoint, because that worker's own (stale) view said nothing had started yet.
+- **What it does *not* isolate**, by design (matches the scope this backend was built for — filesystem containment + independent per-agent installs, not containment against adversarial code):
+  - **Network** — the jailed process shares the host's network stack; there is no network namespace.
+  - **Processes** — there is no PID namespace. The fresh `procfs` mounted into the jail reflects the *host's* real process table, so a command running inside the jail can *see* every host process (though signalling/killing them still goes through the kernel's normal permission checks against the real, unprivileged host uid the mapped "root" resolves to — it can't act on processes it doesn't own).
+  - **CPU/memory** — no cgroup of its own; `update_limits()` is a no-op.
+  - **GPU device scoping** — `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` are still exported the same way as the container backend, but nothing stops a process from seeing every `/dev` entry the host user can.
+- **Cross-process checkpoints**: `agent.save()` records which backend produced a checkpoint (`state["sandbox_image_kind"]`, either `"container"` or `"chroot"`) and `agent.load()` routes `import_image`/`tag_image`/`delete_image` to the matching backend class via `agSandbox.backend_for_image_kind(kind)`, forcing the reconstructed sandbox's `backend` config to `"chroot"` when needed — auto-detection (which prefers podman/docker when available) would otherwise pick a backend that can't make sense of a chroot snapshot's tag.
 
 ## Custom base image and mounts
 
@@ -190,6 +229,8 @@ so the same override can also be spelled as nested attribute access on the
 ```python
 cfg.agSandbox.base_image = "my-registry/custom-image:latest"
 ```
+
+`base_image` and `mounts` (the `host` side of each mount) are resolved by the facade and handed to whichever backend is selected — `_ContainerBackend` uses `base_image` for `docker run`/`podman run`; `_ChrootBackend` ignores it entirely (there's no image concept — see "Chroot backend" above) but still bind-mounts configured `mounts` into the jail at their `container` path.
 
 ## `change_config` / `get_config_copy`
 

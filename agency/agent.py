@@ -25,6 +25,7 @@ from .agcontext import agcontext
 from .aglog import aglog, _ts
 from .agterm import agterm
 from .agsandbox import agSandbox, agSandboxConfig
+from .agsandbox_backend import agSandboxBackendConfig
 from .agresources import agResourcePool
 from .agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
@@ -691,22 +692,28 @@ class agent:
             "history": self.ctx.messages,
             "ts": _ts(),
         }
+        if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
+            # Recorded so load() knows which backend's image format
+            # container.tar is in -- a chroot snapshot directory and a
+            # docker/podman image tag are unrelated formats.
+            state["sandbox_image_kind"] = self.sandbox.image_kind
         state_bytes = json.dumps(state, indent=2).encode()
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
-            agSandbox.tag_image(self.sandbox._checkpoint_image, image_tag)
+            backend_cls = type(self.sandbox._backend)
+            backend_cls.tag_image(self.sandbox._checkpoint_image, image_tag)
             try:
                 _save_timeout = _AgAgentFields(self.agconfig).checkpoint_save_timeout_s
-                image_bytes = agSandbox.export_image(image_tag, _save_timeout)
+                image_bytes = backend_cls.export_image(image_tag, _save_timeout)
                 with tarfile.open(path, "w:gz") as tar:
                     for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
                         info = tarfile.TarInfo(name=name)
                         info.size = len(data)
                         tar.addfile(info, io.BytesIO(data))
             finally:
-                agSandbox.delete_image(image_tag, force=True)
+                backend_cls.delete_image(image_tag, force=True)
         else:
             with tarfile.open(path, "w:gz") as tar:
                 info = tarfile.TarInfo(name="state.json")
@@ -742,12 +749,14 @@ class agent:
             image_bytes = tar.extractfile(container_member).read() if container_member else None
 
         checkpoint: str | None = None
+        image_kind = state.get("sandbox_image_kind", "container")
         if image_bytes is not None:
             _load_timeout = _AgAgentFields(agconfig).checkpoint_load_timeout_s
-            agSandbox.import_image(image_bytes, _load_timeout)
+            backend_cls = agSandbox.backend_for_image_kind(image_kind)
+            backend_cls.import_image(image_bytes, _load_timeout)
             original_tag = f"agency/ckpt-{state['agname']}"
-            agSandbox.tag_image(original_tag, image_tag)
-            agSandbox.delete_image(original_tag)
+            backend_cls.tag_image(original_tag, image_tag)
+            backend_cls.delete_image(original_tag)
             checkpoint = image_tag
 
         ag: agent = cls.__new__(cls)
@@ -768,6 +777,15 @@ class agent:
         if _out is not None:
             sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
             agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+        if checkpoint and image_kind == "chroot":
+            # Force the matching backend -- auto-detection (podman/docker
+            # preferred when usable) would otherwise reconstruct this
+            # sandbox with a backend that can't make sense of a chroot
+            # snapshot tag. Container-kind checkpoints don't need this: auto
+            # picking podman vs. docker for them was already safe before
+            # chroot existed.
+            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
+            agSandboxBackendConfig(sb_cfg).update(backend="chroot")
         ag.sandbox = (
             agSandbox(ag.agname, checkpoint_image=checkpoint, agconfig=sb_cfg)
             if checkpoint
