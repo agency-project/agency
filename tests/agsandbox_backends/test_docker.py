@@ -61,7 +61,7 @@ class TestDanglingImageEagerCleanup:
 
     def test_stop_commit_deletes_old_image(self):
         """stop(commit=True) must delete the image that previously held the tag."""
-        from agency.agsandbox_backends.docker import _DockerBackend
+        import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
 
@@ -85,7 +85,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(_DockerBackend, "_run", fake_run):
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(sb._backend, "_started", True):
                 with patch.object(sb._backend, "_container_running", return_value=True):
                     with patch.object(sb._backend, "_gpu_virtual", False):
@@ -242,9 +242,9 @@ class TestDockerCommandHelpers:
             calls.append((args, check))
             return OK()
 
-        from agency.agsandbox_backends.docker import _DockerBackend
+        import agency.agsandbox_backends.docker as _mod
 
-        with patch.object(_DockerBackend, "_run", fake_run):
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
             sb._backend._rm_container("my-container")
 
         assert len(calls) == 1
@@ -255,9 +255,9 @@ class TestDockerCommandHelpers:
     def test_rm_container_raises_on_failure(self):
         sb = self._sb()
 
-        from agency.agsandbox_backends.docker import _DockerBackend
+        import agency.agsandbox_backends.docker as _mod
 
-        with patch.object(_DockerBackend, "_run", side_effect=RuntimeError("rm failed")):
+        with patch.object(_mod._DockerBackend, "_run", side_effect=RuntimeError("rm failed")):
             with pytest.raises(RuntimeError, match="rm failed"):
                 sb._backend._rm_container("bad-container")
 
