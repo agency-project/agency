@@ -18,7 +18,7 @@ from agency.agconfig import (
     _AgConfigViewBase,
 )
 from agency.agllm import agllm
-from agency.agllm_backend import (
+from agency.agllm_backends import (
     agllm_backend,
     AgLLMBackendFields,
     agLLMBackendConfig,
@@ -26,14 +26,16 @@ from agency.agllm_backend import (
     agOpenAIBackendConfig,
     agAnthropicBackendConfig,
     agBedrockBackendConfig,
-    _OpenAICompatibleBackend,
+)
+from agency.agllm_backends.openai import _OpenAICompatibleBackend
+from agency.agllm_backends.bedrock import (
     _OpenAICompatibleBedrockBackend,
-    _AnthropicBackend,
     _AnthropicAWSBackend,
     _AnthropicBedrockBackend,
 )
+from agency.agllm_backends.anthropic import _AnthropicBackend
 from agency.agsandbox import _AgSandboxFields, agSandboxConfig
-from agency.agsandbox_backend import AgSandboxBackendFields
+from agency.agsandbox_backends import AgSandboxBackendFields
 from agency.agllm import _AgLLMFields, agLLMConfig
 from agency.agtool import _AgToolFields, agToolConfig
 from agency.agresources import _AgResourcePoolFields, agResourcePoolConfig
@@ -799,7 +801,7 @@ class TestForConfigDispatch:
 class TestAttributeBackedClientConstruction:
     def test_openai_compatible_make_client_uses_attributes(self):
         backend = _OpenAICompatibleBackend(_cfg(api_key="k", base_url="http://x/v1"))
-        with patch("agency.agllm_backend.openai.OpenAI") as MockCls:
+        with patch("agency.agllm_backends.openai.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(
             api_key="k", base_url="http://x/v1", timeout=httpx.Timeout(5.0)
@@ -809,7 +811,7 @@ class TestAttributeBackedClientConstruction:
         monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID", raising=False)
         backend = _AnthropicBackend(_cfg(api_key="sk-ant-x"))
         mock_sdk = MagicMock()
-        with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
+        with patch("agency.agllm_backends.anthropic._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
         mock_sdk.Anthropic.assert_called_once_with(api_key="sk-ant-x", timeout=httpx.Timeout(5.0))
 
@@ -823,7 +825,7 @@ class TestAttributeBackedClientConstruction:
         )
         mock_sdk = MagicMock()
         mock_sdk.AnthropicAWS = MagicMock()
-        with patch("agency.agllm_backend._anthropic_sdk", mock_sdk):
+        with patch("agency.agllm_backends.bedrock._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(30.0))
         mock_sdk.AnthropicAWS.assert_called_once_with(
             timeout=httpx.Timeout(30.0),

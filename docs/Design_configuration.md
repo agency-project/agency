@@ -9,7 +9,7 @@ One `agConfig` object carries every tunable for everything it's passed to. You b
 ```python
 from agency import agent
 from agency.agconfig import agConfig
-from agency.agllm_backend import agVLLMBackendConfig
+from agency.agllm_backends import agVLLMBackendConfig
 from agency.agsandbox import agSandboxConfig
 
 cfg = agConfig(

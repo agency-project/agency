@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
 from .agutil import _iter_batched, _strip_thinking, _extract_thinking, _LLMIdleTimeout
-from .agllm_backend import (
+from .agllm_backends import (
     agllm_backend,
     AgLLMBackendFields,
     BAD_REQUEST_EXCS,

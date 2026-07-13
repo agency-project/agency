@@ -48,7 +48,7 @@ Pick the config class for your backend — `agVLLMBackendConfig`, `agOpenAIBacke
 ```python
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
-from agency.agllm_backend import agVLLMBackendConfig
+from agency.agllm_backends import agVLLMBackendConfig
 
 continuation = agskill(
     name="continuation",
@@ -75,7 +75,7 @@ print(result.summary)   # blocks until done
 
 ```python
 from agency.agconfig import agConfig
-from agency.agllm_backend import agOpenAIBackendConfig
+from agency.agllm_backends import agOpenAIBackendConfig
 
 cfg = agConfig(
         agOpenAIBackendConfig(
@@ -94,7 +94,7 @@ This is the same underlying backend used for vLLM/local endpoints above — omit
 
 ```python
 from agency.agconfig import agConfig
-from agency.agllm_backend import agAnthropicBackendConfig
+from agency.agllm_backends import agAnthropicBackendConfig
 
 cfg = agConfig(
         agAnthropicBackendConfig(
@@ -116,7 +116,7 @@ Credentials are picked up automatically from the environment (IAM role, `~/.aws/
 
 ```python
 from agency.agconfig import agConfig
-from agency.agllm_backend import agBedrockBackendConfig
+from agency.agllm_backends import agBedrockBackendConfig
 
 cfg = agConfig(
         agBedrockBackendConfig(

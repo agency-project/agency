@@ -68,12 +68,12 @@ def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
 
 def _llm_agconfig(d: dict) -> agConfig:
     # Force the docker sandbox backend for any test that ends up constructing
-    # a real sandbox -- agsandbox_backend's "auto" selection now prefers
+    # a real sandbox -- agsandbox_backends' "auto" selection now prefers
     # podman over docker when both are usable, but CI's images/build.sh only
     # builds/tags agency-sandbox:latest for docker, so podman has no local
     # image and would try (and fail) to pull one from a registry. This has
     # no effect on the many tests here that never touch ag.sandbox at all.
-    from agency.agsandbox_backend import agSandboxBackendConfig
+    from agency.agsandbox_backends import agSandboxBackendConfig
 
     return agConfig(agSandboxBackendConfig(backend="docker"), {"agllm_backend": dict(d)})
 
