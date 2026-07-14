@@ -21,6 +21,7 @@ from .container import (
     _RUN_ID,
     get_container_runtime,
     keyring_quota,
+    reap_orphaned_containers,
     seed_cache_from_image,
 )
 from .docker import _DockerBackend
@@ -37,6 +38,7 @@ __all__ = [
     "_RUN_ID",
     "get_container_runtime",
     "keyring_quota",
+    "reap_orphaned_containers",
     "seed_cache_from_image",
     "_DockerBackend",
     "_PodmanBackend",

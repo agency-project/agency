@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..agutil import sigterm_as_exit
 from .emitter import agwebui_emitter
 
 # Module-level singleton — set while agwebui.run() is active.
@@ -168,6 +169,15 @@ class agwebui:
         Starts the server subprocess first, waits for it to be ready, then
         calls *fn* in the current thread.  Blocks until *fn* completes and
         (if *linger=True*) until the user presses Ctrl+C.
+
+        Wraps the call in ``agutil.sigterm_as_exit()`` -- see its docstring
+        for why a plain `kill <pid>` needs that at all (short version: with
+        no handler, SIGTERM skips every `atexit` cleanup hook the framework
+        relies on, exactly like SIGKILL). A script that builds/runs agents
+        directly without going through ``agwebui.run()``/``graphui.run()``
+        should wrap itself in ``agutil.sigterm_as_exit()`` (or the
+        ``agency.sigterm_as_exit`` re-export) the same way, since that
+        protection doesn't otherwise exist anywhere more central.
         """
         global _active
 
@@ -255,33 +265,37 @@ class agwebui:
             name="agwebui-commands",
         ).start()
 
-        try:
-            fn(*args, **kwargs)
-        except Exception:
-            import traceback
+        with sigterm_as_exit("agwebui") as sigterm_received:
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                import traceback
 
-            traceback.print_exc()
-        finally:
-            command_stop.set()
-            ui.emitter.done()
-            _active = None
+                traceback.print_exc()
+            finally:
+                command_stop.set()
+                ui.emitter.done()
+                _active = None
 
-            if linger:
-                print(
-                    f"[agwebui] Done — dashboard still at http://localhost:{port}  (Ctrl+C to exit)",
-                    flush=True,
-                )
-                try:
-                    while True:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    pass
+                # Skip lingering if we're already unwinding from a SIGTERM --
+                # the caller asked this process to exit, not to keep serving
+                # the dashboard until a *second* signal (Ctrl+C) arrives.
+                if linger and not sigterm_received.is_set():
+                    print(
+                        f"[agwebui] Done — dashboard still at http://localhost:{port}  (Ctrl+C to exit)",
+                        flush=True,
+                    )
+                    try:
+                        while True:
+                            time.sleep(1)
+                    except KeyboardInterrupt:
+                        pass
 
-            if ui._server_proc is not None:
-                ui._server_proc.terminate()
-                try:
-                    ui._server_proc.wait(timeout=5)
-                except Exception:
-                    pass
-                if ui._server_log is not None:
-                    ui._server_log.close()
+                if ui._server_proc is not None:
+                    ui._server_proc.terminate()
+                    try:
+                        ui._server_proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    if ui._server_log is not None:
+                        ui._server_log.close()
