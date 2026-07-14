@@ -46,12 +46,12 @@ class _AgLLMFields:
     call_max_concurrency = GlobalConfigParam(
         "agllm", default=256
     )  # Max simultaneous in-flight LLM streaming calls across all skills.
-    max_retries = DynamicConfigParam("agllm", default=10)
+    max_retries = DynamicConfigParam("agllm", default=5)
     idle_timeout = DynamicConfigParam(
-        "agllm", default=300.0
-    )  # seconds to wait for first chunk (server dead?)
+        "agllm", default=900.0
+    )  # seconds to wait for first chunk (High TTFT - server dead or overloaded?)
     stream_timeout = DynamicConfigParam(
-        "agllm", default=1800.0
+        "agllm", default=1200.0
     )  # seconds to wait between chunks mid-stream
     retry_sleep_s = DynamicConfigParam(
         "agllm", default=2
@@ -82,11 +82,11 @@ class _AgLLMFields:
     default_context_limit = DynamicConfigParam(
         "agllm", default=128_000
     )  # Fallback context window size when model reports none.
-    summary_task_input_max_chars = DynamicConfigParam("agllm", default=400)
-    summary_assistant_content_max_chars = DynamicConfigParam("agllm", default=400)
-    summary_role_content_max_chars = DynamicConfigParam("agllm", default=600)
-    summary_max_tokens = DynamicConfigParam("agllm", default=4096)
-    tail_turns = DynamicConfigParam("agllm", default=2)
+    summary_task_input_max_chars = DynamicConfigParam("agllm", default=800)
+    summary_assistant_content_max_chars = DynamicConfigParam("agllm", default=800)
+    summary_role_content_max_chars = DynamicConfigParam("agllm", default=1000)
+    summary_max_tokens = DynamicConfigParam("agllm", default=24000)
+    tail_turns = DynamicConfigParam("agllm", default=3)
 
 
 class agLLMConfig(_AgConfigViewBase):
