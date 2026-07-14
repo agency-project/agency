@@ -139,33 +139,52 @@ class agwebui_emitter:
             # logged as a warning by callers like agent._push_live_messages).
             # Match _run_prune()'s own generous timeout below.
             con = sqlite3.connect(str(self._db_path), timeout=30)
-            con.execute(
-                "INSERT INTO events(type, agname, ts, data) VALUES(?,?,?,?)",
-                (etype, agname, ts, data),
-            )
-            # Upsert into state tables for cold-start preamble on reconnect.
-            if etype == "token_update" and agname:
+            try:
                 con.execute(
-                    "INSERT INTO agent_state(agname, tokens) VALUES(?,?)"
-                    " ON CONFLICT(agname) DO UPDATE SET tokens=excluded.tokens",
-                    (agname, data),
+                    "INSERT INTO events(type, agname, ts, data) VALUES(?,?,?,?)",
+                    (etype, agname, ts, data),
                 )
-            elif etype == "messages_snapshot" and agname:
-                con.execute(
-                    "INSERT INTO agent_state(agname, messages) VALUES(?,?)"
-                    " ON CONFLICT(agname) DO UPDATE SET messages=excluded.messages",
-                    (agname, data),
-                )
-            elif etype == "resource_update":
-                con.execute(
-                    "INSERT INTO resource_state(id, data) VALUES(1,?)"
-                    " ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-                    (data,),
-                )
-            self._insert_count += 1
-            should_prune = self._insert_count % self._PRUNE_EVERY == 0
-            con.commit()
-            con.close()
+                # Upsert into state tables for cold-start preamble on reconnect.
+                if etype == "token_update" and agname:
+                    con.execute(
+                        "INSERT INTO agent_state(agname, tokens) VALUES(?,?)"
+                        " ON CONFLICT(agname) DO UPDATE SET tokens=excluded.tokens",
+                        (agname, data),
+                    )
+                elif etype == "messages_snapshot" and agname:
+                    con.execute(
+                        "INSERT INTO agent_state(agname, messages) VALUES(?,?)"
+                        " ON CONFLICT(agname) DO UPDATE SET messages=excluded.messages",
+                        (agname, data),
+                    )
+                elif etype == "resource_update":
+                    con.execute(
+                        "INSERT INTO resource_state(id, data) VALUES(1,?)"
+                        " ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                        (data,),
+                    )
+                self._insert_count += 1
+                should_prune = self._insert_count % self._PRUNE_EVERY == 0
+                con.commit()
+            except sqlite3.DatabaseError:
+                # Corrupt-file-class errors (e.g. "unsupported file format",
+                # "database disk image is malformed", "file is not a
+                # database") mean page 1 itself is unreadable -- retrying the
+                # same file only produces the same error forever, silently
+                # killing the live dashboard for the rest of the run. Leaving
+                # a leaked, unclosed, possibly-uncommitted connection behind
+                # on this path was itself a way to *cause* that corruption
+                # under a long, high-throughput run (many never-closed
+                # handles all still able to touch the file), so close() in
+                # `finally` below always runs, then swap in a fresh db so
+                # subsequent emit() calls succeed again. Historical rows are
+                # unrecoverable once page 1 is gone -- that's an acceptable
+                # loss for what is only a live-dashboard event log, not the
+                # agent's own state.
+                self._reinit_after_corruption()
+                return
+            finally:
+                con.close()
         # Dispatched on a background thread so emit() itself doesn't block
         # for the whole prune -- but _run_prune() below still serializes its
         # actual DELETE through self._lock, the same lock emit() uses (see
@@ -210,24 +229,66 @@ class agwebui_emitter:
                 # so timeline scrubbing always finds a sample within
                 # _PRUNE_BUCKET_S seconds of any scrub position.
                 con = sqlite3.connect(str(self._db_path), timeout=120)
-                con.execute(
-                    """
-                    DELETE FROM events
-                    WHERE type IN ('token_update','messages_snapshot','resource_update')
-                      AND id NOT IN (
-                        SELECT MAX(id) FROM events
+                try:
+                    con.execute(
+                        """
+                        DELETE FROM events
                         WHERE type IN ('token_update','messages_snapshot','resource_update')
-                        GROUP BY type, agname, CAST(ts / ? AS INTEGER)
-                      )
-                    """,
-                    (self._PRUNE_BUCKET_S,),
-                )
-                con.commit()
-                con.close()
+                          AND id NOT IN (
+                            SELECT MAX(id) FROM events
+                            WHERE type IN ('token_update','messages_snapshot','resource_update')
+                            GROUP BY type, agname, CAST(ts / ? AS INTEGER)
+                          )
+                        """,
+                        (self._PRUNE_BUCKET_S,),
+                    )
+                    con.commit()
+                except sqlite3.DatabaseError:
+                    # See emit()'s matching handler -- page 1 is unreadable,
+                    # so hand off to the same reinit rather than leaking this
+                    # connection on every future prune too.
+                    self._reinit_after_corruption()
+                finally:
+                    con.close()
         except Exception:
             pass
         finally:
             self._prune_lock.release()
+
+    def _reinit_after_corruption(self) -> None:
+        """Recover from a corrupt ui_events.db by starting a fresh one.
+
+        Called with self._lock already held (from emit() or _run_prune()),
+        so this must not try to reacquire it. Once SQLite reports page 1 as
+        unreadable ("unsupported file format" / "database disk image is
+        malformed" / "file is not a database"), no query -- not even
+        PRAGMA/.recover-style raw page access -- succeeds against that file
+        again; the only way forward is a new file. The corrupt file is kept
+        alongside (renamed, not deleted) in case a human wants to try
+        forensic recovery (e.g. scraping embedded JSON text with `strings`)
+        later. Historical dashboard events for this run are lost; the
+        agent's own in-memory state is untouched since these pushes are
+        best-effort.
+        """
+        try:
+            corrupt_path = None
+            if self._db_path.exists():
+                corrupt_path = self._db_path.with_name(
+                    self._db_path.name + f".corrupt-{int(time.time())}"
+                )
+                self._db_path.rename(corrupt_path)
+            for suffix in ("-wal", "-shm"):
+                stale = self._db_path.with_name(self._db_path.name + suffix)
+                if stale.exists():
+                    stale.unlink()
+            self._init_db()
+            print(
+                f"[agwebui] WARNING: {self._db_path} was corrupted and has been "
+                f"reinitialized; historical dashboard events for this run were lost "
+                f"(corrupt file kept at {corrupt_path})."
+            )
+        except Exception as _e:
+            print(f"[agwebui] WARNING: failed to recover corrupted {self._db_path}: {_e}")
 
     # ------------------------------------------------------------------
     # Typed emitters
