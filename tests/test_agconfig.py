@@ -1079,7 +1079,7 @@ def test_llm_default_context_limit_default_accessor():
 
 
 def test_llm_tail_turns_default_accessor():
-    assert _AgLLMFields.tail_turns.default == 2
+    assert _AgLLMFields.tail_turns.default == 3
 
 
 def test_tool_timeout_s_default_accessor():
