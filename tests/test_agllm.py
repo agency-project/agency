@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import openai
+import pytest
 
 from agency.agllm import LLMCallResult, agllm
 import json
@@ -1258,6 +1259,181 @@ def test_compact_prunes_large_tool_outputs():
     user_prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
     # Pruned content appears truncated in the prompt
     assert "[truncated]" in user_prompt or len(user_prompt) < huge // 2
+
+
+# ---------------------------------------------------------------------------
+# compact() retries transient LLM errors
+#
+# compact()'s summarisation request used to be a single bare call with no
+# retry at all — a lone read-timeout against the backend would propagate all
+# the way up through maybe_compact() -> execute_react() and crash the whole
+# agent, discarding any already-completed work higher in the call stack (a
+# harness run whose real metrics_output was already finished, in the incident
+# that prompted this). These mirror the existing call()-retry tests above,
+# adapted to compact()'s contract: it has no LLMCallResult-style return value,
+# so exhausted retries raise the underlying error rather than being swallowed.
+# ---------------------------------------------------------------------------
+
+
+def test_compact_retries_api_timeout_then_succeeds():
+    """The exact failure mode from the incident: openai.APITimeoutError on the
+    summarisation call must be retried, not propagated on the first attempt."""
+    messages = _make_messages(6)
+    mock_client = MagicMock()
+    timeout_err = openai.APITimeoutError(request=httpx.Request("POST", "http://x"))
+    mock_client.chat.completions.create.side_effect = [
+        timeout_err,
+        timeout_err,
+        _mock_compact_response("summary after retries"),
+    ]
+
+    with (
+        patch("agency.agllm.openai.OpenAI", return_value=mock_client),
+        patch("agency.agllm.time.sleep"),
+    ):
+        _, summary = LLM_COMPACT.compact(messages)
+
+    assert summary == "summary after retries"
+    assert mock_client.chat.completions.create.call_count == 3
+
+
+def test_compact_retries_connection_error_then_succeeds():
+    messages = _make_messages(6)
+    mock_client = MagicMock()
+    conn_err = openai.APIConnectionError(request=httpx.Request("POST", "http://x"))
+    mock_client.chat.completions.create.side_effect = [conn_err, _mock_compact_response("ok")]
+
+    with (
+        patch("agency.agllm.openai.OpenAI", return_value=mock_client),
+        patch("agency.agllm.time.sleep"),
+    ):
+        _, summary = LLM_COMPACT.compact(messages)
+
+    assert summary == "ok"
+    assert mock_client.chat.completions.create.call_count == 2
+
+
+def test_compact_bare_api_error_retries_then_succeeds():
+    """A bare openai.APIError (no HTTP status to build a more specific
+    subclass from, e.g. a mid-stream server error frame) must retry like any
+    other transient error rather than propagate uncaught."""
+    messages = _make_messages(6)
+    mock_client = MagicMock()
+    err = openai.APIError("server error", httpx.Request("POST", "http://x"), body=None)
+    mock_client.chat.completions.create.side_effect = [err, _mock_compact_response("ok")]
+
+    with (
+        patch("agency.agllm.openai.OpenAI", return_value=mock_client),
+        patch("agency.agllm.time.sleep"),
+    ):
+        _, summary = LLM_COMPACT.compact(messages)
+
+    assert summary == "ok"
+    assert mock_client.chat.completions.create.call_count == 2
+
+
+def test_compact_exhausts_retries_and_raises_last_error():
+    """Unlike call() (which swallows exhaustion into LLMCallResult.conn_error),
+    compact() has no result-object convention — after max_retries identical
+    failures it must raise the underlying error rather than looping forever
+    or returning a summary built from no successful response."""
+    from agency.agllm import _AgLLMFields
+
+    LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
+    messages = _make_messages(6)
+    mock_client = MagicMock()
+    timeout_err = openai.APITimeoutError(request=httpx.Request("POST", "http://x"))
+    mock_client.chat.completions.create.side_effect = timeout_err
+
+    with (
+        patch("agency.agllm.openai.OpenAI", return_value=mock_client),
+        patch("agency.agllm.time.sleep"),
+    ):
+        with pytest.raises(openai.APITimeoutError):
+            LLM_COMPACT.compact(messages)
+
+    assert mock_client.chat.completions.create.call_count == LLM_MAX_RETRIES
+
+
+def test_compact_bad_request_error_not_retried():
+    """BadRequestError means the request itself is malformed — retrying an
+    identical malformed request can never succeed, so this must fail fast
+    with zero retries/sleeps, mirroring call()'s handling. BadRequestError is
+    itself an openai.APIError subclass, so this also guards against the
+    broadened retry-on-APIError clause shadowing the more specific handling."""
+    messages = _make_messages(6)
+    mock_client = MagicMock()
+    err = openai.BadRequestError(
+        message="invalid_request_error",
+        response=MagicMock(status_code=400),
+        body=None,
+    )
+    mock_client.chat.completions.create.side_effect = err
+
+    with (
+        patch("agency.agllm.openai.OpenAI", return_value=mock_client),
+        patch("agency.agllm.time.sleep") as mock_sleep,
+    ):
+        with pytest.raises(openai.BadRequestError):
+            LLM_COMPACT.compact(messages)
+
+    assert mock_client.chat.completions.create.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+def test_compact_rate_limit_honors_retry_after_header():
+    """A 429 during compaction must retry (not crash the agent) and never
+    sleep for less than the server-provided Retry-After duration — jitter is
+    added on top, never subtracted, so this asserts a floor, not equality."""
+    from agency.agllm import _AgLLMFields
+
+    LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S = _AgLLMFields.rate_limit_retry_after_jitter_s.default
+    messages = _make_messages(6)
+    mock_client = MagicMock()
+    err = openai.RateLimitError(
+        message="rate_limit_error",
+        response=MagicMock(status_code=429, headers={"retry-after": "3"}),
+        body=None,
+    )
+    mock_client.chat.completions.create.side_effect = [err, _mock_compact_response("ok")]
+
+    with (
+        patch("agency.agllm.openai.OpenAI", return_value=mock_client),
+        patch("agency.agllm.time.sleep") as mock_sleep,
+    ):
+        _, summary = LLM_COMPACT.compact(messages)
+
+    assert summary == "ok"
+    assert mock_sleep.call_count == 1
+    sleep_s = mock_sleep.call_args.args[0]
+    assert 3.0 <= sleep_s <= 3.0 + LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S
+
+
+def test_compact_rate_limit_falls_back_to_exponential_backoff_without_header():
+    """Missing/unparseable Retry-After must not crash with a TypeError/ValueError
+    — fall back to bounded, jittered exponential backoff instead."""
+    from agency.agllm import _AgLLMFields
+
+    LLM_RATE_LIMIT_MAX_BACKOFF_S = _AgLLMFields.rate_limit_max_backoff_s.default
+    messages = _make_messages(6)
+    mock_client = MagicMock()
+    err = openai.RateLimitError(
+        message="rate_limit_error",
+        response=MagicMock(status_code=429, headers={}),
+        body=None,
+    )
+    mock_client.chat.completions.create.side_effect = [err, _mock_compact_response("ok")]
+
+    with (
+        patch("agency.agllm.openai.OpenAI", return_value=mock_client),
+        patch("agency.agllm.time.sleep") as mock_sleep,
+    ):
+        _, summary = LLM_COMPACT.compact(messages)
+
+    assert summary == "ok"
+    for retry_call in mock_sleep.call_args_list:
+        sleep_s = retry_call.args[0]
+        assert 0 <= sleep_s <= LLM_RATE_LIMIT_MAX_BACKOFF_S
 
 
 # ---------------------------------------------------------------------------

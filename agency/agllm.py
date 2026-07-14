@@ -793,7 +793,51 @@ class agllm(_AgLLMFields):
         compact_kwargs["max_completion_tokens"] = self.summary_max_tokens
         if self.backend.extra_body:
             compact_kwargs["extra_body"] = self.backend.extra_body
-        resp = client.chat.completions.create(**compact_kwargs)
+        # Retry transient failures the same way call() does for the main streaming
+        # path — this call used to be a single bare request with no retry at all,
+        # so one read-timeout here (distinct from a real error in the conversation
+        # being summarized) would crash the whole agent and discard already-completed
+        # work further up the call stack (e.g. a harness run that had already
+        # produced valid metrics_output).
+        resp = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = client.chat.completions.create(**compact_kwargs)
+                break
+            except BAD_REQUEST_EXCS:
+                raise  # not retryable — mirrors call()'s handling
+            except RATE_LIMIT_EXCS as _rate_err:
+                _retry_after = getattr(getattr(_rate_err, "response", None), "headers", {}).get(
+                    "retry-after"
+                )
+                try:
+                    _sleep_s = float(_retry_after) + random.uniform(
+                        0, self.rate_limit_retry_after_jitter_s
+                    )
+                except (TypeError, ValueError):
+                    _backoff = min(
+                        self.rate_limit_max_backoff_s,
+                        self.rate_limit_base_backoff_s * (2**attempt),
+                    )
+                    _sleep_s = random.uniform(0, _backoff)
+                if attempt >= self.max_retries - 1:
+                    raise
+                print(
+                    f"[agllm] compact(): rate limited: {_rate_err}  "
+                    f"retry {attempt + 1}/{self.max_retries - 1} in {_sleep_s:.1f}s"
+                )
+                time.sleep(_sleep_s)
+            except (
+                (ssl.SSLError, OSError, httpx.TransportError) + API_CONN_EXCS + API_ERROR_EXCS
+            ) as _conn_err:
+                if attempt >= self.max_retries - 1:
+                    raise
+                print(
+                    f"[agllm] compact(): {_conn_err}  "
+                    f"retry {attempt + 1}/{self.max_retries - 1} in {self.retry_sleep_s:.1f}s"
+                )
+                time.sleep(self.retry_sleep_s)
+        assert resp is not None  # loop above always returns or raises
         summary = (resp.choices[0].message.content or "").strip()
         injection: list[dict] = [
             {
