@@ -46,7 +46,7 @@ class _AgLLMFields:
     call_max_concurrency = GlobalConfigParam(
         "agllm", default=256
     )  # Max simultaneous in-flight LLM streaming calls across all skills.
-    max_retries = DynamicConfigParam("agllm", default=5)
+    max_retries = DynamicConfigParam("agllm", default=12)
     idle_timeout = DynamicConfigParam(
         "agllm", default=900.0
     )  # seconds to wait for first chunk (High TTFT - server dead or overloaded?)
