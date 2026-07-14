@@ -47,8 +47,111 @@ def _make_sandbox(**kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Dangling-image eager cleanup (stop(commit=True))
+# Owner-PID container labeling -- feeds agsandbox_backends.container's
+# startup orphan reaper (see test_container.py). The label must reflect
+# whichever process actually *constructed* this backend (self._owner_pid,
+# fixed at __init__ time), never a live os.getpid() call made wherever
+# _ensure_started() happens to execute -- for a run_in_subprocess=True tool
+# call (the default), that's a ProcessPoolExecutor *worker*, cloudpickled a
+# copy of this same backend object, distinct from -- and free to exit
+# independently of -- the main process that owns the sandbox for its whole
+# lifetime. Labeling with the worker's own transient PID would let a
+# concurrent reap_orphaned_containers() elsewhere see a "dead" owner (once
+# that worker exits, routine pool recycling, not a crash) for a container
+# that's still very much in active use by a live main process, and delete it.
 # ---------------------------------------------------------------------------
+
+
+class TestOwnerPidLabel:
+    def _captured_run_cmd(self, sb):
+        """Drive _ensure_started() far enough to build its `docker run`
+        argv, without a real daemon: everything _run_with_conflict_retry
+        would normally do is skipped, so this only inspects the command
+        that *would* have been issued."""
+        calls = []
+        with patch.object(sb._backend, "_container_running", return_value=False):
+            with patch.object(sb._backend, "_container_status", return_value=""):
+                with patch.object(
+                    sb._backend,
+                    "_run_with_conflict_retry",
+                    side_effect=lambda run_cmd, name: calls.append(run_cmd),
+                ):
+                    with patch.object(sb._backend, "_run"):  # the post-run `mkdir /workspace`
+                        sb._backend._ensure_started()
+        assert len(calls) == 1, "expected exactly one docker run invocation"
+        return calls[0]
+
+    def _label_value(self, run_cmd: list[str]) -> str:
+        idx = run_cmd.index("--label")
+        label = run_cmd[idx + 1]
+        assert label.startswith("agency.owner_pid=")
+        return label.split("=", 1)[1]
+
+    def test_label_defaults_to_constructing_processs_own_pid(self):
+        """The normal case: construct-and-immediately-use in one process --
+        the label must be this process's real PID, so a reap elsewhere
+        correctly recognizes it as alive for as long as this process runs."""
+        import os
+
+        sb = _make_sandbox()
+        run_cmd = self._captured_run_cmd(sb)
+        assert self._label_value(run_cmd) == str(os.getpid())
+
+    def test_label_reflects_owner_pid_attribute_not_live_process(self):
+        """Regression: simulates the cloudpickle-to-a-worker scenario by
+        overwriting _owner_pid post-construction to a value that is *not*
+        this test process's own PID -- the label must still track that
+        stored value, proving it's read from self._owner_pid rather than
+        computed fresh via os.getpid() at run time (which, run entirely in
+        this one process, could otherwise never distinguish the two)."""
+        import os
+
+        sb = _make_sandbox()
+        sentinel_pid = 424242
+        assert sentinel_pid != os.getpid()
+        sb._backend._owner_pid = sentinel_pid
+
+        run_cmd = self._captured_run_cmd(sb)
+        assert self._label_value(run_cmd) == str(sentinel_pid)
+
+    @docker
+    def test_real_sandboxed_tool_call_labels_container_with_main_process_pid(self):
+        """End-to-end, no mocks: a real run_in_subprocess=True tool call (the
+        default) cloudpickles this backend to a real ProcessPoolExecutor
+        worker, which is the process that actually issues `docker run` --
+        confirms the resulting container's real label still names *this*
+        (main, test) process, not the worker's own distinct PID, i.e. the
+        fix survives the real dispatch mechanism, not just a mock of it."""
+        import os
+
+        from agency.agdata import agdata, agerror
+        from agency.tools import make_sandboxed_tools
+
+        sb = _make_sandbox()
+        tools = {t.name: t for t in make_sandboxed_tools(sb)}
+        try:
+            result = tools["bash"](agdata(command="true"))
+            assert not isinstance(result, agerror), f"bash failed: {result}"
+
+            inspected = subprocess.run(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    '{{index .Config.Labels "agency.owner_pid"}}',
+                    sb._backend._name,
+                ],
+                capture_output=True,
+                check=True,
+            )
+            label_pid = inspected.stdout.decode().strip()
+            assert label_pid == str(os.getpid()), (
+                f"container labeled with pid {label_pid}, expected this test "
+                f"process's own pid {os.getpid()} -- the worker that actually "
+                f"ran `docker run` must not have used its own os.getpid()"
+            )
+        finally:
+            sb.destroy()
 
 
 class TestDanglingImageEagerCleanup:

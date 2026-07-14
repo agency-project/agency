@@ -12,6 +12,7 @@ everything. See those two modules for the handful of things that do.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
@@ -110,6 +111,102 @@ def get_container_runtime() -> str:
             "Neither docker nor podman is installed. Install one of them to use sandboxed agents."
         )
     return _RUNTIME
+
+
+# Every container _ContainerBackendBase starts is labeled with the PID of the
+# process that created it, so reap_orphaned_containers() below can tell a
+# genuinely dead run's containers apart from a different, still-live agency
+# process's -- container names alone can't do this: _RUN_ID is deliberately
+# randomized per process (see its own comment) specifically so a new run
+# never collides with a crashed run's names, which also means a new run
+# never naturally reclaims them either.
+_AGENCY_OWNER_PID_LABEL = "agency.owner_pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if *pid* refers to a currently-running process on this host."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists, just not signalable by us -- not expected for our own
+        # sandbox containers' owner PIDs (always this same user), but
+        # "exists" is the correct answer either way.
+        return True
+    return True
+
+
+_reap_lock = threading.Lock()
+_reap_done = False
+
+
+def reap_orphaned_containers() -> None:
+    """Force-remove containers (and their lifecycle images) left behind by a
+    SIGKILL'd -- or otherwise uncleanly terminated -- previous process.
+
+    SIGKILL can never be caught (see agwebui.run()'s SIGTERM handler for what
+    *can* be done about a plain `kill`), so a SIGKILL'd process's containers
+    just keep running in the daemon forever: nothing in that process's own
+    lifecycle ever gets a chance to call destroy(), and -- per
+    _AGENCY_OWNER_PID_LABEL's docstring above -- a later run doesn't
+    naturally collide with (and thereby reclaim) their names either. This is
+    the other half of that gap: actively look for containers whose owning
+    PID is no longer alive and remove them.
+
+    Runs at most once per process (guarded by _reap_lock/_reap_done) --
+    called automatically the first time any _ContainerBackendBase is
+    constructed (see its __init__), so a real run reaps stale state near its
+    own start without every caller needing to remember to invoke this
+    directly. Best-effort throughout: any failure is logged and swallowed,
+    never allowed to block the actual work.
+    """
+    global _reap_done
+    if _reap_done:
+        return
+    with _reap_lock:
+        if _reap_done:
+            return
+        _reap_done = True
+        try:
+            _do_reap_orphaned_containers()
+        except Exception as _e:
+            print(f"[agsandbox_backend] WARNING: startup container reap failed: {_e}")
+
+
+def _do_reap_orphaned_containers() -> None:
+    try:
+        runtime = get_container_runtime()
+    except RuntimeError:
+        return  # no container runtime usable -- nothing to reap against
+    fmt = '{{.ID}}\t{{.Label "%s"}}\t{{.Names}}' % _AGENCY_OWNER_PID_LABEL
+    result = subprocess.run(
+        [runtime, "ps", "-a", "--filter", f"label={_AGENCY_OWNER_PID_LABEL}", "--format", fmt],
+        capture_output=True,
+        timeout=AgSandboxBackendFields().inspect_timeout_s,
+    )
+    if result.returncode != 0:
+        return
+    own_pid = os.getpid()
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        container_id, pid_str, name = parts
+        try:
+            owner_pid = int(pid_str)
+        except ValueError:
+            continue
+        if owner_pid == own_pid or _pid_alive(owner_pid):
+            continue  # still owned by a live process (or ourselves) -- leave it
+        print(
+            f"[agsandbox_backend] Reaping container {name!r} ({container_id[:12]}), "
+            f"orphaned by dead process {owner_pid} (likely SIGKILL'd)",
+            flush=True,
+        )
+        subprocess.run([runtime, "rm", "-f", container_id], capture_output=True)
+        lifecycle_tag = f"agency/lifecycle-{name}".lower()
+        subprocess.run([runtime, "rmi", "-f", lifecycle_tag], capture_output=True)
 
 
 def seed_cache_from_image(
@@ -297,6 +394,24 @@ class _ContainerBackendBase(agsandbox_backend):
         mounts: "dict[str, tuple[str, str, str]]",
         agconfig: "agConfig | None",
     ) -> None:
+        reap_orphaned_containers()
+        # Captured here, at construction time, rather than read fresh from
+        # os.getpid() inside _ensure_started() -- tool calls with
+        # run_in_subprocess=True (the default) cloudpickle this backend to a
+        # ProcessPoolExecutor worker, so _ensure_started() (and the `docker
+        # run` it issues) can run in a short-lived *worker* process distinct
+        # from -- and which can exit independently of -- the main process
+        # that actually owns this sandbox for its whole lifetime. Labeling
+        # the container with a fresh os.getpid() there would tag it with
+        # whichever worker happened to create it; once that worker exits
+        # (routine pool recycling, not a crash) while the container and its
+        # owning main process are both still very much alive, a concurrent
+        # reap_orphaned_containers() elsewhere would wrongly see a "dead"
+        # owner and delete a container still in active use. self._owner_pid
+        # is a plain instance attribute fixed here in whichever process
+        # actually constructs this backend (always the main process, never a
+        # worker), so it survives that same cloudpickling unchanged.
+        self._owner_pid = os.getpid()
         self._agname = agname
         self._gpu_id: int | None = None
         self._gpu_virtual: bool = False  # LLM has called reserve_gpu
@@ -380,6 +495,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 image = self._checkpoint_image
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
+                    + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
                     + self._gpu_flags
                     + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
@@ -394,6 +510,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     limit_flags.append(f"--cpus={_pool_fields.idle_cpus}")
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
+                    + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
                     + limit_flags
                     + self._gpu_flags
                     + self._vol_flags

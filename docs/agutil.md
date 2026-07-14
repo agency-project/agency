@@ -2,7 +2,7 @@
 
 Internal utility functions shared across the agency framework.
 
-These helpers are not part of the public API. User code generally does not import `agutil` directly, with one exception: `format_exception` is occasionally useful in custom error-handling code.
+These helpers are not part of the public API. User code generally does not import `agutil` directly, with two exceptions: `format_exception` is occasionally useful in custom error-handling code, and `sigterm_as_exit` is a context manager scripts should reach for whenever they run agency code directly (not via `agwebui.run()`/`graphui.run()`, which already use it internally) — see below. Both are also re-exported from the top-level package: `agency.sigterm_as_exit`.
 
 ---
 
@@ -37,6 +37,50 @@ except Exception as e:
     error_text = format_exception(e)
     print(error_text)
 ```
+
+---
+
+## `sigterm_as_exit(label="agency")`
+
+Context manager that installs a `SIGTERM` handler for the duration of the `with` block, converting a plain `kill <pid>` into a normal Python exit (`SystemExit`) instead of the OS's default immediate termination.
+
+**Signature**
+
+```python
+@contextmanager
+def sigterm_as_exit(label: str = "agency") -> Generator[threading.Event, None, None]
+```
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `label` | `str` | `"agency"` | Used only in the message printed when SIGTERM is caught, e.g. `"[agwebui] Received SIGTERM, shutting down..."`. |
+
+**Yields** a `threading.Event` that is set if and only if SIGTERM was actually received during the block — callers can check this in a `finally` to distinguish a signal-triggered exit from a normal one (e.g. to skip an otherwise-unconditional "wait for user input" step).
+
+**Why this exists:** Python installs no handler for `SIGTERM` by default, so a plain `kill <pid>` terminates the process immediately without ever unwinding the stack — every `finally` block and every `atexit` hook the framework relies on (live sandbox teardown in `agsandbox.py`, the tool worker pool in `agtool.py`, a webui/graphui server subprocess, ...) is skipped, exactly like `SIGKILL`. Installing this handler converts SIGTERM into `SystemExit`, so code inside the `with` block unwinds through its own `finally` blocks and reaches normal interpreter shutdown, where those hooks fire exactly as they would on any other clean exit.
+
+`SIGKILL` itself can never be caught by any process, so there is no equivalent possible for it — recovering from a `SIGKILL`'d run relies on the framework's own self-healing (e.g. the orphaned-container reaper described in [agsandbox_backends/container.md](agsandbox_backends/container.md#orphaned-container-reaping)), not on anything a context manager can do.
+
+**Main-thread only:** `signal.signal()` only works when called from the main thread. From any other thread, `sigterm_as_exit` is a no-op — it yields an `Event` that is simply never set, since a background thread can't rely on `KeyboardInterrupt`/Ctrl+C working there either.
+
+**Used internally by** `agwebui.run()` and `graphui.run()` (see [agwebui.md](agwebui.md#shutdown-and-signal-handling)) so that killing an agwebui-driven run cleans up its containers, tool worker pool, and server subprocess normally. Any script that constructs and runs agents/teams **without** going through one of those two wrappers gets no such protection unless it wraps itself the same way:
+
+**Example**
+
+```python
+from agency import sigterm_as_exit
+
+def main():
+    ag = agent(agconfig=..., agname="MyAgent")
+    ag.run(my_skill, agdata(topic="..."))
+
+with sigterm_as_exit("my_script"):
+    main()
+```
+
+**Gotcha:** the previous SIGTERM handler is always restored on exit from the `with` block (normal or via the raised `SystemExit`), so nesting or repeated use is safe — but only one handler is active at a time within a thread, so an inner `sigterm_as_exit` block temporarily shadows an outer one for its duration.
 
 ---
 

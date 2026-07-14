@@ -41,6 +41,28 @@ The container exists only during active tool execution. Between tool calls the c
 
 **`stop()` reliability**: `rm -f` is retried up to 3 times. Each attempt goes through `_run()`, which holds `_get_docker_semaphore()`'s semaphore (caps all concurrent daemon calls, both runtimes, at 16 — see `docker_semaphore_limit`). If all retries fail, a `WARNING` is emitted to stderr and the framework continues — `_started` is cleared regardless so the next tool call can attempt a fresh container.
 
+## Orphaned container reaping
+
+`atexit` handlers (the row above) never run if the execution process is killed with `SIGKILL` — that signal can't be caught by any process, so the interpreter never regains control to remove its live containers. A framework-level `SIGTERM` handler (`agutil.sigterm_as_exit()`, used by `agwebui.run()`/`graphui.run()` — see [agwebui.md](../agwebui.md#shutdown-and-signal-handling)) closes that gap for plain `kill`, but SIGKILL still leaves containers behind. `_RUN_ID` being a per-process random UUID (see "Container naming" above) means the *next* run can't just guess an old container's name to reclaim it — it's deliberately randomized to prevent name collisions across runs, not to enable this.
+
+Instead, every container is labelled at `run` time with the PID of the process that owns it:
+
+```
+--label agency.owner_pid=<pid>
+```
+
+**`self._owner_pid` is captured once, in `_ContainerBackendBase.__init__`**, as `os.getpid()` at construction time — not read live inside `_ensure_started()`. This matters because a tool call with the default `run_in_subprocess=True` dispatches through a `ProcessPoolExecutor` (`agtool.py`), so `_ensure_started()` (and the `docker run` call it makes) can execute inside a **worker** process with its own transient PID, distinct from the main process that actually owns the sandbox's lifecycle. Labelling with a live `os.getpid()` call there would tag containers with a worker PID that exits as soon as the tool call returns, making every container look orphaned to the next reap almost immediately. Capturing the PID once at construction — always in the main process — avoids that.
+
+**At startup**, `_ContainerBackendBase.__init__` calls `reap_orphaned_containers()` (also exported from `agsandbox_backends`) before anything else. It:
+
+1. Lists all containers (any runtime) carrying the `agency.owner_pid` label, via `docker ps -a --filter label=agency.owner_pid --format ...`.
+2. For each, checks whether the labelled PID is (a) this process's own PID (skip — it's a container this same run is about to reuse) or (b) still alive on the host via `_pid_alive()` (`os.kill(pid, 0)`; skip if alive).
+3. Anything left — labelled with a PID that's neither this process nor alive — is a dead run's container. It's force-removed (`rm -f`) along with its lifecycle image tag (`rmi -f agency/lifecycle-<name>`), and a message is printed noting the reap and the dead owner PID.
+
+Runs only once per process (`_reap_done` flag guarded by a lock) — every subsequent `agSandbox`/backend construction in the same process is a no-op. Any exception during the reap (no container runtime available, daemon unreachable, etc.) is caught and logged as a `WARNING`; it never blocks startup.
+
+This is best-effort cleanup, not a substitute for `sigterm_as_exit()` — it only reclaims resources at the *next* run's startup, and only if something runs `_ContainerBackendBase.__init__` again on the same host afterward.
+
 ## GPU device access
 
 `--gpus all` (NVIDIA) or `--device /dev/kfd --device /dev/dri` (AMD/ROCm) is passed to `run` when a GPU is detected on the host (`agsandbox_backends.container._gpu_flags()`, cached process-wide via `agresources.detect_gpus()`). On CPU-only hosts no flag is passed.

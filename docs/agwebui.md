@@ -73,6 +73,29 @@ agwebui.run(main, linger=False)   # exit immediately when done
 
 `agwebui.run(fn)` blocks until `fn` completes and (if `linger=True`) until Ctrl+C. The web server subprocess is started and stopped automatically.
 
+## Shutdown and signal handling
+
+`agwebui.run()` wraps the call to `fn()` in [`agutil.sigterm_as_exit("agwebui")`](agutil.md#sigterm_as_exitlabelagency) (re-exported as `agency.sigterm_as_exit`). Without this, a plain `kill <pid>` (`SIGTERM`) would terminate the process immediately, skipping every `atexit` hook the framework relies on — live sandbox teardown, the tool worker pool, and the `_kill_server()` hook that stops this module's own server subprocess — exactly like `SIGKILL` does. With it, SIGTERM is converted into `SystemExit`, so the same `finally` block that runs on normal completion also runs on `kill`:
+
+- `command_stop.set()` and `ui.emitter.done()` — stop the command-poll thread and mark the run as finished in the UI.
+- **Lingering is skipped even if `linger=True`** — `sigterm_as_exit` yields an `Event` that is set when the signal fires; the `finally` block checks it and, if set, goes straight to server teardown instead of blocking on Ctrl+C. A `kill` means "exit now," not "keep serving the dashboard until a second signal arrives."
+- The server subprocess is terminated (`proc.terminate()`, waited up to 5 s) and its log file closed.
+
+`SIGINT` (Ctrl+C) needs no special handling here — Python's default handler already raises `KeyboardInterrupt`, which the existing `try/except KeyboardInterrupt` around the linger loop (and the framework's own `finally`/`atexit` hooks elsewhere) handle normally.
+
+**`SIGKILL` cannot be caught by any process**, including this one — there is no handler that can run cleanup in response to it. Recovery from a `SIGKILL`'d run relies on the framework's own self-healing at the *next* run's startup, notably the orphaned-container reaper in `agsandbox_backends/container.py` (see [container.md](agsandbox_backends/container.md#orphaned-container-reaping)), not on anything `agwebui.run()` does.
+
+**The web server subprocess does not propagate signals to it.** Sending `kill <pid>` to the execution process's PID only affects that process; the server subprocess (started via `subprocess.Popen`) is a distinct PID with its own default signal handling (uvicorn's own SIGINT/SIGTERM handling) and is stopped only because the execution process's own cleanup code explicitly calls `proc.terminate()` on it — not through any signal relay from the OS.
+
+**Scripts that don't use `agwebui.run()`** (or `graphui.run()`, its project-specific analog) get none of this protection automatically — a bare script that builds and runs agents directly should wrap its own entry point in `sigterm_as_exit()` the same way:
+
+```python
+from agency import sigterm_as_exit
+
+with sigterm_as_exit("my_script"):
+    main()
+```
+
 ## Layout
 
 ```

@@ -1,9 +1,11 @@
 from __future__ import annotations
 import queue
 import re
+import signal
 import threading
 import time
 import traceback as _traceback
+from contextlib import contextmanager
 from typing import Generator, Iterable, TypeVar
 
 from .agconfig import GlobalConfigParam, _AgConfigViewBase
@@ -68,6 +70,57 @@ def format_exception(e: BaseException) -> str:
     if tb and not tb.startswith("NoneType"):
         return tb.rstrip()
     return f"{type(e).__name__}: {e}"
+
+
+@contextmanager
+def sigterm_as_exit(label: str = "agency") -> "Generator[threading.Event, None, None]":
+    """Install a SIGTERM handler for the duration of this ``with`` block that
+    converts a plain ``kill <pid>`` into a normal Python exit (``SystemExit``)
+    instead of the OS's default immediate termination.
+
+    Without this, SIGTERM bypasses every ``atexit`` cleanup hook the
+    framework relies on (live sandbox teardown in agsandbox.py, the tool
+    worker pool in agtool.py, a webui/graphui server subprocess, ...) exactly
+    like SIGKILL does -- the interpreter never regains control, so none of
+    that ever runs. Converting SIGTERM into ``SystemExit`` here lets whatever
+    code is running inside the ``with`` block unwind through its own
+    ``finally`` blocks and reach normal interpreter shutdown instead, where
+    those hooks fire exactly as they would on any other clean exit.
+
+    SIGKILL itself can never be caught by any process, so there's no
+    equivalent possible for it -- resuming cleanly after a SIGKILL relies on
+    the framework's own self-healing (e.g. ``agsandbox_backends.container``'s
+    startup orphan reaper reclaiming a dead run's containers), not on
+    anything a context manager can do.
+
+    Yields a ``threading.Event`` that's set if SIGTERM was actually received
+    during the block, so callers can distinguish a signal-triggered exit from
+    a normal one (e.g. to skip an otherwise-unconditional "wait for user
+    input" step -- the caller asked this process to exit, not to linger for a
+    second signal).
+
+    Only installs the handler when called from the main thread --
+    ``signal.signal()`` raises otherwise. From any other thread this is a
+    no-op: it yields an ``Event`` that's simply never set, since a background
+    thread already can't rely on Ctrl+C/KeyboardInterrupt working here either.
+    *label* is used only in the message printed when SIGTERM is caught (e.g.
+    ``"[agwebui] Received SIGTERM, shutting down..."``).
+    """
+    received = threading.Event()
+    if threading.current_thread() is not threading.main_thread():
+        yield received
+        return
+
+    def _handle_sigterm(signum, frame) -> None:
+        received.set()
+        print(f"\n[{label}] Received SIGTERM, shutting down...", flush=True)
+        raise SystemExit(0)
+
+    prev_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
+    try:
+        yield received
+    finally:
+        signal.signal(signal.SIGTERM, prev_handler)
 
 
 class _LLMIdleTimeout(Exception):
