@@ -7,6 +7,7 @@ from .agtool import agtool
 from .aglog import aglog
 from .agterm import agterm
 from .agent import agent
+from .agmap import agmap, agtask
 from .agteam import agteam
 from .agsync import agsync
 from .agpause import wait_all_paused, wait_all_resumed
@@ -31,6 +32,8 @@ __all__ = [
     "aglog",
     "agterm",
     "agent",
+    "agmap",
+    "agtask",
     "agteam",
     "agsync",
     "wait_all_paused",
