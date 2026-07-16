@@ -23,15 +23,12 @@ class agOpenAIBackendConfig(_AgProviderBackendConfig):
 class _OpenAICompatibleBackend(agllm_backend):
     """Default backend: OpenAI, vLLM, or any other OpenAI-compatible endpoint."""
 
-    def make_client(self, timeout: httpx.Timeout, max_retries: "int | None" = None) -> openai.OpenAI:
-        kwargs: dict = dict(
+    def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
+        return openai.OpenAI(
             api_key=self.api_key or "EMPTY",
             base_url=self.base_url,
             timeout=timeout,
         )
-        if max_retries is not None:
-            kwargs["max_retries"] = max_retries
-        return openai.OpenAI(**kwargs)
 
     def tokenize_url(self) -> "str | None":
         base_url: str = self.base_url or ""

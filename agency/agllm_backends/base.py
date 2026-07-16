@@ -305,15 +305,8 @@ class agllm_backend(AgLLMBackendFields):
             )
         return _OpenAICompatibleBackend(agconfig)
 
-    def make_client(self, timeout: httpx.Timeout, max_retries: "int | None" = None):
-        """Build and return a client exposing `.chat.completions.create()` and `.close()`.
-
-        max_retries, when given, is forwarded to the underlying SDK client's own
-        constructor-level retry budget (distinct from agllm.call()'s separate,
-        hand-rolled outer retry loop) -- this is what makes single-shot call
-        sites like agllm.compact() (which has no outer loop of its own) resilient
-        to a transient timeout/connection error instead of raising on the first
-        attempt. None means "leave the SDK's own default alone"."""
+    def make_client(self, timeout: httpx.Timeout):
+        """Build and return a client exposing `.chat.completions.create()` and `.close()`."""
         raise NotImplementedError
 
     def list_models(self) -> list:

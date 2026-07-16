@@ -276,7 +276,6 @@ class agllm(_AgLLMFields):
                         write=self.http_write_timeout,
                         pool=self.http_pool_timeout,
                     ),
-                    max_retries=self.max_retries,
                 )
 
                 if term:
@@ -783,11 +782,7 @@ class agllm(_AgLLMFields):
                 lines.append(f"[tool result]: {content[: _AgLLMFields.TOOL_OUTPUT_MAX_CHARS]}")
             elif content:
                 lines.append(f"[{role}]: {content[: self.summary_role_content_max_chars]}")
-        # Unlike call(), compact() has no outer Python-level retry loop of its own —
-        # this is a single-shot summarisation call, so it must lean on the SDK
-        # client's own constructor-level retry budget to survive a transient
-        # timeout/connection error, or it crashes the whole skill run outright.
-        client = self.backend.make_client(httpx.Timeout(120.0), max_retries=self.max_retries)
+        client = self.backend.make_client(httpx.Timeout(120.0))
         compact_kwargs: dict = dict(
             model=self.backend.model or "",
             messages=[
