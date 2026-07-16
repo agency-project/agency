@@ -505,7 +505,9 @@ class _ContainerBackendBase(agsandbox_backend):
             else:
                 image = self._resolve_image(self._base_image)
                 _pool_fields = _AgResourcePoolFields(self._agconfig)
-                limit_flags = [f"--memory={_pool_fields.idle_memory}"]
+                limit_flags = []
+                if _pool_fields.idle_memory is not None:
+                    limit_flags.append(f"--memory={_pool_fields.idle_memory}")
                 if self._cfs_supported():
                     limit_flags.append(f"--cpus={_pool_fields.idle_cpus}")
                 run_cmd = (

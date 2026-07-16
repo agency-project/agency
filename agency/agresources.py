@@ -35,11 +35,16 @@ class _AgResourcePoolFields:
         "agResourcePool", default=128
     )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
 
-    # CPU/memory limit applied both when a sandbox container is first created
-    # (docker run) and whenever it's reset to idle (docker update, via
-    # cpu_release) -- the same footprint at rest either way.
-    idle_cpus = DynamicConfigParam("agResourcePool", default=4.0)
-    idle_memory = DynamicConfigParam("agResourcePool", default="4096m")
+    # CPU limit applied both when a sandbox container is first created (docker
+    # run) and whenever it's reset to idle (docker update, via cpu_release) --
+    # the same footprint at rest either way. idle_memory has no such fixed
+    # cap by default (None): both container.py's creation path and
+    # update_limits() treat None as "omit --memory", which is Docker's own
+    # native unlimited behavior (cgroup memory.max="max") -- correct here
+    # since sandboxes are torn down after use rather than reset-and-reused
+    # indefinitely, so there's no multi-tenant idle container to bound.
+    idle_cpus = DynamicConfigParam("agResourcePool", default=8.0)
+    idle_memory = DynamicConfigParam("agResourcePool", default=None)
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig

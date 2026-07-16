@@ -6,6 +6,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from agency.agconfig import agConfig
 from agency.agresources import (
     agResourcePool,
     detect_cpus,
@@ -148,9 +149,32 @@ def test_pool_empty_gpus():
 
 
 def test_pool_default_idle_values():
+    """idle_cpus keeps its fixed default; idle_memory defaults to None (no
+    cap) rather than an arbitrary fixed constant like "4096m" — sandboxes are
+    torn down after use, not reset-and-reused indefinitely, so there's no
+    idle container to bound by default. container.py/update_limits() both
+    treat None as "omit --memory", Docker's own native unlimited behavior."""
     pool = agResourcePool(gpus=[], total_cpus=4, total_memory_mb=8192)
-    assert pool.idle_cpus == 4.0
-    assert pool.idle_memory == "4096m"
+    assert pool.idle_cpus == _AgResourcePoolFields.idle_cpus.default
+    assert pool.idle_memory is None
+
+
+def test_disconnected_fields_instance_idle_memory_defaults_to_none():
+    """agsandbox_backends/container.py's container-creation path reads
+    idle_memory through a fresh _AgResourcePoolFields(sandbox_agconfig) bound
+    to the SANDBOX's own agconfig, not agResourcePool's — a completely
+    different, unrelated agConfig instance that never has idle_memory
+    explicitly set on it. That means idle_memory's own class-level default
+    (not anything set inside agResourcePool.__init__) is what actually
+    reaches real container creation, and it must be None so --memory is
+    omitted there too, not a fixed constant regardless of host size."""
+    fields = _AgResourcePoolFields(agConfig())
+    assert fields.idle_memory is None
+
+
+def test_pool_explicit_idle_memory_overrides_default():
+    pool = agResourcePool(gpus=[], total_memory_mb=8192, idle_memory="1g")
+    assert pool.idle_memory == "1g"
 
 
 def test_pool_initial_acquired_counts_are_zero():
