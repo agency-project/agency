@@ -441,22 +441,26 @@ class _AnthropicBackend(agllm_backend):
     derived base URLs, and the workspace header natively.
     """
 
-    def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
+    def _client_kwargs(self, timeout: httpx.Timeout, max_retries: "int | None" = None) -> dict:
         kwargs: dict = dict(
             api_key=self.api_key or os.environ.get("ANTHROPIC_API_KEY"),
             timeout=timeout,
         )
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
         workspace_id = self.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         if workspace_id:
             kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
         return kwargs
 
-    def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
+    def make_client(
+        self, timeout: httpx.Timeout, max_retries: "int | None" = None
+    ) -> _AnthropicBedrockChatClient:
         if _anthropic_sdk is None:
             raise RuntimeError(
                 "provider='anthropic' requires the 'anthropic' package: pip install anthropic"
             )
-        anthropic_client = _anthropic_sdk.Anthropic(**self._client_kwargs(timeout))
+        anthropic_client = _anthropic_sdk.Anthropic(**self._client_kwargs(timeout, max_retries))
         return _AnthropicBedrockChatClient(anthropic_client)
 
     def list_models(self) -> list:

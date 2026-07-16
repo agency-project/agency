@@ -132,24 +132,31 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
     """Bedrock models reachable through the OpenAI-compatible Mantle gateway —
     every Bedrock model except Anthropic's own (see module docstring above)."""
 
-    def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
+    def make_client(
+        self, timeout: httpx.Timeout, max_retries: "int | None" = None
+    ) -> openai.OpenAI:
         region = self.region or "us-east-1"
         api_key = self.api_key or os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or None
         mantle_url = f"https://bedrock-mantle.{region}.api.aws/v1"
         runtime_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+        retry_kwargs: dict = {"max_retries": max_retries} if max_retries is not None else {}
         # A Bedrock API key (e.g. "ABSK...") is a single opaque bearer token
         # for the Mantle gateway. AWS access/secret key pairs for SigV4 signing
         # are always "ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]" — the
         # colon is what distinguishes the two.
         if api_key and ":" not in api_key:
-            return openai.OpenAI(api_key=api_key, base_url=mantle_url, timeout=timeout)
+            return openai.OpenAI(
+                api_key=api_key, base_url=mantle_url, timeout=timeout, **retry_kwargs
+            )
         if not api_key:
             try:
                 from aws_bedrock_token_generator import provide_token as _provide_token
 
                 os.environ.setdefault("AWS_DEFAULT_REGION", region)
                 token = _provide_token(region=region)
-                return openai.OpenAI(api_key=token, base_url=mantle_url, timeout=timeout)
+                return openai.OpenAI(
+                    api_key=token, base_url=mantle_url, timeout=timeout, **retry_kwargs
+                )
             except ImportError:
                 pass
         return openai.OpenAI(
@@ -158,6 +165,7 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
             http_client=httpx.Client(
                 auth=_BedrockSigV4Auth(region, api_key=api_key), timeout=timeout
             ),
+            **retry_kwargs,
         )
 
     def tokenize_url(self) -> "str | None":
@@ -168,13 +176,18 @@ class _AnthropicBedrockBackend(agllm_backend):
     """Claude models on Amazon Bedrock — native invoke_model API via the
     anthropic SDK's AnthropicBedrock client (Messages API shape)."""
 
-    def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
+    def make_client(
+        self, timeout: httpx.Timeout, max_retries: "int | None" = None
+    ) -> _AnthropicBedrockChatClient:
         if _anthropic_sdk is None:
             raise RuntimeError(
                 "Anthropic models on Bedrock require the 'anthropic' package: pip install anthropic"
             )
         region = self.region or "us-east-1"
-        anthropic_client = _anthropic_sdk.AnthropicBedrock(aws_region=region, timeout=timeout)
+        retry_kwargs: dict = {"max_retries": max_retries} if max_retries is not None else {}
+        anthropic_client = _anthropic_sdk.AnthropicBedrock(
+            aws_region=region, timeout=timeout, **retry_kwargs
+        )
         return _AnthropicBedrockChatClient(anthropic_client)
 
     def list_models(self) -> list:
@@ -197,8 +210,10 @@ class _AnthropicAWSBackend(agllm_backend):
     `aws_region` / AWS_REGION) unless base_url is set.
     """
 
-    def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
+    def _client_kwargs(self, timeout: httpx.Timeout, max_retries: "int | None" = None) -> dict:
         kwargs: dict = dict(timeout=timeout)
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
         api_key = self.api_key or os.environ.get("ANTHROPIC_AWS_API_KEY")
         if api_key:
             kwargs["api_key"] = api_key
@@ -225,7 +240,9 @@ class _AnthropicAWSBackend(agllm_backend):
             kwargs["base_url"] = base_url
         return kwargs
 
-    def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
+    def make_client(
+        self, timeout: httpx.Timeout, max_retries: "int | None" = None
+    ) -> _AnthropicBedrockChatClient:
         if _anthropic_sdk is None:
             raise RuntimeError(
                 "provider='anthropicAWS' requires the 'anthropic' package: pip install anthropic"
@@ -234,7 +251,9 @@ class _AnthropicAWSBackend(agllm_backend):
             raise RuntimeError(
                 "provider='anthropicAWS' requires a recent 'anthropic' package with AnthropicAWS support"
             )
-        anthropic_client = _anthropic_sdk.AnthropicAWS(**self._client_kwargs(timeout))
+        anthropic_client = _anthropic_sdk.AnthropicAWS(
+            **self._client_kwargs(timeout, max_retries)
+        )
         return _AnthropicBedrockChatClient(anthropic_client)
 
     def list_models(self) -> list:
