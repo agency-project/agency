@@ -124,6 +124,73 @@ def test_repr():
 
 
 # ---------------------------------------------------------------------------
+# engine -- the seam between the native ReAct loop and an off-the-shelf
+# harness (see docs/Design_harness_integration.md)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_defaults_to_native():
+    ag = make_agent()
+    assert ag.engine == "native"
+
+
+def test_engine_explicit_constructor_arg():
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), engine="claude_code")
+    assert ag.engine == "claude_code"
+
+
+def test_engine_from_agconfig():
+    from agency.agent import agAgentConfig
+
+    cfg = agConfig(
+        agAgentConfig(engine="opencode"), {"agllm_backend": {"api_key": "k", "model": ""}}
+    )
+    ag = agent(agconfig=cfg)
+    assert ag.engine == "opencode"
+
+
+def test_run_dispatches_to_execute_react_when_native():
+    calls = []
+
+    def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
+        calls.append("react")
+        return agdata(done=True), prev_ctx, []
+
+    def fake_execute_harness(ag, prev_ctx, inp, max_steps=None, **_):
+        calls.append("harness")
+        return agdata(done=True), prev_ctx, []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.execute_react = fake_execute_react
+    skill.execute_harness = fake_execute_harness
+
+    ag = make_agent()
+    assert ag.engine == "native"
+    ag.run(skill, agdata()).done
+    assert calls == ["react"]
+
+
+def test_run_dispatches_to_execute_harness_when_engine_not_native():
+    calls = []
+
+    def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
+        calls.append("react")
+        return agdata(done=True), prev_ctx, []
+
+    def fake_execute_harness(ag, prev_ctx, inp, max_steps=None, **_):
+        calls.append("harness")
+        return agdata(done=True), prev_ctx, []
+
+    skill = agskill(name="s", system_prompt="")
+    skill.execute_react = fake_execute_react
+    skill.execute_harness = fake_execute_harness
+
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), engine="claude_code")
+    ag.run(skill, agdata()).done
+    assert calls == ["harness"]
+
+
+# ---------------------------------------------------------------------------
 # History is updated and serialized on the same agent
 # ---------------------------------------------------------------------------
 
@@ -288,6 +355,12 @@ def test_fork_inherits_config():
 
     forked = agent.fork(ag)
     assert forked.llm.backend.as_dict() == ag.llm.backend.as_dict()
+
+
+def test_fork_inherits_engine():
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), engine="claude_code")
+    forked = agent.fork(ag)
+    assert forked.engine == "claude_code"
 
 
 def test_fork_deep_copies_history():
@@ -612,6 +685,66 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
 
     events = ag2.log.events
     assert any(e.get("event") == "loaded" for e in events)
+    del ag2
+    _agname._allocated.discard(saved_agname)
+
+
+def test_save_and_load_restores_engine(tmp_path, monkeypatch):
+    import subprocess as _sp
+
+    monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
+
+    ag = agent(
+        agconfig=_llm_agconfig({"api_key": "k", "model": "m"}),
+        engine="claude_code",
+    )
+
+    ckpt = tmp_path / "agent.ckpt"
+    ag.save(ckpt)
+    saved_agname = ag.agname
+    del ag
+    _agname._allocated.discard(saved_agname)
+
+    ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
+    assert ag2.engine == "claude_code"
+    del ag2
+    _agname._allocated.discard(saved_agname)
+
+
+def test_load_defaults_engine_to_native_when_absent(tmp_path, monkeypatch):
+    """A checkpoint saved before `engine` existed (or a plain native agent's
+    checkpoint) has no "engine" key at all -- load() must not choke on that,
+    it should just default to "native"."""
+    import json
+    import subprocess as _sp
+
+    monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
+
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
+    ckpt = tmp_path / "agent.ckpt"
+    ag.save(ckpt)
+    saved_agname = ag.agname
+    del ag
+    _agname._allocated.discard(saved_agname)
+
+    # Strip "engine" back out of the saved state.json to simulate an
+    # older checkpoint, then reload from the doctored tarball.
+    import tarfile
+    import io
+
+    with tarfile.open(ckpt, "r:gz") as tar:
+        members = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+    state = json.loads(members["state.json"])
+    del state["engine"]
+    members["state.json"] = json.dumps(state).encode()
+    with tarfile.open(ckpt, "w:gz") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
+    assert ag2.engine == "native"
     del ag2
     _agname._allocated.discard(saved_agname)
     # Container filesystem round-trip (write_file → save → load → read_file)

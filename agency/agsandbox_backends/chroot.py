@@ -181,6 +181,7 @@ class _ChrootBackend(agsandbox_backend):
         self._watched_pids: dict[int, float] = {}
         self._baseline_pids: set[int] = set()
         self._daemon_pids: set[int] = set()
+        self._ptrace_managed_pids: set[int] = set()  # see ingest_ptrace_pids() in base.py
         self._started = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
@@ -353,6 +354,7 @@ class _ChrootBackend(agsandbox_backend):
             self._gpu_id = None
         self._watched_pids = {}
         self._baseline_pids = set()
+        self._ptrace_managed_pids = set()
         if not self._started and not self._workspace.is_dir():
             return
         if commit:
@@ -367,6 +369,7 @@ class _ChrootBackend(agsandbox_backend):
         """Restore the jail's workspace from a previously committed snapshot."""
         self._watched_pids = {}
         self._baseline_pids = set()
+        self._ptrace_managed_pids = set()
         self._checkpoint_image = tag
         # Materialize explicitly rather than resetting _started and calling
         # _ensure_started() -- that only restores when the workspace doesn't

@@ -421,3 +421,65 @@ def test_recover_outputs_no_agtype_fields_returns_empty():
     data = agdata(answer="done")
     paths = s.recover_outputs(data, sb)
     assert paths == []
+
+
+# ---------------------------------------------------------------------------
+# validate_and_recover() -- whole-schema validation + recovery from a
+# harness's single raw final-answer text (agskill.execute_harness()'s path)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_and_recover_valid_json_round_trips():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover('{"answer": "done"}', sb)
+    assert not isinstance(data, agerror)
+    assert data.answer == "done"
+    assert paths == []
+
+
+def test_validate_and_recover_malformed_json_returns_agerror():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover("not json at all {", sb)
+    assert isinstance(data, agerror)
+    assert "could not parse harness output as JSON" in data.error
+    assert paths == []
+
+
+def test_validate_and_recover_non_object_json_returns_agerror():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover("[1, 2, 3]", sb)
+    assert isinstance(data, agerror)
+    assert "must be a JSON object" in data.error
+    assert paths == []
+
+
+def test_validate_and_recover_missing_field_returns_agerror():
+    s = agschema(agdata(answer=str, confidence=float))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover('{"answer": "done"}', sb)
+    assert isinstance(data, agerror)
+    assert "output schema error" in data.error
+    assert "confidence" in data.error
+    assert paths == []
+
+
+def test_validate_and_recover_wrong_type_returns_agerror():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover('{"answer": 42}', sb)
+    assert isinstance(data, agerror)
+    assert "output schema error" in data.error
+
+
+def test_validate_and_recover_recovers_agtype_field():
+    s = agschema(agdata(doc=agfile))
+    sb = MagicMock()
+    sb.read_file.return_value = "the recovered content"
+    data, paths = s.validate_and_recover('{"doc": "/workspace/out.txt"}', sb)
+    assert not isinstance(data, agerror)
+    sb.read_file.assert_called_once_with("/workspace/out.txt")
+    assert data.doc == "the recovered content"
+    assert paths == ["/workspace/out.txt"]

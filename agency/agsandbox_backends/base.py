@@ -466,6 +466,43 @@ class agsandbox_backend(AgSandboxBackendFields):
         self._daemon_pids.add(pid)
         self._watched_pids.pop(pid, None)
 
+    def ingest_ptrace_pids(
+        self, spawned: "set[int] | None" = None, exited: "set[int] | None" = None
+    ) -> None:
+        """Alternate population path for `_watched_pids`, fed by
+        `agproxy_ptrace`'s fork/exit event stream (see
+        `agProxyPtraceHandle.on_spawn`/`.on_exit` in agproxy_ptrace.py) instead
+        of `exec()`'s `/proc`-diff + `__BGPIDS__` marker. `get_live_pids()`/
+        `pid_status_summary()`/`wait_for_processes()`/`release_daemon()`'s
+        external contracts are unchanged -- only the internal population
+        mechanism differs for harness-driven agents versus native ones.
+
+        Pids passed here are tracked in `_ptrace_managed_pids` in addition to
+        `_watched_pids`, so `get_live_pids()` trusts *this* method's `exited`
+        calls as the sole liveness signal for them rather than pruning them
+        the moment its own `/proc` scan doesn't happen to show them --
+        ptrace's fork/exit events are exact regardless of whether the traced
+        pids are visible in whatever PID namespace `_container_exec()`
+        queries, which they are NOT in general (a docker/podman container has
+        its own separate PID namespace from a ptrace supervisor forked on the
+        host; only a supervisor that itself runs inside the container's
+        namespace, e.g. via `docker exec`, or the chroot backend, which
+        shares the host namespace, would see them there too). Bridging that
+        gap for the docker/podman backends -- running the supervisor inside
+        the container plus an IPC channel back to the caller's `agpolicy` --
+        is an open item; see docs/Design_harness_integration.md's "Design
+        Tensions" section.
+        """
+        now = time.monotonic()
+        for pid in spawned or ():
+            if pid in self._baseline_pids or pid in self._daemon_pids:
+                continue
+            self._watched_pids.setdefault(pid, now)
+            self._ptrace_managed_pids.add(pid)
+        for pid in exited or ():
+            self._watched_pids.pop(pid, None)
+            self._ptrace_managed_pids.discard(pid)
+
     def get_live_pids(self) -> set[int]:
         if not self._watched_pids:
             return set()
@@ -557,9 +594,20 @@ class agsandbox_backend(AgSandboxBackendFields):
             if pid not in self._watched_pids:
                 self._watched_pids[pid] = now
 
-        # Prune _watched_pids entries that are no longer alive.
+        # ptrace-managed pids (see ingest_ptrace_pids()) are trusted as alive
+        # for as long as they remain in _watched_pids regardless of whether
+        # this /proc scan happens to show them -- ptrace's own fork/exit
+        # events are the authoritative liveness signal for them (exact, not
+        # a poll), and in general they live in a different PID namespace
+        # than whatever this method's _container_exec() scan just queried.
+        alive |= self._ptrace_managed_pids & set(self._watched_pids)
+
+        # Prune _watched_pids entries that are no longer alive -- except
+        # ptrace-managed ones, which only ever leave _watched_pids via an
+        # explicit ingest_ptrace_pids(exited=...) call, never because this
+        # scan didn't happen to observe them.
         for pid in set(self._watched_pids):
-            if pid not in alive:
+            if pid not in alive and pid not in self._ptrace_managed_pids:
                 del self._watched_pids[pid]
 
         # Release the physical GPU once all watched processes have finished.

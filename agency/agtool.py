@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from .agterm import agterm
     from .agsandbox import agSandbox
     from .agconfig import agConfig
+    from .agpolicy import agpolicy
+    from .agent import agent
 
 # ---------------------------------------------------------------------------
 # Process pool — workers are created lazily on first tool call and scale up
@@ -318,12 +320,29 @@ def dispatch_tools(
     term: "agterm | None",
     tool_offload_chars: "int | None" = None,
     agconfig: "agConfig | None" = None,
+    policy: "agpolicy | None" = None,
+    ag: "agent | None" = None,
 ) -> None:
     """Execute all tool calls from one LLM response, appending results to messages.
 
     Mutates toolkit in place if the read tool is lazily injected due to a large
     tool output being offloaded — the caller derives wire-format schemas from the
     toolkit each iteration, so the injection is automatically visible to the LLM.
+
+    If *policy* is given, every call is mediated through `policy.check(ag,
+    event)` before dispatch -- the same `agpolicy` interface
+    `agproxy_ptrace` uses for harness-driven agents (see agpolicy.py and
+    docs/Design_harness_integration.md), so one policy implementation can
+    govern a mixed team of native and harness-driven agents. `event` is an
+    `agsyscallevent` with `syscall="tool_call"`, `tool_name`/`tool_args`
+    populated, and `argv`/`envp`/`path` left `None` -- a `deny` decision
+    skips the actual tool call and reports the denial reason as the tool's
+    result, matching how a denied syscall reports EPERM back to a harness's
+    own model turn rather than silently substituting a fabricated success.
+    `rewrite` is NOT supported for native tool calls (there is no single
+    argv-shaped string to rewrite the way there is for a traced `execve` --
+    a tool call's arguments are an arbitrary JSON object) and is treated as
+    `allow` if a policy returns it here.
     """
     _state_fn = state_fn
     _live_fn = live_messages_fn
@@ -348,10 +367,43 @@ def dispatch_tools(
             tc["function"]["arguments"] = fn_args
 
         t = toolkit.get(fn_name)
+        _policy_denial: "str | None" = None
+        if t is not None and policy is not None:
+            # Lazy import: agproxy_ptrace_internal transitively guards on
+            # x86_64/Linux at import time (see _ctypes_defs.py's
+            # _arch_guard()), so importing agsyscallevent at agtool.py's
+            # module level would break importing this module at all on
+            # unsupported platforms -- pay that cost only when a caller
+            # actually opts into policy-mediated dispatch.
+            from .agharness_internal.agproxy_ptrace import agsyscallevent
+
+            try:
+                _policy_args = json.loads(fn_args)
+            except (json.JSONDecodeError, TypeError):
+                _policy_args = {}
+            _event = agsyscallevent(
+                syscall="tool_call",
+                pid=-1,
+                tid=-1,
+                argv=None,
+                envp=None,
+                path=None,
+                timestamp=time.time(),
+                tool_name=fn_name,
+                tool_args=_policy_args,
+            )
+            _decision = policy.check(ag, _event)
+            if _decision.kind == "deny":
+                _policy_denial = _decision.reason or f"tool call to {fn_name!r} denied by policy"
+
         if t is None:
             if _term:
                 _term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
             result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
+        elif _policy_denial is not None:
+            if _term:
+                _term.log("TOOL ✗   ", f"{fn_name}  → denied by policy: {_policy_denial}")
+            result_content = json.dumps({"error": _policy_denial})
         else:
             try:
                 if _state_fn:

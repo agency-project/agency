@@ -422,6 +422,7 @@ class _ContainerBackendBase(agsandbox_backend):
         self._watched_pids: dict[int, float] = {}
         self._baseline_pids: set[int] = set()
         self._daemon_pids: set[int] = set()
+        self._ptrace_managed_pids: set[int] = set()  # see ingest_ptrace_pids() in base.py
         self._started = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
@@ -737,6 +738,7 @@ class _ContainerBackendBase(agsandbox_backend):
         # Clear PID tracking — remove kills all processes.
         self._watched_pids = {}
         self._baseline_pids = set()
+        self._ptrace_managed_pids = set()
         if commit:
             tag = self._lifecycle_tag()
             # Capture the current image ID before overwriting the tag so we
@@ -849,6 +851,7 @@ class _ContainerBackendBase(agsandbox_backend):
             self._started = False
             self._watched_pids = {}
             self._baseline_pids = set()
+            self._ptrace_managed_pids = set()
         self._checkpoint_image = tag
         self._ensure_started()
 

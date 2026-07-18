@@ -1,6 +1,7 @@
 """Tests for the agtool class."""
 
 import importlib
+import json
 import os
 from unittest.mock import MagicMock, patch
 from agency.agdata import agdata
@@ -237,3 +238,160 @@ def test_shutdown_tool_pool_noop_when_no_pool():
         assert _agtool_mod._pool is None
     finally:
         _agtool_mod._pool = original
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tools() -- optional agpolicy mediation (Phase 6 retrofit)
+# ---------------------------------------------------------------------------
+
+
+def _build_tool_call(name, args, call_id="c1"):
+    import json
+
+    return {
+        "id": call_id,
+        "function": {"name": name, "arguments": json.dumps(args)},
+    }
+
+
+def test_dispatch_tools_no_policy_behaves_unchanged():
+    """policy=None (the default) must not change dispatch_tools' behavior
+    at all -- this is the existing native path, untouched."""
+    from agency.agtool import dispatch_tools
+
+    t = agtool(
+        name="calc",
+        description="",
+        fn=lambda arg: agdata(val=arg.x * 10),
+        params={"type": "object", "properties": {"x": {"type": "integer"}}},
+        run_in_subprocess=False,
+    )
+    toolkit = {"calc": t}
+    messages = [{"role": "system", "content": "sys"}]
+    tool_calls = [_build_tool_call("calc", {"x": 7})]
+
+    dispatch_tools(tool_calls, toolkit, messages, MagicMock(), "skill", None, None, None, None)
+
+    tool_msg = next(m for m in messages if m.get("role") == "tool")
+    assert json.loads(tool_msg["content"]) == {"val": 70}
+
+
+def test_dispatch_tools_policy_allow_runs_the_tool():
+    from agency.agtool import dispatch_tools
+    from agency.agpolicy import agpolicy, agdecision
+
+    class AllowPolicy(agpolicy):
+        def check(self, ag, event):
+            return agdecision.allow()
+
+    t = agtool(
+        name="calc",
+        description="",
+        fn=lambda arg: agdata(val=arg.x * 10),
+        params={"type": "object", "properties": {"x": {"type": "integer"}}},
+        run_in_subprocess=False,
+    )
+    toolkit = {"calc": t}
+    messages = [{"role": "system", "content": "sys"}]
+    tool_calls = [_build_tool_call("calc", {"x": 7})]
+
+    dispatch_tools(
+        tool_calls, toolkit, messages, MagicMock(), "skill", None, None, None, None,
+        policy=AllowPolicy(), ag=None,
+    )
+
+    tool_msg = next(m for m in messages if m.get("role") == "tool")
+    assert json.loads(tool_msg["content"]) == {"val": 70}
+
+
+def test_dispatch_tools_policy_deny_skips_the_tool_and_reports_reason():
+    from agency.agtool import dispatch_tools
+    from agency.agpolicy import agpolicy, agdecision
+
+    calls = []
+
+    class DenyPolicy(agpolicy):
+        def check(self, ag, event):
+            calls.append(event)
+            return agdecision.deny("blocked for testing")
+
+    ran = []
+
+    def fn(arg):
+        ran.append(arg.x)
+        return agdata(val=arg.x * 10)
+
+    t = agtool(
+        name="calc",
+        description="",
+        fn=fn,
+        params={"type": "object", "properties": {"x": {"type": "integer"}}},
+        run_in_subprocess=False,
+    )
+    toolkit = {"calc": t}
+    messages = [{"role": "system", "content": "sys"}]
+    tool_calls = [_build_tool_call("calc", {"x": 7})]
+
+    dispatch_tools(
+        tool_calls, toolkit, messages, MagicMock(), "skill", None, None, None, None,
+        policy=DenyPolicy(), ag=None,
+    )
+
+    assert ran == []  # the tool itself never executed
+    tool_msg = next(m for m in messages if m.get("role") == "tool")
+    assert json.loads(tool_msg["content"]) == {"error": "blocked for testing"}
+    assert len(calls) == 1
+    event = calls[0]
+    assert event.syscall == "tool_call"
+    assert event.tool_name == "calc"
+    assert event.tool_args == {"x": 7}
+
+
+def test_dispatch_tools_policy_not_consulted_for_unknown_tool():
+    from agency.agtool import dispatch_tools
+    from agency.agpolicy import agpolicy, agdecision
+
+    checked = []
+
+    class RecordingPolicy(agpolicy):
+        def check(self, ag, event):
+            checked.append(event)
+            return agdecision.allow()
+
+    toolkit = {}
+    messages = [{"role": "system", "content": "sys"}]
+    tool_calls = [_build_tool_call("nonexistent", {})]
+
+    dispatch_tools(
+        tool_calls, toolkit, messages, MagicMock(), "skill", None, None, None, None,
+        policy=RecordingPolicy(), ag=None,
+    )
+
+    assert checked == []  # no policy check for a tool that doesn't exist
+    tool_msg = next(m for m in messages if m.get("role") == "tool")
+    assert "unknown tool" in json.loads(tool_msg["content"])["error"]
+
+
+def test_dispatch_tools_policy_receives_ag():
+    from agency.agtool import dispatch_tools
+    from agency.agpolicy import agpolicy, agdecision
+
+    seen_agents = []
+
+    class RecordingPolicy(agpolicy):
+        def check(self, ag, event):
+            seen_agents.append(ag)
+            return agdecision.allow()
+
+    t = agtool(
+        name="noop", description="", fn=lambda arg: agdata(ok=True),
+        params={"type": "object", "properties": {}}, run_in_subprocess=False,
+    )
+    sentinel_agent = object()
+    dispatch_tools(
+        [_build_tool_call("noop", {})], {"noop": t},
+        [{"role": "system", "content": "sys"}], MagicMock(), "skill",
+        None, None, None, None,
+        policy=RecordingPolicy(), ag=sentinel_agent,
+    )
+    assert seen_agents == [sentinel_agent]

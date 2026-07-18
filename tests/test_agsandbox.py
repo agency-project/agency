@@ -1346,6 +1346,130 @@ class TestAgSandboxPIDTracking:
 
 
 # ---------------------------------------------------------------------------
+# agSandbox — ingest_ptrace_pids() (agproxy_ptrace integration, Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestAgSandboxIngestPtracePids:
+    """`ingest_ptrace_pids()` is the alternate _watched_pids population path
+    fed by agproxy_ptrace's fork/exit events for harness-driven agents (see
+    docs/agproxy_ptrace.md). Real-container tests here don't require the
+    pids to actually exist inside the container's own PID namespace --
+    ingest_ptrace_pids()-fed pids are trusted regardless of what the
+    container's own /proc scan shows (see get_live_pids()'s docstring-level
+    comment on _ptrace_managed_pids) -- so a real docker/podman container is
+    only needed here to exercise the real interaction with get_live_pids()'s
+    /proc-scan-driven pruning logic for the OTHER (exec()-marker-based)
+    pids, not because ptrace-sourced ones need to resolve there too.
+    """
+
+    @docker
+    def setup_method(self, _):
+        self.sb = _make_sandbox()
+
+    @docker
+    def teardown_method(self, _):
+        self.sb.destroy()
+
+    def test_ingest_spawned_pid_appears_live(self):
+        self.sb._backend.ingest_ptrace_pids(spawned={999001})
+        assert 999001 in self.sb.get_live_pids()
+
+    def test_ingest_exited_pid_removed(self):
+        self.sb._backend.ingest_ptrace_pids(spawned={999002})
+        assert 999002 in self.sb.get_live_pids()
+        self.sb._backend.ingest_ptrace_pids(exited={999002})
+        assert 999002 not in self.sb.get_live_pids()
+
+    def test_ptrace_pid_not_pruned_by_proc_scan_absence(self):
+        # The whole point of _ptrace_managed_pids: a pid that will never
+        # show up in this container's own /proc (it doesn't exist there at
+        # all -- namespace mismatch is the norm, not the exception) must
+        # NOT be silently pruned just because get_live_pids()'s /proc scan
+        # doesn't find it. Call get_live_pids() several times to make sure
+        # repeated scans don't eventually prune it.
+        self.sb._backend.ingest_ptrace_pids(spawned={999003})
+        for _ in range(3):
+            assert 999003 in self.sb.get_live_pids()
+
+    def test_ingest_coexists_with_real_exec_tracked_pid(self):
+        self.sb.exec("sleep 30 &")
+        self.sb._backend.ingest_ptrace_pids(spawned={999004})
+        live = self.sb.get_live_pids()
+        assert 999004 in live
+        assert len(live) >= 2  # the real sleep + the injected ptrace pid
+
+    def test_release_daemon_also_clears_ptrace_managed_pid(self):
+        self.sb._backend.ingest_ptrace_pids(spawned={999005})
+        self.sb.release_daemon(999005)
+        assert 999005 not in self.sb.get_live_pids()
+
+
+class TestIngestPtracePidsUnit:
+    """Pure-logic tests -- no real container/chroot needed, _container_exec
+    mocked to return no processes at all, matching
+    tests/agsandbox_backends/test_base.py's convention."""
+
+    def _make_backend(self):
+        from unittest.mock import patch
+        from agency.agsandbox_backends.docker import _DockerBackend
+
+        with patch("agency.agsandbox_backends.container._runtime_works", return_value=True):
+            backend = _DockerBackend(
+                "unit-test-agent",
+                name="unit-test-container",
+                checkpoint_image=None,
+                base_image="irrelevant:latest",
+                mounts={},
+                agconfig=None,
+            )
+        return backend
+
+    def test_ingest_populates_watched_and_managed_sets(self):
+        backend = self._make_backend()
+        backend.ingest_ptrace_pids(spawned={111, 222})
+        assert 111 in backend._watched_pids
+        assert 222 in backend._watched_pids
+        assert backend._ptrace_managed_pids == {111, 222}
+
+    def test_ingest_skips_baseline_and_daemon_pids(self):
+        backend = self._make_backend()
+        backend._baseline_pids.add(111)
+        backend._daemon_pids.add(222)
+        backend.ingest_ptrace_pids(spawned={111, 222, 333})
+        assert 111 not in backend._watched_pids
+        assert 222 not in backend._watched_pids
+        assert 333 in backend._watched_pids
+
+    def test_get_live_pids_trusts_ptrace_managed_over_empty_proc_scan(self):
+        from unittest.mock import patch
+
+        backend = self._make_backend()
+        backend.ingest_ptrace_pids(spawned={555})
+        with patch.object(backend, "_container_exec", return_value=("", 0)):
+            live = backend.get_live_pids()
+        assert 555 in live
+        assert 555 in backend._watched_pids  # not pruned
+
+    def test_get_live_pids_prunes_non_ptrace_pid_absent_from_proc_scan(self):
+        from unittest.mock import patch
+
+        backend = self._make_backend()
+        backend._watched_pids[777] = 0.0  # simulate an exec()-marker-tracked pid
+        with patch.object(backend, "_container_exec", return_value=("", 0)):
+            live = backend.get_live_pids()
+        assert 777 not in live
+        assert 777 not in backend._watched_pids  # pruned, unlike a ptrace-managed one
+
+    def test_ingest_exited_removes_from_both_sets(self):
+        backend = self._make_backend()
+        backend.ingest_ptrace_pids(spawned={888})
+        backend.ingest_ptrace_pids(exited={888})
+        assert 888 not in backend._watched_pids
+        assert 888 not in backend._ptrace_managed_pids
+
+
+# ---------------------------------------------------------------------------
 # agSandbox — resource limits
 # ---------------------------------------------------------------------------
 

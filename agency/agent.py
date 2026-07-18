@@ -40,6 +40,11 @@ from .agname import agname as _agname
 class _AgAgentFields:
     checkpoint_save_timeout_s = DynamicConfigParam("agent", default=600)
     checkpoint_load_timeout_s = DynamicConfigParam("agent", default=600)
+    engine = DynamicConfigParam(
+        "agent", default="native"
+    )  # "native" runs agskill.execute_react (the ReAct loop); any other value
+    # is looked up via agharness_backend.for_config() and run through
+    # agskill.execute_harness() instead -- see agskill.py's _task().
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
@@ -229,6 +234,7 @@ class agent:
         llm: "agllm | None" = None,
         sandbox: "agSandbox | None" = None,
         agconfig: "agConfig | None" = None,
+        engine: "str | None" = None,
     ):
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
@@ -266,6 +272,9 @@ class agent:
         self.agname: _agname = _agname.allocate_agname(agname)
 
         self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
+        self.engine: str = (
+            engine if engine is not None else _AgAgentFields(self.agconfig).engine
+        )
         self.ctx: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -585,6 +594,7 @@ class agent:
         # the matching comment in __init__.
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.llm = agllm(ag.agconfig)
+        ag.engine = src.engine
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
@@ -688,6 +698,7 @@ class agent:
 
         state = {
             "agname": self.agname,
+            "engine": self.engine,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             "history": self.ctx.messages,
             "ts": _ts(),
@@ -770,6 +781,7 @@ class agent:
             if k not in _already_set:
                 ag.agconfig.set("agllm_backend", k, v)
         ag.llm = agllm(ag.agconfig)
+        ag.engine = state.get("engine", "native")
         ag.ctx = agcontext(messages=list(state.get("history", [])))
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None

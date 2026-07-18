@@ -369,13 +369,22 @@ class agskill:
                 ag._set_ui_state("skill", skill=self.name)
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
-                # ── 3. Run the ReAct loop.
-                outer_result, updated_ctx, outer_delta = self.execute_react(
-                    ag,
-                    prev_ctx,
-                    local_skill_input,
-                    max_steps,
-                )
+                # ── 3. Run the ReAct loop -- or, for a harness-driven agent,
+                # an external CLI in its place (see execute_harness()).
+                if ag.engine == "native":
+                    outer_result, updated_ctx, outer_delta = self.execute_react(
+                        ag,
+                        prev_ctx,
+                        local_skill_input,
+                        max_steps,
+                    )
+                else:
+                    outer_result, updated_ctx, outer_delta = self.execute_harness(
+                        ag,
+                        prev_ctx,
+                        local_skill_input,
+                        max_steps,
+                    )
 
             except Exception as exc:
                 outer_result = agerror(format_exception(exc))
@@ -815,6 +824,45 @@ class agskill:
         prev_ctx.messages = messages[1:]
         ag.sandbox.remove_files(_offloaded_paths)
         return agerror("max_steps exceeded"), prev_ctx, [messages[0]] + messages[1:][n_before:]
+
+    def execute_harness(
+        self,
+        ag: "agent",
+        prev_ctx: agcontext,
+        skill_input: agdata,
+        max_steps: "int | None" = None,
+    ) -> "tuple[agdata, agcontext, list[dict]]":
+        """Run this skill against *ag* via its configured off-the-shelf
+        harness engine instead of the native ReAct loop -- called by
+        `agskill.run()`'s `_task()` when `ag.engine != "native"`. Same
+        contract as `execute_react()`: `ctx` is the SAME `prev_ctx` object
+        passed in, mutated in place (`.messages`/`.total_input_tokens`/
+        `.total_output_tokens`); `delta` is `[system_prompt_message] +
+        every message appended since this call started`. By the time
+        `_task()` reaches this branch, `prev_ctx.resolve_prev_dependencies()`
+        has already run (agskill.py's `_task()`), so `.messages` is already
+        a concrete resolved list -- this method does not need to resolve
+        futures itself.
+
+        See docs/Design_harness_integration.md for the design this
+        implements: the skill's system prompt + input become a plain
+        user-turn prompt (never injected as the harness's own system
+        prompt or a tool), and the harness's own built-in tools/compaction
+        run untouched -- mediation happens at the syscall level via
+        agproxy_ptrace, not through this method.
+        """
+        from .agharness_internal.agharness_backends.base import agharness_backend
+
+        sys_msg = {"role": "system", "content": self._build_system_prompt()}
+
+        input_error = (
+            self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
+        )
+        if input_error is not None:
+            return agerror(input_error), prev_ctx, [sys_msg]
+
+        backend = agharness_backend.for_config(ag.engine, ag.agconfig)
+        return backend.execute(ag, prev_ctx, skill_input, max_steps, skill=self)
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

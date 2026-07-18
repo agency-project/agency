@@ -291,6 +291,49 @@ class agschema:
             paths.extend(written)
         return paths
 
+    def validate_and_recover(
+        self,
+        raw_text: str,
+        sandbox: "agSandbox",
+    ) -> "tuple[agdata | agerror, list[str]]":
+        """Validate and recover a harness's single raw final-answer text
+        against this schema, in one call.
+
+        The native ReAct loop collects structured output incrementally,
+        one field at a time, through per-field `return_<field>` tool calls
+        (`make_return_output_agtool`/`make_field_handler` above) --
+        `agskill.execute_harness()`'s harness path instead gets one raw
+        text blob back and needs the whole-schema equivalent of that
+        validation + recovery in a single step, which didn't exist as a
+        single entry point before this method: this is pure composition of
+        `check()` (whole-schema field presence/type validation, already
+        used for input validation despite the name) and `recover_outputs()`
+        (per-agtype-field `.recover()`, already used by `execute_react()`'s
+        own success path) -- no new validation logic.
+
+        Returns `(data, paths)` on success (`paths` are the sandbox paths
+        `recover_outputs()` produced, for parity with `execute_react()`'s
+        own cleanup bookkeeping), or `(agerror(...), [])` if *raw_text*
+        isn't valid JSON, isn't a JSON object, or fails schema validation.
+        """
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            return agerror(f"could not parse harness output as JSON: {exc}"), []
+        if not isinstance(parsed, dict):
+            return (
+                agerror(f"harness output must be a JSON object, got {type(parsed).__name__}"),
+                [],
+            )
+
+        data = agdata(**parsed)
+        errors = self.check(data)
+        if errors:
+            return agerror(f"output schema error: {errors}"), []
+
+        paths = self.recover_outputs(data, sandbox)
+        return data, paths
+
     # ------------------------------------------------------------------
     # raw_schema_key equivalent
     # ------------------------------------------------------------------
