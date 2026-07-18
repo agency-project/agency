@@ -241,16 +241,12 @@ class agllm(_AgLLMFields):
         fixed interval.
         """
         if isinstance(exc, RATE_LIMIT_EXCS):
-            _retry_after = getattr(getattr(exc, "response", None), "headers", {}).get(
-                "retry-after"
-            )
+            _retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("retry-after")
             try:
                 # Jitter is added on top, never subtracted -- the header is a
                 # floor, not a target, so we never retry sooner than the
                 # server said to.
-                return float(_retry_after) + random.uniform(
-                    0, self.rate_limit_retry_after_jitter_s
-                )
+                return float(_retry_after) + random.uniform(0, self.rate_limit_retry_after_jitter_s)
             except (TypeError, ValueError):
                 pass
             _base = self.rate_limit_base_backoff_s

@@ -864,7 +864,11 @@ def test_semaphore_released_after_timeout():
         raise _IdleTimeout("no chunk received")
         yield  # makes this a generator function
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _timeout_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _timeout_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -908,7 +912,11 @@ def test_timeout_retries_all_attempts_then_error():
         raise _IdleTimeout("no chunk received")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _timeout_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _timeout_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -935,7 +943,11 @@ def test_timeout_values_fixed_on_retry():
         yield
 
     s = make_skill()
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _capture_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _capture_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1003,7 +1015,11 @@ def test_ssl_error_retries_all_attempts_then_error():
         raise ssl.SSLError("record layer failure")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _ssl_error_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _ssl_error_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1022,7 +1038,11 @@ def test_oserror_retries_all_attempts_then_error():
         raise OSError("connection reset by peer")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _oserror_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _oserror_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1041,7 +1061,11 @@ def test_ssl_error_releases_semaphore():
         raise ssl.SSLError("record layer failure")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _ssl_error_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _ssl_error_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
