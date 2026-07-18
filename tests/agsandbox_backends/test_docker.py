@@ -1,7 +1,12 @@
 """Unit and integration tests for the Docker-specific sandbox backend
 (agency.agsandbox_backends.docker._DockerBackend): dangling-image cleanup on
-commit, and the low-level docker-CLI command helpers (_rm_container, _rmi,
-_ensure_started's pre-cleanup guard, destroy()'s semaphore release).
+commit, the low-level docker-CLI command helpers (_rm_container, _rmi,
+_ensure_started's pre-cleanup guard, destroy()'s semaphore release), and the
+session-keyring-quota machinery (_docker_container_limit/keyring_quota/
+_semaphore_held_count and the _is_quota_exhaustion_error/_wait_for_quota_slot/
+_quota_diagnostics hooks _ContainerBackendBase._run_with_conflict_retry()
+reaches through -- see test_container.py's TestRunWithConflictRetryHooks for
+the runtime-agnostic dispatch logic itself, exercised there against Podman).
 
 Tests that need a real Docker daemon are marked with @pytest.mark.docker and
 skipped automatically when Docker is unreachable.
@@ -16,7 +21,7 @@ import threading
 import uuid
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 def _docker_available() -> bool:
@@ -530,3 +535,144 @@ class TestDockerCommandHelpers:
 
         rm_calls = [a for a in calls if "rm" in a and "rmi" not in a]
         assert not rm_calls, f"must not rm when container absent; got {rm_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Session-keyring-quota machinery: _docker_container_limit/keyring_quota/
+# _semaphore_held_count, and the quota hooks _run_with_conflict_retry() (in
+# container.py, shared by both runtimes) reaches through. No real Docker
+# daemon required -- everything here mocks the /proc reads and the semaphore.
+# ---------------------------------------------------------------------------
+
+
+class TestKeyringQuotaDiagnostics:
+    def test_docker_container_limit_uses_kernel_maxkeys_minus_buffer(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        with patch("pathlib.Path.read_text", return_value="500\n"):
+            limit = _mod._docker_container_limit()
+        fields = _mod.AgSandboxBackendFields()
+        assert limit == 500 - fields.container_limit_buffer
+
+    def test_docker_container_limit_never_below_floor(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        with patch("pathlib.Path.read_text", return_value="1\n"):
+            limit = _mod._docker_container_limit()
+        fields = _mod.AgSandboxBackendFields()
+        assert limit == fields.container_limit_floor
+
+    def test_docker_container_limit_falls_back_when_proc_unreadable(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        with patch("pathlib.Path.read_text", side_effect=OSError("no such file")):
+            limit = _mod._docker_container_limit()
+        fields = _mod.AgSandboxBackendFields()
+        assert limit == fields.container_limit_fallback - fields.container_limit_buffer
+
+    def test_keyring_quota_reports_used_max_and_free(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        def fake_read_text(self):
+            return "200\n" if "maxkeys" in str(self) else "a\nb\nc\n"
+
+        with patch("pathlib.Path.read_text", fake_read_text):
+            quota = _mod.keyring_quota()
+        assert quota == {"used": 3, "max": 200, "free": 197}
+
+    def test_keyring_quota_reports_minus_one_when_proc_unreadable(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        with patch("pathlib.Path.read_text", side_effect=OSError("no such file")):
+            quota = _mod.keyring_quota()
+        assert quota == {"used": -1, "max": -1, "free": -1}
+
+    def test_semaphore_held_count_reflects_acquired_slots(self):
+        """held/limit should go up by exactly one slot per acquire() -- checked
+        as a delta against the semaphore's already-live real value rather than
+        an assumed absolute count, since _container_semaphore is a real
+        process-wide multiprocessing.Semaphore shared with every other test."""
+        import agency.agsandbox_backends.docker as _mod
+
+        before_held, limit = _mod._semaphore_held_count().split("/")
+        _mod._container_semaphore.acquire()
+        try:
+            after_held, limit_after = _mod._semaphore_held_count().split("/")
+        finally:
+            _mod._container_semaphore.release()
+        assert limit_after == limit
+        assert int(after_held) == int(before_held) + 1
+
+    def test_semaphore_held_count_falls_back_to_unknown_on_error(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        fake_semlock = MagicMock()
+        fake_semlock._get_value.side_effect = Exception("boom")
+        with patch.object(_mod, "_docker_container_limit", return_value=10):
+            with patch.object(_mod._container_semaphore, "_semlock", fake_semlock):
+                held = _mod._semaphore_held_count()
+        assert held == "?/10"
+
+
+class TestQuotaExhaustionHooks:
+    """_DockerBackend's overrides of the quota hooks _ContainerBackendBase
+    defines as no-ops (_is_quota_exhaustion_error/_wait_for_quota_slot/
+    _quota_diagnostics) -- these are Docker's half of the keyring-quota
+    handling _run_with_conflict_retry() (container.py) dispatches through."""
+
+    def _sb(self):
+        return _make_sandbox()._backend
+
+    def test_matches_session_key_message(self):
+        sb = self._sb()
+        assert sb._is_quota_exhaustion_error("unable to create session key: disk quota exceeded")
+
+    def test_matches_disk_quota_exceeded_with_keyring(self):
+        sb = self._sb()
+        assert sb._is_quota_exhaustion_error("disk quota exceeded for keyring")
+
+    def test_disk_quota_exceeded_without_keyring_does_not_match(self):
+        """Docker also emits a plain filesystem "disk quota exceeded" for
+        unrelated reasons (e.g. a full overlay volume) -- only the keyring
+        variant should trigger the quota-wait path."""
+        sb = self._sb()
+        assert not sb._is_quota_exhaustion_error("disk quota exceeded")
+
+    def test_unrelated_stderr_does_not_match(self):
+        sb = self._sb()
+        assert not sb._is_quota_exhaustion_error("no such image: agency-sandbox:latest")
+
+    def test_wait_for_quota_slot_polls_until_a_slot_frees_up(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        quotas = iter([{"free": 0}, {"free": 0}, {"free": 1}])
+        with patch.object(_mod, "keyring_quota", side_effect=lambda: next(quotas)):
+            with patch.object(_mod.time, "sleep") as sleep_mock:
+                sb._wait_for_quota_slot()
+        assert sleep_mock.call_count == 2
+
+    def test_wait_for_quota_slot_gives_up_once_deadline_passes(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        # First monotonic() call establishes the deadline; the second (the
+        # loop's own check) reports a time far past it -- the loop body
+        # must never run, so it must never sleep either.
+        moments = iter([0.0, 10_000.0])
+        with patch.object(_mod, "keyring_quota", return_value={"free": 0}):
+            with patch.object(_mod.time, "monotonic", side_effect=lambda: next(moments)):
+                with patch.object(_mod.time, "sleep") as sleep_mock:
+                    sb._wait_for_quota_slot()
+        sleep_mock.assert_not_called()
+
+    def test_quota_diagnostics_format(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        with patch.object(_mod, "keyring_quota", return_value={"used": 5, "max": 200}):
+            with patch.object(_mod, "_semaphore_held_count", return_value="3/195"):
+                assert (
+                    sb._quota_diagnostics()
+                    == "[keyring: 5/200 used, framework semaphore: 3/195 held]"
+                )

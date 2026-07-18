@@ -1,10 +1,11 @@
 """Podman-specific container backend.
 
-Podman needs no session-keyring-derived concurrency slot (see `.docker`'s
-module docstring) -- rootless Podman's independent per-namespace keyrings
-mean `_acquire_runtime_slot`/`_release_runtime_slot` stay the shared base
-class's no-ops. The one thing Podman does need that Docker doesn't is a
-fully-qualified image name for bare references.
+Podman needs no session-keyring-derived concurrency slot or quota handling
+(see `.docker`'s module docstring) -- rootless Podman's independent
+per-namespace keyrings mean `_acquire_runtime_slot`/`_release_runtime_slot`
+and `_is_quota_exhaustion_error`/`_wait_for_quota_slot`/`_quota_diagnostics`
+all stay the shared base class's no-ops here. The one thing Podman does need
+that Docker doesn't is a fully-qualified image name for bare references.
 """
 
 from __future__ import annotations

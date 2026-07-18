@@ -1,13 +1,17 @@
 """Shared docker/podman plumbing.
 
 Runtime detection (`get_container_runtime()`), the subprocess-call throttle
-(`_get_docker_semaphore()`), the session-keyring-quota diagnostics
-(`keyring_quota()`/`_semaphore_held_count()` -- read by the shared retry
-logic below even though only Docker ever actually exhausts that quota, see
-`.docker`'s module docstring), and `_ContainerBackendBase` -- the base class
+(`_get_docker_semaphore()`), and `_ContainerBackendBase` -- the base class
 `.docker._DockerBackend` and `.podman._PodmanBackend` both subclass for
 everything that doesn't differ between the two runtimes, which is nearly
-everything. See those two modules for the handful of things that do.
+everything. The session-keyring-quota machinery
+(`_docker_container_limit()`/`keyring_quota()`/`_semaphore_held_count()`) is
+Docker-only and lives in `.docker` instead -- `_run_with_conflict_retry()`
+below reaches it only through the `_is_quota_exhaustion_error()`/
+`_wait_for_quota_slot()`/`_quota_diagnostics()` hooks `_ContainerBackendBase`
+defines and `_DockerBackend` overrides, so this module itself never needs to
+import anything keyring-specific. See `.docker` and `.podman` for the
+handful of other things that differ between the two runtimes.
 """
 
 from __future__ import annotations
@@ -246,68 +250,6 @@ def seed_cache_from_image(
     )
 
 
-# Hard cap on the number of simultaneously running Docker containers, derived from
-# the Linux kernel session-keyring quota.  Each running Docker container holds one
-# session keyring against the user that ran `docker run`; when total keys reach
-# /proc/sys/kernel/keys/maxkeys the next docker run fails with
-# "unable to create session key: disk quota exceeded".
-# Podman is exempt: rootless Podman uses user namespaces with independent keyring
-# namespaces and is not subject to this quota -- see .docker's module docstring
-# for why the semaphore built from this quota is only ever acquired/released by
-# _DockerBackend, even though it (and the diagnostics below) live in this shared
-# module so _run_with_conflict_retry() -- shared by both runtimes -- can read them.
-# multiprocessing.Semaphore is backed by a POSIX IPC semaphore so the limit is
-# enforced across all worker processes (which run _ensure_started) and the main
-# process (which calls stop/destroy).
-def _docker_container_limit() -> int:
-    """Return the concurrent-Docker-container cap derived from the kernel keyring quota."""
-    _fields = AgSandboxBackendFields()
-    try:
-        maxkeys = int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip())
-        return max(_fields.container_limit_floor, maxkeys - _fields.container_limit_buffer)
-    except OSError:
-        return _fields.container_limit_fallback - _fields.container_limit_buffer
-
-
-def keyring_quota() -> dict[str, int]:
-    """Return the current Linux session-keyring quota for diagnostics.
-
-    Returns a dict with ``used``, ``max``, and ``free`` key counts.
-    ``used`` is -1 when /proc/keys is not readable (non-root on some kernels).
-    """
-    try:
-        maxkeys = int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip())
-    except OSError:
-        maxkeys = -1
-    try:
-        used = sum(1 for ln in Path("/proc/keys").read_text().splitlines() if ln.strip())
-    except OSError:
-        used = -1
-    free = (maxkeys - used) if (maxkeys >= 0 and used >= 0) else -1
-    return {"used": used, "max": maxkeys, "free": free}
-
-
-def _semaphore_held_count() -> str:
-    """Return 'held/limit' for the Docker container-concurrency semaphore, or
-    '?/limit' if unreadable.
-
-    Uses sem_getvalue() via the internal _semlock on POSIX (Linux).  The count
-    reflects this process's view only — other unrelated processes are not
-    tracked by our semaphore but do consume system keyring slots, so comparing
-    this number with keyring_quota()['used'] reveals how many slots belong to
-    external processes.
-    """
-    from .docker import _container_semaphore
-
-    limit = _docker_container_limit()
-    try:
-        available = _container_semaphore._semlock._get_value()
-        held = limit - available
-    except Exception:
-        held = "?"
-    return f"{held}/{limit}"
-
-
 _gpu_flags_cache: "list[str] | None" = None
 _gpu_flags_lock = threading.Lock()
 
@@ -383,6 +325,33 @@ class _ContainerBackendBase(agsandbox_backend):
     def _release_runtime_slot(self) -> None:
         """Release whatever _acquire_runtime_slot() acquired, if anything."""
         return
+
+    def _is_quota_exhaustion_error(self, stderr: str) -> bool:
+        """Return True if *stderr* (from a failed run_cmd) indicates the
+        runtime hit a concurrency quota that waiting can resolve.
+
+        False by default. Overridden by _DockerBackend to recognize the
+        Linux session-keyring quota exhaustion message -- Podman's
+        independent per-namespace keyrings mean it never produces a matching
+        stderr, so this stays the shared no-op for it."""
+        return False
+
+    def _wait_for_quota_slot(self) -> None:
+        """Block (with an internal timeout) until the quota condition
+        _is_quota_exhaustion_error() detected has likely cleared.
+
+        No-op by default. Overridden by _DockerBackend to poll the kernel
+        keyring quota. Also called unconditionally after a name-conflict is
+        resolved below, in case a quota was *also* exhausted (e.g. docker
+        created the container object then hit the limit) -- a no-op here
+        costs nothing for Podman."""
+        return
+
+    def _quota_diagnostics(self) -> str:
+        """Return a short diagnostic string describing quota state, appended
+        to _run_with_conflict_retry()'s final "retries exhausted" error
+        message. Empty by default; overridden by _DockerBackend."""
+        return ""
 
     def __init__(
         self,
@@ -537,13 +506,18 @@ class _ContainerBackendBase(agsandbox_backend):
         self._baseline_pids = self._snapshot_pids()
 
     def _run_with_conflict_retry(self, run_cmd: list[str], name: str) -> None:
-        """Run a docker/podman run command, retrying on name-conflict/keyring
+        """Run a docker/podman run command, retrying on name-conflict/quota
         errors up to conflict_retry_max_attempts times.
 
         A "Conflict / already in use" error can arise when a previous run call
         failed mid-way (e.g. GPU allocation timeout) and left a container
         object in "Created" state without ever starting.  We force-remove the
         stale entry and retry rather than surfacing an opaque error to the agent.
+
+        Quota exhaustion (Docker-only -- see _is_quota_exhaustion_error's
+        docstring) is handled through the _is_quota_exhaustion_error()/
+        _wait_for_quota_slot()/_quota_diagnostics() hooks rather than directly
+        here, since Podman is never subject to it.
         """
         _last_stderr = ""
         for attempt in range(self.conflict_retry_max_attempts):
@@ -553,45 +527,30 @@ class _ContainerBackendBase(agsandbox_backend):
             stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
             _last_stderr = stderr
             conflict = "already in use" in stderr or "Conflict" in stderr
-            keyring = "session key" in stderr or (
-                "disk quota exceeded" in stderr and "keyring" in stderr
-            )
-            if keyring:
-                # Linux session keyring quota exhausted (Docker-only, see this
-                # module's docstring). The runtime-slot semaphore prevents our
-                # own containers from exceeding the limit, but external
-                # processes can consume slots outside our accounting.  Poll the
-                # actual keyring free count from /proc until a slot opens up.
-                deadline = time.monotonic() + self.keyring_wait_timeout_s
-                while time.monotonic() < deadline:
-                    if keyring_quota().get("free", 0) > 0:
-                        break
-                    time.sleep(self.keyring_poll_interval_s)
-                # docker run can partially succeed before failing with keyring:
-                # it creates the container object (reserving the name) but fails
-                # before starting processes.  Remove any such "Created" artifact
-                # so the next attempt does not see a spurious name conflict.
+            if self._is_quota_exhaustion_error(stderr):
+                self._wait_for_quota_slot()
+                # run can partially succeed before failing on quota: it creates
+                # the container object (reserving the name) but fails before
+                # starting processes.  Remove any such "Created" artifact so
+                # the next attempt does not see a spurious name conflict.
                 if self._container_status():
                     self._rm_container(name)
             elif conflict:
                 if self._container_running():
                     raise _ContainerAlreadyRunning()
                 # Leftover container in a non-running state — remove it.
-                # Wait until it's actually gone before retrying docker run.
+                # Wait until it's actually gone before retrying run.
                 self._rm_container(name)
                 deadline = time.monotonic() + self.container_removal_wait_s
                 while time.monotonic() < deadline:
                     if not self._container_status():
                         break
                     time.sleep(self.container_removal_poll_interval_s)
-                # If keyring is also full (docker created the object then hit
-                # the limit), wait for a slot before retrying — otherwise we'll
-                # create another "Created" container and loop on conflicts.
-                deadline = time.monotonic() + self.keyring_wait_timeout_s
-                while time.monotonic() < deadline:
-                    if keyring_quota().get("free", 0) > 0:
-                        break
-                    time.sleep(self.keyring_poll_interval_s)
+                # If a quota is also exhausted (e.g. the object got created
+                # then hit the limit), wait for a slot before retrying —
+                # otherwise we'll create another "Created" container and loop
+                # on conflicts. No-op for runtimes with no quota to wait on.
+                self._wait_for_quota_slot()
                 time.sleep(self.conflict_retry_backoff_base_s * (attempt + 1))
             else:
                 msg = f"{' '.join(run_cmd[:3])} failed (exit {result.returncode})"
@@ -599,13 +558,13 @@ class _ContainerBackendBase(agsandbox_backend):
                     msg += f": {stderr}"
                 raise RuntimeError(msg)
         # Final attempt after retries exhausted.
-        quota = keyring_quota()
         msg = (
-            f"docker run --name {name} failed after retries "
-            f"(container name conflict or keyring quota) "
-            f"[keyring: {quota['used']}/{quota['max']} used, "
-            f"framework semaphore: {_semaphore_held_count()} held]"
+            f"{self._runtime} run --name {name} failed after retries "
+            f"(container name conflict or runtime quota)"
         )
+        diagnostics = self._quota_diagnostics()
+        if diagnostics:
+            msg += f" {diagnostics}"
         if _last_stderr:
             msg += f": {_last_stderr}"
         raise RuntimeError(msg)
@@ -769,7 +728,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 except Exception as _e:
                     if _attempt == self.commit_retry_attempts - 1:
                         print(
-                            f"[agsandbox_backend] WARNING: docker commit {self._container_name()} → {tag} "
+                            f"[agsandbox_backend] WARNING: {self._runtime} commit {self._container_name()} → {tag} "
                             f"failed after {self.commit_retry_attempts} attempts: {_e}",
                             file=__import__("sys").stderr,
                             flush=True,
@@ -815,7 +774,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     import traceback as _tb
 
                     print(
-                        f"[agsandbox_backend] WARNING: docker rm -f {name} failed after {self.rm_retry_attempts} attempts:\n"
+                        f"[agsandbox_backend] WARNING: {self._runtime} rm -f {name} failed after {self.rm_retry_attempts} attempts:\n"
                         f"{_tb.format_exc()}",
                         file=__import__("sys").stderr,
                         flush=True,
