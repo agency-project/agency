@@ -2,7 +2,7 @@
 
 > `_PodmanBackend` is a thin subclass of `_ContainerBackendBase` ([container.md](container.md)) — see there for the mechanics shared with Docker ([docker.md](docker.md)). This doc covers only what's genuinely Podman-specific.
 
-Podman needs no session-keyring-derived concurrency slot (see [docker.md](docker.md)) — rootless Podman's independent per-namespace keyrings mean `_acquire_runtime_slot`/`_release_runtime_slot` stay `_ContainerBackendBase`'s shared no-ops; `_PodmanBackend` doesn't override either.
+Podman shares the exact same session-keyring-derived concurrency slot as Docker (see [docker.md](docker.md) and [container.md](container.md)) — rootless Podman's per-container user namespaces do **not** exempt it from the kernel session-keyring quota, since `runc` charges the session keyring against the real host UID regardless of namespace. `_acquire_runtime_slot`/`_release_runtime_slot`/`_is_quota_exhaustion_error`/`_wait_for_quota_slot`/`_quota_diagnostics` are all concrete on `_ContainerBackendBase` now; `_PodmanBackend` doesn't override any of them, the same as `_DockerBackend`.
 
 ## Image name resolution
 

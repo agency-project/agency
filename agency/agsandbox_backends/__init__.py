@@ -20,10 +20,11 @@ from .container import (
     _ContainerBackendBase,
     _RUN_ID,
     get_container_runtime,
+    keyring_quota,
     reap_orphaned_containers,
     seed_cache_from_image,
 )
-from .docker import _DockerBackend, keyring_quota
+from .docker import _DockerBackend
 from .podman import _PodmanBackend
 from .chroot import _ChrootBackend, chroot_available
 

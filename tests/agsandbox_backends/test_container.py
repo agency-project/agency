@@ -1,12 +1,14 @@
 """Unit tests for agency.agsandbox_backends.container's shared, runtime-
-agnostic logic: the startup orphan reaper and its PID-liveness check, and
-_ContainerBackendBase._run_with_conflict_retry()'s dispatch through the
-_is_quota_exhaustion_error()/_wait_for_quota_slot()/_quota_diagnostics()
-hooks (exercised here against _PodmanBackend -- which never overrides them,
-see podman.py -- specifically to prove the dispatch itself is runtime-
-agnostic; _DockerBackend's concrete keyring-quota overrides of those same
-hooks are covered separately in test_docker.py's TestQuotaExhaustionHooks).
-No real docker/podman required -- everything here mocks subprocess.run/_run."""
+agnostic logic: the startup orphan reaper and its PID-liveness check; the
+session-keyring-quota machinery (_keyring_container_limit/keyring_quota/
+_semaphore_held_count); and _ContainerBackendBase's concrete
+_is_quota_exhaustion_error()/_wait_for_quota_slot()/_quota_diagnostics()/
+_acquire_runtime_slot()/_release_runtime_slot() hooks plus
+_run_with_conflict_retry()'s dispatch through them -- exercised here against
+_PodmanBackend specifically to prove docker and podman share identical
+behavior (both are subject to the same kernel session-keyring quota; see
+container.py's module docstring for why). No real docker/podman required --
+everything here mocks subprocess.run/_run and the /proc reads."""
 
 from __future__ import annotations
 
@@ -121,10 +123,14 @@ class TestReapOrphanedContainers:
         assert _container._reap_done is True
 
 
-class TestQuotaHookDefaults:
-    """_ContainerBackendBase's quota hooks default to no-ops -- exercised via
-    _PodmanBackend, which (per podman.py's module docstring) never overrides
-    any of the three."""
+class TestQuotaHooksSharedAcrossRuntimes:
+    """_ContainerBackendBase's quota hooks are concrete (not no-ops) and
+    identical for both runtimes -- exercised here via _PodmanBackend
+    specifically to prove Podman is NOT exempt from the kernel session-
+    keyring quota, despite its per-container user namespaces (see
+    container.py's module docstring for why: runc joins/creates the session
+    keyring against the real host UID before the container process finishes
+    transitioning into its remapped identity)."""
 
     def _sb(self):
         from agency.agsandbox_backends.podman import _PodmanBackend
@@ -138,19 +144,118 @@ class TestQuotaHookDefaults:
             agconfig=None,
         )
 
-    def test_is_quota_exhaustion_error_always_false(self):
+    def test_matches_session_key_message(self):
         sb = self._sb()
-        # Even stderr that *looks* like Docker's keyring message must not
-        # match -- Podman is exempt from that quota entirely (see docker.py).
-        assert sb._is_quota_exhaustion_error("disk quota exceeded for keyring") is False
+        assert sb._is_quota_exhaustion_error("unable to create session key: disk quota exceeded")
 
-    def test_wait_for_quota_slot_returns_immediately(self):
+    def test_matches_disk_quota_exceeded_with_keyring(self):
         sb = self._sb()
-        sb._wait_for_quota_slot()  # must not raise or block
+        assert sb._is_quota_exhaustion_error("disk quota exceeded for keyring")
 
-    def test_quota_diagnostics_is_empty(self):
+    def test_disk_quota_exceeded_without_keyring_does_not_match(self):
+        """Docker/podman also emit a plain filesystem "disk quota exceeded"
+        for unrelated reasons (e.g. a full overlay volume) -- only the
+        keyring variant should trigger the quota-wait path."""
         sb = self._sb()
-        assert sb._quota_diagnostics() == ""
+        assert not sb._is_quota_exhaustion_error("disk quota exceeded")
+
+    def test_unrelated_stderr_does_not_match(self):
+        sb = self._sb()
+        assert not sb._is_quota_exhaustion_error("no such image: agency-sandbox:latest")
+
+    def test_wait_for_quota_slot_polls_until_a_slot_frees_up(self):
+        sb = self._sb()
+        quotas = iter([{"free": 0}, {"free": 0}, {"free": 1}])
+        with patch.object(_container, "keyring_quota", side_effect=lambda: next(quotas)):
+            with patch.object(_container.time, "sleep") as sleep_mock:
+                sb._wait_for_quota_slot()
+        assert sleep_mock.call_count == 2
+
+    def test_wait_for_quota_slot_gives_up_once_deadline_passes(self):
+        sb = self._sb()
+        # First monotonic() call establishes the deadline; the second (the
+        # loop's own check) reports a time far past it -- the loop body
+        # must never run, so it must never sleep either.
+        moments = iter([0.0, 10_000.0])
+        with patch.object(_container, "keyring_quota", return_value={"free": 0}):
+            with patch.object(_container.time, "monotonic", side_effect=lambda: next(moments)):
+                with patch.object(_container.time, "sleep") as sleep_mock:
+                    sb._wait_for_quota_slot()
+        sleep_mock.assert_not_called()
+
+    def test_quota_diagnostics_format(self):
+        sb = self._sb()
+        with patch.object(_container, "keyring_quota", return_value={"used": 5, "max": 200}):
+            with patch.object(_container, "_semaphore_held_count", return_value="3/195"):
+                assert (
+                    sb._quota_diagnostics()
+                    == "[keyring: 5/200 used, framework semaphore: 3/195 held]"
+                )
+
+    def test_acquire_and_release_runtime_slot_use_the_shared_semaphore(self):
+        sb = self._sb()
+        with patch.object(_container._container_semaphore, "acquire") as acquire_mock:
+            sb._acquire_runtime_slot()
+        acquire_mock.assert_called_once()
+        with patch.object(_container._container_semaphore, "release") as release_mock:
+            sb._release_runtime_slot()
+        release_mock.assert_called_once()
+
+
+class TestKeyringQuotaDiagnostics:
+    def test_keyring_container_limit_uses_kernel_maxkeys_minus_buffer(self):
+        with patch("pathlib.Path.read_text", return_value="500\n"):
+            limit = _container._keyring_container_limit()
+        fields = _container.AgSandboxBackendFields()
+        assert limit == 500 - fields.container_limit_buffer
+
+    def test_keyring_container_limit_never_below_floor(self):
+        with patch("pathlib.Path.read_text", return_value="1\n"):
+            limit = _container._keyring_container_limit()
+        fields = _container.AgSandboxBackendFields()
+        assert limit == fields.container_limit_floor
+
+    def test_keyring_container_limit_falls_back_when_proc_unreadable(self):
+        with patch("pathlib.Path.read_text", side_effect=OSError("no such file")):
+            limit = _container._keyring_container_limit()
+        fields = _container.AgSandboxBackendFields()
+        assert limit == fields.container_limit_fallback - fields.container_limit_buffer
+
+    def test_keyring_quota_reports_used_max_and_free(self):
+        def fake_read_text(self):
+            return "200\n" if "maxkeys" in str(self) else "a\nb\nc\n"
+
+        with patch("pathlib.Path.read_text", fake_read_text):
+            quota = _container.keyring_quota()
+        assert quota == {"used": 3, "max": 200, "free": 197}
+
+    def test_keyring_quota_reports_minus_one_when_proc_unreadable(self):
+        with patch("pathlib.Path.read_text", side_effect=OSError("no such file")):
+            quota = _container.keyring_quota()
+        assert quota == {"used": -1, "max": -1, "free": -1}
+
+    def test_semaphore_held_count_reflects_acquired_slots(self):
+        """held/limit should go up by exactly one slot per acquire() -- checked
+        as a delta against the semaphore's already-live real value rather than
+        an assumed absolute count, since _container_semaphore is a real
+        process-wide multiprocessing.Semaphore shared with every other test
+        (and, now, with both docker and podman backends)."""
+        before_held, limit = _container._semaphore_held_count().split("/")
+        _container._container_semaphore.acquire()
+        try:
+            after_held, limit_after = _container._semaphore_held_count().split("/")
+        finally:
+            _container._container_semaphore.release()
+        assert limit_after == limit
+        assert int(after_held) == int(before_held) + 1
+
+    def test_semaphore_held_count_falls_back_to_unknown_on_error(self):
+        fake_semlock = MagicMock()
+        fake_semlock._get_value.side_effect = Exception("boom")
+        with patch.object(_container, "_keyring_container_limit", return_value=10):
+            with patch.object(_container._container_semaphore, "_semlock", fake_semlock):
+                held = _container._semaphore_held_count()
+        assert held == "?/10"
 
 
 class TestRunWithConflictRetryHooks:

@@ -2,12 +2,13 @@
 
 > Covers `_ContainerBackendBase`, the shared implementation `_DockerBackend` ([docker.md](docker.md)) and `_PodmanBackend` ([podman.md](podman.md)) both subclass. See [base.md](base.md) for backend selection and [chroot.md](chroot.md) for the non-container alternative.
 
-`_ContainerBackendBase` holds everything that doesn't differ between Docker and Podman — nearly everything. The only two things a leaf class overrides:
+`_ContainerBackendBase` holds everything that doesn't differ between Docker and Podman — nearly everything, including the session-keyring-quota handling. The only thing a leaf class overrides:
 
 - **`_resolve_image(name)`** — identity for Docker (bare image names resolve fine); `_PodmanBackend` prefixes `localhost/` (Podman requires fully-qualified names when no unqualified-search registries are configured).
-- **`_acquire_runtime_slot()` / `_release_runtime_slot()`** — no-ops by default; `_DockerBackend` overrides both to acquire/release the session-keyring-derived concurrency semaphore described in [docker.md](docker.md). Podman is exempt (independent per-namespace keyrings), so it never touches this at all.
 
-Containers are created lazily: one starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring (Docker only) and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
+Session-keyring-derived concurrency (`_acquire_runtime_slot()`/`_release_runtime_slot()`/`_is_quota_exhaustion_error()`/`_wait_for_quota_slot()`/`_quota_diagnostics()`) is **not** one of the things that differs: both Docker and rootless Podman (via `runc`) charge each running container's session keyring against the real host UID's kernel quota (`/proc/sys/kernel/keys/maxkeys`) identically — Podman's per-container user namespaces don't exempt it, since `runc` joins/creates the session keyring before the container process finishes transitioning into its remapped identity. (Confirmed empirically — `/proc/keys` gains a `_ses.*` entry owned by the real host UID across a plain `podman run`/`rm` cycle, same as docker — and upstream: containers/podman#13363, kubernetes-sigs/kind#3806.) Both `_DockerBackend` and `_PodmanBackend` therefore use the same concrete implementations on `_ContainerBackendBase`, described in [docker.md](docker.md)/[podman.md](podman.md).
+
+Containers are created lazily: one starts only when a task actually calls a tool with `run_in_subprocess=True`. Tasks that complete using only host-side tools (web fetch, `ask_human`, paper search, …) never create a container at all. After each successful sandbox tool call, the container state is committed to a lifecycle image and the container is removed — the session keyring and GPU are freed so other agents can use them while the LLM thinks. On the next tool call the container is recreated from the lifecycle image, restoring `/workspace` and all other state.
 
 ## Building the sandbox image
 
@@ -23,7 +24,7 @@ The `images/Dockerfile` installs `ripgrep` on top of `python:3.12-slim`. `Docker
 
 ## Container lifecycle
 
-The container exists only during active tool execution. Between tool calls the container is removed, releasing the Linux session keyring (Docker only) and any held GPU so concurrent agents can use those resources.
+The container exists only during active tool execution. Between tool calls the container is removed, releasing the Linux session keyring (both runtimes) and any held GPU so concurrent agents can use those resources.
 
 | Event | What happens |
 |---|---|

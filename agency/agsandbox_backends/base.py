@@ -85,10 +85,11 @@ class AgSandboxBackendFields:
     )  # docker commit: snapshots a full overlay layer; large workspaces need extra time.
     keyring_wait_timeout_s = GlobalConfigParam(
         "agsandbox_backend", default=120
-    )  # Maximum time to wait for a keyring slot before abandoning a docker run retry.
+    )  # Maximum time to wait for a keyring slot before abandoning a docker/podman run retry.
 
-    # _docker_container_limit(): concurrent-container cap derived from the kernel
-    # session-keyring quota (see that function's docstring for the full rationale).
+    # _keyring_container_limit(): concurrent-container cap derived from the kernel
+    # session-keyring quota, which docker and podman (rootless, via runc) both
+    # consume identically (see that function's docstring for the full rationale).
     container_limit_floor = GlobalConfigParam(
         "agsandbox_backend", default=4
     )  # Never cap below this many concurrent containers.

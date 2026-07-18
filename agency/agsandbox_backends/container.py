@@ -4,18 +4,29 @@ Runtime detection (`get_container_runtime()`), the subprocess-call throttle
 (`_get_docker_semaphore()`), and `_ContainerBackendBase` -- the base class
 `.docker._DockerBackend` and `.podman._PodmanBackend` both subclass for
 everything that doesn't differ between the two runtimes, which is nearly
-everything. The session-keyring-quota machinery
-(`_docker_container_limit()`/`keyring_quota()`/`_semaphore_held_count()`) is
-Docker-only and lives in `.docker` instead -- `_run_with_conflict_retry()`
-below reaches it only through the `_is_quota_exhaustion_error()`/
-`_wait_for_quota_slot()`/`_quota_diagnostics()` hooks `_ContainerBackendBase`
-defines and `_DockerBackend` overrides, so this module itself never needs to
-import anything keyring-specific. See `.docker` and `.podman` for the
-handful of other things that differ between the two runtimes.
+everything, including the session-keyring-quota machinery below.
+
+Linux charges each `docker run`/`podman run` invocation's session keyring
+against a quota (`/proc/sys/kernel/keys/maxkeys`) keyed by the *real host
+UID*, not by user namespace -- rootless Podman's per-container user
+namespaces do not exempt it: `runc` joins/creates the session keyring before
+the container process finishes transitioning into its remapped identity, so
+the charge lands on the same `key_user` bucket a rootless Docker container
+run by the same host user would hit. (Confirmed both empirically -- watching
+`/proc/keys` gain a `_ses.*` entry owned by the real UID across a plain
+`podman run`/`rm` cycle -- and upstream: see containers/podman#13363,
+kubernetes-sigs/kind#3806.) `_keyring_container_limit()`/`keyring_quota()`/
+`_semaphore_held_count()` and the concrete `_is_quota_exhaustion_error()`/
+`_wait_for_quota_slot()`/`_quota_diagnostics()`/`_acquire_runtime_slot()`/
+`_release_runtime_slot()` implementations on `_ContainerBackendBase` below
+therefore apply to both runtimes identically; neither `.docker` nor `.podman`
+overrides any of them. See `.docker` and `.podman` for the handful of things
+that still differ (mainly `_resolve_image`).
 """
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -285,20 +296,82 @@ def _gpu_flags() -> list[str]:
         return _gpu_flags_cache
 
 
+# Hard cap on the number of simultaneously running containers (docker and
+# podman share this one cap, not one each -- see this module's docstring for
+# why they're both subject to the same kernel session-keyring quota).
+# multiprocessing.Semaphore is backed by a POSIX IPC semaphore so the limit
+# is enforced across all worker processes (which run _ensure_started) and
+# the main process (which calls stop/destroy), not just threads within one
+# process.
+def _keyring_container_limit() -> int:
+    """Return the concurrent-container cap derived from the kernel keyring quota."""
+    _fields = AgSandboxBackendFields()
+    try:
+        maxkeys = int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip())
+        return max(_fields.container_limit_floor, maxkeys - _fields.container_limit_buffer)
+    except OSError:
+        return _fields.container_limit_fallback - _fields.container_limit_buffer
+
+
+def keyring_quota() -> dict[str, int]:
+    """Return the current Linux session-keyring quota for diagnostics.
+
+    Returns a dict with ``used``, ``max``, and ``free`` key counts.
+    ``used`` is -1 when /proc/keys is not readable (non-root on some kernels).
+    """
+    try:
+        maxkeys = int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip())
+    except OSError:
+        maxkeys = -1
+    try:
+        used = sum(1 for ln in Path("/proc/keys").read_text().splitlines() if ln.strip())
+    except OSError:
+        used = -1
+    free = (maxkeys - used) if (maxkeys >= 0 and used >= 0) else -1
+    return {"used": used, "max": maxkeys, "free": free}
+
+
+def _semaphore_held_count() -> str:
+    """Return 'held/limit' for the container-concurrency semaphore, or
+    '?/limit' if unreadable.
+
+    Uses sem_getvalue() via the internal _semlock on POSIX (Linux).  The count
+    reflects this process's view only — other unrelated processes (including
+    a different runtime, or a container started outside this framework
+    entirely) are not tracked by our semaphore but do consume system keyring
+    slots, so comparing this number with keyring_quota()['used'] reveals how
+    many slots belong to external processes.
+    """
+    limit = _keyring_container_limit()
+    try:
+        available = _container_semaphore._semlock._get_value()
+        held = limit - available
+    except Exception:
+        held = "?"
+    return f"{held}/{limit}"
+
+
+_container_semaphore: "multiprocessing.Semaphore" = multiprocessing.Semaphore(
+    _keyring_container_limit()
+)
+
+
 class _ContainerBackendBase(agsandbox_backend):
     """Manages a single container for one agent via docker or podman.
 
     Subclassed by `.docker._DockerBackend` and `.podman._PodmanBackend`,
     which each hardcode their own `_runtime` string and override only the
-    handful of things that genuinely differ between the two: whether bare
-    image names need a `localhost/` prefix (`_resolve_image`, Podman-only —
+    handful of things that genuinely differ between the two: bare image
+    names need a `localhost/` prefix for Podman only (`_resolve_image` —
     Podman requires fully-qualified names when no unqualified-search
     registries are configured in /etc/containers/registries.conf, Docker
-    accepts bare names fine), and whether starting/stopping a container needs
-    to hold the session-keyring-derived concurrency slot
-    (`_acquire_runtime_slot`/`_release_runtime_slot`, Docker-only — rootless
-    Podman uses independent per-namespace keyrings and isn't subject to that
-    quota at all). Everything else — command building, retries, checkpointing,
+    accepts bare names fine). The session-keyring-derived concurrency
+    handling below (`_acquire_runtime_slot`/`_release_runtime_slot`/
+    `_is_quota_exhaustion_error`/`_wait_for_quota_slot`/`_quota_diagnostics`)
+    is NOT one of those differences: both runtimes are subject to the exact
+    same kernel quota (see this module's docstring), so both use the same
+    concrete implementations here rather than one of them overriding a
+    no-op. Everything else — command building, retries, checkpointing,
     cleanup — is identical regardless of which binary is actually being
     shelled out to, and lives here once.
 
@@ -317,41 +390,48 @@ class _ContainerBackendBase(agsandbox_backend):
         return name
 
     def _acquire_runtime_slot(self) -> None:
-        """No-op by default. Overridden by _DockerBackend to acquire the
-        session-keyring-derived container-concurrency semaphore before
-        starting a new container."""
-        return
+        """Acquire the session-keyring-derived container-concurrency
+        semaphore before starting a new container."""
+        _container_semaphore.acquire()
 
     def _release_runtime_slot(self) -> None:
-        """Release whatever _acquire_runtime_slot() acquired, if anything."""
-        return
+        """Release the slot _acquire_runtime_slot() acquired."""
+        _container_semaphore.release()
 
     def _is_quota_exhaustion_error(self, stderr: str) -> bool:
         """Return True if *stderr* (from a failed run_cmd) indicates the
-        runtime hit a concurrency quota that waiting can resolve.
-
-        False by default. Overridden by _DockerBackend to recognize the
-        Linux session-keyring quota exhaustion message -- Podman's
-        independent per-namespace keyrings mean it never produces a matching
-        stderr, so this stays the shared no-op for it."""
-        return False
+        runtime hit the Linux session-keyring quota -- a concurrency quota
+        that waiting (for another container to exit and free its keyring)
+        can resolve. Matches both docker's and podman's (via runc) wording."""
+        return "session key" in stderr or ("disk quota exceeded" in stderr and "keyring" in stderr)
 
     def _wait_for_quota_slot(self) -> None:
-        """Block (with an internal timeout) until the quota condition
-        _is_quota_exhaustion_error() detected has likely cleared.
+        """Poll the actual keyring free count from /proc until a slot opens
+        up (or give up after keyring_wait_timeout_s).
 
-        No-op by default. Overridden by _DockerBackend to poll the kernel
-        keyring quota. Also called unconditionally after a name-conflict is
-        resolved below, in case a quota was *also* exhausted (e.g. docker
-        created the container object then hit the limit) -- a no-op here
-        costs nothing for Podman."""
-        return
+        The runtime-slot semaphore (_container_semaphore) prevents our own
+        containers from exceeding the limit, but external processes --
+        including the *other* container runtime, or anything else run as
+        this same host user -- can consume slots outside our accounting;
+        polling /proc catches that case too. Also called unconditionally
+        after a name-conflict is resolved in _run_with_conflict_retry(), in
+        case a quota was *also* exhausted (e.g. the container object got
+        created then hit the limit)."""
+        deadline = time.monotonic() + self.keyring_wait_timeout_s
+        while time.monotonic() < deadline:
+            if keyring_quota().get("free", 0) > 0:
+                return
+            time.sleep(self.keyring_poll_interval_s)
 
     def _quota_diagnostics(self) -> str:
         """Return a short diagnostic string describing quota state, appended
         to _run_with_conflict_retry()'s final "retries exhausted" error
-        message. Empty by default; overridden by _DockerBackend."""
-        return ""
+        message."""
+        quota = keyring_quota()
+        return (
+            f"[keyring: {quota['used']}/{quota['max']} used, "
+            f"framework semaphore: {_semaphore_held_count()} held]"
+        )
 
     def __init__(
         self,
@@ -514,10 +594,11 @@ class _ContainerBackendBase(agsandbox_backend):
         object in "Created" state without ever starting.  We force-remove the
         stale entry and retry rather than surfacing an opaque error to the agent.
 
-        Quota exhaustion (Docker-only -- see _is_quota_exhaustion_error's
-        docstring) is handled through the _is_quota_exhaustion_error()/
+        Quota exhaustion (the Linux session-keyring quota -- see
+        _is_quota_exhaustion_error's docstring; both docker and podman are
+        subject to it) is handled through the _is_quota_exhaustion_error()/
         _wait_for_quota_slot()/_quota_diagnostics() hooks rather than directly
-        here, since Podman is never subject to it.
+        here.
         """
         _last_stderr = ""
         for attempt in range(self.conflict_retry_max_attempts):
