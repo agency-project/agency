@@ -1109,11 +1109,10 @@ def test_fetch_context_limit_config_wins_over_vllm():
 
 
 def _mock_compact_response(summary_text: str):
-    msg = MagicMock()
-    msg.content = summary_text
-    resp = MagicMock()
-    resp.choices = [MagicMock(message=msg)]
-    return resp
+    """compact() now delegates to call(), which always streams -- so a
+    successful summarisation response must look like a chunk stream (see
+    _text_chunks), not a flat non-streaming completion object."""
+    return _text_chunks(summary_text)
 
 
 def _make_messages(n_turns: int, *, with_tools: bool = False) -> list[dict]:
@@ -1404,8 +1403,10 @@ def test_compact_rate_limit_honors_retry_after_header():
         _, summary = LLM_COMPACT.compact(messages)
 
     assert summary == "ok"
-    assert mock_sleep.call_count == 1
-    sleep_s = mock_sleep.call_args.args[0]
+    # The retry backoff is the first sleep call; a successful streamed response
+    # also sleeps once per stream-batch drain interval (agutil._iter_batched),
+    # which is unrelated to retrying and is patched to 0s in tests (conftest.py).
+    sleep_s = mock_sleep.call_args_list[0].args[0]
     assert 3.0 <= sleep_s <= 3.0 + LLM_RATE_LIMIT_RETRY_AFTER_JITTER_S
 
 

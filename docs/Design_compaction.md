@@ -50,7 +50,7 @@ if llm_result.context_exceeded:
 After each LLM response in the ReAct loop, `agskill` checks:
 
 ```python
-# _AgLLMFields.COMPACT_THRESHOLD = 0.70 (hardcoded, no agconfig override)
+# _AgLLMFields.COMPACT_THRESHOLD = 0.85 (hardcoded, no agconfig override)
 if _AgLLMFields.should_compact(prompt_tokens, context_limit):
     ag.llm.maybe_compact(...)
 ```
@@ -100,7 +100,7 @@ The most recent assistant turns are kept verbatim. The tail is sized by token bu
 
 ```
 tail_budget = clamp(usable * 0.25, min=2_000, max=8_000)   # tokens
-usable = int(context_limit * 0.70)   # matches _AgLLMFields.COMPACT_THRESHOLD
+usable = int(context_limit * 0.85)   # matches _AgLLMFields.COMPACT_THRESHOLD
 ```
 
 Working backwards, turns (one assistant message + its immediately following tool results) are added to the tail until either:

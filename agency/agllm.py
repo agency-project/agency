@@ -36,7 +36,7 @@ class _AgLLMFields:
     # instance/agconfig to read a ConfigParam descriptor through.
     CHARS_PER_TOKEN = 4  # Rough chars-per-token ratio for char-count token estimates.
     TOKENIZE_TIMEOUT_SECONDS = 5.0
-    COMPACT_THRESHOLD = 0.70  # Fraction of context_limit that triggers compaction.
+    COMPACT_THRESHOLD = 0.9  # Fraction of context_limit that triggers compaction.
     TAIL_FRACTION = 0.25
     TAIL_MIN_TOKENS = 2_000
     TAIL_MAX_TOKENS = 8_000
@@ -55,7 +55,9 @@ class _AgLLMFields:
     )  # seconds to wait between chunks mid-stream
     retry_sleep_s = DynamicConfigParam(
         "agllm", default=2
-    )  # seconds to wait after a connection/SSL error before retrying
+    )  # base seconds for exponential backoff after a connection/timeout/API
+    # error (see _retry_backoff_s) -- grows with attempt count and caps at
+    # rate_limit_max_backoff_s, same as the 429 backoff path
     http_connect_timeout = DynamicConfigParam(
         "agllm", default=10.0
     )  # seconds for httpx to establish a TCP/TLS connection
@@ -80,12 +82,12 @@ class _AgLLMFields:
     # retry in the same instant.
     rate_limit_retry_after_jitter_s = DynamicConfigParam("agllm", default=5.0)
     default_context_limit = DynamicConfigParam(
-        "agllm", default=128_000
+        "agllm", default=200_000
     )  # Fallback context window size when model reports none.
     summary_task_input_max_chars = DynamicConfigParam("agllm", default=800)
     summary_assistant_content_max_chars = DynamicConfigParam("agllm", default=800)
     summary_role_content_max_chars = DynamicConfigParam("agllm", default=1000)
-    summary_max_tokens = DynamicConfigParam("agllm", default=24000)
+    summary_max_tokens = DynamicConfigParam("agllm", default=20000)
     tail_turns = DynamicConfigParam("agllm", default=3)
 
 
@@ -227,6 +229,36 @@ class agllm(_AgLLMFields):
     def build_kwargs(self, messages: list[dict], openai_tools: "list | None" = None) -> dict:
         return agllm.build_llm_kwargs(self.backend, messages, openai_tools)
 
+    def _retry_backoff_s(self, exc: Exception, attempt: int) -> float:
+        """Seconds to sleep before retrying `exc` at 0-indexed `attempt`.
+
+        A rate limit honors the server's Retry-After header when present (it
+        knows exactly when the org's per-minute window resets); otherwise --
+        and for connection/timeout/API errors, which an overloaded backend
+        raises just as often as a 429 -- this falls back to bounded
+        exponential backoff with full jitter, so a sustained overload gets a
+        growing wait instead of every retry hammering the backend at the same
+        fixed interval.
+        """
+        if isinstance(exc, RATE_LIMIT_EXCS):
+            _retry_after = getattr(getattr(exc, "response", None), "headers", {}).get(
+                "retry-after"
+            )
+            try:
+                # Jitter is added on top, never subtracted -- the header is a
+                # floor, not a target, so we never retry sooner than the
+                # server said to.
+                return float(_retry_after) + random.uniform(
+                    0, self.rate_limit_retry_after_jitter_s
+                )
+            except (TypeError, ValueError):
+                pass
+            _base = self.rate_limit_base_backoff_s
+        else:
+            _base = self.retry_sleep_s
+        _backoff = min(self.rate_limit_max_backoff_s, _base * (2**attempt))
+        return random.uniform(0, _backoff)
+
     def call(
         self,
         kwargs: dict,
@@ -239,12 +271,19 @@ class agllm(_AgLLMFields):
         total_output_tokens: int,
         skill_name: str,
         full_history_fn: "Callable | None" = None,
+        call_tag: str = "",
     ) -> "LLMCallResult":
         """Execute a streaming LLM call, retrying on transient connection errors.
+
+        `call_tag` is purely cosmetic -- it's stamped onto this call's log lines
+        (e.g. "[compact]") so a caller that isn't the main ReAct loop (compact(),
+        or any future one-off completion) is distinguishable in the log from a
+        regular skill turn. Leave it blank for the default ReAct-loop call.
 
         Returns an LLMCallResult. Caller checks .ok and .conn_error.
         """
         backend = self.backend
+        _tag = f"[{call_tag}] " if call_tag else ""
 
         kwargs = dict(kwargs)  # shallow copy so we don't mutate caller's dict
         kwargs["stream"] = True
@@ -281,7 +320,7 @@ class agllm(_AgLLMFields):
                 if term:
                     term.log(
                         "LLM ▶    ",
-                        f"model={(backend.model or '?')}  messages={len(messages)}  idle_timeout={self.idle_timeout:.0f}s  stream_timeout={self.stream_timeout:.0f}s",
+                        f"{_tag}model={(backend.model or '?')}  messages={len(messages)}  idle_timeout={self.idle_timeout:.0f}s  stream_timeout={self.stream_timeout:.0f}s",
                     )
                 if state_fn:
                     state_fn("llm", skill=skill_name)
@@ -383,87 +422,51 @@ class agllm(_AgLLMFields):
                         if term:
                             term.log(
                                 "LLM ✗    ",
-                                f"model={(backend.model or '?')}  context length exceeded — will compact and retry",
+                                f"{_tag}model={(backend.model or '?')}  context length exceeded — will compact and retry",
                             )
                         return LLMCallResult(context_exceeded=True, elapsed_ms=_llm_elapsed_ms)
                     if term:
                         term.log(
-                            "LLM ✗    ", f"model={(backend.model or '?')}  bad request: {_bad_req}"
+                            "LLM ✗    ",
+                            f"{_tag}model={(backend.model or '?')}  bad request: {_bad_req}",
                         )
                     return LLMCallResult(conn_error=_bad_req, elapsed_ms=_llm_elapsed_ms)
 
-                except RATE_LIMIT_EXCS as _rate_err:
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
-                    messages.pop()
-                    _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-                    _retry_after = getattr(getattr(_rate_err, "response", None), "headers", {}).get(
-                        "retry-after"
-                    )
-                    try:
-                        # Jitter is added on top, never subtracted — the header is a floor,
-                        # not a target, so we never retry sooner than the server said to.
-                        _retry_sleep_s = float(_retry_after) + random.uniform(
-                            0, self.rate_limit_retry_after_jitter_s
-                        )
-                    except (TypeError, ValueError):
-                        # No (or unparseable) Retry-After header — exponential backoff with
-                        # full jitter so many concurrently-throttled skills don't all wake
-                        # up and retry in the same instant (thundering herd).
-                        _backoff = min(
-                            self.rate_limit_max_backoff_s,
-                            self.rate_limit_base_backoff_s * (2**attempt),
-                        )
-                        _retry_sleep_s = random.uniform(0, _backoff)
-                    if attempt < self.max_retries - 1:
-                        if term:
-                            term.log(
-                                "LLM ✗    ",
-                                f"model={(backend.model or '?')}  rate limited: {_rate_err}  "
-                                f"retry {attempt + 1}/{self.max_retries - 1} in {_retry_sleep_s:.1f}s",
-                            )
-                        _retry_err = _rate_err
-                    else:
-                        if term:
-                            term.log(
-                                "LLM ✗    ",
-                                f"model={(backend.model or '?')}  rate limited: {_rate_err}  all retries exhausted",
-                            )
-                        return LLMCallResult(conn_error=_rate_err, elapsed_ms=_llm_elapsed_ms)
-
-                except (
+                except RATE_LIMIT_EXCS + (
                     (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError)
                     + API_CONN_EXCS
                     + API_ERROR_EXCS
-                ) as _conn_err:
+                ) as _transient_err:
                     try:
                         client.close()
                     except Exception:
                         pass
                     messages.pop()
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-                    if isinstance(_conn_err, API_CONN_EXCS):
-                        _err_desc = f"Connection error: LLM backend unreachable ({_conn_err.__cause__ or _conn_err})"
-                    elif isinstance(_conn_err, API_ERROR_EXCS):
-                        _err_desc = f"API error: {_conn_err}"
+                    if isinstance(_transient_err, RATE_LIMIT_EXCS):
+                        _err_desc = f"rate limited: {_transient_err}"
+                    elif isinstance(_transient_err, API_CONN_EXCS):
+                        _err_desc = f"Connection error: LLM backend unreachable ({_transient_err.__cause__ or _transient_err})"
+                    elif isinstance(_transient_err, API_ERROR_EXCS):
+                        _err_desc = f"API error: {_transient_err}"
                     else:
-                        _err_desc = str(_conn_err)
+                        _err_desc = str(_transient_err)
+                    _retry_sleep_s = self._retry_backoff_s(_transient_err, attempt)
                     if attempt < self.max_retries - 1:
                         if term:
                             term.log(
                                 "LLM ✗    ",
-                                f"model={(backend.model or '?')}  {_err_desc}  retry {attempt + 1}/{self.max_retries - 1}",
+                                f"{_tag}model={(backend.model or '?')}  {_err_desc}  "
+                                f"retry {attempt + 1}/{self.max_retries - 1} in {_retry_sleep_s:.1f}s",
                             )
-                        _retry_err = _conn_err
+                        _retry_err = _transient_err
                     else:
                         if term:
                             term.log(
                                 "LLM ✗    ",
-                                f"model={(backend.model or '?')}  {_err_desc}  all retries exhausted",
+                                f"{_tag}model={(backend.model or '?')}  {_err_desc}  all retries exhausted",
                             )
-                        return LLMCallResult(conn_error=_conn_err, elapsed_ms=_llm_elapsed_ms)
+                        return LLMCallResult(conn_error=_transient_err, elapsed_ms=_llm_elapsed_ms)
 
                 else:
                     messages.pop()  # remove partial placeholder
@@ -732,6 +735,7 @@ class agllm(_AgLLMFields):
         context_limit: "int | None" = None,
         tail_turns: "int | None" = None,
         previous_summary: "str | None" = None,
+        term: "agterm | None" = None,
     ) -> "tuple[list[dict], str]":
         """Summarise old messages; return compacted list and new summary."""
         # tail_turns can't default to self.tail_turns in the signature — a default
@@ -782,7 +786,6 @@ class agllm(_AgLLMFields):
                 lines.append(f"[tool result]: {content[: _AgLLMFields.TOOL_OUTPUT_MAX_CHARS]}")
             elif content:
                 lines.append(f"[{role}]: {content[: self.summary_role_content_max_chars]}")
-        client = self.backend.make_client(httpx.Timeout(120.0))
         compact_kwargs: dict = dict(
             model=self.backend.model or "",
             messages=[
@@ -793,52 +796,26 @@ class agllm(_AgLLMFields):
         compact_kwargs["max_completion_tokens"] = self.summary_max_tokens
         if self.backend.extra_body:
             compact_kwargs["extra_body"] = self.backend.extra_body
-        # Retry transient failures the same way call() does for the main streaming
-        # path — this call used to be a single bare request with no retry at all,
-        # so one read-timeout here (distinct from a real error in the conversation
-        # being summarized) would crash the whole agent and discard already-completed
-        # work further up the call stack (e.g. a harness run that had already
-        # produced valid metrics_output).
-        resp = None
-        for attempt in range(self.max_retries):
-            try:
-                resp = client.chat.completions.create(**compact_kwargs)
-                break
-            except BAD_REQUEST_EXCS:
-                raise  # not retryable — mirrors call()'s handling
-            except RATE_LIMIT_EXCS as _rate_err:
-                _retry_after = getattr(getattr(_rate_err, "response", None), "headers", {}).get(
-                    "retry-after"
-                )
-                try:
-                    _sleep_s = float(_retry_after) + random.uniform(
-                        0, self.rate_limit_retry_after_jitter_s
-                    )
-                except (TypeError, ValueError):
-                    _backoff = min(
-                        self.rate_limit_max_backoff_s,
-                        self.rate_limit_base_backoff_s * (2**attempt),
-                    )
-                    _sleep_s = random.uniform(0, _backoff)
-                if attempt >= self.max_retries - 1:
-                    raise
-                print(
-                    f"[agllm] compact(): rate limited: {_rate_err}  "
-                    f"retry {attempt + 1}/{self.max_retries - 1} in {_sleep_s:.1f}s"
-                )
-                time.sleep(_sleep_s)
-            except (
-                (ssl.SSLError, OSError, httpx.TransportError) + API_CONN_EXCS + API_ERROR_EXCS
-            ) as _conn_err:
-                if attempt >= self.max_retries - 1:
-                    raise
-                print(
-                    f"[agllm] compact(): {_conn_err}  "
-                    f"retry {attempt + 1}/{self.max_retries - 1} in {self.retry_sleep_s:.1f}s"
-                )
-                time.sleep(self.retry_sleep_s)
-        assert resp is not None  # loop above always returns or raises
-        summary = (resp.choices[0].message.content or "").strip()
+        # `[]` below is scratch space call() uses to append/pop a live-streaming
+        # placeholder -- it's not what's sent over the wire (that's
+        # compact_kwargs["messages"] above), so an empty list is fine here.
+        result = self.call(
+            compact_kwargs,
+            [],
+            term,
+            None,
+            None,
+            None,
+            0,
+            0,
+            "compact",
+            call_tag="compact",
+        )
+        if not result.ok:
+            raise result.conn_error or RuntimeError(
+                "compact(): summarisation request itself exceeded the context limit"
+            )
+        summary = "".join(result.content_parts).strip()
         injection: list[dict] = [
             {
                 "role": "user",
@@ -892,6 +869,7 @@ class agllm(_AgLLMFields):
             messages,
             context_limit=self.context_limit,
             previous_summary=ctx.compaction_summary,
+            term=term,
         )
         if log:
             log._lifecycle(
