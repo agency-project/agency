@@ -221,7 +221,7 @@ def test_acquire_blocks_until_release():
     acquired_after = threading.Event()
 
     def waiter():
-        pool.acquire_gpu(timeout=2.0)
+        pool.acquire_gpu(timeout=5.0)
         acquired_after.set()
 
     t = threading.Thread(target=waiter, daemon=True)
@@ -231,10 +231,10 @@ def test_acquire_blocks_until_release():
 
     time.sleep(0.05)
     assert not acquired_after.is_set()
-    pool.release_gpu(0)
-    acquired_after.wait(timeout=2.0)
+    pool.release_gpu(0)  # release_gpu sleeps 3s internally before freeing the slot
+    acquired_after.wait(timeout=5.0)
     assert acquired_after.is_set()
-    t.join(timeout=2.0)
+    t.join(timeout=5.0)
 
 
 def test_acquire_timeout_raises():
@@ -256,7 +256,7 @@ def test_release_double_release_warns(capsys):
     pool.release_gpu(0)
     pool.release_gpu(0)  # double-release — warns, does not raise
     captured = capsys.readouterr()
-    assert "WARNING" in captured.out or True  # warning is best-effort
+    assert "WARNING" in captured.out
 
 
 # ---------------------------------------------------------------------------

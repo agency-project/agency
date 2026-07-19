@@ -389,6 +389,7 @@ class agskill:
                 ag._set_ui_state("error" if _had_error else "finished")
                 if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
                     resource_pool.release_gpu(ag.sandbox._gpu_id)
+                    ag.sandbox._gpu_id = None
                 if ag.sandbox is not None:
                     ag.sandbox.stop(commit=True)
                 if sandbox_lock is not None:

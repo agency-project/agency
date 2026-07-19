@@ -363,7 +363,7 @@ def _semaphore_held_count() -> str:
     return f"{held}/{limit}"
 
 
-_container_semaphore: "multiprocessing.Semaphore" = multiprocessing.Semaphore(
+_container_semaphore: "multiprocessing.BoundedSemaphore" = multiprocessing.BoundedSemaphore(
     _keyring_container_limit()
 )
 
@@ -408,7 +408,14 @@ class _ContainerBackendBase(agsandbox_backend):
 
     def _release_runtime_slot(self) -> None:
         """Release the slot _acquire_runtime_slot() acquired."""
-        _container_semaphore.release()
+        try:
+            _container_semaphore.release()
+        except ValueError as _e:
+            print(
+                f"[agsandbox_backend] WARNING: container-slot semaphore double-release: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
 
     def _is_quota_exhaustion_error(self, stderr: str) -> bool:
         """Return True if *stderr* (from a failed run_cmd) indicates the
@@ -898,7 +905,14 @@ class _ContainerBackendBase(agsandbox_backend):
                     )
                 else:
                     time.sleep(self.rm_retry_backoff_s)
-        self._release_runtime_slot()
+        # Only release the runtime slot once the container is actually
+        # confirmed gone -- if every rm -f attempt failed, the container (and
+        # the physical slot it occupies) is still alive, so releasing here
+        # would over-credit the semaphore while destroy() (or a later stop())
+        # still has a live container to clean up and would release again once
+        # removal genuinely succeeds.
+        if not self._container_running():
+            self._release_runtime_slot()
         self._started = False
 
     def restore(self, tag: str) -> None:
@@ -956,7 +970,13 @@ class _ContainerBackendBase(agsandbox_backend):
             if self._container_status():
                 self._rm_container(container_name)
         finally:
-            if had_container:
+            # Only release if the container is actually confirmed gone now --
+            # if had_container was True because a prior stop() already
+            # observed removal succeed (and already released), this recheck
+            # correctly sees no container and skips a second release; if rm
+            # here fails too, the slot is still legitimately held and must
+            # not be released.
+            if had_container and not self._container_running():
                 self._release_runtime_slot()
 
         # Remove the checkpoint image and all pre-tool snapshots created during

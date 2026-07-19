@@ -241,8 +241,8 @@ class agResourcePool(_AgResourcePoolFields):
         self.total_memory_mb = (
             total_memory_mb if total_memory_mb is not None else detect_memory_mb()
         )
-        self._gpu_locks: dict[int, threading.Semaphore] = {
-            gpu_id: threading.Semaphore(1) for gpu_id in self.gpus
+        self._gpu_locks: dict[int, threading.BoundedSemaphore] = {
+            gpu_id: threading.BoundedSemaphore(1) for gpu_id in self.gpus
         }
         self._res_lock = threading.Lock()
         self._gpus_acquired: int = 0
@@ -281,6 +281,11 @@ class agResourcePool(_AgResourcePoolFields):
     def release_gpu(self, gpu_id: int) -> None:
         sem = self._gpu_locks.get(gpu_id)
         if sem is not None:
+            # Gap between release calls so a just-freed GPU isn't immediately
+            # re-acquired before any concurrent teardown-path release for the
+            # same gpu_id has had a chance to land (and hit the ValueError
+            # guard below) rather than racing a fresh acquire.
+            time.sleep(3.0)
             try:
                 sem.release()
             except ValueError as _e:

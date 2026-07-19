@@ -900,6 +900,49 @@ class TestAgSandboxLifecycle:
         assert sb._started is False  # _started cleared even on failure
 
     @docker
+    def test_stop_then_destroy_after_rm_failure_releases_slot_once(self):
+        """If stop()'s rm -f exhausts retries, the runtime slot is still held.
+
+        destroy() must be the one that releases it -- exactly once -- when
+        the container is actually removed. Regression test for a double
+        release of _container_semaphore when both stop() and destroy() each
+        independently believed they owed a release.
+        """
+        from agency.agsandbox_backends.container import _container_semaphore
+
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+
+        real_run = sb._backend._run
+
+        def always_fail_rm(cmd, **kwargs):
+            if "rm" in cmd and "-f" in cmd:
+                raise RuntimeError("simulated persistent failure")
+            return real_run(cmd, **kwargs)
+
+        # write_file() above already forced _ensure_started(), which
+        # acquired the sandbox's runtime slot -- capture the value with that
+        # slot already held.
+        held = _container_semaphore._semlock._get_value()
+
+        sb._backend._run = always_fail_rm
+        try:
+            sb.stop(commit=False)
+        finally:
+            sb._backend._run = real_run
+
+        # rm never actually succeeded, so the slot must NOT have been
+        # released yet -- the container is still really running.
+        assert _container_semaphore._semlock._get_value() == held
+
+        sb.destroy()
+
+        # destroy() removes the container for real this time and releases
+        # the slot exactly once -- not twice (which would over-credit the
+        # semaphore above its true capacity).
+        assert _container_semaphore._semlock._get_value() == held + 1
+
+    @docker
     def test_concurrent_docker_calls_gated_by_docker_semaphore(self):
         """All docker calls go through _run() which holds _docker_semaphore; peak concurrency <= 8."""
         from agency.agsandbox_backends.container import _docker_semaphore
