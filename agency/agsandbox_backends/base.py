@@ -25,8 +25,12 @@ from __future__ import annotations
 
 import shlex
 import shutil
+import subprocess
+import threading
 import time
-from typing import TYPE_CHECKING
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as _FutureTimeoutError
+from typing import TYPE_CHECKING, Callable
 
 from ..agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
@@ -86,6 +90,11 @@ class AgSandboxBackendFields:
     keyring_wait_timeout_s = GlobalConfigParam(
         "agsandbox_backend", default=120
     )  # Maximum time to wait for a keyring slot before abandoning a docker/podman run retry.
+    unkillable_child_grace_s = GlobalConfigParam(
+        "agsandbox_backend", default=10
+    )  # Extra time _run() waits for subprocess.run's own kill()+wait() to finish
+    # reaping a timed-out child before giving up and returning control to the
+    # caller anyway (see _run()'s docstring for why timeout= alone isn't reliable).
 
     # _keyring_container_limit(): concurrent-container cap derived from the kernel
     # session-keyring quota, which docker and podman (rootless, via runc) both
@@ -134,6 +143,63 @@ class agSandboxBackendConfig(_AgConfigViewBase):
     """
 
     _OWNER = "agsandbox_backend"
+
+
+def run_with_unkillable_child_grace(
+    call: "Callable[[], subprocess.CompletedProcess[bytes]]",
+    *,
+    args: list[str],
+    timeout: float,
+    grace_s: float,
+    on_give_up: "Callable[[], None] | None" = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run *call* (a zero-arg thunk wrapping a single ``subprocess.run(...,
+    timeout=timeout)`` invocation) in a background thread, and give up
+    waiting on it after ``timeout + grace_s`` total, regardless of whether it
+    has actually finished.
+
+    ``subprocess.run``'s own ``timeout=`` is not a reliable ceiling: on
+    ``TimeoutExpired`` it SIGKILLs the child then calls an UNBOUNDED
+    ``process.wait()`` to reap it, and SIGKILL cannot preempt a process stuck
+    in uninterruptible kernel sleep (D-state -- e.g. blocked on a wedged
+    daemon/mount/overlayfs syscall). Such a child can leave ``wait()``
+    hanging for hours, blocking every caller -- and everything blocked
+    transitively on it -- for just as long.
+
+    Giving up does NOT kill the background thread -- Python cannot kill a
+    thread -- it keeps trying to reap the real subprocess for as long as it
+    takes, discarded once it eventually finishes. This function just stops
+    blocking the caller once ``grace_s`` has also elapsed past *call*'s own
+    timeout, converting the hang into the same ``subprocess.TimeoutExpired``
+    every caller already handles for an ordinary (fast) timeout.
+
+    *on_give_up*, if given, runs synchronously (still in the caller's thread)
+    before ``subprocess.TimeoutExpired`` is raised -- e.g. to release a
+    concurrency-limiting semaphore slot the caller held for this call, now
+    that waiting on it is over.
+    """
+    future: "Future[subprocess.CompletedProcess[bytes]]" = Future()
+
+    def _task() -> None:
+        try:
+            future.set_result(call())
+        except BaseException as e:  # noqa: BLE001 - relayed verbatim to the waiter below
+            future.set_exception(e)
+
+    threading.Thread(target=_task, daemon=True).start()
+    try:
+        return future.result(timeout=timeout + grace_s)
+    except _FutureTimeoutError:
+        if on_give_up is not None:
+            on_give_up()
+        print(
+            f"[agsandbox_backend] WARNING: {' '.join(args)} did not exit within "
+            f"{timeout + grace_s}s even after SIGKILL (unkillable/D-state child?) -- "
+            "giving up waiting; the underlying process is not killed and will keep "
+            "being reaped in the background.",
+            flush=True,
+        )
+        raise subprocess.TimeoutExpired(args, timeout) from None
 
 
 _BGPIDS_MARKER = "__BGPIDS__:"

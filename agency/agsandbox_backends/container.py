@@ -37,7 +37,7 @@ from pathlib import Path
 
 from ..agconfig import agConfig
 from ..agresources import detect_gpus, _AgResourcePoolFields
-from .base import AgSandboxBackendFields, agsandbox_backend
+from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
 
 # _RUN_ID is never read within this module itself -- it's defined here and
 # imported by agsandbox_backends/__init__.py (which re-exports it for
@@ -680,21 +680,45 @@ class _ContainerBackendBase(agsandbox_backend):
         input: bytes | None = None,
         timeout: int = AgSandboxBackendFields.DEFAULT_EXEC_TIMEOUT_S,
     ) -> subprocess.CompletedProcess[bytes]:
-        with _get_docker_semaphore():
-            try:
-                return subprocess.run(
-                    args,
-                    input=input,
-                    capture_output=True,
-                    timeout=timeout,
-                    check=check,
-                )
-            except subprocess.CalledProcessError as e:
-                err = (e.stderr or b"").decode("utf-8", errors="replace").strip()
-                msg = f"{' '.join(args)} failed (exit {e.returncode})"
-                if err:
-                    msg += f": {err}"
-                raise RuntimeError(msg) from e
+        """Run *args*, blocking for at most timeout + unkillable_child_grace_s
+        even against a child stuck in uninterruptible kernel sleep that a
+        plain subprocess.run(timeout=...) would hang on forever (see
+        run_with_unkillable_child_grace()'s docstring for why).
+
+        _get_docker_semaphore()'s slot is held for the call's duration and
+        released as soon as we give up waiting -- a wedged call must not also
+        starve every OTHER sandbox's ability to make a docker/podman call
+        (see this module's docstring for the semaphore's shared-pool
+        rationale).
+        """
+        sem = _get_docker_semaphore()
+        sem.acquire()
+        released = False
+
+        def _release_once() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                sem.release()
+
+        try:
+            return run_with_unkillable_child_grace(
+                lambda: subprocess.run(
+                    args, input=input, capture_output=True, timeout=timeout, check=check
+                ),
+                args=args,
+                timeout=timeout,
+                grace_s=self.unkillable_child_grace_s,
+                on_give_up=_release_once,
+            )
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or b"").decode("utf-8", errors="replace").strip()
+            msg = f"{' '.join(args)} failed (exit {e.returncode})"
+            if err:
+                msg += f": {err}"
+            raise RuntimeError(msg) from e
+        finally:
+            _release_once()
 
     def _rm_container(self, name: str) -> None:
         """Force-remove a container by name. Raises on failure."""

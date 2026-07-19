@@ -38,7 +38,7 @@ import uuid as _uuid
 from pathlib import Path
 
 from ..agconfig import agConfig
-from .base import AgSandboxBackendFields, agsandbox_backend
+from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
 
 _chroot_available_cache: "bool | None" = None
 _chroot_available_lock = threading.Lock()
@@ -299,7 +299,16 @@ class _ChrootBackend(agsandbox_backend):
             script,
         ]
         try:
-            proc = subprocess.run(args, input=stdin, capture_output=True, timeout=timeout)
+            # run_with_unkillable_child_grace() bounds this call even against
+            # a child stuck in uninterruptible kernel sleep (e.g. a wedged
+            # mount/overlayfs syscall) that a plain subprocess.run(timeout=...)
+            # would hang on forever -- see its docstring.
+            proc = run_with_unkillable_child_grace(
+                lambda: subprocess.run(args, input=stdin, capture_output=True, timeout=timeout),
+                args=args,
+                timeout=timeout,
+                grace_s=self.unkillable_child_grace_s,
+            )
             output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
             return output, proc.returncode
         except subprocess.TimeoutExpired:

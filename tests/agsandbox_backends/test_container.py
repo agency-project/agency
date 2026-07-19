@@ -369,6 +369,96 @@ class TestRunWithConflictRetryHooks:
                 sb._run_with_conflict_retry(["podman", "run", "--name", "x"], "x")
 
 
+class TestRun:
+    """_run()'s own defense against a docker/podman CLI child stuck in
+    uninterruptible kernel sleep (D-state) -- a real incident in production
+    showed a wedged daemon leave several agents' conversations frozen for
+    HOURS, because subprocess.run(timeout=...)'s own kill()+wait() sequence
+    is not actually a reliable ceiling: SIGKILL cannot preempt a D-state
+    process, so process.wait() after the kill can itself block forever (see
+    run_with_unkillable_child_grace()'s docstring in agsandbox_backends/base.py).
+
+    All of these mock subprocess.run directly (never _run itself, unlike
+    TestRunWithConflictRetryHooks above) so the real threading/timeout logic
+    inside _run() actually executes. timeout=/unkillable_child_grace_s are
+    both overridden to ~0.05-0.1s so the "give up" tests complete in well
+    under a second while still exercising the real code path.
+    """
+
+    def _sb(self):
+        from agency.agsandbox_backends.podman import _PodmanBackend
+
+        return _PodmanBackend(
+            "agent",
+            name="podman-run-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=None,
+        )
+
+    def test_fast_path_returns_the_real_completed_process(self):
+        sb = self._sb()
+        fake_result = subprocess.CompletedProcess(["podman", "x"], 0, b"out", b"")
+        with patch("subprocess.run", return_value=fake_result) as mock_run:
+            result = sb._run(["podman", "x"], timeout=5)
+        mock_run.assert_called_once()
+        assert result is fake_result
+
+    def test_check_true_failure_raises_runtime_error_with_existing_message_format(self):
+        sb = self._sb()
+        err = subprocess.CalledProcessError(1, ["podman", "x"], output=b"", stderr=b"boom")
+        with patch("subprocess.run", side_effect=err):
+            with pytest.raises(RuntimeError, match=r"podman x failed \(exit 1\): boom"):
+                sb._run(["podman", "x"], check=True, timeout=5)
+
+    def test_ordinary_fast_timeout_still_raises_timeout_expired_unchanged(self):
+        sb = self._sb()
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["podman", "x"], 5),
+        ):
+            with pytest.raises(subprocess.TimeoutExpired):
+                sb._run(["podman", "x"], timeout=5)
+
+    def test_gives_up_instead_of_hanging_when_child_outlives_timeout_and_grace(self):
+        """Simulates the actual incident: subprocess.run itself never returns
+        (standing in for a real child stuck in D-state past SIGKILL). _run()
+        must still return control to the caller -- not hang -- once
+        timeout + unkillable_child_grace_s has elapsed."""
+        import time as _time
+
+        sb = self._sb()
+        with patch.object(_container.AgSandboxBackendFields, "unkillable_child_grace_s", 0.05):
+            with patch("subprocess.run", side_effect=lambda *a, **k: _time.sleep(10)):
+                start = _time.monotonic()
+                with pytest.raises(subprocess.TimeoutExpired):
+                    sb._run(["podman", "x"], timeout=0.05)
+                elapsed = _time.monotonic() - start
+        # Must give up close to timeout + grace_s (0.1s total), not hang for
+        # anywhere near the simulated child's real 10s "hang".
+        assert elapsed < 5
+
+    def test_semaphore_is_released_immediately_on_give_up_not_leaked(self):
+        """Regression coverage for the amplification risk: a wedged call must
+        not also starve every OTHER sandbox's ability to make a docker/podman
+        call by holding the shared concurrency semaphore forever."""
+        import time as _time
+
+        sb = self._sb()
+        sem = _container._get_docker_semaphore()
+        with patch.object(_container.AgSandboxBackendFields, "unkillable_child_grace_s", 0.05):
+            with patch("subprocess.run", side_effect=lambda *a, **k: _time.sleep(10)):
+                with pytest.raises(subprocess.TimeoutExpired):
+                    sb._run(["podman", "x"], timeout=0.05)
+        # The slot must be free again immediately -- a non-blocking acquire
+        # succeeds right away if _run() released it on give-up.
+        acquired = sem.acquire(blocking=False)
+        assert acquired, "docker semaphore slot was not released on give-up"
+        if acquired:
+            sem.release()
+
+
 # ---------------------------------------------------------------------------
 # _gpu_flags(runtime) -- regression coverage for the bug where Docker's
 # ``--gpus all`` was used unconditionally for Podman too. Podman accepts that
