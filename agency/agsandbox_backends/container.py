@@ -527,6 +527,55 @@ class _ContainerBackendBase(agsandbox_backend):
             return ""
         return result.stdout.decode("utf-8", errors="replace").strip()
 
+    def _own_host_pids(self) -> "set[int]":
+        """Return the host PIDs of every process currently running inside
+        this container, or an empty set if the container doesn't exist / the
+        query fails.
+
+        Used to scope release_gpu()'s straggler wait (see
+        agResourcePool._wait_for_gpu_clear) to processes THIS sandbox itself
+        spawned, not an unrelated tenant sharing the same physical GPU.
+
+        Deliberately doesn't use ``docker top``/``podman top``: their PID
+        column's host-vs-namespaced semantics differ between the two
+        runtimes (rootless Podman in particular). ``{{.State.Pid}}`` is
+        documented and consistent across both as the container's init
+        process's HOST pid, so instead we read that once and walk
+        /proc's child-PID tree from there -- /proc semantics don't vary by
+        runtime.
+        """
+        result = self._run(
+            [self._runtime, "inspect", "--format", "{{.State.Pid}}", self._container_name()],
+            check=False,
+            timeout=self.inspect_timeout_s,
+        )
+        if result.returncode != 0:
+            return set()
+        try:
+            init_pid = int(result.stdout.decode("utf-8", errors="replace").strip())
+        except ValueError:
+            return set()
+        if init_pid <= 0:
+            return set()
+
+        pids = {init_pid}
+        frontier = [init_pid]
+        while frontier:
+            pid = frontier.pop()
+            try:
+                children_raw = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            except OSError:
+                continue
+            for child_s in children_raw:
+                try:
+                    child = int(child_s)
+                except ValueError:
+                    continue
+                if child not in pids:
+                    pids.add(child)
+                    frontier.append(child)
+        return pids
+
     def _ensure_started(self) -> None:
         """Start the Docker/Podman container on first use.
 
@@ -814,8 +863,11 @@ class _ContainerBackendBase(agsandbox_backend):
             if not self._container_running():
                 return
         # Release GPU so other agents can use it while the container is gone.
+        # Captured while the container still exists (removal happens further
+        # down) so the wait can scope to processes THIS container actually
+        # spawned rather than any process sharing the physical GPU.
         if self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id)
+            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
             self._gpu_id = None
         # Clear PID tracking — remove kills all processes.
         self._watched_pids = {}

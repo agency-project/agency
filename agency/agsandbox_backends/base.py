@@ -231,6 +231,17 @@ class agsandbox_backend(AgSandboxBackendFields):
     # than assuming the container backend unconditionally.
     IMAGE_KIND: "str" = ""
 
+    def _own_host_pids(self) -> "set[int]":
+        """Return the host PIDs of every process this sandbox has currently
+        spawned, used to scope release_gpu()'s straggler wait to processes
+        this sandbox actually owns rather than an unrelated tenant sharing
+        the same physical GPU (see agResourcePool._wait_for_gpu_clear).
+        Overridden per-backend since what counts as "this sandbox's PIDs"
+        differs by isolation mechanism; the empty-set default here means "no
+        sandbox context available," which _wait_for_gpu_clear falls back
+        from to its coarser own-orchestrator-PID-only check."""
+        return set()
+
     @staticmethod
     def for_config(
         agconfig: "agConfig | None",
@@ -446,7 +457,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         if self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
             self.get_live_pids()
         elif not self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id)
+            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
             self._gpu_id = None
 
         return clean_output, rc
@@ -641,7 +652,7 @@ class agsandbox_backend(AgSandboxBackendFields):
 
         # Release the physical GPU once all watched processes have finished.
         if not alive and self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id)
+            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
             self._gpu_id = None
 
         return alive
@@ -661,10 +672,11 @@ class agsandbox_backend(AgSandboxBackendFields):
     def release_resources(self, pool: "agResourcePool | None" = None) -> None:
         self._gpu_virtual = False
         if self._gpu_id is not None:
+            own_pids = self._own_host_pids()
             if pool is not None:
-                pool.release_gpu(self._gpu_id)
+                pool.release_gpu(self._gpu_id, own_pids=own_pids)
             elif self._gpu_release_fn is not None:
-                self._gpu_release_fn(self._gpu_id)
+                self._gpu_release_fn(self._gpu_id, own_pids=own_pids)
             self._gpu_id = None
         if pool is not None and (self._cpu_acquired or self._memory_acquired_mb):
             pool.notify_cpu_released(self._cpu_acquired, self._memory_acquired_mb)

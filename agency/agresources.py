@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import threading
 import time
@@ -34,6 +35,12 @@ class _AgResourcePoolFields:
     marker_mb = GlobalConfigParam(
         "agResourcePool", default=128
     )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
+    gpu_release_wait_poll_s = GlobalConfigParam(
+        "agResourcePool", default=1.0
+    )  # Seconds between nvidia-smi polls waiting for a GPU's compute processes to exit before release
+    gpu_release_wait_timeout_s = GlobalConfigParam(
+        "agResourcePool", default=30
+    )  # Max seconds to wait for stragglers to exit before releasing anyway (with a warning)
 
     # CPU limit applied both when a sandbox container is first created (docker
     # run) and whenever it's reset to idle (docker update, via cpu_release) --
@@ -61,33 +68,42 @@ class agResourcePoolConfig(_AgConfigViewBase):
     _OWNER = "agResourcePool"
 
 
-def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
-    """Allocate marker_mb of VRAM on each GPU directly in the calling process.
+def _visible_device_remap(env_names: "tuple[str, ...]") -> dict[int, int]:
+    """Build a physical-id -> remapped-index map from whichever of env_names
+    is set (e.g. CUDA_VISIBLE_DEVICES="0,3,5,7" -> {0:0, 3:1, 5:2, 7:3}),
+    mirroring how the driver itself remaps physical GPUs to indices 0..N-1
+    inside a process that only sees a restricted device list."""
+    for name in env_names:
+        val = os.environ.get(name, "")
+        if not val or val.lower() in ("nodevfiles", "none"):
+            continue
+        try:
+            ids = [int(x.strip()) for x in val.split(",") if x.strip().lstrip("-").isdigit()]
+            if ids:
+                return {phys: idx for idx, phys in enumerate(ids)}
+        except Exception:
+            pass
+    return {}
 
-    Uses the CUDA driver API via ctypes — no torch dependency required.
-    Allocations live for the process lifetime, which is fine: the memory is
-    tiny (128 MB per GPU by default) and there is no need to release it mid-run.
-    Runs silently if CUDA is unavailable.
-    """
-    marker_bytes = _AgResourcePoolFields().marker_mb * 1024 * 1024
+
+def _allocate_gpu_markers_cuda(gpu_ids: list[int], marker_bytes: int) -> bool:
+    """Try the CUDA driver API. Returns True if libcuda was found at all
+    (regardless of whether individual per-GPU allocations went on to
+    succeed) so the caller knows not to also try the ROCm/HIP path -- a
+    cuInit failure means a broken/inaccessible NVIDIA driver, not "try AMD
+    instead," since there's no AMD hardware to fall back to on an NVIDIA
+    host anyway. Returns False only when libcuda.so.1 isn't present at all."""
     try:
         cuda = ctypes.CDLL("libcuda.so.1")
     except OSError:
-        return
+        return False
     if cuda.cuInit(0) != 0:
-        return
+        return True
 
     # When CUDA_VISIBLE_DEVICES is set (e.g. "0,3,5,7"), the CUDA driver
     # remaps physical GPUs to indices 0..N-1.  gpu_ids are physical IDs, so
     # we must convert to the remapped index before calling CUDA APIs.
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    cuda_index: dict[int, int] = {}
-    if cvd and cvd.lower() not in ("nodevfiles", "none"):
-        try:
-            cvd_list = [int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()]
-            cuda_index = {phys: idx for idx, phys in enumerate(cvd_list)}
-        except Exception:
-            pass
+    cuda_index = _visible_device_remap(("CUDA_VISIBLE_DEVICES",))
 
     for gpu_id in gpu_ids:
         try:
@@ -100,19 +116,152 @@ def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
             # Leave context current; allocation persists for the process lifetime.
         except Exception:
             pass
+    return True
+
+
+def _allocate_gpu_markers_rocm(gpu_ids: list[int], marker_bytes: int) -> None:
+    """ROCm/HIP equivalent of _allocate_gpu_markers_cuda. HIP's runtime API
+    manages a context implicitly per device (hipSetDevice + hipMalloc)
+    rather than CUDA driver API's explicit per-device context object, so
+    there's no analogue of cuCtxCreate to call here."""
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+    except OSError:
+        return
+    if hip.hipInit(0) != 0:
+        return
+
+    hip_index = _visible_device_remap(("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"))
+
+    for gpu_id in gpu_ids:
+        try:
+            dev = hip_index.get(gpu_id, gpu_id)
+            if hip.hipSetDevice(dev) != 0:
+                continue
+            ptr = ctypes.c_void_p()
+            hip.hipMalloc(ctypes.byref(ptr), marker_bytes)
+            # Leave allocated; persists for the process lifetime, same as the
+            # CUDA path above.
+        except Exception:
+            pass
+
+
+def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
+    """Allocate marker_mb of VRAM on each GPU directly in the calling process.
+
+    Tries the CUDA driver API first, falling back to ROCm/HIP — no torch
+    dependency required either way. Allocations live for the process
+    lifetime, which is fine: the memory is tiny (128 MB per GPU by default)
+    and there is no need to release it mid-run. Runs silently if neither
+    CUDA nor ROCm is available.
+    """
+    marker_bytes = _AgResourcePoolFields().marker_mb * 1024 * 1024
+    if _allocate_gpu_markers_cuda(gpu_ids, marker_bytes):
+        return
+    _allocate_gpu_markers_rocm(gpu_ids, marker_bytes)
+
+
+def _nvidia_gpu_compute_pids(gpu_id: int) -> "set[int] | None":
+    """Return host PIDs with an active CUDA context on physical GPU *gpu_id*,
+    or None if nvidia-smi is unavailable/failed (including on non-NVIDIA
+    hardware, where the binary doesn't exist at all)."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid",
+                "--format=csv,noheader,nounits",
+                "-i",
+                str(gpu_id),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_AgResourcePoolFields().gpu_detect_timeout_s,
+        )
+        if result.returncode != 0:
+            return None
+        return {int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()}
+    except Exception:
+        return None
+
+
+_ROCM_PIDGPUS_HEADER_RE = re.compile(r"^PID (\d+) is using (\d+) DRM device\(s\)")
+
+
+def _rocm_gpu_compute_pids(gpu_id: int) -> "set[int] | None":
+    """Return host PIDs with an active KFD compute context on physical GPU
+    *gpu_id*, or None if rocm-smi is unavailable/failed.
+
+    ``rocm-smi --showpidgpus``'s "DRM device" number is rocm-smi's own
+    device index -- the exact same index space as ``--showid``'s cardN (both
+    ultimately come from the same `range(numberOfDevices)` list inside
+    rocm-smi's own implementation), so it lines up directly with detect_gpus()'s
+    gpu_id numbering with no render-node/topology-node/PCI translation needed.
+    Deliberately not ``--json``/``--csv``: rocm-smi silently omits PID data
+    under structured-output modes for this particular query.
+    """
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showpidgpus"],
+            capture_output=True,
+            text=True,
+            timeout=_AgResourcePoolFields().gpu_detect_timeout_s,
+        )
+        if result.returncode != 0:
+            return None
+    except Exception:
+        return None
+
+    pids: set[int] = set()
+    lines = result.stdout.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _ROCM_PIDGPUS_HEADER_RE.match(lines[i].strip())
+        if m is None:
+            i += 1
+            continue
+        pid, n = int(m.group(1)), int(m.group(2))
+        i += 1
+        devices: list[int] = []
+        while len(devices) < n and i < len(lines):
+            devices.extend(int(tok) for tok in lines[i].split() if tok.lstrip("-").isdigit())
+            i += 1
+        if gpu_id in devices:
+            pids.add(pid)
+    return pids
+
+
+def _gpu_compute_pids(gpu_id: int) -> "set[int] | None":
+    """Return host PIDs with an active compute context on physical GPU
+    *gpu_id*, trying nvidia-smi then falling back to rocm-smi (mirroring
+    detect_gpus()'s own nvidia-then-rocm dispatch).
+
+    Returns None (rather than an empty set) when neither query could be
+    performed (no nvidia-smi/rocm-smi, unsupported hardware, timeout) so
+    callers can tell "confirmed empty" apart from "couldn't check" and avoid
+    blocking release on hardware where this check simply isn't possible.
+    """
+    pids = _nvidia_gpu_compute_pids(gpu_id)
+    if pids is not None:
+        return pids
+    return _rocm_gpu_compute_pids(gpu_id)
 
 
 def _cvd_filter(gpu_ids: list[int]) -> list[int]:
-    """Filter gpu_ids to the subset allowed by CUDA_VISIBLE_DEVICES (if set)."""
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not cvd or cvd.lower() in ("nodevfiles", "none"):
-        return gpu_ids
-    try:
-        allowed = {int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()}
-        if allowed:
-            return [g for g in gpu_ids if g in allowed]
-    except Exception:
-        pass
+    """Filter gpu_ids to the subset allowed by CUDA_VISIBLE_DEVICES,
+    HIP_VISIBLE_DEVICES, or ROCR_VISIBLE_DEVICES (whichever is set; checked
+    in that order so a CUDA restriction always wins if somehow more than one
+    is set at once)."""
+    for _env in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+        cvd = os.environ.get(_env, "")
+        if not cvd or cvd.lower() in ("nodevfiles", "none"):
+            continue
+        try:
+            allowed = {int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()}
+            if allowed:
+                return [g for g in gpu_ids if g in allowed]
+        except Exception:
+            pass
     return gpu_ids
 
 
@@ -278,14 +427,58 @@ class agResourcePool(_AgResourcePoolFields):
                 raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
             time.sleep(poll)
 
-    def release_gpu(self, gpu_id: int) -> None:
+    def _wait_for_gpu_clear(self, gpu_id: int, own_pids: "set[int] | None" = None) -> None:
+        """Block until nvidia-smi/rocm-smi reports no relevant compute
+        processes left on *gpu_id*. Guards against handing a "released" GPU
+        to a new acquirer while a background job the releasing sandbox
+        spawned (or a just-killed process's CUDA/HIP context) is still
+        actually resident on the device -- see release_gpu()'s docstring.
+
+        *own_pids*, when given, is the exact set of host PIDs the releasing
+        sandbox itself spawned (see _ContainerBackendBase._own_host_pids()/
+        _ChrootBackend._own_host_pids()) -- only THOSE PIDs are waited on, so
+        an unrelated process sharing the same physical GPU (another tenant,
+        another harness run entirely -- this pool has no cross-process
+        visibility into those and isn't trying to coordinate with them)
+        never counts as a straggler and never triggers a wait or a false
+        warning.
+
+        When own_pids is None (no sandbox context -- e.g. a caller other
+        than a container/chroot-backed sandbox), falls back to the coarser
+        "anything other than our own orchestrator PID" check.
+
+        Also serves as the gap between release calls: a just-freed GPU can't
+        be re-acquired any sooner than this check completes.
+
+        Gives up and returns (so release still proceeds, with a warning)
+        after gpu_release_wait_timeout_s -- a wedged/never-exiting straggler
+        must not permanently strand the GPU as unreleasable. Returns
+        immediately if the query itself isn't possible (no nvidia-smi /
+        rocm-smi) since there's nothing to poll on.
+        """
+        exclude = {os.getpid()}
+        poll = self.gpu_release_wait_poll_s
+        deadline = time.monotonic() + self.gpu_release_wait_timeout_s
+        while True:
+            pids = _gpu_compute_pids(gpu_id)
+            if pids is None:
+                return
+            stragglers = (pids & own_pids) if own_pids is not None else (pids - exclude)
+            if not stragglers:
+                return
+            if time.monotonic() >= deadline:
+                print(
+                    f"[agresources] WARNING: gpu_id={gpu_id} still shows compute "
+                    f"processes {sorted(stragglers)} after {self.gpu_release_wait_timeout_s}s; "
+                    "releasing anyway"
+                )
+                return
+            time.sleep(poll)
+
+    def release_gpu(self, gpu_id: int, own_pids: "set[int] | None" = None) -> None:
         sem = self._gpu_locks.get(gpu_id)
         if sem is not None:
-            # Gap between release calls so a just-freed GPU isn't immediately
-            # re-acquired before any concurrent teardown-path release for the
-            # same gpu_id has had a chance to land (and hit the ValueError
-            # guard below) rather than racing a fresh acquire.
-            time.sleep(3.0)
+            self._wait_for_gpu_clear(gpu_id, own_pids)
             try:
                 sem.release()
             except ValueError as _e:

@@ -432,6 +432,90 @@ class TestGpuMarkers:
             "Physical GPU IDs were passed directly instead of being remapped."
         )
 
+    def test_allocate_gpu_markers_falls_back_to_rocm_when_no_libcuda(self):
+        """On an AMD-only host (no libcuda.so.1 at all), markers must be
+        allocated via ROCm/HIP instead of silently doing nothing."""
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_hip = MagicMock()
+        mock_hip.hipInit.return_value = 0
+        mock_hip.hipSetDevice.return_value = 0
+        mock_hip.hipMalloc.return_value = 0
+
+        def _cdll(name, *a, **kw):
+            if name == "libcuda.so.1":
+                raise OSError("libcuda.so.1 not found")
+            assert name == "libamdhip64.so"
+            return mock_hip
+
+        with patch.object(ctypes, "CDLL", side_effect=_cdll):
+            _allocate_gpu_markers([0, 1])
+        assert mock_hip.hipSetDevice.call_count == 2
+        assert mock_hip.hipMalloc.call_count == 2
+
+    def test_allocate_gpu_markers_skips_rocm_on_hipinit_failure(self):
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_hip = MagicMock()
+        mock_hip.hipInit.return_value = 1  # failure
+
+        def _cdll(name, *a, **kw):
+            if name == "libcuda.so.1":
+                raise OSError("libcuda.so.1 not found")
+            return mock_hip
+
+        with patch.object(ctypes, "CDLL", side_effect=_cdll):
+            _allocate_gpu_markers([0])  # must not raise
+        mock_hip.hipSetDevice.assert_not_called()
+
+    def test_allocate_gpu_markers_skips_entirely_when_neither_cuda_nor_rocm_present(self):
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        with patch.object(ctypes, "CDLL", side_effect=OSError("not found")):
+            _allocate_gpu_markers([0, 1])  # must not raise
+
+    def test_allocate_gpu_markers_remaps_hip_device_indices_with_hip_visible_devices(self):
+        """When HIP_VISIBLE_DEVICES=1,3, physical IDs must be remapped to HIP
+        device indices 0-1 before calling hipSetDevice -- same remap bug class
+        as the CUDA/CUDA_VISIBLE_DEVICES case above, for the ROCm path."""
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_hip = MagicMock()
+        mock_hip.hipInit.return_value = 0
+        mock_hip.hipSetDevice.return_value = 0
+        mock_hip.hipMalloc.return_value = 0
+
+        def _cdll(name, *a, **kw):
+            if name == "libcuda.so.1":
+                raise OSError("libcuda.so.1 not found")
+            return mock_hip
+
+        with patch.object(ctypes, "CDLL", side_effect=_cdll):
+            with patch.dict(os.environ, {"HIP_VISIBLE_DEVICES": "1,3"}):
+                _allocate_gpu_markers([1, 3])
+        called_devs = [call.args[0] for call in mock_hip.hipSetDevice.call_args_list]
+        assert called_devs == [0, 1], (
+            f"Expected HIP device indices [0,1], got {called_devs}. "
+            "Physical GPU IDs were passed directly instead of being remapped."
+        )
+
+    def test_allocate_gpu_markers_does_not_try_rocm_when_cuda_available(self):
+        """CUDA present and working -- ROCm/HIP must never be attempted."""
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_cuda = MagicMock()
+        mock_cuda.cuInit.return_value = 0
+        mock_cuda.cuCtxCreate_v2.return_value = 0
+        mock_cuda.cuMemAlloc_v2.return_value = 0
+        with patch.object(ctypes, "CDLL", return_value=mock_cuda) as cdll:
+            _allocate_gpu_markers([0])
+        cdll.assert_called_once_with("libcuda.so.1")
+
     def test_non_main_process_name_blocks_allocation(self):
         """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
         from agency import agresources

@@ -388,7 +388,9 @@ class agskill:
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 ag._set_ui_state("error" if _had_error else "finished")
                 if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
-                    resource_pool.release_gpu(ag.sandbox._gpu_id)
+                    resource_pool.release_gpu(
+                        ag.sandbox._gpu_id, own_pids=ag.sandbox._own_host_pids()
+                    )
                     ag.sandbox._gpu_id = None
                 if ag.sandbox is not None:
                     ag.sandbox.stop(commit=True)

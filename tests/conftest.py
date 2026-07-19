@@ -2,6 +2,7 @@
 
 import pytest
 import agency.agutil as _agutil_module
+import agency.agresources as _agresources_module
 from agency.agent import agent
 from agency.agname import agname as _agname
 
@@ -10,6 +11,24 @@ from agency.agname import agname as _agname
 def _test_env(monkeypatch):
     """Set stream-batch delay to zero so tests don't sleep 100 ms per LLM call."""
     monkeypatch.setattr(_agutil_module, "_BATCH_INTERVAL_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gpu_process_check(monkeypatch):
+    """release_gpu() polls real nvidia-smi/rocm-smi to confirm a GPU's
+    compute processes have exited before freeing it (see
+    agresources._wait_for_gpu_clear). On a host that actually has working
+    rocm-smi/nvidia-smi and real GPU tenants (this box does), an unmocked
+    pool.release_gpu() call in an unrelated test would perform a REAL query
+    against genuinely shared hardware and could block for up to
+    gpu_release_wait_timeout_s waiting on some other tenant's unrelated
+    workload -- nondeterministic and slow. Default every test to "confirmed
+    no stragglers" so plain acquire/release tests aren't coupled to live
+    external GPU state; tests that specifically exercise the real dispatch
+    call agresources._gpu_compute_pids (or its nvidia/rocm helpers) directly
+    via their own import, which this monkeypatch doesn't affect, or override
+    this default themselves with their own monkeypatch.setattr."""
+    monkeypatch.setattr(_agresources_module, "_gpu_compute_pids", lambda gpu_id: set())
 
 
 @pytest.fixture(autouse=True)

@@ -480,9 +480,17 @@ class TestDockerCommandHelpers:
 
     # --- destroy semaphore release ---
 
-    def test_destroy_releases_semaphore_even_when_rm_raises(self):
-        """The shared (docker+podman) concurrency semaphore must be released
-        in finally even if rm fails."""
+    def test_destroy_does_not_release_semaphore_when_container_still_running_after_rm_failure(
+        self,
+    ):
+        """If rm genuinely fails and the container is confirmed STILL
+        running afterward, the runtime slot must NOT be released -- it's
+        still physically held. Releasing here would over-credit the
+        semaphore (letting one more container start than the host's kernel
+        keyring quota actually allows) for a container that never actually
+        went away. Regression test for the double-release/over-credit bug
+        this exact scenario used to cause: destroy() releasing unconditionally
+        in `finally` regardless of whether removal actually succeeded."""
         import agency.agsandbox_backends.container as _container_mod
         import agency.agsandbox_backends.docker as _mod
 
@@ -505,6 +513,8 @@ class TestDockerCommandHelpers:
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(sb._backend, "_started", True):
+                # Still running both before AND after the failed rm attempt --
+                # removal truly never happened.
                 with patch.object(sb._backend, "_container_running", return_value=True):
                     with patch.object(sb._backend, "_container_status", return_value="running"):
                         with patch.object(
@@ -515,7 +525,54 @@ class TestDockerCommandHelpers:
                             with pytest.raises(RuntimeError, match="rm exploded"):
                                 sb.destroy()
 
-        assert released, "semaphore must be released even when rm raises"
+        assert not released, (
+            "semaphore must NOT be released while the container is confirmed still running"
+        )
+
+    def test_destroy_releases_semaphore_when_container_confirmed_gone_despite_rm_error(self):
+        """If rm raises (e.g. a transient secondary error) but the container
+        is actually confirmed gone by the time destroy() checks again, the
+        runtime slot must still be released -- it really is free now, and an
+        error from rm alone shouldn't strand the slot as unreleasable
+        forever."""
+        import agency.agsandbox_backends.container as _container_mod
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            if "images" in args:
+                result = OK()
+                result.stdout = b""
+                return result
+            return OK()
+
+        released = []
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            # _started=True short-circuits had_container's "self._started or
+            # self._container_running()" check, so _container_running() is
+            # only actually called once in this whole path: the recheck in
+            # destroy()'s `finally` after the failed rm. False there means
+            # "confirmed gone by the time we check."
+            with patch.object(sb._backend, "_started", True):
+                with patch.object(sb._backend, "_container_running", return_value=False):
+                    with patch.object(sb._backend, "_container_status", return_value="running"):
+                        with patch.object(
+                            _container_mod._container_semaphore,
+                            "release",
+                            side_effect=lambda: released.append(1),
+                        ):
+                            with pytest.raises(RuntimeError, match="rm exploded"):
+                                sb.destroy()
+
+        assert released, "semaphore must be released once the container is confirmed gone"
 
     def test_destroy_skips_rm_when_container_absent(self):
         """destroy() must not call rm when the container does not exist."""

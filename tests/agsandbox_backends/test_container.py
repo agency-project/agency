@@ -460,6 +460,108 @@ class TestRun:
 
 
 # ---------------------------------------------------------------------------
+# _own_host_pids() -- scopes release_gpu()'s straggler wait to processes THIS
+# container spawned (see agresources._wait_for_gpu_clear's own_pids param),
+# not an unrelated tenant sharing the same physical GPU. Derived from
+# {{.State.Pid}} (documented as the container's HOST-side init pid on both
+# runtimes) plus a /proc child-PID walk, rather than `docker/podman top`,
+# whose PID column's host-vs-namespaced semantics differ between runtimes.
+# ---------------------------------------------------------------------------
+
+
+class TestOwnHostPids:
+    def _sb(self):
+        from agency.agsandbox_backends.podman import _PodmanBackend
+
+        return _PodmanBackend(
+            "agent",
+            name="own-host-pids-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=None,
+        )
+
+    def test_returns_empty_when_inspect_fails(self):
+        sb = self._sb()
+        fail = MagicMock()
+        fail.returncode = 1
+        with patch("subprocess.run", return_value=fail):
+            assert sb._own_host_pids() == set()
+
+    def test_returns_empty_on_non_positive_pid(self):
+        """{{.State.Pid}} is 0 for a container that exists but isn't
+        running -- must not be treated as a real PID to walk from."""
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"0\n"
+        with patch("subprocess.run", return_value=ok):
+            assert sb._own_host_pids() == set()
+
+    def test_returns_empty_on_unparseable_pid(self):
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"not-a-pid\n"
+        with patch("subprocess.run", return_value=ok):
+            assert sb._own_host_pids() == set()
+
+    def test_walks_full_process_tree_from_init_pid(self, monkeypatch):
+        """init(100) -> {101, 102}; 101 -> {103}; 102 and 103 are leaves --
+        every descendant must be included, not just direct children."""
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"100\n"
+
+        children_by_pid = {100: "101 102", 101: "103", 102: "", 103: ""}
+
+        class _FakePath:
+            def __init__(self, s):
+                self._s = s
+
+            def read_text(self):
+                import re
+
+                m = re.search(r"/proc/(\d+)/task/\d+/children", self._s)
+                pid = int(m.group(1))
+                if pid not in children_by_pid:
+                    raise OSError(f"no such pid {pid}")
+                return children_by_pid[pid]
+
+        with patch("subprocess.run", return_value=ok):
+            monkeypatch.setattr("agency.agsandbox_backends.container.Path", _FakePath)
+            assert sb._own_host_pids() == {100, 101, 102, 103}
+
+    def test_stops_at_dead_ends_without_raising(self):
+        """A child pid that has already exited by the time we read its own
+        /proc/<pid>/task/<pid>/children (race between listing it as a child
+        and reading its own file) must not blow up the whole walk."""
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"100\n"
+
+        with patch("subprocess.run", return_value=ok):
+            with patch("agency.agsandbox_backends.container.Path", side_effect=_RaisingOnAllPath):
+                result = sb._own_host_pids()
+        assert result == {100}
+
+
+class _RaisingOnAllPath:
+    """Every /proc/<pid>/task/<pid>/children read raises -- init pid itself
+    has no discoverable children, so the walk must still return {init_pid}
+    rather than propagating the OSError."""
+
+    def __init__(self, s):
+        self._s = s
+
+    def read_text(self):
+        raise OSError("no children")
+
+
+# ---------------------------------------------------------------------------
 # _gpu_flags(runtime) -- regression coverage for the bug where Docker's
 # ``--gpus all`` was used unconditionally for Podman too. Podman accepts that
 # flag without erroring but never mounts the NVIDIA driver/devices for it, so
@@ -606,6 +708,66 @@ def _docker_has_image(image: str) -> bool:
         )
     except Exception:
         return False
+
+
+docker_only = pytest.mark.skipif(not _docker_available(), reason="Docker daemon not reachable")
+
+
+class TestOwnHostPidsRealContainerIntegration:
+    """_own_host_pids() against a REAL container -- no GPU/special image
+    required, just a plain generic image, unlike the GPU integration classes
+    below. Verifies the {{.State.Pid}} + /proc child-walk approach actually
+    matches ground truth (docker top's own pid listing) rather than relying
+    solely on the mocked TestOwnHostPids above.
+    """
+
+    @docker_only
+    def test_matches_real_docker_top_pids(self):
+        import uuid
+        from agency.agsandbox_backends.docker import _DockerBackend
+
+        name = f"own-host-pids-real-{uuid.uuid4().hex[:8]}"
+        try:
+            subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--name",
+                    name,
+                    "alpine",
+                    "sh",
+                    "-c",
+                    "sleep 30 & sleep 30",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            sb = _DockerBackend(
+                "agent",
+                name=name,
+                checkpoint_image=None,
+                base_image="alpine",
+                mounts={},
+                agconfig=None,
+            )
+            result = sb._own_host_pids()
+
+            top = subprocess.run(
+                ["docker", "top", name, "-eo", "pid"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+            expected = {
+                int(line.strip()) for line in top.stdout.splitlines()[1:] if line.strip().isdigit()
+            }
+            assert expected, "expected docker top to report at least one real pid"
+            assert result == expected
+        finally:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
 
 
 docker_gpu = pytest.mark.skipif(

@@ -199,6 +199,14 @@ class _ChrootBackend(agsandbox_backend):
     def _lifecycle_tag(self) -> str:
         return f"agency/lifecycle-{self._name}".lower()
 
+    def _own_host_pids(self) -> "set[int]":
+        """Chroot processes run directly on the host (no PID namespace, no
+        container to inspect) -- _watched_pids is already host-native, so
+        it's the exact same PID space release_gpu()'s straggler wait needs;
+        no translation required (contrast _ContainerBackendBase's version,
+        which has to derive host PIDs from a container's own namespace)."""
+        return set(self._watched_pids)
+
     def _ensure_started(self) -> None:
         """Create the jail's workspace directory on first use, restoring it
         from ``_checkpoint_image`` if one was given at construction time.
@@ -358,7 +366,7 @@ class _ChrootBackend(agsandbox_backend):
         committing real work just because *this* process's flag never
         flipped to True."""
         if self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id)
+            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
             self._gpu_id = None
         self._watched_pids = {}
         self._baseline_pids = set()

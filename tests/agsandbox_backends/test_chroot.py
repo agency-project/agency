@@ -60,6 +60,35 @@ class TestSanitizeTag:
 
 
 # ---------------------------------------------------------------------------
+# _own_host_pids -- scopes release_gpu()'s straggler wait to this sandbox's
+# own processes (see agresources._wait_for_gpu_clear's own_pids param).
+# Chroot processes run directly on the host (no PID namespace to translate
+# through, unlike _ContainerBackendBase's version), so _watched_pids is
+# already the right PID space -- no real chroot jail needed to test this.
+# ---------------------------------------------------------------------------
+
+
+class TestOwnHostPids:
+    def test_matches_watched_pids(self):
+        sb = _make_backend()
+        sb._watched_pids = {111: 0.0, 222: 0.0}
+        assert sb._own_host_pids() == {111, 222}
+
+    def test_empty_when_no_watched_pids(self):
+        sb = _make_backend()
+        assert sb._own_host_pids() == set()
+
+    def test_returns_a_copy_not_a_live_view(self):
+        """Mutating _watched_pids afterward must not retroactively change an
+        already-returned snapshot out from under a caller mid-wait."""
+        sb = _make_backend()
+        sb._watched_pids = {111: 0.0}
+        result = sb._own_host_pids()
+        sb._watched_pids[222] = 0.0
+        assert result == {111}
+
+
+# ---------------------------------------------------------------------------
 # _ChrootBackend -- functional (requires unprivileged userns + chroot)
 # ---------------------------------------------------------------------------
 

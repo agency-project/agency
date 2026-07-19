@@ -65,7 +65,7 @@ def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
         sandbox._gpu_virtual = False
         if sandbox._gpu_id is not None:
-            pool.release_gpu(sandbox._gpu_id)
+            pool.release_gpu(sandbox._gpu_id, own_pids=sandbox._own_host_pids())
             sandbox._gpu_id = None
         return agdata(message="GPU released")
 
