@@ -9,19 +9,22 @@ mocked tests (see tests/agharness_internal/agharness_backends/test_codex.py), ne
 a live process.
 
 Codex speaks the OpenAI Responses API only (`wire_api="chat"` was removed
-upstream) -- `agproxy_llm`'s only implemented route is chat-completions
-passthrough, so `gateway_mode="translate"` is mandatory here, not optional
-the way it is for opencode/Claude Code's matched-format cases. That
-Responses-API adapter is NOT implemented (same documented gap as Claude
-Code's Messages-API adapter) -- see docs/Design_harness_integration.md's
-Component 1 and agproxy_llm.py's module docstring. Until it exists, this
-backend does not override the harness's LLM endpoint at all.
+upstream), routed at `agproxy_llm`'s `/v1/responses` route (`gateway_mode=
+"translate"` -- see agproxy_llm.py/agproxy_llm_adapters.py's Responses-API
+adapter). This backend writes a `[model_providers.agency-proxy]` block into
+an isolated `CODEX_HOME/config.toml` pointing `base_url` at the gateway and
+selects it as the active provider; the gateway token is passed via an env
+var named by `env_key` (Codex's config schema wants an env-var *name*, not
+an inline key, per its documented config.toml shape) -- the Responses-API
+wire adapter itself is unverified against a live `codex` binary (same
+"no binary available" caveat as the rest of this module).
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import uuid
 from typing import TYPE_CHECKING
 
 from ...agdata import agdata, agerror
@@ -40,6 +43,8 @@ def codex_available() -> bool:
 class _CodexBackend(agharness_backend):
     _DEFAULT_BINARY = "codex"
     _DEFAULT_TIMEOUT_S = 600
+    _PROVIDER_NAME = "agency-proxy"
+    _ENV_KEY_NAME = "AGENCY_PROXY_API_KEY"
 
     def execute(
         self,
@@ -51,6 +56,7 @@ class _CodexBackend(agharness_backend):
         skill: "agskill",
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from ... import agharness
+        from ..agproxy_llm import get_shared_gateway
         from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
 
         sys_msg = {"role": "system", "content": skill._build_system_prompt()}
@@ -60,8 +66,15 @@ class _CodexBackend(agharness_backend):
         if resolved is None:
             return agerror(f"codex binary {binary!r} not found on PATH"), prev_ctx, [sys_msg]
 
-        config_home = agharness.materialize_config_home(ag, token="", base_url="")
+        gateway = get_shared_gateway(ag.agconfig)
+        token = uuid.uuid4().hex
+        gateway.register(token, ag)
+
+        config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
         try:
+            model = getattr(ag.llm.backend, "model", "") or "default"
+            self._write_codex_config(config_home, gateway.base_url, model)
+
             prompt = agharness.build_user_turn_prompt(skill, skill_input)
             if not isinstance(prompt, str):
                 prompt = json.dumps(prompt)
@@ -76,6 +89,10 @@ class _CodexBackend(agharness_backend):
             envp = {
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
                 "CODEX_HOME": str(config_home),
+                # Referenced by config.toml's `env_key` -- Codex reads the
+                # provider's API key from the env var *named* there, not
+                # from an inline value in config.toml.
+                self._ENV_KEY_NAME: token,
             }
 
             px = agProxyPtrace(ag.agconfig)
@@ -86,6 +103,7 @@ class _CodexBackend(agharness_backend):
 
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
         finally:
+            gateway.unregister(token)
             agharness.cleanup_config_home(config_home)
 
         if rc != 0:
@@ -107,6 +125,19 @@ class _CodexBackend(agharness_backend):
 
         prev_ctx.messages = [user_msg, assistant_msg]
         return result, prev_ctx, [sys_msg, user_msg, assistant_msg]
+
+    def _write_codex_config(self, config_home, base_url: str, model: str) -> None:
+        toml_text = (
+            f'model = "{model}"\n'
+            f'model_provider = "{self._PROVIDER_NAME}"\n'
+            f"\n"
+            f"[model_providers.{self._PROVIDER_NAME}]\n"
+            f'name = "Agency Proxy"\n'
+            f'base_url = "{base_url}/v1"\n'
+            f'env_key = "{self._ENV_KEY_NAME}"\n'
+            f'wire_api = "responses"\n'
+        )
+        (config_home / "config.toml").write_text(toml_text)
 
     @staticmethod
     def _parse_output_events(stdout: str) -> str:

@@ -35,6 +35,7 @@ def _make_gateway_with_agent(token="tok", stream_result=None, single_result=None
         )
     fake_ag = MagicMock()
     fake_ag.llm.backend.make_client.return_value = fake_client
+    fake_ag.llm.backend.model = "configured-model"
     px.register(token, fake_ag)
     return px, fake_ag, fake_client
 
@@ -124,6 +125,179 @@ def test_start_returns_real_bound_url_and_stop_is_idempotent():
     px.stop()
     px.stop()  # idempotent, must not raise
     assert px.base_url is None
+
+
+class _Fn:
+    def __init__(self, name="", arguments=""):
+        self.name = name
+        self.arguments = arguments
+
+
+class _ToolCall:
+    def __init__(self, id="", name="", arguments="", index=0):
+        self.id = id
+        self.function = _Fn(name, arguments)
+        self.index = index
+
+
+class _Message:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _Choice:
+    def __init__(self, message=None, delta=None, finish_reason=None):
+        self.message = message
+        self.delta = delta
+        self.finish_reason = finish_reason
+
+
+class _Usage:
+    def __init__(self, prompt_tokens=0, completion_tokens=0):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+class _Response:
+    def __init__(self, choices, usage=None):
+        self.choices = choices
+        self.usage = usage
+
+
+class _Delta:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _Chunk:
+    def __init__(self, choices=(), usage=None):
+        self.choices = list(choices)
+        self.usage = usage
+
+
+def test_anthropic_messages_route_missing_token_returns_401():
+    px, _, _ = _make_gateway_with_agent()
+    client = _client_for(px)
+    resp = client.post("/v1/messages", json={"model": "m", "messages": []})
+    assert resp.status_code == 401
+    assert resp.json()["type"] == "error"
+
+
+def test_anthropic_messages_route_non_streaming_translates_request_and_response():
+    px, ag, fake_client = _make_gateway_with_agent(token="tok")
+    fake_client.chat.completions.create.return_value = _Response(
+        [_Choice(message=_Message(content="hi there"), finish_reason="stop")], usage=_Usage(5, 3)
+    )
+    client = _client_for(px)
+    body = {
+        "model": "claude-x",
+        "system": "be helpful",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+    }
+    resp = client.post("/v1/messages", json=body, headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["type"] == "message"
+    assert payload["content"] == [{"type": "text", "text": "hi there"}]
+    assert payload["stop_reason"] == "end_turn"
+    assert payload["usage"] == {"input_tokens": 5, "output_tokens": 3}
+
+    # the underlying client was called with reshaped OpenAI kwargs, not the
+    # raw Anthropic body -- genuine translation, not passthrough.
+    call_kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["messages"][0] == {"role": "system", "content": "be helpful"}
+    assert call_kwargs["messages"][1] == {"role": "user", "content": "hello"}
+    assert call_kwargs["max_tokens"] == 100
+    # The agent's OWN configured model is used, never the harness's own
+    # request body model -- regression test for a real bug hit against the
+    # live `claude` CLI: Claude Code's default model id has no reason to
+    # match this agent's configured backend model (e.g. a Bedrock
+    # inference-profile id), so trusting the harness's choice 400s against
+    # the real backend instead of routing through agency's own config.
+    assert call_kwargs["model"] == "configured-model"
+    assert call_kwargs["model"] != body["model"]
+
+
+def test_anthropic_messages_route_streaming_returns_anthropic_sse():
+    px, ag, fake_client = _make_gateway_with_agent(token="tok")
+    fake_client.chat.completions.create.return_value = [
+        _Chunk(choices=[_Choice(delta=_Delta(content="hi"))]),
+        _Chunk(choices=[_Choice(delta=_Delta(), finish_reason="stop")]),
+        _Chunk(usage=_Usage(prompt_tokens=1, completion_tokens=1)),
+    ]
+    client = _client_for(px)
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+    resp = client.post("/v1/messages", json=body, headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 200
+    assert "event: message_start" in resp.text
+    assert "event: content_block_delta" in resp.text
+    assert "event: message_stop" in resp.text
+
+
+def test_anthropic_count_tokens_route_returns_estimate():
+    px, _, _ = _make_gateway_with_agent(token="tok")
+    client = _client_for(px)
+    body = {"system": "abcd", "messages": [{"role": "user", "content": "abcdefgh"}]}
+    resp = client.post(
+        "/v1/messages/count_tokens", json=body, headers={"Authorization": "Bearer tok"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["input_tokens"] >= 1
+
+
+def test_anthropic_count_tokens_route_missing_token_returns_401():
+    px, _, _ = _make_gateway_with_agent()
+    client = _client_for(px)
+    resp = client.post("/v1/messages/count_tokens", json={"messages": []})
+    assert resp.status_code == 401
+
+
+def test_openai_responses_route_missing_token_returns_401():
+    px, _, _ = _make_gateway_with_agent()
+    client = _client_for(px)
+    resp = client.post("/v1/responses", json={"model": "m", "input": "hi"})
+    assert resp.status_code == 401
+
+
+def test_openai_responses_route_non_streaming_translates_request_and_response():
+    px, ag, fake_client = _make_gateway_with_agent(token="tok")
+    fake_client.chat.completions.create.return_value = _Response(
+        [_Choice(message=_Message(content="the answer is 4"))], usage=_Usage(3, 4)
+    )
+    client = _client_for(px)
+    body = {"model": "m", "instructions": "be terse", "input": "what is 2+2?", "stream": False}
+    resp = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "completed"
+    assert payload["output"][0]["content"] == [
+        {"type": "output_text", "text": "the answer is 4", "annotations": []}
+    ]
+
+    call_kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["messages"] == [
+        {"role": "system", "content": "be terse"},
+        {"role": "user", "content": "what is 2+2?"},
+    ]
+    assert call_kwargs["model"] == "configured-model"
+
+
+def test_openai_responses_route_streaming_returns_responses_sse():
+    px, ag, fake_client = _make_gateway_with_agent(token="tok")
+    fake_client.chat.completions.create.return_value = [
+        _Chunk(choices=[_Choice(delta=_Delta(content="hi"))]),
+        _Chunk(choices=[_Choice(delta=_Delta(), finish_reason="stop")]),
+    ]
+    client = _client_for(px)
+    body = {"model": "m", "input": "hi", "stream": True}
+    resp = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 200
+    assert "event: response.created" in resp.text
+    assert "event: response.completed" in resp.text
 
 
 def test_agproxy_llm_config_view():

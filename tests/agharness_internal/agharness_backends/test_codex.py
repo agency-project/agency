@@ -21,6 +21,7 @@ from agency.agskill import agskill
 def _make_agent(with_sandbox=True):
     ag = MagicMock()
     ag.agconfig = agConfig()
+    ag.llm.backend.model = "test-model"
     ag.sandbox = MagicMock() if with_sandbox else None
     return ag
 
@@ -29,6 +30,17 @@ def _make_handle(stdout="", stderr="", rc=0):
     handle = MagicMock()
     handle.wait.return_value = (stdout, stderr, rc)
     return handle
+
+
+def _patched_gateway_and_ptrace(handle):
+    mock_gateway = MagicMock()
+    mock_gateway.base_url = "http://127.0.0.1:1"
+
+    def apply(mock_gateway_getter, mock_px_cls):
+        mock_gateway_getter.return_value = mock_gateway
+        mock_px_cls.return_value.launch.return_value = handle
+
+    return mock_gateway, apply
 
 
 @pytest.fixture(autouse=True)
@@ -70,16 +82,20 @@ def test_execute_parses_ndjson_agent_message():
     )
     handle = _make_handle(stdout=stdout)
     with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox") as mock_wire,
     ):
-        mock_px_cls.return_value.launch.return_value = handle
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
         result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
 
     assert not isinstance(result, agerror)
     assert result.result == "hi"
     assert ctx is prev_ctx
     mock_wire.assert_called_once_with(handle, ag.sandbox)
+    mock_gateway.register.assert_called_once()
+    mock_gateway.unregister.assert_called_once()
 
 
 def test_execute_nonzero_exit_returns_agerror():
@@ -90,10 +106,12 @@ def test_execute_nonzero_exit_returns_agerror():
 
     handle = _make_handle(stdout="", stderr="boom", rc=1)
     with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
     ):
-        mock_px_cls.return_value.launch.return_value = handle
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
         result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
 
     assert isinstance(result, agerror)
@@ -113,14 +131,53 @@ def test_execute_recovers_structured_output_schema():
     )
     handle = _make_handle(stdout=stdout)
     with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
     ):
-        mock_px_cls.return_value.launch.return_value = handle
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
         result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
 
     assert not isinstance(result, agerror)
     assert result.answer == "42"
+
+
+def test_execute_writes_model_providers_config_toml():
+    backend = _CodexBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    ag = _make_agent()
+
+    handle = _make_handle(stdout='{"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}')
+    written = {}
+
+    def fake_launch(argv, envp, *, cwd, policy, ag):
+        from pathlib import Path
+
+        written["envp"] = envp
+        written["content"] = (Path(cwd) / "config.toml").read_text()
+        return handle
+
+    with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
+        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
+        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
+    ):
+        mock_gateway, _ = _patched_gateway_and_ptrace(handle)
+        mock_gateway_getter.return_value = mock_gateway
+        mock_px_cls.return_value.launch.side_effect = fake_launch
+
+        backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
+
+    content = written["content"]
+    assert 'model_provider = "agency-proxy"' in content
+    assert 'wire_api = "responses"' in content
+    assert mock_gateway.base_url in content
+    assert "test-model" in content
+    # the gateway token is passed via the env var config.toml's env_key names,
+    # not embedded directly in the file.
+    assert written["envp"]["AGENCY_PROXY_API_KEY"]
+    assert written["envp"]["AGENCY_PROXY_API_KEY"] not in content
 
 
 def test_parse_output_events_ignores_non_agent_message_items():

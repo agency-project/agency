@@ -10,6 +10,7 @@ from agency.agharness_internal.agharness_backends.base import agharness_backend,
 from agency.agharness_internal.agharness_backends.opencode import _OpencodeBackend
 from agency.agharness_internal.agharness_backends.claude_code import _ClaudeCodeBackend
 from agency.agharness_internal.agharness_backends.codex import _CodexBackend
+from agency.agharness_internal.agharness_backends.grok import _GrokBackend
 
 
 class TestForConfigDispatch:
@@ -24,6 +25,10 @@ class TestForConfigDispatch:
     def test_codex_engine_returns_codex_backend(self):
         backend = agharness_backend.for_config("codex", agConfig())
         assert isinstance(backend, _CodexBackend)
+
+    def test_grok_engine_returns_grok_backend(self):
+        backend = agharness_backend.for_config("grok", agConfig())
+        assert isinstance(backend, _GrokBackend)
 
     def test_unknown_engine_raises_value_error(self):
         with pytest.raises(ValueError, match="Unknown harness engine"):

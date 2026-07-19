@@ -10,18 +10,24 @@ bearer token), and to the exact wire format that agent's own backend
 already speaks -- no protocol translation for this phase, see
 docs/Design_harness_integration.md's Component 1.
 
-Chat-completions passthrough only (Phase 3): this already matches agllm's
-internal format 1:1, so the route below just forwards the request body to
-the agent's own backend client and streams the response back unmodified --
-no request/response reshaping. An Anthropic Messages / OpenAI Responses
-adapter (for harnesses that don't speak chat-completions natively) is
-future work, not built here.
+Three routes: `/v1/chat/completions` is a straight passthrough (already
+matches agllm's internal format 1:1, used by opencode/Grok Build, whose
+providers already speak chat-completions). `/v1/messages` (Anthropic
+Messages API, used by Claude Code) and `/v1/responses` (OpenAI Responses
+API, used by Codex) are translated: the incoming request is reshaped into
+chat-completions kwargs, dispatched through the exact same
+`client.chat.completions.create()` every backend uniformly exposes, and the
+(possibly streaming) response reshaped back into the harness's native
+format -- see `agproxy_llm_adapters.py` for the conversion functions
+themselves, kept in a separate module so this file stays about routing, not
+wire-format detail.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 import httpx
@@ -30,6 +36,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
+from .agproxy_llm_adapters import (
+    anthropic_messages_to_openai,
+    openai_response_to_anthropic_message,
+    openai_chunks_to_anthropic_sse,
+    responses_request_to_openai,
+    openai_response_to_responses_api,
+    openai_chunks_to_responses_sse,
+)
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
@@ -130,6 +144,103 @@ class agProxyLLM:
                 return StreamingResponse(sse_gen(), media_type="text/event-stream")
             result = client.chat.completions.create(**body)
             return JSONResponse(result.model_dump())
+
+        @app.post("/v1/messages")
+        async def anthropic_messages(request: Request):
+            token = _extract_bearer_token(request)
+            ag = self._agent_for_token(token)
+            if ag is None:
+                return JSONResponse(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "authentication_error",
+                            "message": "unknown or missing bearer token",
+                        },
+                    },
+                    status_code=401,
+                )
+            body = await request.json()
+            # Route to the model THIS agent is configured for, not whatever
+            # model name the harness itself happened to request -- Claude
+            # Code's own default model id has no reason to match this
+            # agent's configured backend/model (e.g. a Bedrock inference-
+            # profile id), so trusting the harness's choice here would 400
+            # against the real backend rather than actually routing through
+            # agency's own configured LLM. Hit and fixed against the real
+            # `claude` CLI during development.
+            model = getattr(ag.llm.backend, "model", "") or body.get("model", "")
+            request_id = f"msg_{uuid.uuid4().hex}"
+            timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
+            client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
+            openai_kwargs = anthropic_messages_to_openai(body)
+            openai_kwargs["model"] = model
+
+            if body.get("stream"):
+
+                def sse_gen():
+                    chunks = client.chat.completions.create(**openai_kwargs)
+                    for frame in openai_chunks_to_anthropic_sse(chunks, model, request_id):
+                        yield frame
+
+                return StreamingResponse(sse_gen(), media_type="text/event-stream")
+
+            resp = client.chat.completions.create(**openai_kwargs)
+            return JSONResponse(openai_response_to_anthropic_message(resp, model, request_id))
+
+        @app.post("/v1/messages/count_tokens")
+        async def anthropic_count_tokens(request: Request):
+            # No tokenizer wired up here -- a rough heuristic (chars / 4) is
+            # good enough for Claude Code's own context-usage estimates,
+            # which this endpoint only feeds informationally.
+            token = _extract_bearer_token(request)
+            if self._agent_for_token(token) is None:
+                return JSONResponse(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "authentication_error",
+                            "message": "unknown or missing bearer token",
+                        },
+                    },
+                    status_code=401,
+                )
+            body = await request.json()
+            approx_chars = len(str(body.get("system", ""))) + sum(
+                len(str(m.get("content", ""))) for m in body.get("messages", [])
+            )
+            return JSONResponse({"input_tokens": max(1, approx_chars // 4)})
+
+        @app.post("/v1/responses")
+        async def openai_responses(request: Request):
+            token = _extract_bearer_token(request)
+            ag = self._agent_for_token(token)
+            if ag is None:
+                return JSONResponse(
+                    {"error": {"message": "unknown or missing bearer token"}}, status_code=401
+                )
+            body = await request.json()
+            # Same reasoning as /v1/messages above: route to this agent's
+            # own configured model, not whatever Codex's own default
+            # happened to request.
+            model = getattr(ag.llm.backend, "model", "") or body.get("model", "")
+            request_id = f"resp_{uuid.uuid4().hex}"
+            timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
+            client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
+            openai_kwargs = responses_request_to_openai(body)
+            openai_kwargs["model"] = model
+
+            if body.get("stream"):
+
+                def sse_gen():
+                    chunks = client.chat.completions.create(**openai_kwargs)
+                    for frame in openai_chunks_to_responses_sse(chunks, model, request_id):
+                        yield frame
+
+                return StreamingResponse(sse_gen(), media_type="text/event-stream")
+
+            resp = client.chat.completions.create(**openai_kwargs)
+            return JSONResponse(openai_response_to_responses_api(resp, model, request_id))
 
         return app
 

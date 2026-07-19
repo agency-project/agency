@@ -104,6 +104,7 @@ class agharness_backend(AgHarnessFields):
     def for_config(engine: str, agconfig: "agConfig") -> "agharness_backend":
         from .claude_code import _ClaudeCodeBackend
         from .codex import _CodexBackend
+        from .grok import _GrokBackend
         from .opencode import _OpencodeBackend
 
         if engine == "opencode":
@@ -112,7 +113,9 @@ class agharness_backend(AgHarnessFields):
             return _ClaudeCodeBackend(agconfig)
         if engine == "codex":
             return _CodexBackend(agconfig)
+        if engine == "grok":
+            return _GrokBackend(agconfig)
         raise ValueError(
             f"Unknown harness engine {engine!r} -- set agent(engine=...) to one of "
-            f"'opencode', 'claude_code', 'codex' (or 'native' for the built-in ReAct loop)"
+            f"'opencode', 'claude_code', 'codex', 'grok' (or 'native' for the built-in ReAct loop)"
         )

@@ -8,7 +8,7 @@
 > for the phase-by-phase build log. This document remains the source of truth for *why* things are
 > shaped this way; where implementation surfaced a correction to an assumption made here (e.g. the
 > container-capability requirement below), the correction is recorded in place rather than left
-> stale. Off-the-shelf coding agent harnesses (Claude Code, Codex CLI, opencode) run as agents
+> stale. Off-the-shelf coding agent harnesses (Claude Code, Codex CLI, opencode, Grok Build) run as agents
 > inside the agency framework **without modifying the harnesses themselves, with minimal
 > interference in how they already operate, and with total, ground-truth visibility into every
 > file and process operation they perform.** Linux/POSIX is the primary target; see
@@ -38,32 +38,33 @@ all the actual work.
 ### Isolation: one generic supervisor, no harness-specific interception code
 
 The syscall-interception layer (`agproxy_ptrace`, Component 3) is a **single process, harness-agnostic by
-construction**. It does not parse Claude Code's hook JSON, Codex's hook JSON, or opencode's plugin
-API — it sees `execve(2)`/`openat(2)`/etc. and resolved arguments, which look identical regardless
-of which binary produced them. One supervisor implementation covers all three harnesses, and any
-future one, with zero per-harness branching. This is what makes "minimal changes to agency" and
-"total capture" compatible: the interception logic lives once, outside every harness-specific code
-path, and the existing agency abstractions (`agpolicy`, `aglog`, `agsandbox`, a profiler hook) run
-underneath it unmodified. The per-harness backend files (`claude_code.py`/`codex.py`/`opencode.py`)
-shrink to "how do I launch this binary headlessly and parse its own turn-level event stream for
-logging/webui purposes" — they carry no execution-capture logic at all.
+construction**. It does not parse Claude Code's hook JSON, Codex's hook JSON, opencode's plugin
+API, or Grok Build's (Claude-Code-compatible) hook JSON — it sees `execve(2)`/`openat(2)`/etc. and
+resolved arguments, which look identical regardless of which binary produced them. One supervisor
+implementation covers all four harnesses, and any future one, with zero per-harness branching.
+This is what makes "minimal changes to agency" and "total capture" compatible: the interception
+logic lives once, outside every harness-specific code path, and the existing agency abstractions
+(`agpolicy`, `aglog`, `agsandbox`, a profiler hook) run underneath it unmodified. The per-harness
+backend files (`claude_code.py`/`codex.py`/`opencode.py`/`grok.py`) shrink to "how do I launch
+this binary headlessly and parse its own turn-level event stream for logging/webui purposes" —
+they carry no execution-capture logic at all.
 
 ---
 
 ## Why This Is Possible
 
-| Capability | Claude Code | Codex CLI (0.144.x) | opencode |
-|---|---|---|---|
-| Custom LLM endpoint | `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`; wire = Anthropic Messages API | `model_providers` in `config.toml`; wire = OpenAI Responses API only | `provider` block naming an ai-sdk package → any wire format |
-| Headless run + turn-level event stream | `claude -p --output-format stream-json` | `codex exec --json` | `opencode serve` (HTTP+SSE) / `opencode run --format json` |
-| Execution-level mediation | **Not needed via the harness's own hooks** — superseded by syscall interception (Component 3), which requires no harness support at all | same | same |
-| Supplemental tools (opt-in, additive only) | MCP | MCP | MCP + native `.opencode/tools/*.ts` |
+| Capability | Claude Code | Codex CLI (0.144.x) | opencode | Grok Build (xAI) |
+|---|---|---|---|---|
+| Custom LLM endpoint | `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`; wire = Anthropic Messages API | `model_providers` in `config.toml`; wire = OpenAI Responses API only | `provider` block naming an ai-sdk package → any wire format | `[model.<name>]` in `config.toml`, `base_url`/`api_key`/`env_key`; `api_backend` selects `chat_completions` \| `responses` \| `messages` — any of the three wire formats |
+| Headless run + turn-level event stream | `claude -p --output-format stream-json` | `codex exec --json` | `opencode serve` (HTTP+SSE) / `opencode run --format json` | `grok -p "..." --output-format json` (single JSON result) / `streaming-json` (NDJSON) |
+| Execution-level mediation | **Not needed via the harness's own hooks** — superseded by syscall interception (Component 3), which requires no harness support at all | same | same | same |
+| Supplemental tools (opt-in, additive only) | MCP | MCP | MCP + native `.opencode/tools/*.ts` | MCP (stdio + HTTP/SSE), plus auto-imports Claude Code's/Cursor's MCP config |
 
 The key shift from earlier drafts of this design: tool-call capture no longer depends on each
 harness's own `PreToolUse`/`tool.execute.before` hook system firing correctly, or on hook JSON
 schemas that have already changed shape at least once per harness in the last year. It depends on
 the kernel delivering `execve`/`open` syscalls, which is a stable, decades-old ABI. Harness-native
-hooks are still functionally available in all three and are kept as a documented **fallback** for
+hooks are still functionally available in all four and are kept as a documented **fallback** for
 environments where `ptrace` isn't usable (see Platform scope / Design Tensions), but they are no
 longer the default mechanism.
 
@@ -86,7 +87,7 @@ agskill  ───────────────────────�
         ↓                           ↓
 agteam / agsync              agharness  (new)
                                      ↓
-                          agharness_internal/agharness_backends/  (new: claude_code.py, codex.py, opencode.py)
+                          agharness_internal/agharness_backends/  (new: claude_code.py, codex.py, opencode.py, grok.py)
                                      ↓
                     ┌────────────────┴────────────────┐
                     ↓                                  ↓
@@ -102,16 +103,27 @@ which gain no new dependencies at all.
 
 ---
 
-## Component 1: `agproxy_llm` — LLM routing (unchanged from prior draft)
+## Component 1: `agproxy_llm` — LLM routing (both modes now implemented)
 
 Agency's LLM client (`agency/agllm.py`) is server-less today; wiring a harness's LLM traffic to an
 agent's `agllm` requires a small local HTTP server translating each harness's wire format
 (Anthropic Messages / OpenAI Responses / chat-completions) to and from agllm's internal
 chat-completions format, routed per-run by a bearer token minted into the harness's isolated
-config/env at launch (`token → agent → agent.llm`). Passthrough mode (skip translation, only
-observe) applies when the configured backend already speaks the harness's native format, to avoid
-losing prompt-cache breakpoints or thinking-block signatures to a round-trip translation. See the
-original rationale — this component is unaffected by the interception redesign below.
+config/env at launch (`token → agent → agent.llm`). Passthrough mode (`/v1/chat/completions`, no
+reshaping) applies when the configured backend already speaks the harness's native format —
+opencode and Grok Build. Translate mode (`/v1/messages` for Claude Code, `/v1/responses` for
+Codex, conversion functions in `agharness_internal/agproxy_llm_adapters.py`) reshapes the request
+into the uniform `client.chat.completions.create()` call every `agllm_backend` exposes and reshapes
+the response back — implemented as unconditional translation for every request on those two
+routes, not a conditional "reuse the native format when it happens to match" optimization. This is
+a real fidelity cost, not a free lunch: extended-thinking blocks, prompt-cache breakpoints
+(`cache_control`), and image content blocks have no chat-completions equivalent and are silently
+dropped on translation rather than erroring. A future optimization could detect when the
+configured backend's *native* format already matches the harness's wire format (e.g. an
+`agAnthropicBackendConfig`-backed agent talking to Claude Code) and skip translation entirely to
+preserve that fidelity — not built, since the immediate goal was closing the "harness bypasses
+agency's backend choice entirely" gap, not maximizing streaming fidelity for an already-matched
+case.
 
 ---
 
@@ -379,11 +391,11 @@ All six phases are implemented and tested; this section is kept as the historica
    mocked tests only.
 4. **Claude Code backend**, verified against the real, authenticated `claude` CLI (v2.1.212)
    end-to-end — both raw-text and structured-`output_schema` output recovery, real
-   `agproxy_ptrace` tracing of the real process. LLM routing through `agproxy_llm` is **not**
-   implemented for this backend (Claude Code speaks the Anthropic Messages API, which
-   `agproxy_llm` doesn't adapt to yet) — the harness authenticates with whatever credentials it
-   already has on the host, same as running it by hand. **Codex backend** built structurally
-   (same shape, mocked tests only) — no `codex` binary was available to verify against.
+   `agproxy_ptrace` tracing of the real process. LLM routing through `agproxy_llm` was **not**
+   implemented for this backend initially (Claude Code speaks the Anthropic Messages API, a
+   different wire format from the chat-completions-only gateway that existed at the time) — closed
+   in a later pass, see item 8 below. **Codex backend** built structurally (same shape, mocked
+   tests only) — no `codex` binary was available to verify against, then or since.
 5. **Harness-native hook fallback** (`agharness_internal/agharness_backends/_native_hooks.py`) — built at the reduced
    scope this phase called for: the hook-JSON ↔ `agsyscallevent`/`agdecision` translation logic is
    real and tested, but it is not wired into any concrete backend's `execute()` as an actual
@@ -394,3 +406,23 @@ All six phases are implemented and tested; this section is kept as the historica
    `dispatch_tools()` gained optional `policy=`/`ag=` parameters, `None` by default so every
    existing native call site is unaffected. `rewrite` is not meaningful for a native tool call
    (no single argv-shaped string to rewrite) and is treated as `allow` if returned here.
+7. **`grok.py` backend added afterward**, following the exact same shape as the other three (no
+   architecture changes required — this is the point of the design: adding a harness is "one more
+   file in `agharness_backends/`"). Notable because it's the second backend (after opencode) whose
+   `[model.*]` config genuinely supports `api_backend = "chat_completions"`, so it routes through
+   `agproxy_llm`'s existing passthrough gateway rather than leaving the endpoint untouched.
+   Structural + mocked tests only (see `agharness.md`'s per-backend table) — no `grok` binary was
+   installed, since doing so means running xAI's `curl | bash` install script, deliberately not
+   done without being asked first.
+8. **Closed the LLM-routing gap for Claude Code and Codex.** Built the two translate-mode routes
+   Component 1 originally deferred: `/v1/messages` (Anthropic Messages API) and `/v1/responses`
+   (OpenAI Responses API), conversion logic in the new `agharness_internal/agproxy_llm_adapters.py`
+   module. `claude_code.py` now mints a gateway token and points `ANTHROPIC_BASE_URL`/
+   `ANTHROPIC_AUTH_TOKEN` at the gateway instead of carrying over the host's real Anthropic
+   credentials (API key, OAuth login, Bedrock env) — verified against the real `claude` CLI
+   end-to-end, with the request genuinely reaching a real configured backend (Amazon Bedrock)
+   *through* the gateway's translation, not around it. `codex.py` writes a
+   `[model_providers.agency-proxy]` block into its isolated `CODEX_HOME/config.toml` pointing at
+   the gateway with `wire_api = "responses"`; unverified against a live binary, same caveat as
+   before. Every backend now genuinely routes its LLM traffic through `agproxy_llm` — no harness is
+   left free to use its own host credentials/endpoint.

@@ -9,7 +9,7 @@ selected via `agharness_backend.for_config(engine, agconfig)` — the exact same
 ## The engine seam
 
 ```python
-ag = agent(agconfig=cfg, engine="claude_code")   # "native" (default), "opencode", "claude_code", "codex"
+ag = agent(agconfig=cfg, engine="claude_code")   # "native" (default), "opencode", "claude_code", "codex", "grok"
 result = ag.run(my_skill, agdata(task=...))       # completely unchanged call site
 ```
 
@@ -23,7 +23,7 @@ mutated in place; `delta` is `[system_prompt_message] + every message appended t
 checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`'s `__init__`/`fork`/
 `save`/`load` for the four exact insertion points.
 
-## What a concrete backend's `execute()` does (same shape in all three)
+## What a concrete backend's `execute()` does (same shape in all four)
 
 1. Resolve the harness binary (`shutil.which`); missing binary → `agerror`, no launch attempted.
 2. Build the prompt via `agharness.build_user_turn_prompt(skill, skill_input)` (delegates to
@@ -43,7 +43,8 @@ checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`
    `ag.sandbox.get_live_pids()`/`.wait_for_processes()` reflect the harness's process tree.
 6. `handle.wait(timeout=...)` — blocks for the harness to finish; non-zero exit → `agerror`.
 7. Parse the harness's own final-answer text out of its headless output (backend-specific: a
-   single JSON `"result"` field for Claude Code, best-effort NDJSON scanning for opencode/Codex).
+   single JSON `"result"`/`"text"` field for Claude Code/Grok Build, best-effort NDJSON scanning
+   for opencode/Codex).
 8. Recover output via `skill.output_schema.validate_and_recover(text, ag.sandbox)`
    (see [agschema.md](agschema.md)) for a structured schema, or wrap the raw text in `agdata` for a
    raw/no-schema skill — mirrors `execute_react()`'s own raw-text fallback path.
@@ -53,9 +54,28 @@ checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`
 
 | Backend | LLM routing | Tested against |
 |---|---|---|
-| `opencode.py` | `agproxy_llm` passthrough (matches wire format) | Mocked only — no `opencode` binary installable without Node/Bun in the environment this was built in |
-| `claude_code.py` | **Not implemented** — Claude Code speaks the Anthropic Messages API, which `agproxy_llm` doesn't adapt yet; the harness uses whatever credentials it already has on the host | **Real CLI** (v2.1.212) — both raw-text and structured-`output_schema` paths verified end-to-end |
-| `codex.py` | **Not implemented** — Codex speaks the OpenAI Responses API only (`wire_api="chat"` was removed upstream), so `gateway_mode="translate"` would be mandatory here, not optional | Mocked only — no `codex` binary available |
+| `opencode.py` | `agproxy_llm` `/v1/chat/completions` passthrough (matches wire format) | Mocked only — no `opencode` binary installable without Node/Bun in the environment this was built in |
+| `claude_code.py` | `agproxy_llm` `/v1/messages` translate (Anthropic Messages API <-> chat-completions, see [agproxy_llm.md](agharness_internal/agproxy_llm.md)) — `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` point at the gateway; the host's own real credentials (API key, OAuth login, Bedrock env) are never forwarded | **Real CLI** (v2.1.212) — raw-text and structured-`output_schema` paths, both routed genuinely through the gateway to a real backend (Bedrock), verified end-to-end |
+| `codex.py` | `agproxy_llm` `/v1/responses` translate (OpenAI Responses API <-> chat-completions) — mandatory here since Codex dropped `wire_api="chat"` upstream; `CODEX_HOME/config.toml` gets a `[model_providers.agency-proxy]` block pointing `base_url` at the gateway | Mocked only — no `codex` binary available; the Responses-API adapter itself is unverified against a live run |
+| `grok.py` | `agproxy_llm` `/v1/chat/completions` passthrough — Grok Build's `[model.*]` config supports `api_backend = "chat_completions"` per xAI's published docs, matching `agproxy_llm`'s existing route with zero translation, same as opencode | Mocked only — no `grok` binary installed (installing it means running xAI's `curl \| bash` script, deliberately not done without being asked first) |
+
+Every backend now genuinely routes its LLM traffic through `agproxy_llm` rather than leaving any
+harness free to use its own host credentials/endpoint — two are exact wire-format matches
+(`gateway_mode="passthrough"`), two require reshaping (`gateway_mode="translate"`, implemented in
+`agharness_internal/agproxy_llm_adapters.py`). See that module's docstring for the translation
+fidelity cost (extended thinking, prompt-cache breakpoints, and image content blocks have no
+chat-completions equivalent and are dropped, not errored on).
+
+`grok.py` is the second backend (after opencode) that actually routes its LLM traffic through
+`agproxy_llm` rather than leaving the harness's own endpoint untouched — it writes a
+`config.toml` under its isolated `GROK_HOME` with a `[model.agency-proxy]` block pointing
+`base_url`/`api_key` at the gateway. Config isolation uses `GROK_HOME` (redirects the entire
+config directory: `config.toml`, `auth.json`, `sessions/`) rather than a `--setting-sources`/
+`--ignore-user-config`-style flag — xAI's docs don't expose one, so full directory redirection
+(closer to Codex's `CODEX_HOME` than Claude Code's flag-based approach) is the documented
+isolation mechanism. `sessionId` from a successful run is stashed on `session_resume_id`
+(an existing `AgHarnessFields` field) but not yet threaded through to a resumed second call —
+multi-turn resume is future work, not wired up.
 
 ## A real bug worth knowing about: don't override `HOME`
 

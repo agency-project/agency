@@ -1,25 +1,24 @@
 """Claude Code backend.
 
-CAVEAT: `agproxy_llm` (see agproxy_llm.py) only implements a
-chat-completions passthrough route today -- Claude Code speaks the
-Anthropic Messages API (`POST /v1/messages`), a different wire format, so
-`gateway_mode="translate"`'s Messages-API adapter is NOT implemented yet.
-Until it is, this backend does not override `ANTHROPIC_BASE_URL`/
-`ANTHROPIC_AUTH_TOKEN` at all -- the launched `claude` process uses
-whatever credentials/endpoint it's already configured with on this host
-(its own `~/.claude/.credentials.json` or its own env), same as running it
-by hand. LLM routing through agency's own `agConfig` backend choice is a
-real, open gap for this backend specifically -- see
-docs/Design_harness_integration.md's Component 1. Everything else
-(isolated config home, agproxy_ptrace launch + tracing, output-schema
-recovery) works the same as the opencode backend and was verified against
-the real `claude` CLI (v2.1.212) during development.
+LLM routing: `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` are pointed at
+`agproxy_llm`'s `/v1/messages` route (Anthropic Messages API,
+`gateway_mode="translate"` -- see agproxy_llm.py/agproxy_llm_adapters.py),
+which reshapes the request into the exact `client.chat.completions.create()`
+call every other backend uses and routes it through this agent's own
+configured `agConfig` backend. The host's own real Anthropic credentials
+(API key, OAuth login, Bedrock env) are deliberately NOT forwarded to the
+launched process -- every `claude`-driven agent's LLM traffic goes through
+agency's own backend choice, not whatever this host happens to have lying
+around. Everything else (isolated config home, agproxy_ptrace launch +
+tracing, output-schema recovery) works the same as the opencode backend and
+was verified against the real `claude` CLI (v2.1.212) during development.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import uuid
 from typing import TYPE_CHECKING
 
 from ...agdata import agdata, agerror
@@ -49,6 +48,7 @@ class _ClaudeCodeBackend(agharness_backend):
         skill: "agskill",
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from ... import agharness
+        from ..agproxy_llm import get_shared_gateway
         from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
 
         sys_msg = {"role": "system", "content": skill._build_system_prompt()}
@@ -58,7 +58,11 @@ class _ClaudeCodeBackend(agharness_backend):
         if resolved is None:
             return agerror(f"claude binary {binary!r} not found on PATH"), prev_ctx, [sys_msg]
 
-        config_home = agharness.materialize_config_home(ag, token="", base_url="")
+        gateway = get_shared_gateway(ag.agconfig)
+        token = uuid.uuid4().hex
+        gateway.register(token, ag)
+
+        config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
         try:
             prompt = agharness.build_user_turn_prompt(skill, skill_input)
             if not isinstance(prompt, str):
@@ -85,7 +89,24 @@ class _ClaudeCodeBackend(agharness_backend):
             ]
             import os
 
-            envp = {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+            envp = {
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                # Point Claude Code's own LLM traffic at agproxy_llm's
+                # translated Anthropic Messages route instead of any real
+                # Anthropic endpoint -- ANTHROPIC_AUTH_TOKEN sends this
+                # token as a bearer `Authorization` header, which
+                # `_extract_bearer_token` (agproxy_llm.py) reads to look up
+                # this launch's agent. Real host credentials (API key,
+                # OAuth login, Bedrock env) are deliberately NOT forwarded:
+                # every claude-driven agent's LLM calls must go through
+                # this agent's own configured agConfig backend, not
+                # whatever this host happens to have lying around.
+                "ANTHROPIC_BASE_URL": gateway.base_url,
+                "ANTHROPIC_AUTH_TOKEN": token,
+                # Also explicitly unset so the CLI can't fall back to a
+                # locally-configured Bedrock/API-key credential path.
+                "CLAUDE_CODE_USE_BEDROCK": "0",
+            }
             # Deliberately does NOT override HOME: Claude Code's OAuth
             # credentials live under the real $HOME (~/.claude/
             # .credentials.json), and --setting-sources "" above is
@@ -93,24 +114,12 @@ class _ClaudeCodeBackend(agharness_backend):
             # isolation this backend needs -- overriding HOME too would
             # additionally (and unintentionally) cut off the real login,
             # forcing "Not logged in" for every run (hit and fixed during
-            # development against the real CLI).
+            # development against the real CLI). This doesn't matter for
+            # authentication anymore since ANTHROPIC_AUTH_TOKEN above
+            # always takes precedence over OAuth login, but HOME is still
+            # left alone since other CLI state may expect it.
             if "HOME" in os.environ:
                 envp["HOME"] = os.environ["HOME"]
-            # Carry over the real credential env vars this host's `claude`
-            # already relies on (API key / OAuth token paths, etc.) -- see
-            # this module's docstring: LLM routing through agproxy_llm is
-            # not implemented for this backend yet, so the harness must be
-            # left free to authenticate exactly as it would run by hand.
-            for key in (
-                "ANTHROPIC_API_KEY",
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_BASE_URL",
-                "CLAUDE_CODE_USE_BEDROCK",
-                "AWS_REGION",
-                "AWS_BEARER_TOKEN_BEDROCK",
-            ):
-                if key in os.environ:
-                    envp[key] = os.environ[key]
 
             px = agProxyPtrace(ag.agconfig)
             policy = agharness.default_policy(ag)
@@ -120,6 +129,7 @@ class _ClaudeCodeBackend(agharness_backend):
 
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
         finally:
+            gateway.unregister(token)
             agharness.cleanup_config_home(config_home)
 
         if rc != 0:

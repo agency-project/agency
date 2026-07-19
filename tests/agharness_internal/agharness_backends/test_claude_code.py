@@ -1,11 +1,15 @@
 """Tests for the Claude Code agharness_backend.
 
-Tier 1 (mocked agProxyPtrace.launch) covers the orchestration logic
-identically to test_opencode.py. Tier 2 (marked `real_claude`) runs the
-actual installed `claude` CLI end-to-end -- verified working (v2.1.212)
-during development, both raw-text and structured-output-schema paths; kept
-here as a regression check, skipped when the binary/auth isn't available
-so this suite doesn't require real API access to run.
+Tier 1 (mocked agProxyPtrace.launch and agproxy_llm.get_shared_gateway)
+covers the orchestration logic identically to test_opencode.py. Tier 2
+(marked `real_claude`) runs the actual installed `claude` CLI end-to-end
+against a REAL backend (Amazon Bedrock, via AWS_BEARER_TOKEN_BEDROCK) --
+verified working (v2.1.212) during development, both raw-text and
+structured-output-schema paths, with the request genuinely translated and
+routed through agproxy_llm's `/v1/messages` route rather than Claude Code
+using its own host credentials. Kept here as a regression check, skipped
+when the binary/auth isn't available so this suite doesn't require real API
+access to run.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import pytest
 
 from agency.agconfig import agConfig
 from agency.agsandbox_backends import agSandboxBackendConfig
+from agency.agllm_backends import agBedrockBackendConfig
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
 from agency.agent import agent
@@ -27,6 +32,7 @@ from agency.agskill import agskill
 def _make_agent(with_sandbox=True):
     ag = MagicMock()
     ag.agconfig = agConfig()
+    ag.llm.backend.model = "test-model"
     ag.sandbox = MagicMock() if with_sandbox else None
     return ag
 
@@ -35,6 +41,17 @@ def _make_handle(stdout="", stderr="", rc=0):
     handle = MagicMock()
     handle.wait.return_value = (stdout, stderr, rc)
     return handle
+
+
+def _patched_gateway_and_ptrace(handle):
+    mock_gateway = MagicMock()
+    mock_gateway.base_url = "http://127.0.0.1:1"
+
+    def apply(mock_gateway_getter, mock_px_cls):
+        mock_gateway_getter.return_value = mock_gateway
+        mock_px_cls.return_value.launch.return_value = handle
+
+    return mock_gateway, apply
 
 
 @pytest.fixture
@@ -70,10 +87,12 @@ def test_execute_parses_json_result_field(_patch_which_finds_claude):
     payload = json.dumps({"result": "Hi there!", "usage": {"input_tokens": 5, "output_tokens": 2}})
     handle = _make_handle(stdout=payload)
     with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox") as mock_wire,
     ):
-        mock_px_cls.return_value.launch.return_value = handle
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
         result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
 
     assert not isinstance(result, agerror)
@@ -82,6 +101,8 @@ def test_execute_parses_json_result_field(_patch_which_finds_claude):
     assert ctx.total_input_tokens == 5
     assert ctx.total_output_tokens == 2
     mock_wire.assert_called_once_with(handle, ag.sandbox)
+    mock_gateway.register.assert_called_once()
+    mock_gateway.unregister.assert_called_once()
 
 
 def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
@@ -101,13 +122,19 @@ def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
         return handle
 
     with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
     ):
+        mock_gateway, _ = _patched_gateway_and_ptrace(handle)
+        mock_gateway_getter.return_value = mock_gateway
         mock_px_cls.return_value.launch.side_effect = fake_launch
         backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
 
     assert captured_envp.get("HOME") == "/real/home"
+    # LLM traffic is routed through the gateway, not the host's own creds.
+    assert captured_envp.get("ANTHROPIC_BASE_URL") == mock_gateway.base_url
+    assert "ANTHROPIC_API_KEY" not in captured_envp
 
 
 def test_execute_nonzero_exit_returns_agerror(_patch_which_finds_claude):
@@ -118,10 +145,12 @@ def test_execute_nonzero_exit_returns_agerror(_patch_which_finds_claude):
 
     handle = _make_handle(stdout="", stderr="auth error", rc=1)
     with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
     ):
-        mock_px_cls.return_value.launch.return_value = handle
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
         result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
 
     assert isinstance(result, agerror)
@@ -139,10 +168,12 @@ def test_execute_recovers_structured_output_schema(_patch_which_finds_claude):
     payload = json.dumps({"result": '{"greeting": "hi there friend", "word_count": 3}'})
     handle = _make_handle(stdout=payload)
     with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
     ):
-        mock_px_cls.return_value.launch.return_value = handle
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
         result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
 
     assert not isinstance(result, agerror)
@@ -174,9 +205,14 @@ real_claude = pytest.mark.skipif(
 
 @real_claude
 def test_real_claude_raw_text_end_to_end():
+    # A genuinely-working backend, not a placeholder -- now that this
+    # backend routes claude's LLM traffic through agproxy_llm's translated
+    # /v1/messages route, the gateway must be able to actually answer, not
+    # just accept the connection. Uses the same Bedrock bearer-token
+    # credential (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
-        {"agllm_backend": {"api_key": "unused", "model": "unused"}},
+        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
     ag = agent(agconfig=cfg, engine="claude_code")
     skill = agskill(
@@ -192,9 +228,14 @@ def test_real_claude_raw_text_end_to_end():
 
 @real_claude
 def test_real_claude_structured_output_end_to_end():
+    # A genuinely-working backend, not a placeholder -- now that this
+    # backend routes claude's LLM traffic through agproxy_llm's translated
+    # /v1/messages route, the gateway must be able to actually answer, not
+    # just accept the connection. Uses the same Bedrock bearer-token
+    # credential (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
-        {"agllm_backend": {"api_key": "unused", "model": "unused"}},
+        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
     ag = agent(agconfig=cfg, engine="claude_code")
     skill = agskill(
