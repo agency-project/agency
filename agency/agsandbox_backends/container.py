@@ -261,16 +261,26 @@ def seed_cache_from_image(
     )
 
 
-_gpu_flags_cache: "list[str] | None" = None
+_gpu_flags_cache: "dict[str, list[str]]" = {}
 _gpu_flags_lock = threading.Lock()
 
 
-def _gpu_flags() -> list[str]:
-    """Return GPU passthrough flags for the container runtime, cached for the
-    process lifetime.
+def _gpu_flags(runtime: str) -> list[str]:
+    """Return GPU passthrough flags for *runtime* ("docker" or "podman"),
+    cached per runtime for the process lifetime.
 
-    NVIDIA: ``--gpus all`` (requires nvidia-container-toolkit).
-    AMD:    ``--device /dev/kfd --device /dev/dri`` (ROCm device files).
+    NVIDIA:
+      - Docker: ``--gpus all`` (nvidia-container-toolkit's Docker-specific
+        CLI wrapper hook).
+      - Podman: ``--device nvidia.com/gpu=all`` (CDI). Podman does not
+        understand Docker's ``--gpus`` flag: it accepts it silently (no
+        error) but never mounts the NVIDIA driver/devices, so a container
+        started that way has zero GPU access despite `podman run` appearing
+        to succeed -- `nvidia-smi` inside prints "WARNING: The NVIDIA Driver
+        was not detected" and isn't even on PATH. This mirrors the identical
+        fix applied to images/build.sh's own smoke tests.
+    AMD:    ``--device /dev/kfd --device /dev/dri`` (ROCm device files,
+            identical for both runtimes).
     CPU-only hosts get no flags so they keep working without GPU drivers.
 
     GPU presence is delegated to agresources.detect_gpus() — the same probe
@@ -279,21 +289,23 @@ def _gpu_flags() -> list[str]:
     construction used to pay its own full subprocess round-trip just to pick
     a CLI flag; on a busy shared GPU host that adds up to real contention.
     Caching the result (rather than only reusing detect_gpus()'s logic)
-    means this now runs at most once per process regardless of how many
-    sandboxes get created.
+    means this now runs at most once per process per runtime regardless of
+    how many sandboxes get created.
     """
-    global _gpu_flags_cache
-    if _gpu_flags_cache is not None:
-        return _gpu_flags_cache
+    if runtime in _gpu_flags_cache:
+        return _gpu_flags_cache[runtime]
     with _gpu_flags_lock:
-        if _gpu_flags_cache is None:
+        if runtime not in _gpu_flags_cache:
             if not detect_gpus():
-                _gpu_flags_cache = []
+                flags = []
             elif shutil.which("nvidia-smi"):
-                _gpu_flags_cache = ["--gpus", "all"]
+                flags = (
+                    ["--device", "nvidia.com/gpu=all"] if runtime == "podman" else ["--gpus", "all"]
+                )
             else:
-                _gpu_flags_cache = ["--device", "/dev/kfd", "--device", "/dev/dri"]
-        return _gpu_flags_cache
+                flags = ["--device", "/dev/kfd", "--device", "/dev/dri"]
+            _gpu_flags_cache[runtime] = flags
+        return _gpu_flags_cache[runtime]
 
 
 # Hard cap on the number of simultaneously running containers (docker and
@@ -476,7 +488,7 @@ class _ContainerBackendBase(agsandbox_backend):
         self._checkpoint_image: str | None = checkpoint_image
         self._agconfig = agconfig
         self._name = name
-        self._gpu_flags = _gpu_flags()
+        self._gpu_flags = _gpu_flags(self._runtime)
         self._base_image = base_image
         self._vol_flags: list[str] = []
         for host, container, mode in mounts.values():

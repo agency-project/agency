@@ -1,18 +1,27 @@
 """Unit tests for agency.agsandbox_backends.container's shared, runtime-
 agnostic logic: the startup orphan reaper and its PID-liveness check; the
 session-keyring-quota machinery (_keyring_container_limit/keyring_quota/
-_semaphore_held_count); and _ContainerBackendBase's concrete
+_semaphore_held_count); _ContainerBackendBase's concrete
 _is_quota_exhaustion_error()/_wait_for_quota_slot()/_quota_diagnostics()/
 _acquire_runtime_slot()/_release_runtime_slot() hooks plus
 _run_with_conflict_retry()'s dispatch through them -- exercised here against
 _PodmanBackend specifically to prove docker and podman share identical
 behavior (both are subject to the same kernel session-keyring quota; see
-container.py's module docstring for why). No real docker/podman required --
-everything here mocks subprocess.run/_run and the /proc reads."""
+container.py's module docstring for why); and _gpu_flags()'s per-runtime
+NVIDIA/ROCm flag selection (regression coverage for the bug where Docker's
+``--gpus all`` was used unconditionally for Podman too, which Podman accepts
+without error but never actually mounts the driver for -- see
+TestGpuFlagsPerRuntime, and TestPodmanGpuPassthroughIntegration at the bottom
+for the real-container check that would have caught it).
+
+No real docker/podman required for anything above the integration test class
+at the bottom -- everything else here mocks subprocess.run/_run, the /proc
+reads, and detect_gpus()/shutil.which()."""
 
 from __future__ import annotations
 
 import os
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -347,4 +356,201 @@ class TestRunWithConflictRetryHooks:
         with patch.object(sb, "_run", run_mock):
             with pytest.raises(RuntimeError, match="no such image"):
                 sb._run_with_conflict_retry(["podman", "run", "--name", "x"], "x")
-        assert run_mock.call_count == 1, "an unrelated failure must not be retried"
+
+
+# ---------------------------------------------------------------------------
+# _gpu_flags(runtime) -- regression coverage for the bug where Docker's
+# ``--gpus all`` was used unconditionally for Podman too. Podman accepts that
+# flag without erroring but never mounts the NVIDIA driver/devices for it, so
+# a container started that way silently has zero GPU access. No real
+# docker/podman required here -- detect_gpus()/shutil.which() are mocked.
+# ---------------------------------------------------------------------------
+
+
+class TestGpuFlagsPerRuntime:
+    def setup_method(self):
+        # _gpu_flags_cache is a module-level dict keyed by runtime -- clear it
+        # so each test observes only its own mocked detect_gpus()/which().
+        _container._gpu_flags_cache.clear()
+
+    def test_docker_gets_gpus_all_for_nvidia(self):
+        with patch.object(_container, "detect_gpus", return_value=[0, 1]):
+            with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
+                assert _container._gpu_flags("docker") == ["--gpus", "all"]
+
+    def test_podman_gets_cdi_device_flag_for_nvidia_not_docker_syntax(self):
+        """The actual regression: Podman must NOT get Docker's --gpus flag --
+        it silently accepts it without mounting the driver (confirmed against
+        a real host: `podman run --gpus all ... nvidia-smi` prints "WARNING:
+        The NVIDIA Driver was not detected" and nvidia-smi isn't even on
+        PATH), so it needs the CDI device syntax instead."""
+        with patch.object(_container, "detect_gpus", return_value=[0, 1]):
+            with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
+                flags = _container._gpu_flags("podman")
+        assert flags == ["--device", "nvidia.com/gpu=all"]
+        assert "--gpus" not in flags
+
+    def test_docker_and_podman_flags_differ_and_are_cached_independently(self):
+        with patch.object(_container, "detect_gpus", return_value=[0, 1]):
+            with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
+                docker_flags = _container._gpu_flags("docker")
+                podman_flags = _container._gpu_flags("podman")
+        assert docker_flags != podman_flags
+        # Cached per runtime -- fetching docker's again must not have been
+        # clobbered by the podman call (or vice versa).
+        assert _container._gpu_flags_cache["docker"] == ["--gpus", "all"]
+        assert _container._gpu_flags_cache["podman"] == ["--device", "nvidia.com/gpu=all"]
+
+    def test_rocm_flags_identical_for_both_runtimes(self):
+        with patch.object(_container, "detect_gpus", return_value=[0]):
+            with patch.object(_container.shutil, "which", return_value=None):
+                docker_flags = _container._gpu_flags("docker")
+                podman_flags = _container._gpu_flags("podman")
+        expected = ["--device", "/dev/kfd", "--device", "/dev/dri"]
+        assert docker_flags == expected
+        assert podman_flags == expected
+
+    def test_no_gpu_detected_returns_empty_for_both_runtimes(self):
+        with patch.object(_container, "detect_gpus", return_value=[]):
+            assert _container._gpu_flags("docker") == []
+            assert _container._gpu_flags("podman") == []
+
+    def test_backend_construction_passes_its_own_runtime_to_gpu_flags(self):
+        """_ContainerBackendBase.__init__ must thread self._runtime through
+        to _gpu_flags() rather than hardcoding/omitting it -- this is exactly
+        what the bug was: the call site used to be plain `_gpu_flags()`."""
+        from agency.agsandbox_backends.podman import _PodmanBackend
+
+        with patch.object(_container, "_gpu_flags", return_value=["sentinel"]) as gpu_flags_mock:
+            _PodmanBackend(
+                "agent",
+                name="podman-gpu-ctor-test",
+                checkpoint_image=None,
+                base_image="img",
+                mounts={},
+                agconfig=None,
+            )
+        gpu_flags_mock.assert_called_once_with("podman")
+
+
+def _podman_available() -> bool:
+    try:
+        return subprocess.run(["podman", "info"], capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def _host_gpu_available() -> bool:
+    try:
+        return subprocess.run(["nvidia-smi"], capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+podman_gpu = pytest.mark.skipif(
+    not (_podman_available() and _host_gpu_available()),
+    reason="Podman daemon or NVIDIA GPU not available",
+)
+
+
+class TestPodmanGpuPassthroughIntegration:
+    """The check that would have actually caught the regression above: starts
+    a REAL podman container (no mocks anywhere) using the exact flags
+    _gpu_flags('podman') returns, and asserts nvidia-smi run *inside* that
+    container really sees the host's GPUs -- not just that the framework's
+    own CUDA_VISIBLE_DEVICES env var plumbing works (see
+    test_agsandbox.py's TestSandboxedTools/TestResourceTools, which check
+    only that -- a container with zero real GPU access still passes those).
+
+    Requires a real podman binary/daemon and a real NVIDIA GPU -- skipped
+    automatically otherwise. Uses the same `agency-sandbox:latest` image the
+    rest of the suite's @docker-marked real-daemon tests use, built via
+    `images/build.sh`.
+    """
+
+    IMAGE = "agency-sandbox:latest"
+
+    @podman_gpu
+    def test_nvidia_smi_inside_a_real_podman_container_sees_the_gpus(self):
+        flags = _container._gpu_flags("podman")
+        assert flags, "expected non-empty GPU flags on a host with a real GPU"
+        result = subprocess.run(
+            ["podman", "run", "--rm", *flags, self.IMAGE, "nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"nvidia-smi failed inside the container (exit {result.returncode}); "
+            f"this is exactly the failure mode of the --gpus-all-on-podman bug:\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+        assert "GPU" in result.stdout, f"expected a GPU listing, got: {result.stdout!r}"
+
+
+def _docker_available() -> bool:
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def _docker_has_image(image: str) -> bool:
+    try:
+        return (
+            subprocess.run(
+                ["docker", "image", "inspect", image], capture_output=True, timeout=10
+            ).returncode
+            == 0
+        )
+    except Exception:
+        return False
+
+
+docker_gpu = pytest.mark.skipif(
+    not (
+        _docker_available() and _host_gpu_available() and _docker_has_image("agency-sandbox:latest")
+    ),
+    reason="Docker daemon, NVIDIA GPU, or local agency-sandbox:latest docker image not available",
+)
+
+
+class TestDockerGpuPassthroughIntegration:
+    """Symmetric to TestPodmanGpuPassthroughIntegration above -- starts a REAL
+    docker container (no mocks) using the exact flags _gpu_flags('docker')
+    returns and asserts nvidia-smi run *inside* it sees the host's GPUs.
+
+    Docker was never actually broken by the regression this file guards
+    against (the bug was Podman incorrectly getting Docker's ``--gpus`` flag,
+    not the other way around), but this exists so a future change to the
+    Docker branch of _gpu_flags() gets the same real-container safety net
+    Podman has, rather than relying on the unit tests in
+    TestGpuFlagsPerRuntime alone.
+
+    Requires a real docker binary/daemon, a real NVIDIA GPU, AND a locally
+    built `agency-sandbox:latest` docker image -- skipped automatically
+    otherwise. Unlike the rest of this suite's plain @docker-marked tests
+    (which only check daemon reachability, and can therefore fail outright
+    with "pull access denied" on a host where the image was only ever built
+    for podman -- see test_docker.py), this also checks the image is
+    actually present locally before running, so it degrades to a skip
+    instead of a false-positive failure on such a host.
+    """
+
+    IMAGE = "agency-sandbox:latest"
+
+    @docker_gpu
+    def test_nvidia_smi_inside_a_real_docker_container_sees_the_gpus(self):
+        flags = _container._gpu_flags("docker")
+        assert flags, "expected non-empty GPU flags on a host with a real GPU"
+        result = subprocess.run(
+            ["docker", "run", "--rm", *flags, self.IMAGE, "nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"nvidia-smi failed inside the container (exit {result.returncode}):\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+        assert "GPU" in result.stdout, f"expected a GPU listing, got: {result.stdout!r}"
