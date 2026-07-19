@@ -318,7 +318,17 @@ class agsandbox_backend(AgSandboxBackendFields):
         gpu_id = str(self._gpu_id) if self._gpu_id is not None else "NoDevFiles"
         hf_token = os.environ.get("HF_TOKEN", "")
         hf_export = f"export HF_TOKEN={hf_token}\n" if hf_token else ""
-        env_export = f"export CUDA_VISIBLE_DEVICES={gpu_id}\nexport HIP_VISIBLE_DEVICES={gpu_id}\n{hf_export}"
+        # readonly (not just export) so a command that itself starts with
+        # "CUDA_VISIBLE_DEVICES=<n> ..." cannot hijack the leased GPU. Bash rejects that inline reassignment ("readonly
+        # variable", visible on stderr) and still runs the command with the
+        # correct exported value, rather than quietly routing it onto whatever
+        # GPU the command hardcoded.
+        env_export = (
+            f"export CUDA_VISIBLE_DEVICES={gpu_id}\n"
+            f"export HIP_VISIBLE_DEVICES={gpu_id}\n"
+            f"readonly CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES\n"
+            f"{hf_export}"
+        )
 
         wrapped = (
             f"exec 2>&1\n"  # merge stderr into stdout so the BGPIDS marker is never split

@@ -16,7 +16,18 @@ for the real-container check that would have caught it).
 
 No real docker/podman required for anything above the integration test class
 at the bottom -- everything else here mocks subprocess.run/_run, the /proc
-reads, and detect_gpus()/shutil.which()."""
+reads, and detect_gpus()/shutil.which().
+
+The bottom of the file also covers a second, unrelated regression: agents
+routinely put a literal ``CUDA_VISIBLE_DEVICES=<n> ...`` prefix on their own
+bash commands (common ML boilerplate, and an easy misreading of
+reserve_gpu's "always use cuda:0" instruction). Under plain POSIX var=val-
+prefix semantics that silently overrides base.py's exec()-time export for
+just that child process, routing real compute onto whatever GPU the agent
+hardcoded while the pool's semaphore bookkeeping still believes the sandbox
+holds the GPU it actually leased. TestCvdOverrideProtectionIntegration below
+proves the ``readonly`` fix in base.py's exec() holds against a real
+container on both runtimes."""
 
 from __future__ import annotations
 
@@ -554,3 +565,75 @@ class TestDockerGpuPassthroughIntegration:
             f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
         )
         assert "GPU" in result.stdout, f"expected a GPU listing, got: {result.stdout!r}"
+
+
+class TestCvdOverrideProtectionIntegration:
+    """Regression test for the "agent hijacks its own GPU isolation" bug:
+    base.py's exec() exports CUDA_VISIBLE_DEVICES=<leased physical id> fresh
+    before every command, but a command that itself starts with
+    "CUDA_VISIBLE_DEVICES=<other> ..." -- extremely common ML boilerplate
+    (``CUDA_VISIBLE_DEVICES=0 python train.py``), and exactly what
+    reserve_gpu's "always use cuda:0 inside your scripts" instruction is
+    prone to being misread as -- shadows that export for its own child
+    process under plain POSIX var=val-prefix semantics. The pool's semaphore
+    bookkeeping still believes the sandbox holds the GPU it actually leased;
+    the child process runs on whatever GPU the agent hardcoded instead.
+
+    Uses a REAL container (no mocks) on both runtimes, going through the
+    actual agSandbox/agResourcePool/reserve_gpu path an agent uses -- not raw
+    ``docker run``/``podman run`` -- because the fix under test
+    (``readonly CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES`` in base.py's
+    exec()) lives in exactly that command-wrapping logic. Requires a real
+    docker/podman daemon, a real NVIDIA GPU, and the local
+    agency-sandbox:latest image -- skipped otherwise (see the docker_gpu/
+    podman_gpu markers above).
+    """
+
+    def _check(self, backend: str) -> None:
+        import uuid
+
+        from agency.agconfig import agConfig
+        from agency.agdata import agdata
+        from agency.agresources import agResourcePool
+        from agency.agsandbox import agSandbox
+        from agency.agsandbox_backends import agSandboxBackendConfig
+        from agency.tools import make_sandboxed_tools
+
+        cfg = agConfig(agSandboxBackendConfig(backend=backend))
+        sb = agSandbox(str(uuid.uuid4()), agconfig=cfg)
+        pool = agResourcePool(mark_gpus=False)
+        assert pool.gpus, "expected at least one real GPU to be detected on this host"
+        tools = {t.name: t for t in make_sandboxed_tools(sb, pool)}
+        try:
+            tools["reserve_gpu"].fn(agdata())
+
+            leased_out, rc = sb.exec("echo $CUDA_VISIBLE_DEVICES")
+            assert rc == 0
+            leased_gpu_id = leased_out.strip()
+            assert leased_gpu_id.isdigit(), f"expected a leased GPU id, got {leased_out!r}"
+
+            # An id that can never collide with a real leased id -- proves
+            # this is the agent's hardcoded value winning, not a coincidence.
+            hijack_attempt = "999"
+            hijack_out, rc = sb.exec(
+                f"CUDA_VISIBLE_DEVICES={hijack_attempt} python3 -c "
+                "\"import os; print(os.environ['CUDA_VISIBLE_DEVICES'])\""
+            )
+            assert rc == 0, f"python3 should still run (using the real value): {hijack_out!r}"
+            seen_gpu_id = hijack_out.strip().splitlines()[-1]
+            assert seen_gpu_id == leased_gpu_id, (
+                f"agent's inline CUDA_VISIBLE_DEVICES={hijack_attempt} override took "
+                f"effect inside the container -- python saw {seen_gpu_id!r} instead of "
+                f"the harness-leased {leased_gpu_id!r}. GPU isolation is not enforced."
+            )
+        finally:
+            tools["gpu_release"].fn(agdata())
+            sb.destroy()
+
+    @docker_gpu
+    def test_docker_agent_cannot_hijack_cuda_visible_devices(self):
+        self._check("docker")
+
+    @podman_gpu
+    def test_podman_agent_cannot_hijack_cuda_visible_devices(self):
+        self._check("podman")
