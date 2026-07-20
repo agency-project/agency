@@ -192,8 +192,8 @@ class agSandbox(_AgSandboxFields):
     def _own_host_pids(self) -> "set[int]":
         return self._backend._own_host_pids()
 
-    def _gpu_is_clear(self) -> bool:
-        return self._backend._gpu_is_clear()
+    def _has_pending_background_work(self) -> bool:
+        return self._backend._has_pending_background_work()
 
     @property
     def _cpu_acquired(self) -> float:
@@ -210,14 +210,6 @@ class agSandbox(_AgSandboxFields):
     @_memory_acquired_mb.setter
     def _memory_acquired_mb(self, value: int) -> None:
         self._backend._memory_acquired_mb = value
-
-    @property
-    def _started(self) -> bool:
-        return self._backend._started
-
-    @_started.setter
-    def _started(self, value: bool) -> None:
-        self._backend._started = value
 
     @property
     def _checkpoint_image(self) -> "str | None":
@@ -408,12 +400,9 @@ class agSandbox(_AgSandboxFields):
         _poll_interval_s = poll_interval_s
         _state = state_fn
 
-        watched = getattr(self, "_watched_pids", None)
-        if not isinstance(watched, dict) or not watched:
+        if self is None or not self._has_pending_background_work():
             return None
         get_live = self.get_live_pids
-        if not get_live():
-            return None
 
         summary = self.pid_status_summary()
         if _state:
@@ -431,15 +420,22 @@ class agSandbox(_AgSandboxFields):
 
         import time
 
+        # Poll _has_pending_background_work(), not just get_live() -- for
+        # backends whose live-PID tracking can under-count (see
+        # _ChrootBackend._has_pending_background_work()'s docstring), a
+        # process invisible to get_live() can still be genuinely running;
+        # relying on get_live() alone here would let this loop -- and the
+        # "completed" determination right after it -- falsely conclude
+        # nothing is left before it's actually finished.
         deadline = time.monotonic() + _ping_interval_s
         while time.monotonic() < deadline:
             time.sleep(_poll_interval_s)
-            if not get_live():
+            if not self._has_pending_background_work():
                 break
 
         live_now = get_live()
 
-        if not live_now:
+        if not self._has_pending_background_work():
             if _term:
                 _term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
             if _log:

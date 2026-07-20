@@ -49,15 +49,13 @@ podman = pytest.mark.skipif(not _podman_available(), reason="Podman daemon not r
 
 
 def _make_sandbox(**kwargs):
-    """Build an agSandbox forcing the podman backend -- these tests shell out
-    to the ``podman`` CLI directly (or mock ``_PodmanBackend._run``), so they
-    need every sandbox to actually be a podman container regardless of
-    whether Podman is actually reachable on the host running this file
-    (unlike test_docker.py's equivalent, forcing the runtime here isn't about
-    overriding an auto-detected preference -- Podman already *is* preferred
-    when both are usable -- it's the same determinism guarantee: don't let a
-    host with only Docker installed silently change which backend these
-    tests exercise)."""
+    """Build a REAL agSandbox forcing the podman backend -- for the
+    end-to-end (@podman-marked) tests that need the full facade (real
+    make_sandboxed_tools() dispatch, real podman CLI). Goes through
+    agsandbox_backend.for_config(), which requires an actually-reachable
+    podman daemon (see for_config()'s availability check) -- correct for
+    those tests, but NOT for the mock-based unit tests below, which use
+    _make_backend() instead specifically to avoid that requirement."""
     from agency.agconfig import agConfig
     from agency.agsandbox import agSandbox
     from agency.agsandbox_backends import agSandboxBackendConfig
@@ -66,6 +64,30 @@ def _make_sandbox(**kwargs):
     agconfig = kwargs.pop("agconfig", None)
     cfg = agConfig(agSandboxBackendConfig(backend="podman"), agconfig)
     return agSandbox(uid, agconfig=cfg, **kwargs)
+
+
+def _make_backend(**kwargs):
+    """Build a bare _PodmanBackend directly, bypassing agSandbox/
+    for_config()'s real-daemon availability check. These are unit tests that
+    mock _PodmanBackend._run (or _container_running/_container_status/etc.)
+    themselves and never issue a real `podman` call, so they don't need an
+    actual podman binary or reachable daemon on the host running this file
+    -- matching test_container.py's own pattern for mock-based backend unit
+    tests (e.g. TestOwnHostPidsPodman), which construct _PodmanBackend the
+    same way for the same reason."""
+    from agency.agsandbox_backends.podman import _PodmanBackend
+
+    name = f"podman-test-{uuid.uuid4().hex[:8]}"
+    defaults = dict(
+        agname=name,
+        name=name,
+        checkpoint_image=None,
+        base_image="agency-sandbox:latest",
+        mounts={},
+        agconfig=None,
+    )
+    defaults.update(kwargs)
+    return _PodmanBackend(defaults.pop("agname"), **defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -82,15 +104,15 @@ class TestOwnerPidLabel:
         would normally do is skipped, so this only inspects the command
         that *would* have been issued."""
         calls = []
-        with patch.object(sb._backend, "_container_running", return_value=False):
-            with patch.object(sb._backend, "_container_status", return_value=""):
+        with patch.object(sb, "_container_running", return_value=False):
+            with patch.object(sb, "_container_status", return_value=""):
                 with patch.object(
-                    sb._backend,
+                    sb,
                     "_run_with_conflict_retry",
                     side_effect=lambda run_cmd, name: calls.append(run_cmd),
                 ):
-                    with patch.object(sb._backend, "_run"):  # the post-run `mkdir /workspace`
-                        sb._backend._ensure_started()
+                    with patch.object(sb, "_run"):  # the post-run `mkdir /workspace`
+                        sb._ensure_started()
         assert len(calls) == 1, "expected exactly one podman run invocation"
         return calls[0]
 
@@ -106,7 +128,7 @@ class TestOwnerPidLabel:
         correctly recognizes it as alive for as long as this process runs."""
         import os
 
-        sb = _make_sandbox()
+        sb = _make_backend()
         run_cmd = self._captured_run_cmd(sb)
         assert self._label_value(run_cmd) == str(os.getpid())
 
@@ -118,10 +140,10 @@ class TestOwnerPidLabel:
         computed fresh via os.getpid() at run time."""
         import os
 
-        sb = _make_sandbox()
+        sb = _make_backend()
         sentinel_pid = 424242
         assert sentinel_pid != os.getpid()
-        sb._backend._owner_pid = sentinel_pid
+        sb._owner_pid = sentinel_pid
 
         run_cmd = self._captured_run_cmd(sb)
         assert self._label_value(run_cmd) == str(sentinel_pid)
@@ -173,7 +195,7 @@ class TestDanglingImageEagerCleanup:
         """stop(commit=True) must delete the image that previously held the tag."""
         import agency.agsandbox_backends.podman as _mod
 
-        sb = _make_sandbox()
+        sb = _make_backend()
 
         run_calls = []
         fake_old_id = "sha256:deadbeef0000"
@@ -196,10 +218,9 @@ class TestDanglingImageEagerCleanup:
             return FakeCompleted()
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert rmi_calls, "expected podman rmi call for old image"
@@ -211,7 +232,7 @@ class TestDanglingImageEagerCleanup:
         """If the tag does not exist yet (first commit), no rmi call is made."""
         import agency.agsandbox_backends.podman as _mod
 
-        sb = _make_sandbox()
+        sb = _make_backend()
 
         class FakeCompleted:
             def __init__(self, stdout=b"", returncode=0):
@@ -227,10 +248,9 @@ class TestDanglingImageEagerCleanup:
             return FakeCompleted()
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
@@ -239,7 +259,7 @@ class TestDanglingImageEagerCleanup:
         """A failing rmi during old-image cleanup must NOT propagate."""
         import agency.agsandbox_backends.podman as _mod
 
-        sb = _make_sandbox()
+        sb = _make_backend()
         fake_old_id = "sha256:cafebabe1234"
 
         class FakeCompleted:
@@ -259,10 +279,9 @@ class TestDanglingImageEagerCleanup:
         sys.stderr = captured
         try:
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
-                with patch.object(sb._backend, "_started", True):
-                    with patch.object(sb._backend, "_container_running", return_value=True):
-                        with patch.object(sb._backend, "_gpu_virtual", False):
-                            sb.stop(commit=True)  # must not raise
+                with patch.object(sb, "_container_running", return_value=True):
+                    with patch.object(sb, "_gpu_virtual", False):
+                        sb.stop(commit=True)  # must not raise
         finally:
             sys.stderr = old_stderr
 
@@ -330,7 +349,7 @@ class TestPodmanCommandHelpers:
     """Unit tests for _rm_container and _rmi — no real Podman required."""
 
     def _sb(self):
-        return _make_sandbox()
+        return _make_backend()
 
     # --- _rm_container ---
 
@@ -349,7 +368,7 @@ class TestPodmanCommandHelpers:
         import agency.agsandbox_backends.podman as _mod
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            sb._backend._rm_container("my-container")
+            sb._rm_container("my-container")
 
         assert len(calls) == 1
         args, check = calls[0]
@@ -363,7 +382,7 @@ class TestPodmanCommandHelpers:
 
         with patch.object(_mod._PodmanBackend, "_run", side_effect=RuntimeError("rm failed")):
             with pytest.raises(RuntimeError, match="rm failed"):
-                sb._backend._rm_container("bad-container")
+                sb._rm_container("bad-container")
 
     # --- _rmi ---
 
@@ -382,7 +401,7 @@ class TestPodmanCommandHelpers:
         import agency.agsandbox_backends.podman as _mod
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            sb._backend._rmi("sha256:abc123")
+            sb._rmi("sha256:abc123")
 
         assert len(calls) == 1
         args, check = calls[0]
@@ -405,7 +424,7 @@ class TestPodmanCommandHelpers:
         import agency.agsandbox_backends.podman as _mod
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            sb._backend._rmi("myimage:tag", force=True)
+            sb._rmi("myimage:tag", force=True)
 
         assert "-f" in calls[0]
 
@@ -416,7 +435,7 @@ class TestPodmanCommandHelpers:
 
         with patch.object(_mod._PodmanBackend, "_run", side_effect=RuntimeError("rmi failed")):
             with pytest.raises(RuntimeError, match="rmi failed"):
-                sb._backend._rmi("sha256:deadbeef")
+                sb._rmi("sha256:deadbeef")
 
     # --- _ensure_started pre-cleanup guard ---
 
@@ -437,10 +456,10 @@ class TestPodmanCommandHelpers:
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
             # status returns "" → no leftover container
-            with patch.object(sb._backend, "_container_running", return_value=False):
-                with patch.object(sb._backend, "_container_status", return_value=""):
-                    with patch.object(sb._backend, "_run_with_conflict_retry"):
-                        sb._backend._ensure_started()
+            with patch.object(sb, "_container_running", return_value=False):
+                with patch.object(sb, "_container_status", return_value=""):
+                    with patch.object(sb, "_run_with_conflict_retry"):
+                        sb._ensure_started()
 
         rm_calls = [a for a in calls if "rm" in a]
         assert not rm_calls, f"expected no rm call; got {rm_calls}"
@@ -461,10 +480,10 @@ class TestPodmanCommandHelpers:
         import agency.agsandbox_backends.podman as _mod
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=False):
-                with patch.object(sb._backend, "_container_status", return_value="exited"):
-                    with patch.object(sb._backend, "_run_with_conflict_retry"):
-                        sb._backend._ensure_started()
+            with patch.object(sb, "_container_running", return_value=False):
+                with patch.object(sb, "_container_status", return_value="exited"):
+                    with patch.object(sb, "_run_with_conflict_retry"):
+                        sb._ensure_started()
 
         rm_calls = [(a, c) for (a, c) in calls if "rm" in a]
         assert rm_calls, "expected rm call for leftover container"
@@ -474,7 +493,13 @@ class TestPodmanCommandHelpers:
 
     def test_destroy_releases_semaphore_even_when_rm_raises(self):
         """The shared (docker+podman) concurrency semaphore must be released
-        in finally even if rm fails."""
+        in finally if rm raises but the container turns out to be confirmed
+        gone anyway (e.g. rm actually succeeded server-side despite the
+        client call itself raising, or a concurrent cleanup removed it) --
+        NOT when the container is still genuinely running, in which case the
+        slot is legitimately still held and destroy() must NOT release it
+        (see container.py's destroy() docstring/comment for that invariant;
+        a container still running after a raised rm must keep its slot)."""
         import agency.agsandbox_backends.container as _container_mod
         import agency.agsandbox_backends.podman as _mod
 
@@ -495,19 +520,29 @@ class TestPodmanCommandHelpers:
 
         released = []
 
-        with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_container_status", return_value="running"):
-                        with patch.object(
-                            _container_mod._container_semaphore,
-                            "release",
-                            side_effect=lambda: released.append(1),
-                        ):
-                            with pytest.raises(RuntimeError, match="rm exploded"):
-                                sb.destroy()
+        # had_container (destroy()'s pre-rm check) must see "running" so the
+        # test actually exercises the "was running, rm failed, but confirmed
+        # gone by the recheck" path -- the post-rm recheck in the `finally`
+        # block must see "gone". Same method, two different truthful answers
+        # at two different times, exactly like a real rm that silently
+        # succeeded despite raising a secondary error.
+        running_calls = [True, False]
 
-        assert released, "semaphore must be released even when rm raises"
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", side_effect=fake_container_running):
+                with patch.object(sb, "_container_status", return_value="running"):
+                    with patch.object(
+                        _container_mod._container_semaphore,
+                        "release",
+                        side_effect=lambda: released.append(1),
+                    ):
+                        with pytest.raises(RuntimeError, match="rm exploded"):
+                            sb.destroy()
+
+        assert released, "semaphore must be released once the container is confirmed gone"
 
     def test_destroy_skips_rm_when_container_absent(self):
         """destroy() must not call rm when the container does not exist."""
@@ -525,10 +560,9 @@ class TestPodmanCommandHelpers:
             return OK()
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", False):
-                with patch.object(sb._backend, "_container_running", return_value=False):
-                    with patch.object(sb._backend, "_container_status", return_value=""):
-                        sb.destroy()
+            with patch.object(sb, "_container_running", return_value=False):
+                with patch.object(sb, "_container_status", return_value=""):
+                    sb.destroy()
 
         rm_calls = [a for a in calls if "rm" in a and "rmi" not in a]
         assert not rm_calls, f"must not rm when container absent; got {rm_calls}"

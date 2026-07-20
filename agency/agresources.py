@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import os
-import re
 import subprocess
 import threading
 import time
-from typing import Callable
 
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
@@ -36,12 +34,6 @@ class _AgResourcePoolFields:
     marker_mb = GlobalConfigParam(
         "agResourcePool", default=128
     )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
-    gpu_release_wait_poll_s = GlobalConfigParam(
-        "agResourcePool", default=1.0
-    )  # Seconds between is_clear() polls while waiting for the releasing sandbox to go idle
-    gpu_release_wait_timeout_s = GlobalConfigParam(
-        "agResourcePool", default=30
-    )  # Max seconds to wait for is_clear() before releasing anyway (with a warning)
 
     # CPU limit applied both when a sandbox container is first created (docker
     # run) and whenever it's reset to idle (docker update, via cpu_release) --
@@ -160,92 +152,6 @@ def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
     if _allocate_gpu_markers_cuda(gpu_ids, marker_bytes):
         return
     _allocate_gpu_markers_rocm(gpu_ids, marker_bytes)
-
-
-def _nvidia_gpu_compute_pids(gpu_id: int) -> "set[int] | None":
-    """Return host PIDs with an active CUDA context on physical GPU *gpu_id*,
-    or None if nvidia-smi is unavailable/failed (including on non-NVIDIA
-    hardware, where the binary doesn't exist at all)."""
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=pid",
-                "--format=csv,noheader,nounits",
-                "-i",
-                str(gpu_id),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_AgResourcePoolFields().gpu_detect_timeout_s,
-        )
-        if result.returncode != 0:
-            return None
-        return {int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()}
-    except Exception:
-        return None
-
-
-_ROCM_PIDGPUS_HEADER_RE = re.compile(r"^PID (\d+) is using (\d+) DRM device\(s\)")
-
-
-def _rocm_gpu_compute_pids(gpu_id: int) -> "set[int] | None":
-    """Return host PIDs with an active KFD compute context on physical GPU
-    *gpu_id*, or None if rocm-smi is unavailable/failed.
-
-    ``rocm-smi --showpidgpus``'s "DRM device" number is rocm-smi's own
-    device index -- the exact same index space as ``--showid``'s cardN (both
-    ultimately come from the same `range(numberOfDevices)` list inside
-    rocm-smi's own implementation), so it lines up directly with detect_gpus()'s
-    gpu_id numbering with no render-node/topology-node/PCI translation needed.
-    Deliberately not ``--json``/``--csv``: rocm-smi silently omits PID data
-    under structured-output modes for this particular query.
-    """
-    try:
-        result = subprocess.run(
-            ["rocm-smi", "--showpidgpus"],
-            capture_output=True,
-            text=True,
-            timeout=_AgResourcePoolFields().gpu_detect_timeout_s,
-        )
-        if result.returncode != 0:
-            return None
-    except Exception:
-        return None
-
-    pids: set[int] = set()
-    lines = result.stdout.splitlines()
-    i = 0
-    while i < len(lines):
-        m = _ROCM_PIDGPUS_HEADER_RE.match(lines[i].strip())
-        if m is None:
-            i += 1
-            continue
-        pid, n = int(m.group(1)), int(m.group(2))
-        i += 1
-        devices: list[int] = []
-        while len(devices) < n and i < len(lines):
-            devices.extend(int(tok) for tok in lines[i].split() if tok.lstrip("-").isdigit())
-            i += 1
-        if gpu_id in devices:
-            pids.add(pid)
-    return pids
-
-
-def _gpu_compute_pids(gpu_id: int) -> "set[int] | None":
-    """Return host PIDs with an active compute context on physical GPU
-    *gpu_id*, trying nvidia-smi then falling back to rocm-smi (mirroring
-    detect_gpus()'s own nvidia-then-rocm dispatch).
-
-    Returns None (rather than an empty set) when neither query could be
-    performed (no nvidia-smi/rocm-smi, unsupported hardware, timeout) so
-    callers can tell "confirmed empty" apart from "couldn't check" and avoid
-    blocking release on hardware where this check simply isn't possible.
-    """
-    pids = _nvidia_gpu_compute_pids(gpu_id)
-    if pids is not None:
-        return pids
-    return _rocm_gpu_compute_pids(gpu_id)
 
 
 def _cvd_filter(gpu_ids: list[int]) -> list[int]:
@@ -428,53 +334,23 @@ class agResourcePool(_AgResourcePoolFields):
                 raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
             time.sleep(poll)
 
-    def _wait_for_gpu_clear(
-        self, gpu_id: int, is_clear: "Callable[[], bool] | None" = None
-    ) -> None:
-        """Block until *is_clear()* reports the releasing sandbox is idle.
-
-        Callers pass a sandbox-scoped predicate (e.g. container no longer
-        running — the same condition as container exit) so we never consult
-        nvidia-smi/rocm-smi and never wait on an unrelated tenant sharing the
-        physical GPU. When *is_clear* is None (no sandbox context), return
-        immediately.
-
-        Gives up and returns (so release still proceeds, with a warning)
-        after gpu_release_wait_timeout_s — a wedged sandbox must not
-        permanently strand the GPU as unreleasable.
-        """
-        if is_clear is None:
-            return
-        poll = self.gpu_release_wait_poll_s
-        deadline = time.monotonic() + self.gpu_release_wait_timeout_s
-        while True:
-            try:
-                clear = bool(is_clear())
-            except Exception as _e:
-                print(
-                    f"[agresources] WARNING: gpu_id={gpu_id} is_clear() raised {_e!r}; "
-                    "releasing anyway"
-                )
-                return
-            if clear:
-                return
-            if time.monotonic() >= deadline:
-                print(
-                    f"[agresources] WARNING: gpu_id={gpu_id} is_clear() still false "
-                    f"after {self.gpu_release_wait_timeout_s}s; releasing anyway"
-                )
-                return
-            time.sleep(poll)
-
-    def release_gpu(self, gpu_id: int, is_clear: "Callable[[], bool] | None" = None) -> None:
+    def release_gpu(self, gpu_id: int) -> None:
         """Release *gpu_id* back to the pool.
 
-        If *is_clear* is provided, poll it until True (or timeout) before
-        freeing the semaphore — typically ``lambda: not container_running()``.
+        No separate "is this actually idle yet" wait: callers (backend
+        `stop()`/`destroy()`) already run their own teardown -- kill
+        watched processes, then remove the container / rmtree the chroot
+        jail -- synchronously, BEFORE calling this. That ordering is
+        already the confirmation that the sandbox has exited; a poll here
+        would just be re-checking, via the exact same tracked state the
+        teardown already acted on, something the sequencing already
+        guarantees. (A prior version of this threaded an `is_clear`
+        predicate through here for exactly that re-check; removed as
+        redundant -- see agsandbox_backends.chroot's module docstring for
+        the reasoning that led here.)
         """
         sem = self._gpu_locks.get(gpu_id)
         if sem is not None:
-            self._wait_for_gpu_clear(gpu_id, is_clear)
             try:
                 sem.release()
             except ValueError as _e:

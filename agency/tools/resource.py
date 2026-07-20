@@ -30,7 +30,11 @@ def make_gpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
 
     No physical GPU is claimed here. The physical allocation happens lazily
     inside sandbox.exec() the moment a bash command is actually run, and is
-    released when the sandbox stops (container exit / no live chroot PIDs).
+    held for the rest of the sandbox's lifetime -- there is no agent-facing
+    release tool. It is freed automatically when the sandbox stops (container
+    exit / no live chroot PIDs), tying the real GPU semaphore's lifetime to
+    the sandbox's own lifetime rather than to the agent remembering to call
+    a release tool mid-skill.
     """
 
     def _run(arg: agdata) -> agdata:
@@ -54,27 +58,8 @@ def make_gpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
         description=(
             "Reserve GPU access before running commands with GPU acceleration. "
             "CUDA_VISIBLE_DEVICES is set automatically — always use cuda:0 inside your scripts. "
-            "Always call gpu_release when finished."
-        ),
-        params={"type": "object", "properties": {}},
-        run_in_subprocess=False,
-    )
-
-
-def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
-    def _run(arg: agdata) -> agdata:
-        sandbox._gpu_virtual = False
-        if sandbox._gpu_id is not None:
-            pool.release_gpu(sandbox._gpu_id, is_clear=sandbox._gpu_is_clear)
-            sandbox._gpu_id = None
-        return agdata(message="GPU released")
-
-    return agtool(
-        name="gpu_release",
-        fn=_run,
-        description=(
-            "Release the GPU reserved by reserve_gpu back to the shared pool. "
-            "Call this as soon as GPU-intensive work is complete."
+            "The GPU is held for the rest of this sandbox's lifetime and freed "
+            "automatically when the sandbox finishes -- there is no separate release step."
         ),
         params={"type": "object", "properties": {}},
         run_in_subprocess=False,

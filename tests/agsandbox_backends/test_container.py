@@ -464,7 +464,8 @@ class TestRun:
 # ---------------------------------------------------------------------------
 # _own_host_pids() -- host PIDs currently inside this container via
 # docker/podman top (exec sessions are siblings of init, not /proc children).
-# GPU release waits on _gpu_is_clear() / container exit, not nvidia-smi.
+# GPU release runs after stop()/destroy()'s own container-removal step has
+# already completed synchronously -- no separate polling/is_clear check.
 #
 # Syntax is NOT interchangeable between runtimes:
 #   docker: `docker top <name> -eo pid` -- real ps(1) flags, host PIDs.
@@ -1047,7 +1048,6 @@ class TestCvdOverrideProtectionIntegration:
                 f"the harness-leased {leased_gpu_id!r}. GPU isolation is not enforced."
             )
         finally:
-            tools["gpu_release"].fn(agdata())
             sb.destroy()
 
     @docker_gpu

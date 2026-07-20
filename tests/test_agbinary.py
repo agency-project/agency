@@ -365,7 +365,6 @@ class TestAgSandboxBinaryIO:
         from agency.agsandbox_backends.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
-        sb._started = True
         return sb
 
     def test_read_file_bytes_returns_raw_bytes(self):

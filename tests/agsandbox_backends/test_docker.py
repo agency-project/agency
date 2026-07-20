@@ -198,10 +198,9 @@ class TestDanglingImageEagerCleanup:
             return FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert rmi_calls, "expected docker rmi call for old image"
@@ -229,10 +228,9 @@ class TestDanglingImageEagerCleanup:
             return FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
@@ -268,10 +266,9 @@ class TestDanglingImageEagerCleanup:
         sys.stderr = captured
         try:
             with patch.object(_mod._DockerBackend, "_run", fake_run):
-                with patch.object(sb._backend, "_started", True):
-                    with patch.object(sb._backend, "_container_running", return_value=True):
-                        with patch.object(sb._backend, "_gpu_virtual", False):
-                            sb.stop(commit=True)  # must not raise
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.stop(commit=True)  # must not raise
         finally:
             sys.stderr = old_stderr
 
@@ -512,18 +509,17 @@ class TestDockerCommandHelpers:
         released = []
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                # Still running both before AND after the failed rm attempt --
-                # removal truly never happened.
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_container_status", return_value="running"):
-                        with patch.object(
-                            _container_mod._container_semaphore,
-                            "release",
-                            side_effect=lambda: released.append(1),
-                        ):
-                            with pytest.raises(RuntimeError, match="rm exploded"):
-                                sb.destroy()
+            # Still running both before AND after the failed rm attempt --
+            # removal truly never happened.
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(
+                        _container_mod._container_semaphore,
+                        "release",
+                        side_effect=lambda: released.append(1),
+                    ):
+                        with pytest.raises(RuntimeError, match="rm exploded"):
+                            sb.destroy()
 
         assert not released, (
             "semaphore must NOT be released while the container is confirmed still running"
@@ -555,22 +551,29 @@ class TestDockerCommandHelpers:
 
         released = []
 
+        # had_container (destroy()'s pre-rm check) must see "running" so the
+        # test actually exercises the "was running, rm failed, but confirmed
+        # gone by the recheck" path -- the post-rm recheck in the `finally`
+        # block must see "gone". Same method, two different truthful answers
+        # at two different times, exactly like a real rm that silently
+        # succeeded despite raising a secondary error.
+        running_calls = [True, False]
+
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            # _started=True short-circuits had_container's "self._started or
-            # self._container_running()" check, so _container_running() is
-            # only actually called once in this whole path: the recheck in
-            # destroy()'s `finally` after the failed rm. False there means
-            # "confirmed gone by the time we check."
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=False):
-                    with patch.object(sb._backend, "_container_status", return_value="running"):
-                        with patch.object(
-                            _container_mod._container_semaphore,
-                            "release",
-                            side_effect=lambda: released.append(1),
-                        ):
-                            with pytest.raises(RuntimeError, match="rm exploded"):
-                                sb.destroy()
+            with patch.object(
+                sb._backend, "_container_running", side_effect=fake_container_running
+            ):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(
+                        _container_mod._container_semaphore,
+                        "release",
+                        side_effect=lambda: released.append(1),
+                    ):
+                        with pytest.raises(RuntimeError, match="rm exploded"):
+                            sb.destroy()
 
         assert released, "semaphore must be released once the container is confirmed gone"
 
@@ -590,10 +593,9 @@ class TestDockerCommandHelpers:
             return OK()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", False):
-                with patch.object(sb._backend, "_container_running", return_value=False):
-                    with patch.object(sb._backend, "_container_status", return_value=""):
-                        sb.destroy()
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                with patch.object(sb._backend, "_container_status", return_value=""):
+                    sb.destroy()
 
         rm_calls = [a for a in calls if "rm" in a and "rmi" not in a]
         assert not rm_calls, f"must not rm when container absent; got {rm_calls}"

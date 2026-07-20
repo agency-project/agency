@@ -673,12 +673,15 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
-    def test_commit_works_when_started_false(self):
-        """commit() must succeed on a sandbox whose _started=False but whose container
-        is already running (started by a worker process or another sandbox instance).
+    def test_commit_works_on_a_sandbox_object_that_never_started_it_itself(self):
+        """commit() must succeed on a sandbox object that never itself ran
+        _ensure_started() but whose container is already running (started by
+        a worker process or another sandbox instance) -- it always checks
+        _container_running() directly, never a per-process memory flag.
 
-        Simulated by creating two sandbox objects with the same agname: sb_worker starts
-        the container, sb_main (with _started=False) tries to commit it."""
+        Simulated by creating two sandbox objects with the same agname:
+        sb_worker starts the container, sb_main (whose own copy never
+        touched it) tries to commit it."""
         from agency.agconfig import agConfig
         from agency.agsandbox import agSandbox
         from agency.agsandbox_backends import agSandboxBackendConfig
@@ -686,13 +689,11 @@ class TestAgSandboxLifecycle:
         agname = str(uuid.uuid4())
         cfg = agConfig(agSandboxBackendConfig(backend="docker"))
         sb_worker = agSandbox(agname, agconfig=cfg)  # "worker" — starts the container
-        sb_main = agSandbox(agname, agconfig=cfg)  # "main process" — same name, _started=False
+        sb_main = agSandbox(agname, agconfig=cfg)  # "main process" — same name, never started it
         tag = f"agency/test-commit-started-false-{agname[:8]}"
         try:
             # Worker starts container and writes a file.
             sb_worker.write_file("/workspace/marker.txt", "worker-written\n")
-            # sb_main has _started=False but the container is already running.
-            assert sb_main._started is False
             # commit() must detect the running container via docker inspect and succeed.
             assert sb_main.commit(tag) is True
             result = subprocess.run(
@@ -700,7 +701,9 @@ class TestAgSandboxLifecycle:
                 capture_output=True,
                 text=True,
             )
-            assert result.stdout.strip() != "", "image must exist even when _started was False"
+            assert result.stdout.strip() != "", (
+                "image must exist even though sb_main never started it"
+            )
         finally:
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
             sb_worker.destroy()
@@ -710,7 +713,7 @@ class TestAgSandboxLifecycle:
         """commit() must return False (not crash) if no container is running."""
         sb = _make_sandbox()
         tag = f"agency/test-commit-no-container-{sb._agname}"
-        # _started is False and no container was ever started — nothing to commit.
+        # No container was ever started — nothing to commit.
         assert sb.commit(tag) is False
         # No image should have been created.
         result = subprocess.run(
@@ -724,16 +727,22 @@ class TestAgSandboxLifecycle:
     def test_ensure_started_reuses_running_container(self):
         """_ensure_started() must reuse a container already running in Docker rather
         than destroying it and starting fresh — the cross-worker-process file-persistence fix."""
+        from agency.agconfig import agConfig
+        from agency.agsandbox import agSandbox
+        from agency.agsandbox_backends import agSandboxBackendConfig
+
         sb = _make_sandbox()
         # Start the container and write a sentinel file.
         sb.write_file("/workspace/persist.txt", "still-here\n")
-        assert sb._started is True
-        # Simulate a fresh sandbox object (as deserialized in a new worker process):
-        # _started is False but the container is still running in Docker.
-        sb._started = False
-        # _ensure_started() must detect the running container and reuse it.
-        sb._backend._ensure_started()
-        assert sb._started is True
+        assert sb._backend._container_running() is True
+        # A second sandbox object with the same name, standing in for a fresh
+        # worker-process copy -- it has never itself run _ensure_started(),
+        # but _ensure_started() must detect the already-running container via
+        # docker inspect and reuse it rather than trusting any in-process
+        # memory of its own.
+        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
+        worker = agSandbox(sb._agname, agconfig=cfg)
+        worker._backend._ensure_started()
         # The file written before the reset must still be present.
         content = sb.read_file("/workspace/persist.txt")
         assert "still-here" in content
@@ -867,7 +876,7 @@ class TestAgSandboxLifecycle:
         try:
             sb.write_file("/workspace/persistent.txt", "saved\n")
             sb.stop(commit=True)
-            assert sb._started is False
+            assert not sb._backend._container_running()
             # Next exec triggers _ensure_started() which runs docker run from lifecycle image.
             out, rc = sb.exec("cat /workspace/persistent.txt")
             assert rc == 0
@@ -943,7 +952,7 @@ class TestAgSandboxLifecycle:
         sb.stop(commit=False)
 
         assert call_count[0] == 2, "expected one failure then one success"
-        assert sb._started is False
+        assert not sb._backend._container_running()
         # Container must actually be gone after the successful retry
         result = subprocess.run(
             ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
@@ -981,7 +990,6 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
         assert "WARNING" in captured.getvalue()
-        assert sb._started is False  # _started cleared even on failure
 
     @docker
     def test_stop_then_destroy_after_rm_failure_releases_slot_once(self):
@@ -1096,7 +1104,7 @@ class TestAgSandboxLifecycle:
             assert status.stdout.strip() == "created"
             # _ensure_started() must remove the stuck container and start fresh.
             sb._backend._ensure_started()
-            assert sb._started is True
+            assert sb._backend._container_running() is True
             out, rc = sb.exec("echo ok")
             assert rc == 0 and "ok" in out
         finally:
@@ -1124,7 +1132,7 @@ class TestAgSandboxLifecycle:
             sb.stop(commit=True)
             assert call_count[0] == 2, "expected one failure then one success"
             assert sb._checkpoint_image == lifecycle_tag
-            assert sb._started is False
+            assert not sb._backend._container_running()
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
                 capture_output=True,
@@ -1165,7 +1173,7 @@ class TestAgSandboxLifecycle:
 
         assert "WARNING" in captured.getvalue()
         assert sb._checkpoint_image == previous_lifecycle  # not updated on all-retry failure
-        assert sb._started is False
+        assert not sb._backend._container_running()
 
     @docker
     def test_ensure_started_removes_exited_container(self):
@@ -1181,10 +1189,9 @@ class TestAgSandboxLifecycle:
             sb.write_file("/workspace/exited.txt", "still-here\n")
             # Externally stop (not remove) the container — puts it in exited state.
             subprocess.run(["docker", "stop", "-t", "0", name], capture_output=True)
-            sb._started = False
             # _ensure_started() must remove the exited container and do a fresh docker run.
             sb._backend._ensure_started()
-            assert sb._started is True
+            assert sb._backend._container_running() is True
             # The fresh container has no /workspace/exited.txt — the exited container
             # was force-removed.  State would only survive if stop(commit=True) had been
             # called before the stop to commit a checkpoint_image.
@@ -1294,7 +1301,6 @@ class TestAgSandboxReadFileUnit:
         from agency.agsandbox_backends.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
-        sb._started = True
         return sb
 
     def test_read_file_returns_text_content(self):
@@ -1631,7 +1637,7 @@ class TestResourceTools:
         self.tools["reserve_gpu"].fn(agdata())
         assert self.pool._gpus_acquired == 0
         self.sb.exec("echo hello")
-        # Held until stop()/gpu_release (container-exit clear), not released mid-skill.
+        # Held until stop() (container-exit clear); there is no mid-skill release tool.
         assert self.pool._gpus_acquired == 1
         assert self.sb._gpu_id is not None
 
@@ -1708,7 +1714,7 @@ class TestResourceTools:
         self.sb.exec("kill %1 2>/dev/null || true")
 
     def test_physical_gpu_held_after_background_process_finishes(self):
-        """Physical GPU stays held after background work exits; stop()/gpu_release frees it."""
+        """Physical GPU stays held after background work exits; stop() frees it."""
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("sleep 0.1 &")
         time.sleep(1.0)
@@ -1748,41 +1754,10 @@ class TestResourceTools:
         assert exec_done.is_set()
         sb2.destroy()
 
-    # ── gpu_release ────────────────────────────────────────────────────────
-
-    def test_gpu_release_clears_virtual_flag(self):
-        """gpu_release clears _gpu_virtual even when no physical GPU is currently held."""
-        self.tools["reserve_gpu"].fn(agdata())
-        self.tools["gpu_release"].fn(agdata())
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
-
-    def test_gpu_release_also_frees_physical_gpu_held_by_background_process(self, monkeypatch):
-        """gpu_release frees the physical GPU; is_clear waits for container exit (timeout → release)."""
-        # Avoid a real 30s wait: container is still running so is_clear stays false.
-        monkeypatch.setattr(self.pool, "gpu_release_wait_timeout_s", 0)
-        self.tools["reserve_gpu"].fn(agdata())
-        self.sb.exec("sleep 30 &")
-        self.sb.get_live_pids()
-        assert self.sb._gpu_id is not None
-        self.tools["gpu_release"].fn(agdata())
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
-        assert self.pool._gpus_acquired == 0
-        self.sb.exec("kill %1 2>/dev/null || true")
-
-    def test_gpu_release_without_reserve_is_safe(self):
-        """gpu_release is a no-op when nothing is reserved."""
-        result = self.tools["gpu_release"].fn(agdata())
-        assert result.message is not None
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
-
     # ── release_resources ─────────────────────────────────────────────────
 
-    def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self, monkeypatch):
+    def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self):
         """release_resources() clears _gpu_virtual and returns any held physical GPU."""
-        monkeypatch.setattr(self.pool, "gpu_release_wait_timeout_s", 0)
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("sleep 30 &")
         self.sb.get_live_pids()
