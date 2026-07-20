@@ -1010,11 +1010,11 @@ class _ContainerBackendBase(agsandbox_backend):
         undocumented internal storage layout, which is necessarily
         runtime-specific (Docker's overlay2 graphdriver layout and
         Podman's `containers/storage` layout are unrelated). Overridden
-        by `_DockerBackend` (`.docker`); returning None here means "no
-        fast lookup available for this runtime," which
-        `_fold_commit_into_accumulator()` treats as "accumulator
-        unavailable," safely falling back to the slower but always-
-        correct `_squash_commit()` path -- never as an error.
+        by `_DockerBackend` (`.docker`) and `_PodmanBackend` (`.podman`);
+        returning None here means "no fast lookup available for this
+        runtime," which `_fold_commit_into_accumulator()` treats as
+        "accumulator unavailable," safely falling back to the slower
+        but always-correct `_squash_commit()` path -- never as an error.
         """
         return None
 
@@ -1024,17 +1024,18 @@ class _ContainerBackendBase(agsandbox_backend):
         them. Identity by default -- correct for any runtime that
         doesn't remap ownership between its own user namespace and the
         container's (true of non-rootless Docker/Podman, where the
-        overlay2 diff directory's on-disk ownership already IS the
-        container-visible ownership).
+        overlay2/overlay diff directory's on-disk ownership already IS
+        the container-visible ownership).
 
-        Overridden by `_DockerBackend` for rootless Docker specifically,
-        where the daemon's own user namespace means a raw `os.lstat()`
-        on the diff directory reports HOST-remapped ownership instead
-        (confirmed empirically during development: a root-owned file
-        inside the container showed up as owned by the invoking host
-        user via the raw overlay2 path, not uid 0) -- passed to
-        `_layer_squash.overlay_diff_to_tar()`'s `uid_gid_translate`
-        parameter by `_fold_commit_into_accumulator()` below.
+        Overridden by `_DockerBackend` for rootless Docker and
+        `_PodmanBackend` for rootless Podman, where the runtime's user
+        namespace means a raw `os.lstat()` on the diff directory reports
+        HOST-remapped ownership instead (confirmed empirically: a
+        root-owned file inside the container showed up as owned by the
+        invoking host user via the raw overlay path, not uid 0) --
+        passed to `_layer_squash.overlay_diff_to_tar()`'s
+        `uid_gid_translate` parameter by `_fold_commit_into_accumulator()`
+        below.
         """
         return (uid, gid)
 

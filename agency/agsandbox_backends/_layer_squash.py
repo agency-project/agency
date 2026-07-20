@@ -323,16 +323,24 @@ def build_save_archive(
     tag: str,
 ) -> None:
     """Construct a `docker save`/`load`-compatible archive referencing the
-    base image's own layers BY DIGEST ONLY -- their blob content is
-    deliberately never read or included. `docker load` resolves any
-    referenced digest it already has locally from its own content-
-    addressable store instead of requiring the archive to be
-    self-contained (confirmed empirically during development, including
-    against a real ~24GB, 80-layer base image: archive-build and load both
-    completed in well under a second, with zero bytes of base-layer
-    content touched). This is what makes squashing cheap regardless of
-    base image size -- earlier revisions of this function copied the base
-    blobs' bytes into the archive, which defeated the entire point.
+    base image's own layers BY DIGEST ONLY -- their real blob content is
+    deliberately never read or included. Both `docker load` and
+    `podman load` resolve those digests from their own local store
+    (confirmed empirically, including against a real ~24GB, 80-layer
+    base image: archive-build and load both completed in well under a
+    second, with zero bytes of base-layer content touched). This is what
+    makes squashing cheap regardless of base image size -- earlier
+    revisions of this function copied the base blobs' bytes into the
+    archive, which defeated the entire point.
+
+    Podman (unlike Docker) still requires every `manifest.json` Layers
+    path to exist as a member of the archive even when it will resolve
+    the content locally -- missing members fail with "Some layer
+    tarfiles are missing in the tarball". So each unique base-layer
+    digest gets a zero-byte placeholder blob written under
+    `blobs/sha256/<hex>` (empty, never the real layer bytes). Docker
+    tolerates the same placeholders. Duplicate digests (common for
+    empty image layers) share one placeholder member.
 
     *base_layer_digests* are `sha256:<hex>`-prefixed strings (e.g. from
     `docker inspect --format='{{json .RootFS.Layers}}'`), most-base-first,
@@ -346,12 +354,12 @@ def build_save_archive(
     """
     if ":" not in tag.rsplit("/", 1)[-1]:
         tag = f"{tag}:latest"
+    base_blob_names = [f"blobs/sha256/{d.split(':', 1)[1]}" for d in base_layer_digests]
     manifest = [
         {
             "Config": f"blobs/sha256/{config_digest}",
             "RepoTags": [tag],
-            "Layers": [f"blobs/sha256/{d.split(':', 1)[1]}" for d in base_layer_digests]
-            + [f"blobs/sha256/{merged_blob_digest}"],
+            "Layers": base_blob_names + [f"blobs/sha256/{merged_blob_digest}"],
         }
     ]
     manifest_bytes = json.dumps(manifest).encode()
@@ -359,7 +367,10 @@ def build_save_archive(
     with tarfile.open(output_path, "w") as out:
         _add_bytes(out, "manifest.json", manifest_bytes)
         _add_bytes(out, f"blobs/sha256/{config_digest}", config_bytes)
-        # Base layers are deliberately NOT written here -- see docstring.
+        # Zero-byte placeholders so Podman load accepts the archive; real
+        # base-layer content is never read -- see docstring.
+        for blob_name in dict.fromkeys(base_blob_names):
+            _add_bytes(out, blob_name, b"")
         _add_file(out, f"blobs/sha256/{merged_blob_digest}", merged_blob_path)
 
 

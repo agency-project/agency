@@ -4,21 +4,20 @@ Nearly everything about running a container is identical between Docker and
 Podman and lives in `._ContainerBackendBase` (`.container`), including the
 session-keyring-quota machinery -- see that module's docstring for why both
 runtimes are subject to the same kernel quota. `_DockerBackend` itself is
-mostly just the `_runtime` tag; see `.podman._PodmanBackend` for the other
-thing that differs between the two (`_resolve_image`).
+mostly just the `_runtime` tag plus the Docker-specific fast-squash
+storage hooks; see `.podman._PodmanBackend` for Podman's equivalents
+(`_resolve_image`, plus its own `_locate_layer_diff_dir` /
+`_host_to_container_id` against `containers/storage`).
 
-The one substantial override here is `_locate_layer_diff_dir()`, feeding
+The substantial override here is `_locate_layer_diff_dir()`, feeding
 `_ContainerBackendBase._fold_commit_into_accumulator()`'s fast incremental
 squashing path (see docs/agsandbox_backends/container.md's "Fast
 incremental squashing" section). It reaches into Docker's own undocumented
 overlay2 graphdriver on-disk layout -- confirmed empirically during
-development, not from published docs -- which has no verified Podman
-equivalent (Podman uses a different storage backend, `containers/storage`).
-The base class's default implementation returns None unconditionally,
-which `_fold_commit_into_accumulator()` treats as "no fast path available,
-fall back to `_squash_commit()`" -- so `_PodmanBackend` not overriding this
-(yet) is completely safe, just slower at squash time until someone
-verifies Podman's own storage layout and adds the equivalent override here.
+development, not from published docs. `_PodmanBackend` has the analogous
+override for Podman's `containers/storage` overlay layout; the base
+class's default still returns None unconditionally for any future
+runtime that hasn't verified its own storage layout yet.
 """
 
 from __future__ import annotations

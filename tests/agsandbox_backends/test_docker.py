@@ -890,23 +890,6 @@ class TestLocateLayerDiffDir:
 
         assert result is None
 
-    def test_podman_backend_uses_base_default_and_returns_none(self, tmp_path):
-        """_PodmanBackend doesn't override this hook (no verified Podman
-        storage layout) -- it must inherit the base class's safe default
-        rather than accidentally reaching for docker-specific behavior."""
-        from agency.agsandbox_backends.podman import _PodmanBackend
-        from agency.agconfig import agConfig
-
-        backend = _PodmanBackend(
-            "podman-test",
-            name="podman-test",
-            checkpoint_image=None,
-            base_image="agency-sandbox:latest",
-            mounts={},
-            agconfig=agConfig(),
-        )
-        assert backend._locate_layer_diff_dir("sha256:anything") is None
-
 
 class TestHostToContainerId:
     """Tests for _DockerBackend._host_to_container_id() -- the rootless

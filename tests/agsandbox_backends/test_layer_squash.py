@@ -341,11 +341,12 @@ class TestOverlayDiffToTar:
 
 class TestBuildSaveArchive:
     def test_manifest_references_base_by_digest_only_and_merged_layer_in_order(self, tmp_path):
-        """Base layers must be referenced by digest alone -- their content
-        is deliberately never read or written into the archive (that's
-        the entire point: squashing must stay cheap regardless of how
-        large the base image is). Only the merged layer's actual bytes
-        get written."""
+        """Base layers must be referenced by digest alone -- their real
+        content is deliberately never read into the archive (that's the
+        entire point: squashing must stay cheap regardless of how large
+        the base image is). Only the merged layer's actual bytes get
+        written; base digests get zero-byte placeholders so Podman load
+        accepts the archive."""
         base_digest1 = "sha256:" + "a" * 64
         base_digest2 = "sha256:" + "b" * 64
         merged = tmp_path / "merged"
@@ -375,13 +376,53 @@ class TestBuildSaveArchive:
                 f"blobs/sha256/{'b' * 64}",
                 f"blobs/sha256/{merged_digest}",
             ]
-            # The base layers' own blobs must NOT be present in the archive.
-            assert f"blobs/sha256/{'a' * 64}" not in names
-            assert f"blobs/sha256/{'b' * 64}" not in names
+            # Base-layer members exist as zero-byte placeholders (Podman
+            # requires the paths to be present); only the merged layer
+            # carries real content.
+            assert f"blobs/sha256/{'a' * 64}" in names
+            assert f"blobs/sha256/{'b' * 64}" in names
+            assert tf.getmember(f"blobs/sha256/{'a' * 64}").size == 0
+            assert tf.getmember(f"blobs/sha256/{'b' * 64}").size == 0
             assert f"blobs/sha256/{merged_digest}" in names
+            assert tf.extractfile(f"blobs/sha256/{merged_digest}").read() == b"merged-layer-content"
             for member in tf.getmembers():
                 assert member.uid == 0
                 assert member.gid == 0
+
+    def test_duplicate_base_digests_share_one_placeholder(self, tmp_path):
+        """Empty image layers commonly reuse one digest many times -- the
+        archive must list them all in Layers order but only write one
+        placeholder member."""
+        empty = "sha256:" + "e" * 64
+        other = "sha256:" + "f" * 64
+        merged = tmp_path / "merged"
+        merged.write_bytes(b"m")
+        merged_digest = sha256_file(merged)
+        config_bytes = json.dumps({}).encode()
+        config_digest = sha256_file_bytes(config_bytes)
+
+        out = tmp_path / "archive.tar"
+        build_save_archive(
+            out,
+            base_layer_digests=[empty, other, empty, empty],
+            merged_blob_path=merged,
+            merged_blob_digest=merged_digest,
+            config_bytes=config_bytes,
+            config_digest=config_digest,
+            tag="t:latest",
+        )
+        with tarfile.open(out, "r") as tf:
+            names = [m.name for m in tf.getmembers()]
+            assert names.count(f"blobs/sha256/{'e' * 64}") == 1
+            assert names.count(f"blobs/sha256/{'f' * 64}") == 1
+            manifest = json.loads(tf.extractfile("manifest.json").read())
+            assert manifest[0]["Layers"] == [
+                f"blobs/sha256/{'e' * 64}",
+                f"blobs/sha256/{'f' * 64}",
+                f"blobs/sha256/{'e' * 64}",
+                f"blobs/sha256/{'e' * 64}",
+                f"blobs/sha256/{merged_digest}",
+            ]
 
     def test_bare_tag_gets_explicit_latest_qualifier(self, tmp_path):
         """`docker load` rejects a RepoTags entry with no tag component

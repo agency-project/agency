@@ -29,8 +29,10 @@ skipped automatically when Podman is unreachable.
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import sys
+import time
 import uuid
 
 import pytest
@@ -553,7 +555,7 @@ class TestCheckpointSquash:
     def test_squashes_when_threshold_is_reached(self):
         """Mirrors test_docker.py's version -- the plain commit always
         happens first (unchanged), and squashing is a separate,
-        additional step; since the mocked `docker info` returns no
+        additional step; since the mocked `podman info` returns no
         parseable JSON here, the fast accumulator path can't be trusted
         and falls back to `_squash_commit()`'s export/import."""
         import agency.agsandbox_backends.podman as _mod
@@ -754,31 +756,383 @@ class TestCheckpointSquash:
             subprocess.run(["podman", "rmi", "-f", tag], capture_output=True)
 
 
-class TestFastSquashHooksUseBaseDefaults:
-    """_PodmanBackend doesn't override _locate_layer_diff_dir() or
-    _host_to_container_id() -- no verified Podman overlay2-equivalent
-    storage layout yet (see test_docker.py's TestLocateLayerDiffDir /
-    TestHostToContainerId and docs/agsandbox_backends/container.md's
-    "Fast incremental squashing" section). It must inherit
-    _ContainerBackendBase's safe generic defaults rather than silently
-    doing nothing useful: `_locate_layer_diff_dir` returning None makes
-    `_fold_commit_into_accumulator()` fall back to export/import at
-    squash time (exercised end-to-end by TestCheckpointSquash above,
-    where the fast path is never even attempted); `_host_to_container_id`
-    is identity, which is simply a correctness no-op until an override
-    exists."""
+# ---------------------------------------------------------------------------
+# Fast incremental squashing -- mirrors test_docker.py's
+# TestLocateLayerDiffDir / TestHostToContainerId / end-to-end accumulator
+# coverage against _PodmanBackend's containers/storage overlay layout.
+# See docs/agsandbox_backends/container.md's "Fast incremental squashing"
+# section and podman.py's module docstring.
+# ---------------------------------------------------------------------------
+
+
+class TestLocateLayerDiffDir:
+    """Tests for _PodmanBackend._locate_layer_diff_dir() -- reaches into
+    Podman's containers/storage overlay on-disk layout. Uses REAL temp
+    directories structured to match that layout (layers.json +
+    overlay/<id>/diff dirs), not a real podman daemon -- this is pure
+    filesystem-correlation logic once `podman info`'s own result is
+    known, so mocking that one call is enough to exercise it fully."""
 
     def _sb(self):
         return _make_backend()
 
-    def test_locate_layer_diff_dir_returns_none(self):
-        sb = self._sb()
-        assert sb._locate_layer_diff_dir("sha256:anything") is None
+    def _fake_podman_root(self, tmp_path, *, driver="overlay"):
+        root = tmp_path / "podman-root"
+        (root / "overlay-layers").mkdir(parents=True)
+        (root / "overlay").mkdir(parents=True)
+        (root / "overlay-layers" / "layers.json").write_text("[]")
+        return root
 
-    def test_host_to_container_id_is_identity(self):
+    def _add_layer_entry(self, root, diff_id, layer_id, *, with_content=True):
+        layers_path = root / "overlay-layers" / "layers.json"
+        layers = json.loads(layers_path.read_text())
+        layers.append({"id": layer_id, "diff-digest": diff_id})
+        layers_path.write_text(json.dumps(layers))
+        if with_content:
+            diff_dir = root / "overlay" / layer_id / "diff"
+            diff_dir.mkdir(parents=True)
+            (diff_dir / "marker").write_text("x")
+        return layer_id
+
+    def test_finds_diff_dir_matching_digest(self, tmp_path):
+        import agency.agsandbox_backends.podman as _mod
+
         sb = self._sb()
-        assert sb._host_to_container_id(1000, 1000) == (1000, 1000)
-        assert sb._host_to_container_id(0, 0) == (0, 0)
+        root = self._fake_podman_root(tmp_path)
+        self._add_layer_entry(root, "sha256:target123", "layer-target")
+        self._add_layer_entry(root, "sha256:other456", "layer-other")
+
+        with patch.object(
+            _mod._PodmanBackend, "_podman_graph_root_and_driver", return_value=(root, "overlay")
+        ):
+            result = sb._locate_layer_diff_dir("sha256:target123")
+
+        assert result == root / "overlay" / "layer-target" / "diff"
+        assert (result / "marker").read_text() == "x"
+
+    def test_prefers_last_matching_entry_when_digest_duplicated(self, tmp_path):
+        """Empty layers commonly share a digest; layers.json is
+        append-ordered, so the last match is the newest."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        root = self._fake_podman_root(tmp_path)
+        self._add_layer_entry(root, "sha256:shared", "layer-older")
+        self._add_layer_entry(root, "sha256:shared", "layer-newer")
+
+        with patch.object(
+            _mod._PodmanBackend, "_podman_graph_root_and_driver", return_value=(root, "overlay")
+        ):
+            result = sb._locate_layer_diff_dir("sha256:shared")
+
+        assert result == root / "overlay" / "layer-newer" / "diff"
+
+    def test_returns_none_when_digest_not_found(self, tmp_path):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        root = self._fake_podman_root(tmp_path)
+        self._add_layer_entry(root, "sha256:other456", "layer-other")
+
+        with patch.object(
+            _mod._PodmanBackend, "_podman_graph_root_and_driver", return_value=(root, "overlay")
+        ):
+            result = sb._locate_layer_diff_dir("sha256:nonexistent")
+
+        assert result is None
+
+    def test_returns_none_for_non_overlay_driver(self, tmp_path):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        root = self._fake_podman_root(tmp_path)
+        self._add_layer_entry(root, "sha256:target123", "layer-target")
+
+        with patch.object(
+            _mod._PodmanBackend, "_podman_graph_root_and_driver", return_value=(root, "vfs")
+        ):
+            result = sb._locate_layer_diff_dir("sha256:target123")
+
+        assert result is None
+
+    def test_returns_none_when_info_lookup_fails(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        with patch.object(_mod._PodmanBackend, "_podman_graph_root_and_driver", return_value=None):
+            result = sb._locate_layer_diff_dir("sha256:anything")
+        assert result is None
+
+    def test_returns_none_when_layers_json_entry_present_but_content_missing(self, tmp_path):
+        """A matching layers.json entry whose overlay diff dir doesn't
+        actually exist (e.g. already cleaned up) must degrade to None,
+        not raise."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        root = self._fake_podman_root(tmp_path)
+        self._add_layer_entry(root, "sha256:target123", "layer-target", with_content=False)
+
+        with patch.object(
+            _mod._PodmanBackend, "_podman_graph_root_and_driver", return_value=(root, "overlay")
+        ):
+            result = sb._locate_layer_diff_dir("sha256:target123")
+
+        assert result is None
+
+    def test_returns_none_when_layers_json_missing(self, tmp_path):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        root = self._fake_podman_root(tmp_path)
+        (root / "overlay-layers" / "layers.json").unlink()
+
+        with patch.object(
+            _mod._PodmanBackend, "_podman_graph_root_and_driver", return_value=(root, "overlay")
+        ):
+            result = sb._locate_layer_diff_dir("sha256:anything")
+
+        assert result is None
+
+    @podman
+    def test_real_commit_layer_locates_via_live_storage(self):
+        """End-to-end against a real podman commit: the top RootFS.Layers
+        digest must resolve to a real overlay diff dir containing the
+        file we wrote (no mocking of info/storage)."""
+        name = f"test-locate-{uuid.uuid4().hex[:8]}"
+        tag = f"localhost/agency-test-locate-{uuid.uuid4().hex[:8]}:latest"
+        subprocess.run(
+            ["podman", "run", "-d", "--name", name, "alpine:latest", "sleep", "3600"],
+            capture_output=True,
+            check=True,
+        )
+        sb = self._sb()
+        try:
+            subprocess.run(
+                ["podman", "exec", name, "sh", "-c", "echo locate-marker > /tmp/locate.txt"],
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(["podman", "commit", name, tag], capture_output=True, check=True)
+            layers = json.loads(
+                subprocess.run(
+                    ["podman", "inspect", "--format={{json .RootFS.Layers}}", tag],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+            )
+            diff_dir = sb._locate_layer_diff_dir(layers[-1])
+            assert diff_dir is not None, f"failed to locate diff dir for {layers[-1]}"
+            assert (diff_dir / "tmp" / "locate.txt").is_file()
+            assert (diff_dir / "tmp" / "locate.txt").read_text() == "locate-marker\n"
+        finally:
+            subprocess.run(["podman", "rm", "-f", name], capture_output=True)
+            subprocess.run(["podman", "rmi", "-f", tag], capture_output=True)
+
+
+class TestHostToContainerId:
+    """Tests for _PodmanBackend._host_to_container_id() -- the rootless
+    Podman uid/gid translation feeding overlay_diff_to_tar() via
+    _fold_commit_into_accumulator(). Mocks `_podman_info()` rather than
+    a real rootless setup; the reverse-mapping arithmetic itself is
+    exercised against idMappings shaped like a real `podman info`."""
+
+    def _sb(self):
+        return _make_backend()
+
+    def test_identity_when_not_rootless(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        with patch.object(
+            _mod._PodmanBackend,
+            "_podman_info",
+            return_value={"host": {"security": {"rootless": False}}},
+        ):
+            assert sb._host_to_container_id(1000, 1000) == (1000, 1000)
+
+    def test_identity_when_podman_info_unavailable(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        with patch.object(_mod._PodmanBackend, "_podman_info", return_value=None):
+            assert sb._host_to_container_id(1000, 1000) == (1000, 1000)
+
+    def test_identity_when_rootless_but_maps_unavailable(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        with patch.object(
+            _mod._PodmanBackend,
+            "_podman_info",
+            return_value={
+                "host": {
+                    "security": {"rootless": True},
+                    "idMappings": {},
+                }
+            },
+        ):
+            assert sb._host_to_container_id(1000, 1000) == (1000, 1000)
+
+    def test_translates_using_podman_info_id_mappings(self):
+        """idMappings shape captured from a real rootless `podman info`:
+        container uid 0 maps to host uid 1000, and container uids 1-65536
+        map to host 100000+."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        info = {
+            "host": {
+                "security": {"rootless": True},
+                "idMappings": {
+                    "uidmap": [
+                        {"container_id": 0, "host_id": 1000, "size": 1},
+                        {"container_id": 1, "host_id": 100000, "size": 65536},
+                    ],
+                    "gidmap": [
+                        {"container_id": 0, "host_id": 1000, "size": 1},
+                        {"container_id": 1, "host_id": 100000, "size": 65536},
+                    ],
+                },
+            }
+        }
+        with patch.object(_mod._PodmanBackend, "_podman_info", return_value=info):
+            assert sb._host_to_container_id(1000, 1000) == (0, 0)
+            assert sb._host_to_container_id(100001, 100001) == (2, 2)
+
+    def test_translate_id_leaves_unmapped_host_id_unchanged(self):
+        from agency.agsandbox_backends.podman import _translate_id
+
+        assert _translate_id(999999, [(0, 1000, 1)]) == 999999
+
+
+class TestCheckpointAccumulator:
+    """Tests for the fast squash path fed by TestLocateLayerDiffDir's
+    lookup, against _PodmanBackend. Mirrors the fold/accumulator checks
+    in test_docker.py; the shared merge/load logic lives on the base
+    class, so these confirm the Podman hooks wire into it correctly."""
+
+    def _sb(self):
+        return _make_backend()
+
+    def _make_real_diff_dir(self, tmp_path, name, files):
+        d = tmp_path / name
+        d.mkdir()
+        for rel, content in files.items():
+            p = d / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        return d
+
+    def test_fold_builds_accumulator_from_overlay_diff_dir(self, tmp_path):
+        import tarfile
+
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        diff_dir = self._make_real_diff_dir(tmp_path, "diff1", {"workspace/f1": "one"})
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:layer1"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(_mod._PodmanBackend, "_locate_layer_diff_dir", return_value=diff_dir):
+                sb._fold_commit_into_accumulator("some-tag")
+
+        assert sb._accumulated_layer_count == 1
+        assert sb._accumulated_diff_path is not None
+        with tarfile.open(sb._accumulated_diff_path, "r") as tf:
+            content = tf.extractfile("workspace/f1").read()
+        assert content == b"one"
+
+    def test_fold_invalidates_accumulator_when_diff_dir_not_found(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:layer1"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(_mod._PodmanBackend, "_locate_layer_diff_dir", return_value=None):
+                sb._fold_commit_into_accumulator("some-tag")
+
+        assert sb._accumulated_diff_path is None
+        assert sb._accumulated_layer_count == -1
+
+    @podman
+    @pytest.mark.timeout(180)
+    def test_real_end_to_end_fast_squash_against_base_image(self):
+        """Several plain-commit cycles against localhost/agency-sandbox:latest,
+        each folding via the real containers/storage lookup (no mocking),
+        then a real squash -- must complete quickly, produce correct
+        content, and leave the base image's own layers untouched."""
+        sb = _make_sandbox()
+
+        base_ref = "localhost/agency-sandbox:latest"
+        base_layers_before = subprocess.run(
+            ["podman", "inspect", "--format={{json .RootFS.Layers}}", base_ref],
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        sb.exec("mkdir -p /workspace/proj && echo one > /workspace/proj/f1")
+        sb.stop(commit=True)
+        sb.exec("echo two > /workspace/proj/f2 && rm /workspace/proj/f1")
+        sb.stop(commit=True)
+        sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
+
+        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
+        t0 = time.time()
+        sb.stop(commit=True)  # this cycle commits AND squashes
+        elapsed = time.time() - t0
+
+        try:
+            assert elapsed < 20, f"fast squash took {elapsed:.1f}s -- expected well under 20s"
+
+            base_layers_after = subprocess.run(
+                ["podman", "inspect", "--format={{json .RootFS.Layers}}", base_ref],
+                capture_output=True,
+                text=True,
+            ).stdout
+            assert base_layers_after == base_layers_before
+
+            tag = sb._backend._lifecycle_tag()
+            layers = int(
+                subprocess.run(
+                    ["podman", "inspect", "--format={{len .RootFS.Layers}}", tag],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            base_layer_count = len(json.loads(base_layers_before))
+            assert layers == base_layer_count + 1, (
+                "expected exactly one new layer on top of the base"
+            )
+
+            result = subprocess.run(
+                [
+                    "podman",
+                    "run",
+                    "--rm",
+                    tag,
+                    "sh",
+                    "-c",
+                    "ls /workspace/proj/f1 2>&1; cat /workspace/proj/f2; cat /workspace/proj/sub/f3",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert "No such file" in result.stdout or "No such file" in result.stderr
+            assert "two" in result.stdout
+            assert "three" in result.stdout
+        finally:
+            sb.destroy()
 
 
 # ---------------------------------------------------------------------------
