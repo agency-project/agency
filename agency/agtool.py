@@ -399,36 +399,58 @@ def dispatch_tools(
                         print(
                             f"[agtool] WARNING: failed to offload large tool output to {offload_path}: {_e}"
                         )
-                if t.run_in_subprocess:
-                    # A tool may signal failure via agdata(error=...) without raising —
-                    # treat that the same as an exception: discard dirty state.
-                    _result_errored = False
-                    try:
-                        if "error" in json.loads(result_content):
-                            _result_errored = True
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                # stop() runs after every tool call regardless of
+                # run_in_subprocess -- checkpointing/reverting is not
+                # specific to subprocess-isolated tools, and every call
+                # should leave the sandbox in a known, committed-or-reverted
+                # state rather than only the ones that happen to run in a
+                # worker process. The one exception: if this tool call left
+                # background work still running inside the sandbox (e.g. a
+                # bash `cmd &`), stop() must NOT run yet -- it always tears
+                # down or overwrites the sandbox's live state, which would
+                # kill that work before the agent ever gets a chance to
+                # check on it in a later tool call. Skipping here just
+                # defers the checkpoint; the next tool call that finds
+                # nothing pending will catch it up.
+                #
+                # A tool may signal failure via agdata(error=...) without raising —
+                # treat that the same as an exception: discard dirty state.
+                _result_errored = False
+                try:
+                    if "error" in json.loads(result_content):
+                        _result_errored = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                _stopped = False
+                if not sandbox._has_pending_background_work():
                     if _result_errored:
                         sandbox.stop(commit=False)
-                        try:
-                            _result_obj = json.loads(result_content)
-                            _result_obj["workspace_reverted"] = (
-                                "The workspace has been reverted to the state "
-                                "before this tool call."
-                            )
-                            result_content = json.dumps(_result_obj)
-                        except (json.JSONDecodeError, TypeError):
-                            pass
                     else:
                         sandbox.stop(commit=True)
+                    _stopped = True
+                # Only claim the revert happened if stop() actually ran --
+                # if it was deferred above, the workspace is untouched, and
+                # saying otherwise would misinform the agent.
+                if _result_errored and _stopped:
+                    try:
+                        _result_obj = json.loads(result_content)
+                        _result_obj["workspace_reverted"] = (
+                            "The workspace has been reverted to the state before this tool call."
+                        )
+                        result_content = json.dumps(_result_obj)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             except Exception as e:
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)
                 result_content = json.dumps({"error": format_exception(e)})
                 # On failure: remove without committing to discard dirty state.
                 # The next tool call restores from the last successful checkpoint.
-                if t.run_in_subprocess:
+                # Same pending-work deferral as the success/error path above.
+                _stopped = not sandbox._has_pending_background_work()
+                if _stopped:
                     sandbox.stop(commit=False)
+                if _stopped:
                     try:
                         _result_obj = json.loads(result_content)
                         _result_obj["workspace_reverted"] = (

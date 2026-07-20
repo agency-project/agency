@@ -900,11 +900,18 @@ class _ContainerBackendBase(agsandbox_backend):
         # Clear PID tracking — remove kills all processes.
         self._watched_pids = {}
         self._baseline_pids = None  # force a fresh capture on the next _ensure_started()
+        # commit_exc is raised at the end, after rm and the release checks
+        # below still run -- a failed commit doesn't mean the container
+        # shouldn't still be torn down and its resources still released,
+        # it just means this attempt's state wasn't checkpointed forward.
+        commit_exc: Exception | None = None
         if commit:
             tag = self._lifecycle_tag()
             # Capture the current image ID before overwriting the tag so we
             # can delete it afterward — committing to an existing tag leaves
-            # the old image dangling (untagged but still on disk).
+            # the old image dangling (untagged but still on disk). Best
+            # effort: a stray dangling image costs disk space, not
+            # correctness, so this warns rather than aborting stop() over it.
             old_image_id: str | None = None
             try:
                 result = self._run(
@@ -928,21 +935,16 @@ class _ContainerBackendBase(agsandbox_backend):
                         timeout=self.commit_timeout_s,
                     )
                     self._checkpoint_image = tag
+                    commit_exc = None
                     break
                 except Exception as _e:
-                    if _attempt == self.commit_retry_attempts - 1:
-                        print(
-                            f"[agsandbox_backend] WARNING: {self._runtime} commit {self._container_name()} → {tag} "
-                            f"failed after {self.commit_retry_attempts} attempts: {_e}",
-                            file=__import__("sys").stderr,
-                            flush=True,
-                        )
-                    else:
+                    commit_exc = _e
+                    if _attempt != self.commit_retry_attempts - 1:
                         time.sleep(self.commit_retry_backoff_s)
             # Delete the previous image now that the tag points to the new one.
             # Only delete if no containers are currently using it — a fork may still
             # be running from the same image.  The fork's own stop() will delete it
-            # once its container is gone.
+            # once its container is gone. Best-effort, same reasoning as above.
             if old_image_id and self._checkpoint_image == tag:
                 try:
                     in_use = self._run(
@@ -969,21 +971,19 @@ class _ContainerBackendBase(agsandbox_backend):
                         flush=True,
                     )
         name = self._container_name()
+        # rm_exc, like commit_exc, is raised at the end rather than
+        # immediately -- but unlike commit_exc, its failure also gates the
+        # release checks below: an unconfirmed removal means the container
+        # (and whatever it holds) is not known to be gone.
+        rm_exc: Exception | None = None
         for _attempt in range(self.rm_retry_attempts):
             try:
                 self._rm_container(name)
+                rm_exc = None
                 break
-            except Exception:
-                if _attempt == self.rm_retry_attempts - 1:
-                    import traceback as _tb
-
-                    print(
-                        f"[agsandbox_backend] WARNING: {self._runtime} rm -f {name} failed after {self.rm_retry_attempts} attempts:\n"
-                        f"{_tb.format_exc()}",
-                        file=__import__("sys").stderr,
-                        flush=True,
-                    )
-                else:
+            except Exception as _e:
+                rm_exc = _e
+                if _attempt != self.rm_retry_attempts - 1:
                     time.sleep(self.rm_retry_backoff_s)
         # Only release the runtime slot once the container is actually
         # confirmed gone -- if every rm -f attempt failed, the container (and
@@ -993,13 +993,24 @@ class _ContainerBackendBase(agsandbox_backend):
         # removal genuinely succeeds.
         if not self._container_running():
             self._release_runtime_slot()
-        # Free the GPU only after the container is gone -- `_rm_container()`
-        # above is a synchronous, blocking call, so by this point removal has
-        # already completed; releasing earlier raced with live exec/harness
-        # work still holding CUDA contexts inside the container.
-        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+        # Free the GPU only once the container is confirmed gone -- same
+        # ground-truth gate as the runtime slot above; releasing while rm
+        # failed and the container might still be running would let
+        # something else acquire the same physical GPU concurrently.
+        if (
+            gpu_id_to_release is not None
+            and self._gpu_release_fn is not None
+            and not self._container_running()
+        ):
             self._gpu_release_fn(gpu_id_to_release)
             self._gpu_id = None
+        # Surface whichever failure is more severe: an unconfirmed removal
+        # means real resources may still be held, which matters more than a
+        # missed checkpoint.
+        if rm_exc is not None:
+            raise rm_exc
+        if commit_exc is not None:
+            raise commit_exc
 
     def restore(self, tag: str) -> None:
         """Restore the sandbox to a previously committed image snapshot.
@@ -1039,15 +1050,19 @@ class _ContainerBackendBase(agsandbox_backend):
         # Release the GPU here too -- destroy() is called from atexit/__del__
         # (see agsandbox.py) on sandboxes that may never have gone through a
         # normal stop() first, so this can't assume stop() already handled it.
-        # Not delegated to stop(): stop()'s rm retry loop swallows and warns
-        # on failure, but destroy() is required to propagate an rm error when
-        # the container is confirmed still running afterward (see
-        # test_destroy_does_not_release_semaphore_when_container_still_running_after_rm_failure)
-        # rather than silently leaving it stuck.
+        # Not delegated to stop(): stop()'s rm retry loop raises immediately
+        # on failure, but destroy() must still attempt every remaining
+        # cleanup step (GPU release check, image cleanup) before surfacing
+        # that failure, rather than aborting partway through.
         gpu_id_to_release = (
             self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
         )
 
+        # Best-effort courtesy signal before rm -f forces the issue --
+        # rm -f kills everything inside the container regardless of whether
+        # this succeeds, so a failure here doesn't change what actually
+        # happens, only whether tracked processes got a chance to react
+        # first. Warn, don't raise: nothing depends on this succeeding.
         if self._watched_pids:
             pids = " ".join(str(p) for p in self._watched_pids)
             try:
@@ -1062,9 +1077,16 @@ class _ContainerBackendBase(agsandbox_backend):
         # Check before rm so we know whether a runtime slot must be released.
         had_container = self._container_running()
 
+        # rm_exc is raised at the end, after every remaining cleanup step
+        # below has still been attempted -- an unconfirmed removal must
+        # reach the caller, but shouldn't cut short the GPU-release check or
+        # the best-effort image cleanup that don't depend on it.
+        rm_exc: Exception | None = None
         try:
             if self._container_status():
                 self._rm_container(container_name)
+        except Exception as _e:
+            rm_exc = _e
         finally:
             # Only release if the container is actually confirmed gone now --
             # if had_container was True because a prior stop() already
@@ -1075,12 +1097,21 @@ class _ContainerBackendBase(agsandbox_backend):
             if had_container and not self._container_running():
                 self._release_runtime_slot()
 
-        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+        # Same ground-truth gate as the runtime slot above -- releasing the
+        # GPU while rm failed and the container might still be running would
+        # let something else acquire the same physical GPU concurrently.
+        if (
+            gpu_id_to_release is not None
+            and self._gpu_release_fn is not None
+            and not self._container_running()
+        ):
             self._gpu_release_fn(gpu_id_to_release)
             self._gpu_id = None
 
-        # Remove the checkpoint image and all pre-tool snapshots created during
-        # this sandbox's lifetime.
+        # Remove the checkpoint image and all pre-tool snapshots created
+        # during this sandbox's lifetime. Best-effort: a stray dangling
+        # image costs disk space, not correctness, so these warn rather
+        # than raising.
         if self._checkpoint_image:
             try:
                 self._rmi(self._checkpoint_image, force=True)
@@ -1103,6 +1134,9 @@ class _ContainerBackendBase(agsandbox_backend):
             print(
                 f"[agsandbox_backend] WARNING: pretool image cleanup failed for {container_name}: {_e}"
             )
+
+        if rm_exc is not None:
+            raise rm_exc
 
     def _lifecycle_tag(self) -> str:
         return f"agency/lifecycle-{self._name}".lower()

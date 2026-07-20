@@ -302,10 +302,15 @@ class agSandbox(_AgSandboxFields):
         self._backend.remove_files(paths)
 
     def __del__(self) -> None:
+        # Python silently discards any exception raised out of __del__
+        # anyway (printed as "Exception ignored in..." with no way for a
+        # caller to observe it, since nothing is running a call stack that
+        # could catch it) -- so this print is the only way this failure is
+        # ever surfaced at all.
         try:
             self.destroy()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agsandbox] WARNING: destroy() failed during __del__ for {self._agname}: {_e}")
 
     def destroy(self) -> None:
         if self._destroyed:

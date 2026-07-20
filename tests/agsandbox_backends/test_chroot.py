@@ -65,91 +65,80 @@ class TestSanitizeTag:
 # ---------------------------------------------------------------------------
 # _own_host_pids -- chroot processes run directly on the host (no PID
 # namespace to translate through, unlike _ContainerBackendBase's version),
-# so _watched_pids is already the right PID space -- no real chroot jail
-# needed to test this. GPU release itself no longer waits on anything
-# backend-specific at all: release_gpu() just releases immediately, called
-# after stop()/destroy()'s own kill+teardown has already run synchronously
-# (see agresources.release_gpu()'s docstring).
+# and now delegates straight to get_live_pids() (PGID-matched -- see
+# chroot.py's module docstring), so a fake /proc table via monkeypatched
+# _read_proc_table() is enough to test this, no real chroot jail needed.
+# GPU release itself no longer waits on anything backend-specific at all:
+# release_gpu() just releases immediately, called after stop()/destroy()'s
+# own kill+teardown has already run synchronously (see
+# agresources.release_gpu()'s docstring).
 # ---------------------------------------------------------------------------
 
 
 class TestOwnHostPids:
-    def test_matches_watched_pids(self):
+    def test_matches_pgid_matched_pids(self, monkeypatch):
         sb = _make_backend()
-        sb._watched_pids = {111: 0.0, 222: 0.0}
+        sb._invocation_pgids = {4242}
+        monkeypatch.setattr(
+            sb,
+            "_read_proc_table",
+            lambda script, timeout: ("111 1 4242 S\n222 1 4242 S\n", 0),
+        )
         assert sb._own_host_pids() == {111, 222}
 
-    def test_empty_when_no_watched_pids(self):
+    def test_empty_when_nothing_tracked(self):
         sb = _make_backend()
         assert sb._own_host_pids() == set()
-
-    def test_returns_a_copy_not_a_live_view(self):
-        """Mutating _watched_pids afterward must not retroactively change an
-        already-returned snapshot out from under a caller mid-wait."""
-        sb = _make_backend()
-        sb._watched_pids = {111: 0.0}
-        result = sb._own_host_pids()
-        sb._watched_pids[222] = 0.0
-        assert result == {111}
 
 
 class TestChrootDoesNotAdoptUnwatchedLivePids:
     def test_flag_disabled(self):
         assert _make_backend()._adopt_unwatched_live_pids is False
 
-    def test_get_live_pids_does_not_adopt_strangers(self, monkeypatch):
-        """A live non-baseline host PID that was never in BGPIDS must not enter
-        _watched_pids or the returned live set."""
+    def test_get_live_pids_excludes_unrelated_process_groups(self, monkeypatch):
+        """A live process outside every tracked _invocation_pgids must never
+        appear in get_live_pids() -- PGID matching, not host-wide presence,
+        decides membership here."""
         sb = _make_backend()
-        sb._watched_pids = {111: 0.0}
-        sb._baseline_pids = set()
-        # Fake /proc table: watched 111 still alive, stranger 999999 also alive.
+        sb._invocation_pgids = {4242}
+        # Fake /proc table: tracked-group member 111 alive, unrelated stranger
+        # 999999 (a different, untracked pgid) also alive.
         monkeypatch.setattr(
             sb,
             "_read_proc_table",
-            lambda script, timeout: ("111 1 S python\n999999 1 S sleep\n", 0),
+            lambda script, timeout: ("111 1 4242 S\n999999 1 555 S\n", 0),
         )
         live = sb.get_live_pids()
         assert live == {111}
-        assert 999999 not in sb._watched_pids
-        assert sb._watched_pids == {111: 0.0}
 
 
 # ---------------------------------------------------------------------------
-# _has_pending_background_work / _any_invocation_group_alive /
-# _kill_all_sandbox_processes -- regression coverage for a bug found and
-# confirmed live during this backend's own testing: _adopt_unwatched_live_pids
-# = False (see above) means a child spawned by an already-tracked process
-# AFTER that process's own exec() call already returned is never adopted
-# into _watched_pids. That's the right call for get_live_pids() (see above),
-# but _has_pending_background_work() used to just check _watched_pids
-# directly, which meant agSandbox.wait_for_processes() returned None
-# ("nothing to wait for") while a real, untracked child of an already-exited
-# parent was still alive (confirmed empirically via a real `pgrep`) --
-# meaning a skill's result could finalize while the sandbox was still
-# actively running background work.
+# _has_pending_background_work / _live_pgid_matched_pids /
+# _kill_all_sandbox_processes -- this backend tracks background work purely
+# via process groups (see chroot.py's module docstring). Each exec() call's
+# underlying unshare invocation is its own new process-group leader (see
+# _run_unshared()), and that pgid is recorded into _invocation_pgids. A
+# process-group match is a real, kernel-tracked relationship (not a timing
+# guess the way an earlier "non-baseline since jail start" scan was) --
+# immune to host churn, and confirmed empirically to survive a child
+# outliving its exited parent's reparenting, as well as to catch a child
+# spawned well after the exec() call that backgrounded its parent already
+# returned (something an earlier before/after-diff mechanism, since
+# removed, could never see). It's also verified enough to act on
+# destructively via os.killpg(), unlike a baseline scan, which could never
+# confirm a candidate pid's ownership well enough to justify SIGKILLing it.
 #
 # (GPU release itself doesn't need any of this: release_gpu() no longer
 # waits/polls on anything at all -- see agresources.release_gpu()'s
 # docstring for why the caller's own kill+teardown sequence, which already
 # ran before release_gpu() is even called, is sufficient confirmation.)
 #
-# Fixed via _any_invocation_group_alive(): each exec() call's underlying
-# unshare invocation is its own new process-group leader (see
-# _run_unshared()), and that pgid is recorded into _invocation_pgids. A
-# process-group match is a real, kernel-tracked relationship (not a timing
-# guess the way an earlier "non-baseline since jail start" scan was, which
-# this replaces) -- immune to host churn, and confirmed empirically to
-# survive a child outliving its exited parent's reparenting. It's also
-# verified enough to act on destructively via os.killpg(), unlike the
-# earlier scan, closing the same gap for _kill_all_sandbox_processes().
-#
 # The accepted trade-off: a process that calls setsid()/setpgid() to detach
 # into its own new group (nohup/setsid/disown and similar daemonizing
 # idioms) escapes this tracking entirely -- confirmed empirically (see
 # TestChrootDelayedChildSafety.test_setsid_detached_daemon_is_not_tracked
-# below) and accepted deliberately: the alternative (reverting to the old
-# non-baseline scan) traded that same blind spot for a *worse* one, making
+# below) and accepted deliberately: the alternative (a baseline scan) traded
+# that same blind spot for a *worse* one, making
 # _has_pending_background_work() never resolve to "done" quickly on any host
 # with background churn -- confirmed empirically too.
 # ---------------------------------------------------------------------------
@@ -213,30 +202,21 @@ class TestChrootInvocationPgidTracking:
         )
         assert sb._has_pending_background_work() is False
 
-    def test_kill_all_sandbox_processes_kills_watched_pids_and_process_groups(self):
+    def test_kill_all_sandbox_processes_kills_process_groups(self):
         sb = self._sb()
-        sb._watched_pids = {111: 0.0}
-        killed_pids = []
         killed_pgids = []
-        with patch("os.kill", side_effect=lambda pid, sig: killed_pids.append(pid)):
-            with patch("os.killpg", side_effect=lambda pgid, sig: killed_pgids.append(pgid)):
-                sb._kill_all_sandbox_processes()
-        assert killed_pids == [111]
+        with patch("os.killpg", side_effect=lambda pgid, sig: killed_pgids.append(pgid)):
+            sb._kill_all_sandbox_processes()
         assert killed_pgids == [4242]
 
-    def test_kill_all_sandbox_processes_ignores_already_dead_pids_and_groups(self):
+    def test_kill_all_sandbox_processes_ignores_already_dead_groups(self):
         sb = self._sb()
-        sb._watched_pids = {111: 0.0}
-
-        def _raise_kill(pid, sig):
-            raise ProcessLookupError()
 
         def _raise_killpg(pgid, sig):
             raise ProcessLookupError()
 
-        with patch("os.kill", side_effect=_raise_kill):
-            with patch("os.killpg", side_effect=_raise_killpg):
-                sb._kill_all_sandbox_processes()  # must not raise
+        with patch("os.killpg", side_effect=_raise_killpg):
+            sb._kill_all_sandbox_processes()  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -262,24 +242,15 @@ class TestChrootInvocationPgidTracking:
 #    output via a temp file instead, whose reads don't block on other
 #    processes' open write handles the way a pipe's do.
 #
-# Unlike docker/podman, chroot has no isolated PID namespace of its own.
-# get_live_pids()'s "anything not in the one-time startup baseline is this
-# sandbox's own live work" (correct for an isolated container, where nothing
-# else CAN appear in that procfs) is disabled here via
-# `_adopt_unwatched_live_pids = False` (see chroot.py's module docstring) --
-# its host-wide /proc scan only ever PRUNES already-`_watched_pids` entries
-# for liveness, never adopts a newly-seen non-baseline pid the way docker/
-# podman's does. New pids only ever enter tracking via exec()'s own
-# before/after diff, a single, tight per-call window. Two consequences for
-# these tests: (a) a tracked process's own LATER-spawned children (after the
-# exec() call that started it already returned) are never discovered by a
-# later get_live_pids() poll -- tests that need multiple descendants tracked
-# spawn them in the foreground, before the call returns, rather than relying
-# on a subsequent poll to notice them; (b) tests that would need
-# get_live_pids()'s sweep to return exactly empty are written to check
-# specific previously-tracked PIDs are gone rather than asserting the whole
-# set is empty, so they don't flake on a host with unrelated background
-# churn (cron, monitoring agents, other tenants) still being pruned through.
+# Unlike docker/podman, chroot has no isolated PID namespace of its own, so
+# get_live_pids() here is PGID-matched rather than baseline-diffed (see
+# chroot.py's module docstring): every PID sharing a tracked invocation's
+# process group counts, including one spawned well after the exec() call
+# that started that invocation already returned. get_live_pids() and
+# _has_pending_background_work() are backed by the exact same scan, so they
+# can never disagree with each other the way an earlier, since-removed
+# before/after-diff `get_live_pids()` and PGID-based
+# `_has_pending_background_work()` sometimes did.
 # ---------------------------------------------------------------------------
 
 
@@ -293,22 +264,23 @@ class TestChrootBackendPIDTracking:
 
     def test_background_pid_tracked(self):
         self.sb.exec("sleep 5 &")
-        assert len(self.sb._watched_pids) > 0
+        assert len(self.sb.get_live_pids()) > 0
 
     def test_foreground_spawned_child_tracked(self):
         # A foreground command that internally forks a child and exits.
-        # The child escapes jobs -p but must still be captured via /proc diffing.
+        # The child inherits the invocation's pgid, so PGID matching finds
+        # it regardless of the shell's own job table.
         self.sb.write_file(
             "/workspace/spawner.py",
             ("import subprocess\nsubprocess.Popen(['sleep', '5'])\n"),  # detached, not waited on
         )
         self.sb.exec("python3 /workspace/spawner.py")
-        assert len(self.sb._watched_pids) > 0
+        assert len(self.sb.get_live_pids()) > 0
 
     def test_parent_exits_child_survives_still_tracked(self):
         # Parent spawns a child then exits. Child is reparented (to the real
-        # host init, since there's no PID namespace of our own) and escapes
-        # any BFS from the original PID. Baseline diff must find it.
+        # host init, since there's no PID namespace of our own) but keeps
+        # the same pgid regardless -- PGID matching finds it either way.
         self.sb.write_file(
             "/workspace/spawner.py",
             (
@@ -318,23 +290,12 @@ class TestChrootBackendPIDTracking:
             ),
         )
         self.sb.exec("python3 /workspace/spawner.py")
-        assert len(self.sb._watched_pids) > 0
+        assert len(self.sb.get_live_pids()) > 0
 
     def test_multiple_children_tracked_within_same_call(self):
         # A single exec() call whose command spawns multiple detached
-        # children before it returns -- the before/after diff must capture
-        # the WHOLE set spawned during this one call, not just one pid.
-        #
-        # Unlike docker/podman, get_live_pids() cannot discover a tracked
-        # process's own LATER-spawned descendants for chroot --
-        # `_adopt_unwatched_live_pids = False` here means its /proc scan
-        # only ever prunes already-watched pids, never adopts a newly-seen
-        # one (see chroot.py's module docstring for why: unlike a
-        # container's own isolated PID namespace, chroot's /proc scan is
-        # host-wide, so adopting strangers would latch onto unrelated host
-        # churn). So children must exist by the time THIS call's own diff
-        # runs -- spawned in the foreground, before the command returns --
-        # rather than relying on a later get_live_pids() poll to notice them.
+        # children before it returns -- all of them inherit the same
+        # invocation pgid, so a single tracked group covers the whole set.
         self.sb.write_file(
             "/workspace/parent.py",
             (
@@ -342,11 +303,12 @@ class TestChrootBackendPIDTracking:
             ),
         )
         self.sb.exec("python3 /workspace/parent.py")
-        assert len(self.sb._watched_pids) >= 2
+        assert len(self.sb.get_live_pids()) >= 2
 
     def test_double_forked_daemon_tracked(self):
         # Classic Unix double-fork: grandchild is reparented to the real host
-        # init and completely detached from the shell's job table.
+        # init and completely detached from the shell's job table, but keeps
+        # the same pgid regardless of reparenting.
         self.sb.write_file(
             "/workspace/daemon.py",
             (
@@ -359,7 +321,7 @@ class TestChrootBackendPIDTracking:
             ),
         )
         self.sb.exec("python3 /workspace/daemon.py")
-        assert len(self.sb._watched_pids) > 0
+        assert len(self.sb.get_live_pids()) > 0
 
     def test_get_live_pids_returns_running(self):
         self.sb.exec("sleep 5 &")
@@ -369,17 +331,14 @@ class TestChrootBackendPIDTracking:
     def test_get_live_pids_removes_exited(self):
         marker = f"agencytest{uuid.uuid4().hex[:8]}"
         # Set argv[0] to a random, practically-unique marker via `exec -a` so
-        # our own backgrounded process can be conclusively identified among
-        # _watched_pids, rather than assuming the whole set is ours -- this
-        # host's own setup/mount overhead per exec() call (unshare + chroot +
-        # ~40 bind mounts, no persistent daemon to cache it across calls) can
-        # itself take upward of half a second, and unrelated background churn
-        # (confirmed on at least one real dev host during this backend's
-        # testing: other tenants' `sleep N` jobs, monitoring scripts) can be
-        # swept into the same before/after diff window. `sleep 3` gives
-        # comfortable margin over that per-call overhead so our own process
-        # is genuinely still running when tracked, without relying on an
-        # unrealistically short duration a busy host could race past entirely.
+        # our own backgrounded process can be conclusively identified,
+        # rather than assuming the whole set is ours -- this host's own
+        # setup/mount overhead per exec() call (unshare + chroot + ~40 bind
+        # mounts, no persistent daemon to cache it across calls) can itself
+        # take upward of half a second. `sleep 3` gives comfortable margin
+        # over that per-call overhead so our own process is genuinely still
+        # running when tracked, without relying on an unrealistically short
+        # duration a busy host could race past entirely.
         self.sb.exec(f"exec -a {marker} sleep 3 &")
 
         def _find_marked(pids):
@@ -393,8 +352,8 @@ class TestChrootBackendPIDTracking:
                     found.add(pid)
             return found
 
-        marked = _find_marked(self.sb._watched_pids)
-        assert marked, f"expected the marked sleep to be tracked, got {self.sb._watched_pids}"
+        marked = _find_marked(self.sb.get_live_pids())
+        assert marked, f"expected the marked sleep to be tracked, got {self.sb.get_live_pids()}"
         time.sleep(4.0)  # comfortable margin past sleep 3's own exit
         live = self.sb.get_live_pids()
         surviving = _find_marked(marked & live)
@@ -425,7 +384,7 @@ class TestChrootBackendPIDTracking:
             ),
         )
         self.sb.exec("python3 /workspace/daemon_parent.py &")
-        parent_pids = set(self.sb._watched_pids)
+        parent_pids = self.sb.get_live_pids()
         assert parent_pids, "expected the backgrounded parent to be tracked"
         for pid in parent_pids:
             self.sb.release_daemon(pid)
@@ -437,20 +396,23 @@ class TestChrootBackendPIDTracking:
         assert "no background" in summary
 
     def test_pid_status_summary_with_running_process(self):
+        # No elapsed-time figure here, unlike docker/podman -- there is no
+        # per-PID capture timestamp once tracking is PGID-only (see
+        # chroot.py's pid_status_summary() docstring).
         self.sb.exec("sleep 5 &")
         summary = self.sb.pid_status_summary()
         assert "PID" in summary
-        assert "running" in summary
 
 
 @chroot
 class TestChrootDelayedChildSafety:
-    """End-to-end reproduction, against a real jail, of the exact bug found
-    and fixed in _has_pending_background_work(): a child spawned by an
-    already-tracked process AFTER that process's own exec() call already
-    returned is invisible to _watched_pids (by design, see
-    TestChrootDoesNotAdoptUnwatchedLivePids), but must NOT be invisible to
-    the "does wait_for_processes() even bother waiting" check."""
+    """End-to-end reproduction, against a real jail, of the bug PGID-based
+    tracking was introduced to fix: a child spawned by an already-tracked
+    process AFTER that process's own exec() call already returned used to
+    be invisible to the old before/after-diff `_watched_pids` mechanism,
+    but not to `_has_pending_background_work()`'s pgid scan -- a real gap
+    since closed by making get_live_pids() itself PGID-based too (see
+    chroot.py's module docstring), so both now agree the child is alive."""
 
     def _spawn_delayed_child(self, sb):
         sb.write_file(
@@ -468,21 +430,17 @@ class TestChrootDelayedChildSafety:
         # can occasionally take long enough that a tighter margin flakes.
         time.sleep(1.5)
 
-    def test_has_pending_background_work_true_while_untracked_child_alive(self):
+    def test_has_pending_background_work_true_while_delayed_child_alive(self):
         sb = _make_backend()
         try:
             self._spawn_delayed_child(sb)
-            # get_live_pids() (the _watched_pids-based mechanism) must find
-            # nothing alive -- the top-level parent MAY have been captured
-            # by exec()'s own diff (it was genuinely alive at that instant,
-            # which is correct/expected -- see TestChrootBackendPIDTracking),
-            # but it has since exited via os._exit(0), so this confirms
-            # we're reproducing the exact case where ONLY pgid-based
-            # matching, not _watched_pids tracking, can still see the child.
-            assert not sb.get_live_pids(), (
-                "test assumption broken: get_live_pids() found something alive; "
-                "this must reproduce the case where _watched_pids-based tracking "
-                "alone would miss the still-running delayed child"
+            # The top-level parent already exited via os._exit(0); only the
+            # delayed child (spawned after exec() already returned) is still
+            # running. PGID matching finds it via the invocation's own
+            # tracked group, and get_live_pids()/_has_pending_background_work()
+            # necessarily agree since both are backed by the same scan now.
+            assert sb.get_live_pids(), (
+                "expected the delayed child to still be found via PGID matching"
             )
             assert sb._has_pending_background_work() is True, (
                 "a live process from this exact jail is still running -- "
@@ -565,7 +523,7 @@ class TestChrootDevFiles:
         sb = _make_backend()
         try:
             sb.exec("sleep 5 &")
-            assert len(sb._watched_pids) > 0
+            assert len(sb.get_live_pids()) > 0
         finally:
             sb.destroy()
 
@@ -786,10 +744,9 @@ class TestChrootBackendLifecycle:
     def _find_marked_pid(pids, marker):
         """Identify the specific pid matching *marker* among *pids* --
         blindly grabbing an arbitrary tracked pid (e.g. next(iter(...)))
-        is unsafe on a host with background churn, where _watched_pids can
-        also contain unrelated noise swept in by the same exec() call's
-        tight before/after diff window (confirmed to happen in practice
-        during this backend's own testing)."""
+        is unsafe: a single tracked process group can contain more than one
+        pid (the wrapping shell alongside the actual backgrounded command),
+        so the marker is what pins down the specific one being tested."""
         for pid in pids:
             try:
                 cmdline = open(f"/proc/{pid}/cmdline", "rb").read()
@@ -811,9 +768,9 @@ class TestChrootBackendLifecycle:
         marker = f"agencytest{uuid.uuid4().hex[:8]}"
         try:
             sb.exec(f"exec -a {marker} sleep 30 &")
-            tracked_pid = self._find_marked_pid(sb._watched_pids, marker)
+            tracked_pid = self._find_marked_pid(sb.get_live_pids(), marker)
             assert tracked_pid is not None, (
-                f"expected the marked sleep to be tracked, got {sb._watched_pids}"
+                f"expected the marked sleep to be tracked, got {sb.get_live_pids()}"
             )
         finally:
             sb.destroy()
@@ -834,9 +791,9 @@ class TestChrootBackendLifecycle:
         marker = f"agencytest{uuid.uuid4().hex[:8]}"
         try:
             sb.exec(f"exec -a {marker} sleep 30 &")
-            tracked_pid = self._find_marked_pid(sb._watched_pids, marker)
+            tracked_pid = self._find_marked_pid(sb.get_live_pids(), marker)
             assert tracked_pid is not None, (
-                f"expected the marked sleep to be tracked, got {sb._watched_pids}"
+                f"expected the marked sleep to be tracked, got {sb.get_live_pids()}"
             )
             sb.stop(commit=False)
 

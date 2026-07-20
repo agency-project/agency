@@ -33,7 +33,15 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
 
     ag = _MockAgent()
     ag.llm = llm or LLM
-    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    if sandbox is not None:
+        ag.sandbox = sandbox
+    else:
+        ag.sandbox = MagicMock()
+        # A bare MagicMock()'s _has_pending_background_work() would
+        # otherwise auto-mock to a truthy value, making agtool.py's
+        # dispatch_tools() defer stop() forever -- default to "nothing
+        # pending" so tests get the common case without configuring it.
+        ag.sandbox._has_pending_background_work.return_value = False
     ag.terminal = MagicMock()
     ag._state = _agent_state_cls("test")
     ag.log = MagicMock()
@@ -354,6 +362,7 @@ def test_add_tools_extends_sandbox_defaults():
         sb.get_live_pids.return_value = set()
         sb.pid_status_summary.return_value = ""
         sb.commit.return_value = False
+        sb._has_pending_background_work.return_value = False
         s.execute_react(make_mock_agent(LLM, sb), agcontext(), agdata(x=1))
     names = [t["function"]["name"] for t in (captured.get("tools") or [])]
     assert "bash" in names
@@ -1107,6 +1116,7 @@ def test_ssl_error_succeeds_after_retry():
 def _make_sandbox(written=None):
     """Return a mock sandbox that records write_file calls."""
     sandbox = MagicMock()
+    sandbox._has_pending_background_work.return_value = False
     if written is not None:
         sandbox.write_file.side_effect = lambda path, content: written.update({path: content})
     return sandbox
@@ -1189,6 +1199,7 @@ def test_long_tool_output_offloaded_to_sandbox():
     t = agtool(name="fetcher", description="", fn=fn)
     s = make_skill(replace_tools=[t])
     sandbox = MagicMock()
+    sandbox._has_pending_background_work.return_value = False
     responses = [_tool_call("fetcher", {}, "call-999"), _direct('{"ok": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
@@ -1347,6 +1358,7 @@ def _make_sandbox_with_tracking():
     sandbox = MagicMock()
     sandbox._name = "testbox"
     sandbox.stop.return_value = None
+    sandbox._has_pending_background_work.return_value = False
     return sandbox
 
 
@@ -1406,8 +1418,10 @@ def test_tool_failure_adds_workspace_reverted_note():
     assert "reverted" in content["workspace_reverted"].lower()
 
 
-def test_tool_failure_no_restore_without_sandbox():
-    """When agent_sandbox=MagicMock(), a tool error is passed through as-is with no stop attempt."""
+def test_tool_failure_reverts_even_without_subprocess():
+    """A tool error still reverts the workspace when agent_sandbox=MagicMock() and
+    run_in_subprocess=False -- stop()/the revert note are no longer specific to
+    subprocess-isolated tools."""
 
     def fn(arg: agdata) -> agdata:
         return agerror("nope")
@@ -1422,11 +1436,12 @@ def test_tool_failure_no_restore_without_sandbox():
     tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
     content = json.loads(tool_msgs[0]["content"])
     assert content["error"] == "nope"
-    assert "workspace_reverted" not in content
+    assert "workspace_reverted" in content
 
 
-def test_run_in_subprocess_false_no_stop():
-    """Tools with run_in_subprocess=False must not trigger sandbox.stop()."""
+def test_run_in_subprocess_false_still_stops():
+    """Tools with run_in_subprocess=False must still trigger sandbox.stop() --
+    checkpointing runs after every tool call regardless of subprocess isolation."""
     sandbox = _make_sandbox_with_tracking()
 
     def fn(arg: agdata) -> agdata:
@@ -1439,7 +1454,7 @@ def test_run_in_subprocess_false_no_stop():
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
-    sandbox.stop.assert_not_called()
+    sandbox.stop.assert_called_once_with(commit=False)
 
 
 def test_tool_exception_triggers_stop_without_commit():
@@ -1706,6 +1721,9 @@ def _make_real_sandbox(watched_pids=None):
         def __init__(self):
             self._watched_pids = dict(watched_pids or {})
 
+        def _has_pending_background_work(self):
+            return bool(self._watched_pids)
+
         def get_live_pids(self):
             return set(self._watched_pids.keys())
 
@@ -1722,7 +1740,8 @@ def test_wait_for_processes_clean_sandbox_returns_none():
 
 def test_wait_for_processes_no_watched_pids_attr_returns_none():
     class NoPids:
-        pass
+        def _has_pending_background_work(self):
+            return False
 
     assert agSandbox.wait_for_processes(NoPids(), "skill", None, None, "", 300, 5) is None
 
@@ -1731,6 +1750,7 @@ def test_wait_for_processes_mock_sandbox_returns_none():
     from unittest.mock import MagicMock
 
     sb = MagicMock()
+    sb._has_pending_background_work.return_value = False
     assert agSandbox.wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
 
 
@@ -1740,13 +1760,17 @@ def test_wait_for_processes_completes_quickly_returns_completed_msg():
             self._watched_pids = {1234: 0.0}
             self._call_count = 0
 
-        def get_live_pids(self):
+        def _has_pending_background_work(self):
+            # wait_for_processes() polls THIS method in its loop, not
+            # get_live_pids() -- the state transition has to happen here,
+            # not there, or the loop would just spin until ping_interval_s.
             self._call_count += 1
-            # return empty on second poll → processes done
-            if self._call_count >= 2:
+            if self._call_count >= 3:  # gate call + a couple of poll iterations
                 self._watched_pids.clear()
-                return set()
-            return {1234}
+            return bool(self._watched_pids)
+
+        def get_live_pids(self):
+            return set(self._watched_pids.keys())
 
         def pid_status_summary(self):
             return "PID 1234"
@@ -1763,6 +1787,9 @@ def test_wait_for_processes_still_running_returns_update_msg():
     class _FakeSandbox:
         def __init__(self):
             self._watched_pids = {1234: 0.0}
+
+        def _has_pending_background_work(self):
+            return bool(self._watched_pids)
 
         def get_live_pids(self):
             return {1234}
@@ -1784,12 +1811,16 @@ def test_wait_for_processes_calls_state_fn():
             self._watched_pids = {1: 0.0}
             self._call_count = 0
 
-        def get_live_pids(self):
-            # First call returns live pids (triggers monitoring), second returns empty.
+        def _has_pending_background_work(self):
+            # Same reasoning as test_wait_for_processes_completes_quickly_returns_completed_msg:
+            # the loop polls this method, so the transition must live here.
             self._call_count += 1
-            if self._call_count >= 2:
-                return set()
-            return {1}
+            if self._call_count >= 3:
+                self._watched_pids.clear()
+            return bool(self._watched_pids)
+
+        def get_live_pids(self):
+            return set(self._watched_pids.keys())
 
         def pid_status_summary(self):
             return "PID 1"
@@ -1871,6 +1902,9 @@ def test_run_continues_loop_when_sandbox_has_live_pids():
             self._watched_pids = {9999: 0.0}
             self._cleared = False
 
+        def _has_pending_background_work(self):
+            return bool(self._watched_pids)
+
         def get_live_pids(self):
             if self._cleared:
                 return set()
@@ -1927,16 +1961,19 @@ def test_run_injects_process_completed_message():
     class _TrackedSandbox:
         def __init__(self):
             self._watched_pids = {1: 0.0}
-            self._pid_call_count = 0
+            self._call_count = 0
+
+        def _has_pending_background_work(self):
+            # wait_for_processes() polls THIS method in its loop, not
+            # get_live_pids() -- the state transition has to happen here.
+            # First call (the initial gate check): still alive.
+            self._call_count += 1
+            if self._call_count >= 2:
+                self._watched_pids.clear()
+            return bool(self._watched_pids)
 
         def get_live_pids(self):
-            self._pid_call_count += 1
-            # First call (pre-check inside wait_for_processes): still alive.
-            # Second call (during poll loop): clear and report done.
-            if self._pid_call_count >= 2:
-                self._watched_pids.clear()
-                return set()
-            return {1}
+            return set(self._watched_pids.keys())
 
         def pid_status_summary(self):
             return "PID 1"
@@ -1987,6 +2024,9 @@ def test_run_clean_sandbox_returns_immediately():
 
     class _CleanSandbox:
         _watched_pids: dict = {}
+
+        def _has_pending_background_work(self):
+            return False
 
         def get_live_pids(self):
             return set()

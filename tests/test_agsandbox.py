@@ -962,11 +962,9 @@ class TestAgSandboxLifecycle:
         assert name not in result.stdout
 
     @docker
-    def test_stop_emits_warning_after_all_retries_fail(self):
-        """stop() emits a WARNING to stderr when rm -f fails all 3 attempts."""
-        import io
-        import sys
-
+    def test_stop_raises_after_all_retries_fail(self):
+        """stop() raises rather than silently warning when rm -f fails all 3 attempts --
+        the caller must see that the container was not confirmed removed."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
 
@@ -978,18 +976,13 @@ class TestAgSandboxLifecycle:
             return real_run(cmd, **kwargs)
 
         sb._backend._run = always_fail_rm
-        captured = io.StringIO()
-        old_stderr = sys.stderr
-        sys.stderr = captured
         try:
-            sb.stop(commit=False)
+            with pytest.raises(RuntimeError, match="simulated persistent failure"):
+                sb.stop(commit=False)
         finally:
-            sys.stderr = old_stderr
             # Force cleanup bypassing our mock
             sb._backend._run = real_run
             sb.destroy()
-
-        assert "WARNING" in captured.getvalue()
 
     @docker
     def test_stop_then_destroy_after_rm_failure_releases_slot_once(self):
@@ -1019,7 +1012,8 @@ class TestAgSandboxLifecycle:
 
         sb._backend._run = always_fail_rm
         try:
-            sb.stop(commit=False)
+            with pytest.raises(RuntimeError, match="simulated persistent failure"):
+                sb.stop(commit=False)
         finally:
             sb._backend._run = real_run
 
@@ -1144,11 +1138,12 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
-    def test_stop_emits_warning_after_all_commit_retries_fail(self):
-        """stop(commit=True) emits a WARNING to stderr when all 3 commit attempts fail;
-        _checkpoint_image is not updated so the next start restores from the prior checkpoint."""
-        import io
-
+    def test_stop_raises_and_still_removes_container_after_all_commit_retries_fail(self):
+        """stop(commit=True) raises when all 3 commit attempts fail -- but still
+        removes the container first: a failed checkpoint doesn't mean the tool
+        call's teardown should be skipped, just that this attempt's state wasn't
+        snapshotted. _checkpoint_image stays at the prior tag so the next start
+        restores from the last good checkpoint instead."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
         previous_lifecycle = sb._checkpoint_image
@@ -1161,17 +1156,13 @@ class TestAgSandboxLifecycle:
             return real_run(cmd, **kwargs)
 
         sb._backend._run = always_fail_commit
-        captured = io.StringIO()
-        old_stderr = sys.stderr
-        sys.stderr = captured
         try:
-            sb.stop(commit=True)
+            with pytest.raises(RuntimeError, match="simulated persistent commit failure"):
+                sb.stop(commit=True)
         finally:
-            sys.stderr = old_stderr
             sb._backend._run = real_run
             sb.destroy()
 
-        assert "WARNING" in captured.getvalue()
         assert sb._checkpoint_image == previous_lifecycle  # not updated on all-retry failure
         assert not sb._backend._container_running()
 

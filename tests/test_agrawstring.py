@@ -129,6 +129,11 @@ def _make_mock_agent(llm):
     ag._state = _agent_state_cls("test")
     ag.llm = llm
     ag.sandbox = MagicMock()
+    # A bare MagicMock()'s _has_pending_background_work() would otherwise
+    # auto-mock to a truthy value, making agtool.py's dispatch_tools() defer
+    # stop() forever -- default to "nothing pending" so tests get the common
+    # case without configuring it.
+    ag.sandbox._has_pending_background_work.return_value = False
     ag.terminal = MagicMock()
     ag.log = MagicMock()
     ag.log.token_usage = {}
