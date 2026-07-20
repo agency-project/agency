@@ -19,9 +19,13 @@ skipped automatically when Docker is unreachable.
 from __future__ import annotations
 
 import io
+import json
+import os
 import subprocess
 import sys
+import tarfile
 import threading
+import time
 import uuid
 
 import pytest
@@ -172,10 +176,15 @@ class TestDanglingImageEagerCleanup:
         assert not named, "agsandbox-prune thread should have been removed"
 
     def test_stop_commit_deletes_old_image(self):
-        """stop(commit=True) must delete the image that previously held the tag."""
+        """stop(commit=True) must delete the image that previously held the
+        tag -- only possible on a squash cycle (a plain commit's result is
+        always a child of the old image, so the runtime refuses to delete
+        it; old_image_id is only looked up at all when this cycle squashes,
+        see container.py's stop())."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
+        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
 
         run_calls = []
         fake_old_id = "sha256:deadbeef0000"
@@ -209,10 +218,11 @@ class TestDanglingImageEagerCleanup:
         )
 
     def test_stop_commit_skips_rmi_when_no_old_image(self):
-        """If the tag does not exist yet (first commit), no rmi call is made."""
+        """If the tag does not exist yet (first squash), no rmi call is made."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
+        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
 
         class FakeCompleted:
             def __init__(self, stdout=b"", returncode=0):
@@ -235,6 +245,40 @@ class TestDanglingImageEagerCleanup:
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
 
+    def test_plain_commit_cycle_skips_old_image_lookup_entirely(self):
+        """A plain commit's result is ALWAYS a child of whatever it
+        replaces -- the runtime will refuse to delete that old image no
+        matter what, so there's no point even looking it up. A non-squash
+        stop(commit=True) must issue zero old-image-lookup/ps/rmi calls
+        (the doomed-to-fail cleanup this test originally guarded against),
+        even though it now also does a `docker inspect ...RootFS.Layers`
+        call for the diff accumulator (see TestCheckpointAccumulator) --
+        that inspect is for a different purpose and is expected here."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = _make_sandbox()
+        sb._backend._commits_since_squash = 0  # far from the squash threshold
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert not any("--format={{.Id}}" in c for c in calls), (
+            f"must not do the old-image-lookup inspect on a plain commit: {calls}"
+        )
+        assert not any("ps" in c for c in calls), (
+            f"must not check ancestor on a plain commit: {calls}"
+        )
+        assert not any("rmi" in c for c in calls), (
+            f"must not attempt rmi on a plain commit: {calls}"
+        )
+
     def test_stop_commit_rmi_failure_is_best_effort(self):
         """A failing rmi during old-image cleanup must NOT propagate.
 
@@ -247,6 +291,7 @@ class TestDanglingImageEagerCleanup:
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
+        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
         fake_old_id = "sha256:cafebabe1234"
 
         class FakeCompleted:
@@ -274,6 +319,166 @@ class TestDanglingImageEagerCleanup:
 
         assert "WARNING" in captured.getvalue()
         assert fake_old_id in captured.getvalue()
+
+    def test_old_image_ancestor_check_runs_after_container_removal(self):
+        """Regression test: the ancestor-based "is the old image still in
+        use" check must run AFTER `_rm_container`, not before. This
+        container was itself `run` FROM the old image (restart-from-
+        checkpoint), so checking before removal always finds THIS SAME
+        container as a false-positive "still in use" match and never
+        actually deletes anything -- a real, pre-existing bug confirmed
+        live against a real docker daemon (see docs/agsandbox_backends/
+        container.md's "Layer-depth squashing" section for how this
+        surfaced). Only reachable on a squash cycle -- old_image_id is
+        only looked up then (a plain commit's result can never actually
+        free its parent, so there's no point checking)."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = _make_sandbox()
+        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
+        fake_old_id = "sha256:deadbeef0000"
+        call_order = []
+
+        class FakeCompleted:
+            def __init__(self, stdout=b"", returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "inspect" in args:
+                return FakeCompleted(stdout=fake_old_id.encode())
+            if "rm" in args:
+                call_order.append("rm")
+                return FakeCompleted()
+            if "ps" in args:
+                call_order.append("ps")
+                return FakeCompleted()  # empty -- "not in use"
+            if "rmi" in args:
+                call_order.append("rmi")
+                return FakeCompleted()
+            return FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert call_order == ["rm", "ps", "rmi"], f"expected rm before ps/rmi, got {call_order}"
+
+    def test_old_image_cleanup_skipped_when_rm_fails(self):
+        """If _rm_container never succeeds, the container may genuinely
+        still be running from the old image -- skip the ancestor check
+        entirely rather than spending a docker call to reconfirm what
+        rm's own failure already implies."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = _make_sandbox()
+        fake_old_id = "sha256:deadbeef0001"
+        ps_or_rmi_called = []
+
+        class FakeCompleted:
+            def __init__(self, stdout=b"", returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "inspect" in args:
+                return FakeCompleted(stdout=fake_old_id.encode())
+            if "rm" in args:
+                raise RuntimeError("rm failed")
+            if "ps" in args or "rmi" in args:
+                ps_or_rmi_called.append(list(args))
+            return FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    with pytest.raises(RuntimeError):
+                        sb.stop(commit=True)
+
+        assert ps_or_rmi_called == []
+
+    @docker
+    def test_real_plain_commit_cycle_cannot_delete_its_parent(self):
+        """A plain commit's result is a DIFF layer on top of whatever it
+        replaces -- docker refuses to delete an image while a dependent
+        child image still exists ("has dependent child images"), so two
+        consecutive plain-commit cycles can NEVER free the first one's
+        image. This is a real, unavoidable docker constraint, not a bug:
+        confirmed live during development (see docs/agsandbox_backends/
+        container.md's "Layer-depth squashing" section) -- asserting it
+        explicitly here so it reads as an intentional, understood
+        limitation rather than something a future change accidentally
+        "fixes" into an infinite retry loop. stop() now skips even
+        attempting the old-image lookup/delete on a plain-commit cycle
+        (it's guaranteed to fail, so there's no point trying), so this
+        test only checks the end state -- the old image genuinely
+        surviving -- not that a delete was attempted and failed."""
+        sb = _make_sandbox()
+        sb._backend._base_image = "alpine:latest"
+        try:
+            sb.exec("echo one")
+            sb.stop(commit=True)  # checkpoint 1 (plain commit)
+            first_image_id = subprocess.run(
+                ["docker", "inspect", "--format={{.Id}}", sb._backend._lifecycle_tag()],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert first_image_id
+
+            sb.exec("echo two")
+            sb.stop(commit=True)  # checkpoint 2 -- also a plain commit (chain, not squash)
+
+            still_present = (
+                subprocess.run(
+                    ["docker", "image", "inspect", first_image_id], capture_output=True
+                ).returncode
+                == 0
+            )
+            assert still_present, (
+                "checkpoint 1's image is a parent of checkpoint 2's -- must survive"
+            )
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_real_squash_cycle_reclaims_the_entire_prior_chain(self):
+        """The payoff of squashing isn't just bounded layer depth -- once a
+        squash lands (a parentless image), NOTHING depends on the prior
+        chain anymore, so the eager old-image cleanup (fixed above to run
+        after container removal) can finally succeed and `docker rmi`
+        cascades to free the whole accumulated chain in one shot, not just
+        the single most-recent link. End-to-end through the REAL
+        agSandbox/backend stop() flow, not a hand-rolled docker command
+        sequence (which is what test_repeated_commits_leave_no_dangling_
+        images below does, and would not have caught either the ordering
+        bug this fixes or confirmed this cascade)."""
+        sb = _make_sandbox()
+        sb._backend._base_image = "alpine:latest"
+        try:
+            sb.exec("echo one")
+            sb.stop(commit=True)  # checkpoint 1 (plain commit)
+            first_image_id = subprocess.run(
+                ["docker", "inspect", "--format={{.Id}}", sb._backend._lifecycle_tag()],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert first_image_id
+
+            sb.exec("echo two")
+            # Force this cycle to squash instead of plain-committing.
+            sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
+            sb.stop(commit=True)  # checkpoint 2 -- squash: parentless, frees checkpoint 1
+
+            still_present = (
+                subprocess.run(
+                    ["docker", "image", "inspect", first_image_id], capture_output=True
+                ).returncode
+                == 0
+            )
+            assert not still_present, "squashing should have reclaimed the entire prior chain"
+        finally:
+            sb.destroy()
 
     @docker
     def test_repeated_commits_leave_no_dangling_images(self):
@@ -324,6 +529,715 @@ class TestDanglingImageEagerCleanup:
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# Layer-depth squashing -- stop(commit=True) periodically flattens the
+# checkpoint chain (export/import) instead of always stacking a diff on top
+# of it, to stay under the container runtime's hard layer-depth cap. See
+# container.py's _squash_commit() and docs/agsandbox_backends/container.md's
+# "Layer-depth squashing" section.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCompleted:
+    def __init__(self, stdout=b"", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+class TestCheckpointSquash:
+    """checkpoint_squash_interval is a tier-1 GlobalConfigParam (write-once,
+    process-wide -- same as every other timeout/retry knob in this file), so
+    it can't be overridden per-test via agConfig once anything in the
+    process has already read its default. Tests instead pre-seed
+    `_commits_since_squash` directly (a plain instance attribute) to land
+    exactly at/below the real configured interval, exercising the same
+    threshold-crossing logic without fighting that immutability."""
+
+    def _sb(self):
+        return _make_sandbox()
+
+    def test_squashes_when_threshold_is_reached(self):
+        """One commit away from the (real, whatever-it-is) configured
+        interval: this stop(commit=True) call must do the normal plain
+        commit FIRST (unchanged, always happens -- see
+        TestCheckpointAccumulator for why this cycle's own diff-
+        accumulator fold isn't mockable this simply and falls back), and
+        ADDITIONALLY squash. The mocked `docker info` here returns no
+        parseable JSON, so the fast accumulator path can't be trusted and
+        falls back to `_squash_commit()`'s export/import -- the point of
+        this test is the plain-commit-always-happens/counter-resets
+        behavior, not which squash implementation ends up running."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        interval = sb._backend.checkpoint_squash_interval
+        sb._backend._commits_since_squash = interval - 1
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert any(c[:2] == [sb._backend._runtime, "commit"] for c in calls), (
+            f"expected the normal plain commit to still happen: {calls}"
+        )
+        assert any("export" in c for c in calls), (
+            f"expected the squash fallback's export call: {calls}"
+        )
+        assert any("import" in c for c in calls), (
+            f"expected the squash fallback's import call: {calls}"
+        )
+        assert sb._backend._commits_since_squash == 0  # reset after squashing
+
+    def test_does_not_squash_below_threshold(self):
+        """Far from the threshold: stop(commit=True) must commit and must
+        NOT additionally squash."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        sb._backend._commits_since_squash = 0
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert any(c[:2] == [sb._backend._runtime, "commit"] for c in calls), (
+            f"expected a plain commit: {calls}"
+        )
+        assert not any("export" in c for c in calls), f"must not squash yet: {calls}"
+        assert sb._backend._commits_since_squash == 1
+
+    def test_force_squash_flattens_regardless_of_counter(self):
+        """stop(commit=True, force_squash=True) must squash even when
+        nowhere near checkpoint_squash_interval -- used at skill exit
+        (agskill.py's teardown) so a sandbox never hands back control at
+        an arbitrary mid-chain depth. The commit still happens too."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        sb._backend._commits_since_squash = 0  # far from the periodic threshold
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True, force_squash=True)
+
+        assert any(c[:2] == [sb._backend._runtime, "commit"] for c in calls), (
+            f"expected the normal plain commit to still happen: {calls}"
+        )
+        assert any("export" in c for c in calls), f"expected an export call: {calls}"
+        assert any("import" in c for c in calls), f"expected an import call: {calls}"
+
+    def test_force_squash_resets_the_counter(self):
+        """A forced squash must reset _commits_since_squash the same as a
+        periodic one, so the NEXT stop(commit=True) (without force_squash)
+        starts counting fresh rather than immediately squashing again."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        sb._backend._commits_since_squash = 5  # mid-count, nowhere near threshold
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True, force_squash=True)
+
+        assert sb._backend._commits_since_squash == 0
+
+    def test_squash_pipes_export_stdout_into_import_stdin(self):
+        """The flatten must round-trip the container's actual export bytes
+        into import's stdin -- not shell out with a literal pipe (this
+        codebase never invokes a shell for docker/podman calls) and not
+        silently drop the payload."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
+        captured = {}
+        fake_tar_bytes = b"FAKE_EXPORTED_FILESYSTEM_BYTES"
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "export" in args:
+                return _FakeCompleted(stdout=fake_tar_bytes)
+            if "import" in args:
+                captured["input"] = input
+                captured["args"] = list(args)
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert captured["input"] == fake_tar_bytes
+        assert captured["args"][-1] == sb._backend._lifecycle_tag()
+        assert captured["args"][-2] == "-"  # import reads from stdin, not a file path
+
+    def test_squash_failure_is_best_effort_and_does_not_reset_counter(self):
+        """If every squash path fails (both the accumulator fast path and
+        the _squash_commit() fallback), stop() must NOT raise -- the
+        normal plain commit above it already succeeded, so a squash
+        failure only means the layer chain keeps growing until the next
+        attempt, not that this cycle's checkpoint was lost.
+        _commits_since_squash must stay at or above the threshold (not
+        silently reset) so the next stop() tries again."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        threshold = sb._backend.checkpoint_squash_interval
+        sb._backend._commits_since_squash = threshold - 1
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "export" in args or "import" in args:
+                raise RuntimeError("simulated export/import failure")
+            return _FakeCompleted()
+
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.stop(commit=True)  # must not raise
+        finally:
+            sys.stderr = old_stderr
+
+        assert sb._backend._commits_since_squash >= threshold
+        assert "WARNING" in captured.getvalue()
+        assert "squash failed" in captured.getvalue()
+
+    @docker
+    @pytest.mark.timeout(180)
+    def test_squash_flattens_real_layer_depth(self):
+        """A real docker export|import must reset RootFS.Layers to 1,
+        confirming the flatten genuinely resets depth rather than just
+        re-tagging the same growing chain. Uses the tiny local `alpine`
+        image rather than the real (multi-GB) agency-sandbox image --
+        this only needs to exercise the export/import mechanism itself,
+        and a large image makes the round-trip genuinely slow."""
+
+        def _layer_count(ref):
+            r = subprocess.run(
+                ["docker", "inspect", "--format={{len .RootFS.Layers}}", ref],
+                capture_output=True,
+                text=True,
+            )
+            return int(r.stdout.strip())
+
+        name = f"test-squash-{uuid.uuid4().hex[:8]}"
+        tag = f"agency/lifecycle-{name}"
+        subprocess.run(
+            ["docker", "run", "-d", "--name", name, "alpine:latest", "tail", "-f", "/dev/null"],
+            capture_output=True,
+            check=True,
+        )
+        try:
+            # Build up a few real layers first via plain commits, same as an
+            # un-squashed checkpoint chain would.
+            for i in range(3):
+                subprocess.run(
+                    ["docker", "exec", name, "sh", "-c", f"echo {i} > /marker-{i}"],
+                    capture_output=True,
+                    check=True,
+                )
+                subprocess.run(["docker", "commit", name, tag], capture_output=True, check=True)
+            depth_before = _layer_count(tag)
+            assert depth_before > 1, "expected multiple stacked layers before squashing"
+
+            export_proc = subprocess.run(
+                ["docker", "export", name], capture_output=True, check=True
+            )
+            subprocess.run(
+                ["docker", "import", "-", tag],
+                input=export_proc.stdout,
+                capture_output=True,
+                check=True,
+            )
+            depth_after = _layer_count(tag)
+            assert depth_after == 1, f"expected depth 1 after squash, got {depth_after}"
+        finally:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# Fast incremental squashing -- the diff accumulator, fed cheaply after each
+# plain commit by reading that commit's own on-disk overlay2 diff directory
+# directly (see container.py's _fold_commit_into_accumulator() and
+# docker.py's _locate_layer_diff_dir()), letting squash time skip `docker
+# save`/`docker diff` on the whole chain entirely. See
+# docs/agsandbox_backends/container.md's "Fast incremental squashing"
+# section for the full design and the real-world numbers that motivated it.
+# ---------------------------------------------------------------------------
+
+
+class TestLocateLayerDiffDir:
+    """Tests for _DockerBackend._locate_layer_diff_dir() -- reaches into
+    docker's own overlay2 on-disk layout. Uses REAL temp directories
+    structured to match that layout (layerdb entries + cache-id files +
+    overlay2 diff dirs), not a real docker daemon -- this is pure
+    filesystem-correlation logic once `docker info`'s own result is
+    known, so mocking that one call is enough to exercise it fully."""
+
+    def _sb(self):
+        return _make_sandbox()
+
+    def _fake_docker_root(self, tmp_path, *, driver="overlay2"):
+        root = tmp_path / "docker-root"
+        (root / "image" / "overlay2" / "layerdb" / "sha256").mkdir(parents=True)
+        (root / "overlay2").mkdir(parents=True)
+        return root
+
+    def _add_layerdb_entry(self, root, diff_id, cache_id, *, with_content=True):
+        entry = root / "image" / "overlay2" / "layerdb" / "sha256" / f"entry-{cache_id}"
+        entry.mkdir(parents=True)
+        (entry / "diff").write_text(diff_id)
+        (entry / "cache-id").write_text(cache_id)
+        if with_content:
+            diff_dir = root / "overlay2" / cache_id / "diff"
+            diff_dir.mkdir(parents=True)
+            (diff_dir / "marker").write_text("x")
+        return entry
+
+    def test_finds_diff_dir_matching_digest(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        root = self._fake_docker_root(tmp_path)
+        self._add_layerdb_entry(root, "sha256:target123", "cache-target")
+        self._add_layerdb_entry(root, "sha256:other456", "cache-other")
+
+        with patch.object(
+            _mod._DockerBackend, "_docker_data_root_and_driver", return_value=(root, "overlay2")
+        ):
+            result = sb._backend._locate_layer_diff_dir("sha256:target123")
+
+        assert result == root / "overlay2" / "cache-target" / "diff"
+        assert (result / "marker").read_text() == "x"
+
+    def test_returns_none_when_digest_not_found(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        root = self._fake_docker_root(tmp_path)
+        self._add_layerdb_entry(root, "sha256:other456", "cache-other")
+
+        with patch.object(
+            _mod._DockerBackend, "_docker_data_root_and_driver", return_value=(root, "overlay2")
+        ):
+            result = sb._backend._locate_layer_diff_dir("sha256:nonexistent")
+
+        assert result is None
+
+    def test_returns_none_for_non_overlay2_driver(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        root = self._fake_docker_root(tmp_path)
+        self._add_layerdb_entry(root, "sha256:target123", "cache-target")
+
+        with patch.object(
+            _mod._DockerBackend, "_docker_data_root_and_driver", return_value=(root, "devicemapper")
+        ):
+            result = sb._backend._locate_layer_diff_dir("sha256:target123")
+
+        assert result is None
+
+    def test_returns_none_when_info_lookup_fails(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        with patch.object(_mod._DockerBackend, "_docker_data_root_and_driver", return_value=None):
+            result = sb._backend._locate_layer_diff_dir("sha256:anything")
+        assert result is None
+
+    def test_returns_none_when_layerdb_dir_present_but_content_missing(self, tmp_path):
+        """A matching layerdb entry whose overlay2 diff dir doesn't
+        actually exist (e.g. already cleaned up) must degrade to None,
+        not raise."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        root = self._fake_docker_root(tmp_path)
+        self._add_layerdb_entry(root, "sha256:target123", "cache-target", with_content=False)
+
+        with patch.object(
+            _mod._DockerBackend, "_docker_data_root_and_driver", return_value=(root, "overlay2")
+        ):
+            result = sb._backend._locate_layer_diff_dir("sha256:target123")
+
+        assert result is None
+
+    def test_podman_backend_uses_base_default_and_returns_none(self, tmp_path):
+        """_PodmanBackend doesn't override this hook (no verified Podman
+        storage layout) -- it must inherit the base class's safe default
+        rather than accidentally reaching for docker-specific behavior."""
+        from agency.agsandbox_backends.podman import _PodmanBackend
+        from agency.agconfig import agConfig
+
+        backend = _PodmanBackend(
+            "podman-test",
+            name="podman-test",
+            checkpoint_image=None,
+            base_image="agency-sandbox:latest",
+            mounts={},
+            agconfig=agConfig(),
+        )
+        assert backend._locate_layer_diff_dir("sha256:anything") is None
+
+
+class TestHostToContainerId:
+    """Tests for _DockerBackend._host_to_container_id() -- the rootless
+    Docker uid/gid translation feeding overlay_diff_to_tar() via
+    _fold_commit_into_accumulator(). Mocks _docker_info()/PID discovery
+    rather than a real rootless daemon; the reverse-mapping arithmetic
+    itself is exercised directly against real /proc-style uid_map/gid_map
+    content captured from an actual rootless daemon."""
+
+    def _sb(self):
+        return _make_sandbox()
+
+    def test_identity_when_not_rootless(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        with patch.object(
+            _mod._DockerBackend, "_docker_info", return_value={"SecurityOptions": []}
+        ):
+            assert sb._backend._host_to_container_id(1000, 1000) == (1000, 1000)
+
+    def test_identity_when_docker_info_unavailable(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        with patch.object(_mod._DockerBackend, "_docker_info", return_value=None):
+            assert sb._backend._host_to_container_id(1000, 1000) == (1000, 1000)
+
+    def test_identity_when_rootless_but_maps_unreadable(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        with patch.object(
+            _mod._DockerBackend, "_docker_info", return_value={"SecurityOptions": ["name=rootless"]}
+        ):
+            with patch.object(_mod._DockerBackend, "_find_dockerd_pid", return_value=None):
+                assert sb._backend._host_to_container_id(200682, 3662) == (200682, 3662)
+
+    def test_translates_using_real_captured_uid_gid_maps(self):
+        """uid_map/gid_map content captured from a real rootless dockerd
+        during development: container uid 0 maps to exactly host uid
+        200682 (the invoking user), and container uids/gids 1-65536 map
+        to a large host-side range starting at 1355350016 (uid_map) /
+        3663 (gid_map here, standing in for whatever /etc/subgid assigns)."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        uid_map = [(0, 200682, 1), (1, 1355350016, 65536)]
+        gid_map = [(0, 3662, 1), (1, 3663, 65536)]
+        with patch.object(
+            _mod._DockerBackend, "_docker_info", return_value={"SecurityOptions": ["name=rootless"]}
+        ):
+            with patch.object(
+                _mod._DockerBackend, "_rootless_id_maps", return_value=(uid_map, gid_map)
+            ):
+                assert sb._backend._host_to_container_id(200682, 3662) == (0, 0)
+                assert sb._backend._host_to_container_id(1355350017, 3664) == (2, 2)
+
+    def test_translate_id_leaves_unmapped_host_id_unchanged(self):
+        from agency.agsandbox_backends.docker import _translate_id
+
+        assert _translate_id(999999, [(0, 200682, 1)]) == 999999
+
+    def test_find_dockerd_pid_matches_process_by_name_and_owner(self, tmp_path, monkeypatch):
+        """Fakes /proc as a tmp_path tree: PID 111 is "dockerd" owned by
+        our own uid (the match), PID 222 is some other process owned by
+        a different uid (must be skipped)."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        (tmp_path / "111").mkdir()
+        (tmp_path / "111" / "comm").write_text("dockerd\n")
+        (tmp_path / "222").mkdir()
+        (tmp_path / "222" / "comm").write_text("bash\n")
+
+        my_uid = os.getuid()
+        real_stat = os.stat
+
+        def fake_listdir(path):
+            assert path == "/proc"
+            return ["111", "222"]
+
+        def fake_stat(path):
+            if path == "/proc/111":
+                return real_stat(tmp_path / "111")
+            return real_stat(tmp_path)  # some other uid (our own test process's cwd)
+
+        real_open = open
+
+        def fake_open(path, *a, **kw):
+            if str(path).startswith("/proc/"):
+                pid = str(path).split("/")[2]
+                return real_open(tmp_path / pid / "comm", *a, **kw)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(_mod.os, "listdir", fake_listdir)
+        monkeypatch.setattr(_mod.os, "stat", fake_stat)
+        monkeypatch.setattr(_mod.os, "getuid", lambda: my_uid)
+        monkeypatch.setattr(_mod, "open", fake_open, raising=False)
+
+        assert real_stat(tmp_path / "111").st_uid == my_uid
+
+        result = sb._backend._find_dockerd_pid()
+        assert result == 111
+
+    def test_find_dockerd_pid_returns_none_when_absent(self, monkeypatch):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        monkeypatch.setattr(_mod.os, "listdir", lambda p: [])
+        assert sb._backend._find_dockerd_pid() is None
+
+    def test_parse_id_map_reads_real_proc_style_content(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        p = tmp_path / "uid_map"
+        p.write_text("         0     200682          1\n         1 1355350016      65536\n")
+        assert _mod._DockerBackend._parse_id_map(p) == [(0, 200682, 1), (1, 1355350016, 65536)]
+
+    def test_parse_id_map_returns_none_for_missing_file(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        assert _mod._DockerBackend._parse_id_map(tmp_path / "nonexistent") is None
+
+
+class TestCheckpointAccumulator:
+    """Tests for _fold_commit_into_accumulator() and
+    _accumulator_squash_commit() -- the fast squash path fed by
+    TestLocateLayerDiffDir's lookup. Mocks _locate_layer_diff_dir directly
+    (rather than the whole docker-root filesystem dance) since that
+    lookup mechanism is already covered on its own above."""
+
+    def _sb(self):
+        return _make_sandbox()
+
+    def _make_real_diff_dir(self, tmp_path, name, files):
+        d = tmp_path / name
+        d.mkdir()
+        for rel, content in files.items():
+            p = d / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        return d
+
+    def test_fold_builds_accumulator_from_overlay_diff_dir(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        diff_dir = self._make_real_diff_dir(tmp_path, "diff1", {"workspace/f1": "one"})
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:layer1"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff_dir):
+                sb._backend._fold_commit_into_accumulator("some-tag")
+
+        assert sb._backend._accumulated_layer_count == 1
+        assert sb._backend._accumulated_diff_path is not None
+        with tarfile.open(sb._backend._accumulated_diff_path, "r") as tf:
+            content = tf.extractfile("workspace/f1").read()
+        assert content == b"one"
+
+    def test_fold_invalidates_accumulator_when_diff_dir_not_found(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:layer1"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=None):
+                sb._backend._fold_commit_into_accumulator("some-tag")
+
+        assert sb._backend._accumulated_diff_path is None
+        assert sb._backend._accumulated_layer_count == -1
+
+    def test_fold_accumulates_across_multiple_cycles(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        diff1 = self._make_real_diff_dir(tmp_path, "diff1", {"a": "1"})
+        diff2 = self._make_real_diff_dir(tmp_path, "diff2", {"b": "2"})
+
+        layers_seen = ["sha256:layer1"]
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=json.dumps(layers_seen).encode())
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff1):
+                sb._backend._commits_since_squash = 1
+                sb._backend._fold_commit_into_accumulator("tag")
+            layers_seen.append("sha256:layer2")
+            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff2):
+                sb._backend._commits_since_squash = 2
+                sb._backend._fold_commit_into_accumulator("tag")
+
+        assert sb._backend._accumulated_layer_count == 2
+        with tarfile.open(sb._backend._accumulated_diff_path, "r") as tf:
+            names = {m.name for m in tf.getmembers()}
+        assert names == {"a", "b"}
+
+    def test_accumulator_squash_raises_when_layer_count_mismatched(self, tmp_path):
+        """Simulates the post-fork scenario: the accumulator (fresh, 0
+        layers tracked) doesn't match the real gap between the current
+        checkpoint and the base (>0, since the chain has real history) --
+        must raise so the caller falls back, never silently squash an
+        incomplete diff."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        sb._backend._accumulated_diff_path = tmp_path / "fake.tar"
+        sb._backend._accumulated_diff_path.write_bytes(b"")
+        sb._backend._accumulated_layer_count = 0  # fresh, but...
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                # ...the real gap is 2 layers, not 0.
+                if args[-1] == "agency-sandbox:latest":
+                    return _FakeCompleted(stdout=b'["sha256:base1"]')
+                return _FakeCompleted(stdout=b'["sha256:base1", "sha256:c1", "sha256:c2"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with pytest.raises(RuntimeError, match="accumulator tracks"):
+                sb._backend._accumulator_squash_commit("some-tag")
+
+    def test_accumulator_squash_raises_when_base_not_a_prefix(self, tmp_path):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        sb._backend._accumulated_diff_path = tmp_path / "fake.tar"
+        sb._backend._accumulated_diff_path.write_bytes(b"")
+        sb._backend._accumulated_layer_count = 1
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                if args[-1] == "agency-sandbox:latest":
+                    return _FakeCompleted(stdout=b'["sha256:base1"]')
+                # Current chain does NOT start with the base's own layer.
+                return _FakeCompleted(stdout=b'["sha256:different", "sha256:c1"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with pytest.raises(RuntimeError):
+                sb._backend._accumulator_squash_commit("some-tag")
+
+    def test_accumulator_squash_raises_when_no_accumulator(self):
+        sb = self._sb()
+        assert sb._backend._accumulated_diff_path is None
+        with pytest.raises(RuntimeError, match="no checkpoint diff accumulator"):
+            sb._backend._accumulator_squash_commit("some-tag")
+
+    @docker
+    @pytest.mark.timeout(180)
+    def test_real_end_to_end_fast_squash_against_large_base_image(self):
+        """The full, real thing: several plain-commit cycles against the
+        actual multi-GB agency-sandbox:latest image, each folding into
+        the accumulator via the real overlay2 lookup (no mocking at all),
+        then a real squash -- must complete in well under the ~77-180s
+        the slower paths took (measured during development), produce
+        correct content, and leave the base image's own layers
+        genuinely untouched (proving no re-serialization happened)."""
+        sb = _make_sandbox()
+
+        base_layers_before = subprocess.run(
+            ["docker", "inspect", "--format={{json .RootFS.Layers}}", "agency-sandbox:latest"],
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        sb.exec("mkdir -p /workspace/proj && echo one > /workspace/proj/f1")
+        sb.stop(commit=True)
+        sb.exec("echo two > /workspace/proj/f2 && rm /workspace/proj/f1")
+        sb.stop(commit=True)
+        sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
+
+        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
+        t0 = time.time()
+        sb.stop(commit=True)  # this cycle commits AND squashes
+        elapsed = time.time() - t0
+
+        try:
+            assert elapsed < 20, f"fast squash took {elapsed:.1f}s -- expected well under 20s"
+
+            base_layers_after = subprocess.run(
+                ["docker", "inspect", "--format={{json .RootFS.Layers}}", "agency-sandbox:latest"],
+                capture_output=True,
+                text=True,
+            ).stdout
+            assert base_layers_after == base_layers_before
+
+            tag = sb._backend._lifecycle_tag()
+            layers = int(
+                subprocess.run(
+                    ["docker", "inspect", "--format={{len .RootFS.Layers}}", tag],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            base_layer_count = len(json.loads(base_layers_before))
+            assert layers == base_layer_count + 1, (
+                "expected exactly one new layer on top of the base"
+            )
+
+            result = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    tag,
+                    "sh",
+                    "-c",
+                    "ls /workspace/proj/f1 2>&1; cat /workspace/proj/f2; cat /workspace/proj/sub/f3",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert "No such file" in result.stdout or "No such file" in result.stderr
+            assert "two" in result.stdout
+            assert "three" in result.stdout
+        finally:
+            sb.destroy()
 
 
 # ---------------------------------------------------------------------------

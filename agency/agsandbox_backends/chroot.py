@@ -982,11 +982,18 @@ class _ChrootBackend(agsandbox_backend):
         tmp_dir.rename(snapshot_dir)
         return True
 
-    def stop(self, *, commit: bool = False) -> None:
+    def stop(self, *, commit: bool = False, force_squash: bool = False) -> None:
         """ "Stop" the jail: clear PID tracking and either snapshot the
         workspace (commit=True) or discard it (commit=False), mirroring the
         container backend's semantics -- there is no running process to
         actually tear down.
+
+        force_squash is accepted-and-ignored here: a chroot checkpoint is
+        already a plain directory copy, not a layered image, so there is
+        no chain to flatten. Present only so callers that don't know (or
+        care) which backend a sandbox uses -- e.g. agskill.py's skill-exit
+        teardown -- can pass it unconditionally (see
+        _ContainerBackendBase.stop()'s matching parameter).
 
         commit=False only deletes the now-stale workspace; it does not
         restore it from ``_checkpoint_image`` here. That restore is left to

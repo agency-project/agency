@@ -192,10 +192,15 @@ class TestDanglingImageEagerCleanup:
     test_docker.py's class of the same name."""
 
     def test_stop_commit_deletes_old_image(self):
-        """stop(commit=True) must delete the image that previously held the tag."""
+        """stop(commit=True) must delete the image that previously held the
+        tag -- only possible on a squash cycle (a plain commit's result is
+        always a child of the old image, so the runtime refuses to delete
+        it; old_image_id is only looked up at all when this cycle squashes,
+        see container.py's stop())."""
         import agency.agsandbox_backends.podman as _mod
 
         sb = _make_backend()
+        sb._commits_since_squash = sb.checkpoint_squash_interval - 1
 
         run_calls = []
         fake_old_id = "sha256:deadbeef0000"
@@ -229,10 +234,11 @@ class TestDanglingImageEagerCleanup:
         )
 
     def test_stop_commit_skips_rmi_when_no_old_image(self):
-        """If the tag does not exist yet (first commit), no rmi call is made."""
+        """If the tag does not exist yet (first squash), no rmi call is made."""
         import agency.agsandbox_backends.podman as _mod
 
         sb = _make_backend()
+        sb._commits_since_squash = sb.checkpoint_squash_interval - 1
 
         class FakeCompleted:
             def __init__(self, stdout=b"", returncode=0):
@@ -255,11 +261,46 @@ class TestDanglingImageEagerCleanup:
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
 
-    def test_stop_commit_rmi_failure_is_best_effort(self):
-        """A failing rmi during old-image cleanup must NOT propagate."""
+    def test_plain_commit_cycle_skips_old_image_lookup_entirely(self):
+        """A plain commit's result is ALWAYS a child of whatever it
+        replaces -- the runtime will refuse to delete that old image no
+        matter what, so there's no point even looking it up. Mirrors
+        test_docker.py's version; see that test's docstring for the full
+        reasoning (including why an inspect call for the diff accumulator
+        is still expected here)."""
         import agency.agsandbox_backends.podman as _mod
 
         sb = _make_backend()
+        sb._commits_since_squash = 0  # far from the squash threshold
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert not any("--format={{.Id}}" in c for c in calls), (
+            f"must not do the old-image-lookup inspect on a plain commit: {calls}"
+        )
+        assert not any("ps" in c for c in calls), (
+            f"must not check ancestor on a plain commit: {calls}"
+        )
+        assert not any("rmi" in c for c in calls), (
+            f"must not attempt rmi on a plain commit: {calls}"
+        )
+
+    def test_stop_commit_rmi_failure_is_best_effort(self):
+        """A failing rmi during old-image cleanup must NOT propagate.
+        Only reachable on a squash cycle -- see test_stop_commit_deletes_
+        old_image's docstring."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        sb._commits_since_squash = sb.checkpoint_squash_interval - 1
         fake_old_id = "sha256:cafebabe1234"
 
         class FakeCompleted:
@@ -287,6 +328,157 @@ class TestDanglingImageEagerCleanup:
 
         assert "WARNING" in captured.getvalue()
         assert fake_old_id in captured.getvalue()
+
+    def test_old_image_ancestor_check_runs_after_container_removal(self):
+        """Regression test: the ancestor-based "is the old image still in
+        use" check must run AFTER `_rm_container`, not before. This
+        container was itself `run` FROM the old image (restart-from-
+        checkpoint), so checking before removal always finds THIS SAME
+        container as a false-positive "still in use" match and never
+        actually deletes anything -- a real, pre-existing bug confirmed
+        live against a real docker daemon and fixed on the shared
+        `_ContainerBackendBase.stop()` both runtimes use (see
+        test_docker.py's mirror of this test and docs/agsandbox_backends/
+        container.md's "Layer-depth squashing" section). Only reachable
+        on a squash cycle -- old_image_id is only looked up then."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        sb._commits_since_squash = sb.checkpoint_squash_interval - 1
+        fake_old_id = "sha256:deadbeef0000"
+        call_order = []
+
+        class FakeCompleted:
+            def __init__(self, stdout=b"", returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "inspect" in args:
+                return FakeCompleted(stdout=fake_old_id.encode())
+            if "rm" in args:
+                call_order.append("rm")
+                return FakeCompleted()
+            if "ps" in args:
+                call_order.append("ps")
+                return FakeCompleted()  # empty -- "not in use"
+            if "rmi" in args:
+                call_order.append("rmi")
+                return FakeCompleted()
+            return FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert call_order == ["rm", "ps", "rmi"], f"expected rm before ps/rmi, got {call_order}"
+
+    def test_old_image_cleanup_skipped_when_rm_fails(self):
+        """If _rm_container never succeeds, the container may genuinely
+        still be running from the old image -- skip the ancestor check
+        entirely rather than spending a podman call to reconfirm what
+        rm's own failure already implies."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        fake_old_id = "sha256:deadbeef0001"
+        ps_or_rmi_called = []
+
+        class FakeCompleted:
+            def __init__(self, stdout=b"", returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "inspect" in args:
+                return FakeCompleted(stdout=fake_old_id.encode())
+            if "rm" in args:
+                raise RuntimeError("rm failed")
+            if "ps" in args or "rmi" in args:
+                ps_or_rmi_called.append(list(args))
+            return FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    with pytest.raises(RuntimeError):
+                        sb.stop(commit=True)
+
+        assert ps_or_rmi_called == []
+
+    @podman
+    def test_real_plain_commit_cycle_cannot_delete_its_parent(self):
+        """A plain commit's result is a DIFF layer on top of whatever it
+        replaces -- podman refuses to delete an image while a dependent
+        child image still exists, so two consecutive plain-commit cycles
+        can NEVER free the first one's image. This is a real, unavoidable
+        image-store constraint, not a bug -- mirrors test_docker.py's
+        confirmed-live version of this test; unverified against a real
+        podman daemon in the environment this was written in (podman
+        wasn't reachable there), but the underlying mechanism is shared,
+        runtime-agnostic code on `_ContainerBackendBase`."""
+        sb = _make_sandbox()
+        sb._backend._base_image = "alpine:latest"
+        try:
+            sb.exec("echo one")
+            sb.stop(commit=True)  # checkpoint 1 (plain commit)
+            first_image_id = subprocess.run(
+                ["podman", "inspect", "--format={{.Id}}", sb._backend._lifecycle_tag()],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert first_image_id
+
+            sb.exec("echo two")
+            sb.stop(commit=True)  # checkpoint 2 -- also a plain commit (chain, not squash)
+
+            still_present = (
+                subprocess.run(
+                    ["podman", "image", "inspect", first_image_id], capture_output=True
+                ).returncode
+                == 0
+            )
+            assert still_present, (
+                "checkpoint 1's image is a parent of checkpoint 2's -- must survive"
+            )
+        finally:
+            sb.destroy()
+
+    @podman
+    def test_real_squash_cycle_reclaims_the_entire_prior_chain(self):
+        """The payoff of squashing isn't just bounded layer depth -- once a
+        squash lands (a parentless image), nothing depends on the prior
+        chain anymore, so the eager old-image cleanup can finally succeed
+        and `podman rmi` cascades to free the whole accumulated chain in
+        one shot. Mirrors test_docker.py's confirmed-live version; see that
+        test's docstring for the full reasoning."""
+        sb = _make_sandbox()
+        sb._backend._base_image = "alpine:latest"
+        try:
+            sb.exec("echo one")
+            sb.stop(commit=True)  # checkpoint 1 (plain commit)
+            first_image_id = subprocess.run(
+                ["podman", "inspect", "--format={{.Id}}", sb._backend._lifecycle_tag()],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert first_image_id
+
+            sb.exec("echo two")
+            # Force this cycle to squash instead of plain-committing.
+            sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
+            sb.stop(commit=True)  # checkpoint 2 -- squash: parentless, frees checkpoint 1
+
+            still_present = (
+                subprocess.run(
+                    ["podman", "image", "inspect", first_image_id], capture_output=True
+                ).returncode
+                == 0
+            )
+            assert not still_present, "squashing should have reclaimed the entire prior chain"
+        finally:
+            sb.destroy()
 
     @podman
     def test_repeated_commits_leave_no_dangling_images(self):
@@ -337,6 +529,256 @@ class TestDanglingImageEagerCleanup:
         finally:
             subprocess.run(["podman", "rm", "-f", name], capture_output=True)
             subprocess.run(["podman", "rmi", "-f", tag], capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# Layer-depth squashing -- mirrors test_docker.py's TestCheckpointSquash
+# against _PodmanBackend instead. See container.py's _squash_commit() and
+# docs/agsandbox_backends/container.md's "Layer-depth squashing" section.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCompleted:
+    def __init__(self, stdout=b"", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+class TestCheckpointSquash:
+    """checkpoint_squash_interval is a tier-1 GlobalConfigParam (write-once,
+    process-wide), so tests pre-seed `_commits_since_squash` directly
+    instead of trying to override the interval per-test -- see
+    test_docker.py's mirror of this class for the full rationale."""
+
+    def test_squashes_when_threshold_is_reached(self):
+        """Mirrors test_docker.py's version -- the plain commit always
+        happens first (unchanged), and squashing is a separate,
+        additional step; since the mocked `docker info` returns no
+        parseable JSON here, the fast accumulator path can't be trusted
+        and falls back to `_squash_commit()`'s export/import."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        interval = sb.checkpoint_squash_interval
+        sb._commits_since_squash = interval - 1
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert any(c[:2] == [sb._runtime, "commit"] for c in calls), (
+            f"expected the normal plain commit to still happen: {calls}"
+        )
+        assert any("export" in c for c in calls), (
+            f"expected the squash fallback's export call: {calls}"
+        )
+        assert any("import" in c for c in calls), (
+            f"expected the squash fallback's import call: {calls}"
+        )
+        assert sb._commits_since_squash == 0  # reset after squashing
+
+    def test_does_not_squash_below_threshold(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        sb._commits_since_squash = 0
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert any(c[:2] == [sb._runtime, "commit"] for c in calls), (
+            f"expected a plain commit: {calls}"
+        )
+        assert not any("export" in c for c in calls), f"must not squash yet: {calls}"
+        assert sb._commits_since_squash == 1
+
+    def test_force_squash_flattens_regardless_of_counter(self):
+        """stop(commit=True, force_squash=True) must squash even when
+        nowhere near checkpoint_squash_interval. Mirrors test_docker.py's
+        version."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        sb._commits_since_squash = 0  # far from the periodic threshold
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True, force_squash=True)
+
+        assert any(c[:2] == [sb._runtime, "commit"] for c in calls), (
+            f"expected the normal plain commit to still happen: {calls}"
+        )
+        assert any("export" in c for c in calls), f"expected an export call: {calls}"
+        assert any("import" in c for c in calls), f"expected an import call: {calls}"
+
+    def test_force_squash_resets_the_counter(self):
+        """A forced squash must reset _commits_since_squash. Mirrors
+        test_docker.py's version."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        sb._commits_since_squash = 5  # mid-count, nowhere near threshold
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True, force_squash=True)
+
+        assert sb._commits_since_squash == 0
+
+    def test_squash_pipes_export_stdout_into_import_stdin(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        sb._commits_since_squash = sb.checkpoint_squash_interval - 1
+        captured = {}
+        fake_tar_bytes = b"FAKE_EXPORTED_FILESYSTEM_BYTES"
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "export" in args:
+                return _FakeCompleted(stdout=fake_tar_bytes)
+            if "import" in args:
+                captured["input"] = input
+                captured["args"] = list(args)
+            return _FakeCompleted()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_gpu_virtual", False):
+                    sb.stop(commit=True)
+
+        assert captured["input"] == fake_tar_bytes
+        assert captured["args"][-1] == sb._lifecycle_tag()
+        assert captured["args"][-2] == "-"  # import reads from stdin, not a file path
+
+    def test_squash_failure_is_best_effort_and_does_not_reset_counter(self):
+        """Mirrors test_docker.py's version: stop() must NOT raise when
+        every squash path fails, since the normal plain commit above it
+        already succeeded -- only the counter must stay unreset."""
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = _make_backend()
+        threshold = sb.checkpoint_squash_interval
+        sb._commits_since_squash = threshold - 1
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "export" in args or "import" in args:
+                raise RuntimeError("simulated export/import failure")
+            return _FakeCompleted()
+
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(_mod._PodmanBackend, "_run", fake_run):
+                with patch.object(sb, "_container_running", return_value=True):
+                    with patch.object(sb, "_gpu_virtual", False):
+                        sb.stop(commit=True)  # must not raise
+        finally:
+            sys.stderr = old_stderr
+
+        assert sb._commits_since_squash >= threshold
+        assert "WARNING" in captured.getvalue()
+        assert "squash failed" in captured.getvalue()
+
+    @podman
+    @pytest.mark.timeout(180)
+    def test_squash_flattens_real_layer_depth(self):
+        """Uses the tiny local `alpine` image rather than the real
+        (multi-GB) agency-sandbox image -- this only needs to exercise the
+        export/import mechanism itself. Mirrors test_docker.py's version;
+        unverified in the environment this was written in (podman wasn't
+        reachable there)."""
+
+        def _layer_count(ref):
+            r = subprocess.run(
+                ["podman", "inspect", "--format={{len .RootFS.Layers}}", ref],
+                capture_output=True,
+                text=True,
+            )
+            return int(r.stdout.strip())
+
+        name = f"test-squash-{uuid.uuid4().hex[:8]}"
+        tag = f"agency/lifecycle-{name}"
+        subprocess.run(
+            ["podman", "run", "-d", "--name", name, "alpine:latest", "tail", "-f", "/dev/null"],
+            capture_output=True,
+            check=True,
+        )
+        try:
+            for i in range(3):
+                subprocess.run(
+                    ["podman", "exec", name, "sh", "-c", f"echo {i} > /marker-{i}"],
+                    capture_output=True,
+                    check=True,
+                )
+                subprocess.run(["podman", "commit", name, tag], capture_output=True, check=True)
+            depth_before = _layer_count(tag)
+            assert depth_before > 1, "expected multiple stacked layers before squashing"
+
+            export_proc = subprocess.run(
+                ["podman", "export", name], capture_output=True, check=True
+            )
+            subprocess.run(
+                ["podman", "import", "-", tag],
+                input=export_proc.stdout,
+                capture_output=True,
+                check=True,
+            )
+            depth_after = _layer_count(tag)
+            assert depth_after == 1, f"expected depth 1 after squash, got {depth_after}"
+        finally:
+            subprocess.run(["podman", "rm", "-f", name], capture_output=True)
+            subprocess.run(["podman", "rmi", "-f", tag], capture_output=True)
+
+
+class TestFastSquashHooksUseBaseDefaults:
+    """_PodmanBackend doesn't override _locate_layer_diff_dir() or
+    _host_to_container_id() -- no verified Podman overlay2-equivalent
+    storage layout yet (see test_docker.py's TestLocateLayerDiffDir /
+    TestHostToContainerId and docs/agsandbox_backends/container.md's
+    "Fast incremental squashing" section). It must inherit
+    _ContainerBackendBase's safe generic defaults rather than silently
+    doing nothing useful: `_locate_layer_diff_dir` returning None makes
+    `_fold_commit_into_accumulator()` fall back to export/import at
+    squash time (exercised end-to-end by TestCheckpointSquash above,
+    where the fast path is never even attempted); `_host_to_container_id`
+    is identity, which is simply a correctness no-op until an override
+    exists."""
+
+    def _sb(self):
+        return _make_backend()
+
+    def test_locate_layer_diff_dir_returns_none(self):
+        sb = self._sb()
+        assert sb._locate_layer_diff_dir("sha256:anything") is None
+
+    def test_host_to_container_id_is_identity(self):
+        sb = self._sb()
+        assert sb._host_to_container_id(1000, 1000) == (1000, 1000)
+        assert sb._host_to_container_id(0, 0) == (0, 0)
 
 
 # ---------------------------------------------------------------------------

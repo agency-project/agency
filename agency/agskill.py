@@ -387,7 +387,14 @@ class agskill:
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 ag._set_ui_state("error" if _had_error else "finished")
                 if ag.sandbox is not None:
-                    ag.sandbox.stop(commit=True)
+                    # force_squash=True: flatten the layer chain at skill
+                    # exit regardless of the periodic checkpoint_squash_
+                    # interval count -- a skill boundary is a natural point
+                    # to guarantee bounded depth before the sandbox goes
+                    # idle or the next skill call resumes from it, rather
+                    # than leaving it at whatever arbitrary mid-chain depth
+                    # the last per-tool-call checkpoint happened to land on.
+                    ag.sandbox.stop(commit=True, force_squash=True)
                 if sandbox_lock is not None:
                     sandbox_lock.release()
                 agpause.set_current_worker_agent(None)

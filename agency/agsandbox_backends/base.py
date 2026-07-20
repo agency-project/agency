@@ -134,6 +134,20 @@ class AgSandboxBackendFields:
     rm_retry_attempts = GlobalConfigParam("agsandbox_backend", default=3)
     rm_retry_backoff_s = GlobalConfigParam("agsandbox_backend", default=1)
 
+    # Every commit() is a diff layer on top of whatever the container was
+    # restarted from, and restart always resumes FROM the last checkpoint --
+    # so a long-running sandbox's layer chain grows by one every checkpoint
+    # cycle with nothing to bound it, until it crosses the container
+    # runtime's hard layer-depth cap ("max depth exceeded" on docker/moby).
+    # checkpoint_squash_interval periodically flattens the chain back to a
+    # single layer (export/import instead of commit) well before that cap.
+    checkpoint_squash_interval = GlobalConfigParam(
+        "agsandbox_backend", default=60
+    )  # Flatten every Nth checkpoint commit; well under the ~127-layer cap.
+    squash_timeout_s = GlobalConfigParam(
+        "agsandbox_backend", default=600
+    )  # export/import serializes the FULL filesystem, not a diff -- needs more headroom than commit_timeout_s.
+
 
 class agSandboxBackendConfig(_AgConfigViewBase):
     """View over an agConfig for pre-selecting the sandbox backend::
