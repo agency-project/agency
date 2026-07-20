@@ -364,6 +364,7 @@ def dispatch_tools(
                     if isinstance(_parsed.get("timeout"), int):
                         _tool_timeout = _parsed["timeout"]
                 except (json.JSONDecodeError, TypeError, AttributeError):
+                    # Malformed/non-dict arguments -- fall back to the default timeout below.
                     pass
                 if _tool_timeout is None:
                     _tool_timeout = _default_tool_timeout
@@ -420,6 +421,8 @@ def dispatch_tools(
                     if "error" in json.loads(result_content):
                         _result_errored = True
                 except (json.JSONDecodeError, TypeError):
+                    # result_content isn't a JSON object -- not the agerror(...)
+                    # shape, so treat it as a non-errored result.
                     pass
                 _stopped = False
                 if not sandbox._has_pending_background_work():
@@ -439,6 +442,8 @@ def dispatch_tools(
                         )
                         result_content = json.dumps(_result_obj)
                     except (json.JSONDecodeError, TypeError):
+                        # result_content isn't a JSON object -- leave it as-is;
+                        # the note is a best-effort addition, not required.
                         pass
             except Exception as e:
                 if _state_fn:
@@ -458,6 +463,8 @@ def dispatch_tools(
                         )
                         result_content = json.dumps(_result_obj)
                     except (json.JSONDecodeError, TypeError):
+                        # result_content isn't a JSON object -- leave it as-is;
+                        # the note is a best-effort addition, not required.
                         pass
         tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
         messages.append(tool_msg)

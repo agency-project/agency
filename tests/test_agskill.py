@@ -1476,6 +1476,136 @@ def test_tool_exception_triggers_stop_without_commit():
     assert "error" in json.loads(tool_msgs[0]["content"])
 
 
+def test_run_in_subprocess_false_success_still_commits():
+    """The bug this session's dispatch_tools() fix actually targeted: a
+    *successful* run_in_subprocess=False tool call must still trigger
+    sandbox.stop(commit=True) -- checkpointing was previously gated on
+    run_in_subprocess=True, so a host-side tool's successful work was never
+    committed at all."""
+    sandbox = _make_sandbox_with_tracking()
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(result="ok")
+
+    t = agtool(name="hosttool", description="", fn=fn, run_in_subprocess=False)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("hosttool", {}, "c7"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+
+    sandbox.stop.assert_called_once_with(commit=True)
+
+
+def test_pending_background_work_defers_stop_entirely():
+    """When the sandbox still has pending background work (e.g. a
+    backgrounded `cmd &`), stop() must not run at all after a successful
+    tool call -- running it would tear down/overwrite the sandbox's live
+    state out from under that still-running work."""
+    sandbox = _make_sandbox_with_tracking()
+    # True for dispatch_tools()'s own check (what this test targets), then
+    # False afterward -- execute_react() calls wait_for_processes() right
+    # after, whose very first gate check is this same predicate; leaving it
+    # permanently True would make that loop believe work is still pending
+    # forever and hang for the full ping interval instead of returning
+    # immediately (see agsandbox.py's wait_for_processes() docstring).
+    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
+
+    def fn(arg: agdata) -> agdata:
+        return agdata(result="ok")
+
+    t = agtool(name="bgtool", description="", fn=fn, run_in_subprocess=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("bgtool", {}, "c8"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+
+    sandbox.stop.assert_not_called()
+
+
+def test_pending_background_work_omits_workspace_reverted_note_on_error():
+    """Same deferral as above, but for an errored tool call: stop() must be
+    skipped, and the workspace_reverted note -- which claims a revert that
+    didn't actually happen -- must not be added either."""
+    sandbox = _make_sandbox_with_tracking()
+    # True for dispatch_tools()'s own check (what this test targets), then
+    # False afterward -- execute_react() calls wait_for_processes() right
+    # after, whose very first gate check is this same predicate; leaving it
+    # permanently True would make that loop believe work is still pending
+    # forever and hang for the full ping interval instead of returning
+    # immediately (see agsandbox.py's wait_for_processes() docstring).
+    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
+
+    def fn(arg: agdata) -> agdata:
+        return agerror("boom")
+
+    t = agtool(name="bgbadtool", description="", fn=fn, run_in_subprocess=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("bgbadtool", {}, "c9"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+
+    sandbox.stop.assert_not_called()
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
+    content = json.loads(tool_msgs[0]["content"])
+    assert "error" in content
+    assert "workspace_reverted" not in content
+
+
+def test_tool_exception_with_run_in_subprocess_false_still_stops():
+    """Exception-handler path: a raised exception from a run_in_subprocess=False
+    tool must still trigger sandbox.stop(commit=False), the same as a
+    run_in_subprocess=True tool does."""
+    sandbox = _make_sandbox_with_tracking()
+
+    def fn(arg: agdata) -> agdata:
+        raise RuntimeError("exploded")
+
+    t = agtool(name="hostbadtool", description="", fn=fn, run_in_subprocess=False)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("hostbadtool", {}, "c10"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+
+    sandbox.stop.assert_called_once_with(commit=False)
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
+    content = json.loads(tool_msgs[0]["content"])
+    assert "error" in content
+    assert "workspace_reverted" in content
+
+
+def test_tool_exception_with_pending_background_work_defers_stop():
+    """Exception-handler path, gated the same way as the success/error
+    path: pending background work must defer stop() here too."""
+    sandbox = _make_sandbox_with_tracking()
+    # True for dispatch_tools()'s own check (what this test targets), then
+    # False afterward -- execute_react() calls wait_for_processes() right
+    # after, whose very first gate check is this same predicate; leaving it
+    # permanently True would make that loop believe work is still pending
+    # forever and hang for the full ping interval instead of returning
+    # immediately (see agsandbox.py's wait_for_processes() docstring).
+    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
+
+    def fn(arg: agdata) -> agdata:
+        raise RuntimeError("exploded")
+
+    t = agtool(name="bgexctool", description="", fn=fn, run_in_subprocess=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("bgexctool", {}, "c11"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+
+    sandbox.stop.assert_not_called()
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
+    content = json.loads(tool_msgs[0]["content"])
+    assert "error" in content
+    assert "workspace_reverted" not in content
+
+
 def test_dispatch_tools_accepts_camel_case_llm_arguments():
     """End-to-end: an LLM emitting camelCase tool-call JSON (e.g. `filePath`
     instead of `file_path`) still reaches the tool fn correctly -- dispatch_tools

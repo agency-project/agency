@@ -566,3 +566,128 @@ class TestPodmanCommandHelpers:
 
         rm_calls = [a for a in calls if "rm" in a and "rmi" not in a]
         assert not rm_calls, f"must not rm when container absent; got {rm_calls}"
+
+
+# ---------------------------------------------------------------------------
+# GPU semaphore release gating in stop()/destroy() -- mirrors
+# TestDockerGpuReleaseGating in test_docker.py, since this is
+# _ContainerBackendBase's shared logic (identical for both runtimes).
+# ---------------------------------------------------------------------------
+
+
+class TestPodmanGpuReleaseGating:
+    def _sb(self):
+        return _make_backend()
+
+    def _lease_gpu(self, sb, gpu_id=3):
+        released = []
+        sb._gpu_virtual = True
+        sb._gpu_id = gpu_id
+        sb._gpu_release_fn = lambda gid: released.append(gid)
+        return released
+
+    def test_stop_releases_gpu_when_already_confirmed_gone(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        with patch.object(_mod._PodmanBackend, "_run"):
+            with patch.object(sb, "_container_running", return_value=False):
+                sb.stop(commit=False)
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_stop_does_not_release_gpu_when_rm_fails_and_container_still_running(self):
+        import agency.agsandbox_backends.container as _container_mod
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.stop(commit=False)
+
+        assert released == [], (
+            "GPU must not be released while the container is confirmed still running"
+        )
+        assert sb._gpu_id == 3
+
+    def test_destroy_releases_gpu_when_container_confirmed_gone_despite_rm_error(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        running_calls = [True, False]
+
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", side_effect=fake_container_running):
+                with patch.object(sb, "_container_status", return_value="running"):
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.destroy()
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_destroy_does_not_release_gpu_when_container_still_running_after_rm_failure(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._PodmanBackend, "_run", fake_run):
+            with patch.object(sb, "_container_running", return_value=True):
+                with patch.object(sb, "_container_status", return_value="running"):
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.destroy()
+
+        assert released == []
+        assert sb._gpu_id == 3
+
+    def test_gpu_released_exactly_once_across_stop_then_destroy(self):
+        import agency.agsandbox_backends.podman as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        with patch.object(_mod._PodmanBackend, "_run"):
+            with patch.object(sb, "_container_running", return_value=False):
+                sb.stop(commit=False)
+                sb.destroy()
+
+        assert released == [3], "GPU must be released exactly once, not once per call"

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -261,51 +262,99 @@ def seed_cache_from_image(
     )
 
 
-_gpu_flags_cache: "dict[str, list[str]]" = {}
+_gpu_kind_cache: "dict[str, str]" = {}
 _gpu_flags_lock = threading.Lock()
+_amd_render_node_paths_cache: "list[str] | None" = None
+
+# Matches only a per-GPU render node ("renderD128", "renderD129"), never the
+# shared /dev/dri/card* control nodes -- mirrors chroot.py's
+# _NVIDIA_INDEXED_DEV_RE, same rationale.
+_AMD_RENDER_NODE_RE = re.compile(r"^renderD(\d+)$")
 
 
-def _gpu_flags(runtime: str) -> list[str]:
+def _gpu_kind(runtime: str) -> str:
+    """Return "nvidia", "amd", or "none" for *runtime*, cached per runtime
+    for the process lifetime -- the expensive part of GPU flag selection
+    (detect_gpus()/nvidia-smi presence) doesn't depend on which specific
+    GPU a given sandbox leases, so it's cached separately from the
+    per-lease flags themselves (see _gpu_flags())."""
+    if runtime in _gpu_kind_cache:
+        return _gpu_kind_cache[runtime]
+    with _gpu_flags_lock:
+        if runtime not in _gpu_kind_cache:
+            if not detect_gpus():
+                kind = "none"
+            elif shutil.which("nvidia-smi"):
+                kind = "nvidia"
+            else:
+                kind = "amd"
+            _gpu_kind_cache[runtime] = kind
+        return _gpu_kind_cache[runtime]
+
+
+def _amd_render_node_paths() -> "list[str]":
+    """Sorted host /dev/dri/renderD* paths, one per AMD GPU, cached for the
+    process lifetime -- mirrors chroot.py's _all_chroot_gpu_dev_paths() AMD
+    branch so both backends enumerate GPUs in the same order."""
+    global _amd_render_node_paths_cache
+    if _amd_render_node_paths_cache is not None:
+        return _amd_render_node_paths_cache
+    with _gpu_flags_lock:
+        if _amd_render_node_paths_cache is None:
+            dri = Path("/dev/dri")
+            _amd_render_node_paths_cache = (
+                sorted(str(p) for p in dri.iterdir() if _AMD_RENDER_NODE_RE.match(p.name))
+                if dri.is_dir()
+                else []
+            )
+        return _amd_render_node_paths_cache
+
+
+def _gpu_flags(runtime: str, gpu_id: "int | None") -> list[str]:
     """Return GPU passthrough flags for *runtime* ("docker" or "podman"),
-    cached per runtime for the process lifetime.
+    scoped to the single *gpu_id* leased to this sandbox -- mirrors
+    chroot.py's _chroot_gpu_dev_paths(gpu_id): a sandbox that hasn't leased a
+    GPU (gpu_id is None) gets zero GPU devices, and one that has leased a
+    GPU only gets that one device exposed, not every GPU on the host. This
+    is the hardware-level half of GPU isolation; CUDA_VISIBLE_DEVICES /
+    HIP_VISIBLE_DEVICES (set in base.py's exec()) is the software half --
+    without this, a process could bypass the env var by opening another
+    GPU's device node directly, since it was mounted into the container
+    regardless of which GPU was actually leased.
 
     NVIDIA:
-      - Docker: ``--gpus all`` (nvidia-container-toolkit's Docker-specific
+      - Docker: ``--gpus device=N`` (nvidia-container-toolkit's Docker-specific
         CLI wrapper hook).
-      - Podman: ``--device nvidia.com/gpu=all`` (CDI). Podman does not
+      - Podman: ``--device nvidia.com/gpu=N`` (CDI). Podman does not
         understand Docker's ``--gpus`` flag: it accepts it silently (no
         error) but never mounts the NVIDIA driver/devices, so a container
         started that way has zero GPU access despite `podman run` appearing
         to succeed -- `nvidia-smi` inside prints "WARNING: The NVIDIA Driver
         was not detected" and isn't even on PATH. This mirrors the identical
         fix applied to images/build.sh's own smoke tests.
-    AMD:    ``--device /dev/kfd --device /dev/dri`` (ROCm device files,
-            identical for both runtimes).
-    CPU-only hosts get no flags so they keep working without GPU drivers.
-
-    GPU presence is delegated to agresources.detect_gpus() — the same probe
-    the process-wide agResourcePool singleton uses — instead of running an
-    independent nvidia-smi/rocm-smi subprocess here. Every sandbox backend
-    construction used to pay its own full subprocess round-trip just to pick
-    a CLI flag; on a busy shared GPU host that adds up to real contention.
-    Caching the result (rather than only reusing detect_gpus()'s logic)
-    means this now runs at most once per process per runtime regardless of
-    how many sandboxes get created.
+    AMD:    ``--device /dev/kfd`` (shared control device, every AMD GPU needs
+            it regardless of index) plus the one ``/dev/dri/renderD*`` node
+            matching *gpu_id* (host enumeration order; untested against real
+            AMD/ROCm hardware -- see chroot.py's module docstring for the
+            identical caveat on its own AMD branch).
+    CPU-only hosts, and sandboxes that haven't leased a GPU, get no flags.
     """
-    if runtime in _gpu_flags_cache:
-        return _gpu_flags_cache[runtime]
-    with _gpu_flags_lock:
-        if runtime not in _gpu_flags_cache:
-            if not detect_gpus():
-                flags = []
-            elif shutil.which("nvidia-smi"):
-                flags = (
-                    ["--device", "nvidia.com/gpu=all"] if runtime == "podman" else ["--gpus", "all"]
-                )
-            else:
-                flags = ["--device", "/dev/kfd", "--device", "/dev/dri"]
-            _gpu_flags_cache[runtime] = flags
-        return _gpu_flags_cache[runtime]
+    if gpu_id is None:
+        return []
+    kind = _gpu_kind(runtime)
+    if kind == "none":
+        return []
+    if kind == "nvidia":
+        return (
+            ["--device", f"nvidia.com/gpu={gpu_id}"]
+            if runtime == "podman"
+            else ["--gpus", f"device={gpu_id}"]
+        )
+    render_nodes = _amd_render_node_paths()
+    flags = ["--device", "/dev/kfd"]
+    if gpu_id < len(render_nodes):
+        flags += ["--device", render_nodes[gpu_id]]
+    return flags
 
 
 # Hard cap on the number of simultaneously running containers (docker and
@@ -497,7 +546,6 @@ class _ContainerBackendBase(agsandbox_backend):
         self._checkpoint_image: str | None = checkpoint_image
         self._agconfig = agconfig
         self._name = name
-        self._gpu_flags = _gpu_flags(self._runtime)
         self._base_image = base_image
         self._vol_flags: list[str] = []
         for host, container, mode in mounts.values():
@@ -599,6 +647,17 @@ class _ContainerBackendBase(agsandbox_backend):
         # exited, dead, …) that stop() failed to clean up.
         if self._container_status():
             self._rm_container(name)
+        # Acquire the physical GPU (if reserve_gpu was called) before the
+        # container is created, not just in exec() -- the container's GPU
+        # device flags are fixed at `docker/podman run` time, and this method
+        # can be reached first via read_file()/write_file() rather than
+        # exec(), so exec()'s own lazy acquire (base.py) can't be relied on
+        # to have already run. Guarded by `self._gpu_id is None` the same way
+        # exec()'s does, so whichever entry point gets here first acquires it
+        # exactly once.
+        if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
+            self._gpu_id = self._gpu_acquire_fn()
+        gpu_flags = _gpu_flags(self._runtime, self._gpu_id)
         self._acquire_runtime_slot()
         try:
             if self._checkpoint_image is not None:
@@ -608,7 +667,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
-                    + self._gpu_flags
+                    + gpu_flags
                     + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
                 )
@@ -626,7 +685,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
                     + limit_flags
-                    + self._gpu_flags
+                    + gpu_flags
                     + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
                 )

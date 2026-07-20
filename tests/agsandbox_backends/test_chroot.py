@@ -18,8 +18,10 @@ from agency.agsandbox_backends.chroot import (
     chroot_available,
     _ChrootBackend,
     _CHROOT_STATE_ROOT,
+    _chroot_gpu_dev_paths,
     _sanitize_tag,
 )
+import agency.agsandbox_backends.chroot as _chroot_mod
 
 chroot = pytest.mark.skipif(
     not chroot_available(), reason="unprivileged user namespaces not usable"
@@ -490,6 +492,100 @@ class TestChrootDelayedChildSafety:
 
 
 # ---------------------------------------------------------------------------
+# _chroot_gpu_dev_paths(gpu_id) -- scopes the jail's GPU device bind-mounts to
+# the single leased gpu_id (mirrors container.py's _gpu_flags(runtime,
+# gpu_id) after this session's fix there) so a sandboxed process cannot open
+# another leased jail's GPU device node directly by guessing its path. No
+# real chroot/GPU required -- _all_chroot_gpu_dev_paths() (the raw host
+# detection step) is mocked, isolating the scoping logic tested here from
+# nvidia-smi/rocm-smi/real /dev contents.
+# ---------------------------------------------------------------------------
+
+
+class TestChrootGpuDevPaths:
+    def test_gpu_id_none_returns_empty_even_with_gpus_on_host(self):
+        with patch.object(
+            _chroot_mod,
+            "_all_chroot_gpu_dev_paths",
+            return_value=["/dev/nvidiactl", "/dev/nvidia0"],
+        ):
+            assert _chroot_gpu_dev_paths(None) == []
+
+    def test_no_gpu_devices_on_host_returns_empty(self):
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=[]):
+            assert _chroot_gpu_dev_paths(0) == []
+
+    def test_nvidia_control_devices_plus_single_indexed_device(self):
+        all_paths = [
+            "/dev/nvidiactl",
+            "/dev/nvidia-uvm",
+            "/dev/nvidia-uvm-tools",
+            "/dev/nvidia0",
+            "/dev/nvidia1",
+            "/dev/nvidia2",
+        ]
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
+            with patch.object(_chroot_mod.shutil, "which", return_value="/usr/bin/nvidia-smi"):
+                paths = _chroot_gpu_dev_paths(1)
+        assert "/dev/nvidia1" in paths
+        assert "/dev/nvidia0" not in paths
+        assert "/dev/nvidia2" not in paths
+        for control in ("/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"):
+            assert control in paths
+
+    def test_nvidia_gpu_id_out_of_range_returns_only_control_devices(self):
+        all_paths = ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia0"]
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
+            with patch.object(_chroot_mod.shutil, "which", return_value="/usr/bin/nvidia-smi"):
+                paths = _chroot_gpu_dev_paths(5)
+        assert paths == ["/dev/nvidiactl", "/dev/nvidia-uvm"]
+
+    def test_amd_control_device_plus_single_render_node(self):
+        all_paths = ["/dev/kfd", "/dev/dri/card0", "/dev/dri/renderD128", "/dev/dri/renderD129"]
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
+            with patch.object(_chroot_mod.shutil, "which", return_value=None):
+                paths = _chroot_gpu_dev_paths(1)
+        assert paths == ["/dev/kfd", "/dev/dri/renderD129"]
+
+    def test_amd_gpu_id_out_of_range_returns_only_control_device(self):
+        all_paths = ["/dev/kfd", "/dev/dri/renderD128"]
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
+            with patch.object(_chroot_mod.shutil, "which", return_value=None):
+                paths = _chroot_gpu_dev_paths(5)
+        assert paths == ["/dev/kfd"]
+
+
+class TestChrootSetupLinesGpuScoping:
+    """Integration check that _setup_lines() actually wires
+    _chroot_gpu_dev_paths(self._gpu_id) into the jail's /dev bind mounts,
+    rather than every host GPU device -- no real chroot required, this only
+    inspects the generated shell lines."""
+
+    def test_only_the_scoped_gpu_device_is_bind_mounted(self, tmp_path, monkeypatch):
+        scoped_dev = tmp_path / "nvidia1"
+        scoped_dev.touch()
+        sb = _make_backend()
+        sb._gpu_id = 1
+        monkeypatch.setattr(
+            _chroot_mod,
+            "_chroot_gpu_dev_paths",
+            lambda gpu_id: [str(scoped_dev)] if gpu_id == 1 else [],
+        )
+        joined = "\n".join(sb._setup_lines())
+        assert str(scoped_dev) in joined
+        assert "nvidia0" not in joined
+
+    def test_no_gpu_leased_bind_mounts_no_gpu_devices(self, monkeypatch):
+        sb = _make_backend()
+        sb._gpu_id = None
+        monkeypatch.setattr(_chroot_mod, "_chroot_gpu_dev_paths", lambda gpu_id: [])
+        joined = "\n".join(sb._setup_lines())
+        assert "nvidia" not in joined
+        assert "renderD" not in joined
+        assert "kfd" not in joined
+
+
+# ---------------------------------------------------------------------------
 # /dev -- individual per-file bind mounts (not a whole-directory bind, which
 # silently fails identically to /proc -- see module docstring), verified
 # against a real jail rather than just checking the setup script's text.
@@ -805,6 +901,71 @@ class TestChrootBackendLifecycle:
             )
         finally:
             sb.destroy()
+
+
+# ---------------------------------------------------------------------------
+# GPU semaphore release in stop()/destroy() -- unlike the container backend,
+# chroot has no daemon process to inspect for "confirmed torn down", so there
+# is no such gate here: the kill attempt in _kill_all_sandbox_processes() IS
+# the confirmation (see its docstring), and release always follows it
+# unconditionally. No real chroot required --
+# _kill_all_sandbox_processes()/_materialize_workspace() aren't invoked with
+# a real jail here, only stop()/destroy()'s own release-ordering logic is
+# exercised.
+# ---------------------------------------------------------------------------
+
+
+class TestChrootGpuReleaseGating:
+    def _lease_gpu(self, sb, gpu_id=3):
+        released = []
+        sb._gpu_virtual = True
+        sb._gpu_id = gpu_id
+        sb._gpu_release_fn = lambda gid: released.append(gid)
+        return released
+
+    def test_stop_releases_gpu_after_kill_attempt(self, monkeypatch):
+        sb = _make_backend()
+        released = self._lease_gpu(sb)
+        monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: None)
+
+        sb.stop(commit=False)
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_kill_runs_before_release(self, monkeypatch):
+        order = []
+        sb = _make_backend()
+        sb._gpu_virtual = True
+        sb._gpu_id = 3
+        sb._gpu_release_fn = lambda gid: order.append(("release", gid))
+        monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: order.append(("kill",)))
+
+        sb.stop(commit=False)
+
+        assert order == [("kill",), ("release", 3)]
+
+    def test_gpu_released_exactly_once_across_stop_then_destroy(self, monkeypatch):
+        sb = _make_backend()
+        released = self._lease_gpu(sb)
+        monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: None)
+
+        sb.stop(commit=False)
+        sb.destroy()
+
+        assert released == [3], "GPU must be released exactly once, not once per call"
+
+    def test_destroy_releases_gpu_exactly_once(self, monkeypatch):
+        """destroy() calls stop() internally -- confirm that single call
+        chain still only releases once, not via some hidden double
+        invocation."""
+        sb = _make_backend()
+        released = self._lease_gpu(sb)
+        monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: None)
+
+        sb.destroy()
+
+        assert released == [3]
 
 
 @chroot

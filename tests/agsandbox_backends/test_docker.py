@@ -601,6 +601,201 @@ class TestDockerCommandHelpers:
         assert not rm_calls, f"must not rm when container absent; got {rm_calls}"
 
 
+# ---------------------------------------------------------------------------
+# GPU semaphore release gating in stop()/destroy() -- the real GPU semaphore
+# (agResourcePool.release_gpu, wired in via reserve_gpu) must only be
+# released once the container is CONFIRMED torn down, exactly like the
+# runtime-slot semaphore above -- releasing it while the container might
+# still be running and actually using the GPU would let something else
+# acquire the same physical GPU concurrently.
+# ---------------------------------------------------------------------------
+
+
+class TestDockerGpuReleaseGating:
+    def _sb(self):
+        return _make_sandbox()
+
+    def _lease_gpu(self, sb, gpu_id=3):
+        released = []
+        sb._gpu_virtual = True
+        sb._gpu_id = gpu_id
+        sb._gpu_release_fn = lambda gid: released.append(gid)
+        return released
+
+    def test_stop_releases_gpu_when_already_confirmed_gone(self):
+        """stop()'s early-return branch (container already not running when
+        stop() is entered) must still release a leased GPU."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        with patch.object(_mod._DockerBackend, "_run"):
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                sb.stop(commit=False)
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_stop_releases_gpu_via_main_teardown_path_after_successful_rm(self):
+        """The other release site in stop() -- reached via the main
+        teardown path (container was running, rm succeeded) rather than the
+        early-return branch above."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            return OK()
+
+        # top-of-stop() check (must be True to take the main path), then the
+        # post-rm runtime-slot check, then the GPU-release check -- 3 calls.
+        running_calls = [True, False, False]
+
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(
+                sb._backend, "_container_running", side_effect=fake_container_running
+            ):
+                sb.stop(commit=False)
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_stop_does_not_release_gpu_when_rm_fails_and_container_still_running(self):
+        import agency.agsandbox_backends.container as _container_mod
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.stop(commit=False)
+
+        assert released == [], (
+            "GPU must not be released while the container is confirmed still running"
+        )
+        assert sb._gpu_id == 3, "gpu_id must be left untouched when release didn't happen"
+
+    def test_destroy_releases_gpu_when_container_confirmed_gone_despite_rm_error(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        running_calls = [True, False]
+
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(
+                sb._backend, "_container_running", side_effect=fake_container_running
+            ):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.destroy()
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_destroy_does_not_release_gpu_when_container_still_running_after_rm_failure(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.destroy()
+
+        assert released == []
+        assert sb._gpu_id == 3
+
+    def test_gpu_released_exactly_once_across_stop_then_destroy(self):
+        """stop() tears the container down and releases the GPU; a later
+        destroy() call on the same sandbox must see gpu_id already cleared
+        and must not release a second time."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        with patch.object(_mod._DockerBackend, "_run"):
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                sb.stop(commit=False)
+                sb.destroy()
+
+        assert released == [3], "GPU must be released exactly once, not once per call"
+
+    def test_stop_rm_exc_takes_precedence_over_commit_exc(self):
+        """When both the commit retries AND the rm retries exhaust, stop()
+        must still run its GPU/runtime-slot release checks and raise --
+        specifically the rm failure, since rm is stop()'s last word on
+        whether the container is actually gone (a failed commit alone
+        doesn't mean teardown didn't happen)."""
+        import agency.agsandbox_backends.container as _container_mod
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "commit" in args:
+                raise RuntimeError("commit exploded")
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.stop(commit=True)
+
+
 # Session-keyring-quota machinery (_keyring_container_limit/keyring_quota/
 # _semaphore_held_count) and the quota hooks (_is_quota_exhaustion_error/
 # _wait_for_quota_slot/_quota_diagnostics) now live entirely on
