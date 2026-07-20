@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -462,14 +464,100 @@ class TestRun:
 # ---------------------------------------------------------------------------
 # _own_host_pids() -- scopes release_gpu()'s straggler wait to processes THIS
 # container spawned (see agresources._wait_for_gpu_clear's own_pids param),
-# not an unrelated tenant sharing the same physical GPU. Derived from
-# {{.State.Pid}} (documented as the container's HOST-side init pid on both
-# runtimes) plus a /proc child-PID walk, rather than `docker/podman top`,
-# whose PID column's host-vs-namespaced semantics differ between runtimes.
+# not an unrelated tenant sharing the same physical GPU.
+#
+# REGRESSION HISTORY: this used to walk /proc/<init_pid>/task/<init_pid>/
+# children from {{.State.Pid}}. That missed every `docker/podman exec`
+# session (how _container_exec() runs all real work, including the entire
+# harness workload) -- confirmed empirically that `docker exec -d <c> sleep
+# 60` spawns a process `docker top` lists correctly but which never appears
+# anywhere in the host process-ancestry walk from init (it's a SIBLING under
+# the runtime's supervisor, not a descendant). In production this meant
+# own_pids was effectively always just {init_pid}, own_pids never contained
+# the sandbox's actual GPU-using work, the straggler-wait's intersection was
+# always empty, and release_gpu() released immediately regardless of whether
+# real work was still running on the GPU -- silently defeating the entire
+# point of this mechanism while looking like it was doing something.
+#
+# Fixed to use `docker/podman top`, which enumerates PID-NAMESPACE MEMBERSHIP
+# directly (no ancestry walk), so exec'd siblings and init's descendants are
+# found identically. Syntax is NOT interchangeable between runtimes:
+#   docker: `docker top <name> -eo pid` -- real ps(1) flags, host PIDs.
+#   podman: `podman top <name> hpid` -- podman's own positional descriptor.
+#     Using ps(1)-style `-eo`/`-o` flags on podman silently takes a DIFFERENT
+#     code path (runs a real `ps` inside the container's own namespace) and
+#     would report container-LOCAL pids -- exactly as wrong as the old bug,
+#     just via a different mechanism. Podman's plain `pid` descriptor is
+#     also container-local; only `hpid` maps to the real host PID.
 # ---------------------------------------------------------------------------
 
 
-class TestOwnHostPids:
+class TestOwnHostPidsDocker:
+    def _sb(self):
+        from agency.agsandbox_backends.docker import _DockerBackend
+
+        return _DockerBackend(
+            "agent",
+            name="own-host-pids-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=None,
+        )
+
+    def test_uses_docker_top_dash_eo_pid(self):
+        """Must use real ps(1)-style -eo pid syntax for docker, not podman's
+        positional-descriptor syntax."""
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"PID\n100\n"
+        with patch("subprocess.run", return_value=ok) as run:
+            sb._own_host_pids()
+        args = run.call_args.args[0]
+        assert args[:2] == ["docker", "top"]
+        assert args[-2:] == ["-eo", "pid"]
+
+    def test_parses_pids_skipping_header(self):
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"PID\n100\n101\n102\n"
+        with patch("subprocess.run", return_value=ok):
+            assert sb._own_host_pids() == {100, 101, 102}
+
+    def test_includes_exec_spawned_sibling_pids(self):
+        """The exact regression case: docker top lists the init process AND
+        a separately-exec'd sibling process together, in one call -- no
+        ancestry relationship between them required."""
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        # init(100) and an unrelated exec'd sibling(200) -- 200 is NOT a
+        # child of 100 in this scenario, matching the real bug.
+        ok.stdout = b"PID\n100\n200\n"
+        with patch("subprocess.run", return_value=ok):
+            assert sb._own_host_pids() == {100, 200}
+
+    def test_returns_empty_when_top_fails(self):
+        sb = self._sb()
+        fail = MagicMock()
+        fail.returncode = 1
+        with patch("subprocess.run", return_value=fail):
+            assert sb._own_host_pids() == set()
+
+    def test_returns_empty_when_only_header_present(self):
+        """No processes (container gone/just created) -- header line alone
+        must not be misparsed as a pid."""
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"PID\n"
+        with patch("subprocess.run", return_value=ok):
+            assert sb._own_host_pids() == set()
+
+
+class TestOwnHostPidsPodman:
     def _sb(self):
         from agency.agsandbox_backends.podman import _PodmanBackend
 
@@ -482,83 +570,69 @@ class TestOwnHostPids:
             agconfig=None,
         )
 
-    def test_returns_empty_when_inspect_fails(self):
+    def test_uses_podman_hpid_not_ps_style_flags(self):
+        """Must use podman's own positional `hpid` descriptor -- NOT `-eo`/
+        `-o`, which silently switches podman to running a real `ps` inside
+        the container's own namespace and reports container-local pids."""
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"HPID\n100\n"
+        with patch("subprocess.run", return_value=ok) as run:
+            sb._own_host_pids()
+        args = run.call_args.args[0]
+        assert args[:2] == ["podman", "top"]
+        assert "hpid" in args
+        assert "-eo" not in args
+        assert "-o" not in args
+
+    def test_parses_hpids_skipping_header(self):
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"HPID\n100\n101\n"
+        with patch("subprocess.run", return_value=ok):
+            assert sb._own_host_pids() == {100, 101}
+
+    def test_includes_exec_spawned_sibling_pids(self):
+        sb = self._sb()
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.stdout = b"HPID\n100\n200\n"
+        with patch("subprocess.run", return_value=ok):
+            assert sb._own_host_pids() == {100, 200}
+
+    def test_returns_empty_when_top_fails(self):
         sb = self._sb()
         fail = MagicMock()
         fail.returncode = 1
         with patch("subprocess.run", return_value=fail):
             assert sb._own_host_pids() == set()
 
-    def test_returns_empty_on_non_positive_pid(self):
-        """{{.State.Pid}} is 0 for a container that exists but isn't
-        running -- must not be treated as a real PID to walk from."""
+    def test_returns_empty_when_only_header_present(self):
+        """No processes (container gone/just created) -- header line alone
+        must not be misparsed as a pid."""
         sb = self._sb()
         ok = MagicMock()
         ok.returncode = 0
-        ok.stdout = b"0\n"
+        ok.stdout = b"HPID\n"
         with patch("subprocess.run", return_value=ok):
             assert sb._own_host_pids() == set()
 
-    def test_returns_empty_on_unparseable_pid(self):
+    def test_ignores_a_plain_pid_style_header_if_ever_returned(self):
+        """Defensive: even if some podman version's header text differs from
+        the exact 'HPID' string, the header-skip must be positional (skip
+        line 0 unconditionally), not a string match against 'HPID' -- a
+        string-match approach would silently misparse a differently-worded
+        header as a real pid if it happened to be a non-digit string, but
+        could just as easily mis-skip a real numeric first pid if the header
+        were ever blank. This pins the current positional behavior."""
         sb = self._sb()
         ok = MagicMock()
         ok.returncode = 0
-        ok.stdout = b"not-a-pid\n"
+        ok.stdout = b"Some Other Header Text\n100\n101\n"
         with patch("subprocess.run", return_value=ok):
-            assert sb._own_host_pids() == set()
-
-    def test_walks_full_process_tree_from_init_pid(self, monkeypatch):
-        """init(100) -> {101, 102}; 101 -> {103}; 102 and 103 are leaves --
-        every descendant must be included, not just direct children."""
-        sb = self._sb()
-        ok = MagicMock()
-        ok.returncode = 0
-        ok.stdout = b"100\n"
-
-        children_by_pid = {100: "101 102", 101: "103", 102: "", 103: ""}
-
-        class _FakePath:
-            def __init__(self, s):
-                self._s = s
-
-            def read_text(self):
-                import re
-
-                m = re.search(r"/proc/(\d+)/task/\d+/children", self._s)
-                pid = int(m.group(1))
-                if pid not in children_by_pid:
-                    raise OSError(f"no such pid {pid}")
-                return children_by_pid[pid]
-
-        with patch("subprocess.run", return_value=ok):
-            monkeypatch.setattr("agency.agsandbox_backends.container.Path", _FakePath)
-            assert sb._own_host_pids() == {100, 101, 102, 103}
-
-    def test_stops_at_dead_ends_without_raising(self):
-        """A child pid that has already exited by the time we read its own
-        /proc/<pid>/task/<pid>/children (race between listing it as a child
-        and reading its own file) must not blow up the whole walk."""
-        sb = self._sb()
-        ok = MagicMock()
-        ok.returncode = 0
-        ok.stdout = b"100\n"
-
-        with patch("subprocess.run", return_value=ok):
-            with patch("agency.agsandbox_backends.container.Path", side_effect=_RaisingOnAllPath):
-                result = sb._own_host_pids()
-        assert result == {100}
-
-
-class _RaisingOnAllPath:
-    """Every /proc/<pid>/task/<pid>/children read raises -- init pid itself
-    has no discoverable children, so the walk must still return {init_pid}
-    rather than propagating the OSError."""
-
-    def __init__(self, s):
-        self._s = s
-
-    def read_text(self):
-        raise OSError("no children")
+            assert sb._own_host_pids() == {100, 101}
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +724,9 @@ def _host_gpu_available() -> bool:
         return False
 
 
+podman_only = pytest.mark.skipif(not _podman_available(), reason="Podman daemon not reachable")
+
+
 podman_gpu = pytest.mark.skipif(
     not (_podman_available() and _host_gpu_available()),
     reason="Podman daemon or NVIDIA GPU not available",
@@ -716,34 +793,63 @@ docker_only = pytest.mark.skipif(not _docker_available(), reason="Docker daemon 
 class TestOwnHostPidsRealContainerIntegration:
     """_own_host_pids() against a REAL container -- no GPU/special image
     required, just a plain generic image, unlike the GPU integration classes
-    below. Verifies the {{.State.Pid}} + /proc child-walk approach actually
-    matches ground truth (docker top's own pid listing) rather than relying
-    solely on the mocked TestOwnHostPids above.
+    below.
+
+    The container is started with just `tail -f /dev/null` as init (matching
+    _ensure_started()'s real invocation), and the "work" is spawned via a
+    SEPARATE `docker exec -d` call -- matching exactly how _container_exec()
+    invokes every real command in production, including the entire harness
+    workload -- rather than a background job within the initial `run`
+    command. This is deliberate: an earlier version of this test used
+    `sh -c "sleep 30 & sleep 30"` (background jobs, children of the
+    container's own init/shell process), which happened to be reachable by
+    the old /proc-child-walk implementation and therefore never caught the
+    real regression -- an exec'd process is a SIBLING under the runtime's
+    supervisor, not a descendant of init, and the old implementation only
+    ever found {init_pid} in real production use as a result. This test's
+    shape is what would have caught that regression.
     """
 
     @docker_only
-    def test_matches_real_docker_top_pids(self):
+    def test_includes_a_separately_execd_sibling_process(self):
         import uuid
         from agency.agsandbox_backends.docker import _DockerBackend
 
         name = f"own-host-pids-real-{uuid.uuid4().hex[:8]}"
         try:
             subprocess.run(
-                [
-                    "docker",
-                    "run",
-                    "-d",
-                    "--name",
-                    name,
-                    "alpine",
-                    "sh",
-                    "-c",
-                    "sleep 30 & sleep 30",
-                ],
+                ["docker", "run", "-d", "--name", name, "alpine", "tail", "-f", "/dev/null"],
                 check=True,
                 capture_output=True,
                 timeout=30,
             )
+            init_pid = int(
+                subprocess.run(
+                    ["docker", "inspect", "--format", "{{.State.Pid}}", name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ).stdout.strip()
+            )
+            # A SEPARATE exec call -- not a background job within `run` above.
+            subprocess.run(
+                ["docker", "exec", "-d", name, "sh", "-c", "sleep 60"],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            time.sleep(0.5)  # let the exec'd process actually start
+
+            # Ground truth: the exec'd sleep is NOT a /proc child of init --
+            # this is the exact condition that broke the old implementation.
+            children = Path(f"/proc/{init_pid}/task/{init_pid}/children").read_text().split()
+            assert children == [], (
+                "test assumption broken: the exec'd process IS a /proc child of "
+                "init on this host, so this test can't distinguish the fix from "
+                "the old broken behavior"
+            )
+
             sb = _DockerBackend(
                 "agent",
                 name=name,
@@ -764,10 +870,87 @@ class TestOwnHostPidsRealContainerIntegration:
             expected = {
                 int(line.strip()) for line in top.stdout.splitlines()[1:] if line.strip().isdigit()
             }
-            assert expected, "expected docker top to report at least one real pid"
+            assert len(expected) >= 2, "expected both init and the exec'd sleep in docker top"
             assert result == expected
+            assert init_pid in result
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+
+
+class TestOwnHostPidsRealPodmanContainerIntegration:
+    """Podman counterpart of TestOwnHostPidsRealContainerIntegration --
+    skipped on this dev box (no podman installed) but intended to run for
+    real in CI, where podman IS available. Same shape as the Docker version:
+    a separate `podman exec -d` call, not a background job within the
+    initial `run`, since that's the exact distinction that mattered for the
+    real regression (an exec'd process is a PID-namespace sibling, not a
+    /proc descendant of init)."""
+
+    @podman_only
+    def test_includes_a_separately_execd_sibling_process(self):
+        import uuid
+        from agency.agsandbox_backends.podman import _PodmanBackend
+
+        name = f"own-host-pids-real-podman-{uuid.uuid4().hex[:8]}"
+        try:
+            subprocess.run(
+                ["podman", "run", "-d", "--name", name, "alpine", "tail", "-f", "/dev/null"],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            init_pid = int(
+                subprocess.run(
+                    ["podman", "inspect", "--format", "{{.State.Pid}}", name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ).stdout.strip()
+            )
+            # A SEPARATE exec call -- not a background job within `run` above.
+            subprocess.run(
+                ["podman", "exec", "-d", name, "sh", "-c", "sleep 60"],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            time.sleep(0.5)  # let the exec'd process actually start
+
+            # Ground truth: the exec'd sleep is NOT a /proc child of init --
+            # this is the exact condition that broke the old implementation.
+            children = Path(f"/proc/{init_pid}/task/{init_pid}/children").read_text().split()
+            assert children == [], (
+                "test assumption broken: the exec'd process IS a /proc child of "
+                "init on this host, so this test can't distinguish the fix from "
+                "the old broken behavior"
+            )
+
+            sb = _PodmanBackend(
+                "agent",
+                name=name,
+                checkpoint_image=None,
+                base_image="alpine",
+                mounts={},
+                agconfig=None,
+            )
+            result = sb._own_host_pids()
+
+            top = subprocess.run(
+                ["podman", "top", name, "hpid"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+            expected = {
+                int(line.strip()) for line in top.stdout.splitlines()[1:] if line.strip().isdigit()
+            }
+            assert len(expected) >= 2, "expected both init and the exec'd sleep in podman top hpid"
+            assert result == expected
+            assert init_pid in result
+        finally:
+            subprocess.run(["podman", "rm", "-f", name], capture_output=True, timeout=30)
 
 
 docker_gpu = pytest.mark.skipif(

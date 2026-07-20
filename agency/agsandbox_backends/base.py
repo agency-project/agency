@@ -352,11 +352,24 @@ class agsandbox_backend(AgSandboxBackendFields):
     # same base64/proc-diffing logic per backend.
     # ------------------------------------------------------------------
 
+    def _read_proc_table(self, script: str, timeout: int) -> "tuple[str, int]":
+        """Run a pure /proc-reading *script* (no filesystem access, no user
+        command involved) and return its ``(output, rc)``.
+
+        Default: delegate to ``_container_exec()`` -- a container's own exec
+        session runs inside its own procfs view, which IS the right process
+        table for `_snapshot_pids()`/`get_live_pids()` to read for docker and
+        podman. Overridden by `_ChrootBackend`, which has no isolated procfs
+        of its own to exec into (see its module docstring) and must instead
+        read the real host `/proc` directly, unchrooted.
+        """
+        return self._container_exec(script, timeout=timeout, shell="sh")
+
     def _snapshot_pids(self) -> set[int]:
         """Return the set of all live PIDs currently in the container, excluding
         the snapshot shell itself so that monitoring shells are not mistaken
         for user-spawned processes."""
-        out, _ = self._container_exec(
+        out, _ = self._read_proc_table(
             "__SELF=$$\n"
             "for __d in /proc/[0-9]*; do\n"
             '  [ -f "$__d/status" ] || continue\n'
@@ -364,7 +377,6 @@ class agsandbox_backend(AgSandboxBackendFields):
             '  [ "$__p" != "$__SELF" ] && echo "$__p"\n'
             "done",
             timeout=self.inspect_timeout_s,
-            shell="sh",
         )
         pids: set[int] = set()
         for line in out.splitlines():
@@ -372,6 +384,49 @@ class agsandbox_backend(AgSandboxBackendFields):
             if line.isdigit():
                 pids.add(int(line))
         return pids
+
+    def _exec_with_pid_tracking(
+        self, env_export: str, cmd: str, workdir: str, timeout: int
+    ) -> "tuple[str, int]":
+        """Run *cmd* (with *env_export* prefixed) inside the container,
+        wrapped in a before/after /proc diff that discovers any background or
+        detached process *cmd* left running. Returns raw ``(output, rc)`` --
+        the ``__BGPIDS__`` marker is parsed by the caller (`exec()`).
+
+        Default: build the whole before/cmd/after script as ONE string and
+        run it through `_container_exec()` -- for docker/podman that single
+        exec session's own procfs view IS both the command's filesystem
+        context and the right place to read /proc from, so before-snapshot,
+        command, and after-diff can all happen in the same place.
+        Overridden by `_ChrootBackend`, which has no procfs of its own (see
+        its module docstring) and must run the before/after /proc reads
+        against the real host /proc, outside the jail, while still running
+        *cmd* itself chrooted for filesystem containment.
+        """
+        wrapped = (
+            f"exec 2>&1\n"  # merge stderr into stdout so the BGPIDS marker is never split
+            # Snapshot every live PID in the container before the command runs.
+            # Filtering on /proc/<N>/status avoids races with short-lived kernel threads.
+            f"__AGENCY_BEFORE=$(for __d in /proc/[0-9]*; do"
+            f" [ -f \"$__d/status\" ] && echo \"${{__d##*/}}\"; done | tr '\\n' ' ')\n"
+            f"__AGENCY_SHELL=$$\n"
+            f"{env_export}{cmd}\n"
+            f"__AGENCY_RC=$?\n"
+            # Diff /proc after the command: any PID not in the before-snapshot
+            # and not the shell itself was spawned by the command.
+            f"__AGENCY_BGPIDS=''\n"
+            f"for __d in /proc/[0-9]*; do\n"
+            f'  [ -f "$__d/status" ] || continue\n'
+            f"  __p=${{__d##*/}}\n"
+            f'  case " $__AGENCY_BEFORE $__AGENCY_SHELL " in\n'
+            f'    *" $__p "*) ;;\n'
+            f'    *) __AGENCY_BGPIDS="$__AGENCY_BGPIDS $__p" ;;\n'
+            f"  esac\n"
+            f"done\n"
+            f"printf '\\n{_BGPIDS_MARKER}%s' \"$__AGENCY_BGPIDS\"\n"
+            f"exit $__AGENCY_RC"
+        )
+        return self._container_exec(wrapped, workdir=workdir, timeout=timeout)
 
     def exec(
         self,
@@ -407,31 +462,7 @@ class agsandbox_backend(AgSandboxBackendFields):
             f"{hf_export}"
         )
 
-        wrapped = (
-            f"exec 2>&1\n"  # merge stderr into stdout so the BGPIDS marker is never split
-            # Snapshot every live PID in the container before the command runs.
-            # Filtering on /proc/<N>/status avoids races with short-lived kernel threads.
-            f"__AGENCY_BEFORE=$(for __d in /proc/[0-9]*; do"
-            f" [ -f \"$__d/status\" ] && echo \"${{__d##*/}}\"; done | tr '\\n' ' ')\n"
-            f"__AGENCY_SHELL=$$\n"
-            f"{env_export}{cmd}\n"
-            f"__AGENCY_RC=$?\n"
-            # Diff /proc after the command: any PID not in the before-snapshot
-            # and not the shell itself was spawned by the command.
-            f"__AGENCY_BGPIDS=''\n"
-            f"for __d in /proc/[0-9]*; do\n"
-            f'  [ -f "$__d/status" ] || continue\n'
-            f"  __p=${{__d##*/}}\n"
-            f'  case " $__AGENCY_BEFORE $__AGENCY_SHELL " in\n'
-            f'    *" $__p "*) ;;\n'
-            f'    *) __AGENCY_BGPIDS="$__AGENCY_BGPIDS $__p" ;;\n'
-            f"  esac\n"
-            f"done\n"
-            f"printf '\\n{_BGPIDS_MARKER}%s' \"$__AGENCY_BGPIDS\"\n"
-            f"exit $__AGENCY_RC"
-        )
-
-        output, rc = self._container_exec(wrapped, workdir=workdir, timeout=timeout)
+        output, rc = self._exec_with_pid_tracking(env_export, cmd, workdir, timeout)
 
         if _BGPIDS_MARKER in output:
             parts = output.rsplit(_BGPIDS_MARKER, 1)
@@ -572,7 +603,7 @@ class agsandbox_backend(AgSandboxBackendFields):
             '  echo "$__p $__ppid $__st $__nm"\n'
             "done"
         )
-        output, _ = self._container_exec(script, timeout=self.inspect_timeout_s, shell="sh")
+        output, _ = self._read_proc_table(script, timeout=self.inspect_timeout_s)
 
         proc_info: dict[int, tuple[int, str, str]] = {}  # pid → (ppid, state, name)
         for line in output.splitlines():

@@ -536,44 +536,48 @@ class _ContainerBackendBase(agsandbox_backend):
         agResourcePool._wait_for_gpu_clear) to processes THIS sandbox itself
         spawned, not an unrelated tenant sharing the same physical GPU.
 
-        Deliberately doesn't use ``docker top``/``podman top``: their PID
-        column's host-vs-namespaced semantics differ between the two
-        runtimes (rootless Podman in particular). ``{{.State.Pid}}`` is
-        documented and consistent across both as the container's init
-        process's HOST pid, so instead we read that once and walk
-        /proc's child-PID tree from there -- /proc semantics don't vary by
-        runtime.
+        MUST use `docker/podman top`, not a /proc child-PID walk from the
+        container's init process ({{.State.Pid}}): a `docker/podman exec`
+        session (how _container_exec() runs every command, including the
+        entire harness workload) joins the container's existing PID
+        namespace via the runtime's supervisor -- it is a SIBLING under that
+        supervisor, never a host-process-tree descendant of init. Confirmed
+        empirically: `docker exec -d <container> sleep 60` spawns a process
+        `docker top` correctly lists, but which never appears anywhere in
+        /proc/<init_pid>/task/<init_pid>/children. A walk-from-init approach
+        therefore only ever sees {init_pid} in real use (the harness's own
+        exec'd work is invisible to it), making the straggler-wait
+        effectively always intersect empty and release immediately --
+        silently defeating the entire point of scoping to own_pids.
+        `docker/podman top` instead enumerates PID-namespace MEMBERSHIP
+        directly (no process-ancestry walk at all), so it sees exec'd
+        siblings and init's descendants identically, in one call.
+
+        Runtime syntax differs and is NOT interchangeable:
+          docker: `docker top <name> -eo pid` -- real ps(1) flags, host PIDs.
+          podman: `podman top <name> hpid` -- podman's own positional
+            descriptor syntax, NOT `-eo`/`-o`. Passing ps(1)-style flags to
+            podman silently switches it to running a real `ps` INSIDE the
+            container's namespace instead (requires ps installed in the
+            image, and reports container-LOCAL pids, not host ones -- both
+            wrong for this purpose). Podman's own plain `pid` descriptor is
+            also container-namespace-local, not host -- only `hpid` (added
+            2018, present in every podman version in practical use) maps to
+            the real host PID via /proc NSpid matching.
         """
-        result = self._run(
-            [self._runtime, "inspect", "--format", "{{.State.Pid}}", self._container_name()],
-            check=False,
-            timeout=self.inspect_timeout_s,
-        )
+        if self._runtime == "podman":
+            cmd = [self._runtime, "top", self._container_name(), "hpid"]
+        else:
+            cmd = [self._runtime, "top", self._container_name(), "-eo", "pid"]
+        result = self._run(cmd, check=False, timeout=self.inspect_timeout_s)
         if result.returncode != 0:
             return set()
-        try:
-            init_pid = int(result.stdout.decode("utf-8", errors="replace").strip())
-        except ValueError:
-            return set()
-        if init_pid <= 0:
-            return set()
-
-        pids = {init_pid}
-        frontier = [init_pid]
-        while frontier:
-            pid = frontier.pop()
-            try:
-                children_raw = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-            except OSError:
-                continue
-            for child_s in children_raw:
-                try:
-                    child = int(child_s)
-                except ValueError:
-                    continue
-                if child not in pids:
-                    pids.add(child)
-                    frontier.append(child)
+        pids: set[int] = set()
+        lines = result.stdout.decode("utf-8", errors="replace").splitlines()
+        for line in lines[1:]:  # first line is the descriptor header (PID/HPID)
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
         return pids
 
     def _ensure_started(self) -> None:

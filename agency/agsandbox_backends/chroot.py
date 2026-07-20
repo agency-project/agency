@@ -15,14 +15,44 @@ image layer.
 What this does NOT get you, matching the scope this backend was built for
 (filesystem containment + independent per-agent installs, not defense
 against adversarial code): no network namespace (the jailed process shares
-the host's network stack), no PID namespace (a fresh procfs is mounted
-inside the jail so background-process tracking keeps working, but that
-means the jailed process can see -- though not touch, since real
+the host's network stack), no PID namespace (background-process tracking
+works against the REAL host /proc rather than a jailed one -- see below --
+which means the jailed process can see -- though not touch, since real
 permission checks still key off the unprivileged host uid the mapped
 "root" resolves to -- every host process), no cgroup CPU/memory limits
 (update_limits() is a no-op), and no GPU device scoping (a leased GPU's
 CUDA_VISIBLE_DEVICES env var is still set, same as the container backend,
 but nothing stops a process from seeing every /dev entry the host user can).
+
+Background-process tracking (`_snapshot_pids()`/`get_live_pids()`/
+`exec()`'s before/after PID diffing, all defined on the shared
+`agsandbox_backend` base class) fundamentally cannot read a jailed `/proc`
+here: mounting a FRESH procfs instance inside the jail (`mount -t proc`)
+requires the caller's user namespace to own the target PID namespace, and
+BIND-mounting the host's existing `/proc` is refused for the identical
+reason (confirmed empirically via strace: `EINVAL` on `mount(2)` either
+way) -- since this jail's `unshare` only creates a user+mount namespace,
+never a PID namespace of its own, the process stays in the HOST's PID
+namespace, which is owned by the *initial* user namespace, not this jail's
+freshly created one. Adding `--pid` would fix the mount but would also
+require a persistent per-jail "init" process for that namespace to survive
+across calls (this backend deliberately has none -- see `_container_exec()`
+and `_ensure_started()`), and would turn `_watched_pids` into jail-local
+PIDs needing host-PID translation, undoing the very "PIDs are already
+host-native, no translation needed" property `_own_host_pids()` relies on.
+Instead, `_read_proc_table()` and `_exec_with_pid_tracking()` below read
+`/proc` directly against the real host mount, from OUTSIDE the chroot
+(reading an already-mounted procfs needs no new mount() call at all, so the
+same-userns-must-own-the-pidns restriction never applies), while still
+running the user's own command chrooted for filesystem containment.
+
+`/dev` has the identical restriction (devtmpfs bind-mounting is refused for
+the same reason procfs is), so it is populated with a plain `tmpfs` plus
+individual per-file bind mounts of the handful of device files most
+programs assume exist (`null`, `zero`, `random`, `urandom`, `tty`, `full`)
+-- bind-mounting a single FILE doesn't cross the whole-filesystem-instance
+boundary the restriction applies to, confirmed empirically. This mirrors
+how rootless Docker/Podman populate their own `/dev`.
 """
 
 from __future__ import annotations
@@ -38,7 +68,12 @@ import uuid as _uuid
 from pathlib import Path
 
 from ..agconfig import agConfig
-from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
+from .base import (
+    _BGPIDS_MARKER,
+    AgSandboxBackendFields,
+    agsandbox_backend,
+    run_with_unkillable_child_grace,
+)
 
 _chroot_available_cache: "bool | None" = None
 _chroot_available_lock = threading.Lock()
@@ -135,11 +170,18 @@ _CHROOT_SNAPSHOTS_DIR = _CHROOT_STATE_ROOT / "snapshots"
 
 # Host directories bind-mounted read-only into every jail so common
 # interpreters/tools (python, bash, coreutils, shared libs) are usable
-# without needing a separate root filesystem image. /dev is bind-mounted
-# read-write (unscoped -- see the module docstring above) since most
-# programs assume /dev/null, /dev/urandom etc. exist and are writable.
+# without needing a separate root filesystem image.
 _CHROOT_RO_BASE_DIRS = ("bin", "sbin", "lib", "lib32", "lib64", "usr", "etc")
-_CHROOT_RW_BASE_DIRS = ("dev",)
+
+# /dev cannot be bind-mounted as a whole directory (devtmpfs bind-mounting
+# is refused from a nested unprivileged user namespace -- see module
+# docstring), so the jail gets a plain tmpfs at /dev instead, populated with
+# individual per-file bind mounts of just these device files -- bind-mounting
+# a single FILE doesn't cross the whole-filesystem-instance boundary the
+# devtmpfs restriction applies to. Read-write, unscoped (see module
+# docstring), matching what most programs assume /dev/null, /dev/urandom
+# etc. to be.
+_CHROOT_DEV_FILES = ("null", "zero", "random", "urandom", "tty", "full")
 
 
 def _sanitize_tag(tag: str) -> str:
@@ -245,7 +287,19 @@ class _ChrootBackend(agsandbox_backend):
         else:
             self._workspace.mkdir(parents=True, exist_ok=True)
 
-    def _build_jail_script(self, sh_cmd: str, *, workdir: str, shell: str) -> str:
+    def _setup_lines(self) -> "list[str]":
+        """Shell lines that materialize the jail's directory structure and
+        bind mounts, run unprivileged inside the `unshare --user
+        --map-root-user --mount` namespace before anything else (chroot,
+        /proc reads) happens. Shared by `_build_jail_script()` and
+        `_exec_with_pid_tracking()` so the two entry points into a jail
+        agree on what it looks like.
+
+        Does not attempt to mount /proc inside the jail -- see module
+        docstring for why that's refused by the kernel for both a fresh
+        instance and a bind mount, and how PID tracking works around it
+        instead (`_read_proc_table()`/`_exec_with_pid_tracking()`).
+        """
         root = str(self._root)
         lines = [f"mkdir -p {shlex.quote(root)}"]
         for d in _CHROOT_RO_BASE_DIRS:
@@ -256,13 +310,25 @@ class _ChrootBackend(agsandbox_backend):
             lines.append(f"mkdir -p {shlex.quote(jail_path)}")
             lines.append(f"mount --bind {shlex.quote(host_path)} {shlex.quote(jail_path)}")
             lines.append(f"mount -o remount,bind,ro {shlex.quote(jail_path)} 2>/dev/null || true")
-        for d in _CHROOT_RW_BASE_DIRS:
-            host_path = f"/{d}"
-            if not os.path.isdir(host_path):
+        # /dev: individual per-file bind mounts of the device files most
+        # programs assume exist, directly on a plain mkdir -- NOT inside an
+        # intermediate tmpfs. A freshly created mount (tmpfs included) gets
+        # `nodev` forced on it in a nested unprivileged user namespace, and
+        # that restriction is enforced per mountpoint-of-access: a device
+        # special file bind-mounted onto a path under that nodev mount is
+        # blocked from ever being opened as a device (confirmed empirically
+        # -- world-writable /dev/null still EACCES'd through a tmpfs, but
+        # opened fine through a bind directly onto a plain directory, which
+        # isn't itself a fresh mount and so was never nodev-flagged).
+        dev_jail_path = f"{root}/dev"
+        lines.append(f"mkdir -p {shlex.quote(dev_jail_path)}")
+        for name in _CHROOT_DEV_FILES:
+            host_dev = f"/dev/{name}"
+            if not os.path.exists(host_dev):
                 continue
-            jail_path = f"{root}/{d}"
-            lines.append(f"mkdir -p {shlex.quote(jail_path)}")
-            lines.append(f"mount --bind {shlex.quote(host_path)} {shlex.quote(jail_path)}")
+            jail_dev = f"{dev_jail_path}/{name}"
+            lines.append(f"touch {shlex.quote(jail_dev)}")
+            lines.append(f"mount --bind {shlex.quote(host_dev)} {shlex.quote(jail_dev)}")
         for host, container, mode in self._mounts.values():
             jail_path = f"{root}{container}"
             lines.append(f"mkdir -p {shlex.quote(jail_path)}")
@@ -273,9 +339,13 @@ class _ChrootBackend(agsandbox_backend):
                     f"mount -o remount,bind,ro {shlex.quote(jail_path)} 2>/dev/null || true"
                 )
         lines.append(f"mkdir -p {shlex.quote(root + '/workspace')}")
-        lines.append(f"mkdir -p {shlex.quote(root + '/proc')}")
-        lines.append(f"mount -t proc proc {shlex.quote(root + '/proc')} 2>/dev/null || true")
+        lines.append(f"mkdir -p {shlex.quote(root + '/proc')}")  # left empty, see module docstring
         lines.append(f"mkdir -p {shlex.quote(root + '/tmp')}")
+        return lines
+
+    def _build_jail_script(self, sh_cmd: str, *, workdir: str, shell: str) -> str:
+        root = str(self._root)
+        lines = self._setup_lines()
         # Setup (mkdir/mount) output must never reach the caller -- it isn't
         # part of the command's own stdout/stderr, and read_file()/write_file()
         # (inherited from agsandbox_backend) parse the captured output as raw
@@ -285,17 +355,18 @@ class _ChrootBackend(agsandbox_backend):
         exec_line = f"exec chroot {shlex.quote(root)} {shell} -c {shlex.quote(inner_cmd)}"
         return f"{setup}\n{exec_line}"
 
-    def _container_exec(
-        self,
-        sh_cmd: str,
-        workdir: str = "/workspace",
-        timeout: int = AgSandboxBackendFields.DEFAULT_EXEC_TIMEOUT_S,
-        stdin: bytes | None = None,
-        shell: str = "bash",
-    ) -> tuple[str, int]:
-        """Run a raw shell command inside the chroot jail."""
-        self._ensure_started()
-        script = self._build_jail_script(sh_cmd, workdir=workdir, shell=shell)
+    def _run_unshared(
+        self, script: str, *, stdin: "bytes | None" = None, timeout: int
+    ) -> "tuple[str, int]":
+        """Run *script* as ``bash -c script`` inside a fresh ``unshare
+        --user --map-root-user --mount`` namespace (see
+        `_chroot_unshare_prefix()`), returning ``(output, rc)``.
+
+        The lowest-level primitive shared by `_container_exec()` (which
+        further wraps *script* in `_build_jail_script()`'s chroot) and
+        `_exec_with_pid_tracking()` (which builds its own script that only
+        chroots the user's command, not the surrounding /proc reads).
+        """
         args = [
             *_chroot_unshare_prefix(),
             "--user",
@@ -323,6 +394,94 @@ class _ChrootBackend(agsandbox_backend):
             return f"Command timed out after {timeout}s", -1
         except Exception as e:
             return str(e), -1
+
+    def _container_exec(
+        self,
+        sh_cmd: str,
+        workdir: str = "/workspace",
+        timeout: int = AgSandboxBackendFields.DEFAULT_EXEC_TIMEOUT_S,
+        stdin: bytes | None = None,
+        shell: str = "bash",
+    ) -> tuple[str, int]:
+        """Run a raw shell command inside the chroot jail."""
+        self._ensure_started()
+        script = self._build_jail_script(sh_cmd, workdir=workdir, shell=shell)
+        return self._run_unshared(script, stdin=stdin, timeout=timeout)
+
+    def _read_proc_table(self, script: str, timeout: int) -> "tuple[str, int]":
+        """Run a pure /proc-reading *script* directly against the real host
+        /proc, unchrooted -- see module docstring for why the jail has no
+        procfs of its own to exec into, and why this needs no `unshare`/
+        `chroot` at all: it's the same host PID namespace either way, no
+        namespace boundary to cross, no new mount() call needed to read it.
+        """
+        self._ensure_started()
+        try:
+            proc = run_with_unkillable_child_grace(
+                lambda: subprocess.run(["sh", "-c", script], capture_output=True, timeout=timeout),
+                args=["sh", "-c", script],
+                timeout=timeout,
+                grace_s=self.unkillable_child_grace_s,
+            )
+            output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+            return output, proc.returncode
+        except subprocess.TimeoutExpired:
+            return f"Command timed out after {timeout}s", -1
+        except Exception as e:
+            return str(e), -1
+
+    def _exec_with_pid_tracking(
+        self, env_export: str, cmd: str, workdir: str, timeout: int
+    ) -> "tuple[str, int]":
+        """Run *cmd* chrooted for filesystem containment, while snapshotting
+        /proc before and after it against the REAL host /proc (outside the
+        jail) rather than a jailed one -- see module docstring for why the
+        jail has no working procfs of its own.
+
+        Structured as one shell script so the before-snapshot and the
+        after-diff share state (``__AGENCY_BEFORE``) the way
+        `agsandbox_backend._exec_with_pid_tracking()`'s single-exec-session
+        version does for docker/podman -- but only the *middle* `chroot`
+        sub-invocation (a plain forked subprocess, not `exec`-replacing this
+        script) touches the jailed filesystem; the surrounding scans never
+        leave the un-chrooted, real-/proc-visible outer shell. A command
+        that backgrounds a process (``cmd &``) still detaches and survives
+        past the `chroot` sub-invocation's own exit exactly as it does
+        today, since the orphan is reparented on the shared host PID
+        namespace regardless of which process was its immediate parent.
+        """
+        self._ensure_started()
+        root = str(self._root)
+        setup = "{ " + "; ".join(self._setup_lines()) + "; } >/dev/null 2>&1"
+        inner_cmd = f"cd {shlex.quote(workdir)} 2>/dev/null; {env_export}{cmd}"
+        script = (
+            f"{setup}\n"
+            # Snapshot every live host PID before the command runs. Filtering
+            # on /proc/<N>/status avoids races with short-lived kernel threads.
+            f"__AGENCY_BEFORE=$(for __d in /proc/[0-9]*; do"
+            f" [ -f \"$__d/status\" ] && echo \"${{__d##*/}}\"; done | tr '\\n' ' ')\n"
+            f"__AGENCY_SHELL=$$\n"
+            # The chroot sub-invocation is a plain forked child (not `exec`
+            # here), so this outer shell -- and its real /proc view -- is
+            # still here to run the after-diff once it returns.
+            f"__AGENCY_CHROOT_OUT=$(chroot {shlex.quote(root)} bash -c {shlex.quote(inner_cmd)} 2>&1)\n"
+            f"__AGENCY_RC=$?\n"
+            f"printf '%s' \"$__AGENCY_CHROOT_OUT\"\n"
+            # Diff /proc after the command: any PID not in the before-snapshot
+            # and not this shell itself was spawned by the command.
+            f"__AGENCY_BGPIDS=''\n"
+            f"for __d in /proc/[0-9]*; do\n"
+            f'  [ -f "$__d/status" ] || continue\n'
+            f"  __p=${{__d##*/}}\n"
+            f'  case " $__AGENCY_BEFORE $__AGENCY_SHELL " in\n'
+            f'    *" $__p "*) ;;\n'
+            f'    *) __AGENCY_BGPIDS="$__AGENCY_BGPIDS $__p" ;;\n'
+            f"  esac\n"
+            f"done\n"
+            f"printf '\\n{_BGPIDS_MARKER}%s' \"$__AGENCY_BGPIDS\"\n"
+            f"exit $__AGENCY_RC"
+        )
+        return self._run_unshared(script, timeout=timeout)
 
     def update_limits(self, *, cpus: float | None = None, memory: str | None = None) -> None:
         """No-op -- chroot jails have no cgroup of their own to update."""
