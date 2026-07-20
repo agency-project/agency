@@ -16,12 +16,15 @@ Tools are the functions an LLM can call during a ReAct loop. Each tool is an `ag
 | `todowrite` | host | `False` | Persist a structured todo list to disk |
 | `ask_human` | host | `False` | Ask the user a question; blocks until a reply arrives (from UI or stdin) |
 | `daemon_release` | sandbox | `False` | Release a PID from monitoring so a long-lived service doesn't block skill completion |
-| `reserve_gpu` | sandbox | `False` | Reserve GPU access (virtual); physical GPU assigned lazily when bash runs |
-| `gpu_release` | sandbox | `False` | Return the GPU to the pool |
+| `reserve_gpu` | sandbox | `False` | Reserve GPU access (virtual); physical GPU assigned lazily when bash runs, held for the rest of the sandbox's lifetime |
 | `reserve_cpu` | sandbox | `False` | Boost container CPU/memory limits for compute-intensive work |
 | `cpu_release` | sandbox | `False` | Reset CPU/memory limits back to idle defaults |
 
 All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker/podman exec`.
+
+**There is no `gpu_release` tool.** A GPU, once actually acquired via `reserve_gpu`, is released only by `sandbox.stop()`/`sandbox.destroy()` — never by an explicit mid-skill call (see [agresources.md](agresources.md#agent-callable-resource-tools)).
+
+**`run_in_subprocess` no longer gates whether `stop()` runs after a tool call.** Every built-in tool above sets it `False` for an unrelated reason (they need to run synchronously against the same persistent sandbox object, not a disposable cloudpickled worker copy), but `agtool.py`'s `dispatch_tools()` now calls `sandbox.stop(commit=...)` after *every* tool call regardless of this flag — deferred only when `sandbox._has_pending_background_work()` is true, not based on this column at all.
 
 ## Sandboxed tool construction
 
@@ -43,7 +46,6 @@ tools = [
 if pool is not None:
     tools += [
         make_gpu_reserve(sandbox, pool),
-        make_gpu_release(sandbox, pool),
         make_cpu_reserve(sandbox, pool),
         make_cpu_release(sandbox, pool),
     ]

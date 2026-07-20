@@ -6,11 +6,11 @@ All filesystem operations — bash commands, file reads, file writes, glob searc
 
 ## GPU device access
 
-`--gpus all` is passed to `run` when `nvidia-smi` detects GPUs on the host, mounting the NVIDIA device files into the container. On CPU-only hosts the flag is omitted.
+`--gpus all` (docker) / CDI (podman) / per-file device binds scoped to the leased GPU (chroot) make the host's GPU devices reachable — see [agsandbox_backends/container.md](agsandbox_backends/container.md)/[chroot.md](agsandbox_backends/chroot.md) for the backend-specific mechanics. On CPU-only hosts nothing GPU-related is passed/mounted.
 
-Even with `--gpus all`, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES=""` when no virtual reservation is active, making all GPUs invisible to CUDA. Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken. When `exec()` runs a bash command and the virtual flag is set, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected. After a foreground exec with no background processes, the physical GPU is returned to the pool immediately — freeing it for other agents while the LLM thinks. When background processes are alive, the GPU is held until `get_live_pids()` finds them all finished.
+Even so, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES="NoDevFiles"` when no virtual reservation is active, making all GPUs invisible to CUDA (`readonly`-exported, so a command can't hijack a different GPU by reassigning the variable inline). Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken yet. When `exec()` runs a bash command and the virtual flag is set, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected.
 
-See [agsandbox_backends/container.md](agsandbox_backends/container.md) for the container-runtime-level mechanics (the actual `--gpus all`/`--device` flags passed to `run`) behind this.
+**GPU release is tied to the sandbox's lifetime, not to individual `exec()` calls.** There is no `gpu_release` tool and no `is_clear`/polling mechanism — `pool.release_gpu()` releases the semaphore immediately, unconditionally, with no wait. Safety comes purely from ordering: `stop()`/`destroy()` always tear down whatever the sandbox was running (remove the container / kill tracked processes) *before* releasing the GPU, so by the time release happens, nothing this backend could see is still using it. A GPU, once actually acquired, is therefore held until the sandbox itself is stopped or destroyed — there's no way to free it back to the pool mid-skill.
 
 ## Concurrent access
 
@@ -43,6 +43,8 @@ Forking copies the parent's checkpoint image tag to a new tag for the fork via `
 Because forks wait for `src.ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
 ## exec wrapper
+
+> This section (and "Process tracking state" below) describes the **container backends'** before/after PID-diffing specifically. Chroot tracks background work differently — purely via process groups, with no before/after diff and no `_baseline_pids`/`_watched_pids` population at all — see [agsandbox_backends/chroot.md](agsandbox_backends/chroot.md#background-process-tracking).
 
 Every bash command is wrapped before being sent to the container shell:
 

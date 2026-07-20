@@ -239,8 +239,8 @@ class agwebui:
             _pool = _agent_cls.agresource_pool
             if _pool is not None:
                 _pool._emit_resource()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agwebui] WARNING: failed to emit initial resource pool state: {_e}")
 
         def _kill_server() -> None:
             proc = ui._server_proc
@@ -295,7 +295,7 @@ class agwebui:
                     ui._server_proc.terminate()
                     try:
                         ui._server_proc.wait(timeout=5)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        print(f"[agwebui] WARNING: server process did not exit cleanly: {_e}")
                     if ui._server_log is not None:
                         ui._server_log.close()

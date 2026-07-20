@@ -683,8 +683,8 @@ def test_save_all_and_load_all(tmp_path, monkeypatch):
             try:
                 if a.sandbox:
                     a.sandbox.destroy()
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"test cleanup: destroy() failed for {a.agname}: {_e}")
         _agname._allocated.difference_update(saved_names)
 
 
@@ -728,8 +728,8 @@ def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
             try:
                 if a.sandbox:
                     a.sandbox.destroy()
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"test cleanup: destroy() failed for {a.agname}: {_e}")
         _agname._allocated.discard(ag2_name[0])
         _agname._allocated.discard(ag1_name)
 

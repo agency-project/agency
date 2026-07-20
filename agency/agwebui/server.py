@@ -116,14 +116,14 @@ def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None, dic
                     tn = ev.get("team_name")
                     if tn:
                         team_reg[tn] = data
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"[agwebui] skipping malformed registration event row: {_e}")
         row = con.execute("SELECT MAX(id), COUNT(*), MIN(ts), MAX(ts) FROM events").fetchone()
         con.close()
         if row and row[0] is not None:
             return row[0], row[1], row[2], row[3], agent_reg, team_reg
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[agwebui] WARNING: failed to read event summary from {path}: {_e}")
     return 0, 0, None, None, agent_reg, team_reg
 
 
@@ -143,8 +143,8 @@ def _fetch_state_preamble(path: Path) -> list[str]:
         if row:
             rows.append(row[0])
         con.close()
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[agwebui] WARNING: failed to read state preamble from {path}: {_e}")
     return rows
 
 
@@ -339,8 +339,10 @@ async def websocket_endpoint(ws: WebSocket):
                     }
                     cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
                     _atomic_write_text(cmd_file, json.dumps(cmd))
-            except Exception:
-                pass
+            except Exception as _e:
+                # Reference the raw `data`, not `msg` -- json.loads(data) itself
+                # may be what raised, in which case `msg` was never assigned.
+                print(f"[agwebui] WARNING: failed to handle client message {data!r}: {_e}")
     except WebSocketDisconnect:
         async with _lock:
             _clients.discard(ws)
@@ -380,8 +382,8 @@ async def _tail_events() -> None:
                                 tn = ev.get("team_name")
                                 if tn:
                                     _team_registry[tn] = data
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            print(f"[agwebui] skipping malformed registration event row: {_e}")
 
                     dead: set[WebSocket] = set()
                     for _, data in rows:

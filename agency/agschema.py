@@ -444,8 +444,13 @@ class agschema:
                             f"to hold a path rather than content, declare it as agpath instead."
                         )
                         value = resolved
-                except Exception:
-                    pass
+                except Exception as _e:
+                    # Expected whenever the str value just isn't an actual
+                    # readable path in the sandbox -- leave it as a plain
+                    # string rather than auto-resolved content.
+                    print(
+                        f"[agschema] '{field_name}' looked like a path but could not be read: {_e}"
+                    )
 
             if type_hint is float and isinstance(value, int):
                 value = float(value)

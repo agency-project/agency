@@ -55,10 +55,13 @@ The tool then logs the call via `agtool.log()` (terminal + file) and returns the
 
 ## Per-tool-call container lifecycle
 
-After every tool dispatch in `_dispatch_tools()`, the container is stopped:
+After every tool dispatch in `_dispatch_tools()`, the container is stopped — **unless** the tool call left background work still running inside the sandbox (`sandbox._has_pending_background_work()` is true), in which case `stop()` is skipped entirely for that call. `stop()` always tears down or overwrites the sandbox's live state, so running it while something is still backgrounded (`cmd &`) would kill that work before the agent ever got a chance to check on it in a later tool call. Skipping just defers the checkpoint/teardown to whichever later tool call finds nothing pending; this is not specific to tools flagged `run_in_subprocess=True` — that flag no longer gates this at all (see below).
 
 ```
 tool returns result
+  ├─ sandbox._has_pending_background_work() is True
+  │    stop() skipped entirely for this call — deferred to a later one
+  │
   ├─ success (no "error" key in result)
   │    sandbox.stop(commit=True)
   │      docker commit → agency/lifecycle-<agname>   # snapshot /workspace (lowercased by _lifecycle_tag())
@@ -69,8 +72,10 @@ tool returns result
        sandbox.stop(commit=False)
          docker rm -f <container>                    # discard dirty state, no commit
          # next start restores from previous _lifecycle_image
-       result gains "workspace_reverted" note
+       result gains "workspace_reverted" note — only when stop() actually ran
 ```
+
+**Not gated by `run_in_subprocess` anymore.** Earlier, this whole block only ran for tools with `run_in_subprocess=True` — a parameter that traces back to one literally named `need_sandbox`, renamed in an unrelated architecture refactor without revisiting whether the `stop()` gate still made sense under the new name. Since every built-in sandboxed tool (`bash`, `read`, `write`, `edit`, …) sets `run_in_subprocess=False` for unrelated reasons (they need to run synchronously against the same persistent object, not a disposable worker copy), that old gate meant `stop()` was never actually being called after any of them — checkpointing only ever happened once, at the very end of the whole skill. `stop()` now runs after every tool call regardless of that flag, gated only on whether background work is pending.
 
 Before the next tool call `_ensure_started()` recreates the container:
 
@@ -164,9 +169,9 @@ The current `stop()` implementation:
 
 1. Optionally commits the container state via `docker commit` (retried up to 3×) before removal.
 2. Retries `docker rm -f` up to 3 times with a 1-second delay between attempts. Each attempt goes through `_run()`, which holds `_docker_semaphore` for the duration of the subprocess call.
-3. Emits a `WARNING` to stderr after all retries are exhausted, then continues — `_started` is cleared and `_container_semaphore` released regardless, so the framework can keep running even if a zombie remains.
+3. Still runs every remaining step regardless — the runtime-slot/GPU release checks (both gated on `_container_running()` actually confirming the container gone) — then **raises** the underlying exception at the end if either the commit or the `rm` ultimately failed after all retries. If both failed, the `rm` failure is raised in preference: an unconfirmed removal means real resources (the keyring slot, the GPU) may still be held, which is more severe than a missed checkpoint.
 
-The warning makes accumulation visible rather than silent, and the retries handle transient daemon overload.
+This replaced an earlier version that emitted a `WARNING` to stderr after exhausting retries and then silently continued. That made accumulation *visible* but not *actionable* — the caller had no way to know teardown hadn't actually succeeded. `destroy()` (called from `atexit`/`agSandbox.__del__` as a last-resort cleanup) follows the identical cleanup-then-raise shape: a raise there is caught and logged by the atexit wrapper, not fatal, so raising is safe even in that path. The retries still handle transient daemon overload before ever reaching the raise; only a genuinely persistent failure now surfaces instead of being swallowed. Non-critical steps — the old-image inspect/delete after a re-commit, and `destroy()`'s checkpoint/pretool image cleanup — remain best-effort (`WARNING` and continue), since a stray dangling image costs disk space, not correctness.
 
 ---
 
@@ -188,7 +193,7 @@ if proc_msg is not None:
 return (result, prev_ctx, delta_messages)   # sandbox clean → truly done
 ```
 
-`agSandbox.wait_for_processes()` returns `None` immediately if `_watched_pids` is empty or `get_live_pids()` finds no active processes. Otherwise it polls until either all PIDs exit or `ping_interval_s` elapses:
+`agSandbox.wait_for_processes()` returns `None` immediately if `sandbox._has_pending_background_work()` is false (for this backend, that default check is `bool(self._watched_pids)`). Otherwise it polls — checking `_has_pending_background_work()` again each iteration, not `get_live_pids()`, which is used only for reporting (`pid_status_summary()`/the log payload) — until either it goes false or `ping_interval_s` elapses:
 
 | Outcome | Return value | Log event |
 |---|---|---|

@@ -250,8 +250,10 @@ class agwebui_emitter:
                     self._reinit_after_corruption()
                 finally:
                     con.close()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(
+                f"[agwebui] WARNING: event-log prune failed (best-effort, will retry next cycle): {_e}"
+            )
         finally:
             self._prune_lock.release()
 
@@ -404,8 +406,8 @@ class agwebui_emitter:
         text = reply_file.read_text(encoding="utf-8").strip()
         try:
             reply_file.unlink()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agwebui] WARNING: failed to clean up reply file {reply_file}: {_e}")
         return text
 
     def token_update(

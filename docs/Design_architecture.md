@@ -201,7 +201,7 @@ When a skill has no `output_schema`, the model's raw text response is returned a
 
 ### Sandbox lifecycle
 
-The sandbox is created lazily on the first skill run that needs one. After each successful tool call (`run_in_subprocess=True` tools), the sandbox is checkpointed via `stop(commit=True)` + the next `_ensure_started()` restoring from that image. After the skill run completes, `agskill` commits + stops the sandbox again in its teardown. `_lifecycle_tag()` always lowercases the Docker image name (Docker requires lowercase repository names).
+The sandbox is created lazily on the first skill run that needs one. After each tool call — success or failure, regardless of `run_in_subprocess` — the sandbox is checkpointed or reverted via `stop(commit=True/False)` + the next `_ensure_started()` restoring from that image, **unless** the tool call left background work still running (`sandbox._has_pending_background_work()`), in which case `stop()` is deferred to a later call rather than killing that work. After the skill run completes, `agskill` commits + stops the sandbox again in its teardown. `_lifecycle_tag()` always lowercases the Docker image name (Docker requires lowercase repository names).
 
 **Sandbox ownership — no flag, plain attribute**
 

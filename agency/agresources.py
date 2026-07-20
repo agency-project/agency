@@ -74,8 +74,8 @@ def _visible_device_remap(env_names: "tuple[str, ...]") -> dict[int, int]:
             ids = [int(x.strip()) for x in val.split(",") if x.strip().lstrip("-").isdigit()]
             if ids:
                 return {phys: idx for idx, phys in enumerate(ids)}
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agresources] WARNING: could not parse {name}={val!r}: {_e}")
     return {}
 
 
@@ -107,8 +107,8 @@ def _allocate_gpu_markers_cuda(gpu_ids: list[int], marker_bytes: int) -> bool:
                 continue
             cuda.cuMemAlloc_v2(ctypes.byref(ptr), marker_bytes)
             # Leave context current; allocation persists for the process lifetime.
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agresources] WARNING: CUDA marker allocation failed for GPU {gpu_id}: {_e}")
     return True
 
 
@@ -135,8 +135,8 @@ def _allocate_gpu_markers_rocm(gpu_ids: list[int], marker_bytes: int) -> None:
             hip.hipMalloc(ctypes.byref(ptr), marker_bytes)
             # Leave allocated; persists for the process lifetime, same as the
             # CUDA path above.
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agresources] WARNING: ROCm marker allocation failed for GPU {gpu_id}: {_e}")
 
 
 def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
@@ -167,8 +167,8 @@ def _cvd_filter(gpu_ids: list[int]) -> list[int]:
             allowed = {int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()}
             if allowed:
                 return [g for g in gpu_ids if g in allowed]
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agresources] WARNING: could not parse {_env}={cvd!r}: {_e}")
     return gpu_ids
 
 
@@ -185,8 +185,10 @@ def detect_gpus() -> list[int]:
         if result.returncode == 0 and result.stdout.strip():
             ids = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
             return _cvd_filter(ids)
-    except Exception:
-        pass
+    except Exception as _e:
+        # Expected on any host without an NVIDIA driver/nvidia-smi installed --
+        # falls through to the ROCm probe below.
+        print(f"[agresources] nvidia-smi probe failed, trying rocm-smi: {_e}")
     try:
         result = subprocess.run(
             ["rocm-smi", "--showid", "--csv"],
@@ -214,8 +216,9 @@ def detect_gpus() -> list[int]:
                         pass
             if ids:
                 return _cvd_filter(ids)
-    except Exception:
-        pass
+    except Exception as _e:
+        # Expected on any host without an AMD driver/rocm-smi installed.
+        print(f"[agresources] rocm-smi probe failed, no GPUs detected: {_e}")
     return []
 
 
@@ -231,8 +234,10 @@ def detect_memory_mb() -> int:
             for line in f:
                 if line.startswith("MemTotal:"):
                     return int(line.split()[1]) // 1024  # kB → MB
-    except Exception:
-        pass
+    except Exception as _e:
+        # Expected on non-Linux hosts (e.g. macOS has no /proc) -- falls
+        # through to the sysctl probe below.
+        print(f"[agresources] /proc/meminfo read failed, trying sysctl: {_e}")
     try:
         result = subprocess.run(
             ["sysctl", "-n", "hw.memsize"],
@@ -242,8 +247,8 @@ def detect_memory_mb() -> int:
         )
         if result.returncode == 0:
             return int(result.stdout.strip()) // (1024 * 1024)
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[agresources] sysctl memory probe failed, using configured fallback: {_e}")
     return _AgResourcePoolFields().memory_detect_fallback_mb
 
 
