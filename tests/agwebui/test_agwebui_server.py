@@ -177,8 +177,10 @@ def _recv_n(ws, n, timeout=5.0):
         try:
             for _ in range(n):
                 results.append(json.loads(ws.receive_text()))
-        except Exception:
-            pass
+        except Exception as _e:
+            # Expected once the test's own timeout below gives up and the
+            # connection is torn down while this thread is still receiving.
+            print(f"_recv_n reader stopped early: {_e}")
 
     t = threading.Thread(target=_reader, daemon=True)
     t.start()
@@ -196,8 +198,10 @@ def _recv_skipping_sync(ws, n, timeout=5.0):
                 msg = json.loads(ws.receive_text())
                 if msg.get("type") != "timeline_sync":
                     results.append(msg)
-        except Exception:
-            pass
+        except Exception as _e:
+            # Expected once the test's own timeout below gives up and the
+            # connection is torn down while this thread is still receiving.
+            print(f"_recv_skipping_sync reader stopped early: {_e}")
 
     t = threading.Thread(target=_reader, daemon=True)
     t.start()

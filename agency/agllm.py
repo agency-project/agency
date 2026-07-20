@@ -400,8 +400,10 @@ class agllm(_AgLLMFields):
                 except BAD_REQUEST_EXCS as _bad_req:
                     try:
                         client.close()
-                    except Exception:
-                        pass
+                    except Exception as _close_err:
+                        print(
+                            f"[agllm] WARNING: failed to close client during error handling: {_close_err}"
+                        )
                     messages.pop()
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
                     _err_str = str(_bad_req).lower()
@@ -435,8 +437,10 @@ class agllm(_AgLLMFields):
                 ) as _transient_err:
                     try:
                         client.close()
-                    except Exception:
-                        pass
+                    except Exception as _close_err:
+                        print(
+                            f"[agllm] WARNING: failed to close client during error handling: {_close_err}"
+                        )
                     messages.pop()
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
                     if isinstance(_transient_err, RATE_LIMIT_EXCS):
@@ -662,8 +666,8 @@ class agllm(_AgLLMFields):
                     return int(data["count"])
                 if "tokens" in data:
                     return len(data["tokens"])
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"[agllm] remote tokenize endpoint failed, using local estimate: {_e}")
         return agllm.estimate_messages_tokens(messages)
 
     @staticmethod

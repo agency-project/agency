@@ -198,10 +198,9 @@ class TestDanglingImageEagerCleanup:
             return FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert rmi_calls, "expected docker rmi call for old image"
@@ -229,10 +228,9 @@ class TestDanglingImageEagerCleanup:
             return FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
@@ -268,10 +266,9 @@ class TestDanglingImageEagerCleanup:
         sys.stderr = captured
         try:
             with patch.object(_mod._DockerBackend, "_run", fake_run):
-                with patch.object(sb._backend, "_started", True):
-                    with patch.object(sb._backend, "_container_running", return_value=True):
-                        with patch.object(sb._backend, "_gpu_virtual", False):
-                            sb.stop(commit=True)  # must not raise
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.stop(commit=True)  # must not raise
         finally:
             sys.stderr = old_stderr
 
@@ -512,18 +509,17 @@ class TestDockerCommandHelpers:
         released = []
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", True):
-                # Still running both before AND after the failed rm attempt --
-                # removal truly never happened.
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_container_status", return_value="running"):
-                        with patch.object(
-                            _container_mod._container_semaphore,
-                            "release",
-                            side_effect=lambda: released.append(1),
-                        ):
-                            with pytest.raises(RuntimeError, match="rm exploded"):
-                                sb.destroy()
+            # Still running both before AND after the failed rm attempt --
+            # removal truly never happened.
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(
+                        _container_mod._container_semaphore,
+                        "release",
+                        side_effect=lambda: released.append(1),
+                    ):
+                        with pytest.raises(RuntimeError, match="rm exploded"):
+                            sb.destroy()
 
         assert not released, (
             "semaphore must NOT be released while the container is confirmed still running"
@@ -555,22 +551,29 @@ class TestDockerCommandHelpers:
 
         released = []
 
+        # had_container (destroy()'s pre-rm check) must see "running" so the
+        # test actually exercises the "was running, rm failed, but confirmed
+        # gone by the recheck" path -- the post-rm recheck in the `finally`
+        # block must see "gone". Same method, two different truthful answers
+        # at two different times, exactly like a real rm that silently
+        # succeeded despite raising a secondary error.
+        running_calls = [True, False]
+
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            # _started=True short-circuits had_container's "self._started or
-            # self._container_running()" check, so _container_running() is
-            # only actually called once in this whole path: the recheck in
-            # destroy()'s `finally` after the failed rm. False there means
-            # "confirmed gone by the time we check."
-            with patch.object(sb._backend, "_started", True):
-                with patch.object(sb._backend, "_container_running", return_value=False):
-                    with patch.object(sb._backend, "_container_status", return_value="running"):
-                        with patch.object(
-                            _container_mod._container_semaphore,
-                            "release",
-                            side_effect=lambda: released.append(1),
-                        ):
-                            with pytest.raises(RuntimeError, match="rm exploded"):
-                                sb.destroy()
+            with patch.object(
+                sb._backend, "_container_running", side_effect=fake_container_running
+            ):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(
+                        _container_mod._container_semaphore,
+                        "release",
+                        side_effect=lambda: released.append(1),
+                    ):
+                        with pytest.raises(RuntimeError, match="rm exploded"):
+                            sb.destroy()
 
         assert released, "semaphore must be released once the container is confirmed gone"
 
@@ -590,13 +593,207 @@ class TestDockerCommandHelpers:
             return OK()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_started", False):
-                with patch.object(sb._backend, "_container_running", return_value=False):
-                    with patch.object(sb._backend, "_container_status", return_value=""):
-                        sb.destroy()
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                with patch.object(sb._backend, "_container_status", return_value=""):
+                    sb.destroy()
 
         rm_calls = [a for a in calls if "rm" in a and "rmi" not in a]
         assert not rm_calls, f"must not rm when container absent; got {rm_calls}"
+
+
+# ---------------------------------------------------------------------------
+# GPU semaphore release gating in stop()/destroy() -- the real GPU semaphore
+# (agResourcePool.release_gpu, wired in via reserve_gpu) must only be
+# released once the container is CONFIRMED torn down, exactly like the
+# runtime-slot semaphore above -- releasing it while the container might
+# still be running and actually using the GPU would let something else
+# acquire the same physical GPU concurrently.
+# ---------------------------------------------------------------------------
+
+
+class TestDockerGpuReleaseGating:
+    def _sb(self):
+        return _make_sandbox()
+
+    def _lease_gpu(self, sb, gpu_id=3):
+        released = []
+        sb._gpu_virtual = True
+        sb._gpu_id = gpu_id
+        sb._gpu_release_fn = lambda gid: released.append(gid)
+        return released
+
+    def test_stop_releases_gpu_when_already_confirmed_gone(self):
+        """stop()'s early-return branch (container already not running when
+        stop() is entered) must still release a leased GPU."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        with patch.object(_mod._DockerBackend, "_run"):
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                sb.stop(commit=False)
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_stop_releases_gpu_via_main_teardown_path_after_successful_rm(self):
+        """The other release site in stop() -- reached via the main
+        teardown path (container was running, rm succeeded) rather than the
+        early-return branch above."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            return OK()
+
+        # top-of-stop() check (must be True to take the main path), then the
+        # post-rm runtime-slot check, then the GPU-release check -- 3 calls.
+        running_calls = [True, False, False]
+
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(
+                sb._backend, "_container_running", side_effect=fake_container_running
+            ):
+                sb.stop(commit=False)
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_stop_does_not_release_gpu_when_rm_fails_and_container_still_running(self):
+        import agency.agsandbox_backends.container as _container_mod
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.stop(commit=False)
+
+        assert released == [], (
+            "GPU must not be released while the container is confirmed still running"
+        )
+        assert sb._gpu_id == 3, "gpu_id must be left untouched when release didn't happen"
+
+    def test_destroy_releases_gpu_when_container_confirmed_gone_despite_rm_error(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        running_calls = [True, False]
+
+        def fake_container_running():
+            return running_calls.pop(0) if running_calls else False
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(
+                sb._backend, "_container_running", side_effect=fake_container_running
+            ):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.destroy()
+
+        assert released == [3]
+        assert sb._gpu_id is None
+
+    def test_destroy_does_not_release_gpu_when_container_still_running_after_rm_failure(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.destroy()
+
+        assert released == []
+        assert sb._gpu_id == 3
+
+    def test_gpu_released_exactly_once_across_stop_then_destroy(self):
+        """stop() tears the container down and releases the GPU; a later
+        destroy() call on the same sandbox must see gpu_id already cleared
+        and must not release a second time."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        released = self._lease_gpu(sb)
+
+        with patch.object(_mod._DockerBackend, "_run"):
+            with patch.object(sb._backend, "_container_running", return_value=False):
+                sb.stop(commit=False)
+                sb.destroy()
+
+        assert released == [3], "GPU must be released exactly once, not once per call"
+
+    def test_stop_rm_exc_takes_precedence_over_commit_exc(self):
+        """When both the commit retries AND the rm retries exhaust, stop()
+        must still run its GPU/runtime-slot release checks and raise --
+        specifically the rm failure, since rm is stop()'s last word on
+        whether the container is actually gone (a failed commit alone
+        doesn't mean teardown didn't happen)."""
+        import agency.agsandbox_backends.container as _container_mod
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+
+        class OK:
+            returncode = 0
+            stdout = b""
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "commit" in args:
+                raise RuntimeError("commit exploded")
+            if "rm" in args:
+                raise RuntimeError("rm exploded")
+            return OK()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
+                    with pytest.raises(RuntimeError, match="rm exploded"):
+                        sb.stop(commit=True)
 
 
 # Session-keyring-quota machinery (_keyring_container_limit/keyring_quota/

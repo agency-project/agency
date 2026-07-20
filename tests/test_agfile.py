@@ -30,7 +30,15 @@ def _make_mock_agent(llm=None, sandbox=None):
 
     ag._state = _agent_state_cls("test")
     ag.llm = llm or LLM
-    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    if sandbox is not None:
+        ag.sandbox = sandbox
+    else:
+        ag.sandbox = MagicMock()
+        # A bare MagicMock()'s _has_pending_background_work() would
+        # otherwise auto-mock to a truthy value, making agtool.py's
+        # dispatch_tools() defer stop() forever -- default to "nothing
+        # pending" so tests get the common case without configuring it.
+        ag.sandbox._has_pending_background_work.return_value = False
     ag.terminal = MagicMock()
     ag.log = MagicMock()
     ag.log.token_usage = {}
@@ -255,6 +263,7 @@ def test_system_prompt_agfile_type_shown_as_file():
 def test_skill_with_agfile_output_schema_validates_path_string():
     sk = agskill("write", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
     sandbox = MagicMock()
+    sandbox._has_pending_background_work.return_value = False
     sandbox.read_file.return_value = "recovered file content"
     responses = [
         _tool_call("return_doc", {"value": "/workspace/outputs/write_doc.txt"}),
@@ -326,6 +335,7 @@ def test_recover_agtype_outputs_no_schema_returns_empty():
 
 def _run_skill_with_sandbox(skill, responses, sandbox):
     """Helper: run skill with mocked LLM and a provided sandbox."""
+    sandbox._has_pending_background_work.return_value = False
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
         result, *_ = skill.execute_react(_make_mock_agent(LLM, sandbox), agcontext(), agdata())

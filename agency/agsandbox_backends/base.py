@@ -237,15 +237,6 @@ class agsandbox_backend(AgSandboxBackendFields):
         process context)."""
         return set()
 
-    def _gpu_is_clear(self) -> bool:
-        """Return True when this sandbox holds no live processes — the
-        condition release_gpu() waits on before freeing the pool slot.
-
-        Matches container exit for Docker/Podman (no running container) and
-        "no watched host PIDs" for chroot. Default True (nothing to wait on).
-        """
-        return True
-
     @staticmethod
     def for_config(
         agconfig: "agConfig | None",
@@ -485,9 +476,13 @@ class agsandbox_backend(AgSandboxBackendFields):
             clean_output = output
 
         # Re-verify liveness when _watched_pids is non-empty — get_live_pids()
-        # prunes dead entries. GPU release is deferred until stop()/explicit
-        # gpu_release, which waits on _gpu_is_clear() (container exit), not on
-        # nvidia-smi / an empty watched set while the idle entrypoint still runs.
+        # prunes dead entries. GPU release itself is deferred until stop(),
+        # which runs after teardown (kill processes, then remove the
+        # container / rmtree the chroot jail) has already completed
+        # synchronously -- not tied to an empty watched set here while the
+        # idle entrypoint still runs. There is no agent-facing release tool;
+        # the real GPU semaphore's lifetime is tied to the sandbox's own
+        # lifetime.
         if self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
             self.get_live_pids()
 
@@ -592,21 +587,53 @@ class agsandbox_backend(AgSandboxBackendFields):
     # processes into the wait/GPU-clear path.
     _adopt_unwatched_live_pids: bool = True
 
+    def _has_pending_background_work(self) -> bool:
+        """Cheap fast-path check backing `agSandbox.wait_for_processes()`:
+        is there ANYTHING this sandbox might still need to be waited on for?
+
+        Default: just check `_watched_pids`. For docker/podman, an isolated
+        container's own procfs means `_watched_pids` (with
+        `_adopt_unwatched_live_pids` adopting anything new) accurately
+        reflects everything that could possibly be running there, so an
+        empty `_watched_pids` really does mean nothing to wait for.
+        Overridden by `_ChrootBackend`, whose host-wide /proc means
+        `_watched_pids` can under-count a process spawned after the
+        `exec()` call that started its parent already returned (see its
+        module docstring) -- that override also checks a fresh, live,
+        non-mutating scan rather than trusting `_watched_pids` alone.
+        """
+        return bool(self._watched_pids)
+
     def get_live_pids(self) -> set[int]:
         if not self._watched_pids:
             return set()
 
         # Read pid, ppid, state, and comm name for every entry in /proc,
-        # excluding the monitoring shell itself.
+        # excluding the monitoring shell itself. Pure shell builtins only
+        # (read/parameter-expansion/case) -- NOT awk per entry: forking 3
+        # subprocesses per /proc entry across thousands of entries on a busy
+        # host was confirmed empirically to take 10+ seconds (for chroot,
+        # whose scan spans the whole host -- see chroot.py's module
+        # docstring), long enough for a short-lived tracked process to exit
+        # before the scan even reaches it. Reading /proc/<pid>/status
+        # line-by-line via the `read` builtin is dramatically faster since
+        # nothing forks per entry.
         script = (
             "__SELF=$$\n"
             "for __d in /proc/[0-9]*; do\n"
             '  [ -f "$__d/status" ] || continue\n'
             "  __p=${__d##*/}\n"
             '  [ "$__p" = "$__SELF" ] && continue\n'
-            "  __ppid=$(awk '/^PPid:/{print $2}' $__d/status 2>/dev/null)\n"
-            "  __st=$(awk '/^State:/{print $2}' $__d/status 2>/dev/null)\n"
-            "  __nm=$(awk '/^Name:/{print $2}' $__d/status 2>/dev/null)\n"
+            "  __ppid=''\n"
+            "  __st=''\n"
+            "  __nm=''\n"
+            "  while IFS= read -r __line; do\n"
+            '    case "$__line" in\n'
+            "      PPid:*) set -- ${__line#PPid:}; __ppid=$1 ;;\n"
+            "      State:*) set -- ${__line#State:}; __st=$1 ;;\n"
+            "      Name:*) set -- ${__line#Name:}; __nm=$1 ;;\n"
+            "    esac\n"
+            '  done < "$__d/status"\n'
             '  echo "$__p $__ppid $__st $__nm"\n'
             "done"
         )
@@ -696,6 +723,13 @@ class agsandbox_backend(AgSandboxBackendFields):
     def pid_status_summary(self) -> str:
         live = self.get_live_pids()
         if not live:
+            # get_live_pids() can under-count for some backends (see
+            # _ChrootBackend._has_pending_background_work()'s docstring) --
+            # avoid flatly contradicting a caller (e.g. wait_for_processes())
+            # that already determined via the authoritative check that
+            # something is still running, just not individually listable here.
+            if self._has_pending_background_work():
+                return "background activity detected but not individually trackable right now"
             return "no background processes running"
         now = time.monotonic()
         parts = []
@@ -708,11 +742,10 @@ class agsandbox_backend(AgSandboxBackendFields):
     def release_resources(self, pool: "agResourcePool | None" = None) -> None:
         self._gpu_virtual = False
         if self._gpu_id is not None:
-            is_clear = self._gpu_is_clear
             if pool is not None:
-                pool.release_gpu(self._gpu_id, is_clear=is_clear)
+                pool.release_gpu(self._gpu_id)
             elif self._gpu_release_fn is not None:
-                self._gpu_release_fn(self._gpu_id, is_clear=is_clear)
+                self._gpu_release_fn(self._gpu_id)
             self._gpu_id = None
         if pool is not None and (self._cpu_acquired or self._memory_acquired_mb):
             pool.notify_cpu_released(self._cpu_acquired, self._memory_acquired_mb)

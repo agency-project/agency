@@ -156,6 +156,9 @@ class agterm:
                     _agwebui._active.emitter.log(line)
                     if not _is_error:
                         return  # non-error events go to webui only when it's active
-            except Exception:
-                pass
+            except Exception as _e:
+                # Falls through to the stderr print below regardless.
+                print(
+                    f"[agterm] WARNING: failed to forward log line to webui: {_e}", file=sys.stderr
+                )
             print(line, file=sys.stderr, flush=True)

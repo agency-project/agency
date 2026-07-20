@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -36,7 +37,7 @@ import uuid as _uuid
 from pathlib import Path
 
 from ..agconfig import agConfig
-from ..agresources import detect_gpus, _AgResourcePoolFields
+from ..agresources import amd_render_node_paths_by_pci_bus, detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
 
 # _RUN_ID is never read within this module itself -- it's defined here and
@@ -261,51 +262,111 @@ def seed_cache_from_image(
     )
 
 
-_gpu_flags_cache: "dict[str, list[str]]" = {}
+_gpu_kind_cache: "dict[str, str]" = {}
 _gpu_flags_lock = threading.Lock()
+_amd_render_node_paths_cache: "list[str] | None" = None
+
+# Matches only a per-GPU render node ("renderD128", "renderD129"), never the
+# shared /dev/dri/card* control nodes -- mirrors chroot.py's
+# _NVIDIA_INDEXED_DEV_RE, same rationale.
+_AMD_RENDER_NODE_RE = re.compile(r"^renderD(\d+)$")
 
 
-def _gpu_flags(runtime: str) -> list[str]:
+def _gpu_kind(runtime: str) -> str:
+    """Return "nvidia", "amd", or "none" for *runtime*, cached per runtime
+    for the process lifetime -- the expensive part of GPU flag selection
+    (detect_gpus()/nvidia-smi presence) doesn't depend on which specific
+    GPU a given sandbox leases, so it's cached separately from the
+    per-lease flags themselves (see _gpu_flags())."""
+    if runtime in _gpu_kind_cache:
+        return _gpu_kind_cache[runtime]
+    with _gpu_flags_lock:
+        if runtime not in _gpu_kind_cache:
+            if not detect_gpus():
+                kind = "none"
+            elif shutil.which("nvidia-smi"):
+                kind = "nvidia"
+            else:
+                kind = "amd"
+            _gpu_kind_cache[runtime] = kind
+        return _gpu_kind_cache[runtime]
+
+
+def _amd_render_node_paths() -> "list[str]":
+    """Host /dev/dri/renderD* paths ordered so index N is the render node
+    for rocm-smi's GPU N, cached for the process lifetime -- mirrors
+    chroot.py's AMD branch of _chroot_gpu_dev_paths() so both backends
+    enumerate GPUs the same way.
+
+    Ordered via amd_render_node_paths_by_pci_bus() (matches each GPU's
+    rocm-smi PCI bus against its render node's own resolved PCI bus),
+    falling back to naive sorted order only if that mapping can't be built
+    (e.g. rocm-smi --showbus unavailable) -- confirmed on real 8x MI350X
+    hardware that sorted order does NOT correspond to GPU index (see
+    agresources.amd_render_node_paths_by_pci_bus's docstring)."""
+    global _amd_render_node_paths_cache
+    if _amd_render_node_paths_cache is not None:
+        return _amd_render_node_paths_cache
+    with _gpu_flags_lock:
+        if _amd_render_node_paths_cache is None:
+            dri = Path("/dev/dri")
+            naive = (
+                sorted(str(p) for p in dri.iterdir() if _AMD_RENDER_NODE_RE.match(p.name))
+                if dri.is_dir()
+                else []
+            )
+            resolved = amd_render_node_paths_by_pci_bus(naive) if naive else None
+            _amd_render_node_paths_cache = resolved if resolved is not None else naive
+        return _amd_render_node_paths_cache
+
+
+def _gpu_flags(runtime: str, gpu_id: "int | None") -> list[str]:
     """Return GPU passthrough flags for *runtime* ("docker" or "podman"),
-    cached per runtime for the process lifetime.
+    scoped to the single *gpu_id* leased to this sandbox -- mirrors
+    chroot.py's _chroot_gpu_dev_paths(gpu_id): a sandbox that hasn't leased a
+    GPU (gpu_id is None) gets zero GPU devices, and one that has leased a
+    GPU only gets that one device exposed, not every GPU on the host. This
+    is the hardware-level half of GPU isolation; CUDA_VISIBLE_DEVICES /
+    HIP_VISIBLE_DEVICES (set in base.py's exec()) is the software half --
+    without this, a process could bypass the env var by opening another
+    GPU's device node directly, since it was mounted into the container
+    regardless of which GPU was actually leased.
 
     NVIDIA:
-      - Docker: ``--gpus all`` (nvidia-container-toolkit's Docker-specific
+      - Docker: ``--gpus device=N`` (nvidia-container-toolkit's Docker-specific
         CLI wrapper hook).
-      - Podman: ``--device nvidia.com/gpu=all`` (CDI). Podman does not
+      - Podman: ``--device nvidia.com/gpu=N`` (CDI). Podman does not
         understand Docker's ``--gpus`` flag: it accepts it silently (no
         error) but never mounts the NVIDIA driver/devices, so a container
         started that way has zero GPU access despite `podman run` appearing
         to succeed -- `nvidia-smi` inside prints "WARNING: The NVIDIA Driver
         was not detected" and isn't even on PATH. This mirrors the identical
         fix applied to images/build.sh's own smoke tests.
-    AMD:    ``--device /dev/kfd --device /dev/dri`` (ROCm device files,
-            identical for both runtimes).
-    CPU-only hosts get no flags so they keep working without GPU drivers.
-
-    GPU presence is delegated to agresources.detect_gpus() — the same probe
-    the process-wide agResourcePool singleton uses — instead of running an
-    independent nvidia-smi/rocm-smi subprocess here. Every sandbox backend
-    construction used to pay its own full subprocess round-trip just to pick
-    a CLI flag; on a busy shared GPU host that adds up to real contention.
-    Caching the result (rather than only reusing detect_gpus()'s logic)
-    means this now runs at most once per process per runtime regardless of
-    how many sandboxes get created.
+    AMD:    ``--device /dev/kfd`` (shared control device, every AMD GPU needs
+            it regardless of index) plus the one ``/dev/dri/renderD*`` node
+            matching *gpu_id*, ordered by PCI bus to line up with rocm-smi's
+            own GPU numbering (see _amd_render_node_paths() and
+            agresources.amd_render_node_paths_by_pci_bus() -- confirmed on
+            real 8x MI350X hardware that naive sorted /dev/dri order does
+            NOT correspond to GPU index).
+    CPU-only hosts, and sandboxes that haven't leased a GPU, get no flags.
     """
-    if runtime in _gpu_flags_cache:
-        return _gpu_flags_cache[runtime]
-    with _gpu_flags_lock:
-        if runtime not in _gpu_flags_cache:
-            if not detect_gpus():
-                flags = []
-            elif shutil.which("nvidia-smi"):
-                flags = (
-                    ["--device", "nvidia.com/gpu=all"] if runtime == "podman" else ["--gpus", "all"]
-                )
-            else:
-                flags = ["--device", "/dev/kfd", "--device", "/dev/dri"]
-            _gpu_flags_cache[runtime] = flags
-        return _gpu_flags_cache[runtime]
+    if gpu_id is None:
+        return []
+    kind = _gpu_kind(runtime)
+    if kind == "none":
+        return []
+    if kind == "nvidia":
+        return (
+            ["--device", f"nvidia.com/gpu={gpu_id}"]
+            if runtime == "podman"
+            else ["--gpus", f"device={gpu_id}"]
+        )
+    render_nodes = _amd_render_node_paths()
+    flags = ["--device", "/dev/kfd"]
+    if gpu_id < len(render_nodes):
+        flags += ["--device", render_nodes[gpu_id]]
+    return flags
 
 
 # Hard cap on the number of simultaneously running containers (docker and
@@ -488,14 +549,15 @@ class _ContainerBackendBase(agsandbox_backend):
         self._cpu_acquired: float = 0.0
         self._memory_acquired_mb: int = 0
         self._watched_pids: dict[int, float] = {}
-        self._baseline_pids: set[int] = set()
+        # None means "not captured yet" -- distinct from a legitimately empty
+        # baseline. See _ensure_started()'s docstring for why this must be
+        # captured exactly once and never recomputed on a later call.
+        self._baseline_pids: "set[int] | None" = None
         self._daemon_pids: set[int] = set()
-        self._started = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
         self._agconfig = agconfig
         self._name = name
-        self._gpu_flags = _gpu_flags(self._runtime)
         self._base_image = base_image
         self._vol_flags: list[str] = []
         for host, container, mode in mounts.values():
@@ -556,12 +618,6 @@ class _ContainerBackendBase(agsandbox_backend):
                 pids.add(int(line))
         return pids
 
-    def _gpu_is_clear(self) -> bool:
-        """True once this sandbox's container is no longer running — same
-        condition as container exit. release_gpu() waits on this instead of
-        polling nvidia-smi/rocm-smi."""
-        return not self._container_running()
-
     def _ensure_started(self) -> None:
         """Start the Docker/Podman container on first use.
 
@@ -575,21 +631,45 @@ class _ContainerBackendBase(agsandbox_backend):
           - running  → reuse (worker-reuse path, does NOT acquire the runtime slot)
           - absent   → docker/podman run (acquires the runtime slot)
         Any leftover container in another state is force-removed first.
+
+        Ground truth is always _container_running() -- there is no
+        self._started cache. Every call pays a real docker/podman inspect,
+        but that's the price of never trusting a per-process flag that a
+        different worker-process copy of this backend could have made stale.
+
+        _baseline_pids is captured exactly once (None means "not yet") and
+        never refreshed after that, even though this method itself now runs
+        on every single call (the "reuse" branch below fires on every call
+        once the container exists). Recomputing it every time would make it
+        track "whatever's running right now" instead of "what was already
+        running before this sandbox's own tracked work started" -- silently
+        reclassifying a still-running tracked background process as baseline
+        noise the moment any later call (e.g. get_live_pids() itself) happens
+        to re-enter here.
         """
-        if self._started:
-            return
         name = self._name
         if self._container_running():
             # Reuse an already-running container — it already holds whatever
             # slot _acquire_runtime_slot() would take, so we must NOT acquire
             # it again here.
-            self._started = True
-            self._baseline_pids = self._snapshot_pids()
+            if self._baseline_pids is None:
+                self._baseline_pids = self._snapshot_pids_started()
             return
         # Remove any leftover container in a non-running state (created,
         # exited, dead, …) that stop() failed to clean up.
         if self._container_status():
             self._rm_container(name)
+        # Acquire the physical GPU (if reserve_gpu was called) before the
+        # container is created, not just in exec() -- the container's GPU
+        # device flags are fixed at `docker/podman run` time, and this method
+        # can be reached first via read_file()/write_file() rather than
+        # exec(), so exec()'s own lazy acquire (base.py) can't be relied on
+        # to have already run. Guarded by `self._gpu_id is None` the same way
+        # exec()'s does, so whichever entry point gets here first acquires it
+        # exactly once.
+        if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
+            self._gpu_id = self._gpu_acquire_fn()
+        gpu_flags = _gpu_flags(self._runtime, self._gpu_id)
         self._acquire_runtime_slot()
         try:
             if self._checkpoint_image is not None:
@@ -599,7 +679,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
-                    + self._gpu_flags
+                    + gpu_flags
                     + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
                 )
@@ -617,7 +697,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
                     + limit_flags
-                    + self._gpu_flags
+                    + gpu_flags
                     + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
                 )
@@ -630,14 +710,35 @@ class _ContainerBackendBase(agsandbox_backend):
             # Another process started the container while we were retrying;
             # that process owns the slot — release ours.
             self._release_runtime_slot()
-            self._started = True
-            self._baseline_pids = self._snapshot_pids()
+            if self._baseline_pids is None:
+                self._baseline_pids = self._snapshot_pids_started()
             return
         except Exception:
             self._release_runtime_slot()
             raise
-        self._started = True  # set before _snapshot_pids() to prevent re-entry via _container_exec
-        self._baseline_pids = self._snapshot_pids()
+        if self._baseline_pids is None:
+            self._baseline_pids = self._snapshot_pids_started()
+
+    def _snapshot_pids_started(self) -> set[int]:
+        """Same PID listing as base._snapshot_pids(), routed through
+        _container_exec_started() instead of _container_exec() -- see that
+        method's docstring for why this is required here."""
+        out, _ = self._container_exec_started(
+            "__SELF=$$\n"
+            "for __d in /proc/[0-9]*; do\n"
+            '  [ -f "$__d/status" ] || continue\n'
+            "  __p=${__d##*/}\n"
+            '  [ "$__p" != "$__SELF" ] && echo "$__p"\n'
+            "done",
+            timeout=self.inspect_timeout_s,
+            shell="sh",
+        )
+        pids: set[int] = set()
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+        return pids
 
     def _run_with_conflict_retry(self, run_cmd: list[str], name: str) -> None:
         """Run a docker/podman run command, retrying on name-conflict/quota
@@ -784,6 +885,25 @@ class _ContainerBackendBase(agsandbox_backend):
     ) -> tuple[str, int]:
         """Run a raw shell command inside the container."""
         self._ensure_started()
+        return self._container_exec_started(
+            sh_cmd, workdir=workdir, timeout=timeout, stdin=stdin, shell=shell
+        )
+
+    def _container_exec_started(
+        self,
+        sh_cmd: str,
+        workdir: str = "/workspace",
+        timeout: int = AgSandboxBackendFields.DEFAULT_EXEC_TIMEOUT_S,
+        stdin: bytes | None = None,
+        shell: str = "bash",
+    ) -> tuple[str, int]:
+        """Same as _container_exec() but skips _ensure_started() -- only for
+        use by _ensure_started() itself (via _snapshot_pids_started()) while
+        it establishes the baseline PID snapshot on a container it has
+        already just confirmed or just created. Going through the public
+        _container_exec() there would call _ensure_started() again and
+        recurse without end, since there is no self._started flag to
+        short-circuit that re-entry."""
         args = [self._runtime, "exec"]
         if stdin is not None:
             args.append("-i")
@@ -804,7 +924,7 @@ class _ContainerBackendBase(agsandbox_backend):
         memory: str | None = None,
     ) -> None:
         """Live-update container CPU/memory limits."""
-        if not self._started:
+        if not self._container_running():
             return
         cmd = [self._runtime, "update"]
         if cpus is not None and self._cfs_supported():
@@ -821,13 +941,10 @@ class _ContainerBackendBase(agsandbox_backend):
 
         Returns True if the commit succeeded, False if the container doesn't
         exist.  Works on both running and stopped containers (docker commit
-        does not require the container to be running).  Also handles the case
-        where the container was started by a worker process and ``_started``
-        is still False in the main process.
+        does not require the container to be running).
         """
-        if not self._started:
-            if not self._container_running():
-                return False
+        if not self._container_running():
+            return False
         self._run(
             [self._runtime, "commit", self._container_name(), tag],
             check=True,
@@ -846,22 +963,26 @@ class _ContainerBackendBase(agsandbox_backend):
         gpu_id_to_release = (
             self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
         )
-        if not self._started:
-            # Worker-process scenario: _started is False in the calling process
-            # even though a worker may have started the container.
-            if not self._container_running():
-                if gpu_id_to_release is not None and self._gpu_release_fn is not None:
-                    self._gpu_release_fn(gpu_id_to_release, is_clear=self._gpu_is_clear)
-                    self._gpu_id = None
-                return
+        if not self._container_running():
+            if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+                self._gpu_release_fn(gpu_id_to_release)
+                self._gpu_id = None
+            return
         # Clear PID tracking — remove kills all processes.
         self._watched_pids = {}
-        self._baseline_pids = set()
+        self._baseline_pids = None  # force a fresh capture on the next _ensure_started()
+        # commit_exc is raised at the end, after rm and the release checks
+        # below still run -- a failed commit doesn't mean the container
+        # shouldn't still be torn down and its resources still released,
+        # it just means this attempt's state wasn't checkpointed forward.
+        commit_exc: Exception | None = None
         if commit:
             tag = self._lifecycle_tag()
             # Capture the current image ID before overwriting the tag so we
             # can delete it afterward — committing to an existing tag leaves
-            # the old image dangling (untagged but still on disk).
+            # the old image dangling (untagged but still on disk). Best
+            # effort: a stray dangling image costs disk space, not
+            # correctness, so this warns rather than aborting stop() over it.
             old_image_id: str | None = None
             try:
                 result = self._run(
@@ -885,21 +1006,16 @@ class _ContainerBackendBase(agsandbox_backend):
                         timeout=self.commit_timeout_s,
                     )
                     self._checkpoint_image = tag
+                    commit_exc = None
                     break
                 except Exception as _e:
-                    if _attempt == self.commit_retry_attempts - 1:
-                        print(
-                            f"[agsandbox_backend] WARNING: {self._runtime} commit {self._container_name()} → {tag} "
-                            f"failed after {self.commit_retry_attempts} attempts: {_e}",
-                            file=__import__("sys").stderr,
-                            flush=True,
-                        )
-                    else:
+                    commit_exc = _e
+                    if _attempt != self.commit_retry_attempts - 1:
                         time.sleep(self.commit_retry_backoff_s)
             # Delete the previous image now that the tag points to the new one.
             # Only delete if no containers are currently using it — a fork may still
             # be running from the same image.  The fork's own stop() will delete it
-            # once its container is gone.
+            # once its container is gone. Best-effort, same reasoning as above.
             if old_image_id and self._checkpoint_image == tag:
                 try:
                     in_use = self._run(
@@ -926,21 +1042,19 @@ class _ContainerBackendBase(agsandbox_backend):
                         flush=True,
                     )
         name = self._container_name()
+        # rm_exc, like commit_exc, is raised at the end rather than
+        # immediately -- but unlike commit_exc, its failure also gates the
+        # release checks below: an unconfirmed removal means the container
+        # (and whatever it holds) is not known to be gone.
+        rm_exc: Exception | None = None
         for _attempt in range(self.rm_retry_attempts):
             try:
                 self._rm_container(name)
+                rm_exc = None
                 break
-            except Exception:
-                if _attempt == self.rm_retry_attempts - 1:
-                    import traceback as _tb
-
-                    print(
-                        f"[agsandbox_backend] WARNING: {self._runtime} rm -f {name} failed after {self.rm_retry_attempts} attempts:\n"
-                        f"{_tb.format_exc()}",
-                        file=__import__("sys").stderr,
-                        flush=True,
-                    )
-                else:
+            except Exception as _e:
+                rm_exc = _e
+                if _attempt != self.rm_retry_attempts - 1:
                     time.sleep(self.rm_retry_backoff_s)
         # Only release the runtime slot once the container is actually
         # confirmed gone -- if every rm -f attempt failed, the container (and
@@ -950,13 +1064,24 @@ class _ContainerBackendBase(agsandbox_backend):
         # removal genuinely succeeds.
         if not self._container_running():
             self._release_runtime_slot()
-        self._started = False
-        # Free the GPU only after the container is gone (is_clear == container
-        # exit). Releasing earlier raced with live exec/harness work still
-        # holding CUDA contexts inside the container.
-        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
-            self._gpu_release_fn(gpu_id_to_release, is_clear=self._gpu_is_clear)
+        # Free the GPU only once the container is confirmed gone -- same
+        # ground-truth gate as the runtime slot above; releasing while rm
+        # failed and the container might still be running would let
+        # something else acquire the same physical GPU concurrently.
+        if (
+            gpu_id_to_release is not None
+            and self._gpu_release_fn is not None
+            and not self._container_running()
+        ):
+            self._gpu_release_fn(gpu_id_to_release)
             self._gpu_id = None
+        # Surface whichever failure is more severe: an unconfirmed removal
+        # means real resources may still be held, which matters more than a
+        # missed checkpoint.
+        if rm_exc is not None:
+            raise rm_exc
+        if commit_exc is not None:
+            raise commit_exc
 
     def restore(self, tag: str) -> None:
         """Restore the sandbox to a previously committed image snapshot.
@@ -965,7 +1090,7 @@ class _ContainerBackendBase(agsandbox_backend):
         from *tag*.  The image is kept so it can be reused on subsequent
         failures during the same skill run.
         """
-        if self._started:
+        if self._container_running():
             if self._watched_pids:
                 pids = " ".join(str(p) for p in self._watched_pids)
                 try:
@@ -979,9 +1104,8 @@ class _ContainerBackendBase(agsandbox_backend):
                         f"[agsandbox_backend] WARNING: failed to kill PIDs {pids} in {self._name} during restore: {_e}"
                     )
             self._rm_container(self._container_name())
-            self._started = False
             self._watched_pids = {}
-            self._baseline_pids = set()
+            self._baseline_pids = None  # force a fresh capture in _ensure_started() below
         self._checkpoint_image = tag
         self._ensure_started()
 
@@ -989,13 +1113,28 @@ class _ContainerBackendBase(agsandbox_backend):
         if self._destroyed:
             return
         self._destroyed = True
-        # _started is only set to True in the process that called _ensure_started.
-        # When tools run in worker processes the main process always has
-        # _started=False, even though a container may be running.  Always attempt
-        # cleanup — docker rm -f is a no-op when the container doesn't exist.
+        # Always attempt cleanup below -- docker rm -f is a no-op when the
+        # container doesn't exist, and _container_running() is ground truth
+        # regardless of which process (this one or a worker) actually
+        # started the container.
         container_name = self._container_name()
+        # Release the GPU here too -- destroy() is called from atexit/__del__
+        # (see agsandbox.py) on sandboxes that may never have gone through a
+        # normal stop() first, so this can't assume stop() already handled it.
+        # Not delegated to stop(): stop()'s rm retry loop raises immediately
+        # on failure, but destroy() must still attempt every remaining
+        # cleanup step (GPU release check, image cleanup) before surfacing
+        # that failure, rather than aborting partway through.
+        gpu_id_to_release = (
+            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
+        )
 
-        if self._started and self._watched_pids:
+        # Best-effort courtesy signal before rm -f forces the issue --
+        # rm -f kills everything inside the container regardless of whether
+        # this succeeds, so a failure here doesn't change what actually
+        # happens, only whether tracked processes got a chance to react
+        # first. Warn, don't raise: nothing depends on this succeeding.
+        if self._watched_pids:
             pids = " ".join(str(p) for p in self._watched_pids)
             try:
                 self._container_exec(
@@ -1007,11 +1146,18 @@ class _ContainerBackendBase(agsandbox_backend):
                 )
 
         # Check before rm so we know whether a runtime slot must be released.
-        had_container = bool(self._started or self._container_running())
+        had_container = self._container_running()
 
+        # rm_exc is raised at the end, after every remaining cleanup step
+        # below has still been attempted -- an unconfirmed removal must
+        # reach the caller, but shouldn't cut short the GPU-release check or
+        # the best-effort image cleanup that don't depend on it.
+        rm_exc: Exception | None = None
         try:
             if self._container_status():
                 self._rm_container(container_name)
+        except Exception as _e:
+            rm_exc = _e
         finally:
             # Only release if the container is actually confirmed gone now --
             # if had_container was True because a prior stop() already
@@ -1022,8 +1168,21 @@ class _ContainerBackendBase(agsandbox_backend):
             if had_container and not self._container_running():
                 self._release_runtime_slot()
 
-        # Remove the checkpoint image and all pre-tool snapshots created during
-        # this sandbox's lifetime.
+        # Same ground-truth gate as the runtime slot above -- releasing the
+        # GPU while rm failed and the container might still be running would
+        # let something else acquire the same physical GPU concurrently.
+        if (
+            gpu_id_to_release is not None
+            and self._gpu_release_fn is not None
+            and not self._container_running()
+        ):
+            self._gpu_release_fn(gpu_id_to_release)
+            self._gpu_id = None
+
+        # Remove the checkpoint image and all pre-tool snapshots created
+        # during this sandbox's lifetime. Best-effort: a stray dangling
+        # image costs disk space, not correctness, so these warn rather
+        # than raising.
         if self._checkpoint_image:
             try:
                 self._rmi(self._checkpoint_image, force=True)
@@ -1046,6 +1205,9 @@ class _ContainerBackendBase(agsandbox_backend):
             print(
                 f"[agsandbox_backend] WARNING: pretool image cleanup failed for {container_name}: {_e}"
             )
+
+        if rm_exc is not None:
+            raise rm_exc
 
     def _lifecycle_tag(self) -> str:
         return f"agency/lifecycle-{self._name}".lower()
