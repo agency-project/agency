@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import threading
 import time
@@ -220,6 +221,88 @@ def detect_gpus() -> list[int]:
         # Expected on any host without an AMD driver/rocm-smi installed.
         print(f"[agresources] rocm-smi probe failed, no GPUs detected: {_e}")
     return []
+
+
+# Matches the trailing PCI bus address segment of a resolved sysfs device
+# path (e.g. ".../0000:75:00.0" -> "0000:75:00.0").
+_PCI_BUS_RE = re.compile(r"([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$")
+
+
+def _amd_render_node_pci_bus(name: str) -> "str | None":
+    """Resolve the real PCI bus address (e.g. "0000:75:00.0") backing a
+    /dev/dri render node by name (e.g. "renderD128"), by following
+    /sys/class/drm/<name>/device. Returns None for XCD/compute-partition
+    sibling nodes: MI300/MI350-class GPUs expose one render node per
+    accelerator-complex-die under a "amdgpu_xcp_N" platform device even
+    while the GPU itself is in unpartitioned (SPX) mode, and only the one
+    node with a real PCI parent maps 1:1 to a physical GPU."""
+    target = os.path.realpath(f"/sys/class/drm/{name}/device")
+    match = _PCI_BUS_RE.search(target)
+    return match.group(1).lower() if match else None
+
+
+def amd_render_node_paths_by_pci_bus(candidates: "list[str]") -> "list[str] | None":
+    """Reorder *candidates* (absolute /dev/dri/renderD* paths) so index N is
+    the render node for rocm-smi's GPU N, by cross-referencing `rocm-smi
+    --showbus` (GPU index -> PCI bus) against each candidate's own resolved
+    PCI bus -- NOT by assuming sorted order already matches GPU index.
+
+    Confirmed necessary on real 8x MI350X hardware: each GPU there exposes
+    itself plus 7 XCD/compute-partition sibling render nodes (64 nodes total
+    for 8 GPUs), and even the primary node's number doesn't sort in the same
+    order as rocm-smi's GPU index -- e.g. GPU 3's real node was the
+    numerically LOWEST of the 64 present, not the 4th. Naively picking
+    sorted-index N (the old behavior) scoped several GPU IDs to nodes
+    belonging to a different physical GPU entirely.
+
+    Returns None (caller should fall back to naive sorted order) if
+    `rocm-smi --showbus` fails/is unavailable, or any GPU's bus can't be
+    matched to exactly one candidate -- a partial mapping is never applied,
+    since trusting it for some GPUs and not others would be worse than the
+    naive fallback it's meant to replace.
+    """
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showbus", "--csv"],
+            capture_output=True,
+            text=True,
+            timeout=_AgResourcePoolFields().gpu_detect_timeout_s,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+
+    bus_by_gpu_id: "dict[int, str]" = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("device"):
+            continue
+        parts = [c.strip() for c in line.split(",")]
+        if len(parts) < 2 or not parts[0].lower().startswith("card"):
+            continue
+        try:
+            gpu_id = int(parts[0][4:])
+        except ValueError:
+            continue
+        bus_by_gpu_id[gpu_id] = parts[1].lower()
+    if not bus_by_gpu_id:
+        return None
+
+    render_by_bus: "dict[str, str]" = {}
+    for path in candidates:
+        bus = _amd_render_node_pci_bus(os.path.basename(path))
+        if bus is not None:
+            render_by_bus.setdefault(bus, path)
+
+    ordered = []
+    for gpu_id in range(max(bus_by_gpu_id) + 1):
+        bus = bus_by_gpu_id.get(gpu_id)
+        path = render_by_bus.get(bus) if bus is not None else None
+        if path is None:
+            return None
+        ordered.append(path)
+    return ordered
 
 
 def detect_cpus() -> int:

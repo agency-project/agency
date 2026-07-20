@@ -7,7 +7,9 @@ agency.agsandbox_backends.chroot.chroot_available())."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 import time
 import uuid
 
@@ -541,18 +543,49 @@ class TestChrootGpuDevPaths:
         assert paths == ["/dev/nvidiactl", "/dev/nvidia-uvm"]
 
     def test_amd_control_device_plus_single_render_node(self):
+        """amd_render_node_paths_by_pci_bus() is explicitly forced to None
+        here (no rocm-smi/real sysfs in this test), which exercises the
+        naive-sorted-order FALLBACK path specifically -- see
+        test_amd_uses_pci_bus_ordering_when_available below for the mapping
+        actually being applied, and TestChrootAmdRenderNodeLiveHardware for
+        the real-hardware check that found sorted order alone is wrong on a
+        multi-GPU AMD host."""
         all_paths = ["/dev/kfd", "/dev/dri/card0", "/dev/dri/renderD128", "/dev/dri/renderD129"]
         with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
             with patch.object(_chroot_mod.shutil, "which", return_value=None):
-                paths = _chroot_gpu_dev_paths(1)
+                with patch.object(
+                    _chroot_mod, "amd_render_node_paths_by_pci_bus", return_value=None
+                ):
+                    paths = _chroot_gpu_dev_paths(1)
         assert paths == ["/dev/kfd", "/dev/dri/renderD129"]
 
     def test_amd_gpu_id_out_of_range_returns_only_control_device(self):
         all_paths = ["/dev/kfd", "/dev/dri/renderD128"]
         with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
             with patch.object(_chroot_mod.shutil, "which", return_value=None):
-                paths = _chroot_gpu_dev_paths(5)
+                with patch.object(
+                    _chroot_mod, "amd_render_node_paths_by_pci_bus", return_value=None
+                ):
+                    paths = _chroot_gpu_dev_paths(5)
         assert paths == ["/dev/kfd"]
+
+    def test_amd_uses_pci_bus_ordering_when_available(self):
+        """When amd_render_node_paths_by_pci_bus() successfully builds a
+        mapping, _chroot_gpu_dev_paths() must use ITS ordering, not naive
+        sorted /dev/dri order -- this is the actual fix: on real 8x MI350X
+        hardware the two disagree for every GPU (see agresources.py's
+        amd_render_node_paths_by_pci_bus docstring)."""
+        all_paths = ["/dev/kfd", "/dev/dri/renderD128", "/dev/dri/renderD129"]
+        pci_ordered = ["/dev/dri/renderD129", "/dev/dri/renderD128"]  # reversed
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
+            with patch.object(_chroot_mod.shutil, "which", return_value=None):
+                with patch.object(
+                    _chroot_mod, "amd_render_node_paths_by_pci_bus", return_value=pci_ordered
+                ):
+                    paths_0 = _chroot_gpu_dev_paths(0)
+                    paths_1 = _chroot_gpu_dev_paths(1)
+        assert paths_0 == ["/dev/kfd", "/dev/dri/renderD129"]
+        assert paths_1 == ["/dev/kfd", "/dev/dri/renderD128"]
 
 
 class TestChrootSetupLinesGpuScoping:
@@ -583,6 +616,86 @@ class TestChrootSetupLinesGpuScoping:
         assert "nvidia" not in joined
         assert "renderD" not in joined
         assert "kfd" not in joined
+
+
+def _host_rocm_available() -> bool:
+    try:
+        return (
+            subprocess.run(["rocm-smi", "--showid"], capture_output=True, timeout=10).returncode
+            == 0
+        )
+    except Exception:
+        return False
+
+
+rocm_hardware = pytest.mark.skipif(
+    not _host_rocm_available(), reason="No real ROCm/AMD GPU hardware available"
+)
+
+
+class TestChrootAmdRenderNodeLiveHardware:
+    """Runs the real (unmocked) AMD GPU-to-render-node scoping against
+    actual ROCm hardware -- no mocks anywhere. Skipped automatically without
+    a real rocm-smi + AMD GPU(s). Mirrors
+    test_container.py's TestAmdRenderNodeLiveHardware.
+
+    This is the check that actually caught the bug being regression-tested
+    here: on an 8x MI350X host, naive sorted /dev/dri/renderD* order did
+    NOT correspond to rocm-smi's GPU index for ANY of the 8 GPUs (each GPU
+    there exposes itself plus 7 XCD/compute-partition sibling render nodes
+    -- 64 nodes total -- and even the primary node's number doesn't sort in
+    GPU-index order). This test independently recomputes the "ground truth"
+    GPU-to-render-node mapping from rocm-smi --showbus and
+    /sys/class/drm/*/device -- without going through
+    amd_render_node_paths_by_pci_bus itself -- and asserts the real
+    _chroot_gpu_dev_paths() output agrees with it for every real GPU on
+    this host.
+    """
+
+    _PCI_BUS_RE = re.compile(r"([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$")
+
+    def _ground_truth_bus_by_gpu_id(self) -> "dict[int, str]":
+        result = subprocess.run(
+            ["rocm-smi", "--showbus", "--csv"], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0, f"rocm-smi --showbus failed: {result.stderr!r}"
+        mapping = {}
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith("device"):
+                continue
+            card, bus = (c.strip() for c in line.split(",")[:2])
+            mapping[int(card[4:])] = bus.lower()
+        return mapping
+
+    def _real_render_node_bus(self, path: str) -> "str | None":
+        name = os.path.basename(path)
+        target = os.path.realpath(f"/sys/class/drm/{name}/device")
+        match = self._PCI_BUS_RE.search(target)
+        return match.group(1) if match else None
+
+    @rocm_hardware
+    def test_chroot_gpu_dev_paths_match_gpu_pci_bus_on_real_hardware(self):
+        _chroot_mod._gpu_dev_paths_cache = None
+        bus_by_gpu_id = self._ground_truth_bus_by_gpu_id()
+        assert bus_by_gpu_id, "expected at least one real AMD GPU"
+
+        seen_devices = set()
+        for gpu_id, expected_bus in bus_by_gpu_id.items():
+            paths = _chroot_gpu_dev_paths(gpu_id)
+            assert paths and os.path.basename(paths[0]) == "kfd"
+            assert len(paths) == 2, f"expected a scoped render node for gpu_id={gpu_id}: {paths}"
+            render_path = paths[1]
+            actual_bus = self._real_render_node_bus(render_path)
+            assert actual_bus == expected_bus, (
+                f"gpu_id={gpu_id}: _chroot_gpu_dev_paths() picked {render_path} "
+                f"(bus={actual_bus}), but rocm-smi says GPU {gpu_id} is actually "
+                f"on bus {expected_bus}"
+            )
+            assert render_path not in seen_devices, (
+                f"gpu_id={gpu_id} was scoped to {render_path}, already used by another gpu_id"
+            )
+            seen_devices.add(render_path)
 
 
 # ---------------------------------------------------------------------------

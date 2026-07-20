@@ -37,7 +37,7 @@ import uuid as _uuid
 from pathlib import Path
 
 from ..agconfig import agConfig
-from ..agresources import detect_gpus, _AgResourcePoolFields
+from ..agresources import amd_render_node_paths_by_pci_bus, detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
 
 # _RUN_ID is never read within this module itself -- it's defined here and
@@ -293,20 +293,30 @@ def _gpu_kind(runtime: str) -> str:
 
 
 def _amd_render_node_paths() -> "list[str]":
-    """Sorted host /dev/dri/renderD* paths, one per AMD GPU, cached for the
-    process lifetime -- mirrors chroot.py's _all_chroot_gpu_dev_paths() AMD
-    branch so both backends enumerate GPUs in the same order."""
+    """Host /dev/dri/renderD* paths ordered so index N is the render node
+    for rocm-smi's GPU N, cached for the process lifetime -- mirrors
+    chroot.py's AMD branch of _chroot_gpu_dev_paths() so both backends
+    enumerate GPUs the same way.
+
+    Ordered via amd_render_node_paths_by_pci_bus() (matches each GPU's
+    rocm-smi PCI bus against its render node's own resolved PCI bus),
+    falling back to naive sorted order only if that mapping can't be built
+    (e.g. rocm-smi --showbus unavailable) -- confirmed on real 8x MI350X
+    hardware that sorted order does NOT correspond to GPU index (see
+    agresources.amd_render_node_paths_by_pci_bus's docstring)."""
     global _amd_render_node_paths_cache
     if _amd_render_node_paths_cache is not None:
         return _amd_render_node_paths_cache
     with _gpu_flags_lock:
         if _amd_render_node_paths_cache is None:
             dri = Path("/dev/dri")
-            _amd_render_node_paths_cache = (
+            naive = (
                 sorted(str(p) for p in dri.iterdir() if _AMD_RENDER_NODE_RE.match(p.name))
                 if dri.is_dir()
                 else []
             )
+            resolved = amd_render_node_paths_by_pci_bus(naive) if naive else None
+            _amd_render_node_paths_cache = resolved if resolved is not None else naive
         return _amd_render_node_paths_cache
 
 
@@ -334,9 +344,11 @@ def _gpu_flags(runtime: str, gpu_id: "int | None") -> list[str]:
         fix applied to images/build.sh's own smoke tests.
     AMD:    ``--device /dev/kfd`` (shared control device, every AMD GPU needs
             it regardless of index) plus the one ``/dev/dri/renderD*`` node
-            matching *gpu_id* (host enumeration order; untested against real
-            AMD/ROCm hardware -- see chroot.py's module docstring for the
-            identical caveat on its own AMD branch).
+            matching *gpu_id*, ordered by PCI bus to line up with rocm-smi's
+            own GPU numbering (see _amd_render_node_paths() and
+            agresources.amd_render_node_paths_by_pci_bus() -- confirmed on
+            real 8x MI350X hardware that naive sorted /dev/dri order does
+            NOT correspond to GPU index).
     CPU-only hosts, and sandboxes that haven't leased a GPU, get no flags.
     """
     if gpu_id is None:

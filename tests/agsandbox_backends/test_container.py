@@ -32,6 +32,7 @@ container on both runtimes."""
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -690,8 +691,14 @@ class TestGpuFlagsPerRuntime:
 
     def test_rocm_flags_scope_to_leased_render_node(self, tmp_path):
         """AMD: /dev/kfd (shared control device) plus only the one renderD*
-        node matching gpu_id, by sorted host order -- never every render
-        node, and never the other GPU's node."""
+        node matching gpu_id -- never every render node, and never the
+        other GPU's node. amd_render_node_paths_by_pci_bus() is explicitly
+        forced to None here (no rocm-smi/real sysfs in this test), which
+        exercises the naive-sorted-order FALLBACK path specifically -- see
+        test_pci_bus_ordering_used_when_available below for the mapping
+        actually being applied, and TestAmdRenderNodeLiveHardware for the
+        real-hardware check that found sorted order alone is wrong on a
+        multi-GPU AMD host."""
         dri = tmp_path / "dri"
         dri.mkdir()
         (dri / "renderD128").touch()
@@ -700,10 +707,13 @@ class TestGpuFlagsPerRuntime:
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
             with patch.object(_container.shutil, "which", return_value=None):
                 with patch.object(
-                    _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
+                    _container, "amd_render_node_paths_by_pci_bus", return_value=None
                 ):
-                    flags_0 = _container._gpu_flags("docker", 0)
-                    flags_1 = _container._gpu_flags("podman", 1)
+                    with patch.object(
+                        _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
+                    ):
+                        flags_0 = _container._gpu_flags("docker", 0)
+                        flags_1 = _container._gpu_flags("podman", 1)
         assert flags_0 == ["--device", "/dev/kfd", "--device", str(dri / "renderD128")]
         assert flags_1 == ["--device", "/dev/kfd", "--device", str(dri / "renderD129")]
         # Identical for both runtimes (only the NVIDIA branch differs by runtime).
@@ -716,10 +726,37 @@ class TestGpuFlagsPerRuntime:
         with patch.object(_container, "detect_gpus", return_value=[0]):
             with patch.object(_container.shutil, "which", return_value=None):
                 with patch.object(
-                    _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
+                    _container, "amd_render_node_paths_by_pci_bus", return_value=None
                 ):
-                    flags = _container._gpu_flags("docker", 5)
+                    with patch.object(
+                        _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
+                    ):
+                        flags = _container._gpu_flags("docker", 5)
         assert flags == ["--device", "/dev/kfd"]
+
+    def test_rocm_flags_use_pci_bus_ordering_when_available(self, tmp_path):
+        """When amd_render_node_paths_by_pci_bus() successfully builds a
+        mapping, _gpu_flags() must use ITS ordering, not naive sorted
+        /dev/dri order -- this is the actual fix: on real 8x MI350X
+        hardware the two disagree for every GPU (see agresources.py's
+        amd_render_node_paths_by_pci_bus docstring)."""
+        dri = tmp_path / "dri"
+        dri.mkdir()
+        (dri / "renderD128").touch()
+        (dri / "renderD129").touch()
+        pci_ordered = [str(dri / "renderD129"), str(dri / "renderD128")]  # reversed
+        with patch.object(_container, "detect_gpus", return_value=[0, 1]):
+            with patch.object(_container.shutil, "which", return_value=None):
+                with patch.object(
+                    _container, "amd_render_node_paths_by_pci_bus", return_value=pci_ordered
+                ):
+                    with patch.object(
+                        _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
+                    ):
+                        flags_0 = _container._gpu_flags("docker", 0)
+                        flags_1 = _container._gpu_flags("docker", 1)
+        assert flags_0 == ["--device", "/dev/kfd", "--device", str(dri / "renderD129")]
+        assert flags_1 == ["--device", "/dev/kfd", "--device", str(dri / "renderD128")]
 
     def test_backend_construction_no_longer_eagerly_caches_gpu_flags(self):
         """_gpu_flags() now depends on the per-sandbox leased gpu_id, which
@@ -740,6 +777,103 @@ class TestGpuFlagsPerRuntime:
             )
         gpu_flags_mock.assert_not_called()
         assert "_gpu_flags" not in vars(sb)
+
+
+def _host_rocm_available() -> bool:
+    try:
+        return (
+            subprocess.run(["rocm-smi", "--showid"], capture_output=True, timeout=10).returncode
+            == 0
+        )
+    except Exception:
+        return False
+
+
+rocm_hardware = pytest.mark.skipif(
+    not _host_rocm_available(), reason="No real ROCm/AMD GPU hardware available"
+)
+
+
+class TestAmdRenderNodeLiveHardware:
+    """Runs the real (unmocked) AMD GPU-to-render-node scoping against
+    actual ROCm hardware -- no mocks anywhere, unlike TestGpuFlagsPerRuntime
+    above. Skipped automatically without a real rocm-smi + AMD GPU(s).
+
+    This is the check that actually caught the bug being regression-tested
+    here: on an 8x MI350X host, naive sorted /dev/dri/renderD* order did
+    NOT correspond to rocm-smi's GPU index for ANY of the 8 GPUs (each GPU
+    there exposes itself plus 7 XCD/compute-partition sibling render nodes
+    -- 64 nodes total -- and even the primary node's number doesn't sort in
+    GPU-index order; e.g. GPU 3's real node was the numerically LOWEST of
+    the 64 present, not the 4th). These tests independently recompute the
+    "ground truth" GPU-to-render-node mapping from rocm-smi --showbus and
+    /sys/class/drm/*/device -- without going through
+    amd_render_node_paths_by_pci_bus itself -- and assert the real
+    _gpu_flags()/_amd_render_node_paths() output agrees with it for every
+    real GPU on this host.
+    """
+
+    _PCI_BUS_RE = re.compile(r"([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$")
+
+    def _ground_truth_bus_by_gpu_id(self) -> "dict[int, str]":
+        result = subprocess.run(
+            ["rocm-smi", "--showbus", "--csv"], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0, f"rocm-smi --showbus failed: {result.stderr!r}"
+        mapping = {}
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith("device"):
+                continue
+            card, bus = (c.strip() for c in line.split(",")[:2])
+            mapping[int(card[4:])] = bus.lower()
+        return mapping
+
+    def _real_render_node_bus(self, path: str) -> "str | None":
+        name = os.path.basename(path)
+        target = os.path.realpath(f"/sys/class/drm/{name}/device")
+        match = self._PCI_BUS_RE.search(target)
+        return match.group(1) if match else None
+
+    @rocm_hardware
+    def test_amd_render_node_paths_match_gpu_pci_bus_on_real_hardware(self):
+        _container._gpu_kind_cache.clear()
+        _container._amd_render_node_paths_cache = None
+        bus_by_gpu_id = self._ground_truth_bus_by_gpu_id()
+        assert bus_by_gpu_id, "expected at least one real AMD GPU"
+
+        render_nodes = _container._amd_render_node_paths()
+        assert len(render_nodes) == len(bus_by_gpu_id), (
+            f"expected one resolved render node per real GPU ({len(bus_by_gpu_id)}), "
+            f"got {len(render_nodes)}: {render_nodes}"
+        )
+
+        for gpu_id, expected_bus in bus_by_gpu_id.items():
+            actual_bus = self._real_render_node_bus(render_nodes[gpu_id])
+            assert actual_bus == expected_bus, (
+                f"gpu_id={gpu_id}: _amd_render_node_paths() picked "
+                f"{render_nodes[gpu_id]} (bus={actual_bus}), but rocm-smi says "
+                f"GPU {gpu_id} is actually on bus {expected_bus}"
+            )
+
+        # No two GPUs should ever be scoped to the same render node.
+        assert len(set(render_nodes)) == len(render_nodes)
+
+    @rocm_hardware
+    def test_gpu_flags_scope_distinct_real_devices_per_gpu_id(self):
+        _container._gpu_kind_cache.clear()
+        _container._amd_render_node_paths_cache = None
+        bus_by_gpu_id = self._ground_truth_bus_by_gpu_id()
+        seen_devices = set()
+        for gpu_id in bus_by_gpu_id:
+            flags = _container._gpu_flags("docker", gpu_id)
+            assert flags[:2] == ["--device", "/dev/kfd"]
+            assert len(flags) == 4, f"expected a scoped render node for gpu_id={gpu_id}: {flags}"
+            device_path = flags[3]
+            assert device_path not in seen_devices, (
+                f"gpu_id={gpu_id} was scoped to {device_path}, already used by another gpu_id"
+            )
+            seen_devices.add(device_path)
 
 
 def _podman_available() -> bool:

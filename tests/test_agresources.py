@@ -9,6 +9,7 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agresources import (
     agResourcePool,
+    amd_render_node_paths_by_pci_bus,
     detect_cpus,
     detect_gpus,
     detect_memory_mb,
@@ -159,6 +160,119 @@ def test_detect_gpus_rocm_smi_cvd_filters_via_hip_visible_devices(monkeypatch):
         side_effect=_run_nvidia_fails_rocm_succeeds(stdout),
     ):
         assert detect_gpus() == [1]
+
+
+# ---------------------------------------------------------------------------
+# amd_render_node_paths_by_pci_bus -- regression coverage for a real finding
+# on 8x MI350X hardware: rocm-smi's GPU index does NOT correspond to sorted
+# /dev/dri/renderD* order (each GPU there exposes itself plus 7 XCD/compute-
+# partition sibling render nodes, 64 nodes total for 8 GPUs, and even the
+# primary node's number doesn't sort in GPU-index order -- GPU 3's real node
+# was the numerically LOWEST of the 64 present). These tests mock both
+# `rocm-smi --showbus` (subprocess.run) and the /sys/class/drm/*/device
+# symlink resolution (os.path.realpath) so they run identically with or
+# without real ROCm hardware -- see TestAmdRenderNodeLiveHardware in
+# tests/agsandbox_backends/test_container.py for the check against real
+# hardware.
+# ---------------------------------------------------------------------------
+
+
+def _showbus_stdout(bus_by_gpu_id):
+    lines = ["device,PCI Bus"]
+    for gpu_id, bus in bus_by_gpu_id.items():
+        lines.append(f"card{gpu_id},{bus}")
+    return "\n".join(lines) + "\n"
+
+
+def _realpath_stub(bus_by_render_name):
+    """Stub for os.path.realpath: resolves /sys/class/drm/<name>/device to a
+    fake sysfs path ending in the given PCI bus, or (if the name maps to
+    None) a non-PCI platform-device path -- mirrors the real
+    "amdgpu_xcp_N" sysfs layout an XCD/compute-partition sibling render
+    node resolves to on real MI300/MI350 hardware."""
+
+    def _realpath(path):
+        name = path.split("/")[-2]
+        bus = bus_by_render_name.get(name)
+        if bus is None:
+            return f"/sys/devices/platform/amdgpu_xcp_{name}"
+        return f"/sys/devices/pci0000:00/0000:00:01.1/{bus}"
+
+    return _realpath
+
+
+def test_amd_render_node_paths_by_pci_bus_returns_none_when_rocm_smi_missing():
+    with patch("agency.agresources.subprocess.run", side_effect=FileNotFoundError):
+        assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
+
+
+def test_amd_render_node_paths_by_pci_bus_returns_none_on_nonzero_exit():
+    mock = MagicMock()
+    mock.returncode = 1
+    mock.stdout = ""
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
+
+
+def test_amd_render_node_paths_by_pci_bus_returns_none_when_a_gpu_bus_is_unmatched():
+    """Only one of two GPUs' PCI buses resolves to a candidate render node --
+    the mapping must be refused entirely (caller falls back to naive order)
+    rather than half-applied to just the GPUs that happened to match."""
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = _showbus_stdout({0: "0000:05:00.0", 1: "0000:15:00.0"})
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        with patch(
+            "agency.agresources.os.path.realpath",
+            side_effect=_realpath_stub({"renderD128": "0000:05:00.0"}),
+        ):
+            assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
+
+
+def test_amd_render_node_paths_by_pci_bus_reorders_to_match_gpu_index():
+    """Miniature reproduction of the real 8x MI350X finding: sorted
+    /dev/dri order does NOT correspond to rocm-smi's GPU index -- here
+    renderD128 is actually GPU 1's node and renderD129 is actually GPU 0's,
+    the reverse of naive sorted order."""
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = _showbus_stdout({0: "0000:75:00.0", 1: "0000:05:00.0"})
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        with patch(
+            "agency.agresources.os.path.realpath",
+            side_effect=_realpath_stub(
+                {"renderD128": "0000:05:00.0", "renderD129": "0000:75:00.0"}
+            ),
+        ):
+            result = amd_render_node_paths_by_pci_bus(
+                ["/dev/dri/renderD128", "/dev/dri/renderD129"]
+            )
+    assert result == ["/dev/dri/renderD129", "/dev/dri/renderD128"]
+
+
+def test_amd_render_node_paths_by_pci_bus_ignores_non_pci_xcp_sibling_nodes():
+    """XCD/compute-partition sibling render nodes (sysfs parent is a
+    "amdgpu_xcp_N" platform device, not a PCI device) must never be picked
+    as a GPU's primary node -- only the one with a real resolvable PCI bus
+    can match a GPU."""
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = _showbus_stdout({0: "0000:05:00.0", 1: "0000:15:00.0"})
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        with patch(
+            "agency.agresources.os.path.realpath",
+            side_effect=_realpath_stub(
+                {
+                    "renderD128": "0000:05:00.0",
+                    "renderD129": None,  # XCP sibling of GPU 0
+                    "renderD136": "0000:15:00.0",
+                }
+            ),
+        ):
+            result = amd_render_node_paths_by_pci_bus(
+                ["/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD136"]
+            )
+    assert result == ["/dev/dri/renderD128", "/dev/dri/renderD136"]
 
 
 # ---------------------------------------------------------------------------

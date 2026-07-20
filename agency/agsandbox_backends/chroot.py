@@ -181,6 +181,7 @@ import uuid as _uuid
 from pathlib import Path
 
 from ..agconfig import agConfig
+from ..agresources import amd_render_node_paths_by_pci_bus
 from .base import (
     AgSandboxBackendFields,
     agsandbox_backend,
@@ -350,10 +351,19 @@ def _chroot_gpu_dev_paths(gpu_id: "int | None") -> "list[str]":
         )
         return control if gpu_id >= len(indexed) else control + [indexed[gpu_id]]
     # AMD/ROCm: /dev/kfd is the one shared control device; each GPU's own
-    # compute node is /dev/dri/renderD<128+N> in host enumeration order
-    # (untested against real AMD/ROCm hardware -- see module docstring).
+    # compute node is /dev/dri/renderD<128+N>, matched to gpu_id by PCI bus
+    # (agresources.amd_render_node_paths_by_pci_bus()) rather than assumed
+    # host enumeration order -- confirmed on real 8x MI350X hardware that
+    # naive sorted order does NOT correspond to GPU index (each GPU exposes
+    # itself plus 7 XCD/compute-partition sibling render nodes), falling
+    # back to naive order only if the PCI-bus mapping can't be built.
     control = [p for p in all_paths if os.path.basename(p) == "kfd"]
-    render_nodes = sorted(p for p in all_paths if os.path.basename(p).startswith("render"))
+    naive_render_nodes = sorted(p for p in all_paths if os.path.basename(p).startswith("render"))
+    render_nodes = (
+        amd_render_node_paths_by_pci_bus(naive_render_nodes) if naive_render_nodes else None
+    )
+    if render_nodes is None:
+        render_nodes = naive_render_nodes
     return control if gpu_id >= len(render_nodes) else control + [render_nodes[gpu_id]]
 
 
