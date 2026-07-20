@@ -532,38 +532,14 @@ class _ContainerBackendBase(agsandbox_backend):
         this container, or an empty set if the container doesn't exist / the
         query fails.
 
-        Used to scope release_gpu()'s straggler wait (see
-        agResourcePool._wait_for_gpu_clear) to processes THIS sandbox itself
-        spawned, not an unrelated tenant sharing the same physical GPU.
-
-        MUST use `docker/podman top`, not a /proc child-PID walk from the
-        container's init process ({{.State.Pid}}): a `docker/podman exec`
-        session (how _container_exec() runs every command, including the
-        entire harness workload) joins the container's existing PID
-        namespace via the runtime's supervisor -- it is a SIBLING under that
-        supervisor, never a host-process-tree descendant of init. Confirmed
-        empirically: `docker exec -d <container> sleep 60` spawns a process
-        `docker top` correctly lists, but which never appears anywhere in
-        /proc/<init_pid>/task/<init_pid>/children. A walk-from-init approach
-        therefore only ever sees {init_pid} in real use (the harness's own
-        exec'd work is invisible to it), making the straggler-wait
-        effectively always intersect empty and release immediately --
-        silently defeating the entire point of scoping to own_pids.
-        `docker/podman top` instead enumerates PID-namespace MEMBERSHIP
-        directly (no process-ancestry walk at all), so it sees exec'd
-        siblings and init's descendants identically, in one call.
-
-        Runtime syntax differs and is NOT interchangeable:
-          docker: `docker top <name> -eo pid` -- real ps(1) flags, host PIDs.
-          podman: `podman top <name> hpid` -- podman's own positional
-            descriptor syntax, NOT `-eo`/`-o`. Passing ps(1)-style flags to
-            podman silently switches it to running a real `ps` INSIDE the
-            container's namespace instead (requires ps installed in the
-            image, and reports container-LOCAL pids, not host ones -- both
-            wrong for this purpose). Podman's own plain `pid` descriptor is
-            also container-namespace-local, not host -- only `hpid` (added
-            2018, present in every podman version in practical use) maps to
-            the real host PID via /proc NSpid matching.
+        Uses `docker/podman top` (not a /proc walk from {{.State.Pid}}):
+        `exec` sessions are siblings under the runtime supervisor, not
+        descendants of init. Runtime syntax differs and is NOT
+        interchangeable:
+          docker: `docker top <name> -eo pid` — host PIDs.
+          podman: `podman top <name> hpid` — host PIDs (plain `pid` is
+            namespace-local; ps(1)-style flags make podman run ps inside
+            the container).
         """
         if self._runtime == "podman":
             cmd = [self._runtime, "top", self._container_name(), "hpid"]
@@ -579,6 +555,12 @@ class _ContainerBackendBase(agsandbox_backend):
             if line.isdigit():
                 pids.add(int(line))
         return pids
+
+    def _gpu_is_clear(self) -> bool:
+        """True once this sandbox's container is no longer running — same
+        condition as container exit. release_gpu() waits on this instead of
+        polling nvidia-smi/rocm-smi."""
+        return not self._container_running()
 
     def _ensure_started(self) -> None:
         """Start the Docker/Podman container on first use.
@@ -861,18 +843,17 @@ class _ContainerBackendBase(agsandbox_backend):
         commit=True after a successful sandbox tool call; commit=False after a
         failure to discard the dirty state and revert to the last checkpoint.
         """
+        gpu_id_to_release = (
+            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
+        )
         if not self._started:
             # Worker-process scenario: _started is False in the calling process
             # even though a worker may have started the container.
             if not self._container_running():
+                if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+                    self._gpu_release_fn(gpu_id_to_release, is_clear=self._gpu_is_clear)
+                    self._gpu_id = None
                 return
-        # Release GPU so other agents can use it while the container is gone.
-        # Captured while the container still exists (removal happens further
-        # down) so the wait can scope to processes THIS container actually
-        # spawned rather than any process sharing the physical GPU.
-        if self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
-            self._gpu_id = None
         # Clear PID tracking — remove kills all processes.
         self._watched_pids = {}
         self._baseline_pids = set()
@@ -970,6 +951,12 @@ class _ContainerBackendBase(agsandbox_backend):
         if not self._container_running():
             self._release_runtime_slot()
         self._started = False
+        # Free the GPU only after the container is gone (is_clear == container
+        # exit). Releasing earlier raced with live exec/harness work still
+        # holding CUDA contexts inside the container.
+        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+            self._gpu_release_fn(gpu_id_to_release, is_clear=self._gpu_is_clear)
+            self._gpu_id = None
 
     def restore(self, tag: str) -> None:
         """Restore the sandbox to a previously committed image snapshot.

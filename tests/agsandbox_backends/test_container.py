@@ -462,26 +462,11 @@ class TestRun:
 
 
 # ---------------------------------------------------------------------------
-# _own_host_pids() -- scopes release_gpu()'s straggler wait to processes THIS
-# container spawned (see agresources._wait_for_gpu_clear's own_pids param),
-# not an unrelated tenant sharing the same physical GPU.
+# _own_host_pids() -- host PIDs currently inside this container via
+# docker/podman top (exec sessions are siblings of init, not /proc children).
+# GPU release waits on _gpu_is_clear() / container exit, not nvidia-smi.
 #
-# REGRESSION HISTORY: this used to walk /proc/<init_pid>/task/<init_pid>/
-# children from {{.State.Pid}}. That missed every `docker/podman exec`
-# session (how _container_exec() runs all real work, including the entire
-# harness workload) -- confirmed empirically that `docker exec -d <c> sleep
-# 60` spawns a process `docker top` lists correctly but which never appears
-# anywhere in the host process-ancestry walk from init (it's a SIBLING under
-# the runtime's supervisor, not a descendant). In production this meant
-# own_pids was effectively always just {init_pid}, own_pids never contained
-# the sandbox's actual GPU-using work, the straggler-wait's intersection was
-# always empty, and release_gpu() released immediately regardless of whether
-# real work was still running on the GPU -- silently defeating the entire
-# point of this mechanism while looking like it was doing something.
-#
-# Fixed to use `docker/podman top`, which enumerates PID-NAMESPACE MEMBERSHIP
-# directly (no ancestry walk), so exec'd siblings and init's descendants are
-# found identically. Syntax is NOT interchangeable between runtimes:
+# Syntax is NOT interchangeable between runtimes:
 #   docker: `docker top <name> -eo pid` -- real ps(1) flags, host PIDs.
 #   podman: `podman top <name> hpid` -- podman's own positional descriptor.
 #     Using ps(1)-style `-eo`/`-o` flags on podman silently takes a DIFFERENT

@@ -232,15 +232,19 @@ class agsandbox_backend(AgSandboxBackendFields):
     IMAGE_KIND: "str" = ""
 
     def _own_host_pids(self) -> "set[int]":
-        """Return the host PIDs of every process this sandbox has currently
-        spawned, used to scope release_gpu()'s straggler wait to processes
-        this sandbox actually owns rather than an unrelated tenant sharing
-        the same physical GPU (see agResourcePool._wait_for_gpu_clear).
-        Overridden per-backend since what counts as "this sandbox's PIDs"
-        differs by isolation mechanism; the empty-set default here means "no
-        sandbox context available," which _wait_for_gpu_clear falls back
-        from to its coarser own-orchestrator-PID-only check."""
+        """Return the host PIDs of every process this sandbox currently has
+        running. Overridden per-backend; default is empty (no sandbox
+        process context)."""
         return set()
+
+    def _gpu_is_clear(self) -> bool:
+        """Return True when this sandbox holds no live processes — the
+        condition release_gpu() waits on before freeing the pool slot.
+
+        Matches container exit for Docker/Podman (no running container) and
+        "no watched host PIDs" for chroot. Default True (nothing to wait on).
+        """
+        return True
 
     @staticmethod
     def for_config(
@@ -480,16 +484,12 @@ class agsandbox_backend(AgSandboxBackendFields):
         else:
             clean_output = output
 
-        # Release the physical GPU if no background processes remain.  The
-        # /proc diff can catch transient PIDs that already exited by the time
-        # we parse __BGPIDS__, so re-verify liveness when _watched_pids is
-        # non-empty — get_live_pids() prunes dead entries and releases the GPU
-        # if none survive the check.
+        # Re-verify liveness when _watched_pids is non-empty — get_live_pids()
+        # prunes dead entries. GPU release is deferred until stop()/explicit
+        # gpu_release, which waits on _gpu_is_clear() (container exit), not on
+        # nvidia-smi / an empty watched set while the idle entrypoint still runs.
         if self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
             self.get_live_pids()
-        elif not self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
-            self._gpu_id = None
 
         return clean_output, rc
 
@@ -585,6 +585,13 @@ class agsandbox_backend(AgSandboxBackendFields):
         self._daemon_pids.add(pid)
         self._watched_pids.pop(pid, None)
 
+    # When True (Docker/Podman), get_live_pids() adds newly discovered
+    # non-baseline live PIDs into _watched_pids so children of backgrounded
+    # work stay tracked. Chroot sets this False: its /proc scan is the whole
+    # host, so adopting strangers would latch unrelated long-lived host
+    # processes into the wait/GPU-clear path.
+    _adopt_unwatched_live_pids: bool = True
+
     def get_live_pids(self) -> set[int]:
         if not self._watched_pids:
             return set()
@@ -658,10 +665,11 @@ class agsandbox_backend(AgSandboxBackendFields):
                     self._watched_pids.pop(pid, None)
                     changed = True
 
-        # A PID is alive if it exists in /proc, is not baseline, not a system
-        # process (NVIDIA runtime helper), not a daemon, and not a zombie.  Any
-        # newly discovered non-baseline PID is added to _watched_pids so the
-        # outer loop waits for it.
+        # A PID counts as live background work if it exists in /proc, is not
+        # baseline / NVIDIA helper / daemon / zombie, AND is either already
+        # watched or (when _adopt_unwatched_live_pids) newly discovered.
+        # Chroot disables adoption so a non-baseline host process started by
+        # something else cannot enter _watched_pids via this scan.
         alive: set[int] = set()
         now = time.monotonic()
         for pid, (_, state, _) in proc_info.items():
@@ -672,19 +680,16 @@ class agsandbox_backend(AgSandboxBackendFields):
                 or state == "Z"
             ):
                 continue
-            alive.add(pid)
-            if pid not in self._watched_pids:
+            if pid in self._watched_pids:
+                alive.add(pid)
+            elif self._adopt_unwatched_live_pids:
                 self._watched_pids[pid] = now
+                alive.add(pid)
 
         # Prune _watched_pids entries that are no longer alive.
         for pid in set(self._watched_pids):
             if pid not in alive:
                 del self._watched_pids[pid]
-
-        # Release the physical GPU once all watched processes have finished.
-        if not alive and self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
-            self._gpu_id = None
 
         return alive
 
@@ -703,11 +708,11 @@ class agsandbox_backend(AgSandboxBackendFields):
     def release_resources(self, pool: "agResourcePool | None" = None) -> None:
         self._gpu_virtual = False
         if self._gpu_id is not None:
-            own_pids = self._own_host_pids()
+            is_clear = self._gpu_is_clear
             if pool is not None:
-                pool.release_gpu(self._gpu_id, own_pids=own_pids)
+                pool.release_gpu(self._gpu_id, is_clear=is_clear)
             elif self._gpu_release_fn is not None:
-                self._gpu_release_fn(self._gpu_id, own_pids=own_pids)
+                self._gpu_release_fn(self._gpu_id, is_clear=is_clear)
             self._gpu_id = None
         if pool is not None and (self._cpu_acquired or self._memory_acquired_mb):
             pool.notify_cpu_released(self._cpu_acquired, self._memory_acquired_mb)

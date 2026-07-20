@@ -204,6 +204,12 @@ class _ChrootBackend(agsandbox_backend):
 
     IMAGE_KIND = "chroot"
 
+    # Host /proc is shared with every other process on the machine. Adopting
+    # newly discovered non-baseline PIDs in get_live_pids() would let an
+    # unrelated long-lived host process latch into _watched_pids and stall
+    # skill wait / GPU release. Only BGPIDS from our own exec() may watch.
+    _adopt_unwatched_live_pids = False
+
     def __init__(
         self,
         agname: str,
@@ -242,12 +248,18 @@ class _ChrootBackend(agsandbox_backend):
         return f"agency/lifecycle-{self._name}".lower()
 
     def _own_host_pids(self) -> "set[int]":
-        """Chroot processes run directly on the host (no PID namespace, no
-        container to inspect) -- _watched_pids is already host-native, so
-        it's the exact same PID space release_gpu()'s straggler wait needs;
-        no translation required (contrast _ContainerBackendBase's version,
-        which has to derive host PIDs from a container's own namespace)."""
+        """Chroot processes run directly on the host (no PID namespace) —
+        _watched_pids is already host-native."""
         return set(self._watched_pids)
+
+    def _gpu_is_clear(self) -> bool:
+        """True once no watched sandbox processes remain alive on the host
+        (chroot has no container-exit signal; this is the equivalent idle
+        condition for release_gpu())."""
+        for pid in list(self._watched_pids):
+            if Path(f"/proc/{pid}").exists():
+                return False
+        return True
 
     def _ensure_started(self) -> None:
         """Create the jail's workspace directory on first use, restoring it
@@ -524,8 +536,12 @@ class _ChrootBackend(agsandbox_backend):
         backend). Trusting ``self._started`` here would silently skip
         committing real work just because *this* process's flag never
         flipped to True."""
-        if self._gpu_virtual and self._gpu_id is not None:
-            self._gpu_release_fn(self._gpu_id, own_pids=self._own_host_pids())
+        gpu_id_to_release = (
+            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
+        )
+        # Wait for watched processes to exit before clearing tracking / releasing.
+        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+            self._gpu_release_fn(gpu_id_to_release, is_clear=self._gpu_is_clear)
             self._gpu_id = None
         self._watched_pids = {}
         self._baseline_pids = set()

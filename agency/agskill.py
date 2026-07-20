@@ -300,7 +300,6 @@ class agskill:
         agpause.tag_producer(result_future, ag)
         agpause.tag_producer(ctx_future, ag)
         ts_start = _ts()
-        resource_pool = type(ag).agresource_pool
 
         def _task() -> None:
             outer_result: agdata | None = None
@@ -384,14 +383,9 @@ class agskill:
                 history_before = list(prev_ctx.messages)
                 ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
             finally:
-                # ── 4. Teardown — release GPU slot, commit container filesystem.
+                # ── 4. Teardown — stop sandbox (frees GPU after container exit).
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 ag._set_ui_state("error" if _had_error else "finished")
-                if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
-                    resource_pool.release_gpu(
-                        ag.sandbox._gpu_id, own_pids=ag.sandbox._own_host_pids()
-                    )
-                    ag.sandbox._gpu_id = None
                 if ag.sandbox is not None:
                     ag.sandbox.stop(commit=True)
                 if sandbox_lock is not None:

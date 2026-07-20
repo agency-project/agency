@@ -301,7 +301,7 @@ def test_acquire_blocks_until_release():
 
     time.sleep(0.05)
     assert not acquired_after.is_set()
-    pool.release_gpu(0)  # release_gpu sleeps 3s internally before freeing the slot
+    pool.release_gpu(0)
     acquired_after.wait(timeout=5.0)
     assert acquired_after.is_set()
     t.join(timeout=5.0)
@@ -329,52 +329,46 @@ def test_release_double_release_warns(capsys):
     assert "WARNING" in captured.out
 
 
-def test_release_gpu_waits_for_straggler_compute_process_to_clear(monkeypatch):
-    """release_gpu() must not free the slot while nvidia-smi still shows a
-    compute process (e.g. a backgrounded job the caller forgot to wait on)
-    on that physical GPU — it should poll until the process list clears."""
+def test_release_gpu_waits_for_is_clear(monkeypatch):
+    """release_gpu() must not free the slot until is_clear() is True
+    (sandbox idle / container exited) — it should poll until that happens."""
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
     pool.acquire_gpu()
 
     calls = {"n": 0}
 
-    def fake_pids(gpu_id):
+    def fake_clear():
         calls["n"] += 1
-        return {999999} if calls["n"] == 1 else set()
+        return calls["n"] >= 2
 
-    monkeypatch.setattr("agency.agresources._gpu_compute_pids", fake_pids)
     monkeypatch.setattr("agency.agresources.time.sleep", lambda s: None)
 
-    pool.release_gpu(0)
-    assert calls["n"] == 2  # polled once more after the straggler cleared
+    pool.release_gpu(0, is_clear=fake_clear)
+    assert calls["n"] == 2
     assert pool._gpus_acquired == 0
 
 
 def test_release_gpu_gives_up_after_timeout_and_warns(monkeypatch, capsys):
-    """A straggler that never exits must not wedge the GPU as permanently
-    unreleasable — release proceeds anyway once the wait deadline passes,
-    with a warning identifying the leftover pid(s)."""
+    """A sandbox that never clears must not wedge the GPU as permanently
+    unreleasable — release proceeds anyway once the wait deadline passes."""
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
     pool.acquire_gpu()
 
-    monkeypatch.setattr("agency.agresources._gpu_compute_pids", lambda gpu_id: {123456})
     times = iter([0.0, 1000.0])
     monkeypatch.setattr("agency.agresources.time.monotonic", lambda: next(times))
 
-    pool.release_gpu(0)
+    pool.release_gpu(0, is_clear=lambda: False)
     captured = capsys.readouterr()
-    assert "still shows compute processes" in captured.out
-    assert "123456" in captured.out
+    assert "is_clear() still false" in captured.out
     assert pool._gpus_acquired == 0
 
 
-def test_release_gpu_skips_wait_when_nvidia_smi_unavailable(monkeypatch):
-    """On hosts without nvidia-smi (or non-NVIDIA hardware), the check can't
-    run at all — release must proceed immediately rather than block."""
+def test_release_gpu_skips_wait_when_is_clear_omitted(monkeypatch):
+    """With no is_clear predicate (no sandbox context), release proceeds
+    immediately rather than block."""
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
     pool.acquire_gpu()
 
-    monkeypatch.setattr("agency.agresources._gpu_compute_pids", lambda gpu_id: None)
     slept = []
     monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
 
@@ -383,50 +377,17 @@ def test_release_gpu_skips_wait_when_nvidia_smi_unavailable(monkeypatch):
     assert pool._gpus_acquired == 0
 
 
-def test_release_gpu_with_own_pids_ignores_unrelated_process():
-    """A process on the physical GPU that ISN'T one of own_pids (an
-    unrelated tenant sharing the device) must never count as a straggler --
-    release proceeds immediately, no waiting, no warning."""
+def test_release_gpu_is_clear_true_releases_immediately(monkeypatch):
+    """is_clear() already True means no polling sleep before release."""
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
     pool.acquire_gpu()
 
-    with patch("agency.agresources._gpu_compute_pids", lambda gpu_id: {424242}):
-        pool.release_gpu(0, own_pids={111, 222})  # 424242 is unrelated -- ignored
+    slept = []
+    monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
+
+    pool.release_gpu(0, is_clear=lambda: True)
+    assert slept == []
     assert pool._gpus_acquired == 0
-
-
-def test_release_gpu_with_own_pids_waits_for_own_straggler(monkeypatch):
-    """A process that IS in own_pids must still be waited on, even though
-    other unrelated PIDs are also present on the device."""
-    pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpu()
-
-    # First poll reports our straggler (999999) alongside an unrelated PID
-    # (424242, someone else's tenant); second poll reports only the
-    # unrelated one -- ours has cleared, so release must proceed.
-    responses = iter([{999999, 424242}, {424242}])
-    monkeypatch.setattr("agency.agresources._gpu_compute_pids", lambda gpu_id: next(responses))
-    monkeypatch.setattr("agency.agresources.time.sleep", lambda s: None)
-
-    pool.release_gpu(0, own_pids={999999})
-    assert pool._gpus_acquired == 0
-
-
-def test_wait_for_gpu_clear_timeout_warning_lists_only_own_stragglers(monkeypatch, capsys):
-    """When own_pids is given, the give-up warning must only name PIDs that
-    are actually ours -- not every PID nvidia-smi/rocm-smi happens to report
-    on the device (which would misleadingly look like our own leak)."""
-    pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpu()
-
-    monkeypatch.setattr("agency.agresources._gpu_compute_pids", lambda gpu_id: {999999, 424242})
-    times = iter([0.0, 1000.0])
-    monkeypatch.setattr("agency.agresources.time.monotonic", lambda: next(times))
-
-    pool.release_gpu(0, own_pids={999999})
-    captured = capsys.readouterr()
-    assert "999999" in captured.out
-    assert "424242" not in captured.out
 
 
 # ---------------------------------------------------------------------------

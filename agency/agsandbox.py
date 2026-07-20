@@ -192,6 +192,9 @@ class agSandbox(_AgSandboxFields):
     def _own_host_pids(self) -> "set[int]":
         return self._backend._own_host_pids()
 
+    def _gpu_is_clear(self) -> bool:
+        return self._backend._gpu_is_clear()
+
     @property
     def _cpu_acquired(self) -> float:
         return self._backend._cpu_acquired

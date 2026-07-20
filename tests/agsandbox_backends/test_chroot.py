@@ -60,8 +60,8 @@ class TestSanitizeTag:
 
 
 # ---------------------------------------------------------------------------
-# _own_host_pids -- scopes release_gpu()'s straggler wait to this sandbox's
-# own processes (see agresources._wait_for_gpu_clear's own_pids param).
+# _own_host_pids / _gpu_is_clear -- chroot has no container exit signal;
+# release_gpu waits until watched host PIDs are gone.
 # Chroot processes run directly on the host (no PID namespace to translate
 # through, unlike _ContainerBackendBase's version), so _watched_pids is
 # already the right PID space -- no real chroot jail needed to test this.
@@ -86,6 +86,29 @@ class TestOwnHostPids:
         result = sb._own_host_pids()
         sb._watched_pids[222] = 0.0
         assert result == {111}
+
+
+class TestChrootDoesNotAdoptUnwatchedLivePids:
+    def test_flag_disabled(self):
+        assert _make_backend()._adopt_unwatched_live_pids is False
+
+    def test_get_live_pids_does_not_adopt_strangers(self, monkeypatch):
+        """A live non-baseline host PID that was never in BGPIDS must not enter
+        _watched_pids or the returned live set."""
+        sb = _make_backend()
+        sb._started = True
+        sb._watched_pids = {111: 0.0}
+        sb._baseline_pids = set()
+        # Fake /proc table: watched 111 still alive, stranger 999999 also alive.
+        monkeypatch.setattr(
+            sb,
+            "_read_proc_table",
+            lambda script, timeout: ("111 1 S python\n999999 1 S sleep\n", 0),
+        )
+        live = sb.get_live_pids()
+        assert live == {111}
+        assert 999999 not in sb._watched_pids
+        assert sb._watched_pids == {111: 0.0}
 
 
 # ---------------------------------------------------------------------------

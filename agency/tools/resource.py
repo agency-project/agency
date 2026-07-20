@@ -30,7 +30,7 @@ def make_gpu_reserve(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
 
     No physical GPU is claimed here. The physical allocation happens lazily
     inside sandbox.exec() the moment a bash command is actually run, and is
-    released automatically once all spawned processes finish.
+    released when the sandbox stops (container exit / no live chroot PIDs).
     """
 
     def _run(arg: agdata) -> agdata:
@@ -65,7 +65,7 @@ def make_gpu_release(sandbox: "agSandbox", pool: "agResourcePool") -> agtool:
     def _run(arg: agdata) -> agdata:
         sandbox._gpu_virtual = False
         if sandbox._gpu_id is not None:
-            pool.release_gpu(sandbox._gpu_id, own_pids=sandbox._own_host_pids())
+            pool.release_gpu(sandbox._gpu_id, is_clear=sandbox._gpu_is_clear)
             sandbox._gpu_id = None
         return agdata(message="GPU released")
 

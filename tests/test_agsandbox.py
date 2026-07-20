@@ -1630,10 +1630,10 @@ class TestResourceTools:
         """exec() claims a physical GPU from the pool when _gpu_virtual is True."""
         self.tools["reserve_gpu"].fn(agdata())
         assert self.pool._gpus_acquired == 0
-        # During the command a GPU is held; after a foreground exec it is released.
         self.sb.exec("echo hello")
-        # Foreground exec with no background processes releases immediately.
-        assert self.pool._gpus_acquired == 0
+        # Held until stop()/gpu_release (container-exit clear), not released mid-skill.
+        assert self.pool._gpus_acquired == 1
+        assert self.sb._gpu_id is not None
 
     def test_exec_sets_cuda_visible_devices(self):
         """CUDA_VISIBLE_DEVICES is set to a digit (the physical GPU ID) during exec()."""
@@ -1650,28 +1650,31 @@ class TestResourceTools:
 
     # ── physical GPU release after foreground exec ─────────────────────────
 
-    def test_foreground_exec_releases_physical_gpu_immediately(self):
-        """Physical GPU is released at the end of exec() when no background processes remain."""
+    def test_foreground_exec_holds_physical_gpu_until_stop(self):
+        """Physical GPU stays held after exec(); release waits on container exit (stop)."""
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("echo hello")
-        assert self.sb._gpu_id is None
-        assert self.pool._gpus_acquired == 0
-        assert self.sb._gpu_virtual is True  # virtual reservation persists
+        assert self.sb._gpu_id is not None
+        assert self.pool._gpus_acquired == 1
+        assert self.sb._gpu_virtual is True
 
-    def test_consecutive_foreground_execs_each_acquire_and_release(self):
-        """Each foreground exec() acquires a physical GPU then releases it; pool stays free."""
+    def test_consecutive_foreground_execs_reuse_same_physical_gpu(self):
+        """Each foreground exec() reuses the already-held physical GPU."""
         self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("echo first")
+        first = self.sb._gpu_id
+        assert first is not None
         for _ in range(3):
             self.sb.exec("echo iteration")
-            assert self.sb._gpu_id is None
-            assert self.pool._gpus_acquired == 0
+            assert self.sb._gpu_id == first
+            assert self.pool._gpus_acquired == 1
 
-    def test_virtual_reservation_persists_after_physical_release(self):
-        """_gpu_virtual stays True after a foreground exec so the next bash call can re-acquire."""
+    def test_virtual_reservation_and_physical_gpu_persist_across_execs(self):
+        """_gpu_virtual and the leased GPU stay set across successive exec() calls."""
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("echo first")
         assert self.sb._gpu_virtual is True
-        # Second exec() should re-acquire a physical GPU and set CUDA_VISIBLE_DEVICES.
+        assert self.sb._gpu_id is not None
         out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
         assert rc == 0
         assert out.strip().isdigit()
@@ -1704,15 +1707,15 @@ class TestResourceTools:
         assert self.sb._gpu_id == first_gpu_id  # same physical GPU, not re-acquired
         self.sb.exec("kill %1 2>/dev/null || true")
 
-    def test_physical_gpu_released_after_background_process_finishes(self):
-        """Physical GPU is released by get_live_pids() once the background process exits."""
+    def test_physical_gpu_held_after_background_process_finishes(self):
+        """Physical GPU stays held after background work exits; stop()/gpu_release frees it."""
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("sleep 0.1 &")
         time.sleep(1.0)
-        self.sb.get_live_pids()  # triggers release since alive set is now empty
-        assert self.sb._gpu_id is None
-        assert self.pool._gpus_acquired == 0
-        assert self.sb._gpu_virtual is True  # virtual reservation persists
+        self.sb.get_live_pids()
+        assert self.sb._gpu_id is not None
+        assert self.pool._gpus_acquired == 1
+        assert self.sb._gpu_virtual is True
 
     # ── waiting for physical GPU when pool is exhausted ────────────────────
 
@@ -1754,8 +1757,10 @@ class TestResourceTools:
         assert self.sb._gpu_virtual is False
         assert self.sb._gpu_id is None
 
-    def test_gpu_release_also_frees_physical_gpu_held_by_background_process(self):
-        """gpu_release forcibly releases a physical GPU even while a background process runs."""
+    def test_gpu_release_also_frees_physical_gpu_held_by_background_process(self, monkeypatch):
+        """gpu_release frees the physical GPU; is_clear waits for container exit (timeout → release)."""
+        # Avoid a real 30s wait: container is still running so is_clear stays false.
+        monkeypatch.setattr(self.pool, "gpu_release_wait_timeout_s", 0)
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("sleep 30 &")
         self.sb.get_live_pids()
@@ -1775,8 +1780,9 @@ class TestResourceTools:
 
     # ── release_resources ─────────────────────────────────────────────────
 
-    def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self):
+    def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self, monkeypatch):
         """release_resources() clears _gpu_virtual and returns any held physical GPU."""
+        monkeypatch.setattr(self.pool, "gpu_release_wait_timeout_s", 0)
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("sleep 30 &")
         self.sb.get_live_pids()

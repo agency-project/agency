@@ -6,6 +6,7 @@ import re
 import subprocess
 import threading
 import time
+from typing import Callable
 
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
@@ -37,10 +38,10 @@ class _AgResourcePoolFields:
     )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
     gpu_release_wait_poll_s = GlobalConfigParam(
         "agResourcePool", default=1.0
-    )  # Seconds between nvidia-smi polls waiting for a GPU's compute processes to exit before release
+    )  # Seconds between is_clear() polls while waiting for the releasing sandbox to go idle
     gpu_release_wait_timeout_s = GlobalConfigParam(
         "agResourcePool", default=30
-    )  # Max seconds to wait for stragglers to exit before releasing anyway (with a warning)
+    )  # Max seconds to wait for is_clear() before releasing anyway (with a warning)
 
     # CPU limit applied both when a sandbox container is first created (docker
     # run) and whenever it's reset to idle (docker update, via cpu_release) --
@@ -427,58 +428,53 @@ class agResourcePool(_AgResourcePoolFields):
                 raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
             time.sleep(poll)
 
-    def _wait_for_gpu_clear(self, gpu_id: int, own_pids: "set[int] | None" = None) -> None:
-        """Block until nvidia-smi/rocm-smi reports no relevant compute
-        processes left on *gpu_id*. Guards against handing a "released" GPU
-        to a new acquirer while a background job the releasing sandbox
-        spawned (or a just-killed process's CUDA/HIP context) is still
-        actually resident on the device -- see release_gpu()'s docstring.
+    def _wait_for_gpu_clear(
+        self, gpu_id: int, is_clear: "Callable[[], bool] | None" = None
+    ) -> None:
+        """Block until *is_clear()* reports the releasing sandbox is idle.
 
-        *own_pids*, when given, is the exact set of host PIDs the releasing
-        sandbox itself spawned (see _ContainerBackendBase._own_host_pids()/
-        _ChrootBackend._own_host_pids()) -- only THOSE PIDs are waited on, so
-        an unrelated process sharing the same physical GPU (another tenant,
-        another harness run entirely -- this pool has no cross-process
-        visibility into those and isn't trying to coordinate with them)
-        never counts as a straggler and never triggers a wait or a false
-        warning.
-
-        When own_pids is None (no sandbox context -- e.g. a caller other
-        than a container/chroot-backed sandbox), falls back to the coarser
-        "anything other than our own orchestrator PID" check.
-
-        Also serves as the gap between release calls: a just-freed GPU can't
-        be re-acquired any sooner than this check completes.
+        Callers pass a sandbox-scoped predicate (e.g. container no longer
+        running — the same condition as container exit) so we never consult
+        nvidia-smi/rocm-smi and never wait on an unrelated tenant sharing the
+        physical GPU. When *is_clear* is None (no sandbox context), return
+        immediately.
 
         Gives up and returns (so release still proceeds, with a warning)
-        after gpu_release_wait_timeout_s -- a wedged/never-exiting straggler
-        must not permanently strand the GPU as unreleasable. Returns
-        immediately if the query itself isn't possible (no nvidia-smi /
-        rocm-smi) since there's nothing to poll on.
+        after gpu_release_wait_timeout_s — a wedged sandbox must not
+        permanently strand the GPU as unreleasable.
         """
-        exclude = {os.getpid()}
+        if is_clear is None:
+            return
         poll = self.gpu_release_wait_poll_s
         deadline = time.monotonic() + self.gpu_release_wait_timeout_s
         while True:
-            pids = _gpu_compute_pids(gpu_id)
-            if pids is None:
+            try:
+                clear = bool(is_clear())
+            except Exception as _e:
+                print(
+                    f"[agresources] WARNING: gpu_id={gpu_id} is_clear() raised {_e!r}; "
+                    "releasing anyway"
+                )
                 return
-            stragglers = (pids & own_pids) if own_pids is not None else (pids - exclude)
-            if not stragglers:
+            if clear:
                 return
             if time.monotonic() >= deadline:
                 print(
-                    f"[agresources] WARNING: gpu_id={gpu_id} still shows compute "
-                    f"processes {sorted(stragglers)} after {self.gpu_release_wait_timeout_s}s; "
-                    "releasing anyway"
+                    f"[agresources] WARNING: gpu_id={gpu_id} is_clear() still false "
+                    f"after {self.gpu_release_wait_timeout_s}s; releasing anyway"
                 )
                 return
             time.sleep(poll)
 
-    def release_gpu(self, gpu_id: int, own_pids: "set[int] | None" = None) -> None:
+    def release_gpu(self, gpu_id: int, is_clear: "Callable[[], bool] | None" = None) -> None:
+        """Release *gpu_id* back to the pool.
+
+        If *is_clear* is provided, poll it until True (or timeout) before
+        freeing the semaphore — typically ``lambda: not container_running()``.
+        """
         sem = self._gpu_locks.get(gpu_id)
         if sem is not None:
-            self._wait_for_gpu_clear(gpu_id, own_pids)
+            self._wait_for_gpu_clear(gpu_id, is_clear)
             try:
                 sem.release()
             except ValueError as _e:
