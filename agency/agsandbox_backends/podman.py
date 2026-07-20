@@ -163,7 +163,9 @@ class _PodmanBackend(_ContainerBackendBase):
         uid_map, gid_map = maps
         return (_translate_id(uid, uid_map), _translate_id(gid, gid_map))
 
-    def _locate_layer_diff_dir(self, diff_id: str) -> "Path | None":
+    def _locate_layer_diff_dir(
+        self, diff_id: str, *, diff_ids: "list[str] | None" = None
+    ) -> "Path | None":
         """Find the raw overlay diff directory backing *diff_id* directly
         on disk (`<graphRoot>/overlay/<layer-id>/diff/`), bypassing
         `podman diff`/`podman save` entirely -- see
@@ -176,6 +178,10 @@ class _PodmanBackend(_ContainerBackendBase):
         digest hex -- confirmed empirically for `podman commit`-produced
         layers -- so the layers.json indirection is required, unlike a
         naive `overlay/<digest-hex>/diff` probe.)
+
+        *diff_ids* is accepted for API parity with `_DockerBackend` (whose
+        containerd-snapshotter path needs the full chain) and ignored
+        here -- Podman keys layers by DiffID alone via layers.json.
 
         Returns None for a missing/unexpected layers.json entry or a
         non-overlay storage driver -- the base class's caller treats

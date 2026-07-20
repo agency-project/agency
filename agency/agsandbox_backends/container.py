@@ -994,7 +994,9 @@ class _ContainerBackendBase(agsandbox_backend):
         )
         return json.loads(result.stdout.decode("utf-8", errors="replace"))
 
-    def _locate_layer_diff_dir(self, diff_id: str) -> "Path | None":
+    def _locate_layer_diff_dir(
+        self, diff_id: str, *, diff_ids: "list[str] | None" = None
+    ) -> "Path | None":
         """Find the raw, on-disk diff directory backing *diff_id* directly
         -- i.e. exactly the same data a `docker/podman commit` producing
         this layer already read to build it, reused here essentially for
@@ -1006,10 +1008,17 @@ class _ContainerBackendBase(agsandbox_backend):
         docs/agsandbox_backends/container.md's "Fast incremental
         squashing" section for the full rationale.
 
+        *diff_ids*, when provided, is the image's full RootFS.Layers list
+        (most-base-first) ending at *diff_id*. Some storage backends
+        (Docker's containerd overlayfs snapshotter) key layers by ChainID,
+        which is a function of that whole prefix -- not the tip DiffID
+        alone -- so the fold path always passes it; backends that only
+        need *diff_id* may ignore it.
+
         None by default -- this means reaching into a runtime's own
         undocumented internal storage layout, which is necessarily
-        runtime-specific (Docker's overlay2 graphdriver layout and
-        Podman's `containers/storage` layout are unrelated). Overridden
+        runtime-specific (Docker's overlay2 / containerd-overlayfs layouts
+        and Podman's `containers/storage` layout are unrelated). Overridden
         by `_DockerBackend` (`.docker`) and `_PodmanBackend` (`.podman`);
         returning None here means "no fast lookup available for this
         runtime," which `_fold_commit_into_accumulator()` treats as
@@ -1058,8 +1067,9 @@ class _ContainerBackendBase(agsandbox_backend):
         trusting stale or incomplete data.
         """
         try:
-            new_layer_digest = self._image_diff_ids(tag)[-1]
-            diff_dir = self._locate_layer_diff_dir(new_layer_digest)
+            diff_ids = self._image_diff_ids(tag)
+            new_layer_digest = diff_ids[-1]
+            diff_dir = self._locate_layer_diff_dir(new_layer_digest, diff_ids=diff_ids)
             if diff_dir is None:
                 self._invalidate_accumulator()
                 return

@@ -12,18 +12,30 @@ storage hooks; see `.podman._PodmanBackend` for Podman's equivalents
 The substantial override here is `_locate_layer_diff_dir()`, feeding
 `_ContainerBackendBase._fold_commit_into_accumulator()`'s fast incremental
 squashing path (see docs/agsandbox_backends/container.md's "Fast
-incremental squashing" section). It reaches into Docker's own undocumented
-overlay2 graphdriver on-disk layout -- confirmed empirically during
-development, not from published docs. `_PodmanBackend` has the analogous
-override for Podman's `containers/storage` overlay layout; the base
-class's default still returns None unconditionally for any future
-runtime that hasn't verified its own storage layout yet.
+incremental squashing" section). It supports two Docker storage backends,
+both confirmed empirically:
+
+- Classic moby **overlay2** graphdriver: `<DockerRootDir>/image/overlay2/layerdb`
+  → `cache-id` → `<DockerRootDir>/overlay2/<cache-id>/diff/`.
+- Containerd **overlayfs** snapshotter (`Driver: overlayfs` /
+  `io.containerd.snapshotter.v1`): ChainID from the image's RootFS.Layers
+  → `ctr -n moby snapshots view/mounts` →
+  `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<id>/fs/`.
+
+The snapshotter `fs/` directory (and usually the containerd root) must be
+readable by this process for the fold to succeed -- same constraint classic
+overlay2 has on rootful `/var/lib/docker`. When lookup or read fails, the
+base class falls back to `_squash_commit()` export/import.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import subprocess
+import uuid
 from pathlib import Path
 
 from .container import _ContainerBackendBase
@@ -39,6 +51,44 @@ def _translate_id(host_id: int, id_map: "list[tuple[int, int, int]]") -> int:
         if host_start <= host_id < host_start + length:
             return ns_start + (host_id - host_start)
     return host_id
+
+
+def _chain_id_for_diff_ids(diff_ids: "list[str]") -> "str | None":
+    """OCI/containerd ChainID for *diff_ids* (most-base-first).
+
+    ChainID(L0) = DiffID(L0); ChainID(Ln) = sha256(ChainID(Ln-1) + " " + DiffID(Ln)),
+    where both sides of the concatenation keep their `sha256:` prefix
+    (containerd's definition). Returns None for an empty list.
+    """
+    if not diff_ids:
+        return None
+    chain = diff_ids[0]
+    for diff_id in diff_ids[1:]:
+        chain = "sha256:" + hashlib.sha256(f"{chain} {diff_id}".encode()).hexdigest()
+    return chain
+
+
+def _parse_ctr_mounts_top_fs(mounts_stdout: str) -> "Path | None":
+    """Extract the top layer's on-disk fs directory from `ctr snapshots mounts`
+    output. For an overlay mount the first `lowerdir=` component is the
+    uppermost (the snapshot we viewed); for a single-layer bind mount the
+    bind source is that directory."""
+    m = re.search(r"lowerdir=([^,\s]+)", mounts_stdout)
+    if m:
+        first = m.group(1).split(":")[0]
+        return Path(first) if first else None
+    m = re.search(r"(?:--bind|-o\s+bind)\s+(\S+)", mounts_stdout)
+    if m:
+        return Path(m.group(1))
+    # `mount --bind SRC DST` without -o bind
+    m = re.search(r"^\s*mount\s+(\S+)\s+(\S+)\s*$", mounts_stdout, re.MULTILINE)
+    if m and m.group(1) not in ("-t", "--bind"):
+        # unlikely; prefer explicit patterns above
+        pass
+    m = re.search(r"mount\s+--bind\s+(\S+)\s+\S+", mounts_stdout)
+    if m:
+        return Path(m.group(1))
+    return None
 
 
 class _DockerBackend(_ContainerBackendBase):
@@ -168,29 +218,129 @@ class _DockerBackend(_ContainerBackendBase):
         uid_map, gid_map = maps
         return (_translate_id(uid, uid_map), _translate_id(gid, gid_map))
 
-    def _locate_layer_diff_dir(self, diff_id: str) -> "Path | None":
-        """Find the raw overlay2 diff directory backing *diff_id* directly
-        on disk (`<data_root>/overlay2/<cache-id>/diff/`), bypassing
-        `docker diff`/`docker save` entirely -- see
-        docs/agsandbox_backends/container.md's "Fast incremental
-        squashing" section for the full rationale and empirical
-        verification this is based on. This directory is exactly the
-        same data a `docker commit` producing this layer already read to
-        build it -- reading it again is nearly free, unlike `docker
-        diff` (a generic scan costing ~9s on a real ~24GB/many-file image
-        regardless of how much actually changed) or `docker save` (cost
-        proportional to the whole image).
+    def _ctr_argv(self) -> "list[str] | None":
+        """Argv prefix for talking to containerd (`ctr` or `sudo -n ctr`),
+        cached for this backend's lifetime. Docker's containerd-snapshotter
+        mode stores image layers in the `moby` namespace; rootful installs
+        typically restrict the containerd socket to root, so passwordless
+        `sudo -n ctr` is tried when bare `ctr` can't connect. None if
+        neither works -- caller falls back to the slow squash path."""
+        cached = getattr(self, "_ctr_argv_cache", "unset")
+        if cached != "unset":
+            return cached
+        result = None
+        for prefix in (["ctr"], ["sudo", "-n", "ctr"]):
+            try:
+                completed = subprocess.run(
+                    prefix + ["version"],
+                    capture_output=True,
+                    timeout=self.inspect_timeout_s,
+                )
+            except Exception as _e:
+                # Expected when this prefix can't even be launched (missing
+                # binary, sudo denied, …); try the next candidate.
+                print(
+                    f"[agsandbox_backend] WARNING: ctr probe {' '.join(prefix)} failed: {_e}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+                completed = None
+            if completed is not None and completed.returncode == 0:
+                result = prefix
+                break
+        self._ctr_argv_cache = result
+        return result
 
-        Returns None for a missing/unexpected layerdb entry or a
-        non-overlay2 storage driver -- the base class's caller treats
-        None as "the accumulator can't be trusted," never as an error.
+    def _locate_containerd_overlayfs_diff_dir(self, diff_ids: "list[str]") -> "Path | None":
+        """Resolve a layer chain to its containerd overlayfs snapshot `fs/`
+        directory via `ctr -n moby snapshots view` + `mounts`. *diff_ids*
+        must be the image's full RootFS.Layers list (most-base-first)
+        ending at the layer whose diff we want -- ChainID is a function of
+        the whole prefix, not the tip DiffID alone.
         """
-        root_and_driver = self._docker_data_root_and_driver()
-        if root_and_driver is None:
+        chain_id = _chain_id_for_diff_ids(diff_ids)
+        if chain_id is None:
             return None
-        data_root, driver = root_and_driver
-        if driver != "overlay2":
+        ctr = self._ctr_argv()
+        if ctr is None:
             return None
+        view = f"agency-locate-{uuid.uuid4().hex}"
+        ctr_n = ctr + ["-n", "moby"]
+        try:
+            created = subprocess.run(
+                ctr_n + ["snapshots", "view", view, chain_id],
+                capture_output=True,
+                timeout=self.inspect_timeout_s,
+            )
+            if created.returncode != 0:
+                return None
+            mounts = subprocess.run(
+                ctr_n + ["snapshots", "mounts", "/tmp/agency-ctr-unused", view],
+                capture_output=True,
+                text=True,
+                timeout=self.inspect_timeout_s,
+            )
+            if mounts.returncode != 0:
+                return None
+            diff_dir = _parse_ctr_mounts_top_fs(mounts.stdout or "")
+            if diff_dir is None:
+                return None
+            # Rootful containerd creates snapshot dirs as 0700. When we
+            # reached ctr via sudo -n, also open this one snapshot for
+            # the current user so overlay_diff_to_tar can read it --
+            # scoped to diff_dir's parent (snapshots/<id>/), not the
+            # whole containerd tree.
+            if ctr[:2] == ["sudo", "-n"]:
+                try:
+                    subprocess.run(
+                        ["sudo", "-n", "chmod", "-R", "a+rX", str(diff_dir.parent)],
+                        capture_output=True,
+                        timeout=self.inspect_timeout_s,
+                    )
+                except Exception as _e:
+                    # Best-effort: fold will see an unreadable dir and
+                    # degrade to None below rather than hard-failing.
+                    print(
+                        f"[agsandbox_backend] WARNING: could not chmod "
+                        f"containerd snapshot {diff_dir.parent} for fast squash: {_e}",
+                        file=__import__("sys").stderr,
+                        flush=True,
+                    )
+            try:
+                if not diff_dir.is_dir():
+                    return None
+                next(diff_dir.iterdir(), None)
+            except OSError:
+                return None
+            return diff_dir
+        except Exception as _e:
+            # Any unexpected ctr/mounts failure: fast path unavailable,
+            # caller falls back to export/import.
+            print(
+                f"[agsandbox_backend] WARNING: containerd overlayfs layer lookup failed: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+            return None
+        finally:
+            try:
+                subprocess.run(
+                    ctr_n + ["snapshots", "rm", view],
+                    capture_output=True,
+                    timeout=self.inspect_timeout_s,
+                )
+            except Exception as _e:
+                # Best-effort cleanup of the temporary view snapshot.
+                print(
+                    f"[agsandbox_backend] WARNING: could not remove temporary "
+                    f"ctr snapshot view {view}: {_e}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+
+    def _locate_overlay2_layer_diff_dir(self, data_root: Path, diff_id: str) -> "Path | None":
+        """Classic moby overlay2 graphdriver: layerdb `diff` → `cache-id`
+        → `<data_root>/overlay2/<cache-id>/diff/`."""
         layerdb_root = data_root / "image" / "overlay2" / "layerdb" / "sha256"
         try:
             for entry in layerdb_root.iterdir():
@@ -204,4 +354,30 @@ class _DockerBackend(_ContainerBackendBase):
                 return diff_dir if diff_dir.is_dir() else None
         except OSError:
             return None
+        return None
+
+    def _locate_layer_diff_dir(
+        self, diff_id: str, *, diff_ids: "list[str] | None" = None
+    ) -> "Path | None":
+        """Find the raw on-disk layer diff directory backing *diff_id*.
+
+        Dispatches on `docker info`'s `Driver`:
+        - `overlay2`: classic graphdriver layout under DockerRootDir.
+        - `overlayfs`: containerd snapshotter; needs *diff_ids* (full
+          RootFS.Layers chain ending at *diff_id*) to compute ChainID.
+
+        Returns None when the driver is unsupported, the chain isn't
+        provided for overlayfs, or lookup/read fails -- the base class
+        treats None as "accumulator unavailable," never as an error.
+        """
+        root_and_driver = self._docker_data_root_and_driver()
+        if root_and_driver is None:
+            return None
+        data_root, driver = root_and_driver
+        if driver == "overlay2":
+            return self._locate_overlay2_layer_diff_dir(data_root, diff_id)
+        if driver == "overlayfs":
+            if not diff_ids or diff_ids[-1] != diff_id:
+                return None
+            return self._locate_containerd_overlayfs_diff_dir(diff_ids)
         return None

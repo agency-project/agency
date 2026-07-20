@@ -23,7 +23,7 @@ This is why `images/build.sh` tags Podman's build `localhost/agency-sandbox:late
 
 ## Fast incremental squashing storage hooks
 
-`_PodmanBackend` overrides `_locate_layer_diff_dir()` and `_host_to_container_id()` for the shared fast checkpoint-squash path on `_ContainerBackendBase` (see [container.md](container.md)'s "Fast incremental squashing" section). The mechanics mirror `_DockerBackend`'s overlay2 hooks, but against Podman's `containers/storage` layout:
+`_PodmanBackend` overrides `_locate_layer_diff_dir()` and `_host_to_container_id()` for the shared fast checkpoint-squash path on `_ContainerBackendBase` (see [container.md](container.md)'s "Fast incremental squashing" section). The mechanics mirror `_DockerBackend`'s hooks, but against Podman's `containers/storage` layout:
 
-- **`_locate_layer_diff_dir(diff_id)`**: `podman info` → `store.graphRoot` / `store.graphDriverName` (must be `overlay`); then `<graphRoot>/overlay-layers/layers.json` entry whose `diff-digest` equals the inspect-reported layer digest → storage layer `id` → `<graphRoot>/overlay/<id>/diff/`.
+- **`_locate_layer_diff_dir(diff_id, *, diff_ids=None)`**: `podman info` → `store.graphRoot` / `store.graphDriverName` (must be `overlay`); then `<graphRoot>/overlay-layers/layers.json` entry whose `diff-digest` equals the inspect-reported layer digest → storage layer `id` → `<graphRoot>/overlay/<id>/diff/`. `diff_ids` is accepted for API parity with Docker's containerd path and ignored.
 - **`_host_to_container_id(uid, gid)`**: when `host.security.rootless` is true, reverse-maps through `host.idMappings` (`uidmap`/`gidmap`); identity otherwise.
