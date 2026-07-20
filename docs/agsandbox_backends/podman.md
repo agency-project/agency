@@ -20,3 +20,7 @@ This is why `images/build.sh` tags Podman's build `localhost/agency-sandbox:late
 ## Auto-selection priority
 
 `agsandbox_backends.base._auto_detect_runtime()`'s `"auto"` backend selection prefers **podman over docker** when both are usable (see [base.md](base.md)) — this is why `images/build.sh` builds for both runtimes, podman first, so a host with both installed doesn't end up auto-selecting a runtime with no local image built for it.
+
+## Fast squash: not yet implemented
+
+`_PodmanBackend` doesn't override `_locate_layer_diff_dir()` or `_host_to_container_id()` — see [container.md](container.md)'s "Fast incremental squashing" section and [docker.md](docker.md)'s "Fast squash internals" for what these do on the Docker side (reaching into Docker's own undocumented overlay2 graphdriver on-disk layout, which has no verified Podman equivalent; Podman uses a different storage backend, `containers/storage`). Inheriting `_ContainerBackendBase`'s safe generic defaults (`None` / identity) is completely safe here — it just means Podman stays on the slower export/import squash path (`_squash_commit()`) at every `checkpoint_squash_interval` boundary until someone verifies Podman's own storage layout and adds the equivalent overrides. Covered by `tests/agsandbox_backends/test_podman.py`'s `TestFastSquashHooksUseBaseDefaults`.
