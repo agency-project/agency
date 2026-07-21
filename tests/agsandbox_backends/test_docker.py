@@ -586,9 +586,10 @@ class TestDanglingImageEagerCleanup:
 
 
 class _FakeCompleted:
-    def __init__(self, stdout=b"", returncode=0):
+    def __init__(self, stdout=b"", returncode=0, stderr=b""):
         self.stdout = stdout
         self.returncode = returncode
+        self.stderr = stderr
 
 
 class TestCheckpointSquash:
@@ -1286,6 +1287,126 @@ class TestLocateLayerDiffDir:
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+
+
+class TestCtrArgv:
+    """Tests for _DockerBackend._ctr_argv()/_containerd_address() -- the
+    fix for rootless Docker's containerd-snapshotter mode reaching for
+    the wrong socket. Rootless Docker runs its own private per-user
+    containerd (reported via `docker info`'s Containerd.Address field),
+    never the system-wide /run/containerd/containerd.sock bare `ctr`
+    defaults to -- confirmed empirically: on a real rootless host, the
+    system socket stayed root-owned and permission-denied while the
+    daemon's own private socket (owned by the invoking user) worked.
+    """
+
+    def _sb(self):
+        return _make_sandbox()
+
+    def test_containerd_address_reads_docker_info_field(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        info = {"Containerd": {"Address": "/run/user/1000/docker/containerd/containerd.sock"}}
+        with patch.object(_mod._DockerBackend, "_docker_info", return_value=info):
+            assert (
+                sb._backend._containerd_address()
+                == "/run/user/1000/docker/containerd/containerd.sock"
+            )
+
+    def test_containerd_address_none_when_field_missing(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        with patch.object(_mod._DockerBackend, "_docker_info", return_value={}):
+            assert sb._backend._containerd_address() is None
+        with patch.object(_mod._DockerBackend, "_docker_info", return_value=None):
+            assert sb._backend._containerd_address() is None
+
+    def test_ctr_argv_passes_address_when_available(self):
+        """The probed argv must target the daemon's own containerd
+        socket via --address, not bare `ctr` (which would silently
+        default to the root-owned system socket)."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        address = "/run/user/1000/docker/containerd/containerd.sock"
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeCompleted(returncode=0)
+
+        with patch.object(_mod._DockerBackend, "_containerd_address", return_value=address):
+            with patch.object(_mod.subprocess, "run", side_effect=fake_run):
+                result = sb._backend._ctr_argv()
+
+        assert result == ["ctr", "--address", address]
+        assert calls == [["ctr", "--address", address, "version"]]
+
+    def test_ctr_argv_falls_back_to_sudo_with_address_when_bare_fails(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        address = "/run/containerd/containerd.sock"
+
+        def fake_run(args, **kwargs):
+            if args[:2] == ["sudo", "-n"]:
+                return _FakeCompleted(returncode=0)
+            return _FakeCompleted(returncode=1, stderr=b"permission denied")
+
+        with patch.object(_mod._DockerBackend, "_containerd_address", return_value=address):
+            with patch.object(_mod.subprocess, "run", side_effect=fake_run):
+                result = sb._backend._ctr_argv()
+
+        assert result == ["sudo", "-n", "ctr", "--address", address]
+
+    def test_ctr_argv_plain_ctr_when_no_address_reported(self):
+        """Older Docker or a runtime that doesn't expose Containerd.Address
+        must still fall back to bare `ctr` rather than erroring."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeCompleted(returncode=0)
+
+        with patch.object(_mod._DockerBackend, "_containerd_address", return_value=None):
+            with patch.object(_mod.subprocess, "run", side_effect=fake_run):
+                result = sb._backend._ctr_argv()
+
+        assert result == ["ctr"]
+        assert calls == [["ctr", "version"]]
+
+    def test_ctr_argv_none_when_nothing_works(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        with patch.object(_mod._DockerBackend, "_containerd_address", return_value=None):
+            with patch.object(
+                _mod.subprocess, "run", return_value=_FakeCompleted(returncode=1, stderr=b"nope")
+            ):
+                assert sb._backend._ctr_argv() is None
+
+    def test_ctr_argv_cached(self):
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeCompleted(returncode=0)
+
+        with patch.object(_mod._DockerBackend, "_containerd_address", return_value=None):
+            with patch.object(_mod.subprocess, "run", side_effect=fake_run):
+                first = sb._backend._ctr_argv()
+                second = sb._backend._ctr_argv()
+
+        assert first == second == ["ctr"]
+        assert len(calls) == 1
 
 
 class TestHostToContainerId:

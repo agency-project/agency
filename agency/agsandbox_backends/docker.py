@@ -20,7 +20,9 @@ both confirmed empirically:
 - Containerd **overlayfs** snapshotter (`Driver: overlayfs` /
   `io.containerd.snapshotter.v1`): ChainID from the image's RootFS.Layers
   → `ctr -n moby snapshots view/mounts` →
-  `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<id>/fs/`.
+  `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<id>/fs/`
+  (rootful) or the daemon's own private per-user containerd (rootless --
+  see `_ctr_argv()`/`_containerd_address()`).
 
 The snapshotter `fs/` directory (and usually the containerd root) must be
 readable by this process for the fold to succeed -- same constraint classic
@@ -145,6 +147,25 @@ class _DockerBackend(_ContainerBackendBase):
             )
             return None
 
+    def _containerd_address(self) -> "str | None":
+        """The containerd socket address this daemon itself is using, per
+        `docker info`'s `Containerd.Address` field. Rootless Docker runs
+        its own PRIVATE per-user containerd (e.g.
+        `/run/user/<uid>/docker/containerd/containerd.sock`, owned by the
+        invoking user) rather than the system-wide
+        `/run/containerd/containerd.sock` bare `ctr` dials by default --
+        confirmed empirically: on a rootless host, `docker info` reported
+        this private address while the system socket remained root-owned
+        and inaccessible without sudo. Reading the address straight from
+        the daemon means `ctr` always targets the SAME containerd this
+        Docker is actually using, rootless or not. None if `docker info`
+        doesn't expose it (older Docker, or a runtime with no such
+        field)."""
+        info = self._docker_info()
+        if info is None:
+            return None  # already warned in _docker_info()
+        return (info.get("Containerd") or {}).get("Address") or None
+
     def _is_rootless(self) -> bool:
         """True iff `docker info` reports the `rootless` security option
         -- the officially documented, supported way to detect this
@@ -245,17 +266,34 @@ class _DockerBackend(_ContainerBackendBase):
         return (_translate_id(uid, uid_map), _translate_id(gid, gid_map))
 
     def _ctr_argv(self) -> "list[str] | None":
-        """Argv prefix for talking to containerd (`ctr` or `sudo -n ctr`),
-        cached for this backend's lifetime. Docker's containerd-snapshotter
-        mode stores image layers in the `moby` namespace; rootful installs
-        typically restrict the containerd socket to root, so passwordless
-        `sudo -n ctr` is tried when bare `ctr` can't connect. None if
-        neither works -- caller falls back to the slow squash path."""
+        """Argv prefix for talking to containerd (`ctr`, optionally with
+        `--address` and/or `sudo -n`), cached for this backend's
+        lifetime. Docker's containerd-snapshotter mode stores image
+        layers in the `moby` namespace.
+
+        Bare `ctr` (no `--address`) defaults to the SYSTEM containerd
+        socket (`/run/containerd/containerd.sock`) -- wrong for rootless
+        Docker, which runs its own PRIVATE per-user containerd at a
+        different address (e.g. `/run/user/<uid>/docker/containerd/
+        containerd.sock`, owned by the invoking user) and was never
+        reachable through the system socket at all, confirmed
+        empirically: that socket stayed root-owned and permission-denied
+        regardless. `_containerd_address()` gives us the address this
+        daemon is actually using, so `--address` is passed explicitly
+        whenever `docker info` exposes it, covering rootless correctly
+        without needing sudo.
+
+        Rootful installs typically restrict THAT socket to root, so
+        passwordless `sudo -n ctr` is still tried as a fallback for that
+        case. None if nothing works -- caller falls back to the slow
+        squash path."""
         cached = getattr(self, "_ctr_argv_cache", "unset")
         if cached != "unset":
             return cached
+        address = self._containerd_address()
+        base = ["ctr", "--address", address] if address else ["ctr"]
         result = None
-        for prefix in (["ctr"], ["sudo", "-n", "ctr"]):
+        for prefix in (base, ["sudo", "-n"] + base):
             try:
                 completed = subprocess.run(
                     prefix + ["version"],
