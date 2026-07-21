@@ -1669,6 +1669,30 @@ class TestCheckpointAccumulator:
 
         sb = _make_sandbox()
 
+        # The fast accumulator path needs direct filesystem read access to
+        # docker's overlay2 layerdb -- some CI runners run dockerd as a
+        # separate user/service whose data root the test process itself
+        # can't read (confirmed: PermissionError on
+        # <data_root>/image/overlay2/layerdb/sha256), which forces every
+        # fold to invalidate and every squash to fall back to the slow
+        # export/import path -- not a regression in the mechanism itself,
+        # just an environment where it structurally can't be exercised.
+        # Skip rather than let the timing assertion below flap on a
+        # constraint this test has no control over.
+        root_and_driver = sb._backend._docker_data_root_and_driver()
+        if root_and_driver is not None:
+            data_root, driver = root_and_driver
+            if driver == "overlay2":
+                layerdb_root = data_root / "image" / "overlay2" / "layerdb" / "sha256"
+                try:
+                    next(layerdb_root.iterdir(), None)
+                except PermissionError:
+                    sb.destroy()
+                    pytest.skip(
+                        f"test process can't read {layerdb_root} (dockerd likely runs as a "
+                        "different user on this host) -- fast path structurally unavailable here"
+                    )
+
         base_layers_before = subprocess.run(
             ["docker", "inspect", "--format={{json .RootFS.Layers}}", "agency-sandbox:latest"],
             capture_output=True,

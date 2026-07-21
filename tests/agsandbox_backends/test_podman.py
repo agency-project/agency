@@ -414,9 +414,18 @@ class TestDanglingImageEagerCleanup:
         that on every cycle, not just squash cycles. Unverified against a
         real podman daemon in the environment this was written in (podman
         wasn't reachable there), but the underlying mechanism is shared,
-        runtime-agnostic code on `_ContainerBackendBase`."""
+        runtime-agnostic code on `_ContainerBackendBase`.
+
+        Uses agency-sandbox:latest, not a bare `alpine:latest` -- Podman's
+        `_resolve_image()` prefixes bare names with `localhost/` (see its
+        docstring), and a `localhost/alpine:latest` that was never actually
+        pulled/tagged locally makes Podman attempt a real network pull
+        against a registry literally named `localhost`, which fails outright
+        on any host without that exact local tag already present. The
+        already-locally-built `agency-sandbox:latest` used by the rest of
+        this file's real-daemon tests doesn't have that problem."""
         sb = _make_sandbox()
-        sb._backend._base_image = "alpine:latest"
+        sb._backend._base_image = "agency-sandbox:latest"
         try:
             sb.exec("echo one")
             sb.commit()  # checkpoint 1 (plain commit)
@@ -452,11 +461,17 @@ class TestDanglingImageEagerCleanup:
         this test (see its docstring for the full reasoning on why this is
         a narrower guarantee than the OLD design's "reclaims the WHOLE
         accumulated chain"). Unverified against a real podman daemon in the
-        environment this was written in (podman wasn't reachable there)."""
+        environment this was written in (podman wasn't reachable there).
+
+        Uses agency-sandbox:latest, not a bare `alpine:latest` -- see
+        test_real_plain_commit_cycle_cleans_up_previous_sibling's docstring
+        for why a bare name that resolves to `localhost/alpine:latest` via
+        Podman's `_resolve_image()` fails outright unless that exact tag was
+        already pulled locally."""
         import agency.agsandbox_backends.podman as _mod
 
         sb = _make_sandbox()
-        sb._backend._base_image = "alpine:latest"
+        sb._backend._base_image = "agency-sandbox:latest"
 
         def _dangling_ids():
             r = subprocess.run(
@@ -467,7 +482,12 @@ class TestDanglingImageEagerCleanup:
             return set(ln.strip() for ln in r.stdout.splitlines() if ln.strip())
 
         base_layers_before = subprocess.run(
-            ["podman", "inspect", "--format={{json .RootFS.Layers}}", "alpine:latest"],
+            [
+                "podman",
+                "inspect",
+                "--format={{json .RootFS.Layers}}",
+                "localhost/agency-sandbox:latest",
+            ],
             capture_output=True,
             text=True,
         ).stdout

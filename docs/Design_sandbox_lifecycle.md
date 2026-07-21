@@ -81,15 +81,19 @@ Before the next tool call `_ensure_started()` resumes or (re)creates the contain
 
 ```
 _ensure_started() (called lazily from exec())
-  ├─ container running?            → reuse (worker-reuse fast path; does NOT acquire the runtime slot)
-  ├─ container exists, not running (hibernating)?
+  (running, status) = _inspect_container_state()   # ONE docker/podman inspect call,
+                                                     # not two separate ones
+  ├─ running?                      → reuse (worker-reuse fast path; does NOT acquire the runtime slot)
+  ├─ status truthy, not running (hibernating)?
   │    _acquire_runtime_slot()        (blocks until a keyring slot is free)
-  │    docker/podman start <name>     (resume in place — the GPU was never released)
+  │    docker/podman start <name>     (resume in place — GPU re-acquired lazily on the next exec())
   └─ container absent entirely?
        _acquire_runtime_slot()        (blocks until a keyring slot is free)
        _lifecycle_image set → docker run from lifecycle image
        not set              → docker run from base_image (first tool call ever)
 ```
+
+`_inspect_container_state()` merges what used to be two separate `_container_running()`/`_container_status()` inspect round-trips into one (`{{.State.Running}}|{{.State.Status}}`), since `_ensure_started()` is the only caller that ever needs both facts together — `stop()`/`rm_container()`/`commit()`/`destroy()` still call the individual methods directly, since each only needs one fact.
 
 **Three states, not two.** The old invariant — "after `stop()` the container does not exist," so anything not running is a zombie to be force-removed before a fresh `run` — no longer holds. `rm_container()` still guarantees the container is gone afterward, but a merely-hibernated (`stop()`ped) container is *not* a zombie: it holds exactly the state the previous tool call left behind on its own writable layer, and `docker/podman start` resumes it in place at a fraction of the cost of a fresh `run`. A hibernating container found under this exact name is unambiguously this backend's own — container names embed `_RUN_ID` (a fresh UUID per process), so nothing else could have created one under it — there is no "leftover from someone else" case to force-remove here anymore. State is now preserved two different ways depending on which branch resumed the container: through the container's own writable layer (running → hibernating → running again, with no image involved at all), or through `_lifecycle_image` commits (absent → running, e.g. right after a skill-level `rm_container()`, or on a brand-new agent).
 
@@ -153,20 +157,30 @@ Every successful *skill* call (not tool call — `commit()` now runs at most onc
 docker commit <container> agency/lifecycle-<agname>
 ```
 
-When Docker retags an existing image, the old image loses its tag and becomes **dangling** — no name, not referenced by any container, but still occupying space in `/var/lib/docker/.../overlay2`. A container runtime refuses to delete an image while another image still depends on it as a parent (`docker rmi` fails with "has dependent child images"), and a plain commit's result is *always* a child of whatever it replaces — so **two consecutive plain-commit cycles can never free the first one's image**. This is an unavoidable property of layered images, not a bug: dangling images genuinely accumulate between squash points.
+When Docker retags an existing image, the old image loses its tag and becomes **dangling** — no name, not referenced by any container, but still occupying space in `/var/lib/docker/.../overlay2`, *unless* something deletes it. A container runtime refuses to delete an image while another image still depends on it as a parent (`docker rmi` fails with "has dependent child images") — under the OLD per-tool-call-teardown design, a plain commit's result WAS always a child of whatever it replaced (the container was recreated FROM each checkpoint), so two consecutive plain-commit cycles could never free the first one's image, and dangling images genuinely accumulated between squash points.
 
-**Squashing is what actually reclaims the space, not an eager per-checkpoint delete.** `commit()` doesn't even attempt an old-image lookup/delete on an ordinary plain-commit cycle — it's guaranteed to fail with "has dependent child images," so trying would only cost an extra `inspect`/`ps`/`rmi` round-trip and print a permanent, misleading warning on the vast majority of cycles. The lookup only runs when this cycle's commit also crossed `checkpoint_squash_max_depth` and triggered a squash: a squash's image is parentless — nothing in the runtime depends on the prior chain anymore — so the old (now fully superseded) chain's `docker rmi` finally succeeds, and removing it cascades to free every one of its now-unreferenced ancestor layers at once.
+**Under the hibernate model this no longer holds, and cleanup happens on every commit now, not just at squash points.** The container is never recreated between successful commits — only `rm_container()` does that, and only on skill failure — so `docker/podman commit` always diffs against the container's *fixed* `run`-time ancestor, never against whatever the previous commit produced. Confirmed empirically: two consecutive `commit()` calls on the same never-recreated container produce **sibling** images of identical depth (each capturing the container's full cumulative diff, not just what changed since the last commit), never a parent/child chain. Since the previous commit is never a parent of the new one, it's immediately safe to delete once the tag moves off it — `commit()` does exactly this now, on *every* cycle:
+
+```python
+# runs at the START of every commit() call, before the plain commit itself
+previous_image_id = ...  # whatever image the tag currently points to, if any
+# ... plain commit runs, moving the tag to a new image ...
+if previous_image_id and <no container still running from it>:
+    self._rmi(previous_image_id)       # best-effort — warns rather than raises on failure
+```
+
+This is separate from, and in addition to, the squash's own cleanup of the transient plain-commit image it superseded:
 
 ```python
 # only reached when this cycle's commit also crossed checkpoint_squash_max_depth
-old_image_id = ...  # the FULL prior chain's own image ID, captured before the squash
+old_image_id = ...  # THIS cycle's own plain-commit result, about to be replaced by the squash
 self._accumulator_squash_commit(tag)   # fast path, falls back to _squash_commit() (export/import)
 if old_image_id and <no container still running from it>:
     self._rmi(old_image_id)            # best-effort — warns rather than raises on failure
 ```
 
-- **Squash-triggered, not eager**: space is reclaimed in one lump sum at each squash point, not incrementally at every checkpoint.
-- **Best-effort**: the delete is skipped (not raised) if a container — e.g. a fork still running from that intermediate tag — is confirmed still using the old image; any other failure to check/delete just warns, since a stray dangling image costs disk space, not correctness.
+- **Continuous, not squash-triggered**: the previous-sibling cleanup above reclaims space on every successful commit, not just in one lump sum at squash points — a real change from the old design, where nothing could be reclaimed between squashes at all.
+- **Best-effort**: either delete is skipped (not raised) if a container — e.g. a fork still running from that exact tag — is confirmed still using the old image; any other failure to check/delete just warns, since a stray dangling image costs disk space, not correctness.
 - **No background thread needed**: the prune thread and `_PRUNE_INTERVAL_S` constant remain removed.
 
 `checkpoint_squash_max_depth` (default `100`) is a depth check on the chain's own actual layer count, not a fixed commit-count interval — a real base image was found to already carry 80 layers on its own, so a naive `base_depth + interval` count could cross the runtime's real cap before the interval ever fired. Squashing itself is triggered from inside `commit()` now (once per skill), rather than from the old per-tool-call `stop(commit=True)` — an earlier design also force-flattened the chain at every skill exit regardless of depth (`force_squash`), to guarantee bounded depth despite many uncontrolled per-tool-call commits landing at an arbitrary mid-chain point in between. That parameter no longer exists at all: since `commit()` now runs at most once per skill call, the depth check performed right after that one commit is sufficient on its own — there's nothing left for a forced, unconditional squash to guard against. See `agsandbox_backends/container.md`'s "Layer-depth squashing" and "Squashing and dangling images" sections for the full mechanism, including the fast incremental accumulator path (`_accumulator_squash_commit()`) that avoids re-serializing the whole image on every squash.
@@ -178,12 +192,12 @@ if old_image_id and <no container still running from it>:
 The old single `stop(commit, force_squash)` call bundled retry-and-raise behavior for both the optional commit and the removal into one method. Splitting it into three orthogonal operations split that behavior across them too:
 
 - **`stop()`** — a single `docker/podman stop` attempt, not retried at all: the sandbox's entrypoint is always `tail -f /dev/null`, which never handles `SIGTERM` gracefully, so a retry wouldn't change the outcome (only the grace period — already fixed at `0` — would, and retrying doesn't touch that). Releases the runtime slot only once `_container_running()` confirms the container is actually stopped, then **raises** the underlying exception if the `stop` call itself failed.
-- **`rm_container()`** — retries `docker/podman rm -f` up to `rm_retry_attempts` (3×) with a fixed backoff (`rm_retry_backoff_s`) between attempts. Releases both the runtime slot and the GPU only once `_container_running()` confirms the container is gone, then **raises** the last exception if every attempt failed — an unconfirmed removal means real resources (the keyring slot, the GPU) may still be held, which the caller must not silently ignore.
+- **`rm_container()`** — retries `docker/podman rm -f` up to `rm_retry_attempts` (3×) with a fixed backoff (`rm_retry_backoff_s`) between attempts. Releases the GPU only if it was actually held (`self._gpu_id is not None`, which is already `None` if a prior `stop()` released it) — self-guarding, since the GPU's own state variable tracks whether it's held. The runtime slot needs its own explicit guard: `had_container = self._container_running()` is captured *before* the rm attempt, and the slot is only released `if had_container and not self._container_running()` afterward. Without this, calling `rm_container()` on a container that's *already* hibernating (the normal skill-failure case — every prior tool call already hibernated it via `stop()`) would release the runtime slot a second time: `multiprocessing.Semaphore.release()` does not raise on over-release (unlike `threading.BoundedSemaphore`), so this was a real, previously-latent bug that silently over-credited the semaphore on every skill failure until it was found and fixed. Raises the last exception if every rm attempt failed — an unconfirmed removal means real resources (the keyring slot, the GPU) may still be held, which the caller must not silently ignore.
 - **`commit()`** — retries the plain `docker/podman commit` up to `commit_retry_attempts` (3×) with its own backoff (`commit_retry_backoff_s`), and **raises** the last exception if every attempt failed. Never removes or stops the container either way, so a failed commit only means this cycle's state wasn't checkpointed forward — nothing about the container's own liveness changes. A squash failure (fast accumulator path or the export/import fallback) is different: best-effort, warned rather than raised, since the plain commit that triggered the squash check already succeeded by that point.
 
 All three follow the same "don't release until ground truth agrees" pattern: a resource (the runtime slot, the GPU) is only released once `_container_running()` independently confirms the state the release assumes. This replaced an earlier version that emitted a `WARNING` to stderr after exhausting retries and then silently continued — visible in logs, but not actionable, since the caller had no way to know teardown hadn't actually succeeded.
 
-`destroy()` (called from `atexit`/`agSandbox.__del__` as a last-resort cleanup) follows the identical cleanup-then-raise shape as `rm_container()`: it attempts every remaining step (the GPU-release check, checkpoint-image deletion) regardless of an earlier failure, then raises the `rm` failure, if any, at the end. A raise there is caught and logged by the atexit wrapper, not fatal, so raising is safe even in that path. Non-critical steps — the old-image inspect/delete after a squash, and `destroy()`'s checkpoint-image cleanup — remain best-effort (`WARNING` and continue), since a stray dangling image costs disk space, not correctness.
+`destroy()` (called from `atexit`/`agSandbox.__del__` as a last-resort cleanup) now literally calls `self.rm_container()` for removal, rather than keeping its own separate copy of the retry-and-release logic — the duplication used to exist because the old combined `stop()` raised immediately on failure, but `rm_container()` doesn't need that workaround, and keeping a second copy in sync was exactly how the double-release bug above went unnoticed. `destroy()` wraps that call in a try/except so it still runs its own remaining steps regardless — a best-effort courtesy kill of `_watched_pids` beforehand (rm_container() doesn't do this; destroy() may be called on a sandbox that never went through a normal `stop()` first), and checkpoint-image/accumulator-dir cleanup afterward — then raises the `rm` failure, if any, at the end. A raise there is caught and logged by the atexit wrapper, not fatal, so raising is safe even in that path. The checkpoint-image cleanup remains best-effort (`WARNING` and continue), since a stray dangling image costs disk space, not correctness.
 
 ---
 
