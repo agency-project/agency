@@ -442,35 +442,33 @@ def _amd_render_node_paths() -> "list[str]":
         return _amd_render_node_paths_cache
 
 
-def _gpu_flags(runtime: str, gpu_reserved: bool) -> list[str]:
+def _gpu_flags(runtime: str) -> list[str]:
     """Return GPU passthrough flags for *runtime* ("docker" or "podman").
 
-    Attaches EVERY GPU on the host once *gpu_reserved* is true (this
-    sandbox called reserve_gpu()) -- not just the specific id currently
-    held in self._gpu_id. This is deliberate: `docker/podman run` is the
-    only point these flags are ever set (neither runtime supports
-    hot-attaching a device to an already-created container), but
-    stop()/start() (hibernate) now releases and re-acquires the physical
-    GPU semaphore between tool calls, and a resumed container can end up
-    holding a *different* gpu_id than it started with. Attaching every
-    GPU up front means that never requires recreating the container --
-    resuming an existing one is always enough, regardless of which
-    physical GPU is currently assigned. A sandbox that hasn't reserved a
-    GPU at all still gets zero GPU devices, so the common (non-GPU) case
-    is unaffected.
+    Attaches EVERY GPU on the host to EVERY container, regardless of
+    whether reserve_gpu() has been called on the owning sandbox --
+    `docker/podman run` is the only point these flags are ever set
+    (neither runtime supports hot-attaching a device to an
+    already-created container), so gating on `_gpu_virtual` at creation
+    time meant a container first created (e.g. via a bash/read_file/
+    write_file call) before reserve_gpu() ran was permanently stuck
+    without device access for its entire lifetime -- reserve_gpu() could
+    flip the sandbox's own flag, but nothing could retroactively attach
+    the device to the already-running container. Attaching unconditionally
+    removes that ordering dependency entirely: it no longer matters
+    whether reserve_gpu() is called before or after the first exec().
 
-    TRADE-OFF, accepted deliberately: this removes the hardware-level
-    half of GPU isolation for any sandbox that HAS reserved a GPU.
-    CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES (set in base.py's exec(),
-    still readonly-exported so a command can't hijack a different GPU by
-    reassigning the variable inline) becomes the ONLY restriction keeping
-    that sandbox off other GPUs -- nothing stops code running inside it
-    from opening another GPU's device node directly and ignoring the env
-    var entirely. Only safe when the sandboxed code is trusted not to do
-    that on purpose; a genuinely adversarial-code use case would need the
-    old scoped-to-one-device attachment back, at the cost of a full
-    recreate (commit + rm_container + run, not just stop()/start()) on
-    every GPU release/re-acquire cycle instead.
+    This is safe because CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES (set in
+    base.py's exec(), readonly-exported so a command can't hijack a
+    different GPU by reassigning the variable inline) is the ONLY access
+    control point by design -- a sandbox that hasn't called reserve_gpu()
+    gets "NoDevFiles" and sees no GPU regardless of what's attached at the
+    container level. Nothing stops code running inside a container from
+    opening another GPU's device node directly and ignoring the env var
+    entirely; this was already true for any sandbox that HAD reserved a
+    GPU even under the old gpu_reserved-gated design, so unconditional
+    attachment does not weaken isolation for the trusted-code case this
+    is meant for.
 
     NVIDIA: Docker ``--gpus all``; Podman ``--device nvidia.com/gpu=all``
       (CDI). Podman does not understand Docker's ``--gpus`` flag: it
@@ -484,11 +482,8 @@ def _gpu_flags(runtime: str, gpu_reserved: bool) -> list[str]:
       ``/dev/dri/renderD*`` node found -- there's no single "all" flag for
       ROCm the way ``--gpus all``/CDI ``=all`` covers NVIDIA, so each
       render node is attached explicitly.
-    CPU-only hosts, and sandboxes that haven't reserved a GPU, get no
-    flags at all.
+    CPU-only hosts get no flags at all (no GPUs to attach).
     """
-    if not gpu_reserved:
-        return []
     kind = _gpu_kind(runtime)
     if kind == "none":
         return []
@@ -870,16 +865,18 @@ class _ContainerBackendBase(agsandbox_backend):
                 self._baseline_pids = self._snapshot_pids_started()
             return
         # Acquire the physical GPU (if reserve_gpu was called) before the
-        # container is created, not just in exec() -- the container's GPU
-        # device flags are fixed at `docker/podman run` time, and this method
-        # can be reached first via read_file()/write_file() rather than
-        # exec(), so exec()'s own lazy acquire (base.py) can't be relied on
-        # to have already run. Guarded by `self._gpu_id is None` the same way
+        # container is created, not just in exec() -- this method can be
+        # reached first via read_file()/write_file() rather than exec(), so
+        # exec()'s own lazy acquire (base.py) can't be relied on to have
+        # already run. Guarded by `self._gpu_id is None` the same way
         # exec()'s does, so whichever entry point gets here first acquires it
-        # exactly once.
+        # exactly once. Note this only affects which physical GPU
+        # CUDA_VISIBLE_DEVICES points at -- _gpu_flags() below attaches every
+        # GPU device to the container unconditionally, so it no longer
+        # matters whether this runs before or after reserve_gpu().
         if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
             self._gpu_id = self._gpu_acquire_fn()
-        gpu_flags = _gpu_flags(self._runtime, self._gpu_virtual)
+        gpu_flags = _gpu_flags(self._runtime)
         self._acquire_runtime_slot()
         try:
             if self._checkpoint_image is not None:
@@ -1516,9 +1513,9 @@ class _ContainerBackendBase(agsandbox_backend):
 
         Releasing the GPU here (rather than holding it for the container's
         whole life) is safe ONLY because `_gpu_flags()` attaches EVERY GPU
-        on the host to a GPU-reserving container at `run` time, not just
-        the one currently assigned -- so a resumed container can be handed
-        a *different* physical GPU than it had before hibernating without
+        on the host to every container at `run` time, not just the one
+        currently assigned -- so a resumed container can be handed a
+        *different* physical GPU than it had before hibernating without
         ever needing to be recreated (`docker/podman start` can't change a
         container's device attachment; neither runtime supports hot-
         attaching one). The actual restriction to one GPU at a time is

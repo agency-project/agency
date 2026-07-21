@@ -883,21 +883,23 @@ class TestOwnHostPidsPodman:
 
 
 # ---------------------------------------------------------------------------
-# _gpu_flags(runtime, gpu_reserved) -- regression coverage for:
+# _gpu_flags(runtime) -- regression coverage for:
 # (1) Docker's ``--gpus all`` was used unconditionally for Podman too. Podman
 #     accepts that flag without erroring but never mounts the NVIDIA
 #     driver/devices for it, so a container started that way silently has
 #     zero GPU access.
-# (2) A sandbox that never reserves a GPU at all (reserve_gpu() never called)
-#     must still get zero GPU devices mounted -- gpu_reserved=False.
-# EVERY GPU on the host is attached once gpu_reserved is True -- not just the
-# one currently leased in self._gpu_id -- deliberately, so stop()/start()
-# (hibernate) can release and re-acquire a *different* physical GPU between
-# tool calls without ever needing to recreate the container (neither runtime
-# supports hot-attaching a device to an already-created container). The
-# accepted trade-off: CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES becomes the
-# ONLY restriction keeping a GPU-reserving sandbox off other GPUs -- see
-# _gpu_flags()'s docstring in container.py for the full reasoning.
+# (2) A container created (e.g. via a bash/read_file/write_file call) before
+#     reserve_gpu() was ever called on its sandbox got zero GPU devices at
+#     `docker/podman run` time, and neither runtime supports hot-attaching a
+#     device afterward -- so that container was permanently stuck without
+#     GPU access even after reserve_gpu() ran. EVERY GPU on the host is now
+#     attached to EVERY container unconditionally, regardless of
+#     reserve_gpu() state, removing that ordering dependency entirely (and,
+#     as a side effect, still letting stop()/start() hand a resumed
+#     container a *different* physical GPU without recreating it). The
+#     accepted trade-off: CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES becomes
+#     the ONLY restriction keeping a GPU-reserving sandbox off other GPUs --
+#     see _gpu_flags()'s docstring in container.py for the full reasoning.
 # No real docker/podman required here -- detect_gpus()/shutil.which() are
 # mocked, and /dev/dri is faked via a real tmp directory for the AMD branch.
 # ---------------------------------------------------------------------------
@@ -911,22 +913,15 @@ class TestGpuFlagsPerRuntime:
         _container._gpu_kind_cache.clear()
         _container._amd_render_node_paths_cache = None
 
-    def test_gpu_not_reserved_returns_empty_for_both_runtimes(self):
-        """No GPU reserved -- zero GPU devices exposed, regardless of what
-        the host actually has (detect_gpus() isn't even consulted)."""
-        with patch.object(_container, "detect_gpus", return_value=[0, 1]):
-            assert _container._gpu_flags("docker", False) == []
-            assert _container._gpu_flags("podman", False) == []
-
     def test_no_gpu_detected_returns_empty_for_both_runtimes(self):
         with patch.object(_container, "detect_gpus", return_value=[]):
-            assert _container._gpu_flags("docker", True) == []
-            assert _container._gpu_flags("podman", True) == []
+            assert _container._gpu_flags("docker") == []
+            assert _container._gpu_flags("podman") == []
 
     def test_docker_attaches_all_gpus_for_nvidia(self):
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
             with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                assert _container._gpu_flags("docker", True) == ["--gpus", "all"]
+                assert _container._gpu_flags("docker") == ["--gpus", "all"]
 
     def test_podman_attaches_all_gpus_via_cdi_not_docker_syntax(self):
         """The original regression: Podman must NOT get Docker's --gpus flag
@@ -936,15 +931,15 @@ class TestGpuFlagsPerRuntime:
         even on PATH), so it needs the CDI device syntax instead."""
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
             with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                flags = _container._gpu_flags("podman", True)
+                flags = _container._gpu_flags("podman")
         assert flags == ["--device", "nvidia.com/gpu=all"]
         assert "--gpus" not in flags
 
     def test_docker_and_podman_flags_differ_for_nvidia(self):
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
             with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                docker_flags = _container._gpu_flags("docker", True)
-                podman_flags = _container._gpu_flags("podman", True)
+                docker_flags = _container._gpu_flags("docker")
+                podman_flags = _container._gpu_flags("podman")
         assert docker_flags != podman_flags
         assert docker_flags == ["--gpus", "all"]
         assert podman_flags == ["--device", "nvidia.com/gpu=all"]
@@ -969,8 +964,8 @@ class TestGpuFlagsPerRuntime:
                     with patch.object(
                         _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
                     ):
-                        docker_flags = _container._gpu_flags("docker", True)
-                        podman_flags = _container._gpu_flags("podman", True)
+                        docker_flags = _container._gpu_flags("docker")
+                        podman_flags = _container._gpu_flags("podman")
         expected = [
             "--device",
             "/dev/kfd",
@@ -996,7 +991,7 @@ class TestGpuFlagsPerRuntime:
                     with patch.object(
                         _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
                     ):
-                        flags = _container._gpu_flags("docker", True)
+                        flags = _container._gpu_flags("docker")
         assert flags == ["--device", "/dev/kfd", "--device", str(dri / "renderD128")]
 
     def test_rocm_flags_use_pci_bus_ordering_when_available(self, tmp_path):
@@ -1020,7 +1015,7 @@ class TestGpuFlagsPerRuntime:
                     with patch.object(
                         _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
                     ):
-                        flags = _container._gpu_flags("docker", True)
+                        flags = _container._gpu_flags("docker")
         assert flags == [
             "--device",
             "/dev/kfd",
@@ -1049,6 +1044,54 @@ class TestGpuFlagsPerRuntime:
             )
         gpu_flags_mock.assert_not_called()
         assert "_gpu_flags" not in vars(sb)
+
+
+class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
+    """Regression coverage for the bug this fixes: _gpu_flags() used to be
+    gated on `self._gpu_virtual` (whether reserve_gpu() had been called
+    *before* the container was created), so a container created via a first
+    bash/read_file/write_file call before reserve_gpu() ran was permanently
+    stuck without GPU device access -- reserve_gpu() could flip the
+    sandbox's own flag afterward, but neither docker nor podman can
+    hot-attach a device to an already-running container. `_gpu_flags()` is
+    now called unconditionally, so the `docker/podman run` invocation must
+    include GPU flags even when `_gpu_virtual` is still False at the moment
+    the container is actually created."""
+
+    def _sb(self):
+        from agency.agsandbox_backends.podman import _PodmanBackend
+
+        return _PodmanBackend(
+            "agent",
+            name="podman-gpu-order-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=None,
+        )
+
+    def test_run_cmd_includes_gpu_flags_when_container_created_before_reserve_gpu(self):
+        sb = self._sb()
+        assert sb._gpu_virtual is False  # reserve_gpu() has NOT been called yet
+
+        with patch.object(_container, "_gpu_flags", return_value=["--device", "sentinel"]) as gf:
+            with patch.object(sb, "_inspect_container_state", return_value=(False, "")):
+                with patch.object(sb, "_acquire_runtime_slot"):
+                    with patch.object(sb, "_resolve_image", return_value="img"):
+                        with patch.object(sb, "_cfs_supported", return_value=False):
+                            with patch.object(sb, "_run_with_conflict_retry") as run_retry:
+                                with patch.object(sb, "_run"):
+                                    with patch.object(
+                                        sb, "_snapshot_pids_started", return_value=set()
+                                    ):
+                                        sb._ensure_started()
+
+        gf.assert_called_once_with(sb._runtime)
+        run_cmd = run_retry.call_args_list[0].args[0]
+        assert "--device" in run_cmd and "sentinel" in run_cmd, (
+            f"expected GPU flags in the run command even though reserve_gpu() was never "
+            f"called before container creation: {run_cmd}"
+        )
 
 
 def _host_rocm_available() -> bool:
@@ -1132,18 +1175,19 @@ class TestAmdRenderNodeLiveHardware:
         assert len(set(render_nodes)) == len(render_nodes)
 
     @rocm_hardware
-    def test_gpu_flags_attach_every_real_render_node_when_reserved(self):
-        """_gpu_flags() no longer scopes to a single gpu_id -- it attaches
-        every render node _amd_render_node_paths() resolves once a GPU is
-        reserved at all, so the hibernate model can hand a resumed container
-        a different physical GPU without recreating it (see _gpu_flags()'s
-        docstring in container.py)."""
+    def test_gpu_flags_attach_every_real_render_node(self):
+        """_gpu_flags() attaches every render node _amd_render_node_paths()
+        resolves unconditionally -- both so the hibernate model can hand a
+        resumed container a different physical GPU without recreating it,
+        and so a container created before reserve_gpu() is ever called
+        still gets device access (see _gpu_flags()'s docstring in
+        container.py)."""
         _container._gpu_kind_cache.clear()
         _container._amd_render_node_paths_cache = None
         bus_by_gpu_id = self._ground_truth_bus_by_gpu_id()
         assert bus_by_gpu_id, "expected at least one real AMD GPU"
 
-        flags = _container._gpu_flags("docker", True)
+        flags = _container._gpu_flags("docker")
         assert flags[:2] == ["--device", "/dev/kfd"]
         device_flags = flags[2:]
         assert device_flags[::2] == ["--device"] * len(bus_by_gpu_id), (
@@ -1159,10 +1203,6 @@ class TestAmdRenderNodeLiveHardware:
                 f"gpu_id={gpu_id}: _gpu_flags() attached {device_paths[gpu_id]} "
                 f"(bus={actual_bus}), but rocm-smi says GPU {gpu_id} is on bus {expected_bus}"
             )
-
-        assert _container._gpu_flags("docker", False) == [], (
-            "a sandbox that never reserved a GPU must get zero devices attached"
-        )
 
 
 def _podman_available() -> bool:
@@ -1207,7 +1247,7 @@ class TestPodmanGpuPassthroughIntegration:
 
     @podman_gpu
     def test_nvidia_smi_inside_a_real_podman_container_sees_the_gpus(self):
-        flags = _container._gpu_flags("podman", True)
+        flags = _container._gpu_flags("podman")
         assert flags, "expected non-empty GPU flags on a host with a real GPU"
         result = subprocess.run(
             ["podman", "run", "--rm", *flags, self.IMAGE, "nvidia-smi", "-L"],
@@ -1442,7 +1482,7 @@ class TestDockerGpuPassthroughIntegration:
 
     @docker_gpu
     def test_nvidia_smi_inside_a_real_docker_container_sees_the_gpus(self):
-        flags = _container._gpu_flags("docker", True)
+        flags = _container._gpu_flags("docker")
         assert flags, "expected non-empty GPU flags on a host with a real GPU"
         result = subprocess.run(
             ["docker", "run", "--rm", *flags, self.IMAGE, "nvidia-smi", "-L"],
