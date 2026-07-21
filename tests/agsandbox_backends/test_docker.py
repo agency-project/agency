@@ -169,7 +169,7 @@ class TestOwnerPidLabel:
 
 
 class TestDanglingImageEagerCleanup:
-    """Tests for the eager old-image deletion in stop(commit=True)."""
+    """Tests for the eager old-image deletion in commit()."""
 
     def test_no_prune_thread(self):
         """No background agsandbox-prune thread should exist after the refactor."""
@@ -177,11 +177,13 @@ class TestDanglingImageEagerCleanup:
         assert not named, "agsandbox-prune thread should have been removed"
 
     def test_stop_commit_deletes_old_image(self):
-        """stop(commit=True) must delete the image that previously held the
-        tag -- only possible on a squash cycle (a plain commit's result is
-        always a child of the old image, so the runtime refuses to delete
-        it; old_image_id is only looked up at all when this cycle squashes,
-        see container.py's stop())."""
+        """commit() must delete the image that previously held the tag --
+        only possible on a squash cycle (a plain commit's result is always a
+        child of the old image, so the runtime refuses to delete it;
+        old_image_id is only looked up at all when this cycle squashes, see
+        container.py's commit()). checkpoint_squash_max_depth is patched
+        down to 1 to force this cycle to squash without needing a real
+        deep chain."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
@@ -196,7 +198,9 @@ class TestDanglingImageEagerCleanup:
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             run_calls.append(args)
-            if "inspect" in args:
+            if "--format={{json .RootFS.Layers}}" in args:
+                return FakeCompleted(stdout=b'["sha256:layer0"]')
+            if "--format={{.Id}}" in args:
                 return FakeCompleted(stdout=fake_old_id.encode())
             if "commit" in args:
                 return FakeCompleted()
@@ -206,10 +210,11 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.commit()
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert rmi_calls, "expected docker rmi call for old image"
@@ -232,30 +237,34 @@ class TestDanglingImageEagerCleanup:
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             run_calls.append(args)
-            if "inspect" in args:
+            if "--format={{json .RootFS.Layers}}" in args:
+                return FakeCompleted(stdout=b'["sha256:layer0"]')
+            if "--format={{.Id}}" in args:
                 return FakeCompleted(stdout=b"", returncode=1)  # tag not found
             return FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.commit()
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
 
-    def test_plain_commit_cycle_skips_old_image_lookup_entirely(self):
-        """A plain commit's result is ALWAYS a child of whatever it
-        replaces -- the runtime will refuse to delete that old image no
-        matter what, so there's no point even looking it up. A non-squash
-        stop(commit=True) must issue zero old-image-lookup/ps/rmi calls
-        (the doomed-to-fail cleanup this test originally guarded against),
-        even though it now also does a `docker inspect ...RootFS.Layers`
-        call for the diff accumulator AND the depth check (see
-        TestCheckpointAccumulator/TestCheckpointSquash) -- those inspects
-        are for different purposes and are expected here. A shallow,
+    def test_plain_commit_cycle_with_no_previous_image_skips_ps_and_rmi(self):
+        """commit() now looks up whatever image the tag currently points to
+        on EVERY cycle (step 0), not just squash cycles -- under the
+        hibernate model, successive commits on the same never-recreated
+        container are siblings, not parent/child, so the previous tag
+        image is always safe to reclaim once the tag moves off it (see
+        container.md's "Squashing and dangling images"). But when there's
+        no previous image at all (the tag doesn't exist yet -- this
+        sandbox's first-ever commit), there's nothing to check or delete,
+        so the `ps`/`rmi` follow-up calls must still be skipped. A shallow,
         far-below-max-depth chain keeps the depth check itself from
-        triggering a squash."""
+        triggering a squash, so the squash-specific old-image lookup (step
+        3) also never runs here."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
@@ -265,21 +274,22 @@ class TestDanglingImageEagerCleanup:
             calls.append(list(args))
             if "--format={{json .RootFS.Layers}}" in args:
                 return _FakeCompleted(stdout=json.dumps(["sha256:layer0"]).encode())
+            if "--format={{.Id}}" in args:
+                return _FakeCompleted(stdout=b"", returncode=1)  # tag not found yet
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
+            with patch.object(sb._backend, "_container_status", return_value="running"):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)
+                    sb.commit()
 
-        assert not any("--format={{.Id}}" in c for c in calls), (
-            f"must not do the old-image-lookup inspect on a plain commit: {calls}"
-        )
+        id_lookups = [c for c in calls if "--format={{.Id}}" in c]
+        assert id_lookups, "step 0 must still look up the tag's current image every cycle"
         assert not any("ps" in c for c in calls), (
-            f"must not check ancestor on a plain commit: {calls}"
+            f"must not check ancestor when there was no previous image: {calls}"
         )
         assert not any("rmi" in c for c in calls), (
-            f"must not attempt rmi on a plain commit: {calls}"
+            f"must not attempt rmi when there was no previous image: {calls}"
         )
 
     def test_stop_commit_rmi_failure_is_best_effort(self):
@@ -288,9 +298,9 @@ class TestDanglingImageEagerCleanup:
         Per Design_sandbox_lifecycle.md's "Dangling image accumulation and
         eager cleanup" section, this rmi is best-effort: a race with another
         agent's inspect/rmi (or a fork still using the image) is expected and
-        should leave a dangling image rather than crash stop() — which runs
-        after every tool call, so a hard failure here would be far worse than
-        the disk-space cost of an occasional dangling image."""
+        should leave a dangling image rather than crash commit() — which is
+        called once per skill, so a hard failure here would be far worse
+        than the disk-space cost of an occasional dangling image."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
@@ -302,7 +312,9 @@ class TestDanglingImageEagerCleanup:
                 self.returncode = returncode
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
-            if "inspect" in args:
+            if "--format={{json .RootFS.Layers}}" in args:
+                return FakeCompleted(stdout=b'["sha256:layer0"]')
+            if "--format={{.Id}}" in args:
                 return FakeCompleted(stdout=fake_old_id.encode())
             if "rmi" in args:
                 raise RuntimeError("image in use")
@@ -312,28 +324,35 @@ class TestDanglingImageEagerCleanup:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(_mod._DockerBackend, "_run", fake_run):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True, force_squash=True)  # must not raise
+            with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+                with patch.object(_mod._DockerBackend, "_run", fake_run):
+                    with patch.object(sb._backend, "_container_status", return_value="running"):
+                        with patch.object(sb._backend, "_gpu_virtual", False):
+                            sb.commit()  # must not raise
         finally:
             sys.stderr = old_stderr
 
         assert "WARNING" in captured.getvalue()
         assert fake_old_id in captured.getvalue()
 
-    def test_old_image_ancestor_check_runs_after_container_removal(self):
-        """Regression test: the ancestor-based "is the old image still in
-        use" check must run AFTER `_rm_container`, not before. This
-        container was itself `run` FROM the old image (restart-from-
-        checkpoint), so checking before removal always finds THIS SAME
-        container as a false-positive "still in use" match and never
-        actually deletes anything -- a real, pre-existing bug confirmed
-        live against a real docker daemon (see docs/agsandbox_backends/
-        container.md's "Layer-depth squashing" section for how this
-        surfaced). Only reachable on a squash cycle -- old_image_id is
-        only looked up then (a plain commit's result can never actually
-        free its parent, so there's no point checking)."""
+    def test_old_image_ancestor_checks_run_via_ps_then_rmi(self):
+        """The ancestor-based "is the old image still in use" check must
+        run via `ps` then `rmi`, in that order -- twice per cycle when a
+        squash is due, once for step 0's previous-tag-image cleanup (which
+        now runs on every cycle, before the plain commit) and once for the
+        squash's own superseded-plain-commit cleanup (step 3, after the
+        squash). Under the OLD design, stop(commit=True) bundled a
+        container remove+recreate into the same call, so this check had to
+        run AFTER that internal removal (otherwise it always found THIS
+        SAME container as a false-positive "still in use" match) -- a real,
+        pre-existing bug confirmed live against a real docker daemon (see
+        docs/agsandbox_backends/container.md's "Layer-depth squashing"
+        section). Under the NEW design, commit() never removes the
+        container at all (see its docstring: "it keeps running (or stays
+        hibernating)"), so there is no `rm` call here to order against any
+        more -- the container's own `run`-time ancestor is whatever
+        checkpoint it was created from, not either cycle's just-superseded
+        image, so the ancestor check simply never matches it."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
@@ -346,7 +365,9 @@ class TestDanglingImageEagerCleanup:
                 self.returncode = returncode
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
-            if "inspect" in args:
+            if "--format={{json .RootFS.Layers}}" in args:
+                return FakeCompleted(stdout=b'["sha256:layer0"]')
+            if "--format={{.Id}}" in args:
                 return FakeCompleted(stdout=fake_old_id.encode())
             if "rm" in args:
                 call_order.append("rm")
@@ -359,67 +380,42 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.commit()
 
-        assert call_order == ["rm", "ps", "rmi"], f"expected rm before ps/rmi, got {call_order}"
-
-    def test_old_image_cleanup_skipped_when_rm_fails(self):
-        """If _rm_container never succeeds, the container may genuinely
-        still be running from the old image -- skip the ancestor check
-        entirely rather than spending a docker call to reconfirm what
-        rm's own failure already implies."""
-        import agency.agsandbox_backends.docker as _mod
-
-        sb = _make_sandbox()
-        fake_old_id = "sha256:deadbeef0001"
-        ps_or_rmi_called = []
-
-        class FakeCompleted:
-            def __init__(self, stdout=b"", returncode=0):
-                self.stdout = stdout
-                self.returncode = returncode
-
-        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
-            if "inspect" in args:
-                return FakeCompleted(stdout=fake_old_id.encode())
-            if "rm" in args:
-                raise RuntimeError("rm failed")
-            if "ps" in args or "rmi" in args:
-                ps_or_rmi_called.append(list(args))
-            return FakeCompleted()
-
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    with pytest.raises(RuntimeError):
-                        sb.stop(commit=True)
-
-        assert ps_or_rmi_called == []
+        assert "rm" not in call_order, (
+            f"commit() must never call rm -- it never removes the container: {call_order}"
+        )
+        assert call_order == ["ps", "rmi", "ps", "rmi"], (
+            f"expected ps-then-rmi for step 0's previous-image cleanup, then again for "
+            f"the squash's own superseded-commit cleanup, got {call_order}"
+        )
 
     @docker
-    def test_real_plain_commit_cycle_cannot_delete_its_parent(self):
-        """A plain commit's result is a DIFF layer on top of whatever it
-        replaces -- docker refuses to delete an image while a dependent
-        child image still exists ("has dependent child images"), so two
-        consecutive plain-commit cycles can NEVER free the first one's
-        image. This is a real, unavoidable docker constraint, not a bug:
-        confirmed live during development (see docs/agsandbox_backends/
-        container.md's "Layer-depth squashing" section) -- asserting it
-        explicitly here so it reads as an intentional, understood
-        limitation rather than something a future change accidentally
-        "fixes" into an infinite retry loop. stop() now skips even
-        attempting the old-image lookup/delete on a plain-commit cycle
-        (it's guaranteed to fail, so there's no point trying), so this
-        test only checks the end state -- the old image genuinely
-        surviving -- not that a delete was attempted and failed."""
+    def test_real_plain_commit_cycle_cleans_up_previous_sibling(self):
+        """commit() never removes or recreates the container (see its
+        docstring: "it keeps running (or stays hibernating)") -- so two
+        consecutive plain commit() calls on the SAME never-recreated
+        container each just re-snapshot that one container's own writable
+        layer as a fresh base+1 image (confirmed empirically: repeated
+        `docker commit` on a container that was never removed/recreated
+        always yields images of the SAME depth, never chained onto each
+        other -- unlike the OLD design, which force-recreated the container
+        from each checkpoint, making consecutive commits genuinely
+        incremental). checkpoint 1's image is therefore not a parent of
+        checkpoint 2's under the new design -- which means, unlike the old
+        design, it's immediately safe to delete once the tag moves off it:
+        commit()'s step 0/1a does exactly that on every cycle, not just
+        squash cycles (see test_plain_commit_cycle_with_no_previous_image_
+        skips_ps_and_rmi's mocked version of this same mechanism)."""
         sb = _make_sandbox()
         sb._backend._base_image = "alpine:latest"
         try:
             sb.exec("echo one")
-            sb.stop(commit=True)  # checkpoint 1 (plain commit)
+            sb.commit()  # checkpoint 1 (plain commit)
             first_image_id = subprocess.run(
                 ["docker", "inspect", "--format={{.Id}}", sb._backend._lifecycle_tag()],
                 capture_output=True,
@@ -428,7 +424,7 @@ class TestDanglingImageEagerCleanup:
             assert first_image_id
 
             sb.exec("echo two")
-            sb.stop(commit=True)  # checkpoint 2 -- also a plain commit (chain, not squash)
+            sb.commit()  # checkpoint 2 -- also a plain commit, on the SAME container
 
             still_present = (
                 subprocess.run(
@@ -436,55 +432,102 @@ class TestDanglingImageEagerCleanup:
                 ).returncode
                 == 0
             )
-            assert still_present, (
-                "checkpoint 1's image is a parent of checkpoint 2's -- must survive"
+            assert not still_present, (
+                "checkpoint 1's image is a sibling, not a parent, of checkpoint 2's -- "
+                "commit() must clean it up once the tag moves off it, not leave it dangling"
             )
         finally:
             sb.destroy()
 
     @docker
-    def test_real_squash_cycle_reclaims_the_entire_prior_chain(self):
-        """The payoff of squashing isn't just bounded layer depth -- once a
-        squash lands (a parentless image), NOTHING depends on the prior
-        chain anymore, so the eager old-image cleanup (fixed above to run
-        after container removal) can finally succeed and `docker rmi`
-        cascades to free the whole accumulated chain in one shot, not just
-        the single most-recent link. End-to-end through the REAL
-        agSandbox/backend stop() flow, not a hand-rolled docker command
-        sequence (which is what test_repeated_commits_leave_no_dangling_
-        images below does, and would not have caught either the ordering
-        bug this fixes or confirmed this cascade)."""
+    def test_real_squash_cycle_reclaims_its_own_superseded_commit(self):
+        """The payoff of squashing: the transient plain-commit image
+        commit()'s own step 1 produces gets reclaimed the moment the squash
+        (step 3) supersedes it, since nothing was ever `run` from that
+        transient image (commit() never touches the container's existence
+        at all).
+
+        Note this is a narrower guarantee than the OLD design's "squashing
+        reclaims the WHOLE accumulated chain in one shot": under the old
+        design the container was force-recreated from the just-committed
+        image every cycle, so a real multi-link parent-child chain built up
+        across cycles, and squashing (recreating the container fresh from
+        the new squashed image on the VERY NEXT cycle) let the entire prior
+        chain become unreferenced at once. Under the new design the
+        container is NEVER recreated by commit()/stop() -- only by an
+        explicit rm_container() -- and whatever checkpoint the live
+        container currently descends from stays referenced (and therefore
+        undeletable) by that live container indefinitely, regardless of how
+        many further commits happen. The only image a squash can ever
+        actually reclaim is the one commit()'s own step 1 just produced a
+        moment earlier within that SAME call -- which was never "run" as
+        anything, so nothing pins it. See test_stop_commit_deletes_old_
+        image's mocked version of this exact mechanism, and
+        test_repeated_commits_leave_no_dangling_images below for the
+        broader "no dangling images accumulate" guarantee via raw CLI
+        commands (not through this Python API)."""
+        import agency.agsandbox_backends.docker as _mod
+
         sb = _make_sandbox()
         sb._backend._base_image = "alpine:latest"
-        try:
-            sb.exec("echo one")
-            sb.stop(commit=True)  # checkpoint 1 (plain commit)
-            first_image_id = subprocess.run(
-                ["docker", "inspect", "--format={{.Id}}", sb._backend._lifecycle_tag()],
+
+        def _dangling_ids():
+            r = subprocess.run(
+                ["docker", "images", "-f", "dangling=true", "-q"],
                 capture_output=True,
                 text=True,
-            ).stdout.strip()
-            assert first_image_id
-
-            sb.exec("echo two")
-            # Force this cycle to squash instead of plain-committing.
-            sb.stop(
-                commit=True, force_squash=True
-            )  # checkpoint 2 -- squash: parentless, frees checkpoint 1
-
-            still_present = (
-                subprocess.run(
-                    ["docker", "image", "inspect", first_image_id], capture_output=True
-                ).returncode
-                == 0
             )
-            assert not still_present, "squashing should have reclaimed the entire prior chain"
+            return set(ln.strip() for ln in r.stdout.splitlines() if ln.strip())
+
+        base_layers_before = subprocess.run(
+            ["docker", "inspect", "--format={{json .RootFS.Layers}}", "alpine:latest"],
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        try:
+            sb.exec("echo one")
+            before = _dangling_ids()
+            # Force this very first commit to squash: step 1's plain commit
+            # still runs (briefly tagging a real image), then the squash
+            # step must delete exactly that transient image rather than
+            # leaving it dangling.
+            with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+                sb.commit()
+            after = _dangling_ids()
+
+            assert after - before == set(), (
+                "a squashing commit() must not leave its own superseded "
+                f"plain-commit image behind as a dangling leftover: {after - before}"
+            )
+
+            # Depending on whether the real overlay2 lookup this cycle's own
+            # fold (step 2, which always runs before the squash decision --
+            # even on this, the squashing cycle itself) happened to succeed
+            # on this host, the squash may have taken either the fast
+            # accumulator-merge path (base's own layers + 1 merged layer) or
+            # the export/import fallback (a single parentless layer) -- both
+            # are correct outcomes here, so accept either rather than
+            # asserting one specific implementation won.
+            base_layer_count = len(json.loads(base_layers_before))
+            tag = sb._backend._lifecycle_tag()
+            layers = int(
+                subprocess.run(
+                    ["docker", "inspect", "--format={{len .RootFS.Layers}}", tag],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            assert layers in (1, base_layer_count + 1), (
+                f"expected either a fully flattened (1) or fast-path-merged "
+                f"({base_layer_count + 1}) result, got {layers}"
+            )
         finally:
             sb.destroy()
 
     @docker
     def test_repeated_commits_leave_no_dangling_images(self):
-        """stop(commit=True) called 3 times to the same tag must leave 0 new dangling images."""
+        """commit() called 3 times to the same tag must leave 0 new dangling images."""
         name = f"test-eager-{uuid.uuid4().hex[:8]}"
         tag = f"agency/lifecycle-{name}"
 
@@ -550,11 +593,15 @@ class _FakeCompleted:
 
 class TestCheckpointSquash:
     """Squashing is triggered purely by the chain's actual current depth
-    (`checkpoint_squash_max_depth`) or an explicit `force_squash=True` --
-    there is no commit-count interval to fight with tier-1 GlobalConfigParam
-    immutability here; tests just mock the depth-check inspect
-    (`docker inspect --format={{json .RootFS.Layers}}`) to return a chain
-    of the desired length."""
+    (`checkpoint_squash_max_depth`) -- the `force_squash=True` escape hatch
+    is gone entirely (see container.py's commit() docstring): under the new
+    once-per-skill commit() design there's only ever one commit per skill,
+    so the automatic depth check alone is sufficient, with no need for a
+    caller to force it. Tests mock the depth-check inspect (`docker inspect
+    --format={{json .RootFS.Layers}}`) to return a chain of the desired
+    length; where a test needs squashing to trigger without a large real
+    chain, checkpoint_squash_max_depth is patched down to a tiny value
+    instead."""
 
     def _sb(self):
         return _make_sandbox()
@@ -566,7 +613,8 @@ class TestCheckpointSquash:
         is exactly what made a real production squash fallback
         undiagnosable without live forensics on the running process (see
         docs/agsandbox_backends/container.md's "Fast incremental
-        squashing" section)."""
+        squashing" section). checkpoint_squash_max_depth is patched down to
+        1 to force this cycle to squash."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
@@ -578,16 +626,19 @@ class TestCheckpointSquash:
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "export" in args:
                 return _FakeCompleted(stdout=b"FAKE_TAR")
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:layer0"]')
             return _FakeCompleted()
 
         captured = io.StringIO()
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(_mod._DockerBackend, "_run", fake_run):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True, force_squash=True)
+            with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+                with patch.object(_mod._DockerBackend, "_run", fake_run):
+                    with patch.object(sb._backend, "_container_status", return_value="running"):
+                        with patch.object(sb._backend, "_gpu_virtual", False):
+                            sb.commit()
         finally:
             sys.stderr = old_stderr
 
@@ -597,11 +648,10 @@ class TestCheckpointSquash:
 
     def test_squashes_when_depth_at_or_above_max_depth(self):
         """A chain at/above checkpoint_squash_max_depth must squash on an
-        ordinary stop(commit=True) -- no force_squash needed. The normal
-        plain commit must still happen first (unchanged); the mocked
-        `docker info` here returns no parseable JSON, so the fast
-        accumulator path can't be trusted and falls back to
-        `_squash_commit()`'s export/import -- the point of this test is
+        ordinary commit(). The normal plain commit must still happen first
+        (unchanged); the mocked `docker info` here returns no parseable
+        JSON, so the fast accumulator path can't be trusted and falls back
+        to `_squash_commit()`'s export/import -- the point of this test is
         the depth-triggers-squash behavior, not which squash
         implementation ends up running."""
         import agency.agsandbox_backends.docker as _mod
@@ -618,9 +668,9 @@ class TestCheckpointSquash:
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
+            with patch.object(sb._backend, "_container_status", return_value="running"):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)
+                    sb.commit()
 
         assert any(c[:2] == [sb._backend._runtime, "commit"] for c in calls), (
             f"expected the normal plain commit to still happen: {calls}"
@@ -648,9 +698,9 @@ class TestCheckpointSquash:
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
+            with patch.object(sb._backend, "_container_status", return_value="running"):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)
+                    sb.commit()
 
         assert any(c[:2] == [sb._backend._runtime, "commit"] for c in calls), (
             f"expected a plain commit: {calls}"
@@ -659,9 +709,8 @@ class TestCheckpointSquash:
 
     def test_squash_check_failure_does_not_raise_and_skips_squash(self):
         """If the depth-check inspect itself fails (unparseable output,
-        runtime unreachable, etc.), stop() must not crash -- it just can't
-        use the depth signal this cycle, so no squash happens (force_squash
-        is the only other trigger, and it's not set here)."""
+        runtime unreachable, etc.), commit() must not crash -- it just
+        can't use the depth signal this cycle, so no squash happens."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
@@ -674,40 +723,11 @@ class TestCheckpointSquash:
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
+            with patch.object(sb._backend, "_container_status", return_value="running"):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)  # must not raise
+                    sb.commit()  # must not raise
 
         assert not any("export" in c for c in calls), f"must not squash: {calls}"
-
-    def test_force_squash_flattens_regardless_of_depth(self):
-        """stop(commit=True, force_squash=True) must squash even with a
-        shallow chain nowhere near checkpoint_squash_max_depth -- used at
-        skill exit (agskill.py's teardown) so a sandbox never hands back
-        control to the next skill call sitting at an arbitrary mid-chain
-        depth. The commit still happens too."""
-        import agency.agsandbox_backends.docker as _mod
-
-        sb = self._sb()
-        shallow_chain = ["sha256:layer0"]
-        calls = []
-
-        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
-            calls.append(list(args))
-            if "--format={{json .RootFS.Layers}}" in args:
-                return _FakeCompleted(stdout=json.dumps(shallow_chain).encode())
-            return _FakeCompleted()
-
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
-
-        assert any(c[:2] == [sb._backend._runtime, "commit"] for c in calls), (
-            f"expected the normal plain commit to still happen: {calls}"
-        )
-        assert any("export" in c for c in calls), f"expected an export call: {calls}"
-        assert any("import" in c for c in calls), f"expected an import call: {calls}"
 
     def test_squash_pipes_export_stdout_into_import_stdin(self):
         """The flatten must round-trip the container's actual export bytes
@@ -717,7 +737,8 @@ class TestCheckpointSquash:
         --change, since export/import (unlike commit) doesn't preserve
         container labels at all -- without this, a fallback-squashed
         image would be permanently unreapable by
-        reap_orphaned_containers()'s image scan."""
+        reap_orphaned_containers()'s image scan. checkpoint_squash_max_depth
+        is patched down to 1 to force this cycle to squash."""
         import agency.agsandbox_backends.docker as _mod
         from agency.agsandbox_backends.container import _AGENCY_OWNER_PID_LABEL
 
@@ -731,12 +752,16 @@ class TestCheckpointSquash:
             if "import" in args:
                 captured["input"] = input
                 captured["args"] = list(args)
+                return _FakeCompleted()
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:layer0"]')
             return _FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.commit()
 
         assert captured["input"] == fake_tar_bytes
         assert captured["args"][-1] == sb._backend._lifecycle_tag()
@@ -753,7 +778,10 @@ class TestCheckpointSquash:
         what lets the NEXT squash use the fast path again instead of
         being permanently stuck re-paying export/import forever (see
         docs/agsandbox_backends/container.md's "Re-baselining after a
-        fallback" section)."""
+        fallback" section). The single fixed chain value returned below
+        both triggers this cycle's squash (via the patched-down
+        checkpoint_squash_max_depth) and is what the post-import rebaseline
+        lookup reads back."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
@@ -767,10 +795,11 @@ class TestCheckpointSquash:
                 return _FakeCompleted(stdout=b'["sha256:flattened-single-layer"]')
             return _FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.commit()
 
         assert sb._backend._squash_base_diff_ids == ["sha256:flattened-single-layer"]
 
@@ -779,26 +808,34 @@ class TestCheckpointSquash:
         the squash itself (which already succeeded) must not be reported
         as a failure -- only the re-baseline optimization is lost, falling
         back to self._base_image again next time, same as before
-        re-baselining existed."""
+        re-baselining existed. The depth-check/fold's own two earlier
+        reads of the chain must stay parseable (so the squash is actually
+        triggered and attempted) -- only the LATER post-import read (the
+        3rd call) is corrupted."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
+        calls_n = {"n": 0}
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "export" in args:
                 return _FakeCompleted(stdout=b"FAKE_TAR")
             if "--format={{json .RootFS.Layers}}" in args:
-                return _FakeCompleted(stdout=b"not json")  # unparseable
+                calls_n["n"] += 1
+                if calls_n["n"] <= 2:
+                    return _FakeCompleted(stdout=b'["sha256:layer0"]')
+                return _FakeCompleted(stdout=b"not json")  # unparseable on rebaseline
             return _FakeCompleted()
 
         captured = io.StringIO()
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(_mod._DockerBackend, "_run", fake_run):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True, force_squash=True)  # must not raise
+            with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+                with patch.object(_mod._DockerBackend, "_run", fake_run):
+                    with patch.object(sb._backend, "_container_status", return_value="running"):
+                        with patch.object(sb._backend, "_gpu_virtual", False):
+                            sb.commit()  # must not raise
         finally:
             sys.stderr = old_stderr
 
@@ -815,7 +852,11 @@ class TestCheckpointSquash:
         permanently stuck re-paying export/import forever -- confirmed
         as a real production issue for a long-running sandbox with
         unusually large per-commit diffs (see docs/agsandbox_backends/
-        container.md's "Re-baselining after a fallback" section)."""
+        container.md's "Re-baselining after a fallback" section).
+        checkpoint_squash_max_depth is patched down (to 1 for cycle 1, to
+        2 for cycle 2, matching each cycle's own real chain length) to
+        force each cycle to squash instead of the removed force_squash=
+        parameter."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
@@ -831,10 +872,11 @@ class TestCheckpointSquash:
                 return _FakeCompleted(stdout=b'["sha256:flattened-1"]')
             return _FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run_cycle1):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(_mod._DockerBackend, "_run", fake_run_cycle1):
+                with patch.object(sb._backend, "_container_status", return_value="running"):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.commit()
 
         assert any("export" in c for c in calls), f"cycle 1 must have fallen back: {calls}"
         assert sb._backend._squash_base_diff_ids == ["sha256:flattened-1"]
@@ -858,11 +900,14 @@ class TestCheckpointSquash:
                 )
             return _FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run_cycle2):
-            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff_dir):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True, force_squash=True)
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 2):
+            with patch.object(_mod._DockerBackend, "_run", fake_run_cycle2):
+                with patch.object(
+                    _mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff_dir
+                ):
+                    with patch.object(sb._backend, "_container_status", return_value="running"):
+                        with patch.object(sb._backend, "_gpu_virtual", False):
+                            sb.commit()
 
         assert not any("export" in c or "import" in c for c in calls), (
             f"cycle 2 must use the fast path, not fall back again: {calls}"
@@ -871,10 +916,12 @@ class TestCheckpointSquash:
 
     def test_squash_failure_is_best_effort(self):
         """If every squash path fails (both the accumulator fast path and
-        the _squash_commit() fallback), stop() must NOT raise -- the
+        the _squash_commit() fallback), commit() must NOT raise -- the
         normal plain commit above it already succeeded, so a squash
         failure only means the layer chain keeps growing until the next
-        attempt, not that this cycle's checkpoint was lost."""
+        attempt, not that this cycle's checkpoint was lost.
+        checkpoint_squash_max_depth is patched down to 1 to force this
+        cycle to squash."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
@@ -882,16 +929,19 @@ class TestCheckpointSquash:
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "export" in args or "import" in args:
                 raise RuntimeError("simulated export/import failure")
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:layer0"]')
             return _FakeCompleted()
 
         captured = io.StringIO()
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(_mod._DockerBackend, "_run", fake_run):
-                with patch.object(sb._backend, "_container_running", return_value=True):
-                    with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True, force_squash=True)  # must not raise
+            with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+                with patch.object(_mod._DockerBackend, "_run", fake_run):
+                    with patch.object(sb._backend, "_container_status", return_value="running"):
+                        with patch.object(sb._backend, "_gpu_virtual", False):
+                            sb.commit()  # must not raise
         finally:
             sys.stderr = old_stderr
 
@@ -1598,7 +1648,25 @@ class TestCheckpointAccumulator:
         then a real squash -- must complete in well under the ~77-180s
         the slower paths took (measured during development), produce
         correct content, and leave the base image's own layers
-        genuinely untouched (proving no re-serialization happened)."""
+        genuinely untouched (proving no re-serialization happened).
+        checkpoint_squash_max_depth is patched down to force the third
+        commit() to squash instead of the removed force_squash= parameter.
+
+        rm_container() is called between cycles so each commit() is a
+        genuine incremental layer on top of the PREVIOUS checkpoint (a
+        fresh container recreated FROM that checkpoint) rather than a
+        repeated commit of the SAME never-recreated container -- confirmed
+        empirically that the latter always yields a same-depth (base+1)
+        sibling image every time, never a growing chain, since `docker
+        commit` always snapshots the container's cumulative writable-layer
+        diff relative to its own fixed run-time base, regardless of how
+        many times it's been committed before. Without the real incremental
+        layers this produces, the accumulator's own fold-count bookkeeping
+        (which assumes each fold is a genuinely new layer) mismatches the
+        real chain depth and the fast path can't be trusted -- exactly the
+        scenario this test exists to exercise."""
+        import agency.agsandbox_backends.docker as _mod
+
         sb = _make_sandbox()
 
         base_layers_before = subprocess.run(
@@ -1608,13 +1676,16 @@ class TestCheckpointAccumulator:
         ).stdout
 
         sb.exec("mkdir -p /workspace/proj && echo one > /workspace/proj/f1")
-        sb.stop(commit=True)
+        sb.commit()
+        sb.rm_container()
         sb.exec("echo two > /workspace/proj/f2 && rm /workspace/proj/f1")
-        sb.stop(commit=True)
+        sb.commit()
+        sb.rm_container()
         sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
 
         t0 = time.time()
-        sb.stop(commit=True, force_squash=True)  # this cycle commits AND squashes
+        with patch.object(_mod._DockerBackend, "checkpoint_squash_max_depth", 1):
+            sb.commit()  # this cycle commits AND squashes
         elapsed = time.time() - t0
 
         try:
@@ -1788,8 +1859,28 @@ class TestDockerCommandHelpers:
         rm_calls = [a for a in calls if "rm" in a]
         assert not rm_calls, f"expected no rm call; got {rm_calls}"
 
-    def test_ensure_started_rms_leftover_container(self):
-        """rm is issued when a non-running leftover container exists."""
+    def test_ensure_started_resumes_hibernating_container(self):
+        """When _inspect_container_state() reports (running=False, status=
+        truthy) -- i.e. hibernating via stop(), not removed -- _ensure_
+        started() must resume it in place via `docker start`, NOT
+        force-remove and recreate it. Under the new lifecycle split, a
+        container found in this state under this exact name is
+        unambiguously this backend's own (container names embed _RUN_ID, a
+        fresh uuid4 per process, so nothing else could have created one
+        here) -- there is no "leftover from someone else" ambiguity to
+        force-remove any more, unlike the old bundled stop()/_ensure_started()
+        design. A container stuck in Docker's "Created" state (never fully
+        started) is a different scenario, still handled by
+        _run_with_conflict_retry()'s own name-conflict removal logic when a
+        *fresh* `docker run` hits it -- not by this branch, which is why
+        _run_with_conflict_retry is intentionally left unmocked here (it
+        must not be invoked at all in this scenario). _container_running()/
+        _container_status() are patched too (return values that would
+        contradict the mocked state below) purely as a tripwire: if
+        _ensure_started() ever regresses to calling either of them directly
+        instead of the merged _inspect_container_state(), this test would
+        then follow the WRONG branch and fail loudly rather than silently
+        passing for the wrong reason."""
         sb = self._sb()
         calls = []
 
@@ -1804,14 +1895,20 @@ class TestDockerCommandHelpers:
         import agency.agsandbox_backends.docker as _mod
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=False):
-                with patch.object(sb._backend, "_container_status", return_value="exited"):
-                    with patch.object(sb._backend, "_run_with_conflict_retry"):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_container_status", return_value=""):
+                    with patch.object(
+                        sb._backend, "_inspect_container_state", return_value=(False, "exited")
+                    ):
                         sb._backend._ensure_started()
 
         rm_calls = [(a, c) for (a, c) in calls if "rm" in a]
-        assert rm_calls, "expected rm call for leftover container"
-        assert all(c is True for _, c in rm_calls), "rm must use check=True"
+        assert not rm_calls, f"must not remove a hibernating container; got {rm_calls}"
+        start_calls = [(a, c) for (a, c) in calls if "start" in a]
+        assert start_calls, "expected `docker start` to resume the hibernating container"
+        assert start_calls[0][0] == [sb._backend._runtime, "start", sb._backend._name], (
+            f"unexpected start invocation: {start_calls[0][0]}"
+        )
 
     # --- destroy semaphore release ---
 
@@ -1940,12 +2037,19 @@ class TestDockerCommandHelpers:
 
 
 # ---------------------------------------------------------------------------
-# GPU semaphore release gating in stop()/destroy() -- the real GPU semaphore
-# (agResourcePool.release_gpu, wired in via reserve_gpu) must only be
-# released once the container is CONFIRMED torn down, exactly like the
+# GPU semaphore release gating in rm_container()/destroy() -- the real GPU
+# semaphore (agResourcePool.release_gpu, wired in via reserve_gpu) must only
+# be released once the container is CONFIRMED torn down, exactly like the
 # runtime-slot semaphore above -- releasing it while the container might
 # still be running and actually using the GPU would let something else
-# acquire the same physical GPU concurrently.
+# acquire the same physical GPU concurrently. Note that stop() (hibernate)
+# never releases the GPU at all any more -- a container's `--gpus device=N`
+# flags are fixed at `run` time and can't change via `start`, so releasing
+# the GPU on a mere hibernate would let another sandbox be handed the same
+# physical device while this one is still very much alive, just paused (see
+# container.py's stop() docstring). Only rm_container()/destroy(), which
+# actually remove the container, ever release it -- so every scenario below
+# that used to be about stop() now targets rm_container() instead.
 # ---------------------------------------------------------------------------
 
 
@@ -1960,24 +2064,24 @@ class TestDockerGpuReleaseGating:
         sb._gpu_release_fn = lambda gid: released.append(gid)
         return released
 
-    def test_stop_releases_gpu_when_already_confirmed_gone(self):
-        """stop()'s early-return branch (container already not running when
-        stop() is entered) must still release a leased GPU."""
+    def test_rm_container_releases_gpu_when_already_confirmed_gone(self):
+        """rm_container()'s early-return branch (no container at all when
+        rm_container() is entered) must still release a leased GPU."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
         released = self._lease_gpu(sb)
 
         with patch.object(_mod._DockerBackend, "_run"):
-            with patch.object(sb._backend, "_container_running", return_value=False):
-                sb.stop(commit=False)
+            with patch.object(sb._backend, "_container_status", return_value=""):
+                sb.rm_container()
 
         assert released == [3]
         assert sb._gpu_id is None
 
-    def test_stop_releases_gpu_via_main_teardown_path_after_successful_rm(self):
-        """The other release site in stop() -- reached via the main
-        teardown path (container was running, rm succeeded) rather than the
+    def test_rm_container_releases_gpu_via_main_teardown_path_after_successful_rm(self):
+        """The other release site in rm_container() -- reached via the main
+        teardown path (container existed, rm succeeded) rather than the
         early-return branch above."""
         import agency.agsandbox_backends.docker as _mod
 
@@ -1991,23 +2095,24 @@ class TestDockerGpuReleaseGating:
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             return OK()
 
-        # top-of-stop() check (must be True to take the main path), then the
-        # post-rm runtime-slot check, then the GPU-release check -- 3 calls.
-        running_calls = [True, False, False]
+        # Post-rm runtime-slot check, then the GPU-release check -- 2 calls,
+        # both confirming the container is gone now that rm succeeded.
+        running_calls = [False, False]
 
         def fake_container_running():
             return running_calls.pop(0) if running_calls else False
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(
-                sb._backend, "_container_running", side_effect=fake_container_running
-            ):
-                sb.stop(commit=False)
+            with patch.object(sb._backend, "_container_status", return_value="running"):
+                with patch.object(
+                    sb._backend, "_container_running", side_effect=fake_container_running
+                ):
+                    sb.rm_container()
 
         assert released == [3]
         assert sb._gpu_id is None
 
-    def test_stop_does_not_release_gpu_when_rm_fails_and_container_still_running(self):
+    def test_rm_container_does_not_release_gpu_when_rm_fails_and_container_still_running(self):
         import agency.agsandbox_backends.container as _container_mod
         import agency.agsandbox_backends.docker as _mod
 
@@ -2024,10 +2129,11 @@ class TestDockerGpuReleaseGating:
             return OK()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
-                    with pytest.raises(RuntimeError, match="rm exploded"):
-                        sb.stop(commit=False)
+            with patch.object(sb._backend, "_container_status", return_value="running"):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
+                        with pytest.raises(RuntimeError, match="rm exploded"):
+                            sb.rm_container()
 
         assert released == [], (
             "GPU must not be released while the container is confirmed still running"
@@ -2089,49 +2195,22 @@ class TestDockerGpuReleaseGating:
         assert released == []
         assert sb._gpu_id == 3
 
-    def test_gpu_released_exactly_once_across_stop_then_destroy(self):
-        """stop() tears the container down and releases the GPU; a later
-        destroy() call on the same sandbox must see gpu_id already cleared
-        and must not release a second time."""
+    def test_gpu_released_exactly_once_across_rm_container_then_destroy(self):
+        """rm_container() tears the container down and releases the GPU; a
+        later destroy() call on the same sandbox must see gpu_id already
+        cleared and must not release a second time."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
         released = self._lease_gpu(sb)
 
         with patch.object(_mod._DockerBackend, "_run"):
-            with patch.object(sb._backend, "_container_running", return_value=False):
-                sb.stop(commit=False)
-                sb.destroy()
+            with patch.object(sb._backend, "_container_status", return_value=""):
+                with patch.object(sb._backend, "_container_running", return_value=False):
+                    sb.rm_container()
+                    sb.destroy()
 
         assert released == [3], "GPU must be released exactly once, not once per call"
-
-    def test_stop_rm_exc_takes_precedence_over_commit_exc(self):
-        """When both the commit retries AND the rm retries exhaust, stop()
-        must still run its GPU/runtime-slot release checks and raise --
-        specifically the rm failure, since rm is stop()'s last word on
-        whether the container is actually gone (a failed commit alone
-        doesn't mean teardown didn't happen)."""
-        import agency.agsandbox_backends.container as _container_mod
-        import agency.agsandbox_backends.docker as _mod
-
-        sb = self._sb()
-
-        class OK:
-            returncode = 0
-            stdout = b""
-
-        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
-            if "commit" in args:
-                raise RuntimeError("commit exploded")
-            if "rm" in args:
-                raise RuntimeError("rm exploded")
-            return OK()
-
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(_container_mod.time, "sleep"):  # skip real retry backoff
-                    with pytest.raises(RuntimeError, match="rm exploded"):
-                        sb.stop(commit=True)
 
 
 # Session-keyring-quota machinery (_keyring_container_limit/keyring_quota/

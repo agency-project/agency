@@ -129,11 +129,10 @@ Each call to `agskill.execute_react()` runs the following steps:
 7. If response contains tool calls → for each tool:
    a. Coerce malformed JSON arguments to `"{}"` so history replay never crashes
    b. If the tool is a `return_<field>` output tool → validate and store the value (see [Output collection via tools](#output-collection-via-tools)); skip normal dispatch
-   c. If `run_in_subprocess=True`, commit the sandbox to a pre-call checkpoint image
-   d. Execute the tool (in the calling thread for sandbox tools, or offloaded to a worker process)
-   e. If the result contains `"error"`, restore the sandbox from the checkpoint and append `workspace_reverted` to the error message (see [Tool failure and checkpoint revert](#tool-failure-and-checkpoint-revert))
-   f. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
-   g. Append the tool result message and go to 3
+   c. Execute the tool (in the calling thread for sandbox tools, or offloaded to a worker process — `run_in_subprocess` only controls this, no checkpointing is tied to it)
+   d. Hibernate the sandbox (`sandbox.stop()`) regardless of whether the tool succeeded or failed, unless it left background work still running (see [Tool call hibernation and skill-level revert](#tool-call-hibernation-and-skill-level-revert))
+   e. If the result is large, offload to a file (see [Tool output offloading](#tool-output-offloading))
+   f. Append the tool result message and go to 3
 8. If response has no tool calls → check if all required output fields have been registered
 9. If fields are missing and retries remain → inject reprompt message listing missing fields, go to 3
 10. If sandbox has live background processes → `agSandbox.wait_for_processes()` polls until they exit or `ping_interval_s` elapses; inject status message and go to 3
@@ -220,27 +219,21 @@ Files are written to `/workspace/long_tool_call_outputs/<tool_name>_<call_id>.tx
 
 This guard prevents a single oversized tool result (e.g. a raw PDF fetched via `webfetch`) from filling the entire context window. If no sandbox is available the result is kept inline unchanged.
 
-### Tool failure and checkpoint revert
+### Tool call hibernation and skill-level revert
 
-There's no separate checkpoint taken before each tool call. Instead, after every tool call the container is torn down via `sandbox.stop(commit=...)` (see [container.md](agsandbox_backends/container.md)'s "Container lifecycle"):
+There's no per-tool-call checkpoint or revert anymore — a single tool call's own success or failure has no bearing on whether the sandbox gets checkpointed or discarded. Instead, after every tool call the container is only *hibernated* (`sandbox.stop()`, a `docker/podman stop` that never removes the container — see [container.md](agsandbox_backends/container.md)'s "Container lifecycle"), regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred entirely for this call; a later call that finds nothing pending is what actually hibernates it).
 
-- On success: `stop(commit=True)` commits the container to `agency/lifecycle-<name>` before removing it, so the *next* tool call's container restarts from this new state.
-- On failure (the tool returned `agdata(error=...)`, or raised): `stop(commit=False)` removes the container **without** committing, discarding whatever partial filesystem changes it made. The next tool call's container restarts from the *previous* `agency/lifecycle-<name>` — i.e. the last successfully committed state — which is what makes this a revert: nothing is rolled back explicitly, the bad state is simply never checkpointed forward.
+Rollback happens once per *skill* call instead, at `_task()`'s teardown:
 
-When a failure triggers this, the framework appends `"workspace_reverted": "The workspace has been reverted to the state before this tool call."` to the tool result JSON — but only if `stop()` actually ran for this call (it's skipped, and no such note added, when the tool left background work still running in the sandbox; see [container.md](agsandbox_backends/container.md)'s lifecycle table).
+- On success: `sandbox.commit()` checkpoints the container's current state to `agency/lifecycle-<name>` **without removing or stopping it** — the very next skill call resumes directly from the same container, no `run` needed.
+- On failure (the skill's own result contains `"error"`, or an exception escaped): `sandbox.rm_container()` force-removes the container, discarding everything since the last successful skill's `commit()`. The next tool call's `_ensure_started()` recreates fresh from that previous `agency/lifecycle-<name>` — i.e. the last successfully committed state — which is what makes this a revert: nothing is rolled back explicitly, the bad state is simply never checkpointed forward.
 
-```json
-{
-  "error": "...",
-  "workspace_reverted": "The workspace has been reverted to the state before this tool call."
-}
-```
+Because the failing skill's own result is already final by the time teardown runs, the revert notice can't be attached to it. Instead it's pushed onto the agent's `inbox` (`ag.inbox.put(...)`, a plain `queue.Queue[str]`), which the react loop drains every iteration — including the first, before that skill's first LLM call — via `_drain_inbox()` (step 3 above). So the agent learns about the revert as a `{"role": "user", ...}` turn right as the *next* skill call begins, rather than inside the failed skill's own output.
 
 **When revert does NOT happen:**
 
 - `sandbox` is `None` — no container exists.
-- The tool succeeded — `stop(commit=True)` runs instead, checkpointing forward rather than discarding.
-- Background work was left running — `stop()` is deferred entirely for this call; a later call that finds nothing pending is what actually checkpoints/discards.
+- The skill succeeded — `commit()` runs instead, checkpointing forward rather than discarding.
 
 The lifecycle image is named `agency/lifecycle-<container_name>`, scoped to a single sandbox lifetime, and deleted when `sandbox.destroy()` is called.
 

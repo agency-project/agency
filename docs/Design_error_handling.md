@@ -103,7 +103,11 @@ finally:
     # always runs, even on exception:
     _remove_offloaded_fields(...)
     pool.release_gpu(...)     # GPU released even if skill crashed
-    ag.sandbox.stop(commit=True)  # checkpoint and tear down container no matter what
+    if _had_error:
+        ag.sandbox.rm_container()  # discard dirty state; releases GPU + runtime slot too
+        ag.inbox.put(...)          # revert notice, delivered at the NEXT skill's start
+    else:
+        ag.sandbox.commit()       # checkpoint in place -- container is never torn down
     sandbox = None
 ```
 

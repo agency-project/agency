@@ -295,6 +295,9 @@ class agSandbox(_AgSandboxFields):
     def stop(self, *args, **kwargs) -> None:
         self._backend.stop(*args, **kwargs)
 
+    def rm_container(self, *args, **kwargs) -> None:
+        self._backend.rm_container(*args, **kwargs)
+
     def restore(self, *args, **kwargs) -> None:
         self._backend.restore(*args, **kwargs)
 

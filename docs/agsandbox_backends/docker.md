@@ -6,7 +6,7 @@ Docker and rootless Podman (via `runc`) are **both** subject to the Linux kernel
 
 ## Dangling image cleanup
 
-`stop(commit=True)` captures the current image ID for the lifecycle tag *before* committing over it, then deletes that old image ID afterward (skipping deletion if another container is still running from it, e.g. a fork) — this is the shared `_ContainerBackendBase.stop()` logic (see [container.md](container.md)), not Docker-specific, but it's what keeps repeated commits to the same tag from silently piling up dangling (untagged) images on disk.
+`commit()`'s squash path captures the current image ID for the lifecycle tag *before* committing over it, then deletes that old image ID afterward (skipping deletion if another container is still running from it, e.g. a fork) — this is the shared `_ContainerBackendBase.commit()` logic (see [container.md](container.md)), not Docker-specific, but it's what keeps repeated commits to the same tag from silently piling up dangling (untagged) images on disk.
 
 ## Fast squash internals
 

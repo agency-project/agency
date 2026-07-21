@@ -122,7 +122,21 @@ class AgSandboxBackendFields:
         "agsandbox_backend", default=0.5
     )  # Multiplied by attempt number for linear backoff between retries.
 
-    # stop(): commit-then-remove teardown sequence.
+    # stop(): hibernate (docker/podman stop, container kept).
+    docker_stop_timeout_s = GlobalConfigParam(
+        "agsandbox_backend", default=120
+    )  # docker stop: should complete fast, see docker_stop_grace_s below.
+    docker_stop_grace_s = GlobalConfigParam(
+        "agsandbox_backend", default=0
+    )  # `docker stop -t` grace period before SIGKILL. Default 0 (immediate
+    # SIGKILL) because every sandbox container's entrypoint is `tail -f
+    # /dev/null`, which never handles SIGTERM -- any nonzero grace period
+    # is pure wasted wall-clock waiting for a timeout that always fires.
+    docker_start_timeout_s = GlobalConfigParam(
+        "agsandbox_backend", default=120
+    )  # docker start: resuming a hibernating container.
+
+    # commit(): checkpoint-in-place, container is not removed.
     stop_inspect_timeout_s = GlobalConfigParam(
         "agsandbox_backend", default=30
     )  # docker inspect (pre-commit image-id lookup).
@@ -131,6 +145,8 @@ class AgSandboxBackendFields:
     stop_ps_check_timeout_s = GlobalConfigParam(
         "agsandbox_backend", default=10
     )  # docker ps (checking whether the old image is still in use).
+
+    # rm_container(): force-remove teardown, discarding all container state.
     rm_retry_attempts = GlobalConfigParam("agsandbox_backend", default=3)
     rm_retry_backoff_s = GlobalConfigParam("agsandbox_backend", default=1)
 

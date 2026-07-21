@@ -442,52 +442,61 @@ def _amd_render_node_paths() -> "list[str]":
         return _amd_render_node_paths_cache
 
 
-def _gpu_flags(runtime: str, gpu_id: "int | None") -> list[str]:
-    """Return GPU passthrough flags for *runtime* ("docker" or "podman"),
-    scoped to the single *gpu_id* leased to this sandbox -- mirrors
-    chroot.py's _chroot_gpu_dev_paths(gpu_id): a sandbox that hasn't leased a
-    GPU (gpu_id is None) gets zero GPU devices, and one that has leased a
-    GPU only gets that one device exposed, not every GPU on the host. This
-    is the hardware-level half of GPU isolation; CUDA_VISIBLE_DEVICES /
-    HIP_VISIBLE_DEVICES (set in base.py's exec()) is the software half --
-    without this, a process could bypass the env var by opening another
-    GPU's device node directly, since it was mounted into the container
-    regardless of which GPU was actually leased.
+def _gpu_flags(runtime: str, gpu_reserved: bool) -> list[str]:
+    """Return GPU passthrough flags for *runtime* ("docker" or "podman").
 
-    NVIDIA:
-      - Docker: ``--gpus device=N`` (nvidia-container-toolkit's Docker-specific
-        CLI wrapper hook).
-      - Podman: ``--device nvidia.com/gpu=N`` (CDI). Podman does not
-        understand Docker's ``--gpus`` flag: it accepts it silently (no
-        error) but never mounts the NVIDIA driver/devices, so a container
-        started that way has zero GPU access despite `podman run` appearing
-        to succeed -- `nvidia-smi` inside prints "WARNING: The NVIDIA Driver
-        was not detected" and isn't even on PATH. This mirrors the identical
-        fix applied to images/build.sh's own smoke tests.
-    AMD:    ``--device /dev/kfd`` (shared control device, every AMD GPU needs
-            it regardless of index) plus the one ``/dev/dri/renderD*`` node
-            matching *gpu_id*, ordered by PCI bus to line up with rocm-smi's
-            own GPU numbering (see _amd_render_node_paths() and
-            agresources.amd_render_node_paths_by_pci_bus() -- confirmed on
-            real 8x MI350X hardware that naive sorted /dev/dri order does
-            NOT correspond to GPU index).
-    CPU-only hosts, and sandboxes that haven't leased a GPU, get no flags.
+    Attaches EVERY GPU on the host once *gpu_reserved* is true (this
+    sandbox called reserve_gpu()) -- not just the specific id currently
+    held in self._gpu_id. This is deliberate: `docker/podman run` is the
+    only point these flags are ever set (neither runtime supports
+    hot-attaching a device to an already-created container), but
+    stop()/start() (hibernate) now releases and re-acquires the physical
+    GPU semaphore between tool calls, and a resumed container can end up
+    holding a *different* gpu_id than it started with. Attaching every
+    GPU up front means that never requires recreating the container --
+    resuming an existing one is always enough, regardless of which
+    physical GPU is currently assigned. A sandbox that hasn't reserved a
+    GPU at all still gets zero GPU devices, so the common (non-GPU) case
+    is unaffected.
+
+    TRADE-OFF, accepted deliberately: this removes the hardware-level
+    half of GPU isolation for any sandbox that HAS reserved a GPU.
+    CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES (set in base.py's exec(),
+    still readonly-exported so a command can't hijack a different GPU by
+    reassigning the variable inline) becomes the ONLY restriction keeping
+    that sandbox off other GPUs -- nothing stops code running inside it
+    from opening another GPU's device node directly and ignoring the env
+    var entirely. Only safe when the sandboxed code is trusted not to do
+    that on purpose; a genuinely adversarial-code use case would need the
+    old scoped-to-one-device attachment back, at the cost of a full
+    recreate (commit + rm_container + run, not just stop()/start()) on
+    every GPU release/re-acquire cycle instead.
+
+    NVIDIA: Docker ``--gpus all``; Podman ``--device nvidia.com/gpu=all``
+      (CDI). Podman does not understand Docker's ``--gpus`` flag: it
+      accepts it silently (no error) but never mounts the NVIDIA
+      driver/devices, so a container started that way has zero GPU access
+      despite `podman run` appearing to succeed -- `nvidia-smi` inside
+      prints "WARNING: The NVIDIA Driver was not detected" and isn't even
+      on PATH. This mirrors the identical fix applied to images/build.sh's
+      own smoke tests.
+    AMD: ``--device /dev/kfd`` (shared control device) plus every
+      ``/dev/dri/renderD*`` node found -- there's no single "all" flag for
+      ROCm the way ``--gpus all``/CDI ``=all`` covers NVIDIA, so each
+      render node is attached explicitly.
+    CPU-only hosts, and sandboxes that haven't reserved a GPU, get no
+    flags at all.
     """
-    if gpu_id is None:
+    if not gpu_reserved:
         return []
     kind = _gpu_kind(runtime)
     if kind == "none":
         return []
     if kind == "nvidia":
-        return (
-            ["--device", f"nvidia.com/gpu={gpu_id}"]
-            if runtime == "podman"
-            else ["--gpus", f"device={gpu_id}"]
-        )
-    render_nodes = _amd_render_node_paths()
+        return ["--device", "nvidia.com/gpu=all"] if runtime == "podman" else ["--gpus", "all"]
     flags = ["--device", "/dev/kfd"]
-    if gpu_id < len(render_nodes):
-        flags += ["--device", render_nodes[gpu_id]]
+    for node in _amd_render_node_paths():
+        flags += ["--device", node]
     return flags
 
 
@@ -774,6 +783,33 @@ class _ContainerBackendBase(agsandbox_backend):
                 pids.add(int(line))
         return pids
 
+    def _inspect_container_state(self) -> "tuple[bool, str]":
+        """Return (running, status) from a SINGLE docker/podman inspect call
+        -- merges what _container_running()/_container_status() would
+        otherwise need two separate inspect round-trips for, since
+        _ensure_started() (its only caller that needs both) always wants to
+        know both facts together. status is '' if the container doesn't
+        exist at all, same convention as _container_status(). Ground truth,
+        same as those two -- no caching across calls (see _ensure_started()'s
+        docstring for why)."""
+        result = self._run(
+            [
+                self._runtime,
+                "inspect",
+                "--format",
+                "{{.State.Running}}|{{.State.Status}}",
+                self._name,
+            ],
+            check=False,
+            timeout=self.inspect_timeout_s,
+        )
+        if result.returncode != 0:
+            return (False, "")
+        running_str, _, status = (
+            result.stdout.decode("utf-8", errors="replace").strip().partition("|")
+        )
+        return (running_str == "true", status)
+
     def _ensure_started(self) -> None:
         """Start the Docker/Podman container on first use.
 
@@ -782,16 +818,24 @@ class _ContainerBackendBase(agsandbox_backend):
         Tasks that complete using only host-side tools (webfetch, todowrite,
         find_papers, …) never start a container at all.
 
-        Invariant: after stop() the container does not exist.  The only two
-        states we handle here are therefore:
-          - running  → reuse (worker-reuse path, does NOT acquire the runtime slot)
-          - absent   → docker/podman run (acquires the runtime slot)
-        Any leftover container in another state is force-removed first.
+        Invariant: after rm_container() the container does not exist; after
+        stop() (hibernate) it still does, just not running -- see that
+        method's docstring. The three states handled here are therefore:
+          - running     → reuse (worker-reuse path, does NOT acquire the runtime slot)
+          - hibernating  → docker/podman start (resume in place, acquires the
+                           runtime slot; the GPU is re-acquired lazily on the
+                           next exec() -- see base.py's exec())
+          - absent       → docker/podman run (acquires the runtime slot and GPU)
+        A hibernating container is unambiguously our own: container names
+        embed _RUN_ID (a fresh uuid4 per process), so no other process could
+        have created one under this exact name -- there is no "leftover from
+        someone else" case to force-remove here the way there used to be.
 
-        Ground truth is always _container_running() -- there is no
-        self._started cache. Every call pays a real docker/podman inspect,
-        but that's the price of never trusting a per-process flag that a
-        different worker-process copy of this backend could have made stale.
+        Ground truth is always a real docker/podman inspect -- there is no
+        self._started cache. Every call pays that cost (just one inspect
+        call now, via _inspect_container_state(), not two), but that's the
+        price of never trusting a per-process flag that a different
+        worker-process copy of this backend could have made stale.
 
         _baseline_pids is captured exactly once (None means "not yet") and
         never refreshed after that, even though this method itself now runs
@@ -804,17 +848,27 @@ class _ContainerBackendBase(agsandbox_backend):
         to re-enter here.
         """
         name = self._name
-        if self._container_running():
+        running, status = self._inspect_container_state()
+        if running:
             # Reuse an already-running container — it already holds whatever
             # slot _acquire_runtime_slot() would take, so we must NOT acquire
             # it again here.
             if self._baseline_pids is None:
                 self._baseline_pids = self._snapshot_pids_started()
             return
-        # Remove any leftover container in a non-running state (created,
-        # exited, dead, …) that stop() failed to clean up.
-        if self._container_status():
-            self._rm_container(name)
+        if status:
+            # Hibernating (stopped(), not removed) -- resume it in place.
+            # No image, no `docker/podman run`: the container's writable
+            # layer already holds everything from before it was stopped.
+            self._acquire_runtime_slot()
+            try:
+                self._start_with_quota_retry(name)
+            except Exception:
+                self._release_runtime_slot()
+                raise
+            if self._baseline_pids is None:
+                self._baseline_pids = self._snapshot_pids_started()
+            return
         # Acquire the physical GPU (if reserve_gpu was called) before the
         # container is created, not just in exec() -- the container's GPU
         # device flags are fixed at `docker/podman run` time, and this method
@@ -825,7 +879,7 @@ class _ContainerBackendBase(agsandbox_backend):
         # exactly once.
         if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
             self._gpu_id = self._gpu_acquire_fn()
-        gpu_flags = _gpu_flags(self._runtime, self._gpu_id)
+        gpu_flags = _gpu_flags(self._runtime, self._gpu_virtual)
         self._acquire_runtime_slot()
         try:
             if self._checkpoint_image is not None:
@@ -954,6 +1008,39 @@ class _ContainerBackendBase(agsandbox_backend):
             f"{self._runtime} run --name {name} failed after retries "
             f"(container name conflict or runtime quota)"
         )
+        diagnostics = self._quota_diagnostics()
+        if diagnostics:
+            msg += f" {diagnostics}"
+        if _last_stderr:
+            msg += f": {_last_stderr}"
+        raise RuntimeError(msg)
+
+    def _start_with_quota_retry(self, name: str) -> None:
+        """Run `docker/podman start` on an existing, stopped container,
+        retrying on session-keyring quota exhaustion -- resuming a
+        hibernating container re-acquires a keyring slot exactly the same
+        way `run` does (see _run_with_conflict_retry()'s docstring). Unlike
+        that method, there's no name-conflict case to handle here: the
+        container already exists under this exact name, so there's nothing
+        to remove-and-retry on -- only the quota-wait loop applies.
+        """
+        _last_stderr = ""
+        for attempt in range(self.conflict_retry_max_attempts):
+            result = self._run([self._runtime, "start", name], timeout=self.docker_start_timeout_s)
+            if result.returncode == 0:
+                return
+            stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+            _last_stderr = stderr
+            if self._is_quota_exhaustion_error(stderr):
+                self._wait_for_quota_slot()
+                time.sleep(self.conflict_retry_backoff_base_s * (attempt + 1))
+            else:
+                msg = f"{self._runtime} start {name} failed (exit {result.returncode})"
+                if stderr:
+                    msg += f": {stderr}"
+                raise RuntimeError(msg)
+        # Final attempt after retries exhausted.
+        msg = f"{self._runtime} start {name} failed after retries (runtime quota)"
         diagnostics = self._quota_diagnostics()
         if diagnostics:
             msg += f" {diagnostics}"
@@ -1091,22 +1178,6 @@ class _ContainerBackendBase(agsandbox_backend):
             return  # nothing to update
         cmd.append(self._container_name())
         self._run(cmd, timeout=self.inspect_timeout_s)
-
-    def commit(self, tag: str) -> bool:
-        """Commit the container filesystem to a new image tag.
-
-        Returns True if the commit succeeded, False if the container doesn't
-        exist.  Works on both running and stopped containers (docker commit
-        does not require the container to be running).
-        """
-        if not self._container_running():
-            return False
-        self._run(
-            [self._runtime, "commit", self._container_name(), tag],
-            check=True,
-            timeout=self.commit_timeout_s,
-        )
-        return True
 
     def _image_diff_ids(self, image_ref: str) -> "list[str]":
         """The image's uncompressed layer content digests, in order --
@@ -1435,151 +1506,92 @@ class _ContainerBackendBase(agsandbox_backend):
             self._squash_base_diff_ids = None
         self._reset_accumulator()
 
-    def stop(self, *, commit: bool = False, force_squash: bool = False) -> None:
-        """Stop and remove the container, releasing its runtime slot and GPU.
+    def stop(self) -> None:
+        """Hibernate the container: `docker/podman stop` it WITHOUT removing
+        it, releasing the runtime slot (the session-keyring-derived
+        concurrency semaphore) AND the GPU. The container object and its
+        writable layer stay intact, so the next _ensure_started() can
+        `docker/podman start` it straight back into the exact same state:
+        no commit, no image, no `run` involved at all.
 
-        If commit=True, the container filesystem is committed to an image first
-        so _ensure_started() can recreate from it on the next tool call.  Pass
-        commit=True after a successful sandbox tool call; commit=False after a
-        failure to discard the dirty state and revert to the last checkpoint.
+        Releasing the GPU here (rather than holding it for the container's
+        whole life) is safe ONLY because `_gpu_flags()` attaches EVERY GPU
+        on the host to a GPU-reserving container at `run` time, not just
+        the one currently assigned -- so a resumed container can be handed
+        a *different* physical GPU than it had before hibernating without
+        ever needing to be recreated (`docker/podman start` can't change a
+        container's device attachment; neither runtime supports hot-
+        attaching one). The actual restriction to one GPU at a time is
+        therefore purely `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES`
+        (base.py's exec()) -- see `_gpu_flags()`'s docstring for the
+        isolation trade-off this accepts.
 
-        force_squash=True flattens the layer chain (see _squash_commit())
-        regardless of the chain's current actual depth -- used at skill
-        exit (agskill.py's teardown) so a sandbox never hands back
-        control to the next skill call sitting at an arbitrary mid-chain
-        depth. Ignored when commit=False (nothing is checkpointed at all
-        in that case).
+        Use rm_container() instead when the container's current state must
+        be discarded outright, and commit() to checkpoint the current state
+        into a lifecycle image -- either way, without removing the
+        container itself.
         """
         gpu_id_to_release = (
             self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
         )
         if not self._container_running():
+            return
+        # Clear PID tracking — stopping kills every process inside, same as rm.
+        self._watched_pids = {}
+        self._baseline_pids = None  # force a fresh capture on the next _ensure_started()
+        name = self._container_name()
+        stop_exc: Exception | None = None
+        try:
+            self._run(
+                [self._runtime, "stop", "-t", str(self.docker_stop_grace_s), name],
+                check=True,
+                timeout=self.docker_stop_timeout_s,
+            )
+        except Exception as _e:
+            stop_exc = _e
+        # Only release once actually confirmed not running -- a failed stop
+        # may still leave the container (and the slot/GPU it holds) alive.
+        if not self._container_running():
+            self._release_runtime_slot()
+            if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+                self._gpu_release_fn(gpu_id_to_release)
+                self._gpu_id = None
+        if stop_exc is not None:
+            raise stop_exc
+
+    def rm_container(self) -> None:
+        """Force-remove the container outright, discarding all of its
+        current state and releasing both the runtime slot and the GPU (see
+        stop()'s docstring for why the GPU is only released here, never on
+        a mere hibernate). Raises if removal fails after retrying -- an
+        unconfirmed removal means the container, and whatever resources it
+        holds, may still be alive, which the caller must not silently
+        ignore.
+
+        Does not touch self._checkpoint_image: the next _ensure_started()
+        recreates fresh from it (or from self._base_image if none exists
+        yet), which is exactly what makes this the discard/revert
+        primitive -- call it without a preceding commit() to throw away
+        everything since the last checkpoint.
+
+        Safe to call when there is no container at all (never started, or
+        already removed) -- a no-op in that case, aside from a GPU release
+        if one was still held.
+        """
+        gpu_id_to_release = (
+            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
+        )
+        if not self._container_status():
             if gpu_id_to_release is not None and self._gpu_release_fn is not None:
                 self._gpu_release_fn(gpu_id_to_release)
                 self._gpu_id = None
             return
-        # Clear PID tracking — remove kills all processes.
         self._watched_pids = {}
-        self._baseline_pids = None  # force a fresh capture on the next _ensure_started()
-        # commit_exc is raised at the end, after rm and the release checks
-        # below still run -- a failed commit doesn't mean the container
-        # shouldn't still be torn down and its resources still released,
-        # it just means this attempt's state wasn't checkpointed forward.
-        commit_exc: Exception | None = None
-        old_image_id: str | None = None
-        if commit:
-            tag = self._lifecycle_tag()
-
-            # 1. Always do the normal, fast plain commit first -- unconditionally,
-            #    regardless of whether a squash turns out to be due. Squashing
-            #    (below) is a separate, additional step layered on top when
-            #    due, never a replacement for it, so an ordinary tool call's
-            #    checkpoint/revert cost never regresses.
-            for _attempt in range(self.commit_retry_attempts):
-                try:
-                    self._run(
-                        [self._runtime, "commit", self._container_name(), tag],
-                        check=True,
-                        timeout=self.commit_timeout_s,
-                    )
-                    self._checkpoint_image = tag
-                    commit_exc = None
-                    break
-                except Exception as _e:
-                    commit_exc = _e
-                    if _attempt != self.commit_retry_attempts - 1:
-                        time.sleep(self.commit_retry_backoff_s)
-
-            if commit_exc is None:
-                # 1b. Squash is triggered purely by the chain's actual current
-                #     depth (checkpoint_squash_max_depth) or an explicit
-                #     force_squash -- not by a fixed commit count: a count
-                #     can't account for how many layers the base image
-                #     itself already consumes (a real base image was
-                #     observed at 80 layers on its own), so a count-based
-                #     interval could let the real depth cross the runtime's
-                #     actual cap before the interval ever fired.
-                #     `_image_diff_ids()` is a cheap inspect (cost
-                #     independent of image size), not a second commit.
-                should_squash = force_squash
-                if not should_squash:
-                    try:
-                        should_squash = (
-                            len(self._image_diff_ids(tag)) >= self.checkpoint_squash_max_depth
-                        )
-                    except Exception as _e:
-                        print(
-                            f"[agsandbox_backend] WARNING: could not check chain depth for tag "
-                            f"{tag}, skipping this cycle's squash check: {_e}",
-                            file=__import__("sys").stderr,
-                            flush=True,
-                        )
-
-                # 2. Best-effort: fold this cycle's own diff into the
-                #    accumulator, read directly from this commit's own
-                #    on-disk diff directory -- essentially free where
-                #    supported (see _fold_commit_into_accumulator()'s and
-                #    _locate_layer_diff_dir()'s docstrings). Never raises.
-                self._fold_commit_into_accumulator(tag)
-
-                if should_squash:
-                    # 3. A squash is due -- perform it as an ADDITIONAL step
-                    #    now, on top of the commit that just succeeded above.
-                    #    old_image_id is the FULL chain's own image ID
-                    #    (base + every commit including the one just above) --
-                    #    everything the new squashed image is about to make
-                    #    obsolete. A plain commit's result is ALWAYS a child
-                    #    layer of whatever it replaces, so the runtime would
-                    #    refuse to delete it ("has dependent child images");
-                    #    only a squash's result -- rebuilt directly on the
-                    #    shared base, whether via the accumulator fast path or
-                    #    _squash_commit()'s parentless export/import fallback
-                    #    -- makes the old chain's deletion possible, which is
-                    #    why this lookup only happens on a squash cycle.
-                    try:
-                        result = self._run(
-                            [self._runtime, "inspect", "--format={{.Id}}", tag],
-                            check=False,
-                            timeout=self.stop_inspect_timeout_s,
-                        )
-                        if result and result.returncode == 0:
-                            old_image_id = (
-                                result.stdout.decode("utf-8", errors="replace").strip() or None
-                            )
-                    except Exception as _e:
-                        print(
-                            f"[agsandbox_backend] WARNING: could not inspect existing image for tag {tag}: {_e}",
-                            file=__import__("sys").stderr,
-                            flush=True,
-                        )
-                    try:
-                        self._accumulator_squash_commit(tag)
-                    except Exception as _fast_e:
-                        print(
-                            f"[agsandbox_backend] WARNING: fast squash path failed for "
-                            f"tag {tag}, falling back to export/import: {_fast_e}",
-                            file=__import__("sys").stderr,
-                            flush=True,
-                        )
-                        try:
-                            self._squash_commit(tag)
-                        except Exception as _e:
-                            # Best-effort: the checkpoint itself (step 1) already
-                            # succeeded -- a squash failure just means the layer
-                            # chain keeps growing until the next attempt, not
-                            # that this cycle's checkpoint is lost. Not raised
-                            # as commit_exc for that reason.
-                            print(
-                                f"[agsandbox_backend] WARNING: squash failed for tag {tag}, "
-                                f"layer chain will keep growing until the next attempt: {_e}",
-                                file=__import__("sys").stderr,
-                                flush=True,
-                            )
+        self._baseline_pids = None
         name = self._container_name()
-        # rm_exc, like commit_exc, is raised at the end rather than
-        # immediately -- but unlike commit_exc, its failure also gates the
-        # release checks below: an unconfirmed removal means the container
-        # (and whatever it holds) is not known to be gone.
+        # rm_exc is raised at the end, after the release checks below still
+        # run -- an unconfirmed removal must reach the caller, but shouldn't
+        # cut short a release that's still legitimately possible to check.
         rm_exc: Exception | None = None
         for _attempt in range(self.rm_retry_attempts):
             try:
@@ -1590,28 +1602,226 @@ class _ContainerBackendBase(agsandbox_backend):
                 rm_exc = _e
                 if _attempt != self.rm_retry_attempts - 1:
                     time.sleep(self.rm_retry_backoff_s)
-        if commit:
+        if not self._container_running():
+            self._release_runtime_slot()
+        if (
+            gpu_id_to_release is not None
+            and self._gpu_release_fn is not None
+            and not self._container_running()
+        ):
+            self._gpu_release_fn(gpu_id_to_release)
+            self._gpu_id = None
+        if rm_exc is not None:
+            raise rm_exc
+
+    def commit(self, tag: "str | None" = None) -> bool:
+        """Checkpoint the container's current filesystem into a lifecycle
+        image WITHOUT removing the container -- it keeps running (or stays
+        hibernating) so the next tool call or skill resumes directly from
+        it, with no `docker/podman run` needed either way.
+
+        Squashing is fully automatic: triggered purely by the chain's
+        actual current depth (checkpoint_squash_max_depth), checked right
+        after this commit succeeds -- never by a fixed commit count, and
+        never forced. A count can't account for how many layers the base
+        image itself already consumes (a real base image was observed at
+        80 layers on its own), so a count-based interval could let the real
+        depth cross the runtime's actual cap before the interval ever
+        fired -- exactly what caused a real "max depth exceeded" failure on
+        an ordinary plain commit. `_image_diff_ids()` is a cheap inspect
+        (cost independent of image size), not a second commit.
+
+        Returns False if there's no container to commit at all (e.g. a
+        skill that never touched the sandbox) -- otherwise True once the
+        plain commit (step 1 below) has succeeded, regardless of whether a
+        squash was due or how it went. Raises if the plain commit itself
+        fails after retrying; a squash failure only warns, since the
+        checkpoint from step 1 already succeeded either way.
+        """
+        if not self._container_status():
+            return False
+        tag = tag if tag is not None else self._lifecycle_tag()
+
+        # 0. Capture whatever image *tag* currently points to, before the
+        #    plain commit below moves it -- under the hibernate model this
+        #    container is never recreated between successful commits, so
+        #    `docker/podman commit` always diffs against the container's
+        #    fixed run-time ancestor, not against the previous commit's
+        #    image (confirmed empirically: two consecutive commits with no
+        #    recreate in between produce SIBLING images of identical depth,
+        #    each containing the full cumulative diff -- never a growing
+        #    chain). That means the previous commit's image is never a
+        #    parent of this one, so once the tag moves off it, it's
+        #    immediately, safely deletable -- unlike the old teardown-every-
+        #    cycle design, where a plain commit's result was always a child
+        #    of what it replaced and could never free it. Best-effort: a
+        #    failure to even look this up just means one image doesn't get
+        #    cleaned up this cycle, not that the commit itself is at risk.
+        previous_image_id: str | None = None
+        try:
+            _prev_result = self._run(
+                [self._runtime, "inspect", "--format={{.Id}}", tag],
+                check=False,
+                timeout=self.stop_inspect_timeout_s,
+            )
+            if _prev_result and _prev_result.returncode == 0:
+                previous_image_id = (
+                    _prev_result.stdout.decode("utf-8", errors="replace").strip() or None
+                )
+        except Exception as _e:
+            print(
+                f"[agsandbox_backend] WARNING: could not inspect existing image for tag "
+                f"{tag} before commit: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+
+        # 1. Always do the normal, fast plain commit first -- unconditionally,
+        #    regardless of whether a squash turns out to be due. Squashing
+        #    (below) is a separate, additional step layered on top when
+        #    due, never a replacement for it, so an ordinary commit's cost
+        #    never regresses.
+        commit_exc: Exception | None = None
+        for _attempt in range(self.commit_retry_attempts):
+            try:
+                self._run(
+                    [self._runtime, "commit", self._container_name(), tag],
+                    check=True,
+                    timeout=self.commit_timeout_s,
+                )
+                self._checkpoint_image = tag
+                commit_exc = None
+                break
+            except Exception as _e:
+                commit_exc = _e
+                if _attempt != self.commit_retry_attempts - 1:
+                    time.sleep(self.commit_retry_backoff_s)
+        if commit_exc is not None:
+            raise commit_exc
+
+        # 1a. Clean up the image *tag* pointed at before this commit moved
+        #     it -- see step 0's docstring for why this is always safe now
+        #     (never a parent of the new commit), unlike squash cleanup
+        #     below which only ever applied on a squash cycle. Guarded by
+        #     an ancestor check the same way: a fork may have tagged this
+        #     exact image and already be running a container from it, in
+        #     which case it's left alone. Best-effort -- a stray dangling
+        #     image costs disk space, not correctness.
+        if previous_image_id:
+            try:
+                _in_use = self._run(
+                    [
+                        self._runtime,
+                        "ps",
+                        "-a",
+                        "--filter",
+                        f"ancestor={previous_image_id}",
+                        "--format",
+                        "{{.ID}}",
+                    ],
+                    check=False,
+                    timeout=self.stop_ps_check_timeout_s,
+                )
+                if _in_use and _in_use.stdout.strip():
+                    pass  # a container (e.g. a fork) still runs from this image — leave it
+                else:
+                    self._rmi(previous_image_id)
+            except Exception as _e:
+                print(
+                    f"[agsandbox_backend] WARNING: could not check/delete previous image "
+                    f"{previous_image_id} for tag {tag}: {_e}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+
+        # 1b. Squash is triggered purely by the chain's actual current depth
+        #     (checkpoint_squash_max_depth) -- not by a fixed commit count:
+        #     a count can't account for how many layers the base image
+        #     itself already consumes (a real base image was observed at 80
+        #     layers on its own), so a count-based interval could let the
+        #     real depth cross the runtime's actual cap before the interval
+        #     ever fired. `_image_diff_ids()` is a cheap inspect (cost
+        #     independent of image size), not a second commit.
+        should_squash = False
+        try:
+            should_squash = len(self._image_diff_ids(tag)) >= self.checkpoint_squash_max_depth
+        except Exception as _e:
+            print(
+                f"[agsandbox_backend] WARNING: could not check chain depth for tag "
+                f"{tag}, skipping this cycle's squash check: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+
+        # 2. Best-effort: fold this cycle's own diff into the accumulator,
+        #    read directly from this commit's own on-disk diff directory --
+        #    essentially free where supported (see
+        #    _fold_commit_into_accumulator()'s and _locate_layer_diff_dir()'s
+        #    docstrings). Never raises.
+        self._fold_commit_into_accumulator(tag)
+
+        if should_squash:
+            # 3. A squash is due -- perform it as an ADDITIONAL step now, on
+            #    top of the commit that just succeeded above. old_image_id
+            #    is the FULL chain's own image ID (base + every commit
+            #    including the one just above) -- everything the new
+            #    squashed image is about to make obsolete. A plain commit's
+            #    result is ALWAYS a child layer of whatever it replaces, so
+            #    the runtime would refuse to delete it ("has dependent child
+            #    images"); only a squash's result -- rebuilt directly on the
+            #    shared base, whether via the accumulator fast path or
+            #    _squash_commit()'s parentless export/import fallback --
+            #    makes the old chain's deletion possible, which is why this
+            #    lookup only happens on a squash cycle.
+            old_image_id: str | None = None
+            try:
+                result = self._run(
+                    [self._runtime, "inspect", "--format={{.Id}}", tag],
+                    check=False,
+                    timeout=self.stop_inspect_timeout_s,
+                )
+                if result and result.returncode == 0:
+                    old_image_id = result.stdout.decode("utf-8", errors="replace").strip() or None
+            except Exception as _e:
+                print(
+                    f"[agsandbox_backend] WARNING: could not inspect existing image for tag {tag}: {_e}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+            try:
+                self._accumulator_squash_commit(tag)
+            except Exception as _fast_e:
+                print(
+                    f"[agsandbox_backend] WARNING: fast squash path failed for "
+                    f"tag {tag}, falling back to export/import: {_fast_e}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+                try:
+                    self._squash_commit(tag)
+                except Exception as _e:
+                    # Best-effort: the checkpoint itself (step 1) already
+                    # succeeded -- a squash failure just means the layer
+                    # chain keeps growing until the next attempt, not that
+                    # this cycle's checkpoint is lost.
+                    print(
+                        f"[agsandbox_backend] WARNING: squash failed for tag {tag}, "
+                        f"layer chain will keep growing until the next attempt: {_e}",
+                        file=__import__("sys").stderr,
+                        flush=True,
+                    )
             # Delete the previous image now that the tag points to the new
-            # one -- old_image_id is None unless this cycle squashed (see
-            # above), since a plain commit's result can never actually free
-            # its parent. Only delete if no containers are currently using
-            # it -- a fork may still be running from the same image (the
-            # fork's own stop() will delete it once its container is gone),
-            # and this container itself just got removed above. Deliberately
-            # checked AFTER _rm_container, not before: this container was
-            # `run` FROM old_image_id (that's what restart-from-checkpoint
-            # means), so `docker ps --filter ancestor=<old_image_id>`
-            # matches THIS SAME container as long as it's still alive --
-            # checking before removal meant the "in use" check always found
-            # a false positive (this container itself, always about to be
-            # removed anyway) and never actually deleted anything. Only run
-            # this check at all if removal actually succeeded -- if rm_exc
-            # is set, the container may genuinely still be running from
-            # old_image_id, so it really is still in use, and there's no
-            # point spending another docker call confirming that.
-            # Best-effort: a stray dangling image costs disk space, not
-            # correctness.
-            if old_image_id and self._checkpoint_image == tag and rm_exc is None:
+            # one -- a plain commit's result can never actually free its own
+            # parent, only a squash's result can. Only delete if no
+            # containers are currently using it -- a fork may still be
+            # running from the same image (the fork's own commit()/
+            # rm_container() will delete it once its container is gone).
+            # This backend's own container is virtually always still alive
+            # at this point too, but its `run`-time ancestor is whatever it
+            # was originally created from, not this just-superseded
+            # intermediate commit -- so it never matches here. Best-effort:
+            # a stray dangling image costs disk space, not correctness.
+            if old_image_id and self._checkpoint_image == tag:
                 try:
                     in_use = self._run(
                         [
@@ -1636,32 +1846,7 @@ class _ContainerBackendBase(agsandbox_backend):
                         file=__import__("sys").stderr,
                         flush=True,
                     )
-        # Only release the runtime slot once the container is actually
-        # confirmed gone -- if every rm -f attempt failed, the container (and
-        # the physical slot it occupies) is still alive, so releasing here
-        # would over-credit the semaphore while destroy() (or a later stop())
-        # still has a live container to clean up and would release again once
-        # removal genuinely succeeds.
-        if not self._container_running():
-            self._release_runtime_slot()
-        # Free the GPU only once the container is confirmed gone -- same
-        # ground-truth gate as the runtime slot above; releasing while rm
-        # failed and the container might still be running would let
-        # something else acquire the same physical GPU concurrently.
-        if (
-            gpu_id_to_release is not None
-            and self._gpu_release_fn is not None
-            and not self._container_running()
-        ):
-            self._gpu_release_fn(gpu_id_to_release)
-            self._gpu_id = None
-        # Surface whichever failure is more severe: an unconfirmed removal
-        # means real resources may still be held, which matters more than a
-        # missed checkpoint.
-        if rm_exc is not None:
-            raise rm_exc
-        if commit_exc is not None:
-            raise commit_exc
+        return True
 
     def restore(self, tag: str) -> None:
         """Restore the sandbox to a previously committed image snapshot.
@@ -1683,9 +1868,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     print(
                         f"[agsandbox_backend] WARNING: failed to kill PIDs {pids} in {self._name} during restore: {_e}"
                     )
-            self._rm_container(self._container_name())
-            self._watched_pids = {}
-            self._baseline_pids = None  # force a fresh capture in _ensure_started() below
+            self.rm_container()
         self._checkpoint_image = tag
         self._ensure_started()
 
