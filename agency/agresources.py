@@ -29,9 +29,6 @@ class _AgResourcePoolFields:
     memory_detect_fallback_mb = GlobalConfigParam(
         "agResourcePool", default=4096
     )  # Safe fallback total RAM in MB when detection fails on both Linux and macOS
-    gpu_acquire_poll_interval_s = GlobalConfigParam(
-        "agResourcePool", default=0.25
-    )  # Seconds between polls waiting for a free GPU semaphore
     marker_mb = GlobalConfigParam(
         "agResourcePool", default=128
     )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
@@ -385,10 +382,15 @@ class agResourcePool(_AgResourcePoolFields):
         self.total_memory_mb = (
             total_memory_mb if total_memory_mb is not None else detect_memory_mb()
         )
-        self._gpu_locks: dict[int, threading.BoundedSemaphore] = {
-            gpu_id: threading.BoundedSemaphore(1) for gpu_id in self.gpus
-        }
-        self._res_lock = threading.Lock()
+        # A single Condition (rather than one BoundedSemaphore per GPU) so
+        # release_gpu() can directly wake a waiter instead of every
+        # acquire_gpu() call polling every GPU's own lock in a loop -- see
+        # acquire_gpu()/release_gpu() docstrings for the full reasoning.
+        # Also covers _gpus_acquired/cpus_acquired/memory_acquired_mb, which
+        # used to need a separate _res_lock: they're always mutated in the
+        # same critical sections as _free_gpus now, so one lock covers both.
+        self._cond = threading.Condition()
+        self._free_gpus: set[int] = set(self.gpus)
         self._gpus_acquired: int = 0
         self.cpus_acquired: float = 0.0
         self.memory_acquired_mb: int = 0
@@ -407,20 +409,39 @@ class agResourcePool(_AgResourcePoolFields):
         return self._agconfig.clone()
 
     def acquire_gpu(self, timeout: float | None = None) -> int:
-        """Block until any GPU is free; return its id."""
-        deadline = None if timeout is None else time.monotonic() + timeout
-        poll = _AgResourcePoolFields().gpu_acquire_poll_interval_s
+        """Block until any GPU is free; return its id.
 
-        while True:
-            for gpu_id, sem in self._gpu_locks.items():
-                if sem.acquire(blocking=False):
-                    with self._res_lock:
-                        self._gpus_acquired += 1
-                    self._emit_resource()
-                    return gpu_id
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
-            time.sleep(poll)
+        Waits on a single shared Condition rather than polling every GPU's
+        own lock in a loop -- release_gpu() notifies exactly one waiter the
+        moment a GPU frees up, instead of every waiter re-checking on a
+        fixed timer (which wasted CPU/context-switches under contention and
+        added up to one poll interval of latency before a freed GPU was
+        even noticed).
+
+        The `while not self._free_gpus` re-check after `wait()` returns is
+        required, not defensive style: `notify()` only guarantees the
+        woken thread gets a chance to recheck the condition, not that what
+        it was waiting for is still there by the time it reacquires the
+        lock -- another thread (a waiter woken earlier, or a fresh caller
+        that never waited at all) can win the race and take the last free
+        GPU first. `remaining` is recomputed from the original deadline on
+        each iteration (not reset to a fresh `timeout`) so a caller that
+        gets repeatedly out-raced still times out after its original
+        budget, not a fresh one per iteration.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            while not self._free_gpus:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
+                if not self._cond.wait(timeout=remaining):
+                    raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
+            gpu_id = self._free_gpus.pop()
+            self._gpus_acquired += 1
+            acquired_snapshot = self._gpus_acquired
+        self._emit_resource(acquired_snapshot)
+        return gpu_id
 
     def release_gpu(self, gpu_id: int) -> None:
         """Release *gpu_id* back to the pool.
@@ -436,40 +457,64 @@ class agResourcePool(_AgResourcePoolFields):
         predicate through here for exactly that re-check; removed as
         redundant -- see agsandbox_backends.chroot's module docstring for
         the reasoning that led here.)
+
+        Explicitly guards against gpu_id not being one of this pool's GPUs,
+        and against double-releasing a gpu_id already in `_free_gpus` --
+        neither is caught for free by a plain set the way a
+        BoundedSemaphore used to reject an over-release on its own. The
+        second check matters even though a set can't hold two copies of
+        the same id: without it, a double-release (or releasing a gpu_id
+        another sandbox still legitimately holds) would silently mark an
+        in-use GPU as free, letting two sandboxes acquire the same physical
+        GPU at once -- the actual hazard, not just a cosmetic duplicate
+        entry.
         """
-        sem = self._gpu_locks.get(gpu_id)
-        if sem is not None:
-            try:
-                sem.release()
-            except ValueError as _e:
-                print(
-                    f"[agresources] WARNING: GPU semaphore double-release for gpu_id={gpu_id}: {_e}"
-                )
-            with self._res_lock:
-                self._gpus_acquired = max(0, self._gpus_acquired - 1)
-            self._emit_resource()
+        with self._cond:
+            if gpu_id not in self.gpus:
+                print(f"[agresources] WARNING: release_gpu called with unknown gpu_id={gpu_id}")
+                return
+            if gpu_id in self._free_gpus:
+                print(f"[agresources] WARNING: GPU double-release for gpu_id={gpu_id}")
+                return
+            self._free_gpus.add(gpu_id)
+            self._gpus_acquired = max(0, self._gpus_acquired - 1)
+            acquired_snapshot = self._gpus_acquired
+            self._cond.notify()
+        self._emit_resource(acquired_snapshot)
 
     def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:
         """Record that a sandbox boosted its CPU/memory limits."""
-        with self._res_lock:
+        with self._cond:
             self.cpus_acquired += cpus
             self.memory_acquired_mb += memory_mb
-        self._emit_resource()
+            acquired_snapshot = self._gpus_acquired
+        self._emit_resource(acquired_snapshot)
 
     def notify_cpu_released(self, cpus: float, memory_mb: int) -> None:
         """Record that a sandbox reset its CPU/memory limits to idle."""
-        with self._res_lock:
+        with self._cond:
             self.cpus_acquired = max(0.0, self.cpus_acquired - cpus)
             self.memory_acquired_mb = max(0, self.memory_acquired_mb - memory_mb)
-        self._emit_resource()
+            acquired_snapshot = self._gpus_acquired
+        self._emit_resource(acquired_snapshot)
 
-    def _emit_resource(self) -> None:
+    def _emit_resource(self, gpus_acquired: int) -> None:
+        """Push a resource_update to the webui dashboard, if active.
+
+        Called after releasing self._cond -- gpus_acquired is passed in as a
+        snapshot taken while the lock was still held, rather than re-read
+        from self._gpus_acquired here, so a call never reports a different
+        thread's mutation as if it were its own. cpus_acquired/
+        memory_acquired_mb are read live (not snapshotted) since they're not
+        part of the invariant this refactor centers on; a harmless
+        interleaving there matches this method's pre-existing behavior.
+        """
         try:
             from . import agwebui as _agwebui
 
             if _agwebui._active is not None:
                 _agwebui._active.emitter.resource_update(
-                    gpus_acquired=self._gpus_acquired,
+                    gpus_acquired=gpus_acquired,
                     gpus_total=len(self.gpus),
                     cpus_acquired=self.cpus_acquired,
                     cpus_total=self.total_cpus,
