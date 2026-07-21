@@ -692,6 +692,26 @@ class _ContainerBackendBase(agsandbox_backend):
         self._accumulated_diff_path: "Path | None" = None
         self._accumulated_layer_count: int = 0
         self._accumulator_dir: "Path | None" = None
+        # The reference chain _accumulator_squash_commit() validates and
+        # builds against -- None means "use self._base_image's own
+        # digests" (the ordinary case, and always true until this
+        # backend's own first successful squash). Set to the JUST-
+        # PRODUCED chain's digests after every successful squash (fast or
+        # fallback -- see _accumulator_squash_commit()/_squash_commit()),
+        # so a squash that fell back to export/import doesn't permanently
+        # lock this backend out of the fast path for the rest of its
+        # life: the fallback's own single-layer result becomes the new
+        # reference point for the NEXT squash instead of the original,
+        # now-unrelated base image. Referenced by DIGEST only (never the
+        # mutable lifecycle tag string, which gets overwritten by every
+        # subsequent commit) -- safe to hold onto indefinitely, since a
+        # layer that's an ancestor of the current chain can't be deleted
+        # out from under it (the runtime refuses "has dependent child
+        # images"). Purely in-memory: lost on process restart or fork
+        # (a fresh backend object starts back at None, falling back to
+        # self._base_image -- the same one-time-per-object gap as before,
+        # not a regression).
+        self._squash_base_diff_ids: "list[str] | None" = None
         self._agconfig = agconfig
         self._name = name
         self._base_image = base_image
@@ -1180,6 +1200,14 @@ class _ContainerBackendBase(agsandbox_backend):
             new_layer_digest = diff_ids[-1]
             diff_dir = self._locate_layer_diff_dir(new_layer_digest, diff_ids=diff_ids)
             if diff_dir is None:
+                print(
+                    f"[agsandbox_backend] WARNING: could not locate on-disk diff "
+                    f"directory for layer {new_layer_digest} (tag {tag}) -- "
+                    f"invalidating the checkpoint diff accumulator, next squash "
+                    f"will fall back to export/import",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
                 self._invalidate_accumulator()
                 return
 
@@ -1220,26 +1248,48 @@ class _ContainerBackendBase(agsandbox_backend):
 
     def _accumulator_squash_commit(self, tag: str) -> None:
         """Fast path: apply the incrementally-built accumulator diff-tar
-        directly onto the base image's own layers (referenced by digest
-        only -- see `_layer_squash.build_save_archive()`, never touched)
-        to produce the new squashed HEAD image. Confirmed empirically to
-        complete in well under a second regardless of base image size
-        (verified against the real ~24GB, 80-layer `agency-sandbox:latest`).
+        directly onto the reference chain's own layers (referenced by
+        digest only -- see `_layer_squash.build_save_archive()`, never
+        touched) to produce the new squashed HEAD image. Confirmed
+        empirically to complete in well under a second regardless of base
+        image size (verified against the real ~24GB, 80-layer
+        `agency-sandbox:latest`).
+
+        The reference chain is `self._squash_base_diff_ids` if this
+        backend has already squashed successfully at least once (fast or
+        fallback -- see below), else `self._base_image`'s own digests.
+        This is what lets a sandbox recover fast-path eligibility after a
+        `_squash_commit()` fallback: without it, the base image's digests
+        stop being a prefix of the chain FOREVER the moment a fallback
+        ever runs (export/import produces a parentless image, permanently
+        disconnected from `self._base_image`'s lineage), forcing every
+        future squash to fall back too -- confirmed as a real production
+        issue (repeated tens-of-GB export/imports for a long-running
+        sandbox whose per-commit diffs were themselves large enough that
+        a single lookup hiccup was plausible). Re-baselining against
+        whatever the last squash actually produced sidesteps that: the
+        very next squash gets a fresh reference and a fresh accumulator,
+        so a one-time hiccup doesn't compound into permanent degradation.
 
         Raises if the accumulator can't be trusted for this squash --
         e.g. `_accumulated_layer_count` doesn't match the real gap
-        between the current checkpoint and the base (happens right after
-        a fork, whose backend starts this counter fresh; see
-        agsandbox.py's fork()), or the base image doesn't prefix the
-        current chain (e.g. rebuilt since this sandbox's chain started).
-        Callers must catch and fall back to `_squash_commit()` -- this
-        method never silently produces a possibly-wrong image.
+        between the current checkpoint and the reference chain (happens
+        right after a fork, whose backend starts both this counter and
+        `_squash_base_diff_ids` fresh; see agsandbox.py's fork()), or the
+        reference chain doesn't prefix the current chain (e.g. the base
+        image was rebuilt since this sandbox's chain started, for a
+        backend that hasn't squashed yet). Callers must catch and fall
+        back to `_squash_commit()` -- this method never silently produces
+        a possibly-wrong image.
         """
         if self._accumulated_diff_path is None:
             raise RuntimeError("no checkpoint diff accumulator available")
 
-        resolved_base = self._resolve_image(self._base_image)
-        base_diff_ids = self._image_diff_ids(resolved_base)
+        if self._squash_base_diff_ids is not None:
+            base_diff_ids = self._squash_base_diff_ids
+        else:
+            resolved_base = self._resolve_image(self._base_image)
+            base_diff_ids = self._image_diff_ids(resolved_base)
         current_diff_ids = self._image_diff_ids(tag)
         expected_new_layers = len(current_diff_ids) - len(base_diff_ids)
         if (
@@ -1295,6 +1345,10 @@ class _ContainerBackendBase(agsandbox_backend):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+        # Re-baseline: the NEXT squash validates/builds against this
+        # squash's own resulting chain, not self._base_image -- see this
+        # method's docstring.
+        self._squash_base_diff_ids = new_diff_ids
         self._reset_accumulator()
 
     def _squash_commit(self, tag: str) -> None:
@@ -1335,12 +1389,16 @@ class _ContainerBackendBase(agsandbox_backend):
         `_accumulator_squash_commit()`): export/import produces a
         PARENTLESS image, disconnected from `self._base_image`'s own
         lineage entirely -- meaning `_accumulator_squash_commit()`'s
-        base-is-a-prefix precondition can never hold again for this
-        sandbox going forward, so every future squash permanently falls
-        back to this same slower path too. Safe (never produces a wrong
-        image), just permanently degraded after the first fallback;
-        clearing the accumulator here avoids carrying around now-
-        meaningless stale state on top of that.
+        base-is-a-prefix precondition can never hold again relative to
+        the ORIGINAL base image. This no longer means every future squash
+        is permanently stuck on this slower path, though: this method
+        re-baselines `self._squash_base_diff_ids` to the freshly-
+        flattened image's own (single-layer) chain right below, so the
+        NEXT squash attempt validates/builds against THAT instead --
+        recovering fast-path eligibility from here on, for as long as
+        this backend object lives (see `self._squash_base_diff_ids`'s
+        docstring in __init__ for why this is safe and why it doesn't
+        persist across a process restart or fork).
         """
         export_result = self._run(
             [self._runtime, "export", self._container_name()],
@@ -1360,6 +1418,21 @@ class _ContainerBackendBase(agsandbox_backend):
             check=True,
             timeout=self.squash_timeout_s,
         )
+        try:
+            self._squash_base_diff_ids = self._image_diff_ids(tag)
+        except Exception as _e:
+            # Best-effort: the flatten itself already succeeded above --
+            # this only means the NEXT squash won't benefit from the fast
+            # path re-baseline (falls back to self._base_image instead,
+            # which will fail its prefix check again and fall back once
+            # more, exactly like before this re-baselining existed).
+            print(
+                f"[agsandbox_backend] WARNING: could not record post-squash chain "
+                f"for tag {tag}, next squash will fall back to export/import again: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+            self._squash_base_diff_ids = None
         self._reset_accumulator()
 
     def stop(self, *, commit: bool = False, force_squash: bool = False) -> None:
@@ -1481,7 +1554,13 @@ class _ContainerBackendBase(agsandbox_backend):
                         )
                     try:
                         self._accumulator_squash_commit(tag)
-                    except Exception:
+                    except Exception as _fast_e:
+                        print(
+                            f"[agsandbox_backend] WARNING: fast squash path failed for "
+                            f"tag {tag}, falling back to export/import: {_fast_e}",
+                            file=__import__("sys").stderr,
+                            flush=True,
+                        )
                         try:
                             self._squash_commit(tag)
                         except Exception as _e:

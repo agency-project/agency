@@ -114,7 +114,13 @@ class _DockerBackend(_ContainerBackendBase):
                     timeout=self.inspect_timeout_s,
                 ).stdout.decode("utf-8", errors="replace")
             )
-        except Exception:
+        except Exception as _e:
+            print(
+                f"[agsandbox_backend] WARNING: `docker info` failed, fast squash path "
+                f"unavailable for this backend's lifetime: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
             info = None
         self._docker_info_cache = info
         return info
@@ -127,10 +133,16 @@ class _DockerBackend(_ContainerBackendBase):
         """
         info = self._docker_info()
         if info is None:
-            return None
+            return None  # already warned in _docker_info()
         try:
             return (Path(info["DockerRootDir"]), info.get("Driver", ""))
-        except Exception:
+        except Exception as _e:
+            print(
+                f"[agsandbox_backend] WARNING: `docker info` output missing "
+                f"DockerRootDir, fast squash path unavailable: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
             return None
 
     def _is_rootless(self) -> bool:
@@ -180,7 +192,13 @@ class _DockerBackend(_ContainerBackendBase):
                     continue
                 entries.append((int(parts[0]), int(parts[1]), int(parts[2])))
             return entries or None
-        except (OSError, ValueError):
+        except (OSError, ValueError) as _e:
+            print(
+                f"[agsandbox_backend] WARNING: could not parse {path} for rootless "
+                f"uid/gid translation: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
             return None
 
     def _rootless_id_maps(self) -> "tuple[list, list] | None":
@@ -194,7 +212,15 @@ class _DockerBackend(_ContainerBackendBase):
             return cached
         result = None
         pid = self._find_dockerd_pid()
-        if pid is not None:
+        if pid is None:
+            print(
+                "[agsandbox_backend] WARNING: rootless Docker confirmed but dockerd's "
+                "own PID could not be found -- uid/gid translation unavailable, fast "
+                "squash path will fail lchown checks for this backend's lifetime",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+        else:
             uid_map = self._parse_id_map(Path(f"/proc/{pid}/uid_map"))
             gid_map = self._parse_id_map(Path(f"/proc/{pid}/gid_map"))
             if uid_map is not None and gid_map is not None:
@@ -248,6 +274,22 @@ class _DockerBackend(_ContainerBackendBase):
             if completed is not None and completed.returncode == 0:
                 result = prefix
                 break
+            if completed is not None:
+                print(
+                    f"[agsandbox_backend] WARNING: ctr probe {' '.join(prefix)} exited "
+                    f"{completed.returncode}: "
+                    f"{completed.stderr.decode('utf-8', errors='replace').strip()}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+        if result is None:
+            print(
+                "[agsandbox_backend] WARNING: neither `ctr` nor `sudo -n ctr` is usable "
+                "on this host -- containerd overlayfs fast squash path unavailable for "
+                "this backend's lifetime",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
         self._ctr_argv_cache = result
         return result
 
@@ -260,10 +302,16 @@ class _DockerBackend(_ContainerBackendBase):
         """
         chain_id = _chain_id_for_diff_ids(diff_ids)
         if chain_id is None:
+            print(
+                "[agsandbox_backend] WARNING: could not compute a containerd ChainID "
+                "(empty diff_ids) -- fast squash unavailable for this cycle",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
             return None
         ctr = self._ctr_argv()
         if ctr is None:
-            return None
+            return None  # already warned in _ctr_argv()
         view = f"agency-locate-{uuid.uuid4().hex}"
         ctr_n = ctr + ["-n", "moby"]
         try:
@@ -273,6 +321,13 @@ class _DockerBackend(_ContainerBackendBase):
                 timeout=self.inspect_timeout_s,
             )
             if created.returncode != 0:
+                print(
+                    f"[agsandbox_backend] WARNING: `ctr snapshots view` failed for "
+                    f"chain {chain_id}: "
+                    f"{created.stderr.decode('utf-8', errors='replace').strip()}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
                 return None
             mounts = subprocess.run(
                 ctr_n + ["snapshots", "mounts", "/tmp/agency-ctr-unused", view],
@@ -281,9 +336,22 @@ class _DockerBackend(_ContainerBackendBase):
                 timeout=self.inspect_timeout_s,
             )
             if mounts.returncode != 0:
+                print(
+                    f"[agsandbox_backend] WARNING: `ctr snapshots mounts` failed for "
+                    f"chain {chain_id}: {mounts.stderr.strip()}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
                 return None
             diff_dir = _parse_ctr_mounts_top_fs(mounts.stdout or "")
             if diff_dir is None:
+                print(
+                    f"[agsandbox_backend] WARNING: could not parse a diff directory "
+                    f"out of `ctr snapshots mounts` output for chain {chain_id}: "
+                    f"{mounts.stdout!r}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
                 return None
             # Rootful containerd creates snapshot dirs as 0700. When we
             # reached ctr via sudo -n, also open this one snapshot for
@@ -308,9 +376,22 @@ class _DockerBackend(_ContainerBackendBase):
                     )
             try:
                 if not diff_dir.is_dir():
+                    print(
+                        f"[agsandbox_backend] WARNING: containerd snapshot diff dir "
+                        f"{diff_dir} does not exist -- fast squash unavailable for "
+                        f"this cycle",
+                        file=__import__("sys").stderr,
+                        flush=True,
+                    )
                     return None
                 next(diff_dir.iterdir(), None)
-            except OSError:
+            except OSError as _e:
+                print(
+                    f"[agsandbox_backend] WARNING: containerd snapshot diff dir "
+                    f"{diff_dir} is not readable: {_e}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
                 return None
             return diff_dir
         except Exception as _e:
@@ -348,12 +429,39 @@ class _DockerBackend(_ContainerBackendBase):
                     if (entry / "diff").read_text().strip() != diff_id:
                         continue
                     cache_id = (entry / "cache-id").read_text().strip()
-                except (OSError, UnicodeDecodeError):
+                except (OSError, UnicodeDecodeError) as _e:
+                    print(
+                        f"[agsandbox_backend] WARNING: could not read layerdb entry "
+                        f"{entry}, skipping it: {_e}",
+                        file=__import__("sys").stderr,
+                        flush=True,
+                    )
                     continue
                 diff_dir = data_root / "overlay2" / cache_id / "diff"
-                return diff_dir if diff_dir.is_dir() else None
-        except OSError:
+                if not diff_dir.is_dir():
+                    print(
+                        f"[agsandbox_backend] WARNING: layerdb entry {entry} for "
+                        f"diff_id {diff_id} points at {diff_dir}, which doesn't "
+                        f"exist -- fast squash unavailable for this cycle",
+                        file=__import__("sys").stderr,
+                        flush=True,
+                    )
+                    return None
+                return diff_dir
+        except OSError as _e:
+            print(
+                f"[agsandbox_backend] WARNING: could not list {layerdb_root}: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
             return None
+        print(
+            f"[agsandbox_backend] WARNING: no overlay2 layerdb entry found for "
+            f"diff_id {diff_id} under {layerdb_root} -- fast squash unavailable "
+            f"for this cycle",
+            file=__import__("sys").stderr,
+            flush=True,
+        )
         return None
 
     def _locate_layer_diff_dir(
@@ -372,12 +480,26 @@ class _DockerBackend(_ContainerBackendBase):
         """
         root_and_driver = self._docker_data_root_and_driver()
         if root_and_driver is None:
-            return None
+            return None  # already warned in _docker_info()/_docker_data_root_and_driver()
         data_root, driver = root_and_driver
         if driver == "overlay2":
             return self._locate_overlay2_layer_diff_dir(data_root, diff_id)
         if driver == "overlayfs":
             if not diff_ids or diff_ids[-1] != diff_id:
+                print(
+                    f"[agsandbox_backend] WARNING: _locate_layer_diff_dir() called "
+                    f"without a matching diff_ids chain for {diff_id} (got {diff_ids!r}) "
+                    f"-- this is an internal caller mismatch, fast squash unavailable "
+                    f"for this cycle",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
                 return None
             return self._locate_containerd_overlayfs_diff_dir(diff_ids)
+        print(
+            f"[agsandbox_backend] WARNING: unsupported docker storage driver "
+            f"{driver!r} -- fast squash path unavailable for this backend's lifetime",
+            file=__import__("sys").stderr,
+            flush=True,
+        )
         return None

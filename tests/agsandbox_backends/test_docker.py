@@ -559,6 +559,42 @@ class TestCheckpointSquash:
     def _sb(self):
         return _make_sandbox()
 
+    def test_warns_when_fast_path_fails_even_if_fallback_succeeds(self):
+        """The fast accumulator path raising must ALWAYS be visible, even
+        when the fallback then succeeds -- previously this was completely
+        silent (only a failure of BOTH paths ever printed anything), which
+        is exactly what made a real production squash fallback
+        undiagnosable without live forensics on the running process (see
+        docs/agsandbox_backends/container.md's "Fast incremental
+        squashing" section)."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        # No accumulator ever built (fresh sandbox) -- _accumulator_squash_commit()
+        # raises immediately with "no checkpoint diff accumulator available",
+        # forcing the export/import fallback, which succeeds via the mock below.
+        assert sb._backend._accumulated_diff_path is None
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "export" in args:
+                return _FakeCompleted(stdout=b"FAKE_TAR")
+            return _FakeCompleted()
+
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.stop(commit=True, force_squash=True)
+        finally:
+            sys.stderr = old_stderr
+
+        assert "WARNING" in captured.getvalue()
+        assert "fast squash path failed" in captured.getvalue()
+        assert "falling back to export/import" in captured.getvalue()
+
     def test_squashes_when_depth_at_or_above_max_depth(self):
         """A chain at/above checkpoint_squash_max_depth must squash on an
         ordinary stop(commit=True) -- no force_squash needed. The normal
@@ -711,6 +747,128 @@ class TestCheckpointSquash:
             f"LABEL {_AGENCY_OWNER_PID_LABEL}={sb._backend._owner_pid}"
         )
 
+    def test_squash_commit_records_post_import_diff_ids_for_rebaseline(self):
+        """After a successful export/import fallback, _squash_base_diff_ids
+        must be set to the freshly-flattened image's OWN chain -- this is
+        what lets the NEXT squash use the fast path again instead of
+        being permanently stuck re-paying export/import forever (see
+        docs/agsandbox_backends/container.md's "Re-baselining after a
+        fallback" section)."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        assert sb._backend._squash_base_diff_ids is None
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "export" in args:
+                return _FakeCompleted(stdout=b"FAKE_TAR")
+            if "--format={{json .RootFS.Layers}}" in args:
+                # The freshly-imported, single-layer flattened image.
+                return _FakeCompleted(stdout=b'["sha256:flattened-single-layer"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True, force_squash=True)
+
+        assert sb._backend._squash_base_diff_ids == ["sha256:flattened-single-layer"]
+
+    def test_squash_commit_degrades_gracefully_when_recording_diff_ids_fails(self):
+        """If reading back the freshly-flattened image's diff_ids fails,
+        the squash itself (which already succeeded) must not be reported
+        as a failure -- only the re-baseline optimization is lost, falling
+        back to self._base_image again next time, same as before
+        re-baselining existed."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "export" in args:
+                return _FakeCompleted(stdout=b"FAKE_TAR")
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b"not json")  # unparseable
+            return _FakeCompleted()
+
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.stop(commit=True, force_squash=True)  # must not raise
+        finally:
+            sys.stderr = old_stderr
+
+        assert sb._backend._squash_base_diff_ids is None
+        assert "WARNING" in captured.getvalue()
+        # And critically, this must NOT be reported as a squash failure --
+        # the flatten itself succeeded.
+        assert "squash failed" not in captured.getvalue()
+
+    def test_second_squash_after_fallback_uses_fast_path(self, tmp_path):
+        """The actual recovery scenario this whole mechanism exists for:
+        a sandbox that fell back to export/import once must be able to
+        use the FAST path on its next squash, instead of being
+        permanently stuck re-paying export/import forever -- confirmed
+        as a real production issue for a long-running sandbox with
+        unusually large per-commit diffs (see docs/agsandbox_backends/
+        container.md's "Re-baselining after a fallback" section)."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        calls = []
+
+        # --- Cycle 1: force a squash with no accumulator built yet --
+        #     _accumulator_squash_commit() raises immediately, falls back.
+        def fake_run_cycle1(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            if "export" in args:
+                return _FakeCompleted(stdout=b"FAKE_TAR")
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:flattened-1"]')
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run_cycle1):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True, force_squash=True)
+
+        assert any("export" in c for c in calls), f"cycle 1 must have fallen back: {calls}"
+        assert sb._backend._squash_base_diff_ids == ["sha256:flattened-1"]
+
+        # --- Cycle 2: accumulator builds fine this time, squash forced
+        #     again -- must use the FAST path, no export/import at all.
+        diff_dir = tmp_path / "diff2"
+        diff_dir.mkdir()
+        (diff_dir / "f").write_text("x")
+        calls.clear()
+
+        def fake_run_cycle2(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:flattened-1", "sha256:new-commit"]')
+            if args[1] == "inspect":
+                return _FakeCompleted(
+                    stdout=json.dumps(
+                        [{"Config": {}, "Architecture": "amd64", "Os": "linux"}]
+                    ).encode()
+                )
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run_cycle2):
+            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff_dir):
+                with patch.object(sb._backend, "_container_running", return_value=True):
+                    with patch.object(sb._backend, "_gpu_virtual", False):
+                        sb.stop(commit=True, force_squash=True)
+
+        assert not any("export" in c or "import" in c for c in calls), (
+            f"cycle 2 must use the fast path, not fall back again: {calls}"
+        )
+        assert any("load" in c for c in calls), f"expected the fast path's docker load: {calls}"
+
     def test_squash_failure_is_best_effort(self):
         """If every squash path fails (both the accumulator fast path and
         the _squash_commit() fallback), stop() must NOT raise -- the
@@ -850,18 +1008,32 @@ class TestLocateLayerDiffDir:
         assert (result / "marker").read_text() == "x"
 
     def test_returns_none_when_digest_not_found(self, tmp_path):
+        """No warning silence: a fast-path lookup miss must be visible in
+        the logs, not just an unexplained fallback discovered later (this
+        exact silence cost real debugging time diagnosing a production
+        squash fallback -- see docs/agsandbox_backends/container.md)."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
         root = self._fake_docker_root(tmp_path)
         self._add_layerdb_entry(root, "sha256:other456", "cache-other")
 
-        with patch.object(
-            _mod._DockerBackend, "_docker_data_root_and_driver", return_value=(root, "overlay2")
-        ):
-            result = sb._backend._locate_layer_diff_dir("sha256:nonexistent")
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(
+                _mod._DockerBackend,
+                "_docker_data_root_and_driver",
+                return_value=(root, "overlay2"),
+            ):
+                result = sb._backend._locate_layer_diff_dir("sha256:nonexistent")
+        finally:
+            sys.stderr = old_stderr
 
         assert result is None
+        assert "WARNING" in captured.getvalue()
+        assert "sha256:nonexistent" in captured.getvalue()
 
     def test_returns_none_for_unsupported_driver(self, tmp_path):
         import agency.agsandbox_backends.docker as _mod
@@ -870,12 +1042,22 @@ class TestLocateLayerDiffDir:
         root = self._fake_docker_root(tmp_path)
         self._add_layerdb_entry(root, "sha256:target123", "cache-target")
 
-        with patch.object(
-            _mod._DockerBackend, "_docker_data_root_and_driver", return_value=(root, "devicemapper")
-        ):
-            result = sb._backend._locate_layer_diff_dir("sha256:target123")
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(
+                _mod._DockerBackend,
+                "_docker_data_root_and_driver",
+                return_value=(root, "devicemapper"),
+            ):
+                result = sb._backend._locate_layer_diff_dir("sha256:target123")
+        finally:
+            sys.stderr = old_stderr
 
         assert result is None
+        assert "WARNING" in captured.getvalue()
+        assert "devicemapper" in captured.getvalue()
 
     def test_returns_none_when_info_lookup_fails(self):
         import agency.agsandbox_backends.docker as _mod
@@ -888,19 +1070,28 @@ class TestLocateLayerDiffDir:
     def test_returns_none_when_layerdb_dir_present_but_content_missing(self, tmp_path):
         """A matching layerdb entry whose overlay2 diff dir doesn't
         actually exist (e.g. already cleaned up) must degrade to None,
-        not raise."""
+        not raise -- and must warn, not fail silently."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
         root = self._fake_docker_root(tmp_path)
         self._add_layerdb_entry(root, "sha256:target123", "cache-target", with_content=False)
 
-        with patch.object(
-            _mod._DockerBackend, "_docker_data_root_and_driver", return_value=(root, "overlay2")
-        ):
-            result = sb._backend._locate_layer_diff_dir("sha256:target123")
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(
+                _mod._DockerBackend,
+                "_docker_data_root_and_driver",
+                return_value=(root, "overlay2"),
+            ):
+                result = sb._backend._locate_layer_diff_dir("sha256:target123")
+        finally:
+            sys.stderr = old_stderr
 
         assert result is None
+        assert "WARNING" in captured.getvalue()
 
     def test_overlayfs_requires_diff_ids_chain_ending_at_diff_id(self, tmp_path):
         """Containerd snapshotter path keys layers by ChainID -- calling
@@ -1212,6 +1403,10 @@ class TestCheckpointAccumulator:
         assert content == b"one"
 
     def test_fold_invalidates_accumulator_when_diff_dir_not_found(self):
+        """Must warn, not fail silently -- a silent invalidation here is
+        exactly what made a real production squash fallback undiagnosable
+        without live forensics (see docs/agsandbox_backends/container.md's
+        "Fast incremental squashing" section)."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
@@ -1221,12 +1416,20 @@ class TestCheckpointAccumulator:
                 return _FakeCompleted(stdout=b'["sha256:layer1"]')
             return _FakeCompleted()
 
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=None):
-                sb._backend._fold_commit_into_accumulator("some-tag")
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            with patch.object(_mod._DockerBackend, "_run", fake_run):
+                with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=None):
+                    sb._backend._fold_commit_into_accumulator("some-tag")
+        finally:
+            sys.stderr = old_stderr
 
         assert sb._backend._accumulated_diff_path is None
         assert sb._backend._accumulated_layer_count == -1
+        assert "WARNING" in captured.getvalue()
+        assert "some-tag" in captured.getvalue()
 
     def test_fold_accumulates_across_multiple_cycles(self, tmp_path):
         import agency.agsandbox_backends.docker as _mod
@@ -1304,6 +1507,87 @@ class TestCheckpointAccumulator:
         assert sb._backend._accumulated_diff_path is None
         with pytest.raises(RuntimeError, match="no checkpoint diff accumulator"):
             sb._backend._accumulator_squash_commit("some-tag")
+
+    def test_accumulator_squash_uses_squash_base_diff_ids_when_already_set(self, tmp_path):
+        """Once this backend has squashed successfully at least once,
+        _squash_base_diff_ids -- not self._base_image -- is the reference
+        chain the fast path validates/builds against. This is the whole
+        point of re-baselining: a sandbox that already fell back once
+        must not need to match the ORIGINAL base image's digests ever
+        again."""
+        import agency.agsandbox_backends.docker as _mod
+        from agency.agsandbox_backends._layer_squash import overlay_diff_to_tar
+
+        sb = self._sb()
+        diff_dir = self._make_real_diff_dir(tmp_path, "diff1", {"a": "1"})
+        accum_tar = tmp_path / "accum.tar"
+        overlay_diff_to_tar(diff_dir, accum_tar)
+        sb._backend._accumulated_diff_path = accum_tar
+        sb._backend._accumulated_layer_count = 1
+        # Simulate "already squashed once" -- reference chain is a PRIOR
+        # squash's own result, unrelated to the real base image.
+        sb._backend._squash_base_diff_ids = ["sha256:prior-squash-layer"]
+
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b'["sha256:prior-squash-layer", "sha256:c1"]')
+            if args[1] == "inspect":
+                return _FakeCompleted(
+                    stdout=json.dumps(
+                        [{"Config": {}, "Architecture": "amd64", "Os": "linux"}]
+                    ).encode()
+                )
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            sb._backend._accumulator_squash_commit("some-tag")
+
+        assert not any("agency-sandbox" in c[-1] for c in calls if len(c) > 1), (
+            f"must not consult the original base image once already re-baselined: {calls}"
+        )
+        assert sb._backend._squash_base_diff_ids[0] == "sha256:prior-squash-layer"
+        assert len(sb._backend._squash_base_diff_ids) == 2  # prior layer + this squash's new one
+
+    def test_accumulator_squash_records_new_diff_ids_on_success(self, tmp_path):
+        """A fresh backend's first-ever squash still validates against
+        self._base_image (unchanged behavior), but afterward records the
+        result so the NEXT squash re-baselines instead of re-querying the
+        base image again."""
+        import agency.agsandbox_backends.docker as _mod
+        from agency.agsandbox_backends._layer_squash import overlay_diff_to_tar
+
+        sb = self._sb()
+        assert sb._backend._squash_base_diff_ids is None
+        diff_dir = self._make_real_diff_dir(tmp_path, "diff1", {"a": "1"})
+        accum_tar = tmp_path / "accum.tar"
+        overlay_diff_to_tar(diff_dir, accum_tar)
+        sb._backend._accumulated_diff_path = accum_tar
+        sb._backend._accumulated_layer_count = 1
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                if args[-1] == "agency-sandbox:latest":
+                    return _FakeCompleted(stdout=b'["sha256:base1"]')
+                return _FakeCompleted(stdout=b'["sha256:base1", "sha256:c1"]')
+            if args[1] == "inspect":
+                return _FakeCompleted(
+                    stdout=json.dumps(
+                        [{"Config": {}, "Architecture": "amd64", "Os": "linux"}]
+                    ).encode()
+                )
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            sb._backend._accumulator_squash_commit("some-tag")
+
+        # new_diff_ids = base_diff_ids + [merged_digest] -- the base's own
+        # chain plus exactly one new flattened layer, NOT the intermediate
+        # per-commit layers current_diff_ids reported (those get replaced).
+        assert sb._backend._squash_base_diff_ids[0] == "sha256:base1"
+        assert len(sb._backend._squash_base_diff_ids) == 2
 
     @docker
     @pytest.mark.timeout(180)
