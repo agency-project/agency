@@ -403,18 +403,30 @@ class TestSandboxNaming:
         assert "myagent" in sb._name
 
     def test_container_name_format(self):
+        """The agname component is deduplicated (see agsandbox.py's
+        __init__) -- "myagent" becomes "sandbox_myagent_XXXX" via the
+        shared agname registry, so the exact suffix isn't predictable
+        (it depends on how many times this base has already been claimed
+        elsewhere in this same test process), only the overall shape is."""
         from agency.agsandbox import agSandbox, _RUN_ID
 
         sb = agSandbox("myagent")
-        assert sb._name == f"sandbox-{_RUN_ID}-myagent"
+        assert re.fullmatch(rf"sandbox-{_RUN_ID}-sandbox_myagent_[0-9a-z]{{4}}", sb._name), sb._name
 
-    def test_two_sandboxes_same_agname_same_run_share_name(self):
-        """Within a run, agname uniquely identifies the container."""
+    def test_two_sandboxes_same_agname_get_deduplicated_names(self):
+        """Every agSandbox construction claims its own unique name from the
+        shared agname registry (see agsandbox.py's __init__) -- passing the
+        same literal agname twice must NOT collide into the same container
+        identity. Anyone who genuinely needs to reference an existing
+        sandbox must keep the object/backend itself around, not re-pass its
+        name string (see test_agsandbox.py's
+        test_ensure_started_reuses_running_container for the supported way
+        to do that)."""
         from agency.agsandbox import agSandbox
 
         sb1 = agSandbox("shared-agent")
         sb2 = agSandbox("shared-agent")
-        assert sb1._name == sb2._name
+        assert sb1._name != sb2._name
 
     def test_two_sandboxes_different_agnames_differ(self):
         from agency.agsandbox import agSandbox

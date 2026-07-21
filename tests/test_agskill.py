@@ -1349,12 +1349,33 @@ def test_long_output_no_duplicate_read_when_already_present():
 
 
 # ---------------------------------------------------------------------------
-# Tool call failure handling and checkpoint revert
+# Skill-exit sandbox teardown (agskill.py's own run()/_task() finally block)
+#
+# Per-tool commit/rollback is gone (agtool.py's dispatch_tools() now just
+# calls sandbox.stop() unconditionally after each call -- a separate,
+# already-updated concern, not tested here). The remaining rollback boundary
+# lives one level up, in agskill.py's _task(): on a *skill's own* result
+# being an error, it calls ag.sandbox.rm_container() (discarding everything
+# since the last successful skill's commit()) and pushes a plain string onto
+# ag.inbox describing the revert -- surfaced at the START of the next skill
+# call via ag._drain_inbox() (see execute_react()'s loop), since the failed
+# skill's own result is already final by the time _task() reaches teardown.
+# On success, it calls ag.sandbox.commit() (no args -- squashing is now
+# fully automatic, the old force_squash parameter is gone).
+#
+# These tests exercise that finally block directly by running skills through
+# the real agent.run()/_task() path (not execute_react() in isolation, which
+# never reaches this teardown) against a real agent and a mocked sandbox,
+# with execute_react() itself replaced by a fake so the scenario -- success,
+# an agerror result, or an uncaught exception -- is fully controlled. Any
+# per-tool run_in_subprocess distinction is irrelevant at this layer (kept
+# only in a few names/docstrings for traceability from the pre-refactor
+# suite these evolved from).
 # ---------------------------------------------------------------------------
 
 
 def _make_sandbox_with_tracking():
-    """Return a sandbox mock that records stop() calls."""
+    """Return a sandbox mock that records stop()/commit()/rm_container() calls."""
     sandbox = MagicMock()
     sandbox._name = "testbox"
     sandbox.stop.return_value = None
@@ -1362,139 +1383,180 @@ def _make_sandbox_with_tracking():
     return sandbox
 
 
+def _run_skill_via_agent(s, sandbox, skill_input=None):
+    """Run *s* to completion through a real agent.run() -- the only code
+    path that reaches agskill.py's _task() finally block -- against a real
+    agent and *sandbox* (typically a MagicMock so commit()/rm_container()/
+    inbox.put() calls can be asserted on). Returns (ag, resolved pending
+    agdata)."""
+    cfg = agConfig({"agllm_backend": LLM_CONFIG})
+    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
+    ag.inbox = MagicMock()
+    pending = ag.run(s, skill_input if skill_input is not None else agdata(x=1))
+    pending.wait()
+    return ag, pending
+
+
 def test_tool_success_commits_and_stops():
-    """A successful tool call must trigger sandbox.stop(commit=True)."""
+    """A skill run that completes successfully must call sandbox.commit()
+    (no args) in agskill.py's _task() finally block, and must not
+    rm_container() or push anything onto the inbox."""
     sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(result="ok"),
+        prev_ctx,
+        [],
+    )
 
-    def fn(arg: agdata) -> agdata:
-        return agdata(result="ok")
+    ag, _ = _run_skill_via_agent(s, sandbox)
 
-    t = agtool(name="mytool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("mytool", {}, "c1"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_called_once_with(commit=True)
+    sandbox.commit.assert_called_once_with()
+    sandbox.rm_container.assert_not_called()
+    ag.inbox.put.assert_not_called()
 
 
 def test_tool_failure_triggers_stop_without_commit():
-    """When a run_in_subprocess tool returns an error, sandbox.stop(commit=False) is called."""
+    """When the skill's own result is an error, the finally block must call
+    sandbox.rm_container() (discard since the last successful commit)
+    instead of sandbox.commit()."""
     sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("boom"),
+        prev_ctx,
+        [],
+    )
 
-    def fn(arg: agdata) -> agdata:
-        return agerror("boom")
+    ag, pending = _run_skill_via_agent(s, sandbox)
 
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c2"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_called_once_with(commit=False)
+    sandbox.rm_container.assert_called_once_with()
+    sandbox.commit.assert_not_called()
+    assert pending._data.get("error") == "boom"
 
 
 def test_tool_failure_adds_workspace_reverted_note():
-    """Tool error response must include workspace_reverted when the tool returns agerror(...)."""
+    """The old "workspace_reverted key injected into the tool result JSON"
+    behavior is gone entirely -- the revert notice now goes on ag.inbox as a
+    plain string (queue.Queue[str]), not in the failed skill's own result,
+    since that result is already final by the time _task() reaches
+    teardown. The note is meant to surface at the START of the next skill
+    call via ag._drain_inbox()."""
     sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("disk full"),
+        prev_ctx,
+        [],
+    )
 
-    def fn(arg: agdata) -> agdata:
-        return agerror("disk full")
+    ag, pending = _run_skill_via_agent(s, sandbox)
 
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c3"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert len(tool_msgs) == 1
-    content = json.loads(tool_msgs[0]["content"])
-    assert "error" in content
-    assert "workspace_reverted" in content
-    assert "reverted" in content["workspace_reverted"].lower()
+    ag.inbox.put.assert_called_once()
+    (note,), _kwargs = ag.inbox.put.call_args
+    assert isinstance(note, str)
+    assert "revert" in note.lower() or "discard" in note.lower()
+    # The failed skill's own result carries only its own error -- no
+    # revert-related key was added to it at this layer.
+    assert pending._data == {"error": "disk full"}
 
 
 def test_tool_failure_reverts_even_without_subprocess():
-    """A tool error still reverts the workspace when agent_sandbox=MagicMock() and
-    run_in_subprocess=False -- stop()/the revert note are no longer specific to
-    subprocess-isolated tools."""
+    """The revert-and-notify teardown is triggered purely by the skill's own
+    result being an error -- it doesn't matter whether any tool ran at all,
+    let alone in a subprocess; _task() only ever inspects outer_result."""
+    sandbox = MagicMock()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("nope"),
+        prev_ctx,
+        [],
+    )
 
-    def fn(arg: agdata) -> agdata:
-        return agerror("nope")
+    ag, pending = _run_skill_via_agent(s, sandbox)
 
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=False)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c4"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    content = json.loads(tool_msgs[0]["content"])
-    assert content["error"] == "nope"
-    assert "workspace_reverted" in content
+    sandbox.rm_container.assert_called_once_with()
+    ag.inbox.put.assert_called_once()
+    assert pending._data.get("error") == "nope"
 
 
 def test_run_in_subprocess_false_still_stops():
-    """Tools with run_in_subprocess=False must still trigger sandbox.stop() --
-    checkpointing runs after every tool call regardless of subprocess isolation."""
+    """The commit()/rm_container() decision is made fresh for every skill
+    call on the same agent -- a later call's failure must still trigger
+    rm_container() (and a fresh inbox note) even though an earlier call
+    already committed successfully."""
     sandbox = _make_sandbox_with_tracking()
+    ok_skill = make_skill(name="ok")
+    ok_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(result="ok"),
+        prev_ctx,
+        [],
+    )
+    bad_skill = make_skill(name="bad")
+    bad_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("second call failed"),
+        prev_ctx,
+        [],
+    )
 
-    def fn(arg: agdata) -> agdata:
-        return agerror("oops")
+    cfg = agConfig({"agllm_backend": LLM_CONFIG})
+    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
+    ag.inbox = MagicMock()
+    ag.run(ok_skill, agdata(x=1)).wait()
+    ag.run(bad_skill, agdata(x=1)).wait()
 
-    t = agtool(name="hosttool", description="", fn=fn, run_in_subprocess=False)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("hosttool", {}, "c5"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_called_once_with(commit=False)
+    assert sandbox.commit.call_count == 1
+    assert sandbox.rm_container.call_count == 1
+    ag.inbox.put.assert_called_once()
 
 
 def test_tool_exception_triggers_stop_without_commit():
-    """When a run_in_subprocess tool raises an exception, sandbox.stop(commit=False) is called."""
+    """An uncaught exception raised out of execute_react() is caught by
+    _task()'s own outer try/except and turned into an agerror -- which must
+    then trigger the same rm_container()-without-commit teardown as an
+    ordinary agerror result."""
     sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
 
-    def fn(arg: agdata) -> agdata:
+    def _raise(ag, prev_ctx, skill_input, max_steps=None):
         raise RuntimeError("exploded")
 
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c6"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+    s.execute_react = _raise
 
-    sandbox.stop.assert_called_once_with(commit=False)
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert "error" in json.loads(tool_msgs[0]["content"])
+    ag, pending = _run_skill_via_agent(s, sandbox)
+
+    sandbox.rm_container.assert_called_once_with()
+    sandbox.commit.assert_not_called()
+    assert "exploded" in pending._data.get("error", "")
 
 
 def test_run_in_subprocess_false_success_still_commits():
-    """The bug this session's dispatch_tools() fix actually targeted: a
-    *successful* run_in_subprocess=False tool call must still trigger
-    sandbox.stop(commit=True) -- checkpointing was previously gated on
-    run_in_subprocess=True, so a host-side tool's successful work was never
-    committed at all."""
+    """A skill call's own commit()/rm_container() decision doesn't carry
+    over from an earlier call on the same agent -- a successful call must
+    still commit() even immediately after a prior call's failure already
+    triggered a revert."""
     sandbox = _make_sandbox_with_tracking()
+    bad_skill = make_skill(name="bad")
+    bad_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("first call failed"),
+        prev_ctx,
+        [],
+    )
+    ok_skill = make_skill(name="ok")
+    ok_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(result="ok"),
+        prev_ctx,
+        [],
+    )
 
-    def fn(arg: agdata) -> agdata:
-        return agdata(result="ok")
+    cfg = agConfig({"agllm_backend": LLM_CONFIG})
+    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
+    ag.inbox = MagicMock()
+    ag.run(bad_skill, agdata(x=1)).wait()
+    ag.run(ok_skill, agdata(x=1)).wait()
 
-    t = agtool(name="hosttool", description="", fn=fn, run_in_subprocess=False)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("hosttool", {}, "c7"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_called_once_with(commit=True)
+    assert sandbox.rm_container.call_count == 1
+    assert sandbox.commit.call_count == 1
 
 
 def test_pending_background_work_defers_stop_entirely():
@@ -1555,26 +1617,28 @@ def test_pending_background_work_omits_workspace_reverted_note_on_error():
 
 
 def test_tool_exception_with_run_in_subprocess_false_still_stops():
-    """Exception-handler path: a raised exception from a run_in_subprocess=False
-    tool must still trigger sandbox.stop(commit=False), the same as a
-    run_in_subprocess=True tool does."""
+    """Same exception-triggers-revert teardown as
+    test_tool_exception_triggers_stop_without_commit, confirmed here via a
+    plain ValueError (rather than RuntimeError) raised very early -- before
+    execute_react() ever reaches a tool call -- to show the finally block's
+    rm_container()+inbox path doesn't depend on how far execute_react() got
+    before failing."""
     sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
 
-    def fn(arg: agdata) -> agdata:
-        raise RuntimeError("exploded")
+    def _raise_early(ag, prev_ctx, skill_input, max_steps=None):
+        raise ValueError("early failure")
 
-    t = agtool(name="hostbadtool", description="", fn=fn, run_in_subprocess=False)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("hostbadtool", {}, "c10"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+    s.execute_react = _raise_early
 
-    sandbox.stop.assert_called_once_with(commit=False)
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    content = json.loads(tool_msgs[0]["content"])
-    assert "error" in content
-    assert "workspace_reverted" in content
+    ag, pending = _run_skill_via_agent(s, sandbox)
+
+    sandbox.rm_container.assert_called_once_with()
+    sandbox.commit.assert_not_called()
+    assert "early failure" in pending._data.get("error", "")
+    ag.inbox.put.assert_called_once()
+    (note,), _kwargs = ag.inbox.put.call_args
+    assert "revert" in note.lower() or "discard" in note.lower()
 
 
 def test_tool_exception_with_pending_background_work_defers_stop():

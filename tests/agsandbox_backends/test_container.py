@@ -94,8 +94,10 @@ class TestReapOrphanedContainers:
             with patch("subprocess.run", return_value=ps_result) as mock_run:
                 _container.reap_orphaned_containers()
 
-        # Only the initial `docker ps` call should have happened -- no rm/rmi.
-        assert mock_run.call_count == 1
+        # The container ps call, then the lifecycle-image scan (see
+        # TestReapOrphanedLifecycleImages) -- no rm/rmi of anything.
+        assert mock_run.call_count == 2
+        assert not any("rm" in c.args[0] or "rmi" in c.args[0] for c in mock_run.call_args_list)
 
     def test_skips_container_owned_by_self(self):
         ps_result = self._fake_ps_result([f"abc123\t{os.getpid()}\tsandbox-rXXXXXXX-someagent"])
@@ -104,7 +106,7 @@ class TestReapOrphanedContainers:
         ):
             with patch("subprocess.run", return_value=ps_result) as mock_run:
                 _container.reap_orphaned_containers()
-        assert mock_run.call_count == 1
+        assert mock_run.call_count == 2
 
     def test_no_containers_found_is_a_noop(self):
         ps_result = self._fake_ps_result([])
@@ -113,7 +115,7 @@ class TestReapOrphanedContainers:
         ):
             with patch("subprocess.run", return_value=ps_result) as mock_run:
                 _container.reap_orphaned_containers()
-        assert mock_run.call_count == 1
+        assert mock_run.call_count == 2
 
     def test_runs_at_most_once_per_process(self):
         ps_result = self._fake_ps_result([])
@@ -124,7 +126,7 @@ class TestReapOrphanedContainers:
                 _container.reap_orphaned_containers()
                 _container.reap_orphaned_containers()
                 _container.reap_orphaned_containers()
-        assert mock_run.call_count == 1, "second/third calls must be no-ops"
+        assert mock_run.call_count == 2, "second/third calls must be no-ops"
 
     def test_no_usable_runtime_is_a_noop(self):
         with patch(
@@ -144,6 +146,264 @@ class TestReapOrphanedContainers:
                 _container.reap_orphaned_containers()  # must not raise
         # Still marked done -- a broken daemon shouldn't retry every construction.
         assert _container._reap_done is True
+
+
+class TestReapOrphanedLifecycleImages:
+    """_reap_orphaned_lifecycle_images() -- the image-side half of the
+    reaper, catching lifecycle images whose owning CONTAINER is already
+    gone (so TestReapOrphanedContainers's container-label scan above never
+    even sees them). Calls the function directly rather than going through
+    reap_orphaned_containers() (whose own once-per-process guard and empty
+    container-ps step are already covered above).
+
+    Three real subprocess.run shapes are involved, each mocked separately
+    by dispatching on which subcommand appears in argv -- unlike
+    `docker ps`, `docker images`'s --format context has no .Label/.Labels
+    accessor at all (confirmed empirically against a real daemon: an
+    earlier version of this scan used `docker images --format
+    '...{{.Label "..."}}'` in one combined call, which fails with a
+    template-parsing error every time -- returncode != 0, so the whole
+    scan silently no-op'd, real bug that shipped and was only caught by
+    checking a real host, not by these mocks, since they modeled the
+    (wrong) single-call shape too):
+
+    1. `docker images --filter label=... --format {{.Repository}}:{{.Tag}}`
+       -- list of candidate tags, no label value.
+    2. `docker inspect --format {{index .Config.Labels "..."}} <tag>`
+       -- the actual label value, one call per candidate tag.
+    3. `docker ps -a --filter ancestor=<tag> --format {{.ID}}` -- the
+       safety check, only reached if step 2's PID looks dead.
+    """
+
+    def _fake_result(self, returncode=0, stdout=""):
+        result = MagicMock()
+        result.returncode = returncode
+        result.stdout = stdout.encode() if isinstance(stdout, str) else stdout
+        return result
+
+    def _dispatcher(self, *, images_lines=None, labels=None, ancestor_lines=None, images_rc=0):
+        """*labels* maps tag -> pid string (or None to simulate a missing/
+        unparseable label) for the per-tag inspect call. *ancestor_lines*
+        is shared across every tag's ancestor check (fine: these tests
+        only ever exercise one candidate tag at a time)."""
+        labels = labels or {}
+
+        def fake_run(args, **kwargs):
+            if "images" in args:
+                if images_rc != 0:
+                    return self._fake_result(returncode=images_rc)
+                lines = images_lines or []
+                return self._fake_result(stdout="\n".join(lines) + ("\n" if lines else ""))
+            if "inspect" in args:
+                tag = args[-1]
+                pid_str = labels.get(tag)
+                return self._fake_result(stdout="" if pid_str is None else str(pid_str))
+            if "ps" in args:
+                lines = ancestor_lines if ancestor_lines is not None else []
+                return self._fake_result(stdout="\n".join(lines) + ("\n" if lines else ""))
+            if "rmi" in args:
+                return self._fake_result()
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        return fake_run
+
+    def test_removes_lifecycle_image_owned_by_dead_pid(self):
+        dead_pid = 2**31 - 1
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: dead_pid}, ancestor_lines=[])
+
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+
+        rmi_calls = [c for c in mock_run.call_args_list if "rmi" in c.args[0]]
+        assert any(tag in c.args[0] for c in rmi_calls)
+
+    def test_skips_image_owned_by_live_pid(self):
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: os.getpid()})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid() + 1)
+        # images list + one inspect -- never reaches the ancestor check or rmi.
+        assert mock_run.call_count == 2
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_skips_image_owned_by_self(self):
+        own_pid = os.getpid()
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: own_pid})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", own_pid)
+        assert mock_run.call_count == 2
+
+    def test_skips_image_with_missing_or_unparseable_label(self):
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: None})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert mock_run.call_count == 2, "must not attempt to delete on unparseable evidence"
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_skips_non_lifecycle_prefixed_image_even_with_dead_label(self):
+        dead_pid = 2**31 - 1
+        tag = "agency/ckpt-restore-abc123:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: dead_pid})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        # Skipped before ever inspecting it -- only the images list call.
+        assert mock_run.call_count == 1, "only agency/lifecycle-* images are in scope"
+
+    def test_skips_image_still_in_use_by_a_container_despite_dead_label(self):
+        """The core safety guard: a stale label (e.g. from a checkpoint
+        restored via agent.load(), which DOES preserve the original,
+        possibly-foreign owner's label) must not cause an image a live
+        container is currently running from to be deleted."""
+        dead_pid = 2**31 - 1
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(
+            images_lines=[tag], labels={tag: dead_pid}, ancestor_lines=["somecontainerid"]
+        )
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_ancestor_check_failure_skips_rather_than_deletes(self):
+        """If the safety check itself can't be confirmed (non-zero
+        returncode or an exception), the image must be left alone -- never
+        deleted on missing evidence."""
+        dead_pid = 2**31 - 1
+        tag = "agency/lifecycle-someagent:latest"
+
+        def fake_run(args, **kwargs):
+            if "images" in args:
+                return self._fake_result(stdout=f"{tag}\n")
+            if "inspect" in args:
+                return self._fake_result(stdout=str(dead_pid))
+            if "ps" in args:
+                return self._fake_result(returncode=1)
+            raise AssertionError(f"unexpected call: {args}")
+
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_images_scan_failure_is_a_noop(self):
+        fake_run = self._dispatcher(images_rc=1)
+        with patch("subprocess.run", side_effect=fake_run):
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())  # must not raise
+
+    def test_no_images_found_is_a_noop(self):
+        fake_run = self._dispatcher(images_lines=[])
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert mock_run.call_count == 1
+
+    def test_real_scan_against_live_daemon_finds_no_broken_template(self):
+        """Regression test for the exact bug this class's docstring
+        describes: run the real `docker images --filter ... --format
+        {{.Repository}}:{{.Tag}}` command (no mocking) and confirm it
+        doesn't fail -- this is the specific call whose broken
+        `--format` string previously made returncode != 0 look like "no
+        orphans found" instead of "the command itself is malformed"."""
+        if subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode != 0:
+            pytest.skip("Docker daemon not reachable")
+        result = subprocess.run(
+            [
+                "docker",
+                "images",
+                "--filter",
+                "label=agency.owner_pid",
+                "--format",
+                "{{.Repository}}:{{.Tag}}",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+
+
+class TestRelabelOwnerPid:
+    """_ContainerBackendBase.relabel_owner_pid() -- used by agent.py's
+    save()/load() to scrub/restamp the owner_pid label on a checkpoint's
+    embedded image (see that method's docstring). Builds its own throwaway
+    container via `docker create` (never started) purely to give
+    `docker commit --change` something to commit from."""
+
+    def _fake_completed(self, stdout=b""):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = stdout
+        return result
+
+    def test_stamps_given_pid_via_create_then_commit(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if "create" in args:
+                return self._fake_completed(stdout=b"fakecontainerid123\n")
+            return self._fake_completed()
+
+        with patch(
+            "agency.agsandbox_backends.container.get_container_runtime", return_value="docker"
+        ):
+            with patch("subprocess.run", side_effect=fake_run):
+                _container._ContainerBackendBase.relabel_owner_pid("agency/ckpt-foo", 4242, 30)
+
+        create_calls = [c for c in calls if "create" in c]
+        commit_calls = [c for c in calls if "commit" in c]
+        rm_calls = [c for c in calls if c[1:3] == ["rm", "-f"]]
+        assert create_calls and create_calls[0][-1] == "agency/ckpt-foo"
+        assert commit_calls, calls
+        assert "--change" in commit_calls[0]
+        change_idx = commit_calls[0].index("--change")
+        assert commit_calls[0][change_idx + 1] == "LABEL agency.owner_pid=4242"
+        assert commit_calls[0][-2] == "fakecontainerid123"  # the created container's id
+        assert commit_calls[0][-1] == "agency/ckpt-foo"
+        assert rm_calls and rm_calls[0][-1] == "fakecontainerid123", (
+            "the throwaway container must always be cleaned up"
+        )
+
+    def test_none_pid_clears_the_label(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if "create" in args:
+                return self._fake_completed(stdout=b"cid\n")
+            return self._fake_completed()
+
+        with patch(
+            "agency.agsandbox_backends.container.get_container_runtime", return_value="docker"
+        ):
+            with patch("subprocess.run", side_effect=fake_run):
+                _container._ContainerBackendBase.relabel_owner_pid("agency/ckpt-foo", None, 30)
+
+        commit_calls = [c for c in calls if "commit" in c]
+        change_idx = commit_calls[0].index("--change")
+        assert commit_calls[0][change_idx + 1] == "LABEL agency.owner_pid="
+
+    def test_temp_container_removed_even_when_commit_fails(self):
+        import subprocess as _sp
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if "create" in args:
+                return self._fake_completed(stdout=b"cid\n")
+            if "commit" in args:
+                raise _sp.CalledProcessError(1, args)
+            return self._fake_completed()
+
+        with patch(
+            "agency.agsandbox_backends.container.get_container_runtime", return_value="docker"
+        ):
+            with patch("subprocess.run", side_effect=fake_run):
+                with pytest.raises(_sp.CalledProcessError):
+                    _container._ContainerBackendBase.relabel_owner_pid("agency/ckpt-foo", 1, 30)
+
+        rm_calls = [c for c in calls if c[1:3] == ["rm", "-f"]]
+        assert rm_calls and rm_calls[0][-1] == "cid"
 
 
 class TestQuotaHooksSharedAcrossRuntimes:
@@ -623,19 +883,21 @@ class TestOwnHostPidsPodman:
 
 
 # ---------------------------------------------------------------------------
-# _gpu_flags(runtime, gpu_id) -- regression coverage for two separate bugs:
+# _gpu_flags(runtime, gpu_reserved) -- regression coverage for:
 # (1) Docker's ``--gpus all`` was used unconditionally for Podman too. Podman
 #     accepts that flag without erroring but never mounts the NVIDIA
 #     driver/devices for it, so a container started that way silently has
 #     zero GPU access.
-# (2) Every container used to get ALL host GPU devices mounted regardless of
-#     which single GPU (if any) was actually leased via reserve_gpu --
-#     CUDA_VISIBLE_DEVICES masked this at the software level, but a process
-#     could still open another GPU's device node directly since it was
-#     mounted into the container's /dev either way. _gpu_flags() is now
-#     scoped to the single leased gpu_id (mirrors chroot.py's
-#     _chroot_gpu_dev_paths(gpu_id)), and gpu_id=None (no GPU leased) gets
-#     zero GPU devices at all.
+# (2) A sandbox that never reserves a GPU at all (reserve_gpu() never called)
+#     must still get zero GPU devices mounted -- gpu_reserved=False.
+# EVERY GPU on the host is attached once gpu_reserved is True -- not just the
+# one currently leased in self._gpu_id -- deliberately, so stop()/start()
+# (hibernate) can release and re-acquire a *different* physical GPU between
+# tool calls without ever needing to recreate the container (neither runtime
+# supports hot-attaching a device to an already-created container). The
+# accepted trade-off: CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES becomes the
+# ONLY restriction keeping a GPU-reserving sandbox off other GPUs -- see
+# _gpu_flags()'s docstring in container.py for the full reasoning.
 # No real docker/podman required here -- detect_gpus()/shutil.which() are
 # mocked, and /dev/dri is faked via a real tmp directory for the AMD branch.
 # ---------------------------------------------------------------------------
@@ -649,56 +911,51 @@ class TestGpuFlagsPerRuntime:
         _container._gpu_kind_cache.clear()
         _container._amd_render_node_paths_cache = None
 
-    def test_gpu_id_none_returns_empty_for_both_runtimes(self):
-        """No GPU leased -- zero GPU devices exposed, regardless of what the
-        host actually has (detect_gpus() isn't even consulted)."""
+    def test_gpu_not_reserved_returns_empty_for_both_runtimes(self):
+        """No GPU reserved -- zero GPU devices exposed, regardless of what
+        the host actually has (detect_gpus() isn't even consulted)."""
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
-            assert _container._gpu_flags("docker", None) == []
-            assert _container._gpu_flags("podman", None) == []
+            assert _container._gpu_flags("docker", False) == []
+            assert _container._gpu_flags("podman", False) == []
 
     def test_no_gpu_detected_returns_empty_for_both_runtimes(self):
         with patch.object(_container, "detect_gpus", return_value=[]):
-            assert _container._gpu_flags("docker", 0) == []
-            assert _container._gpu_flags("podman", 0) == []
+            assert _container._gpu_flags("docker", True) == []
+            assert _container._gpu_flags("podman", True) == []
 
-    def test_docker_scopes_to_leased_device_for_nvidia(self):
+    def test_docker_attaches_all_gpus_for_nvidia(self):
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
             with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                assert _container._gpu_flags("docker", 0) == ["--gpus", "device=0"]
-                assert _container._gpu_flags("docker", 1) == ["--gpus", "device=1"]
+                assert _container._gpu_flags("docker", True) == ["--gpus", "all"]
 
-    def test_podman_scopes_to_leased_device_via_cdi_not_docker_syntax(self):
+    def test_podman_attaches_all_gpus_via_cdi_not_docker_syntax(self):
         """The original regression: Podman must NOT get Docker's --gpus flag
         -- it silently accepts it without mounting the driver (confirmed
         against a real host: `podman run --gpus all ... nvidia-smi` prints
         "WARNING: The NVIDIA Driver was not detected" and nvidia-smi isn't
-        even on PATH), so it needs the CDI device syntax instead, now scoped
-        to the specific leased id rather than "all"."""
+        even on PATH), so it needs the CDI device syntax instead."""
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
             with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                flags = _container._gpu_flags("podman", 1)
-        assert flags == ["--device", "nvidia.com/gpu=1"]
+                flags = _container._gpu_flags("podman", True)
+        assert flags == ["--device", "nvidia.com/gpu=all"]
         assert "--gpus" not in flags
 
-    def test_docker_and_podman_flags_differ_for_same_gpu_id(self):
+    def test_docker_and_podman_flags_differ_for_nvidia(self):
         with patch.object(_container, "detect_gpus", return_value=[0, 1]):
             with patch.object(_container.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                docker_flags = _container._gpu_flags("docker", 0)
-                podman_flags = _container._gpu_flags("podman", 0)
+                docker_flags = _container._gpu_flags("docker", True)
+                podman_flags = _container._gpu_flags("podman", True)
         assert docker_flags != podman_flags
-        assert docker_flags == ["--gpus", "device=0"]
-        assert podman_flags == ["--device", "nvidia.com/gpu=0"]
+        assert docker_flags == ["--gpus", "all"]
+        assert podman_flags == ["--device", "nvidia.com/gpu=all"]
 
-    def test_rocm_flags_scope_to_leased_render_node(self, tmp_path):
-        """AMD: /dev/kfd (shared control device) plus only the one renderD*
-        node matching gpu_id -- never every render node, and never the
-        other GPU's node. amd_render_node_paths_by_pci_bus() is explicitly
-        forced to None here (no rocm-smi/real sysfs in this test), which
-        exercises the naive-sorted-order FALLBACK path specifically -- see
-        test_pci_bus_ordering_used_when_available below for the mapping
-        actually being applied, and TestAmdRenderNodeLiveHardware for the
-        real-hardware check that found sorted order alone is wrong on a
-        multi-GPU AMD host."""
+    def test_rocm_flags_attach_every_render_node(self, tmp_path):
+        """AMD: /dev/kfd (shared control device) plus EVERY renderD* node
+        found -- there's no single "all" flag for ROCm the way `--gpus
+        all`/CDI `=all` covers NVIDIA, so each node is attached explicitly.
+        Identical for both runtimes (only the NVIDIA branch differs by
+        runtime), and identical regardless of how many GPUs detect_gpus()
+        reports (every render node found is attached either way)."""
         dri = tmp_path / "dri"
         dri.mkdir()
         (dri / "renderD128").touch()
@@ -712,14 +969,22 @@ class TestGpuFlagsPerRuntime:
                     with patch.object(
                         _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
                     ):
-                        flags_0 = _container._gpu_flags("docker", 0)
-                        flags_1 = _container._gpu_flags("podman", 1)
-        assert flags_0 == ["--device", "/dev/kfd", "--device", str(dri / "renderD128")]
-        assert flags_1 == ["--device", "/dev/kfd", "--device", str(dri / "renderD129")]
-        # Identical for both runtimes (only the NVIDIA branch differs by runtime).
-        assert _container._gpu_flags("docker", 1) == flags_1
+                        docker_flags = _container._gpu_flags("docker", True)
+                        podman_flags = _container._gpu_flags("podman", True)
+        expected = [
+            "--device",
+            "/dev/kfd",
+            "--device",
+            str(dri / "renderD128"),
+            "--device",
+            str(dri / "renderD129"),
+        ]
+        assert docker_flags == expected
+        assert podman_flags == expected
 
-    def test_rocm_gpu_id_out_of_range_returns_only_control_device(self, tmp_path):
+    def test_rocm_single_render_node_present(self, tmp_path):
+        """Only one render node on disk -- attach just that one plus the
+        shared control device, not an empty/missing second entry."""
         dri = tmp_path / "dri"
         dri.mkdir()
         (dri / "renderD128").touch()
@@ -731,15 +996,17 @@ class TestGpuFlagsPerRuntime:
                     with patch.object(
                         _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
                     ):
-                        flags = _container._gpu_flags("docker", 5)
-        assert flags == ["--device", "/dev/kfd"]
+                        flags = _container._gpu_flags("docker", True)
+        assert flags == ["--device", "/dev/kfd", "--device", str(dri / "renderD128")]
 
     def test_rocm_flags_use_pci_bus_ordering_when_available(self, tmp_path):
         """When amd_render_node_paths_by_pci_bus() successfully builds a
-        mapping, _gpu_flags() must use ITS ordering, not naive sorted
-        /dev/dri order -- this is the actual fix: on real 8x MI350X
-        hardware the two disagree for every GPU (see agresources.py's
-        amd_render_node_paths_by_pci_bus docstring)."""
+        mapping, _gpu_flags() must attach the nodes in ITS ordering, not
+        naive sorted /dev/dri order -- this is the actual fix: on real 8x
+        MI350X hardware the two disagree for every GPU (see agresources.py's
+        amd_render_node_paths_by_pci_bus docstring). Every GPU is attached
+        either way now, but the ORDER the flags list them in still follows
+        the PCI-bus mapping when available."""
         dri = tmp_path / "dri"
         dri.mkdir()
         (dri / "renderD128").touch()
@@ -753,10 +1020,15 @@ class TestGpuFlagsPerRuntime:
                     with patch.object(
                         _container, "Path", lambda p: dri if p == "/dev/dri" else Path(p)
                     ):
-                        flags_0 = _container._gpu_flags("docker", 0)
-                        flags_1 = _container._gpu_flags("docker", 1)
-        assert flags_0 == ["--device", "/dev/kfd", "--device", str(dri / "renderD129")]
-        assert flags_1 == ["--device", "/dev/kfd", "--device", str(dri / "renderD128")]
+                        flags = _container._gpu_flags("docker", True)
+        assert flags == [
+            "--device",
+            "/dev/kfd",
+            "--device",
+            str(dri / "renderD129"),
+            "--device",
+            str(dri / "renderD128"),
+        ]
 
     def test_backend_construction_no_longer_eagerly_caches_gpu_flags(self):
         """_gpu_flags() now depends on the per-sandbox leased gpu_id, which
@@ -860,20 +1132,37 @@ class TestAmdRenderNodeLiveHardware:
         assert len(set(render_nodes)) == len(render_nodes)
 
     @rocm_hardware
-    def test_gpu_flags_scope_distinct_real_devices_per_gpu_id(self):
+    def test_gpu_flags_attach_every_real_render_node_when_reserved(self):
+        """_gpu_flags() no longer scopes to a single gpu_id -- it attaches
+        every render node _amd_render_node_paths() resolves once a GPU is
+        reserved at all, so the hibernate model can hand a resumed container
+        a different physical GPU without recreating it (see _gpu_flags()'s
+        docstring in container.py)."""
         _container._gpu_kind_cache.clear()
         _container._amd_render_node_paths_cache = None
         bus_by_gpu_id = self._ground_truth_bus_by_gpu_id()
-        seen_devices = set()
-        for gpu_id in bus_by_gpu_id:
-            flags = _container._gpu_flags("docker", gpu_id)
-            assert flags[:2] == ["--device", "/dev/kfd"]
-            assert len(flags) == 4, f"expected a scoped render node for gpu_id={gpu_id}: {flags}"
-            device_path = flags[3]
-            assert device_path not in seen_devices, (
-                f"gpu_id={gpu_id} was scoped to {device_path}, already used by another gpu_id"
+        assert bus_by_gpu_id, "expected at least one real AMD GPU"
+
+        flags = _container._gpu_flags("docker", True)
+        assert flags[:2] == ["--device", "/dev/kfd"]
+        device_flags = flags[2:]
+        assert device_flags[::2] == ["--device"] * len(bus_by_gpu_id), (
+            f"expected one --device pair per real GPU ({len(bus_by_gpu_id)}): {flags}"
+        )
+        device_paths = device_flags[1::2]
+        assert len(set(device_paths)) == len(device_paths), (
+            f"no two GPUs should ever resolve to the same render node: {device_paths}"
+        )
+        for gpu_id, expected_bus in bus_by_gpu_id.items():
+            actual_bus = self._real_render_node_bus(device_paths[gpu_id])
+            assert actual_bus == expected_bus, (
+                f"gpu_id={gpu_id}: _gpu_flags() attached {device_paths[gpu_id]} "
+                f"(bus={actual_bus}), but rocm-smi says GPU {gpu_id} is on bus {expected_bus}"
             )
-            seen_devices.add(device_path)
+
+        assert _container._gpu_flags("docker", False) == [], (
+            "a sandbox that never reserved a GPU must get zero devices attached"
+        )
 
 
 def _podman_available() -> bool:
@@ -918,7 +1207,7 @@ class TestPodmanGpuPassthroughIntegration:
 
     @podman_gpu
     def test_nvidia_smi_inside_a_real_podman_container_sees_the_gpus(self):
-        flags = _container._gpu_flags("podman", 0)
+        flags = _container._gpu_flags("podman", True)
         assert flags, "expected non-empty GPU flags on a host with a real GPU"
         result = subprocess.run(
             ["podman", "run", "--rm", *flags, self.IMAGE, "nvidia-smi", "-L"],
@@ -1153,7 +1442,7 @@ class TestDockerGpuPassthroughIntegration:
 
     @docker_gpu
     def test_nvidia_smi_inside_a_real_docker_container_sees_the_gpus(self):
-        flags = _container._gpu_flags("docker", 0)
+        flags = _container._gpu_flags("docker", True)
         assert flags, "expected non-empty GPU flags on a host with a real GPU"
         result = subprocess.run(
             ["docker", "run", "--rm", *flags, self.IMAGE, "nvidia-smi", "-L"],

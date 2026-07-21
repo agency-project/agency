@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import pytest
 from unittest.mock import MagicMock, patch
@@ -628,9 +629,12 @@ def _make_ckpt_subprocess_mock(real_run):
 
     def _mock(cmd, *args, **kwargs):
         cmd_str = " ".join(str(c) for c in cmd)
-        ops = ("save", "tag", "rmi")
-        # Intercept ckpt-related save/tag/rmi AND any bare "load" call (docker load
-        # receives our fake image bytes as stdin so must also be mocked).
+        # create/commit: relabel_owner_pid()'s scrub-on-save/restamp-on-load
+        # dance (docker create <tag> && docker commit --change ... <cid> <tag>).
+        ops = ("save", "tag", "rmi", "create", "commit")
+        # Intercept ckpt-related save/tag/rmi/create/commit AND any bare "load"
+        # call (docker load receives our fake image bytes as stdin so must
+        # also be mocked).
         is_ckpt_op = ("ckpt" in cmd_str and any(op in cmd_str for op in ops)) or (
             "load" in cmd_str and "ckpt" not in cmd_str and kwargs.get("input") == _FAKE_IMAGE
         )
@@ -641,6 +645,58 @@ def _make_ckpt_subprocess_mock(real_run):
         return _sp.CompletedProcess(cmd, returncode=0, stdout=_FAKE_IMAGE, stderr=b"")
 
     return _mock
+
+
+@_docker_ok
+def test_save_scrubs_and_load_restamps_owner_pid_label(tmp_path, monkeypatch):
+    """save() must scrub the owning process's PID (pass None to
+    relabel_owner_pid()) before embedding the sandbox image -- a foreign
+    PID from this process is meaningless, and potentially misleading,
+    once restored by an unrelated process possibly on a different host.
+    load() must then restamp the actually-current restoring process's own
+    PID afterward. See relabel_owner_pid()'s docstring for why:
+    reap_orphaned_containers()'s image scan trusts this label to decide
+    whether an image's owner is still alive, and a stale/foreign PID
+    could make it act on wrong evidence."""
+    import subprocess as _sp
+    from agency.agsandbox_backends.container import _ContainerBackendBase
+
+    monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
+
+    skill_write = agskill(name="write", system_prompt="")
+
+    def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
+        ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
+        return agdata(ok=True), prev_ctx, []
+
+    skill_write.execute_react = fake_write
+
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
+    ag.run(skill_write, agdata(agname=ag.agname)).ok
+    assert ag.sandbox is not None and ag.sandbox._checkpoint_image is not None
+
+    ckpt = tmp_path / "agent.ckpt"
+    with patch.object(_ContainerBackendBase, "relabel_owner_pid") as mock_relabel:
+        ag.save(ckpt)
+    assert mock_relabel.call_count == 1
+    assert mock_relabel.call_args.args[1] is None, "save() must scrub, not preserve, the PID"
+
+    saved_agname = ag.agname
+    ag.sandbox.destroy()
+    del ag
+    _agname._allocated.discard(saved_agname)
+
+    with patch.object(_ContainerBackendBase, "relabel_owner_pid") as mock_relabel2:
+        ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
+    assert mock_relabel2.call_count == 1
+    assert mock_relabel2.call_args.args[1] == os.getpid(), (
+        "load() must restamp the CURRENT restoring process's own PID"
+    )
+
+    if ag2.sandbox:
+        ag2.sandbox.destroy()
+    del ag2
+    _agname._allocated.discard(saved_agname)
 
 
 @_docker_ok

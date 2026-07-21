@@ -843,12 +843,12 @@ class TestChrootBackendLifecycle:
         finally:
             orig.destroy()
 
-    def test_stop_commit_true_commits_even_when_this_process_never_started(self):
-        """Same root cause as above, for stop(): the orchestrating process
-        calls stop(commit=True) on a sandbox whose actual workspace content
-        was written entirely by worker-process tool calls, which this
-        process's own copy never directly observed. stop() must still find
-        and commit that real work rather than silently skip committing."""
+    def test_commit_commits_even_when_this_process_never_started(self):
+        """Same root cause as above, for commit(): the orchestrating process
+        calls commit() on a sandbox whose actual workspace content was
+        written entirely by worker-process tool calls, which this process's
+        own copy never directly observed. commit() must still find and
+        checkpoint that real work rather than silently skip committing."""
         import pickle
 
         orig = _make_backend()
@@ -857,8 +857,8 @@ class TestChrootBackendLifecycle:
             worker = pickle.loads(pickle.dumps(orig))
             worker.write_file("/workspace/data.txt", "from-worker\n")
 
-            orig.stop(commit=True)
-            assert orig._checkpoint_image is not None, "stop(commit=True) must have committed"
+            assert orig.commit() is True, "commit() must have committed"
+            assert orig._checkpoint_image is not None
 
             restored = _make_backend(checkpoint_image=orig._checkpoint_image)
             assert restored.read_file("/workspace/data.txt") == "from-worker\n"
@@ -870,19 +870,28 @@ class TestChrootBackendLifecycle:
             orig.destroy()
 
     def test_commit_then_new_backend_restores_content(self):
+        """sb2 must materialize (and finish reading) its own copy of the
+        snapshot BEFORE sb1.destroy() runs: commit() now leaves the live
+        workspace alone but still sets self._checkpoint_image = tag (see
+        commit()'s docstring), and destroy() unconditionally deletes
+        whatever snapshot self._checkpoint_image points at -- exactly the
+        tag this test just committed. Reading sb2 first (which copies the
+        snapshot into sb2's own, independent workspace directory) makes
+        sb1's later cleanup of that same tag irrelevant to sb2's already-
+        materialized copy."""
         tag = f"agency/lifecycle-test-{uuid.uuid4().hex[:8]}"
         sb1 = _make_backend()
+        sb2 = None
         try:
             sb1.write_file("/workspace/marker.txt", "checkpoint\n")
             assert sb1.commit(tag) is True
-        finally:
-            sb1.destroy()
 
-        sb2 = _make_backend(checkpoint_image=tag)
-        try:
+            sb2 = _make_backend(checkpoint_image=tag)
             assert sb2.read_file("/workspace/marker.txt") == "checkpoint\n"
         finally:
-            sb2.destroy()
+            sb1.destroy()
+            if sb2 is not None:
+                sb2.destroy()
             _ChrootBackend.delete_image(tag, force=True)
 
     def test_commit_returns_false_when_never_started(self):
@@ -890,15 +899,22 @@ class TestChrootBackendLifecycle:
         assert sb.commit("agency/never-started") is False
         sb.destroy()
 
-    def test_stop_commit_false_discards_dirty_state(self):
-        tag = f"agency/lifecycle-test-{uuid.uuid4().hex[:8]}"
+    def test_rm_container_discards_dirty_state(self):
+        """commit() then rm_container() reproduces the old
+        stop(commit=True)-then-stop(commit=False) revert sequence: commit()
+        checkpoints "good.txt" without touching the live workspace,
+        rm_container() discards the workspace outright (including the later
+        "dirty.txt"), and the next _ensure_started() re-materializes from
+        the last checkpoint -- which never saw "dirty.txt" in the first
+        place."""
         sb = _make_backend()
         try:
             sb.write_file("/workspace/good.txt", "good\n")
-            sb.stop(commit=True)
+            sb.commit()
+            sb.rm_container()
             sb._ensure_started()
             sb.write_file("/workspace/dirty.txt", "dirty\n")
-            sb.stop(commit=False)
+            sb.rm_container()
             sb._ensure_started()
             content = sb.read_file("/workspace/good.txt")
             assert content == "good\n"
@@ -906,7 +922,6 @@ class TestChrootBackendLifecycle:
                 sb.read_file("/workspace/dirty.txt")
         finally:
             sb.destroy()
-            _ChrootBackend.delete_image(sb._checkpoint_image or tag, force=True)
 
     def test_restore_materializes_snapshot(self):
         tag = f"agency/lifecycle-test-{uuid.uuid4().hex[:8]}"
@@ -991,9 +1006,38 @@ class TestChrootBackendLifecycle:
             "backgrounded process must not survive destroy()"
         )
 
-    def test_stop_kills_background_process_before_reverting_workspace(self):
+    def test_stop_kills_background_process_but_preserves_workspace(self):
+        """stop() hibernates: it must still kill any background process (the
+        same kill step rm_container()/destroy() use) but must NOT touch the
+        workspace -- unlike rm_container(), a hibernated sandbox's state,
+        files included, has to survive stop()."""
+        sb = _make_backend()
+        marker = f"agencytest{uuid.uuid4().hex[:8]}"
+        try:
+            sb.write_file("/workspace/kept.txt", "kept\n")
+            sb.exec(f"exec -a {marker} sleep 30 &")
+            tracked_pid = self._find_marked_pid(sb.get_live_pids(), marker)
+            assert tracked_pid is not None, (
+                f"expected the marked sleep to be tracked, got {sb.get_live_pids()}"
+            )
+            sb.stop()
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and os.path.exists(f"/proc/{tracked_pid}"):
+                time.sleep(0.1)
+            assert not os.path.exists(f"/proc/{tracked_pid}"), (
+                "backgrounded process must not survive stop()"
+            )
+            sb._ensure_started()
+            assert sb.read_file("/workspace/kept.txt") == "kept\n", (
+                "stop() must not touch the workspace -- only rm_container() discards it"
+            )
+        finally:
+            sb.destroy()
+
+    def test_rm_container_kills_background_process_before_reverting_workspace(self):
         """Same regression as test_destroy_kills_background_process_before_removing_root,
-        for stop(commit=False): a background job from the dirty state being
+        for rm_container(): a background job from the dirty state being
         discarded must not be left running independently once the
         workspace is reverted out from under it."""
         sb = _make_backend()
@@ -1004,13 +1048,13 @@ class TestChrootBackendLifecycle:
             assert tracked_pid is not None, (
                 f"expected the marked sleep to be tracked, got {sb.get_live_pids()}"
             )
-            sb.stop(commit=False)
+            sb.rm_container()
 
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and os.path.exists(f"/proc/{tracked_pid}"):
                 time.sleep(0.1)
             assert not os.path.exists(f"/proc/{tracked_pid}"), (
-                "backgrounded process must not survive stop()"
+                "backgrounded process must not survive rm_container()"
             )
         finally:
             sb.destroy()
@@ -1041,7 +1085,7 @@ class TestChrootGpuReleaseGating:
         released = self._lease_gpu(sb)
         monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: None)
 
-        sb.stop(commit=False)
+        sb.stop()
 
         assert released == [3]
         assert sb._gpu_id is None
@@ -1054,7 +1098,7 @@ class TestChrootGpuReleaseGating:
         sb._gpu_release_fn = lambda gid: order.append(("release", gid))
         monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: order.append(("kill",)))
 
-        sb.stop(commit=False)
+        sb.stop()
 
         assert order == [("kill",), ("release", 3)]
 
@@ -1063,14 +1107,14 @@ class TestChrootGpuReleaseGating:
         released = self._lease_gpu(sb)
         monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: None)
 
-        sb.stop(commit=False)
+        sb.stop()
         sb.destroy()
 
         assert released == [3], "GPU must be released exactly once, not once per call"
 
     def test_destroy_releases_gpu_exactly_once(self, monkeypatch):
-        """destroy() calls stop() internally -- confirm that single call
-        chain still only releases once, not via some hidden double
+        """destroy() calls rm_container() internally -- confirm that single
+        call chain still only releases once, not via some hidden double
         invocation."""
         sb = _make_backend()
         released = self._lease_gpu(sb)
@@ -1124,6 +1168,15 @@ class TestChrootImageHelpers:
         with pytest.raises(FileNotFoundError):
             _ChrootBackend.export_image(f"agency/no-such-{uuid.uuid4().hex[:8]}", 30)
 
+    def test_relabel_owner_pid_is_a_noop(self):
+        """A chroot snapshot has no label/metadata concept at all (see
+        _ContainerBackendBase's real version, which this mirrors for API
+        parity so agent.py's save()/load() can call it generically
+        regardless of backend) -- must not raise even for a tag that
+        doesn't exist."""
+        _ChrootBackend.relabel_owner_pid(f"agency/no-such-{uuid.uuid4().hex[:8]}", 12345, 30)
+        _ChrootBackend.relabel_owner_pid(f"agency/no-such-{uuid.uuid4().hex[:8]}", None, 30)
+
 
 # ---------------------------------------------------------------------------
 # Facade integration -- agSandbox(backend="chroot")
@@ -1158,11 +1211,11 @@ class TestFacadeWithChrootBackend:
         finally:
             sb.destroy()
 
-    def test_facade_stop_commit_true_sets_checkpoint_image(self):
+    def test_facade_commit_sets_checkpoint_image(self):
         sb = self._make_sandbox()
         try:
             sb.exec("true")
-            sb.stop(commit=True)
+            sb.commit()
             assert sb._checkpoint_image is not None
         finally:
             sb.destroy()
@@ -1172,7 +1225,7 @@ class TestFacadeWithChrootBackend:
         fork_sb = None
         try:
             sb.write_file("/workspace/parent.txt", "parent-data\n")
-            sb.stop(commit=True)
+            sb.commit()
             fork_sb = sb.fork(str(uuid.uuid4()))
             assert isinstance(fork_sb._backend, _ChrootBackend)
             assert fork_sb.read_file("/workspace/parent.txt") == "parent-data\n"
@@ -1212,7 +1265,7 @@ class TestAgentSaveLoadWithChrootBackend:
         try:
             ag.sandbox = agSandbox(ag.agname, agconfig=cfg)
             ag.sandbox.write_file("/workspace/marker.txt", "data\n")
-            ag.sandbox.stop(commit=True)
+            ag.sandbox.commit()
 
             ckpt = tmp_path / "agent.ckpt"
             ag.save(ckpt)
@@ -1236,7 +1289,7 @@ class TestAgentSaveLoadWithChrootBackend:
         try:
             ag.sandbox = agSandbox(ag.agname, agconfig=cfg)
             ag.sandbox.write_file("/workspace/marker.txt", "checkpointed-via-agent\n")
-            ag.sandbox.stop(commit=True)
+            ag.sandbox.commit()
 
             ckpt = tmp_path / "agent.ckpt"
             ag.save(ckpt)

@@ -22,9 +22,9 @@ Tools are the functions an LLM can call during a ReAct loop. Each tool is an `ag
 
 All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker/podman exec`.
 
-**There is no `gpu_release` tool.** A GPU, once actually acquired via `reserve_gpu`, is released only by `sandbox.stop()`/`sandbox.destroy()` — never by an explicit mid-skill call (see [agresources.md](agresources.md#agent-callable-resource-tools)).
+**There is no `gpu_release` tool.** A GPU, once actually acquired via `reserve_gpu`, is released only by `sandbox.rm_container()`/`sandbox.destroy()` — never by an explicit mid-skill call, and never by a mere hibernate (see [agresources.md](agresources.md#agent-callable-resource-tools) and [container.md](agsandbox_backends/container.md)'s "GPU device access").
 
-**`run_in_subprocess` no longer gates whether `stop()` runs after a tool call.** Every built-in tool above sets it `False` for an unrelated reason (they need to run synchronously against the same persistent sandbox object, not a disposable cloudpickled worker copy), but `agtool.py`'s `dispatch_tools()` now calls `sandbox.stop(commit=...)` after *every* tool call regardless of this flag — deferred only when `sandbox._has_pending_background_work()` is true, not based on this column at all.
+**`run_in_subprocess` no longer gates whether `stop()` runs after a tool call.** Every built-in tool above sets it `False` for an unrelated reason (they need to run synchronously against the same persistent sandbox object, not a disposable cloudpickled worker copy), but `agtool.py`'s `dispatch_tools()` now calls `sandbox.stop()` (hibernate only — no checkpoint or removal) after *every* tool call regardless of this flag — deferred only when `sandbox._has_pending_background_work()` is true, not based on this column at all.
 
 ## Sandboxed tool construction
 
@@ -203,26 +203,13 @@ skill = agskill("classify", "Classify this text.", replace_tools=[])
 
 `add_tools` extends the defaults; `replace_tools` overrides them entirely.
 
-## Tool failure, checkpoint revert, and timeout
+## Tool hibernation, skill-level revert, and timeout
 
-### Checkpoint revert on failure
+### No per-tool checkpoint or revert
 
-Before every sandboxed tool call the framework snapshots the sandbox container:
+A tool call's own success or failure has no effect on the sandbox's checkpoint state anymore. Every tool call ends with `sandbox.stop()` — a hibernate only (`docker/podman stop`, container kept, never committed or removed) — regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred until a later call finds nothing pending). See [container.md](agsandbox_backends/container.md)'s "Container lifecycle" for the full mechanics.
 
-```
-agency/pretool-<container_name>-<call_id[:8]>
-```
-
-If the tool returns `agdata(error=...)`, the sandbox is automatically rolled back to that snapshot and the tool result gains a `workspace_reverted` field:
-
-```json
-{
-  "error": "command exited with code 1: ...",
-  "workspace_reverted": "The workspace has been reverted to the state before this tool call."
-}
-```
-
-The LLM sees both the error and the revert notice so it can retry with a corrected approach on a clean filesystem. Revert does not happen when `run_in_subprocess=False`, when `sandbox` is `None`, when `commit()` failed, or when the tool succeeded.
+Checkpointing and revert both happen once per *skill* call instead, at `agskill.py`'s teardown: `sandbox.commit()` on success, `sandbox.rm_container()` (discarding everything since the last successful skill) on failure, with a revert notice delivered to the agent via its `inbox` rather than inlined into any one tool's result — see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert) for the full mechanics and why the notice can't live in the failed skill's own result.
 
 ### Agent-controlled timeout
 

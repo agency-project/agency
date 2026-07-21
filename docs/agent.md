@@ -122,7 +122,7 @@ The name is always postfixed with `_XXXX` (a 4-character base-36 counter, digits
 
 ## Lifecycle and cleanup
 
-sandboxs are created lazily — only when a task calls a tool with `run_in_subprocess=True` for the first time. Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a sandbox. When a sandbox is started, stale sandboxs from a previous run (e.g. after a hard kill) are removed first. The sandbox is stopped with `ag.sandbox.stop(commit=True)` — a single call that snapshots and stops the container — at task end. An `atexit` handler removes any sandboxs still running at process exit.
+sandboxs are created lazily — only when a task first calls a tool that actually touches the sandbox (`run_in_subprocess` no longer gates this at all — see [agtools.md](agtools.md)). Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a sandbox. When a sandbox is started, stale sandboxs from a previous run (e.g. after a hard kill) are removed first. Between tool calls the sandbox is only hibernated (`ag.sandbox.stop()` — paused, never removed); it's checkpointed with `ag.sandbox.commit()` or discarded with `ag.sandbox.rm_container()` once per skill call at task end, depending on whether the skill succeeded (see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert)). An `atexit` handler removes any sandboxs still running at process exit.
 
 ## UI callbacks
 

@@ -122,7 +122,21 @@ class AgSandboxBackendFields:
         "agsandbox_backend", default=0.5
     )  # Multiplied by attempt number for linear backoff between retries.
 
-    # stop(): commit-then-remove teardown sequence.
+    # stop(): hibernate (docker/podman stop, container kept).
+    docker_stop_timeout_s = GlobalConfigParam(
+        "agsandbox_backend", default=120
+    )  # docker stop: should complete fast, see docker_stop_grace_s below.
+    docker_stop_grace_s = GlobalConfigParam(
+        "agsandbox_backend", default=0
+    )  # `docker stop -t` grace period before SIGKILL. Default 0 (immediate
+    # SIGKILL) because every sandbox container's entrypoint is `tail -f
+    # /dev/null`, which never handles SIGTERM -- any nonzero grace period
+    # is pure wasted wall-clock waiting for a timeout that always fires.
+    docker_start_timeout_s = GlobalConfigParam(
+        "agsandbox_backend", default=120
+    )  # docker start: resuming a hibernating container.
+
+    # commit(): checkpoint-in-place, container is not removed.
     stop_inspect_timeout_s = GlobalConfigParam(
         "agsandbox_backend", default=30
     )  # docker inspect (pre-commit image-id lookup).
@@ -131,8 +145,35 @@ class AgSandboxBackendFields:
     stop_ps_check_timeout_s = GlobalConfigParam(
         "agsandbox_backend", default=10
     )  # docker ps (checking whether the old image is still in use).
+
+    # rm_container(): force-remove teardown, discarding all container state.
     rm_retry_attempts = GlobalConfigParam("agsandbox_backend", default=3)
     rm_retry_backoff_s = GlobalConfigParam("agsandbox_backend", default=1)
+
+    # Every commit() is a diff layer on top of whatever the container was
+    # restarted from, and restart always resumes FROM the last checkpoint --
+    # so a long-running sandbox's layer chain grows by one every checkpoint
+    # cycle with nothing to bound it, until it crosses the container
+    # runtime's hard layer-depth cap ("max depth exceeded" on docker/moby).
+    # checkpoint_squash_max_depth periodically flattens the chain back to a
+    # single layer (export/import instead of commit) well before that cap,
+    # triggered by the chain's actual current depth
+    # (`len(_image_diff_ids(tag))`, a cheap `docker/podman inspect` --
+    # not proportional to image size) rather than a fixed commit count: a
+    # count can't account for how many layers the base image itself
+    # already consumes (a real base image was observed at 80 layers on its
+    # own), so a count-based interval could let the real depth cross the
+    # runtime's actual cap before the interval ever fired -- exactly what
+    # caused a real "max depth exceeded" failure on an ordinary plain commit.
+    checkpoint_squash_max_depth = GlobalConfigParam(
+        "agsandbox_backend", default=100
+    )  # Squash once the chain's actual depth reaches this; keep well under
+    # the real cap (~125 observed empirically on docker/moby) to leave
+    # margin for the squash itself and any variance across storage
+    # drivers/runtime versions.
+    squash_timeout_s = GlobalConfigParam(
+        "agsandbox_backend", default=600
+    )  # export/import serializes the FULL filesystem, not a diff -- needs more headroom than commit_timeout_s.
 
 
 class agSandboxBackendConfig(_AgConfigViewBase):

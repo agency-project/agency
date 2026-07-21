@@ -959,9 +959,14 @@ class _ChrootBackend(agsandbox_backend):
         """No-op -- chroot jails have no cgroup of their own to update."""
         return
 
-    def commit(self, tag: str) -> bool:
-        """Snapshot the current workspace to *tag*. Returns False if the
-        jail was never started (nothing to snapshot).
+    def commit(self, tag: "str | None" = None) -> bool:
+        """Snapshot the current workspace to *tag* (default: this jail's own
+        lifecycle tag) -- the chroot equivalent of a container `commit`.
+        Leaves the live workspace untouched (unlike the old commit-then-
+        discard stop()): the jail keeps running from it exactly as before,
+        no different from a container backend's commit() not removing the
+        container. Returns False if the jail was never started (nothing to
+        snapshot).
 
         Checks the workspace directory's existence on disk directly -- this
         may be called from the orchestrating process on a sandbox whose
@@ -970,6 +975,7 @@ class _ChrootBackend(agsandbox_backend):
         """
         if not self._workspace.is_dir():
             return False
+        tag = tag if tag is not None else self._lifecycle_tag()
         snapshot_dir = _CHROOT_SNAPSHOTS_DIR / _sanitize_tag(tag)
         snapshot_dir.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir = snapshot_dir.with_name(snapshot_dir.name + f".tmp-{_uuid.uuid4().hex[:8]}")
@@ -980,27 +986,26 @@ class _ChrootBackend(agsandbox_backend):
         if snapshot_dir.exists():
             shutil.rmtree(snapshot_dir, ignore_errors=True)
         tmp_dir.rename(snapshot_dir)
+        self._checkpoint_image = tag
         return True
 
-    def stop(self, *, commit: bool = False) -> None:
-        """ "Stop" the jail: clear PID tracking and either snapshot the
-        workspace (commit=True) or discard it (commit=False), mirroring the
-        container backend's semantics -- there is no running process to
-        actually tear down.
+    def stop(self) -> None:
+        """Hibernate the jail: kill tracked processes and release the GPU --
+        the chroot equivalent of releasing a container's resources. There
+        is no keyring/runtime slot to release here (chroot processes run
+        directly on the host, with no docker/podman container involved at
+        all -- see the module docstring), so this is simpler than the
+        container backend's stop(): unlike that one, releasing the GPU
+        here is safe, since chroot has no persistent container object with
+        GPU device flags baked in at creation -- visibility is granted
+        per-exec via env vars, so a later resume can safely be handed a
+        different physical GPU.
 
-        commit=False only deletes the now-stale workspace; it does not
-        restore it from ``_checkpoint_image`` here. That restore is left to
-        the next ``_ensure_started()`` call, which already materializes from
-        ``_checkpoint_image`` whenever it finds the workspace missing (see
-        its docstring) -- doing the same copy here too would just pay that
-        cost immediately instead of only if/when the sandbox is used again
-        (and would need to happen again, wastefully, right before a
-        destroy() that deletes the whole jail root moments later).
-
-        Checks the workspace directory's existence on disk directly --
-        called from the orchestrating process, which may never have run a
-        single exec() of its own (every tool call ran in a worker process,
-        each with its own cloudpickled copy of this backend)."""
+        Deliberately leaves self._workspace untouched -- hibernating must
+        preserve state across calls the same way the container backend's
+        stop() does; use rm_container() to discard it, and commit() to
+        checkpoint it.
+        """
         gpu_id_to_release = (
             self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
         )
@@ -1019,13 +1024,28 @@ class _ChrootBackend(agsandbox_backend):
             self._gpu_id = None
         self._watched_pids = {}
         self._invocation_pgids = set()
-        if not self._workspace.is_dir():
-            return
-        if commit:
-            tag = self._lifecycle_tag()
-            if self.commit(tag):
-                self._checkpoint_image = tag
-        elif self._workspace.exists():
+
+    def rm_container(self) -> None:
+        """Discard the jail's current workspace outright -- kill tracked
+        processes, release the GPU, and delete the live workspace directory
+        under /tmp. The chroot equivalent of force-removing a container.
+
+        Does not touch any committed snapshot: the next _ensure_started()
+        materializes fresh from self._checkpoint_image (or starts empty if
+        none exists yet), which is what makes this the discard/revert
+        primitive -- call it without a preceding commit() to throw away
+        everything since the last checkpoint.
+        """
+        gpu_id_to_release = (
+            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
+        )
+        self._kill_all_sandbox_processes()
+        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
+            self._gpu_release_fn(gpu_id_to_release)
+            self._gpu_id = None
+        self._watched_pids = {}
+        self._invocation_pgids = set()
+        if self._workspace.exists():
             shutil.rmtree(self._workspace, ignore_errors=True)
 
     def restore(self, tag: str) -> None:
@@ -1047,25 +1067,17 @@ class _ChrootBackend(agsandbox_backend):
         if self._destroyed:
             return
         self._destroyed = True
-        # stop() kills tracked processes and releases the GPU (both
-        # idempotent -- a no-op if a prior stop() already did them) before
-        # deleting the workspace out from under anything still running (see
-        # _kill_all_sandbox_processes()'s docstring). Its own workspace
-        # deletion is subsumed by the root rmtree below, so this is safe to
-        # call unconditionally even though it duplicates that one step.
-        self.stop(commit=False)
+        # rm_container() kills tracked processes, releases the GPU, and
+        # deletes the workspace (all idempotent -- a no-op if a prior
+        # stop()/rm_container() already did them) before the root rmtree
+        # below removes anything left over; safe to call unconditionally
+        # even though it duplicates that one step.
+        self.rm_container()
         if self._root.exists():
             shutil.rmtree(self._root, ignore_errors=True)
         if self._checkpoint_image:
             self.delete_image(self._checkpoint_image, force=True)
             self._checkpoint_image = None
-        # Pretool snapshots created during this sandbox's lifetime (mirrors
-        # _ContainerBackendBase.destroy()'s dangling-image cleanup).
-        prefix = _sanitize_tag(f"agency/pretool-{self._name}-")
-        if _CHROOT_SNAPSHOTS_DIR.is_dir():
-            for entry in _CHROOT_SNAPSHOTS_DIR.iterdir():
-                if entry.name.startswith(prefix):
-                    shutil.rmtree(entry, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Static helpers — snapshot-directory-level operations, the chroot
@@ -1115,3 +1127,10 @@ class _ChrootBackend(agsandbox_backend):
                 tar.extractall(_CHROOT_SNAPSHOTS_DIR, filter="data")
         finally:
             os.unlink(buf.name)
+
+    @staticmethod
+    def relabel_owner_pid(tag: str, owner_pid: "int | None", timeout: int) -> None:
+        """No-op: a chroot snapshot is a plain directory copy with no
+        label/metadata concept at all (see _ContainerBackendBase's
+        version, which this mirrors for API parity so agent.py's
+        save()/load() can call it generically regardless of backend)."""
