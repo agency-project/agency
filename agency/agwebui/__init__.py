@@ -238,9 +238,7 @@ class agwebui:
 
             _pool = _agent_cls.agresource_pool
             if _pool is not None:
-                with _pool._cond:
-                    _acquired_snapshot = _pool._gpus_acquired
-                _pool._emit_resource(_acquired_snapshot)
+                _pool._emit_resource()
         except Exception as _e:
             print(f"[agwebui] WARNING: failed to emit initial resource pool state: {_e}")
 

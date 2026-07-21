@@ -386,12 +386,18 @@ class agResourcePool(_AgResourcePoolFields):
         # release_gpu() can directly wake a waiter instead of every
         # acquire_gpu() call polling every GPU's own lock in a loop -- see
         # acquire_gpu()/release_gpu() docstrings for the full reasoning.
-        # Also covers _gpus_acquired/cpus_acquired/memory_acquired_mb, which
-        # used to need a separate _res_lock: they're always mutated in the
-        # same critical sections as _free_gpus now, so one lock covers both.
-        self._cond = threading.Condition()
+        # Guards only _free_gpus/_gpus_acquired -- NOT cpus_acquired/
+        # memory_acquired_mb, which have no invariant linking them to GPU
+        # state (a thread can reserve CPU while another concurrently
+        # acquires a GPU with no interaction between the two), so they get
+        # their own _cpu_mem_cond instead of sharing this one.
+        self._gpu_cond = threading.Condition()
         self._free_gpus: set[int] = set(self.gpus)
         self._gpus_acquired: int = 0
+        # Plain mutex for cpus_acquired/memory_acquired_mb -- a Condition
+        # rather than a bare Lock only for consistency with _gpu_cond above;
+        # nothing here ever calls wait()/notify().
+        self._cpu_mem_cond = threading.Condition()
         self.cpus_acquired: float = 0.0
         self.memory_acquired_mb: int = 0
         if mark_gpus and self.gpus:
@@ -430,17 +436,16 @@ class agResourcePool(_AgResourcePoolFields):
         budget, not a fresh one per iteration.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._cond:
+        with self._gpu_cond:
             while not self._free_gpus:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
-                if not self._cond.wait(timeout=remaining):
+                if not self._gpu_cond.wait(timeout=remaining):
                     raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
             gpu_id = self._free_gpus.pop()
             self._gpus_acquired += 1
-            acquired_snapshot = self._gpus_acquired
-        self._emit_resource(acquired_snapshot)
+        self._emit_resource()
         return gpu_id
 
     def release_gpu(self, gpu_id: int) -> None:
@@ -469,7 +474,7 @@ class agResourcePool(_AgResourcePoolFields):
         GPU at once -- the actual hazard, not just a cosmetic duplicate
         entry.
         """
-        with self._cond:
+        with self._gpu_cond:
             if gpu_id not in self.gpus:
                 print(f"[agresources] WARNING: release_gpu called with unknown gpu_id={gpu_id}")
                 return
@@ -478,43 +483,45 @@ class agResourcePool(_AgResourcePoolFields):
                 return
             self._free_gpus.add(gpu_id)
             self._gpus_acquired = max(0, self._gpus_acquired - 1)
-            acquired_snapshot = self._gpus_acquired
-            self._cond.notify()
-        self._emit_resource(acquired_snapshot)
+            self._gpu_cond.notify()
+        self._emit_resource()
 
     def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:
         """Record that a sandbox boosted its CPU/memory limits."""
-        with self._cond:
+        with self._cpu_mem_cond:
             self.cpus_acquired += cpus
             self.memory_acquired_mb += memory_mb
-            acquired_snapshot = self._gpus_acquired
-        self._emit_resource(acquired_snapshot)
+        self._emit_resource()
 
     def notify_cpu_released(self, cpus: float, memory_mb: int) -> None:
         """Record that a sandbox reset its CPU/memory limits to idle."""
-        with self._cond:
+        with self._cpu_mem_cond:
             self.cpus_acquired = max(0.0, self.cpus_acquired - cpus)
             self.memory_acquired_mb = max(0, self.memory_acquired_mb - memory_mb)
-            acquired_snapshot = self._gpus_acquired
-        self._emit_resource(acquired_snapshot)
+        self._emit_resource()
 
-    def _emit_resource(self, gpus_acquired: int) -> None:
+    def _emit_resource(self) -> None:
         """Push a resource_update to the webui dashboard, if active.
 
-        Called after releasing self._cond -- gpus_acquired is passed in as a
-        snapshot taken while the lock was still held, rather than re-read
-        from self._gpus_acquired here, so a call never reports a different
-        thread's mutation as if it were its own. cpus_acquired/
-        memory_acquired_mb are read live (not snapshotted) since they're not
-        part of the invariant this refactor centers on; a harmless
-        interleaving there matches this method's pre-existing behavior.
+        Reads _gpus_acquired/cpus_acquired/memory_acquired_mb directly, with
+        no lock -- this is a live status gauge for a dashboard badge, not a
+        value anything computes with, so there's no invariant here worth
+        guarding: a plain int/float attribute read is already atomic under
+        the GIL (no torn reads), and the value is stale the instant it
+        crosses into the emitter/websocket/browser regardless of whether a
+        lock momentarily delayed a concurrent writer. Locking here would
+        narrow that inevitable staleness window by nothing -- it would just
+        relocate where the race happens, not remove it. (Contrast
+        _free_gpus in acquire_gpu()/release_gpu(), which DOES need locking:
+        two threads racing there can make two sandboxes believe they hold
+        the same physical GPU -- an actual invariant, not a status number.)
         """
         try:
             from . import agwebui as _agwebui
 
             if _agwebui._active is not None:
                 _agwebui._active.emitter.resource_update(
-                    gpus_acquired=gpus_acquired,
+                    gpus_acquired=self._gpus_acquired,
                     gpus_total=len(self.gpus),
                     cpus_acquired=self.cpus_acquired,
                     cpus_total=self.total_cpus,
