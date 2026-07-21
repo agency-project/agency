@@ -677,8 +677,13 @@ class TestCheckpointSquash:
         """The flatten must round-trip the container's actual export bytes
         into import's stdin -- not shell out with a literal pipe (this
         codebase never invokes a shell for docker/podman calls) and not
-        silently drop the payload."""
+        silently drop the payload. Must also re-apply agency.owner_pid via
+        --change, since export/import (unlike commit) doesn't preserve
+        container labels at all -- without this, a fallback-squashed
+        image would be permanently unreapable by
+        reap_orphaned_containers()'s image scan."""
         import agency.agsandbox_backends.docker as _mod
+        from agency.agsandbox_backends.container import _AGENCY_OWNER_PID_LABEL
 
         sb = self._sb()
         captured = {}
@@ -700,6 +705,11 @@ class TestCheckpointSquash:
         assert captured["input"] == fake_tar_bytes
         assert captured["args"][-1] == sb._backend._lifecycle_tag()
         assert captured["args"][-2] == "-"  # import reads from stdin, not a file path
+        assert "--change" in captured["args"]
+        change_idx = captured["args"].index("--change")
+        assert captured["args"][change_idx + 1] == (
+            f"LABEL {_AGENCY_OWNER_PID_LABEL}={sb._backend._owner_pid}"
+        )
 
     def test_squash_failure_is_best_effort(self):
         """If every squash path fails (both the accumulator fast path and

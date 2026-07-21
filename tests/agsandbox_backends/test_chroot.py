@@ -1124,6 +1124,15 @@ class TestChrootImageHelpers:
         with pytest.raises(FileNotFoundError):
             _ChrootBackend.export_image(f"agency/no-such-{uuid.uuid4().hex[:8]}", 30)
 
+    def test_relabel_owner_pid_is_a_noop(self):
+        """A chroot snapshot has no label/metadata concept at all (see
+        _ContainerBackendBase's real version, which this mirrors for API
+        parity so agent.py's save()/load() can call it generically
+        regardless of backend) -- must not raise even for a tag that
+        doesn't exist."""
+        _ChrootBackend.relabel_owner_pid(f"agency/no-such-{uuid.uuid4().hex[:8]}", 12345, 30)
+        _ChrootBackend.relabel_owner_pid(f"agency/no-such-{uuid.uuid4().hex[:8]}", None, 30)
+
 
 # ---------------------------------------------------------------------------
 # Facade integration -- agSandbox(backend="chroot")

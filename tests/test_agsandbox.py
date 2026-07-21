@@ -679,30 +679,44 @@ class TestAgSandboxLifecycle:
         a worker process or another sandbox instance) -- it always checks
         _container_running() directly, never a per-process memory flag.
 
-        Simulated by creating two sandbox objects with the same agname:
-        sb_worker starts the container, sb_main (whose own copy never
-        touched it) tries to commit it."""
+        Simulated by creating two BACKEND objects with the same name:
+        sb_worker starts the container, main_backend (whose own copy never
+        touched it) tries to commit it. main_backend is built directly via
+        agsandbox_backend.for_config() rather than a second agSandbox(...)
+        call, since agSandbox's own agname is deduplicated on every
+        construction (see agsandbox.py's __init__) -- passing the same
+        agname through it again would produce a DIFFERENT identity, not
+        simulate a second view of the same one (matching what cloudpickle
+        actually does across worker processes: it preserves the
+        already-computed name rather than reallocating it)."""
         from agency.agconfig import agConfig
         from agency.agsandbox import agSandbox
-        from agency.agsandbox_backends import agSandboxBackendConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
 
         agname = str(uuid.uuid4())
         cfg = agConfig(agSandboxBackendConfig(backend="docker"))
         sb_worker = agSandbox(agname, agconfig=cfg)  # "worker" — starts the container
-        sb_main = agSandbox(agname, agconfig=cfg)  # "main process" — same name, never started it
+        main_backend = agsandbox_backend.for_config(
+            cfg,
+            agname=sb_worker._backend._agname,
+            name=sb_worker._backend._name,
+            checkpoint_image=None,
+            base_image=sb_worker.base_image,
+            mounts={},
+        )  # "main process" — same name, never started it
         tag = f"agency/test-commit-started-false-{agname[:8]}"
         try:
             # Worker starts container and writes a file.
             sb_worker.write_file("/workspace/marker.txt", "worker-written\n")
             # commit() must detect the running container via docker inspect and succeed.
-            assert sb_main.commit(tag) is True
+            assert main_backend.commit(tag) is True
             result = subprocess.run(
                 ["docker", "images", "-q", tag],
                 capture_output=True,
                 text=True,
             )
             assert result.stdout.strip() != "", (
-                "image must exist even though sb_main never started it"
+                "image must exist even though main_backend never started it"
             )
         finally:
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
@@ -728,21 +742,30 @@ class TestAgSandboxLifecycle:
         """_ensure_started() must reuse a container already running in Docker rather
         than destroying it and starting fresh — the cross-worker-process file-persistence fix."""
         from agency.agconfig import agConfig
-        from agency.agsandbox import agSandbox
-        from agency.agsandbox_backends import agSandboxBackendConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
 
         sb = _make_sandbox()
         # Start the container and write a sentinel file.
         sb.write_file("/workspace/persist.txt", "still-here\n")
         assert sb._backend._container_running() is True
-        # A second sandbox object with the same name, standing in for a fresh
-        # worker-process copy -- it has never itself run _ensure_started(),
-        # but _ensure_started() must detect the already-running container via
-        # docker inspect and reuse it rather than trusting any in-process
-        # memory of its own.
+        # A second backend object with the SAME name, standing in for a fresh
+        # worker-process copy (matching what cloudpickle actually does --
+        # preserving the already-computed _name rather than reallocating it).
+        # Built directly via agsandbox_backend.for_config() rather than a
+        # second agSandbox(...) call: agSandbox's own agname is deduplicated
+        # on every construction (see agsandbox.py's __init__), so passing
+        # sb's agname through it again would produce a DIFFERENT name, not
+        # the same one this test needs to simulate reuse.
         cfg = agConfig(agSandboxBackendConfig(backend="docker"))
-        worker = agSandbox(sb._agname, agconfig=cfg)
-        worker._backend._ensure_started()
+        worker_backend = agsandbox_backend.for_config(
+            cfg,
+            agname=sb._backend._agname,
+            name=sb._backend._name,
+            checkpoint_image=None,
+            base_image=sb.base_image,
+            mounts={},
+        )
+        worker_backend._ensure_started()
         # The file written before the reset must still be present.
         content = sb.read_file("/workspace/persist.txt")
         assert "still-here" in content

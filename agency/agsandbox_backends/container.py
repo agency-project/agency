@@ -164,6 +164,14 @@ _reap_done = False
 def reap_orphaned_containers() -> None:
     """Force-remove containers (and their lifecycle images) left behind by a
     SIGKILL'd -- or otherwise uncleanly terminated -- previous process.
+    Also sweeps lifecycle IMAGES whose owning container is already gone
+    (see _reap_orphaned_lifecycle_images()) -- the container-based sweep
+    above only ever helps if the owning container still exists (carrying
+    its agency.owner_pid label) when this runs; once that container's
+    already been removed by anything other than this reaper (a crash's
+    container surviving to a later run, or e.g. external tooling deleting
+    containers directly without ever invoking Python), its lifecycle image
+    would otherwise be unreapable forever, since nothing else ever revisits it.
 
     SIGKILL can never be caught (see agwebui.run()'s SIGTERM handler for what
     *can* be done about a plain `kill`), so a SIGKILL'd process's containers
@@ -227,6 +235,116 @@ def _do_reap_orphaned_containers() -> None:
         subprocess.run([runtime, "rm", "-f", container_id], capture_output=True)
         lifecycle_tag = f"agency/lifecycle-{name}".lower()
         subprocess.run([runtime, "rmi", "-f", lifecycle_tag], capture_output=True)
+
+    _reap_orphaned_lifecycle_images(runtime, own_pid)
+
+
+def _reap_orphaned_lifecycle_images(runtime: str, own_pid: int) -> None:
+    """Remove `agency/lifecycle-*` images whose owning process is confirmed
+    dead, independent of whether their container still exists.
+
+    `docker commit` propagates a container's labels onto its image
+    automatically, so every lifecycle image already carries
+    _AGENCY_OWNER_PID_LABEL for free -- EXCEPT one produced by
+    `_squash_commit()`'s export/import fallback, which needs (and, as of
+    this fix, has) an explicit `--change` to re-apply it, since export/
+    import doesn't preserve container config at all. Images still missing
+    the label (e.g. ones committed before this fix existed) simply don't
+    match the `--filter label=...` query below and are silently skipped --
+    unreapable by this mechanism until a future commit refreshes them, not
+    a correctness problem, just a known gap for pre-existing images.
+
+    Safety: a lifecycle tag can carry a STALE label from an unrelated,
+    long-dead process -- most notably after `agent.load()`'s checkpoint
+    restore (`docker load` DOES preserve the original label, from
+    whatever process originally called `agent.save()`, possibly on a
+    different host entirely) -- while a brand-new, genuinely-live process
+    is right now running a container from that same tag, simply because it
+    hasn't committed under its OWN pid yet. Checking the label alone would
+    risk deleting an image a live container depends on. So even after the
+    label says "dead," this also confirms no container (running or not --
+    matches stop()'s own old-image-cleanup check) currently exists with
+    this image as its ancestor before ever calling `rmi`.
+    """
+    # Unlike `docker ps`, `docker images`'s --format context has no
+    # .Label/.Labels accessor at all (confirmed empirically: both raise a
+    # template-parsing error, even {{json .}} omits labels entirely) --
+    # the `--filter label=...` half still works fine, it's only reading
+    # the value back in the same command that's unsupported. So this
+    # filters for candidate tags first, then reads each one's actual
+    # label value via a separate `docker inspect` (cheap: this list is
+    # small and this only runs once per process).
+    result = subprocess.run(
+        [
+            runtime,
+            "images",
+            "--filter",
+            f"label={_AGENCY_OWNER_PID_LABEL}",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+        ],
+        capture_output=True,
+        timeout=AgSandboxBackendFields().inspect_timeout_s,
+    )
+    if result.returncode != 0:
+        return
+    for tag in result.stdout.decode("utf-8", errors="replace").splitlines():
+        tag = tag.strip()
+        if not tag or not tag.startswith("agency/lifecycle-"):
+            continue
+        try:
+            label_result = subprocess.run(
+                [
+                    runtime,
+                    "inspect",
+                    "--format",
+                    f'{{{{index .Config.Labels "{_AGENCY_OWNER_PID_LABEL}"}}}}',
+                    tag,
+                ],
+                capture_output=True,
+                timeout=AgSandboxBackendFields().inspect_timeout_s,
+            )
+            if label_result.returncode != 0:
+                continue
+            owner_pid = int(label_result.stdout.decode("utf-8", errors="replace").strip())
+        except Exception as _e:
+            # The images list above was already filtered to label=..., so
+            # reaching here means the tag vanished (e.g. removed by a
+            # concurrent process) or its label value was somehow
+            # unparseable -- rare. Unknown either way, never treat as dead.
+            print(
+                f"[agsandbox_backend] WARNING: could not read owner_pid label for "
+                f"lifecycle image {tag!r}, skipping: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+            continue
+        if owner_pid == own_pid or _pid_alive(owner_pid):
+            continue  # still owned by a live process (or ourselves) -- leave it
+        try:
+            in_use = subprocess.run(
+                [runtime, "ps", "-a", "--filter", f"ancestor={tag}", "--format", "{{.ID}}"],
+                capture_output=True,
+                timeout=AgSandboxBackendFields().stop_ps_check_timeout_s,
+            )
+            if in_use.returncode != 0:
+                continue  # couldn't confirm safety -- skip rather than risk it
+            if in_use.stdout.strip():
+                continue  # a container -- possibly a fresh owner reusing this tag -- is still running from it
+        except Exception as _e:
+            print(
+                f"[agsandbox_backend] WARNING: could not confirm lifecycle image {tag!r} "
+                f"is unused, skipping rather than risk deleting a live image: {_e}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+            continue
+        print(
+            f"[agsandbox_backend] Reaping lifecycle image {tag!r}, "
+            f"orphaned by dead process {owner_pid} (likely SIGKILL'd)",
+            flush=True,
+        )
+        subprocess.run([runtime, "rmi", "-f", tag], capture_output=True)
 
 
 def seed_cache_from_image(
@@ -1200,9 +1318,18 @@ class _ContainerBackendBase(agsandbox_backend):
         than just the accumulated diff.
 
         Safe to drop the image metadata `docker commit` would normally
-        preserve (env, labels, embedded CMD/ENTRYPOINT): _ensure_started()'s
+        preserve (env, embedded CMD/ENTRYPOINT): _ensure_started()'s
         restart `run` command always passes an explicit `tail -f
         /dev/null`, never relying on anything baked into the image itself.
+        The one label that IS explicitly re-applied via `--change` is
+        `_AGENCY_OWNER_PID_LABEL` -- `docker commit` propagates a
+        container's labels onto its image automatically, but `export`/
+        `import` doesn't preserve container config at all (confirmed
+        empirically: an export/import round-trip strips every label), so
+        without this the resulting image would carry no owner_pid at
+        all, making it permanently unreapable by
+        `reap_orphaned_containers()`'s image-scan (see that function's
+        docstring) even after its owning process dies.
 
         Resets the diff accumulator on success (see
         `_accumulator_squash_commit()`): export/import produces a
@@ -1221,7 +1348,14 @@ class _ContainerBackendBase(agsandbox_backend):
             timeout=self.squash_timeout_s,
         )
         self._run(
-            [self._runtime, "import", "-", tag],
+            [
+                self._runtime,
+                "import",
+                "--change",
+                f"LABEL {_AGENCY_OWNER_PID_LABEL}={self._owner_pid}",
+                "-",
+                tag,
+            ],
             input=export_result.stdout,
             check=True,
             timeout=self.squash_timeout_s,
@@ -1630,3 +1764,57 @@ class _ContainerBackendBase(agsandbox_backend):
                 check=True,
                 timeout=timeout,
             )
+
+    @staticmethod
+    def relabel_owner_pid(tag: str, owner_pid: "int | None", timeout: int) -> None:
+        """Overwrite *tag*'s _AGENCY_OWNER_PID_LABEL (clearing it if
+        *owner_pid* is None).
+
+        Used by agent.py's save()/load(): a checkpoint's embedded image
+        was originally committed by (or, if it went through
+        `_squash_commit()`'s export/import fallback, explicitly
+        re-labelled with) the PID of whatever process happened to be
+        running the sandbox at checkpoint time -- meaningless, and
+        potentially misleading, once embedded in a portable .ckpt file
+        that might be restored by an entirely different process, on a
+        different host, at an arbitrary later time (that foreign PID
+        could even coincidentally collide with a real, live, unrelated
+        process on the restoring host). save() scrubs it (passing
+        owner_pid=None) before embedding the image; load() re-stamps it
+        with the actually-current restoring process's own PID afterward,
+        so `reap_orphaned_containers()`'s image scan (which trusts this
+        label to decide "is this image's owner still alive") never acts
+        on stale, foreign evidence.
+
+        `docker create` registers a container without ever starting or
+        running it -- sufficient as `docker commit --change`'s source
+        here, since the only thing being changed is metadata, not
+        anything that requires the image to actually run. The temporary
+        container is always removed, even on failure.
+        """
+        runtime = get_container_runtime()
+        value = "" if owner_pid is None else str(owner_pid)
+        with _get_docker_semaphore():
+            created = subprocess.run(
+                [runtime, "create", tag],
+                capture_output=True,
+                check=True,
+                timeout=timeout,
+            )
+            container_id = created.stdout.decode("utf-8", errors="replace").strip()
+            try:
+                subprocess.run(
+                    [
+                        runtime,
+                        "commit",
+                        "--change",
+                        f"LABEL {_AGENCY_OWNER_PID_LABEL}={value}",
+                        container_id,
+                        tag,
+                    ],
+                    capture_output=True,
+                    check=True,
+                    timeout=timeout,
+                )
+            finally:
+                subprocess.run([runtime, "rm", "-f", container_id], capture_output=True)

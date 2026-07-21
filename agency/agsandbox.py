@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
+from .agname import agname as _agname
 from .agsandbox_backends import agsandbox_backend, backend_for_image_kind, _RUN_ID
 
 if TYPE_CHECKING:
@@ -109,7 +110,18 @@ class agSandbox(_AgSandboxFields):
         checkpoint_image: str | None = None,
         agconfig: "agConfig | None" = None,
     ) -> None:
-        self._agname = agname
+        # Claimed from the SAME shared registry agent() uses (agname.py)
+        # -- the "sandbox_" prefix guarantees this claim can never collide
+        # with an agent's own agname. Without it, an agent named e.g.
+        # "alex_0000" and a directly-constructed agSandbox("alex_0000", ...)
+        # (bypassing agent entirely) would compute the IDENTICAL container
+        # name and lifecycle tag within the same process -- _RUN_ID is a
+        # process-wide constant, not object-specific, so nothing else
+        # disambiguates them. allocate_agname() (not claim_unique_agname())
+        # so this never raises, even when the same base *agname* is used to
+        # construct multiple sandboxes -- each gets its own auto-suffixed
+        # claim instead.
+        self._agname = _agname.allocate_agname(f"sandbox_{agname}")
         # Held by agskill for the full duration of a skill run so a sandbox
         # shared across agents is never driven by more than one skill run
         # at a time. See agskill.py's _task().
@@ -123,7 +135,7 @@ class agSandbox(_AgSandboxFields):
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
-        self._name = f"sandbox-{_RUN_ID}-{agname}"
+        self._name = f"sandbox-{_RUN_ID}-{self._agname}"
 
         # Resolve image/mounts once, here, rather than lazily -- a running
         # backend is physically fixed once created, so this is a tier-2
@@ -141,7 +153,7 @@ class agSandbox(_AgSandboxFields):
 
         self._backend = agsandbox_backend.for_config(
             self._agconfig,
-            agname=agname,
+            agname=self._agname,
             name=self._name,
             checkpoint_image=checkpoint_image,
             base_image=base_image,
@@ -322,6 +334,10 @@ class agSandbox(_AgSandboxFields):
     def fork(self, new_agname: str, agconfig: "agConfig | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_agname* starting from this sandbox's
         current checkpoint image.  If no checkpoint exists the fork starts fresh.
+
+        *new_agname* doesn't need to already be unique -- like every
+        agSandbox construction, it's automatically deduplicated (see
+        __init__'s docstring below).
 
         When *agconfig* is not given, the fork inherits this sandbox's own
         agconfig unchanged (rather than silently re-reading whatever

@@ -94,8 +94,10 @@ class TestReapOrphanedContainers:
             with patch("subprocess.run", return_value=ps_result) as mock_run:
                 _container.reap_orphaned_containers()
 
-        # Only the initial `docker ps` call should have happened -- no rm/rmi.
-        assert mock_run.call_count == 1
+        # The container ps call, then the lifecycle-image scan (see
+        # TestReapOrphanedLifecycleImages) -- no rm/rmi of anything.
+        assert mock_run.call_count == 2
+        assert not any("rm" in c.args[0] or "rmi" in c.args[0] for c in mock_run.call_args_list)
 
     def test_skips_container_owned_by_self(self):
         ps_result = self._fake_ps_result([f"abc123\t{os.getpid()}\tsandbox-rXXXXXXX-someagent"])
@@ -104,7 +106,7 @@ class TestReapOrphanedContainers:
         ):
             with patch("subprocess.run", return_value=ps_result) as mock_run:
                 _container.reap_orphaned_containers()
-        assert mock_run.call_count == 1
+        assert mock_run.call_count == 2
 
     def test_no_containers_found_is_a_noop(self):
         ps_result = self._fake_ps_result([])
@@ -113,7 +115,7 @@ class TestReapOrphanedContainers:
         ):
             with patch("subprocess.run", return_value=ps_result) as mock_run:
                 _container.reap_orphaned_containers()
-        assert mock_run.call_count == 1
+        assert mock_run.call_count == 2
 
     def test_runs_at_most_once_per_process(self):
         ps_result = self._fake_ps_result([])
@@ -124,7 +126,7 @@ class TestReapOrphanedContainers:
                 _container.reap_orphaned_containers()
                 _container.reap_orphaned_containers()
                 _container.reap_orphaned_containers()
-        assert mock_run.call_count == 1, "second/third calls must be no-ops"
+        assert mock_run.call_count == 2, "second/third calls must be no-ops"
 
     def test_no_usable_runtime_is_a_noop(self):
         with patch(
@@ -144,6 +146,264 @@ class TestReapOrphanedContainers:
                 _container.reap_orphaned_containers()  # must not raise
         # Still marked done -- a broken daemon shouldn't retry every construction.
         assert _container._reap_done is True
+
+
+class TestReapOrphanedLifecycleImages:
+    """_reap_orphaned_lifecycle_images() -- the image-side half of the
+    reaper, catching lifecycle images whose owning CONTAINER is already
+    gone (so TestReapOrphanedContainers's container-label scan above never
+    even sees them). Calls the function directly rather than going through
+    reap_orphaned_containers() (whose own once-per-process guard and empty
+    container-ps step are already covered above).
+
+    Three real subprocess.run shapes are involved, each mocked separately
+    by dispatching on which subcommand appears in argv -- unlike
+    `docker ps`, `docker images`'s --format context has no .Label/.Labels
+    accessor at all (confirmed empirically against a real daemon: an
+    earlier version of this scan used `docker images --format
+    '...{{.Label "..."}}'` in one combined call, which fails with a
+    template-parsing error every time -- returncode != 0, so the whole
+    scan silently no-op'd, real bug that shipped and was only caught by
+    checking a real host, not by these mocks, since they modeled the
+    (wrong) single-call shape too):
+
+    1. `docker images --filter label=... --format {{.Repository}}:{{.Tag}}`
+       -- list of candidate tags, no label value.
+    2. `docker inspect --format {{index .Config.Labels "..."}} <tag>`
+       -- the actual label value, one call per candidate tag.
+    3. `docker ps -a --filter ancestor=<tag> --format {{.ID}}` -- the
+       safety check, only reached if step 2's PID looks dead.
+    """
+
+    def _fake_result(self, returncode=0, stdout=""):
+        result = MagicMock()
+        result.returncode = returncode
+        result.stdout = stdout.encode() if isinstance(stdout, str) else stdout
+        return result
+
+    def _dispatcher(self, *, images_lines=None, labels=None, ancestor_lines=None, images_rc=0):
+        """*labels* maps tag -> pid string (or None to simulate a missing/
+        unparseable label) for the per-tag inspect call. *ancestor_lines*
+        is shared across every tag's ancestor check (fine: these tests
+        only ever exercise one candidate tag at a time)."""
+        labels = labels or {}
+
+        def fake_run(args, **kwargs):
+            if "images" in args:
+                if images_rc != 0:
+                    return self._fake_result(returncode=images_rc)
+                lines = images_lines or []
+                return self._fake_result(stdout="\n".join(lines) + ("\n" if lines else ""))
+            if "inspect" in args:
+                tag = args[-1]
+                pid_str = labels.get(tag)
+                return self._fake_result(stdout="" if pid_str is None else str(pid_str))
+            if "ps" in args:
+                lines = ancestor_lines if ancestor_lines is not None else []
+                return self._fake_result(stdout="\n".join(lines) + ("\n" if lines else ""))
+            if "rmi" in args:
+                return self._fake_result()
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        return fake_run
+
+    def test_removes_lifecycle_image_owned_by_dead_pid(self):
+        dead_pid = 2**31 - 1
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: dead_pid}, ancestor_lines=[])
+
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+
+        rmi_calls = [c for c in mock_run.call_args_list if "rmi" in c.args[0]]
+        assert any(tag in c.args[0] for c in rmi_calls)
+
+    def test_skips_image_owned_by_live_pid(self):
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: os.getpid()})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid() + 1)
+        # images list + one inspect -- never reaches the ancestor check or rmi.
+        assert mock_run.call_count == 2
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_skips_image_owned_by_self(self):
+        own_pid = os.getpid()
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: own_pid})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", own_pid)
+        assert mock_run.call_count == 2
+
+    def test_skips_image_with_missing_or_unparseable_label(self):
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: None})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert mock_run.call_count == 2, "must not attempt to delete on unparseable evidence"
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_skips_non_lifecycle_prefixed_image_even_with_dead_label(self):
+        dead_pid = 2**31 - 1
+        tag = "agency/ckpt-restore-abc123:latest"
+        fake_run = self._dispatcher(images_lines=[tag], labels={tag: dead_pid})
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        # Skipped before ever inspecting it -- only the images list call.
+        assert mock_run.call_count == 1, "only agency/lifecycle-* images are in scope"
+
+    def test_skips_image_still_in_use_by_a_container_despite_dead_label(self):
+        """The core safety guard: a stale label (e.g. from a checkpoint
+        restored via agent.load(), which DOES preserve the original,
+        possibly-foreign owner's label) must not cause an image a live
+        container is currently running from to be deleted."""
+        dead_pid = 2**31 - 1
+        tag = "agency/lifecycle-someagent:latest"
+        fake_run = self._dispatcher(
+            images_lines=[tag], labels={tag: dead_pid}, ancestor_lines=["somecontainerid"]
+        )
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_ancestor_check_failure_skips_rather_than_deletes(self):
+        """If the safety check itself can't be confirmed (non-zero
+        returncode or an exception), the image must be left alone -- never
+        deleted on missing evidence."""
+        dead_pid = 2**31 - 1
+        tag = "agency/lifecycle-someagent:latest"
+
+        def fake_run(args, **kwargs):
+            if "images" in args:
+                return self._fake_result(stdout=f"{tag}\n")
+            if "inspect" in args:
+                return self._fake_result(stdout=str(dead_pid))
+            if "ps" in args:
+                return self._fake_result(returncode=1)
+            raise AssertionError(f"unexpected call: {args}")
+
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert not any("rmi" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_images_scan_failure_is_a_noop(self):
+        fake_run = self._dispatcher(images_rc=1)
+        with patch("subprocess.run", side_effect=fake_run):
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())  # must not raise
+
+    def test_no_images_found_is_a_noop(self):
+        fake_run = self._dispatcher(images_lines=[])
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            _container._reap_orphaned_lifecycle_images("docker", os.getpid())
+        assert mock_run.call_count == 1
+
+    def test_real_scan_against_live_daemon_finds_no_broken_template(self):
+        """Regression test for the exact bug this class's docstring
+        describes: run the real `docker images --filter ... --format
+        {{.Repository}}:{{.Tag}}` command (no mocking) and confirm it
+        doesn't fail -- this is the specific call whose broken
+        `--format` string previously made returncode != 0 look like "no
+        orphans found" instead of "the command itself is malformed"."""
+        if subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode != 0:
+            pytest.skip("Docker daemon not reachable")
+        result = subprocess.run(
+            [
+                "docker",
+                "images",
+                "--filter",
+                "label=agency.owner_pid",
+                "--format",
+                "{{.Repository}}:{{.Tag}}",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+
+
+class TestRelabelOwnerPid:
+    """_ContainerBackendBase.relabel_owner_pid() -- used by agent.py's
+    save()/load() to scrub/restamp the owner_pid label on a checkpoint's
+    embedded image (see that method's docstring). Builds its own throwaway
+    container via `docker create` (never started) purely to give
+    `docker commit --change` something to commit from."""
+
+    def _fake_completed(self, stdout=b""):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = stdout
+        return result
+
+    def test_stamps_given_pid_via_create_then_commit(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if "create" in args:
+                return self._fake_completed(stdout=b"fakecontainerid123\n")
+            return self._fake_completed()
+
+        with patch(
+            "agency.agsandbox_backends.container.get_container_runtime", return_value="docker"
+        ):
+            with patch("subprocess.run", side_effect=fake_run):
+                _container._ContainerBackendBase.relabel_owner_pid("agency/ckpt-foo", 4242, 30)
+
+        create_calls = [c for c in calls if "create" in c]
+        commit_calls = [c for c in calls if "commit" in c]
+        rm_calls = [c for c in calls if c[1:3] == ["rm", "-f"]]
+        assert create_calls and create_calls[0][-1] == "agency/ckpt-foo"
+        assert commit_calls, calls
+        assert "--change" in commit_calls[0]
+        change_idx = commit_calls[0].index("--change")
+        assert commit_calls[0][change_idx + 1] == "LABEL agency.owner_pid=4242"
+        assert commit_calls[0][-2] == "fakecontainerid123"  # the created container's id
+        assert commit_calls[0][-1] == "agency/ckpt-foo"
+        assert rm_calls and rm_calls[0][-1] == "fakecontainerid123", (
+            "the throwaway container must always be cleaned up"
+        )
+
+    def test_none_pid_clears_the_label(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if "create" in args:
+                return self._fake_completed(stdout=b"cid\n")
+            return self._fake_completed()
+
+        with patch(
+            "agency.agsandbox_backends.container.get_container_runtime", return_value="docker"
+        ):
+            with patch("subprocess.run", side_effect=fake_run):
+                _container._ContainerBackendBase.relabel_owner_pid("agency/ckpt-foo", None, 30)
+
+        commit_calls = [c for c in calls if "commit" in c]
+        change_idx = commit_calls[0].index("--change")
+        assert commit_calls[0][change_idx + 1] == "LABEL agency.owner_pid="
+
+    def test_temp_container_removed_even_when_commit_fails(self):
+        import subprocess as _sp
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if "create" in args:
+                return self._fake_completed(stdout=b"cid\n")
+            if "commit" in args:
+                raise _sp.CalledProcessError(1, args)
+            return self._fake_completed()
+
+        with patch(
+            "agency.agsandbox_backends.container.get_container_runtime", return_value="docker"
+        ):
+            with patch("subprocess.run", side_effect=fake_run):
+                with pytest.raises(_sp.CalledProcessError):
+                    _container._ContainerBackendBase.relabel_owner_pid("agency/ckpt-foo", 1, 30)
+
+        rm_calls = [c for c in calls if c[1:3] == ["rm", "-f"]]
+        assert rm_calls and rm_calls[0][-1] == "cid"
 
 
 class TestQuotaHooksSharedAcrossRuntimes:

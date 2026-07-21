@@ -1115,3 +1115,10 @@ class _ChrootBackend(agsandbox_backend):
                 tar.extractall(_CHROOT_SNAPSHOTS_DIR, filter="data")
         finally:
             os.unlink(buf.name)
+
+    @staticmethod
+    def relabel_owner_pid(tag: str, owner_pid: "int | None", timeout: int) -> None:
+        """No-op: a chroot snapshot is a plain directory copy with no
+        label/metadata concept at all (see _ContainerBackendBase's
+        version, which this mirrors for API parity so agent.py's
+        save()/load() can call it generically regardless of backend)."""
