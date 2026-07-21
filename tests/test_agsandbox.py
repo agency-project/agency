@@ -1135,6 +1135,46 @@ class TestAgSandboxLifecycle:
         assert _container_semaphore._semlock._get_value() == held + 1
 
     @docker
+    def test_rm_container_on_already_hibernating_container_releases_slot_once(self):
+        """rm_container() called on a container that's ALREADY hibernating
+        (stop() already ran and already released the runtime slot) must NOT
+        release the slot a second time.
+
+        This is the exact shape of a real skill-failure teardown: every
+        prior tool call already hibernated the sandbox via stop() before
+        agskill.py calls rm_container() on it. multiprocessing.Semaphore
+        does not raise on over-release (confirmed empirically -- unlike
+        threading.BoundedSemaphore), so a double-release here would
+        silently over-credit the semaphore, eventually letting more
+        containers run concurrently than the kernel keyring quota actually
+        supports -- the same class of bug the quota exists to prevent.
+        """
+        from agency.agsandbox_backends.container import _container_semaphore
+
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+        # write_file() above already forced _ensure_started(), which
+        # acquired the sandbox's runtime slot -- capture the value with that
+        # slot already held.
+        held = _container_semaphore._semlock._get_value()
+
+        sb.stop()
+        assert _container_semaphore._semlock._get_value() == held + 1, (
+            "stop() must release the slot exactly once"
+        )
+
+        sb.rm_container()
+        assert _container_semaphore._semlock._get_value() == held + 1, (
+            "rm_container() on an already-hibernating container must not "
+            "release the slot again -- it was never re-acquired"
+        )
+
+        sb.destroy()
+        assert _container_semaphore._semlock._get_value() == held + 1, (
+            "destroy() on an already-removed container must not release the slot again either"
+        )
+
+    @docker
     def test_concurrent_docker_calls_gated_by_docker_semaphore(self):
         """All docker calls go through _run() which holds _docker_semaphore; peak concurrency <= 8."""
         from agency.agsandbox_backends.container import _docker_semaphore

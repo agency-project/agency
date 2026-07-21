@@ -1586,6 +1586,19 @@ class _ContainerBackendBase(agsandbox_backend):
                 self._gpu_release_fn(gpu_id_to_release)
                 self._gpu_id = None
             return
+        # Captured BEFORE the rm attempt: this is what tells us whether the
+        # runtime slot is actually ours to release below. Called on an
+        # already-hibernating container (stop() already ran and already
+        # released the slot -- the normal case for a skill-failure teardown,
+        # since every prior tool call's stop() already hibernated it), this
+        # is False, and the release check below correctly no-ops instead of
+        # crediting the semaphore a second time. Without this gate, a
+        # multiprocessing.Semaphore silently over-releases past its true
+        # capacity (confirmed empirically: release() raises no ValueError on
+        # over-release, unlike threading.BoundedSemaphore), letting more
+        # containers run concurrently than the kernel keyring quota actually
+        # supports -- the same class of bug the quota exists to prevent.
+        had_container = self._container_running()
         self._watched_pids = {}
         self._baseline_pids = None
         name = self._container_name()
@@ -1602,7 +1615,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 rm_exc = _e
                 if _attempt != self.rm_retry_attempts - 1:
                     time.sleep(self.rm_retry_backoff_s)
-        if not self._container_running():
+        if had_container and not self._container_running():
             self._release_runtime_slot()
         if (
             gpu_id_to_release is not None
@@ -1876,27 +1889,18 @@ class _ContainerBackendBase(agsandbox_backend):
         if self._destroyed:
             return
         self._destroyed = True
-        # Always attempt cleanup below -- docker rm -f is a no-op when the
-        # container doesn't exist, and _container_running() is ground truth
-        # regardless of which process (this one or a worker) actually
-        # started the container.
         container_name = self._container_name()
-        # Release the GPU here too -- destroy() is called from atexit/__del__
-        # (see agsandbox.py) on sandboxes that may never have gone through a
-        # normal stop() first, so this can't assume stop() already handled it.
-        # Not delegated to stop(): stop()'s rm retry loop raises immediately
-        # on failure, but destroy() must still attempt every remaining
-        # cleanup step (GPU release check, image cleanup) before surfacing
-        # that failure, rather than aborting partway through.
-        gpu_id_to_release = (
-            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
-        )
 
-        # Best-effort courtesy signal before rm -f forces the issue --
-        # rm -f kills everything inside the container regardless of whether
-        # this succeeds, so a failure here doesn't change what actually
-        # happens, only whether tracked processes got a chance to react
-        # first. Warn, don't raise: nothing depends on this succeeding.
+        # Best-effort courtesy signal before rm_container() forces the issue
+        # -- rm -f kills everything inside the container regardless of
+        # whether this succeeds, so a failure here doesn't change what
+        # actually happens, only whether tracked processes got a chance to
+        # react first. Warn, don't raise: nothing depends on this
+        # succeeding. Kept as destroy()'s own step (not something
+        # rm_container() does) since destroy() is called from
+        # atexit/__del__ on sandboxes that may never have gone through a
+        # normal stop() first -- rm_container() alone can't assume anything
+        # already gave tracked processes this courtesy.
         if self._watched_pids:
             pids = " ".join(str(p) for p in self._watched_pids)
             try:
@@ -1908,39 +1912,20 @@ class _ContainerBackendBase(agsandbox_backend):
                     f"[agsandbox_backend] WARNING: failed to kill PIDs {pids} in {container_name}: {_e}"
                 )
 
-        # Check before rm so we know whether a runtime slot must be released.
-        had_container = self._container_running()
-
-        # rm_exc is raised at the end, after every remaining cleanup step
+        # rm_container() already retries and only releases the runtime
+        # slot/GPU once actually confirmed gone (see its docstring) --
+        # destroy() no longer needs its own copy of that logic (a prior
+        # copy here silently drifted out of sync with a fix made to
+        # rm_container() itself, which is exactly the risk of keeping two).
+        # rm_exc is raised at the end, after the image/accumulator cleanup
         # below has still been attempted -- an unconfirmed removal must
-        # reach the caller, but shouldn't cut short the GPU-release check or
-        # the best-effort image cleanup that don't depend on it.
+        # reach the caller, but shouldn't cut short cleanup that doesn't
+        # depend on it.
         rm_exc: Exception | None = None
         try:
-            if self._container_status():
-                self._rm_container(container_name)
+            self.rm_container()
         except Exception as _e:
             rm_exc = _e
-        finally:
-            # Only release if the container is actually confirmed gone now --
-            # if had_container was True because a prior stop() already
-            # observed removal succeed (and already released), this recheck
-            # correctly sees no container and skips a second release; if rm
-            # here fails too, the slot is still legitimately held and must
-            # not be released.
-            if had_container and not self._container_running():
-                self._release_runtime_slot()
-
-        # Same ground-truth gate as the runtime slot above -- releasing the
-        # GPU while rm failed and the container might still be running would
-        # let something else acquire the same physical GPU concurrently.
-        if (
-            gpu_id_to_release is not None
-            and self._gpu_release_fn is not None
-            and not self._container_running()
-        ):
-            self._gpu_release_fn(gpu_id_to_release)
-            self._gpu_id = None
 
         # Remove the checkpoint image created during this sandbox's
         # lifetime. Best-effort: a stray dangling image costs disk space,
