@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -325,7 +326,7 @@ def test_pool_explicit_gpus():
 def test_pool_empty_gpus():
     pool = agResourcePool(gpus=[], total_cpus=4, total_memory_mb=8192)
     assert pool.gpus == []
-    assert pool._gpu_locks == {}
+    assert pool._free_gpus == set()
 
 
 def test_pool_default_idle_values():
@@ -407,8 +408,6 @@ def test_acquire_blocks_until_release():
     t = threading.Thread(target=waiter, daemon=True)
     t.start()
 
-    import time
-
     time.sleep(0.05)
     assert not acquired_after.is_set()
     pool.release_gpu(0)
@@ -423,6 +422,91 @@ def test_acquire_timeout_raises():
     with pytest.raises(TimeoutError):
         pool.acquire_gpu(timeout=0.1)
     pool.release_gpu(0)
+
+
+def test_acquire_does_not_poll_via_sleep(monkeypatch):
+    """acquire_gpu() blocks on Condition.wait(), not a sleep/retry loop --
+    unlike the old per-GPU-semaphore round-robin polling design, nothing in
+    the wait path should ever call time.sleep(). Uses a threading.Event
+    (not time.sleep) to sequence the main thread, since agency.agresources'
+    `time` import IS the stdlib time module -- patching time.sleep there
+    patches it everywhere in this process, including a time.sleep() call
+    made directly from this test."""
+    pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
+    pool.acquire_gpu()
+
+    slept = []
+    monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
+
+    started = threading.Event()
+
+    def waiter():
+        started.set()
+        pool.acquire_gpu(timeout=2.0)
+
+    t = threading.Thread(target=waiter, daemon=True)
+    t.start()
+    started.wait(timeout=5.0)
+    pool.release_gpu(0)
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert slept == []
+
+
+def test_release_wakes_a_waiter_promptly():
+    """release_gpu() must wake a blocked waiter directly (via notify()),
+    not leave it discovering the free GPU only on its next poll tick --
+    the wakeup should land in well under what a 0.25s poll interval would
+    have cost."""
+    pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
+    pool.acquire_gpu()
+
+    woke_at = []
+
+    def waiter():
+        pool.acquire_gpu(timeout=5.0)
+        woke_at.append(time.monotonic())
+
+    t = threading.Thread(target=waiter, daemon=True)
+    t.start()
+    time.sleep(0.05)  # ensure the waiter is parked in wait() before releasing
+    released_at = time.monotonic()
+    pool.release_gpu(0)
+    t.join(timeout=5.0)
+    assert woke_at, "waiter never acquired the released GPU"
+    assert woke_at[0] - released_at < 0.05
+
+
+def test_multiple_waiters_each_get_woken_exactly_once():
+    """With N GPUs freed one at a time, exactly N waiters (out of more than
+    N contenders) should succeed -- notify() must wake one waiter per
+    release, never zero (a waiter stuck forever) or more than one racing
+    for the same freed id."""
+    pool = agResourcePool(gpus=[0, 1], total_cpus=4, total_memory_mb=8192)
+    pool.acquire_gpu()
+    pool.acquire_gpu()
+
+    results = []
+    lock = threading.Lock()
+
+    def waiter():
+        try:
+            gpu_id = pool.acquire_gpu(timeout=5.0)
+            with lock:
+                results.append(gpu_id)
+        except TimeoutError:
+            pass
+
+    threads = [threading.Thread(target=waiter, daemon=True) for _ in range(4)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)
+    pool.release_gpu(0)
+    pool.release_gpu(1)
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert sorted(results) == [0, 1]
 
 
 def test_release_unknown_gpu_is_safe():
