@@ -207,13 +207,9 @@ skill = agskill("classify", "Classify this text.", replace_tools=[])
 
 ### Checkpoint revert on failure
 
-Before every sandboxed tool call the framework snapshots the sandbox container:
+There's no separate snapshot taken before each tool call. Instead, every tool call ends with `sandbox.stop(commit=...)`: `commit=True` on success (checkpoints the container's new state forward to `agency/lifecycle-<name>` before removing it), `commit=False` on failure (removes the container without committing, so the *next* tool call's container restarts from the *previous* checkpoint — the revert is simply never checkpointing the bad state forward, not an explicit rollback). See [container.md](agsandbox_backends/container.md)'s "Container lifecycle" for the full mechanics.
 
-```
-agency/pretool-<container_name>-<call_id[:8]>
-```
-
-If the tool returns `agdata(error=...)`, the sandbox is automatically rolled back to that snapshot and the tool result gains a `workspace_reverted` field:
+If the tool returns `agdata(error=...)`, the tool result gains a `workspace_reverted` field:
 
 ```json
 {
@@ -222,7 +218,7 @@ If the tool returns `agdata(error=...)`, the sandbox is automatically rolled bac
 }
 ```
 
-The LLM sees both the error and the revert notice so it can retry with a corrected approach on a clean filesystem. Revert does not happen when `run_in_subprocess=False`, when `sandbox` is `None`, when `commit()` failed, or when the tool succeeded.
+The LLM sees both the error and the revert notice so it can retry with a corrected approach on a clean filesystem. Revert does not happen when `sandbox` is `None`, when the tool succeeded (commit=True runs instead), or when the tool left background work running in the sandbox (`stop()` is deferred entirely until a later call finds nothing pending).
 
 ### Agent-controlled timeout
 

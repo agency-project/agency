@@ -185,7 +185,6 @@ class TestDanglingImageEagerCleanup:
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
-        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
 
         run_calls = []
         fake_old_id = "sha256:deadbeef0000"
@@ -210,7 +209,7 @@ class TestDanglingImageEagerCleanup:
         with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(sb._backend, "_container_running", return_value=True):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)
+                    sb.stop(commit=True, force_squash=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert rmi_calls, "expected docker rmi call for old image"
@@ -223,7 +222,6 @@ class TestDanglingImageEagerCleanup:
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
-        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
 
         class FakeCompleted:
             def __init__(self, stdout=b"", returncode=0):
@@ -241,7 +239,7 @@ class TestDanglingImageEagerCleanup:
         with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(sb._backend, "_container_running", return_value=True):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)
+                    sb.stop(commit=True, force_squash=True)
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
         assert not rmi_calls, "must not call rmi when there was no previous image"
@@ -253,16 +251,20 @@ class TestDanglingImageEagerCleanup:
         stop(commit=True) must issue zero old-image-lookup/ps/rmi calls
         (the doomed-to-fail cleanup this test originally guarded against),
         even though it now also does a `docker inspect ...RootFS.Layers`
-        call for the diff accumulator (see TestCheckpointAccumulator) --
-        that inspect is for a different purpose and is expected here."""
+        call for the diff accumulator AND the depth check (see
+        TestCheckpointAccumulator/TestCheckpointSquash) -- those inspects
+        are for different purposes and are expected here. A shallow,
+        far-below-max-depth chain keeps the depth check itself from
+        triggering a squash."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
-        sb._backend._commits_since_squash = 0  # far from the squash threshold
         calls = []
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             calls.append(list(args))
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=json.dumps(["sha256:layer0"]).encode())
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
@@ -292,7 +294,6 @@ class TestDanglingImageEagerCleanup:
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
-        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
         fake_old_id = "sha256:cafebabe1234"
 
         class FakeCompleted:
@@ -314,7 +315,7 @@ class TestDanglingImageEagerCleanup:
             with patch.object(_mod._DockerBackend, "_run", fake_run):
                 with patch.object(sb._backend, "_container_running", return_value=True):
                     with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)  # must not raise
+                        sb.stop(commit=True, force_squash=True)  # must not raise
         finally:
             sys.stderr = old_stderr
 
@@ -336,7 +337,6 @@ class TestDanglingImageEagerCleanup:
         import agency.agsandbox_backends.docker as _mod
 
         sb = _make_sandbox()
-        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
         fake_old_id = "sha256:deadbeef0000"
         call_order = []
 
@@ -362,7 +362,7 @@ class TestDanglingImageEagerCleanup:
         with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(sb._backend, "_container_running", return_value=True):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)
+                    sb.stop(commit=True, force_squash=True)
 
         assert call_order == ["rm", "ps", "rmi"], f"expected rm before ps/rmi, got {call_order}"
 
@@ -468,8 +468,9 @@ class TestDanglingImageEagerCleanup:
 
             sb.exec("echo two")
             # Force this cycle to squash instead of plain-committing.
-            sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
-            sb.stop(commit=True)  # checkpoint 2 -- squash: parentless, frees checkpoint 1
+            sb.stop(
+                commit=True, force_squash=True
+            )  # checkpoint 2 -- squash: parentless, frees checkpoint 1
 
             still_present = (
                 subprocess.run(
@@ -548,37 +549,36 @@ class _FakeCompleted:
 
 
 class TestCheckpointSquash:
-    """checkpoint_squash_interval is a tier-1 GlobalConfigParam (write-once,
-    process-wide -- same as every other timeout/retry knob in this file), so
-    it can't be overridden per-test via agConfig once anything in the
-    process has already read its default. Tests instead pre-seed
-    `_commits_since_squash` directly (a plain instance attribute) to land
-    exactly at/below the real configured interval, exercising the same
-    threshold-crossing logic without fighting that immutability."""
+    """Squashing is triggered purely by the chain's actual current depth
+    (`checkpoint_squash_max_depth`) or an explicit `force_squash=True` --
+    there is no commit-count interval to fight with tier-1 GlobalConfigParam
+    immutability here; tests just mock the depth-check inspect
+    (`docker inspect --format={{json .RootFS.Layers}}`) to return a chain
+    of the desired length."""
 
     def _sb(self):
         return _make_sandbox()
 
-    def test_squashes_when_threshold_is_reached(self):
-        """One commit away from the (real, whatever-it-is) configured
-        interval: this stop(commit=True) call must do the normal plain
-        commit FIRST (unchanged, always happens -- see
-        TestCheckpointAccumulator for why this cycle's own diff-
-        accumulator fold isn't mockable this simply and falls back), and
-        ADDITIONALLY squash. The mocked `docker info` here returns no
-        parseable JSON, so the fast accumulator path can't be trusted and
-        falls back to `_squash_commit()`'s export/import -- the point of
-        this test is the plain-commit-always-happens/counter-resets
-        behavior, not which squash implementation ends up running."""
+    def test_squashes_when_depth_at_or_above_max_depth(self):
+        """A chain at/above checkpoint_squash_max_depth must squash on an
+        ordinary stop(commit=True) -- no force_squash needed. The normal
+        plain commit must still happen first (unchanged); the mocked
+        `docker info` here returns no parseable JSON, so the fast
+        accumulator path can't be trusted and falls back to
+        `_squash_commit()`'s export/import -- the point of this test is
+        the depth-triggers-squash behavior, not which squash
+        implementation ends up running."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
-        interval = sb._backend.checkpoint_squash_interval
-        sb._backend._commits_since_squash = interval - 1
+        max_depth = sb._backend.checkpoint_squash_max_depth
+        deep_chain = [f"sha256:layer{i}" for i in range(max_depth)]
         calls = []
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             calls.append(list(args))
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=json.dumps(deep_chain).encode())
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
@@ -590,24 +590,25 @@ class TestCheckpointSquash:
             f"expected the normal plain commit to still happen: {calls}"
         )
         assert any("export" in c for c in calls), (
-            f"expected the squash fallback's export call: {calls}"
+            f"expected the squash fallback's export call once depth reaches the cap: {calls}"
         )
         assert any("import" in c for c in calls), (
             f"expected the squash fallback's import call: {calls}"
         )
-        assert sb._backend._commits_since_squash == 0  # reset after squashing
 
-    def test_does_not_squash_below_threshold(self):
-        """Far from the threshold: stop(commit=True) must commit and must
-        NOT additionally squash."""
+    def test_does_not_squash_when_depth_is_below_max_depth(self):
+        """A shallow chain, far below the max-depth cap, must not squash --
+        confirms the depth check doesn't fire indiscriminately."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
-        sb._backend._commits_since_squash = 0
+        shallow_chain = ["sha256:layer0", "sha256:layer1"]
         calls = []
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             calls.append(list(args))
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=json.dumps(shallow_chain).encode())
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
@@ -619,21 +620,46 @@ class TestCheckpointSquash:
             f"expected a plain commit: {calls}"
         )
         assert not any("export" in c for c in calls), f"must not squash yet: {calls}"
-        assert sb._backend._commits_since_squash == 1
 
-    def test_force_squash_flattens_regardless_of_counter(self):
-        """stop(commit=True, force_squash=True) must squash even when
-        nowhere near checkpoint_squash_interval -- used at skill exit
-        (agskill.py's teardown) so a sandbox never hands back control at
-        an arbitrary mid-chain depth. The commit still happens too."""
+    def test_squash_check_failure_does_not_raise_and_skips_squash(self):
+        """If the depth-check inspect itself fails (unparseable output,
+        runtime unreachable, etc.), stop() must not crash -- it just can't
+        use the depth signal this cycle, so no squash happens (force_squash
+        is the only other trigger, and it's not set here)."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
-        sb._backend._commits_since_squash = 0  # far from the periodic threshold
         calls = []
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             calls.append(list(args))
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=b"not json")
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_running", return_value=True):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    sb.stop(commit=True)  # must not raise
+
+        assert not any("export" in c for c in calls), f"must not squash: {calls}"
+
+    def test_force_squash_flattens_regardless_of_depth(self):
+        """stop(commit=True, force_squash=True) must squash even with a
+        shallow chain nowhere near checkpoint_squash_max_depth -- used at
+        skill exit (agskill.py's teardown) so a sandbox never hands back
+        control to the next skill call sitting at an arbitrary mid-chain
+        depth. The commit still happens too."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        shallow_chain = ["sha256:layer0"]
+        calls = []
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            calls.append(list(args))
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=json.dumps(shallow_chain).encode())
             return _FakeCompleted()
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
@@ -647,25 +673,6 @@ class TestCheckpointSquash:
         assert any("export" in c for c in calls), f"expected an export call: {calls}"
         assert any("import" in c for c in calls), f"expected an import call: {calls}"
 
-    def test_force_squash_resets_the_counter(self):
-        """A forced squash must reset _commits_since_squash the same as a
-        periodic one, so the NEXT stop(commit=True) (without force_squash)
-        starts counting fresh rather than immediately squashing again."""
-        import agency.agsandbox_backends.docker as _mod
-
-        sb = self._sb()
-        sb._backend._commits_since_squash = 5  # mid-count, nowhere near threshold
-
-        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
-            return _FakeCompleted()
-
-        with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(sb._backend, "_container_running", return_value=True):
-                with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True, force_squash=True)
-
-        assert sb._backend._commits_since_squash == 0
-
     def test_squash_pipes_export_stdout_into_import_stdin(self):
         """The flatten must round-trip the container's actual export bytes
         into import's stdin -- not shell out with a literal pipe (this
@@ -674,7 +681,6 @@ class TestCheckpointSquash:
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
-        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
         captured = {}
         fake_tar_bytes = b"FAKE_EXPORTED_FILESYSTEM_BYTES"
 
@@ -689,25 +695,21 @@ class TestCheckpointSquash:
         with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(sb._backend, "_container_running", return_value=True):
                 with patch.object(sb._backend, "_gpu_virtual", False):
-                    sb.stop(commit=True)
+                    sb.stop(commit=True, force_squash=True)
 
         assert captured["input"] == fake_tar_bytes
         assert captured["args"][-1] == sb._backend._lifecycle_tag()
         assert captured["args"][-2] == "-"  # import reads from stdin, not a file path
 
-    def test_squash_failure_is_best_effort_and_does_not_reset_counter(self):
+    def test_squash_failure_is_best_effort(self):
         """If every squash path fails (both the accumulator fast path and
         the _squash_commit() fallback), stop() must NOT raise -- the
         normal plain commit above it already succeeded, so a squash
         failure only means the layer chain keeps growing until the next
-        attempt, not that this cycle's checkpoint was lost.
-        _commits_since_squash must stay at or above the threshold (not
-        silently reset) so the next stop() tries again."""
+        attempt, not that this cycle's checkpoint was lost."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
-        threshold = sb._backend.checkpoint_squash_interval
-        sb._backend._commits_since_squash = threshold - 1
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "export" in args or "import" in args:
@@ -721,11 +723,10 @@ class TestCheckpointSquash:
             with patch.object(_mod._DockerBackend, "_run", fake_run):
                 with patch.object(sb._backend, "_container_running", return_value=True):
                     with patch.object(sb._backend, "_gpu_virtual", False):
-                        sb.stop(commit=True)  # must not raise
+                        sb.stop(commit=True, force_squash=True)  # must not raise
         finally:
             sys.stderr = old_stderr
 
-        assert sb._backend._commits_since_squash >= threshold
         assert "WARNING" in captured.getvalue()
         assert "squash failed" in captured.getvalue()
 
@@ -1233,11 +1234,9 @@ class TestCheckpointAccumulator:
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff1):
-                sb._backend._commits_since_squash = 1
                 sb._backend._fold_commit_into_accumulator("tag")
             layers_seen.append("sha256:layer2")
             with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff2):
-                sb._backend._commits_since_squash = 2
                 sb._backend._fold_commit_into_accumulator("tag")
 
         assert sb._backend._accumulated_layer_count == 2
@@ -1320,9 +1319,8 @@ class TestCheckpointAccumulator:
         sb.stop(commit=True)
         sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
 
-        sb._backend._commits_since_squash = sb._backend.checkpoint_squash_interval - 1
         t0 = time.time()
-        sb.stop(commit=True)  # this cycle commits AND squashes
+        sb.stop(commit=True, force_squash=True)  # this cycle commits AND squashes
         elapsed = time.time() - t0
 
         try:

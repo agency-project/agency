@@ -560,15 +560,6 @@ class _ContainerBackendBase(agsandbox_backend):
         self._daemon_pids: set[int] = set()
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
-        # Counts checkpoint commits since the layer chain was last flattened
-        # (see stop()'s squash branch below) -- resets to 0 on fork() (a new
-        # backend instance, not carried over from the parent's counter,
-        # since fork() only forwards _checkpoint_image itself). This means a
-        # fork can delay its own next squash by up to
-        # checkpoint_squash_interval commits beyond what the parent's chain
-        # depth already was; acceptable given the default interval leaves
-        # ample margin under the runtime's real layer-depth cap.
-        self._commits_since_squash: int = 0
         # Incrementally-built "diff since last squash", fed cheaply after
         # each plain commit by reading that commit's own on-disk diff
         # directory directly via _locate_layer_diff_dir() (see
@@ -1076,7 +1067,8 @@ class _ContainerBackendBase(agsandbox_backend):
 
             if self._accumulator_dir is None:
                 self._accumulator_dir = Path(tempfile.mkdtemp(prefix="agency-accum-"))
-            cycle_tar = self._accumulator_dir / f"cycle-{self._commits_since_squash}.tar"
+            nonce = _uuid.uuid4().hex
+            cycle_tar = self._accumulator_dir / f"cycle-{nonce}.tar"
             overlay_diff_to_tar(diff_dir, cycle_tar, uid_gid_translate=self._host_to_container_id)
 
             if self._accumulated_diff_path is None:
@@ -1085,7 +1077,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     0  # fresh start (first fold, or recovering after invalidation)
                 )
             else:
-                new_accumulated = self._accumulator_dir / f"accum-{self._commits_since_squash}.tar"
+                new_accumulated = self._accumulator_dir / f"accum-{nonce}.tar"
                 merge_layer_tars([self._accumulated_diff_path, cycle_tar], new_accumulated)
                 self._accumulated_diff_path.unlink(missing_ok=True)
                 cycle_tar.unlink(missing_ok=True)
@@ -1185,7 +1177,6 @@ class _ContainerBackendBase(agsandbox_backend):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        self._commits_since_squash = 0
         self._reset_accumulator()
 
     def _squash_commit(self, tag: str) -> None:
@@ -1198,27 +1189,25 @@ class _ContainerBackendBase(agsandbox_backend):
         restarts FROM the last checkpoint image, a long-running sandbox's
         layer chain grows by exactly one every checkpoint cycle with
         nothing to bound it, until it crosses the container runtime's hard
-        layer-depth cap ("max depth exceeded" on docker/moby, a fixed
-        ~127-layer limit). `export`+`import` serializes the container's
-        FULL filesystem into a new image with no parent chain at all,
-        resetting depth back to 1 -- this is the always-correct fallback
-        `stop()` uses when `_accumulator_squash_commit()`'s faster,
-        diff-only path raises (its accumulator can't be trusted for this
-        squash); materially slower since it re-serializes the whole
-        merged filesystem rather than just the accumulated diff.
+        layer-depth cap ("max depth exceeded" on docker/moby, ~125 layers
+        observed empirically on this host). `export`+`import` serializes
+        the container's FULL filesystem into a new image with no parent
+        chain at all, resetting depth back to 1 -- this is the
+        always-correct fallback `stop()` uses when
+        `_accumulator_squash_commit()`'s faster, diff-only path raises
+        (its accumulator can't be trusted for this squash); materially
+        slower since it re-serializes the whole merged filesystem rather
+        than just the accumulated diff.
 
         Safe to drop the image metadata `docker commit` would normally
         preserve (env, labels, embedded CMD/ENTRYPOINT): _ensure_started()'s
         restart `run` command always passes an explicit `tail -f
         /dev/null`, never relying on anything baked into the image itself.
 
-        Resets `_commits_since_squash` to 0 on success -- done HERE rather
-        than by each caller, so every squash (periodic or forced via
-        `stop(force_squash=True)`) restarts the periodic count fresh
-        regardless of who triggered it or why. Also resets the diff
-        accumulator (see `_accumulator_squash_commit()`): export/import
-        produces a PARENTLESS image, disconnected from `self._base_image`'s
-        own lineage entirely -- meaning `_accumulator_squash_commit()`'s
+        Resets the diff accumulator on success (see
+        `_accumulator_squash_commit()`): export/import produces a
+        PARENTLESS image, disconnected from `self._base_image`'s own
+        lineage entirely -- meaning `_accumulator_squash_commit()`'s
         base-is-a-prefix precondition can never hold again for this
         sandbox going forward, so every future squash permanently falls
         back to this same slower path too. Safe (never produces a wrong
@@ -1237,7 +1226,6 @@ class _ContainerBackendBase(agsandbox_backend):
             check=True,
             timeout=self.squash_timeout_s,
         )
-        self._commits_since_squash = 0
         self._reset_accumulator()
 
     def stop(self, *, commit: bool = False, force_squash: bool = False) -> None:
@@ -1249,8 +1237,8 @@ class _ContainerBackendBase(agsandbox_backend):
         failure to discard the dirty state and revert to the last checkpoint.
 
         force_squash=True flattens the layer chain (see _squash_commit())
-        regardless of `_commits_since_squash`'s current count -- used at
-        skill exit (agskill.py's teardown) so a sandbox never hands back
+        regardless of the chain's current actual depth -- used at skill
+        exit (agskill.py's teardown) so a sandbox never hands back
         control to the next skill call sitting at an arbitrary mid-chain
         depth. Ignored when commit=False (nothing is checkpointed at all
         in that case).
@@ -1274,16 +1262,12 @@ class _ContainerBackendBase(agsandbox_backend):
         old_image_id: str | None = None
         if commit:
             tag = self._lifecycle_tag()
-            self._commits_since_squash += 1
-            should_squash = (
-                force_squash or self._commits_since_squash >= self.checkpoint_squash_interval
-            )
 
             # 1. Always do the normal, fast plain commit first -- unconditionally,
-            #    regardless of should_squash. This is exactly today's checkpoint
-            #    behavior, unchanged: squashing (below) is a separate, additional
-            #    step layered on top when due, never a replacement for it, so an
-            #    ordinary tool call's checkpoint/revert cost never regresses.
+            #    regardless of whether a squash turns out to be due. Squashing
+            #    (below) is a separate, additional step layered on top when
+            #    due, never a replacement for it, so an ordinary tool call's
+            #    checkpoint/revert cost never regresses.
             for _attempt in range(self.commit_retry_attempts):
                 try:
                     self._run(
@@ -1300,6 +1284,30 @@ class _ContainerBackendBase(agsandbox_backend):
                         time.sleep(self.commit_retry_backoff_s)
 
             if commit_exc is None:
+                # 1b. Squash is triggered purely by the chain's actual current
+                #     depth (checkpoint_squash_max_depth) or an explicit
+                #     force_squash -- not by a fixed commit count: a count
+                #     can't account for how many layers the base image
+                #     itself already consumes (a real base image was
+                #     observed at 80 layers on its own), so a count-based
+                #     interval could let the real depth cross the runtime's
+                #     actual cap before the interval ever fired.
+                #     `_image_diff_ids()` is a cheap inspect (cost
+                #     independent of image size), not a second commit.
+                should_squash = force_squash
+                if not should_squash:
+                    try:
+                        should_squash = (
+                            len(self._image_diff_ids(tag)) >= self.checkpoint_squash_max_depth
+                        )
+                    except Exception as _e:
+                        print(
+                            f"[agsandbox_backend] WARNING: could not check chain depth for tag "
+                            f"{tag}, skipping this cycle's squash check: {_e}",
+                            file=__import__("sys").stderr,
+                            flush=True,
+                        )
+
                 # 2. Best-effort: fold this cycle's own diff into the
                 #    accumulator, read directly from this commit's own
                 #    on-disk diff directory -- essentially free where
@@ -1538,10 +1546,9 @@ class _ContainerBackendBase(agsandbox_backend):
             self._gpu_release_fn(gpu_id_to_release)
             self._gpu_id = None
 
-        # Remove the checkpoint image and all pre-tool snapshots created
-        # during this sandbox's lifetime. Best-effort: a stray dangling
-        # image costs disk space, not correctness, so these warn rather
-        # than raising.
+        # Remove the checkpoint image created during this sandbox's
+        # lifetime. Best-effort: a stray dangling image costs disk space,
+        # not correctness, so this warns rather than raising.
         if self._checkpoint_image:
             try:
                 self._rmi(self._checkpoint_image, force=True)
@@ -1550,20 +1557,6 @@ class _ContainerBackendBase(agsandbox_backend):
                     f"[agsandbox_backend] WARNING: checkpoint image cleanup failed for {container_name}: {_e}"
                 )
             self._checkpoint_image = None
-        try:
-            result = self._run(
-                [self._runtime, "images", "--format", "{{.Repository}}:{{.Tag}}"],
-                timeout=self.image_timeout_s,
-            )
-            prefix = f"agency/pretool-{self._name}-"
-            for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-                tag = line.strip()
-                if tag.startswith(prefix):
-                    self._rmi(tag, force=True)
-        except Exception as _e:
-            print(
-                f"[agsandbox_backend] WARNING: pretool image cleanup failed for {container_name}: {_e}"
-            )
 
         if self._accumulator_dir is not None:
             shutil.rmtree(self._accumulator_dir, ignore_errors=True)

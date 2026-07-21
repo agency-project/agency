@@ -139,11 +139,22 @@ class AgSandboxBackendFields:
     # so a long-running sandbox's layer chain grows by one every checkpoint
     # cycle with nothing to bound it, until it crosses the container
     # runtime's hard layer-depth cap ("max depth exceeded" on docker/moby).
-    # checkpoint_squash_interval periodically flattens the chain back to a
-    # single layer (export/import instead of commit) well before that cap.
-    checkpoint_squash_interval = GlobalConfigParam(
-        "agsandbox_backend", default=60
-    )  # Flatten every Nth checkpoint commit; well under the ~127-layer cap.
+    # checkpoint_squash_max_depth periodically flattens the chain back to a
+    # single layer (export/import instead of commit) well before that cap,
+    # triggered by the chain's actual current depth
+    # (`len(_image_diff_ids(tag))`, a cheap `docker/podman inspect` --
+    # not proportional to image size) rather than a fixed commit count: a
+    # count can't account for how many layers the base image itself
+    # already consumes (a real base image was observed at 80 layers on its
+    # own), so a count-based interval could let the real depth cross the
+    # runtime's actual cap before the interval ever fired -- exactly what
+    # caused a real "max depth exceeded" failure on an ordinary plain commit.
+    checkpoint_squash_max_depth = GlobalConfigParam(
+        "agsandbox_backend", default=100
+    )  # Squash once the chain's actual depth reaches this; keep well under
+    # the real cap (~125 observed empirically on docker/moby) to leave
+    # margin for the squash itself and any variance across storage
+    # drivers/runtime versions.
     squash_timeout_s = GlobalConfigParam(
         "agsandbox_backend", default=600
     )  # export/import serializes the FULL filesystem, not a diff -- needs more headroom than commit_timeout_s.

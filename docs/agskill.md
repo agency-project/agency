@@ -222,18 +222,12 @@ This guard prevents a single oversized tool result (e.g. a raw PDF fetched via `
 
 ### Tool failure and checkpoint revert
 
-Before every `run_in_subprocess=True` tool call, the framework commits the sandbox container to a lightweight checkpoint image:
+There's no separate checkpoint taken before each tool call. Instead, after every tool call the container is torn down via `sandbox.stop(commit=...)` (see [container.md](agsandbox_backends/container.md)'s "Container lifecycle"):
 
-```
-agency/pretool-<container_name>-<call_id[:8]>
-```
+- On success: `stop(commit=True)` commits the container to `agency/lifecycle-<name>` before removing it, so the *next* tool call's container restarts from this new state.
+- On failure (the tool returned `agdata(error=...)`, or raised): `stop(commit=False)` removes the container **without** committing, discarding whatever partial filesystem changes it made. The next tool call's container restarts from the *previous* `agency/lifecycle-<name>` — i.e. the last successfully committed state — which is what makes this a revert: nothing is rolled back explicitly, the bad state is simply never checkpointed forward.
 
-If the tool returns an `agdata(error=...)`, the framework automatically:
-
-1. Calls `sandbox.restore(checkpoint_tag)` — stops the running container and restarts it from the checkpoint image, so any partial filesystem changes made by the tool are rolled back.
-2. Appends `"workspace_reverted": "The workspace has been reverted to the state before this tool call."` to the tool result JSON.
-
-The LLM sees both the error and the revert notice, so it knows the filesystem is clean and can try a different approach.
+When a failure triggers this, the framework appends `"workspace_reverted": "The workspace has been reverted to the state before this tool call."` to the tool result JSON — but only if `stop()` actually ran for this call (it's skipped, and no such note added, when the tool left background work still running in the sandbox; see [container.md](agsandbox_backends/container.md)'s lifecycle table).
 
 ```json
 {
@@ -244,12 +238,11 @@ The LLM sees both the error and the revert notice, so it knows the filesystem is
 
 **When revert does NOT happen:**
 
-- `run_in_subprocess=False` — no checkpoint is taken, so no revert is possible.
 - `sandbox` is `None` — no container exists.
-- `sandbox.commit()` raised — checkpoint tag is discarded; the error is still forwarded to the LLM unchanged.
-- The tool succeeded — restore is never called on success.
+- The tool succeeded — `stop(commit=True)` runs instead, checkpointing forward rather than discarding.
+- Background work was left running — `stop()` is deferred entirely for this call; a later call that finds nothing pending is what actually checkpoints/discards.
 
-Checkpoint images are named with the container name, so they are scoped to a single sandbox lifetime. All `agency/pretool-<container_name>-*` images are deleted when `sandbox.destroy()` is called.
+The lifecycle image is named `agency/lifecycle-<container_name>`, scoped to a single sandbox lifetime, and deleted when `sandbox.destroy()` is called.
 
 #### Agent-controlled timeout
 

@@ -1066,13 +1066,6 @@ class _ChrootBackend(agsandbox_backend):
         if self._checkpoint_image:
             self.delete_image(self._checkpoint_image, force=True)
             self._checkpoint_image = None
-        # Pretool snapshots created during this sandbox's lifetime (mirrors
-        # _ContainerBackendBase.destroy()'s dangling-image cleanup).
-        prefix = _sanitize_tag(f"agency/pretool-{self._name}-")
-        if _CHROOT_SNAPSHOTS_DIR.is_dir():
-            for entry in _CHROOT_SNAPSHOTS_DIR.iterdir():
-                if entry.name.startswith(prefix):
-                    shutil.rmtree(entry, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Static helpers — snapshot-directory-level operations, the chroot
