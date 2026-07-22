@@ -17,6 +17,7 @@ from .agprof import (
     span,
     start,
     stop,
+    summary_table,
     thread_name,
 )
 
@@ -28,5 +29,6 @@ __all__ = [
     "span",
     "start",
     "stop",
+    "summary_table",
     "thread_name",
 ]

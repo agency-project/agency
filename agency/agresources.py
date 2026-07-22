@@ -446,6 +446,9 @@ class agResourcePool(_AgResourcePoolFields):
                     raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
             gpu_id = self._free_gpus.pop()
             self._gpus_acquired += 1
+        # Lease-interval event for the profiler: exclusive ownership of this
+        # device starts now (device-scope; joined to spans at analysis time).
+        agprof.gpu_lease_begin(gpu_id)
         self._emit_resource()
         return gpu_id
 
@@ -485,6 +488,7 @@ class agResourcePool(_AgResourcePoolFields):
             self._free_gpus.add(gpu_id)
             self._gpus_acquired = max(0, self._gpus_acquired - 1)
             self._gpu_cond.notify()
+        agprof.gpu_lease_end(gpu_id)
         self._emit_resource()
 
     def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:
