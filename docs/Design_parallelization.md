@@ -16,6 +16,7 @@ Where CPU is genuinely needed — executing a Python tool function synchronously
 |---|---|---|---|
 | `agteam` tasks | Each other | One daemon thread per `run()` call | `agteam._wrap_run` |
 | `agent` runs | Each other (forked agents) | One daemon thread per `run()` call | `agskill.run()` |
+| `agmap` tasks | Each other | One daemon thread per mapped call | `agmap._spawn()` |
 | `agskill` steps | Other agents' steps | Same thread as the owning agent task | `agskill.execute_react()` (synchronous ReAct loop) |
 | `agtool` calls | Other threads / agents | `ProcessPoolExecutor(max_workers=256)` | `agtool._pool` (module-level) |
 | LLM SSE stream | Other agent threads | Background drain thread + batch queue | `agskill._iter_batched()` |
@@ -50,6 +51,17 @@ results = [agent.fork(ag).run(summarise_skill, agdata(text=t)) for t in texts]
 ```
 
 Each `agent.fork(ag)` deep-copies the history at that instant and starts its work in an independent thread. The parent agent's history is never touched.
+
+## agmap — non-agent parallelism
+
+`agmap(fn, items)` is the deterministic counterpart to forked `agent.run()`: it runs a plain function over items, one daemon thread per call, and returns results as `agtask` (an `agdata` subclass). Use it for non-LLM work that still needs to run in parallel — forking sandboxes, applying patches, running tests — instead of a `ThreadPoolExecutor` or a throwaway `agteam`.
+
+```python
+results = agmap(_validate, list(enumerate(candidates)))   # synchronous: blocks, returns results
+pending = agmap(_validate, candidates, is_asynchronous=True)  # pending agtasks; join with agsync(pending)
+```
+
+Like agent runs, `agmap` tasks are throttled at the container layer (the sandbox semaphore), not by a fixed worker pool, so mapping over a large list stays safe. Asynchronous results come back as `agtask` objects that `agsync` accepts as explicit targets (`agsync(pending)`), joining them alongside agents and teams; the futures live only in those handles — there is no global registry, so a bare `agsync()` inside a mapped function can never self-join. See [agmap.md](agmap.md).
 
 ## agskill — intra-agent ReAct steps
 

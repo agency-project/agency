@@ -8,7 +8,9 @@ def agsync(*targets) -> None:
 
     * a single ``agent``
     * a single ``agteam``
-    * a list containing any mix of ``agent`` and ``agteam`` objects
+    * a single ``agtask`` (a pending ``agmap`` result)
+    * a list containing any mix of ``agent``, ``agteam``, and ``agtask`` objects
+      (e.g. the list returned by ``agmap(..., is_asynchronous=True)``)
 
     For an ``agteam``, every agent tracked by the team is included — both
     agents created in ``setup()`` and any fork agents (``agent(parent)``)
@@ -35,6 +37,7 @@ def agsync(*targets) -> None:
     """
     from .agent import agent as _agent_cls
     from .agteam import agteam as _agteam_cls
+    from .agmap import agtask as _agtask_cls
 
     # Flatten: each positional arg may itself be a list
     flat: list = []
@@ -47,14 +50,17 @@ def agsync(*targets) -> None:
 
     solo_agents: list = []
     teams: list = []
+    tasks: list = []
 
     for t in targets:
         if isinstance(t, _agent_cls):
             solo_agents.append(t)
         elif isinstance(t, _agteam_cls):
             teams.append(t)
+        elif isinstance(t, _agtask_cls):
+            tasks.append(t)
         else:
-            raise TypeError(f"agsync: expected agent or agteam, got {type(t).__name__!r}")
+            raise TypeError(f"agsync: expected agent, agteam, or agtask, got {type(t).__name__!r}")
 
     # Join ALL team threads before raising any exception, so that no team is
     # abandoned mid-run. Collect exceptions and re-raise after everything joins.
@@ -71,6 +77,11 @@ def agsync(*targets) -> None:
 
     for ag in solo_agents + team_agents:
         ag.ctx.resolve_prev_dependencies()
+
+    # Join any agmap tasks passed as targets. Task errors resolve to agerror
+    # (agmap's never-crash-siblings contract) rather than re-raising here.
+    for task in tasks:
+        task._resolve()
 
     if errors:
         if len(errors) == 1:
