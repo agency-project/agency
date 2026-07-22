@@ -960,7 +960,7 @@ class TestLocateLayerDiffDir:
 class TestHostToContainerId:
     """Tests for _PodmanBackend._host_to_container_id() -- the rootless
     Podman uid/gid translation feeding overlay_diff_to_tar() via
-    _fold_commit_into_accumulator(). Mocks `_podman_info()` rather than
+    `_build_accumulator_for_squash()`. Mocks `_podman_info()` rather than
     a real rootless setup; the reverse-mapping arithmetic itself is
     exercised against idMappings shaped like a real `podman info`."""
 
@@ -1051,12 +1051,13 @@ class TestCheckpointAccumulator:
             p.write_text(content)
         return d
 
-    def test_fold_builds_accumulator_from_overlay_diff_dir(self, tmp_path):
+    def test_build_accumulator_from_overlay_diff_dir(self, tmp_path):
         import tarfile
 
         import agency.agsandbox_backends.podman as _mod
 
         sb = self._sb()
+        sb._squash_base_diff_ids = []
         diff_dir = self._make_real_diff_dir(tmp_path, "diff1", {"workspace/f1": "one"})
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
@@ -1066,18 +1067,20 @@ class TestCheckpointAccumulator:
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
             with patch.object(_mod._PodmanBackend, "_locate_layer_diff_dir", return_value=diff_dir):
-                sb._fold_commit_into_accumulator("some-tag")
+                sb._build_accumulator_for_squash("some-tag")
 
         assert sb._accumulated_layer_count == 1
         assert sb._accumulated_diff_path is not None
         with tarfile.open(sb._accumulated_diff_path, "r") as tf:
             content = tf.extractfile("workspace/f1").read()
         assert content == b"one"
+        sb._reset_accumulator()
 
-    def test_fold_invalidates_accumulator_when_diff_dir_not_found(self):
+    def test_build_accumulator_raises_when_diff_dir_not_found(self):
         import agency.agsandbox_backends.podman as _mod
 
         sb = self._sb()
+        sb._squash_base_diff_ids = []
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "--format={{json .RootFS.Layers}}" in args:
@@ -1086,10 +1089,11 @@ class TestCheckpointAccumulator:
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
             with patch.object(_mod._PodmanBackend, "_locate_layer_diff_dir", return_value=None):
-                sb._fold_commit_into_accumulator("some-tag")
+                with pytest.raises(RuntimeError, match="could not locate on-disk diff"):
+                    sb._build_accumulator_for_squash("some-tag")
 
         assert sb._accumulated_diff_path is None
-        assert sb._accumulated_layer_count == -1
+        assert sb._accumulated_layer_count == 0
 
     @podman
     @pytest.mark.timeout(180)

@@ -10,7 +10,7 @@ storage hooks; see `.podman._PodmanBackend` for Podman's equivalents
 `_host_to_container_id` against `containers/storage`).
 
 The substantial override here is `_locate_layer_diff_dir()`, feeding
-`_ContainerBackendBase._fold_commit_into_accumulator()`'s fast incremental
+`_ContainerBackendBase._build_accumulator_for_squash()`'s lazy fast
 squashing path (see docs/agsandbox_backends/container.md's "Fast
 incremental squashing" section). It supports two Docker storage backends,
 both confirmed empirically:

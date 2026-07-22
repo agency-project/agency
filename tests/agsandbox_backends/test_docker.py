@@ -619,9 +619,8 @@ class TestCheckpointSquash:
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
-        # No accumulator ever built (fresh sandbox) -- _accumulator_squash_commit()
-        # raises immediately with "no checkpoint diff accumulator available",
-        # forcing the export/import fallback, which succeeds via the mock below.
+        # Lazy build can't locate a diff dir (default hook returns None), so
+        # the fast path fails and falls back to export/import.
         assert sb._backend._accumulated_diff_path is None
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
@@ -863,8 +862,9 @@ class TestCheckpointSquash:
         sb = self._sb()
         calls = []
 
-        # --- Cycle 1: force a squash with no accumulator built yet --
-        #     _accumulator_squash_commit() raises immediately, falls back.
+        # --- Cycle 1: force a squash; lazy build can't locate a diff dir
+        #     (default hook returns None) so the fast path fails and falls
+        #     back to export/import.
         def fake_run_cycle1(self_inner, args, *, check=False, input=None, timeout=120):
             calls.append(list(args))
             if "export" in args:
@@ -882,8 +882,8 @@ class TestCheckpointSquash:
         assert any("export" in c for c in calls), f"cycle 1 must have fallen back: {calls}"
         assert sb._backend._squash_base_diff_ids == ["sha256:flattened-1"]
 
-        # --- Cycle 2: accumulator builds fine this time, squash forced
-        #     again -- must use the FAST path, no export/import at all.
+        # --- Cycle 2: lazy build locates the tip layer this time, squash
+        #     forced again -- must use the FAST path, no export/import.
         diff_dir = tmp_path / "diff2"
         diff_dir.mkdir()
         (diff_dir / "f").write_text("x")
@@ -1006,7 +1006,7 @@ class TestCheckpointSquash:
 # ---------------------------------------------------------------------------
 # Fast incremental squashing -- the diff accumulator, fed cheaply after each
 # plain commit by reading that commit's own on-disk overlay2 diff directory
-# directly (see container.py's _fold_commit_into_accumulator() and
+# directly (see container.py's _build_accumulator_for_squash() and
 # docker.py's _locate_layer_diff_dir()), letting squash time skip `docker
 # save`/`docker diff` on the whole chain entirely. See
 # docs/agsandbox_backends/container.md's "Fast incremental squashing"
@@ -1412,7 +1412,7 @@ class TestCtrArgv:
 class TestHostToContainerId:
     """Tests for _DockerBackend._host_to_container_id() -- the rootless
     Docker uid/gid translation feeding overlay_diff_to_tar() via
-    _fold_commit_into_accumulator(). Mocks _docker_info()/PID discovery
+    `_build_accumulator_for_squash()`. Mocks _docker_info()/PID discovery
     rather than a real rootless daemon; the reverse-mapping arithmetic
     itself is exercised directly against real /proc-style uid_map/gid_map
     content captured from an actual rootless daemon."""
@@ -1534,11 +1534,11 @@ class TestHostToContainerId:
 
 
 class TestCheckpointAccumulator:
-    """Tests for _fold_commit_into_accumulator() and
-    _accumulator_squash_commit() -- the fast squash path fed by
-    TestLocateLayerDiffDir's lookup. Mocks _locate_layer_diff_dir directly
-    (rather than the whole docker-root filesystem dance) since that
-    lookup mechanism is already covered on its own above."""
+    """Tests for lazy `_build_accumulator_for_squash()` and
+    `_accumulator_squash_commit()` -- the fast squash path fed by
+    TestLocateLayerDiffDir's lookup. Mocks `_locate_layer_diff_dir`
+    directly (rather than the whole docker-root filesystem dance) since
+    that lookup mechanism is already covered on its own above."""
 
     def _sb(self):
         return _make_sandbox()
@@ -1552,10 +1552,12 @@ class TestCheckpointAccumulator:
             p.write_text(content)
         return d
 
-    def test_fold_builds_accumulator_from_overlay_diff_dir(self, tmp_path):
+    def test_build_accumulator_from_overlay_diff_dir(self, tmp_path):
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
+        # Empty reference chain: one tip layer past "nothing".
+        sb._backend._squash_base_diff_ids = []
         diff_dir = self._make_real_diff_dir(tmp_path, "diff1", {"workspace/f1": "one"})
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
@@ -1565,68 +1567,96 @@ class TestCheckpointAccumulator:
 
         with patch.object(_mod._DockerBackend, "_run", fake_run):
             with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff_dir):
-                sb._backend._fold_commit_into_accumulator("some-tag")
+                sb._backend._build_accumulator_for_squash("some-tag")
 
         assert sb._backend._accumulated_layer_count == 1
         assert sb._backend._accumulated_diff_path is not None
         with tarfile.open(sb._backend._accumulated_diff_path, "r") as tf:
             content = tf.extractfile("workspace/f1").read()
         assert content == b"one"
+        sb._backend._reset_accumulator()
 
-    def test_fold_invalidates_accumulator_when_diff_dir_not_found(self):
-        """Must warn, not fail silently -- a silent invalidation here is
-        exactly what made a real production squash fallback undiagnosable
-        without live forensics (see docs/agsandbox_backends/container.md's
-        "Fast incremental squashing" section)."""
+    def test_build_accumulator_raises_when_diff_dir_not_found(self):
+        """Must raise (so commit() falls back visibly) -- a silent miss
+        here is exactly what made a real production squash fallback
+        undiagnosable without live forensics (see
+        docs/agsandbox_backends/container.md's "Fast incremental
+        squashing" section)."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
+        sb._backend._squash_base_diff_ids = []
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "--format={{json .RootFS.Layers}}" in args:
                 return _FakeCompleted(stdout=b'["sha256:layer1"]')
             return _FakeCompleted()
 
-        captured = io.StringIO()
-        old_stderr = sys.stderr
-        sys.stderr = captured
-        try:
-            with patch.object(_mod._DockerBackend, "_run", fake_run):
-                with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=None):
-                    sb._backend._fold_commit_into_accumulator("some-tag")
-        finally:
-            sys.stderr = old_stderr
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=None):
+                with pytest.raises(RuntimeError, match="could not locate on-disk diff"):
+                    sb._backend._build_accumulator_for_squash("some-tag")
 
         assert sb._backend._accumulated_diff_path is None
-        assert sb._backend._accumulated_layer_count == -1
-        assert "WARNING" in captured.getvalue()
-        assert "some-tag" in captured.getvalue()
+        assert sb._backend._accumulated_layer_count == 0
 
-    def test_fold_accumulates_across_multiple_cycles(self, tmp_path):
+    def test_build_accumulator_merges_all_layers_since_reference(self, tmp_path):
+        """One lazy build over a multi-layer gap must fold every new
+        layer (the failure-recreate deepening case), not just the tip."""
         import agency.agsandbox_backends.docker as _mod
 
         sb = self._sb()
+        sb._backend._squash_base_diff_ids = ["sha256:base1"]
         diff1 = self._make_real_diff_dir(tmp_path, "diff1", {"a": "1"})
         diff2 = self._make_real_diff_dir(tmp_path, "diff2", {"b": "2"})
-
-        layers_seen = ["sha256:layer1"]
+        chain = ["sha256:base1", "sha256:layer1", "sha256:layer2"]
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "--format={{json .RootFS.Layers}}" in args:
-                return _FakeCompleted(stdout=json.dumps(layers_seen).encode())
+                return _FakeCompleted(stdout=json.dumps(chain).encode())
             return _FakeCompleted()
 
+        def fake_locate(self_inner, diff_id, *, diff_ids=None):
+            if diff_id == "sha256:layer1":
+                return diff1
+            if diff_id == "sha256:layer2":
+                return diff2
+            return None
+
         with patch.object(_mod._DockerBackend, "_run", fake_run):
-            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff1):
-                sb._backend._fold_commit_into_accumulator("tag")
-            layers_seen.append("sha256:layer2")
-            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff2):
-                sb._backend._fold_commit_into_accumulator("tag")
+            with patch.object(_mod._DockerBackend, "_locate_layer_diff_dir", fake_locate):
+                sb._backend._build_accumulator_for_squash("tag")
 
         assert sb._backend._accumulated_layer_count == 2
         with tarfile.open(sb._backend._accumulated_diff_path, "r") as tf:
             names = {m.name for m in tf.getmembers()}
         assert names == {"a", "b"}
+        sb._backend._reset_accumulator()
+
+    def test_ordinary_commit_does_not_build_accumulator(self):
+        """Plain commits below the squash depth must not touch TMPDIR."""
+        import agency.agsandbox_backends.docker as _mod
+
+        sb = self._sb()
+        shallow_chain = ["sha256:layer0", "sha256:layer1"]
+
+        def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
+            if "--format={{json .RootFS.Layers}}" in args:
+                return _FakeCompleted(stdout=json.dumps(shallow_chain).encode())
+            return _FakeCompleted()
+
+        with patch.object(_mod._DockerBackend, "_run", fake_run):
+            with patch.object(sb._backend, "_container_status", return_value="running"):
+                with patch.object(sb._backend, "_gpu_virtual", False):
+                    with patch.object(
+                        _mod._DockerBackend,
+                        "_build_accumulator_for_squash",
+                        side_effect=AssertionError("must not build accumulator"),
+                    ):
+                        sb.commit()
+
+        assert sb._backend._accumulated_diff_path is None
+        assert sb._backend._accumulator_dir is None
 
     def test_accumulator_squash_raises_when_layer_count_mismatched(self, tmp_path):
         """Simulates the post-fork scenario: the accumulator (fresh, 0

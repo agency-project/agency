@@ -174,7 +174,9 @@ This is separate from, and in addition to, the squash's own cleanup of the trans
 ```python
 # only reached when this cycle's commit also crossed checkpoint_squash_max_depth
 old_image_id = ...  # THIS cycle's own plain-commit result, about to be replaced by the squash
-self._accumulator_squash_commit(tag)   # fast path, falls back to _squash_commit() (export/import)
+self._build_accumulator_for_squash(tag)  # lazy: only when squash is due
+self._accumulator_squash_commit(tag)     # fast path, falls back to _squash_commit() (export/import)
+# finally: _reset_accumulator() always clears the temp tar
 if old_image_id and <no container still running from it>:
     self._rmi(old_image_id)            # best-effort — warns rather than raises on failure
 ```

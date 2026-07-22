@@ -13,7 +13,7 @@ incremental-squashing hooks:
 `_locate_layer_diff_dir()` reaches into Podman's `containers/storage`
 overlay layout -- confirmed empirically, not from a single published
 "how to find a layer's diff dir" doc -- feeding
-`_ContainerBackendBase._fold_commit_into_accumulator()` the same way
+`_ContainerBackendBase._build_accumulator_for_squash()` the same way
 `.docker._DockerBackend` feeds it from Docker's overlay2 graphdriver
 (see docs/agsandbox_backends/container.md's "Fast incremental squashing"
 section). The correlation is: `podman info`'s `store.graphRoot` +

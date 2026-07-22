@@ -682,17 +682,16 @@ class _ContainerBackendBase(agsandbox_backend):
         self._daemon_pids: set[int] = set()
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
-        # Incrementally-built "diff since last squash", fed cheaply after
-        # each plain commit by reading that commit's own on-disk diff
-        # directory directly via _locate_layer_diff_dir() (see
-        # _fold_commit_into_accumulator()) -- avoids ever needing `docker
-        # save` on the whole chain at squash time. None/0 means "no
-        # accumulator, or it's known-unreliable" --
-        # squash falls back to the slower but always-correct
-        # `_squash_commit()` export/import path whenever the accumulator's
-        # tracked layer count doesn't match the real gap between the
-        # current checkpoint and the base image (e.g. right after a fork,
-        # which starts this counter fresh -- see agsandbox.py's fork()).
+        # Transient squash-time "diff since reference chain" tar, built
+        # lazily only when a squash is due (see
+        # `_build_accumulator_for_squash()`) by reading each new layer's
+        # on-disk overlay diff via `_locate_layer_diff_dir()`. Ordinary
+        # plain commits do NOT touch this -- under the hibernate model the
+        # lifecycle tag already keeps a single commit image, so eagerly
+        # copying that tip into TMPDIR every skill was pure duplicate
+        # disk. Cleared in a finally after the squash attempt (success or
+        # fallback). None/0 means "not built yet"; a failed build raises
+        # so commit() falls back to `_squash_commit()` export/import.
         self._accumulated_diff_path: "Path | None" = None
         self._accumulated_layer_count: int = 0
         self._accumulator_dir: "Path | None" = None
@@ -1200,7 +1199,7 @@ class _ContainerBackendBase(agsandbox_backend):
         free instead of re-deriving it via `docker diff` (a generic scan
         costing ~9s on a real ~24GB/many-file image regardless of how
         much actually changed) or `docker save` (cost proportional to the
-        whole image). See `_fold_commit_into_accumulator()`'s docstring
+        whole image). See `_build_accumulator_for_squash()`'s docstring
         for how this feeds the fast squash path, and
         docs/agsandbox_backends/container.md's "Fast incremental
         squashing" section for the full rationale.
@@ -1218,7 +1217,7 @@ class _ContainerBackendBase(agsandbox_backend):
         and Podman's `containers/storage` layout are unrelated). Overridden
         by `_DockerBackend` (`.docker`) and `_PodmanBackend` (`.podman`);
         returning None here means "no fast lookup available for this
-        runtime," which `_fold_commit_into_accumulator()` treats as
+        runtime," which `_build_accumulator_for_squash()` treats as
         "accumulator unavailable," safely falling back to the slower
         but always-correct `_squash_commit()` path -- never as an error.
         """
@@ -1240,7 +1239,7 @@ class _ContainerBackendBase(agsandbox_backend):
         root-owned file inside the container showed up as owned by the
         invoking host user via the raw overlay path, not uid 0) --
         passed to `_layer_squash.overlay_diff_to_tar()`'s
-        `uid_gid_translate` parameter by `_fold_commit_into_accumulator()`
+        `uid_gid_translate` parameter by `_fold_overlay_diff_into_accumulator()`
         below.
         """
         return (uid, gid)
@@ -1252,70 +1251,83 @@ class _ContainerBackendBase(agsandbox_backend):
         self._accumulated_diff_path = None
         self._accumulated_layer_count = 0
 
-    def _fold_commit_into_accumulator(self, tag: str) -> None:
-        """Best-effort: extend the incrementally-built "diff since last
-        squash" with this cycle's own change, read directly from the
-        commit's own on-disk diff directory via `_locate_layer_diff_dir()`
-        (None by default -- see that method's docstring for which
-        backends override it). Never raises -- any failure just leaves
-        the accumulator unusable (a mismatched `_accumulated_layer_count`),
-        which `_accumulator_squash_commit()` detects and falls back to
-        `_squash_commit()` for on the next squash attempt, rather than
-        trusting stale or incomplete data.
+    def _fold_overlay_diff_into_accumulator(self, diff_dir: Path) -> None:
+        """Append one overlay upper directory into the squash-time
+        accumulator tar (creating the TMPDIR scratch dir on first use).
+        Raises on failure -- caller is the lazy squash builder, which
+        treats any error as "fall back to export/import".
         """
-        try:
-            diff_ids = self._image_diff_ids(tag)
-            new_layer_digest = diff_ids[-1]
-            diff_dir = self._locate_layer_diff_dir(new_layer_digest, diff_ids=diff_ids)
-            if diff_dir is None:
-                print(
-                    f"[agsandbox_backend] WARNING: could not locate on-disk diff "
-                    f"directory for layer {new_layer_digest} (tag {tag}) -- "
-                    f"invalidating the checkpoint diff accumulator, next squash "
-                    f"will fall back to export/import",
-                    file=__import__("sys").stderr,
-                    flush=True,
-                )
-                self._invalidate_accumulator()
-                return
+        if self._accumulator_dir is None:
+            self._accumulator_dir = Path(tempfile.mkdtemp(prefix="agency-accum-"))
+        nonce = _uuid.uuid4().hex
+        cycle_tar = self._accumulator_dir / f"cycle-{nonce}.tar"
+        overlay_diff_to_tar(diff_dir, cycle_tar, uid_gid_translate=self._host_to_container_id)
 
-            if self._accumulator_dir is None:
-                self._accumulator_dir = Path(tempfile.mkdtemp(prefix="agency-accum-"))
-            nonce = _uuid.uuid4().hex
-            cycle_tar = self._accumulator_dir / f"cycle-{nonce}.tar"
-            overlay_diff_to_tar(diff_dir, cycle_tar, uid_gid_translate=self._host_to_container_id)
+        if self._accumulated_diff_path is None:
+            self._accumulated_diff_path = cycle_tar
+        else:
+            new_accumulated = self._accumulator_dir / f"accum-{nonce}.tar"
+            merge_layer_tars([self._accumulated_diff_path, cycle_tar], new_accumulated)
+            self._accumulated_diff_path.unlink(missing_ok=True)
+            cycle_tar.unlink(missing_ok=True)
+            self._accumulated_diff_path = new_accumulated
+        self._accumulated_layer_count += 1
 
-            if self._accumulated_diff_path is None:
-                self._accumulated_diff_path = cycle_tar
-                self._accumulated_layer_count = (
-                    0  # fresh start (first fold, or recovering after invalidation)
-                )
-            else:
-                new_accumulated = self._accumulator_dir / f"accum-{nonce}.tar"
-                merge_layer_tars([self._accumulated_diff_path, cycle_tar], new_accumulated)
-                self._accumulated_diff_path.unlink(missing_ok=True)
-                cycle_tar.unlink(missing_ok=True)
-                self._accumulated_diff_path = new_accumulated
-            self._accumulated_layer_count += 1
-        except Exception as _e:
-            print(
-                f"[agsandbox_backend] WARNING: could not extend checkpoint diff accumulator: {_e}",
-                file=__import__("sys").stderr,
-                flush=True,
+    def _build_accumulator_for_squash(self, tag: str) -> None:
+        """Lazily build the squash accumulator from every layer between
+        the reference chain and *tag*'s current chain.
+
+        Called only when a squash is due -- ordinary plain commits leave
+        the lifecycle image alone and do not copy overlay uppers into
+        TMPDIR. Under the hibernate model that image usually has exactly
+        one tip layer past the reference (sibling commits replace each
+        other); after skill-failure recreates the chain can be deeper,
+        and each of those layers is folded here in one shot.
+
+        Raises on any failure (missing reference prefix, unlocatable
+        overlay diff, tar/merge error) so `commit()` falls back to
+        `_squash_commit()` export/import. Temp files under
+        `agency-accum-*` must be removed afterward via
+        `_reset_accumulator()` (commit()'s squash block uses try/finally).
+        """
+        self._reset_accumulator()
+        current_diff_ids = self._image_diff_ids(tag)
+        if self._squash_base_diff_ids is not None:
+            base_diff_ids = self._squash_base_diff_ids
+        else:
+            base_diff_ids = self._image_diff_ids(self._resolve_image(self._base_image))
+        if (
+            len(current_diff_ids) < len(base_diff_ids)
+            or current_diff_ids[: len(base_diff_ids)] != base_diff_ids
+        ):
+            raise RuntimeError(
+                f"reference chain is not a prefix of {tag}; cannot build squash accumulator"
             )
-            self._invalidate_accumulator()
+        expected_new_layers = len(current_diff_ids) - len(base_diff_ids)
+        if expected_new_layers <= 0:
+            raise RuntimeError(f"no layers beyond the reference chain to squash for {tag}")
 
-    def _invalidate_accumulator(self) -> None:
-        if self._accumulator_dir is not None:
-            shutil.rmtree(self._accumulator_dir, ignore_errors=True)
-        self._accumulator_dir = None
-        self._accumulated_diff_path = None
-        self._accumulated_layer_count = (
-            -1
-        )  # sentinel: guaranteed mismatch until the next fresh start
+        for i in range(len(base_diff_ids), len(current_diff_ids)):
+            prefix = current_diff_ids[: i + 1]
+            layer_digest = prefix[-1]
+            diff_dir = self._locate_layer_diff_dir(layer_digest, diff_ids=prefix)
+            if diff_dir is None:
+                raise RuntimeError(
+                    f"could not locate on-disk diff directory for layer {layer_digest} (tag {tag})"
+                )
+            self._fold_overlay_diff_into_accumulator(diff_dir)
+
+        if (
+            self._accumulated_diff_path is None
+            or self._accumulated_layer_count != expected_new_layers
+        ):
+            raise RuntimeError(
+                f"squash accumulator incomplete after build: tracked "
+                f"{self._accumulated_layer_count} layers, expected {expected_new_layers}"
+            )
 
     def _accumulator_squash_commit(self, tag: str) -> None:
-        """Fast path: apply the incrementally-built accumulator diff-tar
+        """Fast path: apply the lazily-built accumulator diff-tar
         directly onto the reference chain's own layers (referenced by
         digest only -- see `_layer_squash.build_save_archive()`, never
         touched) to produce the new squashed HEAD image. Confirmed
@@ -1323,8 +1335,10 @@ class _ContainerBackendBase(agsandbox_backend):
         image size (verified against the real ~24GB, 80-layer
         `agency-sandbox:latest`).
 
-        The reference chain is `self._squash_base_diff_ids` if this
-        backend has already squashed successfully at least once (fast or
+        The accumulator must already have been built by
+        `_build_accumulator_for_squash()` for this same *tag*. The
+        reference chain is `self._squash_base_diff_ids` if this backend
+        has already squashed successfully at least once (fast or
         fallback -- see below), else `self._base_image`'s own digests.
         This is what lets a sandbox recover fast-path eligibility after a
         `_squash_commit()` fallback: without it, the base image's digests
@@ -1341,14 +1355,12 @@ class _ContainerBackendBase(agsandbox_backend):
 
         Raises if the accumulator can't be trusted for this squash --
         e.g. `_accumulated_layer_count` doesn't match the real gap
-        between the current checkpoint and the reference chain (happens
-        right after a fork, whose backend starts both this counter and
-        `_squash_base_diff_ids` fresh; see agsandbox.py's fork()), or the
-        reference chain doesn't prefix the current chain (e.g. the base
-        image was rebuilt since this sandbox's chain started, for a
-        backend that hasn't squashed yet). Callers must catch and fall
-        back to `_squash_commit()` -- this method never silently produces
-        a possibly-wrong image.
+        between the current checkpoint and the reference chain, or the
+        reference chain doesn't prefix the current chain. Callers must
+        catch and fall back to `_squash_commit()` -- this method never
+        silently produces a possibly-wrong image. Does NOT clear the
+        accumulator temp dir; `commit()`'s squash finally-block always
+        does that so a failed fast path can't leave multi-GB tars behind.
         """
         if self._accumulated_diff_path is None:
             raise RuntimeError("no checkpoint diff accumulator available")
@@ -1415,9 +1427,10 @@ class _ContainerBackendBase(agsandbox_backend):
 
         # Re-baseline: the NEXT squash validates/builds against this
         # squash's own resulting chain, not self._base_image -- see this
-        # method's docstring.
+        # method's docstring. Accumulator temp cleanup is left to
+        # commit()'s squash finally-block so a failed fast path can't
+        # leave multi-GB tars behind either.
         self._squash_base_diff_ids = new_diff_ids
-        self._reset_accumulator()
 
     def _squash_commit(self, tag: str) -> None:
         """Flatten the container's current filesystem into a brand-new
@@ -1763,13 +1776,9 @@ class _ContainerBackendBase(agsandbox_backend):
                 flush=True,
             )
 
-        # 2. Best-effort: fold this cycle's own diff into the accumulator,
-        #    read directly from this commit's own on-disk diff directory --
-        #    essentially free where supported (see
-        #    _fold_commit_into_accumulator()'s and _locate_layer_diff_dir()'s
-        #    docstrings). Never raises.
-        self._fold_commit_into_accumulator(tag)
-
+        # 2. Ordinary commits keep only the lifecycle image (step 1 / 1a) --
+        #    no TMPDIR overlay-diff copy. The accumulator is built lazily
+        #    below, only when a squash is actually due.
         if should_squash:
             # 3. A squash is due -- perform it as an ADDITIONAL step now, on
             #    top of the commit that just succeeded above. old_image_id
@@ -1799,27 +1808,35 @@ class _ContainerBackendBase(agsandbox_backend):
                     flush=True,
                 )
             try:
-                self._accumulator_squash_commit(tag)
-            except Exception as _fast_e:
-                print(
-                    f"[agsandbox_backend] WARNING: fast squash path failed for "
-                    f"tag {tag}, falling back to export/import: {_fast_e}",
-                    file=__import__("sys").stderr,
-                    flush=True,
-                )
+                # Lazy: materialize the overlay-diff tar(s) for layers
+                # since the reference chain, fast-squash from that, and
+                # always delete the temp dir afterward -- even when the
+                # fast path fails and we fall back to export/import.
                 try:
-                    self._squash_commit(tag)
-                except Exception as _e:
-                    # Best-effort: the checkpoint itself (step 1) already
-                    # succeeded -- a squash failure just means the layer
-                    # chain keeps growing until the next attempt, not that
-                    # this cycle's checkpoint is lost.
+                    self._build_accumulator_for_squash(tag)
+                    self._accumulator_squash_commit(tag)
+                except Exception as _fast_e:
                     print(
-                        f"[agsandbox_backend] WARNING: squash failed for tag {tag}, "
-                        f"layer chain will keep growing until the next attempt: {_e}",
+                        f"[agsandbox_backend] WARNING: fast squash path failed for "
+                        f"tag {tag}, falling back to export/import: {_fast_e}",
                         file=__import__("sys").stderr,
                         flush=True,
                     )
+                    try:
+                        self._squash_commit(tag)
+                    except Exception as _e:
+                        # Best-effort: the checkpoint itself (step 1) already
+                        # succeeded -- a squash failure just means the layer
+                        # chain keeps growing until the next attempt, not that
+                        # this cycle's checkpoint is lost.
+                        print(
+                            f"[agsandbox_backend] WARNING: squash failed for tag {tag}, "
+                            f"layer chain will keep growing until the next attempt: {_e}",
+                            file=__import__("sys").stderr,
+                            flush=True,
+                        )
+            finally:
+                self._reset_accumulator()
             # Delete the previous image now that the tag points to the new
             # one -- a plain commit's result can never actually free its own
             # parent, only a squash's result can. Only delete if no
