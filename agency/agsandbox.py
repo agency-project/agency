@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
+from .agname import agname as _agname
 from .agsandbox_backends import agsandbox_backend, backend_for_image_kind, _RUN_ID
 
 if TYPE_CHECKING:
@@ -109,7 +110,18 @@ class agSandbox(_AgSandboxFields):
         checkpoint_image: str | None = None,
         agconfig: "agConfig | None" = None,
     ) -> None:
-        self._agname = agname
+        # Claimed from the SAME shared registry agent() uses (agname.py)
+        # -- the "sandbox_" prefix guarantees this claim can never collide
+        # with an agent's own agname. Without it, an agent named e.g.
+        # "alex_0000" and a directly-constructed agSandbox("alex_0000", ...)
+        # (bypassing agent entirely) would compute the IDENTICAL container
+        # name and lifecycle tag within the same process -- _RUN_ID is a
+        # process-wide constant, not object-specific, so nothing else
+        # disambiguates them. allocate_agname() (not claim_unique_agname())
+        # so this never raises, even when the same base *agname* is used to
+        # construct multiple sandboxes -- each gets its own auto-suffixed
+        # claim instead.
+        self._agname = _agname.allocate_agname(f"sandbox_{agname}")
         # Held by agskill for the full duration of a skill run so a sandbox
         # shared across agents is never driven by more than one skill run
         # at a time. See agskill.py's _task().
@@ -123,7 +135,7 @@ class agSandbox(_AgSandboxFields):
 
         # Container name is fixed at creation time using the main-process PID
         # prefix so that worker processes (with different PIDs) use the correct name.
-        self._name = f"sandbox-{_RUN_ID}-{agname}"
+        self._name = f"sandbox-{_RUN_ID}-{self._agname}"
 
         # Resolve image/mounts once, here, rather than lazily -- a running
         # backend is physically fixed once created, so this is a tier-2
@@ -141,7 +153,7 @@ class agSandbox(_AgSandboxFields):
 
         self._backend = agsandbox_backend.for_config(
             self._agconfig,
-            agname=agname,
+            agname=self._agname,
             name=self._name,
             checkpoint_image=checkpoint_image,
             base_image=base_image,
@@ -189,6 +201,12 @@ class agSandbox(_AgSandboxFields):
     def _gpu_release_fn(self, value) -> None:
         self._backend._gpu_release_fn = value
 
+    def _own_host_pids(self) -> "set[int]":
+        return self._backend._own_host_pids()
+
+    def _has_pending_background_work(self) -> bool:
+        return self._backend._has_pending_background_work()
+
     @property
     def _cpu_acquired(self) -> float:
         return self._backend._cpu_acquired
@@ -204,14 +222,6 @@ class agSandbox(_AgSandboxFields):
     @_memory_acquired_mb.setter
     def _memory_acquired_mb(self, value: int) -> None:
         self._backend._memory_acquired_mb = value
-
-    @property
-    def _started(self) -> bool:
-        return self._backend._started
-
-    @_started.setter
-    def _started(self, value: bool) -> None:
-        self._backend._started = value
 
     @property
     def _checkpoint_image(self) -> "str | None":
@@ -285,6 +295,9 @@ class agSandbox(_AgSandboxFields):
     def stop(self, *args, **kwargs) -> None:
         self._backend.stop(*args, **kwargs)
 
+    def rm_container(self, *args, **kwargs) -> None:
+        self._backend.rm_container(*args, **kwargs)
+
     def restore(self, *args, **kwargs) -> None:
         self._backend.restore(*args, **kwargs)
 
@@ -304,10 +317,15 @@ class agSandbox(_AgSandboxFields):
         self._backend.remove_files(paths)
 
     def __del__(self) -> None:
+        # Python silently discards any exception raised out of __del__
+        # anyway (printed as "Exception ignored in..." with no way for a
+        # caller to observe it, since nothing is running a call stack that
+        # could catch it) -- so this print is the only way this failure is
+        # ever surfaced at all.
         try:
             self.destroy()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agsandbox] WARNING: destroy() failed during __del__ for {self._agname}: {_e}")
 
     def destroy(self) -> None:
         if self._destroyed:
@@ -319,6 +337,10 @@ class agSandbox(_AgSandboxFields):
     def fork(self, new_agname: str, agconfig: "agConfig | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_agname* starting from this sandbox's
         current checkpoint image.  If no checkpoint exists the fork starts fresh.
+
+        *new_agname* doesn't need to already be unique -- like every
+        agSandbox construction, it's automatically deduplicated (see
+        __init__'s docstring below).
 
         When *agconfig* is not given, the fork inherits this sandbox's own
         agconfig unchanged (rather than silently re-reading whatever
@@ -402,12 +424,9 @@ class agSandbox(_AgSandboxFields):
         _poll_interval_s = poll_interval_s
         _state = state_fn
 
-        watched = getattr(self, "_watched_pids", None)
-        if not isinstance(watched, dict) or not watched:
+        if self is None or not self._has_pending_background_work():
             return None
         get_live = self.get_live_pids
-        if not get_live():
-            return None
 
         summary = self.pid_status_summary()
         if _state:
@@ -425,15 +444,22 @@ class agSandbox(_AgSandboxFields):
 
         import time
 
+        # Poll _has_pending_background_work(), not just get_live() -- for
+        # backends whose live-PID tracking can under-count (see
+        # _ChrootBackend._has_pending_background_work()'s docstring), a
+        # process invisible to get_live() can still be genuinely running;
+        # relying on get_live() alone here would let this loop -- and the
+        # "completed" determination right after it -- falsely conclude
+        # nothing is left before it's actually finished.
         deadline = time.monotonic() + _ping_interval_s
         while time.monotonic() < deadline:
             time.sleep(_poll_interval_s)
-            if not get_live():
+            if not self._has_pending_background_work():
                 break
 
         live_now = get_live()
 
-        if not live_now:
+        if not self._has_pending_background_work():
             if _term:
                 _term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
             if _log:

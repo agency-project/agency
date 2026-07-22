@@ -37,7 +37,15 @@ def _make_mock_agent(llm=None, sandbox=None):
 
     ag._state = _agent_state_cls("test")
     ag.llm = llm or LLM
-    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    if sandbox is not None:
+        ag.sandbox = sandbox
+    else:
+        ag.sandbox = MagicMock()
+        # A bare MagicMock()'s _has_pending_background_work() would
+        # otherwise auto-mock to a truthy value, making agtool.py's
+        # dispatch_tools() defer stop() forever -- default to "nothing
+        # pending" so tests get the common case without configuring it.
+        ag.sandbox._has_pending_background_work.return_value = False
     ag.terminal = MagicMock()
     ag.log = MagicMock()
     ag.log.token_usage = {}
@@ -251,6 +259,7 @@ def test_system_prompt_agpath_type_shown_as_path():
 
 def _run_skill_with_sandbox(skill, responses, sandbox, skill_input=None):
     """Helper: run skill with mocked LLM and a provided sandbox."""
+    sandbox._has_pending_background_work.return_value = False
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
         result, *_ = skill.execute_react(
@@ -300,6 +309,7 @@ def test_return_agpath_non_path_value_exhausts_retries():
 def test_input_agpath_rejects_non_path_value_before_llm_call():
     sk = agskill("move", "", input_schema=agdata(dest=agpath), output_schema=agdata(result=str))
     sandbox = MagicMock()
+    sandbox._has_pending_background_work.return_value = False
     with patch("openai.OpenAI") as MockClient:
         result, *_ = sk.execute_react(
             _make_mock_agent(LLM, sandbox), agcontext(), agdata(dest="not a path")

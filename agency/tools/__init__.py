@@ -12,7 +12,6 @@ from .webfetch import webfetch
 from .todowrite import todowrite
 from .resource import (
     make_gpu_reserve,
-    make_gpu_release,
     make_cpu_reserve,
     make_cpu_release,
     make_daemon_release,
@@ -50,7 +49,6 @@ def make_sandboxed_tools(
     if pool is not None:
         tools += [
             make_gpu_reserve(sandbox, pool),
-            make_gpu_release(sandbox, pool),
             make_cpu_reserve(sandbox, pool),
             make_cpu_release(sandbox, pool),
         ]
@@ -67,7 +65,6 @@ __all__ = [
     "make_glob",
     "make_grep",
     "make_gpu_reserve",
-    "make_gpu_release",
     "make_cpu_reserve",
     "make_cpu_release",
     "make_daemon_release",

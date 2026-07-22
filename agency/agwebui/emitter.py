@@ -75,17 +75,63 @@ class agwebui_emitter:
         self._lock = threading.Lock()
         # Prevents concurrent prune threads from piling up.
         self._prune_lock = threading.Lock()
-        # Latest cumulative token counts per agent; flushed again on done().
-        self._token_state: dict[str, tuple[int, int, int, int]] = {}
-        # Registration state re-emitted in done() for late-joining clients.
-        self._agent_registry: dict[str, dict] = {}  # agname -> event dict
-        self._team_registry: dict[str, dict] = {}  # team_name -> event dict
         self._init_db()
 
-    # High-frequency event types that are upserted into state tables AND
-    # pruned from the append log to keep the database small.
-    _STATE_TYPES = frozenset({"token_update", "messages_snapshot", "resource_update"})
+    # Event types with a meaningful "current value" -- each gets its own
+    # latest-value table (one row per key, upserted in place) IN ADDITION to
+    # its normal append-only insert into `events` above. The append-only
+    # insert is what a client already connected when the event fires sees
+    # live; the state-table upsert is what a client connecting or
+    # reconnecting LATER recovers, regardless of how long the run has been
+    # going -- immune to both TAIL_EVENTS' fixed-size replay window and
+    # _PRUNE_TYPES' downsampling below, neither of which these tables are
+    # ever subject to (they hold one row per key, so there's nothing to
+    # prune or age out). See _fetch_state_preamble() in server.py, which
+    # reads all of them in full on every client connect.
+    #
+    # agent_registered/team_registered fire once per agent/team and never
+    # again -- this replaces what used to be a bespoke in-memory dict on
+    # both this class and server.py (_agent_registry/_team_registry),
+    # rebuilt by re-scanning the full, never-pruned `events` log at server
+    # startup. That was only ever correct because registration events are
+    # never pruned -- it happened to work, not because it needed a
+    # different mechanism. Folding them into the same upsert-table pattern
+    # as token_update/agent_state removes that asymmetry: one mechanism for
+    # every "current value" type, backed by SQLite instead of a second,
+    # server-process-local cache that has to be kept in sync by hand.
+    _UPSERT_TABLES = {
+        "token_update": "agent_tokens",
+        "messages_snapshot": "agent_messages",
+        "agent_state": "agent_state",
+        "agent_config": "agent_config_state",
+        "agent_registered": "agent_registry",
+        "team_registered": "team_registry",
+    }
+    # Genuinely high-frequency types (many events/sec/agent possible) that
+    # ALSO get downsampled out of the append-only `events` log -- the
+    # append-only copy exists only for live delivery, so once a newer row
+    # for the same (type, agname, time bucket) exists, older ones in that
+    # bucket are pure waste. agent_registered/team_registered/agent_config
+    # fire at most a handful of times per agent for the whole run, same
+    # order of magnitude as `log` -- not worth pruning, same as `log` isn't.
+    _PRUNE_TYPES = frozenset(
+        {"token_update", "messages_snapshot", "resource_update", "agent_state"}
+    )
     _PRUNE_EVERY = 500  # prune after this many inserts into events
+    # The most recent _PRUNE_KEEP_RAW rows (by id, across ALL types) are
+    # never touched by a prune sweep, regardless of type or time bucket --
+    # every sweep only evaluates rows older than (current max id -
+    # _PRUNE_KEEP_RAW). This is what lets server.py's TAIL_EVENTS replay
+    # assume the tail it requests is always fully raw, never partially
+    # compacted mid-window: since a sweep fires every _PRUNE_EVERY inserts
+    # and never prunes the newest _PRUNE_KEEP_RAW rows, the raw
+    # (unpruned-by-this-mechanism) tail at any moment is at least
+    # _PRUNE_KEEP_RAW rows (right after a sweep) and at most
+    # _PRUNE_KEEP_RAW + _PRUNE_EVERY rows (right before the next one, when
+    # a full _PRUNE_EVERY inserts' worth has accumulated past the previous
+    # sweep's protected window without yet being swept themselves). With
+    # both set to 500, that's a 500-1000 row raw tail -- see TAIL_EVENTS.
+    _PRUNE_KEEP_RAW = 500
     # Time-bucket size for downsampling: keep the last event per
     # (type, agname, floor(ts / bucket)) so scrubbing always finds a sample
     # within one bucket of any position.
@@ -106,10 +152,31 @@ class agwebui_emitter:
             CREATE INDEX IF NOT EXISTS idx_events_ts     ON events(ts);
             CREATE INDEX IF NOT EXISTS idx_events_type   ON events(type);
             CREATE INDEX IF NOT EXISTS idx_events_agname ON events(agname);
+
+            -- Latest-value tables -- see _UPSERT_TABLES' docstring above.
+            CREATE TABLE IF NOT EXISTS agent_tokens (
+                agname TEXT PRIMARY KEY,
+                data   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                agname TEXT PRIMARY KEY,
+                data   TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS agent_state (
-                agname   TEXT PRIMARY KEY,
-                tokens   TEXT,
-                messages TEXT
+                agname TEXT PRIMARY KEY,
+                data   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_config_state (
+                agname TEXT PRIMARY KEY,
+                data   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_registry (
+                agname TEXT PRIMARY KEY,
+                data   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS team_registry (
+                team_name TEXT PRIMARY KEY,
+                data      TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS resource_state (
                 id   INTEGER PRIMARY KEY CHECK (id = 1),
@@ -144,20 +211,27 @@ class agwebui_emitter:
                     "INSERT INTO events(type, agname, ts, data) VALUES(?,?,?,?)",
                     (etype, agname, ts, data),
                 )
-                # Upsert into state tables for cold-start preamble on reconnect.
-                if etype == "token_update" and agname:
+                # Upsert into this type's latest-value table (if it has one)
+                # for cold-start preamble on reconnect -- see _UPSERT_TABLES'
+                # docstring above. team_registered keys on team_name, not
+                # agname (there is no per-agent column here); every other
+                # entry in _UPSERT_TABLES keys on agname.
+                table = self._UPSERT_TABLES.get(etype)
+                if table == "team_registry":
+                    key = event.get("team_name")
+                    if key:
+                        con.execute(
+                            f"INSERT INTO {table}(team_name, data) VALUES(?,?)"
+                            " ON CONFLICT(team_name) DO UPDATE SET data=excluded.data",
+                            (key, data),
+                        )
+                elif table and agname:
                     con.execute(
-                        "INSERT INTO agent_state(agname, tokens) VALUES(?,?)"
-                        " ON CONFLICT(agname) DO UPDATE SET tokens=excluded.tokens",
+                        f"INSERT INTO {table}(agname, data) VALUES(?,?)"
+                        " ON CONFLICT(agname) DO UPDATE SET data=excluded.data",
                         (agname, data),
                     )
-                elif etype == "messages_snapshot" and agname:
-                    con.execute(
-                        "INSERT INTO agent_state(agname, messages) VALUES(?,?)"
-                        " ON CONFLICT(agname) DO UPDATE SET messages=excluded.messages",
-                        (agname, data),
-                    )
-                elif etype == "resource_update":
+                if etype == "resource_update":
                     con.execute(
                         "INSERT INTO resource_state(id, data) VALUES(1,?)"
                         " ON CONFLICT(id) DO UPDATE SET data=excluded.data",
@@ -224,24 +298,37 @@ class agwebui_emitter:
             return
         try:
             with self._lock:
-                # Keep the last event per (type, agname, time-bucket).
-                # This guarantees at most one sample per bucket per agent,
-                # so timeline scrubbing always finds a sample within
-                # _PRUNE_BUCKET_S seconds of any scrub position.
+                # Keep the last event per (type, agname, time-bucket) --
+                # ONLY among rows older than the most recent _PRUNE_KEEP_RAW
+                # (by id). The `id <= (MAX(id) - _PRUNE_KEEP_RAW)` guard
+                # excludes the newest _PRUNE_KEEP_RAW rows from the DELETE
+                # entirely, regardless of type or bucket -- so
+                # server.py's TAIL_EVENTS replay can always assume its
+                # requested tail is fully raw, never a mix of some rows
+                # already bucket-compacted and others not, which a plain
+                # id-agnostic sweep firing mid-tail could otherwise produce.
                 con = sqlite3.connect(str(self._db_path), timeout=120)
                 try:
-                    con.execute(
-                        """
-                        DELETE FROM events
-                        WHERE type IN ('token_update','messages_snapshot','resource_update')
-                          AND id NOT IN (
-                            SELECT MAX(id) FROM events
-                            WHERE type IN ('token_update','messages_snapshot','resource_update')
-                            GROUP BY type, agname, CAST(ts / ? AS INTEGER)
-                          )
-                        """,
-                        (self._PRUNE_BUCKET_S,),
-                    )
+                    max_id_row = con.execute("SELECT MAX(id) FROM events").fetchone()
+                    max_id = max_id_row[0] if max_id_row else None
+                    if max_id is not None:
+                        cutoff = max_id - self._PRUNE_KEEP_RAW
+                        placeholders = ",".join("?" for _ in self._PRUNE_TYPES)
+                        prune_types = tuple(self._PRUNE_TYPES)
+                        con.execute(
+                            f"""
+                            DELETE FROM events
+                            WHERE type IN ({placeholders})
+                              AND id <= ?
+                              AND id NOT IN (
+                                SELECT MAX(id) FROM events
+                                WHERE type IN ({placeholders})
+                                  AND id <= ?
+                                GROUP BY type, agname, CAST(ts / ? AS INTEGER)
+                              )
+                            """,
+                            prune_types + (cutoff,) + prune_types + (cutoff, self._PRUNE_BUCKET_S),
+                        )
                     con.commit()
                 except sqlite3.DatabaseError:
                     # See emit()'s matching handler -- page 1 is unreadable,
@@ -250,8 +337,10 @@ class agwebui_emitter:
                     self._reinit_after_corruption()
                 finally:
                     con.close()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(
+                f"[agwebui] WARNING: event-log prune failed (best-effort, will retry next cycle): {_e}"
+            )
         finally:
             self._prune_lock.release()
 
@@ -298,16 +387,15 @@ class agwebui_emitter:
         self.emit({"type": "log", "line": line, "ts": time.time()})
 
     def agent_registered(self, agname: str, hex_color: str, team: str | None = None) -> None:
-        ev = {
-            "type": "agent_registered",
-            "agname": agname,
-            "color": hex_color,
-            "team": team,
-            "ts": time.time(),
-        }
-        with self._lock:
-            self._agent_registry[agname] = ev
-        self.emit(ev)
+        self.emit(
+            {
+                "type": "agent_registered",
+                "agname": agname,
+                "color": hex_color,
+                "team": team,
+                "ts": time.time(),
+            }
+        )
 
     def agent_state(
         self,
@@ -345,15 +433,14 @@ class agwebui_emitter:
         )
 
     def team_registered(self, team_name: str, agent_names: list[str]) -> None:
-        ev = {
-            "type": "team_registered",
-            "team_name": team_name,
-            "agents": agent_names,
-            "ts": time.time(),
-        }
-        with self._lock:
-            self._team_registry[team_name] = ev
-        self.emit(ev)
+        self.emit(
+            {
+                "type": "team_registered",
+                "team_name": team_name,
+                "agents": agent_names,
+                "ts": time.time(),
+            }
+        )
 
     def push_messages(self, agname: str, messages: list[dict]) -> None:
         try:
@@ -404,8 +491,8 @@ class agwebui_emitter:
         text = reply_file.read_text(encoding="utf-8").strip()
         try:
             reply_file.unlink()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agwebui] WARNING: failed to clean up reply file {reply_file}: {_e}")
         return text
 
     def token_update(
@@ -417,8 +504,6 @@ class agwebui_emitter:
         global_output: int,
     ) -> None:
         """Emit cumulative token counts for one agent and the framework total."""
-        with self._lock:
-            self._token_state[agname] = (agent_input, agent_output, global_input, global_output)
         self.emit(
             {
                 "type": "token_update",
@@ -455,27 +540,14 @@ class agwebui_emitter:
         )
 
     def done(self) -> None:
-        # Re-emit registration and token state so that late-joining clients
-        # always receive a complete roster and current token counts.
-        with self._lock:
-            agents = list(self._agent_registry.values())
-            teams = list(self._team_registry.values())
-            tokens = dict(self._token_state)
-        now = time.time()
-        for ev in agents:
-            self.emit({**ev, "ts": now})
-        for ev in teams:
-            self.emit({**ev, "ts": now})
-        for agname, (ai, ao, gi, go) in tokens.items():
-            self.emit(
-                {
-                    "type": "token_update",
-                    "agname": agname,
-                    "agent_input": ai,
-                    "agent_output": ao,
-                    "global_input": gi,
-                    "global_output": go,
-                    "ts": now,
-                }
-            )
-        self.emit({"type": "done", "ts": now})
+        """Emit the terminal marker.
+
+        Used to re-emit registration/token state by hand here so a
+        late-joining client would see a complete roster -- no longer
+        necessary now that agent_registered/team_registered/token_update
+        (and every other _UPSERT_TABLES entry) are durably upserted into
+        their own latest-value table on every emit(), read in full by
+        _fetch_state_preamble() on every connect regardless of when it
+        happens. See _UPSERT_TABLES' docstring.
+        """
+        self.emit({"type": "done", "ts": time.time()})

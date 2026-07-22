@@ -57,8 +57,6 @@ def server(tmp_path):
     old_event_count = srv._event_count
     old_first_ts = srv._first_ts
     old_last_ts = srv._last_ts
-    old_agent_reg = srv._agent_registry
-    old_team_reg = srv._team_registry
 
     # Point the server at a fresh temp directory
     srv._run_dir = tmp_path
@@ -71,8 +69,6 @@ def server(tmp_path):
     srv._event_count = 0
     srv._first_ts = None
     srv._last_ts = None
-    srv._agent_registry = {}
-    srv._team_registry = {}
 
     with TestClient(srv.app) as client:
         yield client, tmp_path, srv
@@ -86,8 +82,6 @@ def server(tmp_path):
     srv._event_count = old_event_count
     srv._first_ts = old_first_ts
     srv._last_ts = old_last_ts
-    srv._agent_registry = old_agent_reg
-    srv._team_registry = old_team_reg
 
 
 def _wait_for(condition, timeout=3.0, interval=0.05):
@@ -177,8 +171,10 @@ def _recv_n(ws, n, timeout=5.0):
         try:
             for _ in range(n):
                 results.append(json.loads(ws.receive_text()))
-        except Exception:
-            pass
+        except Exception as _e:
+            # Expected once the test's own timeout below gives up and the
+            # connection is torn down while this thread is still receiving.
+            print(f"_recv_n reader stopped early: {_e}")
 
     t = threading.Thread(target=_reader, daemon=True)
     t.start()
@@ -196,8 +192,10 @@ def _recv_skipping_sync(ws, n, timeout=5.0):
                 msg = json.loads(ws.receive_text())
                 if msg.get("type") != "timeline_sync":
                     results.append(msg)
-        except Exception:
-            pass
+        except Exception as _e:
+            # Expected once the test's own timeout below gives up and the
+            # connection is torn down while this thread is still receiving.
+            print(f"_recv_skipping_sync reader stopped early: {_e}")
 
     t = threading.Thread(target=_reader, daemon=True)
     t.start()
@@ -520,3 +518,42 @@ def test_api_events_invalid_range_returns_empty(server):
     resp = client.get("/api/events?start_ts=10.0&end_ts=5.0")
     assert resp.status_code == 200
     assert resp.json()["events"] == []
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — state preamble survives aging out of TAIL_EVENTS
+# ---------------------------------------------------------------------------
+
+
+def test_agent_config_survives_being_pushed_out_of_tail_window(server):
+    """Regression test: agent_config used to only ever be inserted into the
+    append-only events table, with no latest-value table of its own -- so
+    once more than TAIL_EVENTS other events landed after it, a client
+    connecting later could never recover it (see agwebui_emitter's
+    _UPSERT_TABLES). Uses the real emitter (not the hand-crafted
+    _write_events helper) so this exercises the actual upsert path, then
+    floods well past TAIL_EVENTS with unrelated log lines before connecting,
+    proving the config is still recoverable via the state preamble alone."""
+    client, run_dir, srv = server
+    from agency.agwebui.emitter import agwebui_emitter
+
+    em = agwebui_emitter(run_dir)
+    em.agent_config("LateAgent", {"agskill": {"react_max_steps": 7}})
+    for i in range(srv.TAIL_EVENTS + 50):
+        em.log(f"filler{i}")
+
+    assert _wait_for(lambda: srv._last_event_id > srv.TAIL_EVENTS), (
+        "tail task did not catch up on the flood of filler events"
+    )
+
+    with client.websocket_connect("/ws") as ws:
+        # TAIL_EVENTS log lines exhaust the tail replay itself; the state
+        # preamble (where agent_config actually lives, as the only row in
+        # agent_config_state) is sent right after -- exactly one more
+        # message to wait for.
+        received = _recv_skipping_sync(ws, srv.TAIL_EVENTS + 1)
+
+    configs = [e for e in received if e.get("type") == "agent_config"]
+    assert configs, "agent_config was not recovered via the state preamble"
+    assert configs[-1]["agname"] == "LateAgent"
+    assert configs[-1]["config"]["agskill"]["react_max_steps"] == 7

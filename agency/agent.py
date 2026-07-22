@@ -2,6 +2,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import os
 import queue
 import tarfile
 import threading
@@ -717,6 +718,14 @@ class agent:
             backend_cls.tag_image(self.sandbox._checkpoint_image, image_tag)
             try:
                 _save_timeout = _AgAgentFields(self.agconfig).checkpoint_save_timeout_s
+                # Scrub the owning process's PID before embedding -- it's
+                # meaningless (and, since a .ckpt file can be restored by
+                # an unrelated process on a different host entirely,
+                # potentially misleading) once outside this process's own
+                # lifetime. load() re-stamps the actually-current
+                # restoring process's PID after import. See
+                # relabel_owner_pid()'s docstring.
+                backend_cls.relabel_owner_pid(image_tag, None, _save_timeout)
                 image_bytes = backend_cls.export_image(image_tag, _save_timeout)
                 with tarfile.open(path, "w:gz") as tar:
                     for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
@@ -768,6 +777,12 @@ class agent:
             original_tag = f"agency/ckpt-{state['agname']}"
             backend_cls.tag_image(original_tag, image_tag)
             backend_cls.delete_image(original_tag)
+            # Stamp the actually-current restoring process's own PID --
+            # save() scrubbed whatever PID this image carried before
+            # embedding it (see relabel_owner_pid()'s docstring), so
+            # without this the restored image would carry no owner
+            # evidence at all, same as a never-labelled image.
+            backend_cls.relabel_owner_pid(image_tag, os.getpid(), _load_timeout)
             checkpoint = image_tag
 
         ag: agent = cls.__new__(cls)

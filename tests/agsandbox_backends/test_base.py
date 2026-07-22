@@ -12,6 +12,30 @@ from unittest.mock import patch
 from agency.agsandbox_backends import agsandbox_backend
 
 
+@pytest.fixture(autouse=True)
+def _reset_runtime_cache():
+    """get_container_runtime()'s `_RUNTIME` is a module-level, process-wide
+    cache (agsandbox_backends/container.py) -- set once, reused forever
+    after. Constructing a real backend below (test_explicit_docker_builds_
+    docker_backend/test_explicit_podman_builds_podman_backend) triggers
+    reap_orphaned_containers() -> get_container_runtime() internally,
+    which can populate this cache with a value derived from THIS test's
+    own mocks. Without resetting it, that value leaks into every other
+    test in the whole pytest process afterward -- confirmed to actually
+    happen (bisected): a too-broad `shutil.which` mock here made podman
+    look available too, caching _RUNTIME='podman' even though this host
+    only has docker, breaking unrelated tests elsewhere with
+    `FileNotFoundError: podman` far later in the same run. Reset both
+    before AND after so a stale value from some earlier, unrelated test
+    can't affect these tests' own assertions either.
+    """
+    import agency.agsandbox_backends.container as _container_mod
+
+    _container_mod._RUNTIME = None
+    yield
+    _container_mod._RUNTIME = None
+
+
 class TestBackendSelection:
     def test_unknown_backend_raises_value_error(self):
         from agency.agconfig import agConfig
@@ -85,8 +109,17 @@ class TestBackendSelection:
 
         cfg = agConfig(agSandboxBackendConfig(backend="docker"))
         with patch("agency.agsandbox_backends.container._runtime_works", return_value=True):
+            # shutil.which is a single shared module object (both base.py and
+            # container.py do plain `import shutil`) -- a return_value= mock
+            # here would make EVERY call, for ANY binary name, look truthy,
+            # including get_container_runtime()'s own internal "is podman
+            # also available?" check (triggered by the real backend
+            # construction below, via reap_orphaned_containers()). Argument-
+            # aware so only "docker" resolves, matching what this test
+            # actually claims to verify.
             with patch(
-                "agency.agsandbox_backends.base.shutil.which", return_value="/usr/bin/docker"
+                "agency.agsandbox_backends.base.shutil.which",
+                side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None,
             ):
                 backend = agsandbox_backend.for_config(
                     cfg,
@@ -105,8 +138,12 @@ class TestBackendSelection:
 
         cfg = agConfig(agSandboxBackendConfig(backend="podman"))
         with patch("agency.agsandbox_backends.container._runtime_works", return_value=True):
+            # See test_explicit_docker_builds_docker_backend's comment --
+            # argument-aware for the same reason (shutil.which is one
+            # shared module object, not scoped to base.py).
             with patch(
-                "agency.agsandbox_backends.base.shutil.which", return_value="/usr/bin/podman"
+                "agency.agsandbox_backends.base.shutil.which",
+                side_effect=lambda name: "/usr/bin/podman" if name == "podman" else None,
             ):
                 backend = agsandbox_backend.for_config(
                     cfg,

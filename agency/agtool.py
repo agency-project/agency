@@ -416,6 +416,7 @@ def dispatch_tools(
                     if isinstance(_parsed.get("timeout"), int):
                         _tool_timeout = _parsed["timeout"]
                 except (json.JSONDecodeError, TypeError, AttributeError):
+                    # Malformed/non-dict arguments -- fall back to the default timeout below.
                     pass
                 if _tool_timeout is None:
                     _tool_timeout = _default_tool_timeout
@@ -451,44 +452,31 @@ def dispatch_tools(
                         print(
                             f"[agtool] WARNING: failed to offload large tool output to {offload_path}: {_e}"
                         )
-                if t.run_in_subprocess:
-                    # A tool may signal failure via agdata(error=...) without raising —
-                    # treat that the same as an exception: discard dirty state.
-                    _result_errored = False
-                    try:
-                        if "error" in json.loads(result_content):
-                            _result_errored = True
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                    if _result_errored:
-                        sandbox.stop(commit=False)
-                        try:
-                            _result_obj = json.loads(result_content)
-                            _result_obj["workspace_reverted"] = (
-                                "The workspace has been reverted to the state "
-                                "before this tool call."
-                            )
-                            result_content = json.dumps(_result_obj)
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                    else:
-                        sandbox.stop(commit=True)
+                # stop() (hibernate) runs after every tool call regardless
+                # of run_in_subprocess -- releasing the sandbox's runtime
+                # slot between calls isn't specific to subprocess-isolated
+                # tools. Rollback no longer happens at this granularity: a
+                # tool call's own success or failure no longer decides
+                # whether the sandbox gets checkpointed or discarded --
+                # only the skill as a whole does, at its own teardown (see
+                # agskill.py). The one exception here: if this tool call
+                # left background work still running inside the sandbox
+                # (e.g. a bash `cmd &`), stop() must NOT run yet -- it kills
+                # every process inside, which would end that work before the
+                # agent ever gets a chance to check on it in a later tool
+                # call. Skipping here just defers the hibernate; the next
+                # tool call that finds nothing pending will catch it up.
+                if not sandbox._has_pending_background_work():
+                    sandbox.stop()
             except Exception as e:
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)
                 result_content = json.dumps({"error": format_exception(e)})
-                # On failure: remove without committing to discard dirty state.
-                # The next tool call restores from the last successful checkpoint.
-                if t.run_in_subprocess:
-                    sandbox.stop(commit=False)
-                    try:
-                        _result_obj = json.loads(result_content)
-                        _result_obj["workspace_reverted"] = (
-                            "The workspace has been reverted to the state before this tool call."
-                        )
-                        result_content = json.dumps(_result_obj)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                # An exception escaping tool dispatch is handled the same
+                # way as an ordinary result at this granularity -- hibernate,
+                # not discard. Same pending-work deferral as above.
+                if not sandbox._has_pending_background_work():
+                    sandbox.stop()
         tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
         messages.append(tool_msg)
         if _live_fn:

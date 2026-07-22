@@ -32,7 +32,15 @@ def _make_mock_agent(llm=None, sandbox=None):
 
     ag._state = _agent_state_cls("test")
     ag.llm = llm or LLM
-    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    if sandbox is not None:
+        ag.sandbox = sandbox
+    else:
+        ag.sandbox = MagicMock()
+        # A bare MagicMock()'s _has_pending_background_work() would
+        # otherwise auto-mock to a truthy value, making agtool.py's
+        # dispatch_tools() defer stop() forever -- default to "nothing
+        # pending" so tests get the common case without configuring it.
+        ag.sandbox._has_pending_background_work.return_value = False
     ag.terminal = MagicMock()
     ag.log = MagicMock()
     ag.log.token_usage = {}
@@ -101,6 +109,7 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
 
 
 def _run_skill_with_sandbox(skill, responses, sandbox):
+    sandbox._has_pending_background_work.return_value = False
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
         result, *_ = skill.execute_react(_make_mock_agent(LLM, sandbox), agcontext(), agdata())
@@ -365,7 +374,6 @@ class TestAgSandboxBinaryIO:
         from agency.agsandbox_backends.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
-        sb._started = True
         return sb
 
     def test_read_file_bytes_returns_raw_bytes(self):

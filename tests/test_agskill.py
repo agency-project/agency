@@ -33,7 +33,15 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
 
     ag = _MockAgent()
     ag.llm = llm or LLM
-    ag.sandbox = sandbox if sandbox is not None else MagicMock()
+    if sandbox is not None:
+        ag.sandbox = sandbox
+    else:
+        ag.sandbox = MagicMock()
+        # A bare MagicMock()'s _has_pending_background_work() would
+        # otherwise auto-mock to a truthy value, making agtool.py's
+        # dispatch_tools() defer stop() forever -- default to "nothing
+        # pending" so tests get the common case without configuring it.
+        ag.sandbox._has_pending_background_work.return_value = False
     ag.terminal = MagicMock()
     ag._state = _agent_state_cls("test")
     ag.log = MagicMock()
@@ -354,6 +362,7 @@ def test_add_tools_extends_sandbox_defaults():
         sb.get_live_pids.return_value = set()
         sb.pid_status_summary.return_value = ""
         sb.commit.return_value = False
+        sb._has_pending_background_work.return_value = False
         s.execute_react(make_mock_agent(LLM, sb), agcontext(), agdata(x=1))
     names = [t["function"]["name"] for t in (captured.get("tools") or [])]
     assert "bash" in names
@@ -864,7 +873,11 @@ def test_semaphore_released_after_timeout():
         raise _IdleTimeout("no chunk received")
         yield  # makes this a generator function
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _timeout_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _timeout_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -908,7 +921,11 @@ def test_timeout_retries_all_attempts_then_error():
         raise _IdleTimeout("no chunk received")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _timeout_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _timeout_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -935,7 +952,11 @@ def test_timeout_values_fixed_on_retry():
         yield
 
     s = make_skill()
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _capture_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _capture_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1003,7 +1024,11 @@ def test_ssl_error_retries_all_attempts_then_error():
         raise ssl.SSLError("record layer failure")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _ssl_error_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _ssl_error_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1022,7 +1047,11 @@ def test_oserror_retries_all_attempts_then_error():
         raise OSError("connection reset by peer")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _oserror_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _oserror_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1041,7 +1070,11 @@ def test_ssl_error_releases_semaphore():
         raise ssl.SSLError("record layer failure")
         yield
 
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _ssl_error_iter):
+    with (
+        patch("openai.OpenAI") as MockClient,
+        patch("agency.agllm._iter_batched", _ssl_error_iter),
+        patch("agency.agllm.time.sleep"),
+    ):
         MockClient.return_value.chat.completions.create.return_value = []
         s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
 
@@ -1083,6 +1116,7 @@ def test_ssl_error_succeeds_after_retry():
 def _make_sandbox(written=None):
     """Return a mock sandbox that records write_file calls."""
     sandbox = MagicMock()
+    sandbox._has_pending_background_work.return_value = False
     if written is not None:
         sandbox.write_file.side_effect = lambda path, content: written.update({path: content})
     return sandbox
@@ -1165,6 +1199,7 @@ def test_long_tool_output_offloaded_to_sandbox():
     t = agtool(name="fetcher", description="", fn=fn)
     s = make_skill(replace_tools=[t])
     sandbox = MagicMock()
+    sandbox._has_pending_background_work.return_value = False
     responses = [_tool_call("fetcher", {}, "call-999"), _direct('{"ok": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
@@ -1314,103 +1349,236 @@ def test_long_output_no_duplicate_read_when_already_present():
 
 
 # ---------------------------------------------------------------------------
-# Tool call failure handling and checkpoint revert
+# Skill-exit sandbox teardown (agskill.py's own run()/_task() finally block)
+#
+# Per-tool commit/rollback is gone (agtool.py's dispatch_tools() now just
+# calls sandbox.stop() unconditionally after each call -- a separate,
+# already-updated concern, not tested here). The remaining rollback boundary
+# lives one level up, in agskill.py's _task(): on a *skill's own* result
+# being an error, it calls ag.sandbox.rm_container() (discarding everything
+# since the last successful skill's commit()) and pushes a plain string onto
+# ag.inbox describing the revert -- surfaced at the START of the next skill
+# call via ag._drain_inbox() (see execute_react()'s loop), since the failed
+# skill's own result is already final by the time _task() reaches teardown.
+# On success, it calls ag.sandbox.commit() (no args -- squashing is now
+# fully automatic, the old force_squash parameter is gone).
+#
+# These tests exercise that finally block directly by running skills through
+# the real agent.run()/_task() path (not execute_react() in isolation, which
+# never reaches this teardown) against a real agent and a mocked sandbox,
+# with execute_react() itself replaced by a fake so the scenario -- success,
+# an agerror result, or an uncaught exception -- is fully controlled. Any
+# per-tool run_in_subprocess distinction is irrelevant at this layer (kept
+# only in a few names/docstrings for traceability from the pre-refactor
+# suite these evolved from).
 # ---------------------------------------------------------------------------
 
 
 def _make_sandbox_with_tracking():
-    """Return a sandbox mock that records stop() calls."""
+    """Return a sandbox mock that records stop()/commit()/rm_container() calls."""
     sandbox = MagicMock()
     sandbox._name = "testbox"
     sandbox.stop.return_value = None
+    sandbox._has_pending_background_work.return_value = False
     return sandbox
 
 
+def _run_skill_via_agent(s, sandbox, skill_input=None):
+    """Run *s* to completion through a real agent.run() -- the only code
+    path that reaches agskill.py's _task() finally block -- against a real
+    agent and *sandbox* (typically a MagicMock so commit()/rm_container()/
+    inbox.put() calls can be asserted on). Returns (ag, resolved pending
+    agdata)."""
+    cfg = agConfig({"agllm_backend": LLM_CONFIG})
+    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
+    ag.inbox = MagicMock()
+    pending = ag.run(s, skill_input if skill_input is not None else agdata(x=1))
+    pending.wait()
+    return ag, pending
+
+
 def test_tool_success_commits_and_stops():
-    """A successful tool call must trigger sandbox.stop(commit=True)."""
+    """A skill run that completes successfully must call sandbox.commit()
+    (no args) in agskill.py's _task() finally block, and must not
+    rm_container() or push anything onto the inbox."""
     sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(result="ok"),
+        prev_ctx,
+        [],
+    )
+
+    ag, _ = _run_skill_via_agent(s, sandbox)
+
+    sandbox.commit.assert_called_once_with()
+    sandbox.rm_container.assert_not_called()
+    ag.inbox.put.assert_not_called()
+
+
+def test_tool_failure_triggers_stop_without_commit():
+    """When the skill's own result is an error, the finally block must call
+    sandbox.rm_container() (discard since the last successful commit)
+    instead of sandbox.commit()."""
+    sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("boom"),
+        prev_ctx,
+        [],
+    )
+
+    ag, pending = _run_skill_via_agent(s, sandbox)
+
+    sandbox.rm_container.assert_called_once_with()
+    sandbox.commit.assert_not_called()
+    assert pending._data.get("error") == "boom"
+
+
+def test_tool_failure_adds_workspace_reverted_note():
+    """The old "workspace_reverted key injected into the tool result JSON"
+    behavior is gone entirely -- the revert notice now goes on ag.inbox as a
+    plain string (queue.Queue[str]), not in the failed skill's own result,
+    since that result is already final by the time _task() reaches
+    teardown. The note is meant to surface at the START of the next skill
+    call via ag._drain_inbox()."""
+    sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("disk full"),
+        prev_ctx,
+        [],
+    )
+
+    ag, pending = _run_skill_via_agent(s, sandbox)
+
+    ag.inbox.put.assert_called_once()
+    (note,), _kwargs = ag.inbox.put.call_args
+    assert isinstance(note, str)
+    assert "revert" in note.lower() or "discard" in note.lower()
+    # The failed skill's own result carries only its own error -- no
+    # revert-related key was added to it at this layer.
+    assert pending._data == {"error": "disk full"}
+
+
+def test_tool_failure_reverts_even_without_subprocess():
+    """The revert-and-notify teardown is triggered purely by the skill's own
+    result being an error -- it doesn't matter whether any tool ran at all,
+    let alone in a subprocess; _task() only ever inspects outer_result."""
+    sandbox = MagicMock()
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("nope"),
+        prev_ctx,
+        [],
+    )
+
+    ag, pending = _run_skill_via_agent(s, sandbox)
+
+    sandbox.rm_container.assert_called_once_with()
+    ag.inbox.put.assert_called_once()
+    assert pending._data.get("error") == "nope"
+
+
+def test_run_in_subprocess_false_still_stops():
+    """The commit()/rm_container() decision is made fresh for every skill
+    call on the same agent -- a later call's failure must still trigger
+    rm_container() (and a fresh inbox note) even though an earlier call
+    already committed successfully."""
+    sandbox = _make_sandbox_with_tracking()
+    ok_skill = make_skill(name="ok")
+    ok_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(result="ok"),
+        prev_ctx,
+        [],
+    )
+    bad_skill = make_skill(name="bad")
+    bad_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("second call failed"),
+        prev_ctx,
+        [],
+    )
+
+    cfg = agConfig({"agllm_backend": LLM_CONFIG})
+    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
+    ag.inbox = MagicMock()
+    ag.run(ok_skill, agdata(x=1)).wait()
+    ag.run(bad_skill, agdata(x=1)).wait()
+
+    assert sandbox.commit.call_count == 1
+    assert sandbox.rm_container.call_count == 1
+    ag.inbox.put.assert_called_once()
+
+
+def test_tool_exception_triggers_stop_without_commit():
+    """An uncaught exception raised out of execute_react() is caught by
+    _task()'s own outer try/except and turned into an agerror -- which must
+    then trigger the same rm_container()-without-commit teardown as an
+    ordinary agerror result."""
+    sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+
+    def _raise(ag, prev_ctx, skill_input, max_steps=None):
+        raise RuntimeError("exploded")
+
+    s.execute_react = _raise
+
+    ag, pending = _run_skill_via_agent(s, sandbox)
+
+    sandbox.rm_container.assert_called_once_with()
+    sandbox.commit.assert_not_called()
+    assert "exploded" in pending._data.get("error", "")
+
+
+def test_run_in_subprocess_false_success_still_commits():
+    """A skill call's own commit()/rm_container() decision doesn't carry
+    over from an earlier call on the same agent -- a successful call must
+    still commit() even immediately after a prior call's failure already
+    triggered a revert."""
+    sandbox = _make_sandbox_with_tracking()
+    bad_skill = make_skill(name="bad")
+    bad_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agerror("first call failed"),
+        prev_ctx,
+        [],
+    )
+    ok_skill = make_skill(name="ok")
+    ok_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(result="ok"),
+        prev_ctx,
+        [],
+    )
+
+    cfg = agConfig({"agllm_backend": LLM_CONFIG})
+    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
+    ag.inbox = MagicMock()
+    ag.run(bad_skill, agdata(x=1)).wait()
+    ag.run(ok_skill, agdata(x=1)).wait()
+
+    assert sandbox.rm_container.call_count == 1
+    assert sandbox.commit.call_count == 1
+
+
+def test_pending_background_work_defers_stop_entirely():
+    """When the sandbox still has pending background work (e.g. a
+    backgrounded `cmd &`), stop() must not run at all after a successful
+    tool call -- running it would tear down/overwrite the sandbox's live
+    state out from under that still-running work."""
+    sandbox = _make_sandbox_with_tracking()
+    # True for dispatch_tools()'s own check (what this test targets), then
+    # False afterward -- execute_react() calls wait_for_processes() right
+    # after, whose very first gate check is this same predicate; leaving it
+    # permanently True would make that loop believe work is still pending
+    # forever and hang for the full ping interval instead of returning
+    # immediately (see agsandbox.py's wait_for_processes() docstring).
+    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
 
     def fn(arg: agdata) -> agdata:
         return agdata(result="ok")
 
-    t = agtool(name="mytool", description="", fn=fn, run_in_subprocess=True)
+    t = agtool(name="bgtool", description="", fn=fn, run_in_subprocess=True)
     s = make_skill(replace_tools=[t])
-    responses = [_tool_call("mytool", {}, "c1"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_called_once_with(commit=True)
-
-
-def test_tool_failure_triggers_stop_without_commit():
-    """When a run_in_subprocess tool returns an error, sandbox.stop(commit=False) is called."""
-    sandbox = _make_sandbox_with_tracking()
-
-    def fn(arg: agdata) -> agdata:
-        return agerror("boom")
-
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c2"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_called_once_with(commit=False)
-
-
-def test_tool_failure_adds_workspace_reverted_note():
-    """Tool error response must include workspace_reverted when the tool returns agerror(...)."""
-    sandbox = _make_sandbox_with_tracking()
-
-    def fn(arg: agdata) -> agdata:
-        return agerror("disk full")
-
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c3"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert len(tool_msgs) == 1
-    content = json.loads(tool_msgs[0]["content"])
-    assert "error" in content
-    assert "workspace_reverted" in content
-    assert "reverted" in content["workspace_reverted"].lower()
-
-
-def test_tool_failure_no_restore_without_sandbox():
-    """When agent_sandbox=MagicMock(), a tool error is passed through as-is with no stop attempt."""
-
-    def fn(arg: agdata) -> agdata:
-        return agerror("nope")
-
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=False)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c4"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    content = json.loads(tool_msgs[0]["content"])
-    assert content["error"] == "nope"
-    assert "workspace_reverted" not in content
-
-
-def test_run_in_subprocess_false_no_stop():
-    """Tools with run_in_subprocess=False must not trigger sandbox.stop()."""
-    sandbox = _make_sandbox_with_tracking()
-
-    def fn(arg: agdata) -> agdata:
-        return agerror("oops")
-
-    t = agtool(name="hosttool", description="", fn=fn, run_in_subprocess=False)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("hosttool", {}, "c5"), _direct('{"done": 1}')]
+    responses = [_tool_call("bgtool", {}, "c8"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
         s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
@@ -1418,23 +1586,88 @@ def test_run_in_subprocess_false_no_stop():
     sandbox.stop.assert_not_called()
 
 
-def test_tool_exception_triggers_stop_without_commit():
-    """When a run_in_subprocess tool raises an exception, sandbox.stop(commit=False) is called."""
+def test_pending_background_work_omits_workspace_reverted_note_on_error():
+    """Same deferral as above, but for an errored tool call: stop() must be
+    skipped, and the workspace_reverted note -- which claims a revert that
+    didn't actually happen -- must not be added either."""
     sandbox = _make_sandbox_with_tracking()
+    # True for dispatch_tools()'s own check (what this test targets), then
+    # False afterward -- execute_react() calls wait_for_processes() right
+    # after, whose very first gate check is this same predicate; leaving it
+    # permanently True would make that loop believe work is still pending
+    # forever and hang for the full ping interval instead of returning
+    # immediately (see agsandbox.py's wait_for_processes() docstring).
+    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
 
     def fn(arg: agdata) -> agdata:
-        raise RuntimeError("exploded")
+        return agerror("boom")
 
-    t = agtool(name="badtool", description="", fn=fn, run_in_subprocess=True)
+    t = agtool(name="bgbadtool", description="", fn=fn, run_in_subprocess=True)
     s = make_skill(replace_tools=[t])
-    responses = [_tool_call("badtool", {}, "c6"), _direct('{"done": 1}')]
+    responses = [_tool_call("bgbadtool", {}, "c9"), _direct('{"done": 1}')]
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.side_effect = responses
         _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
 
-    sandbox.stop.assert_called_once_with(commit=False)
+    sandbox.stop.assert_not_called()
     tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert "error" in json.loads(tool_msgs[0]["content"])
+    content = json.loads(tool_msgs[0]["content"])
+    assert "error" in content
+    assert "workspace_reverted" not in content
+
+
+def test_tool_exception_with_run_in_subprocess_false_still_stops():
+    """Same exception-triggers-revert teardown as
+    test_tool_exception_triggers_stop_without_commit, confirmed here via a
+    plain ValueError (rather than RuntimeError) raised very early -- before
+    execute_react() ever reaches a tool call -- to show the finally block's
+    rm_container()+inbox path doesn't depend on how far execute_react() got
+    before failing."""
+    sandbox = _make_sandbox_with_tracking()
+    s = make_skill()
+
+    def _raise_early(ag, prev_ctx, skill_input, max_steps=None):
+        raise ValueError("early failure")
+
+    s.execute_react = _raise_early
+
+    ag, pending = _run_skill_via_agent(s, sandbox)
+
+    sandbox.rm_container.assert_called_once_with()
+    sandbox.commit.assert_not_called()
+    assert "early failure" in pending._data.get("error", "")
+    ag.inbox.put.assert_called_once()
+    (note,), _kwargs = ag.inbox.put.call_args
+    assert "revert" in note.lower() or "discard" in note.lower()
+
+
+def test_tool_exception_with_pending_background_work_defers_stop():
+    """Exception-handler path, gated the same way as the success/error
+    path: pending background work must defer stop() here too."""
+    sandbox = _make_sandbox_with_tracking()
+    # True for dispatch_tools()'s own check (what this test targets), then
+    # False afterward -- execute_react() calls wait_for_processes() right
+    # after, whose very first gate check is this same predicate; leaving it
+    # permanently True would make that loop believe work is still pending
+    # forever and hang for the full ping interval instead of returning
+    # immediately (see agsandbox.py's wait_for_processes() docstring).
+    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
+
+    def fn(arg: agdata) -> agdata:
+        raise RuntimeError("exploded")
+
+    t = agtool(name="bgexctool", description="", fn=fn, run_in_subprocess=True)
+    s = make_skill(replace_tools=[t])
+    responses = [_tool_call("bgexctool", {}, "c11"), _direct('{"done": 1}')]
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.side_effect = responses
+        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
+
+    sandbox.stop.assert_not_called()
+    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
+    content = json.loads(tool_msgs[0]["content"])
+    assert "error" in content
+    assert "workspace_reverted" not in content
 
 
 def test_dispatch_tools_accepts_camel_case_llm_arguments():
@@ -1682,6 +1915,9 @@ def _make_real_sandbox(watched_pids=None):
         def __init__(self):
             self._watched_pids = dict(watched_pids or {})
 
+        def _has_pending_background_work(self):
+            return bool(self._watched_pids)
+
         def get_live_pids(self):
             return set(self._watched_pids.keys())
 
@@ -1698,7 +1934,8 @@ def test_wait_for_processes_clean_sandbox_returns_none():
 
 def test_wait_for_processes_no_watched_pids_attr_returns_none():
     class NoPids:
-        pass
+        def _has_pending_background_work(self):
+            return False
 
     assert agSandbox.wait_for_processes(NoPids(), "skill", None, None, "", 300, 5) is None
 
@@ -1707,6 +1944,7 @@ def test_wait_for_processes_mock_sandbox_returns_none():
     from unittest.mock import MagicMock
 
     sb = MagicMock()
+    sb._has_pending_background_work.return_value = False
     assert agSandbox.wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
 
 
@@ -1716,13 +1954,17 @@ def test_wait_for_processes_completes_quickly_returns_completed_msg():
             self._watched_pids = {1234: 0.0}
             self._call_count = 0
 
-        def get_live_pids(self):
+        def _has_pending_background_work(self):
+            # wait_for_processes() polls THIS method in its loop, not
+            # get_live_pids() -- the state transition has to happen here,
+            # not there, or the loop would just spin until ping_interval_s.
             self._call_count += 1
-            # return empty on second poll → processes done
-            if self._call_count >= 2:
+            if self._call_count >= 3:  # gate call + a couple of poll iterations
                 self._watched_pids.clear()
-                return set()
-            return {1234}
+            return bool(self._watched_pids)
+
+        def get_live_pids(self):
+            return set(self._watched_pids.keys())
 
         def pid_status_summary(self):
             return "PID 1234"
@@ -1739,6 +1981,9 @@ def test_wait_for_processes_still_running_returns_update_msg():
     class _FakeSandbox:
         def __init__(self):
             self._watched_pids = {1234: 0.0}
+
+        def _has_pending_background_work(self):
+            return bool(self._watched_pids)
 
         def get_live_pids(self):
             return {1234}
@@ -1760,12 +2005,16 @@ def test_wait_for_processes_calls_state_fn():
             self._watched_pids = {1: 0.0}
             self._call_count = 0
 
-        def get_live_pids(self):
-            # First call returns live pids (triggers monitoring), second returns empty.
+        def _has_pending_background_work(self):
+            # Same reasoning as test_wait_for_processes_completes_quickly_returns_completed_msg:
+            # the loop polls this method, so the transition must live here.
             self._call_count += 1
-            if self._call_count >= 2:
-                return set()
-            return {1}
+            if self._call_count >= 3:
+                self._watched_pids.clear()
+            return bool(self._watched_pids)
+
+        def get_live_pids(self):
+            return set(self._watched_pids.keys())
 
         def pid_status_summary(self):
             return "PID 1"
@@ -1847,6 +2096,9 @@ def test_run_continues_loop_when_sandbox_has_live_pids():
             self._watched_pids = {9999: 0.0}
             self._cleared = False
 
+        def _has_pending_background_work(self):
+            return bool(self._watched_pids)
+
         def get_live_pids(self):
             if self._cleared:
                 return set()
@@ -1903,16 +2155,19 @@ def test_run_injects_process_completed_message():
     class _TrackedSandbox:
         def __init__(self):
             self._watched_pids = {1: 0.0}
-            self._pid_call_count = 0
+            self._call_count = 0
+
+        def _has_pending_background_work(self):
+            # wait_for_processes() polls THIS method in its loop, not
+            # get_live_pids() -- the state transition has to happen here.
+            # First call (the initial gate check): still alive.
+            self._call_count += 1
+            if self._call_count >= 2:
+                self._watched_pids.clear()
+            return bool(self._watched_pids)
 
         def get_live_pids(self):
-            self._pid_call_count += 1
-            # First call (pre-check inside wait_for_processes): still alive.
-            # Second call (during poll loop): clear and report done.
-            if self._pid_call_count >= 2:
-                self._watched_pids.clear()
-                return set()
-            return {1}
+            return set(self._watched_pids.keys())
 
         def pid_status_summary(self):
             return "PID 1"
@@ -1963,6 +2218,9 @@ def test_run_clean_sandbox_returns_immediately():
 
     class _CleanSandbox:
         _watched_pids: dict = {}
+
+        def _has_pending_background_work(self):
+            return False
 
         def get_live_pids(self):
             return set()

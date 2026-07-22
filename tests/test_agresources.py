@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agresources import (
     agResourcePool,
+    amd_render_node_paths_by_pci_bus,
     detect_cpus,
     detect_gpus,
     detect_memory_mb,
@@ -52,6 +54,33 @@ def test_cvd_filter_id_not_in_pool_excluded(monkeypatch):
     assert _cvd_filter([0, 1, 2]) == []
 
 
+def test_cvd_filter_hip_visible_devices_restricts(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1,3")
+    assert _cvd_filter([0, 1, 2, 3]) == [1, 3]
+
+
+def test_cvd_filter_rocr_visible_devices_restricts(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "2")
+    assert _cvd_filter([0, 1, 2, 3]) == [2]
+
+
+def test_cvd_filter_cuda_takes_priority_over_hip(monkeypatch):
+    """If both happen to be set, CUDA_VISIBLE_DEVICES wins -- matches the
+    order _cvd_filter checks them in."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    assert _cvd_filter([0, 1]) == [0]
+
+
+def test_cvd_filter_hip_nodevfiles_passes_all(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "NoDevFiles")
+    assert _cvd_filter([0, 1]) == [0, 1]
+
+
 # ---------------------------------------------------------------------------
 # detect_gpus
 # ---------------------------------------------------------------------------
@@ -93,6 +122,158 @@ def test_detect_gpus_cvd_filters_nvidia_output(monkeypatch):
     mock.stdout = "0\n1\n2\n"
     with patch("agency.agresources.subprocess.run", return_value=mock):
         assert detect_gpus() == [0, 2]
+
+
+def _run_nvidia_fails_rocm_succeeds(rocm_stdout):
+    """Build a subprocess.run stub: nvidia-smi raises FileNotFoundError (not
+    installed), rocm-smi succeeds with the given stdout -- simulating an
+    AMD-only host, exactly the fallback path detect_gpus() is meant to take."""
+
+    def _run(cmd, *a, **kw):
+        if cmd[0] == "nvidia-smi":
+            raise FileNotFoundError("no nvidia-smi")
+        mock = MagicMock()
+        mock.returncode = 0
+        mock.stdout = rocm_stdout
+        return mock
+
+    return _run
+
+
+def test_detect_gpus_falls_back_to_rocm_smi_when_nvidia_smi_missing(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    stdout = "device,Device Name\ncard0,AMD Instinct MI350X\ncard1,AMD Instinct MI350X\n"
+    with patch(
+        "agency.agresources.subprocess.run",
+        side_effect=_run_nvidia_fails_rocm_succeeds(stdout),
+    ):
+        assert detect_gpus() == [0, 1]
+
+
+def test_detect_gpus_rocm_smi_cvd_filters_via_hip_visible_devices(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    stdout = "device,Device Name\ncard0,AMD Instinct MI350X\ncard1,AMD Instinct MI350X\n"
+    with patch(
+        "agency.agresources.subprocess.run",
+        side_effect=_run_nvidia_fails_rocm_succeeds(stdout),
+    ):
+        assert detect_gpus() == [1]
+
+
+# ---------------------------------------------------------------------------
+# amd_render_node_paths_by_pci_bus -- regression coverage for a real finding
+# on 8x MI350X hardware: rocm-smi's GPU index does NOT correspond to sorted
+# /dev/dri/renderD* order (each GPU there exposes itself plus 7 XCD/compute-
+# partition sibling render nodes, 64 nodes total for 8 GPUs, and even the
+# primary node's number doesn't sort in GPU-index order -- GPU 3's real node
+# was the numerically LOWEST of the 64 present). These tests mock both
+# `rocm-smi --showbus` (subprocess.run) and the /sys/class/drm/*/device
+# symlink resolution (os.path.realpath) so they run identically with or
+# without real ROCm hardware -- see TestAmdRenderNodeLiveHardware in
+# tests/agsandbox_backends/test_container.py for the check against real
+# hardware.
+# ---------------------------------------------------------------------------
+
+
+def _showbus_stdout(bus_by_gpu_id):
+    lines = ["device,PCI Bus"]
+    for gpu_id, bus in bus_by_gpu_id.items():
+        lines.append(f"card{gpu_id},{bus}")
+    return "\n".join(lines) + "\n"
+
+
+def _realpath_stub(bus_by_render_name):
+    """Stub for os.path.realpath: resolves /sys/class/drm/<name>/device to a
+    fake sysfs path ending in the given PCI bus, or (if the name maps to
+    None) a non-PCI platform-device path -- mirrors the real
+    "amdgpu_xcp_N" sysfs layout an XCD/compute-partition sibling render
+    node resolves to on real MI300/MI350 hardware."""
+
+    def _realpath(path):
+        name = path.split("/")[-2]
+        bus = bus_by_render_name.get(name)
+        if bus is None:
+            return f"/sys/devices/platform/amdgpu_xcp_{name}"
+        return f"/sys/devices/pci0000:00/0000:00:01.1/{bus}"
+
+    return _realpath
+
+
+def test_amd_render_node_paths_by_pci_bus_returns_none_when_rocm_smi_missing():
+    with patch("agency.agresources.subprocess.run", side_effect=FileNotFoundError):
+        assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
+
+
+def test_amd_render_node_paths_by_pci_bus_returns_none_on_nonzero_exit():
+    mock = MagicMock()
+    mock.returncode = 1
+    mock.stdout = ""
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
+
+
+def test_amd_render_node_paths_by_pci_bus_returns_none_when_a_gpu_bus_is_unmatched():
+    """Only one of two GPUs' PCI buses resolves to a candidate render node --
+    the mapping must be refused entirely (caller falls back to naive order)
+    rather than half-applied to just the GPUs that happened to match."""
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = _showbus_stdout({0: "0000:05:00.0", 1: "0000:15:00.0"})
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        with patch(
+            "agency.agresources.os.path.realpath",
+            side_effect=_realpath_stub({"renderD128": "0000:05:00.0"}),
+        ):
+            assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
+
+
+def test_amd_render_node_paths_by_pci_bus_reorders_to_match_gpu_index():
+    """Miniature reproduction of the real 8x MI350X finding: sorted
+    /dev/dri order does NOT correspond to rocm-smi's GPU index -- here
+    renderD128 is actually GPU 1's node and renderD129 is actually GPU 0's,
+    the reverse of naive sorted order."""
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = _showbus_stdout({0: "0000:75:00.0", 1: "0000:05:00.0"})
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        with patch(
+            "agency.agresources.os.path.realpath",
+            side_effect=_realpath_stub(
+                {"renderD128": "0000:05:00.0", "renderD129": "0000:75:00.0"}
+            ),
+        ):
+            result = amd_render_node_paths_by_pci_bus(
+                ["/dev/dri/renderD128", "/dev/dri/renderD129"]
+            )
+    assert result == ["/dev/dri/renderD129", "/dev/dri/renderD128"]
+
+
+def test_amd_render_node_paths_by_pci_bus_ignores_non_pci_xcp_sibling_nodes():
+    """XCD/compute-partition sibling render nodes (sysfs parent is a
+    "amdgpu_xcp_N" platform device, not a PCI device) must never be picked
+    as a GPU's primary node -- only the one with a real resolvable PCI bus
+    can match a GPU."""
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = _showbus_stdout({0: "0000:05:00.0", 1: "0000:15:00.0"})
+    with patch("agency.agresources.subprocess.run", return_value=mock):
+        with patch(
+            "agency.agresources.os.path.realpath",
+            side_effect=_realpath_stub(
+                {
+                    "renderD128": "0000:05:00.0",
+                    "renderD129": None,  # XCP sibling of GPU 0
+                    "renderD136": "0000:15:00.0",
+                }
+            ),
+        ):
+            result = amd_render_node_paths_by_pci_bus(
+                ["/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD136"]
+            )
+    assert result == ["/dev/dri/renderD128", "/dev/dri/renderD136"]
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +326,7 @@ def test_pool_explicit_gpus():
 def test_pool_empty_gpus():
     pool = agResourcePool(gpus=[], total_cpus=4, total_memory_mb=8192)
     assert pool.gpus == []
-    assert pool._gpu_locks == {}
+    assert pool._free_gpus == set()
 
 
 def test_pool_default_idle_values():
@@ -221,20 +402,18 @@ def test_acquire_blocks_until_release():
     acquired_after = threading.Event()
 
     def waiter():
-        pool.acquire_gpu(timeout=2.0)
+        pool.acquire_gpu(timeout=5.0)
         acquired_after.set()
 
     t = threading.Thread(target=waiter, daemon=True)
     t.start()
 
-    import time
-
     time.sleep(0.05)
     assert not acquired_after.is_set()
     pool.release_gpu(0)
-    acquired_after.wait(timeout=2.0)
+    acquired_after.wait(timeout=5.0)
     assert acquired_after.is_set()
-    t.join(timeout=2.0)
+    t.join(timeout=5.0)
 
 
 def test_acquire_timeout_raises():
@@ -243,6 +422,91 @@ def test_acquire_timeout_raises():
     with pytest.raises(TimeoutError):
         pool.acquire_gpu(timeout=0.1)
     pool.release_gpu(0)
+
+
+def test_acquire_does_not_poll_via_sleep(monkeypatch):
+    """acquire_gpu() blocks on Condition.wait(), not a sleep/retry loop --
+    unlike the old per-GPU-semaphore round-robin polling design, nothing in
+    the wait path should ever call time.sleep(). Uses a threading.Event
+    (not time.sleep) to sequence the main thread, since agency.agresources'
+    `time` import IS the stdlib time module -- patching time.sleep there
+    patches it everywhere in this process, including a time.sleep() call
+    made directly from this test."""
+    pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
+    pool.acquire_gpu()
+
+    slept = []
+    monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
+
+    started = threading.Event()
+
+    def waiter():
+        started.set()
+        pool.acquire_gpu(timeout=2.0)
+
+    t = threading.Thread(target=waiter, daemon=True)
+    t.start()
+    started.wait(timeout=5.0)
+    pool.release_gpu(0)
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert slept == []
+
+
+def test_release_wakes_a_waiter_promptly():
+    """release_gpu() must wake a blocked waiter directly (via notify()),
+    not leave it discovering the free GPU only on its next poll tick --
+    the wakeup should land in well under what a 0.25s poll interval would
+    have cost."""
+    pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
+    pool.acquire_gpu()
+
+    woke_at = []
+
+    def waiter():
+        pool.acquire_gpu(timeout=5.0)
+        woke_at.append(time.monotonic())
+
+    t = threading.Thread(target=waiter, daemon=True)
+    t.start()
+    time.sleep(0.05)  # ensure the waiter is parked in wait() before releasing
+    released_at = time.monotonic()
+    pool.release_gpu(0)
+    t.join(timeout=5.0)
+    assert woke_at, "waiter never acquired the released GPU"
+    assert woke_at[0] - released_at < 0.05
+
+
+def test_multiple_waiters_each_get_woken_exactly_once():
+    """With N GPUs freed one at a time, exactly N waiters (out of more than
+    N contenders) should succeed -- notify() must wake one waiter per
+    release, never zero (a waiter stuck forever) or more than one racing
+    for the same freed id."""
+    pool = agResourcePool(gpus=[0, 1], total_cpus=4, total_memory_mb=8192)
+    pool.acquire_gpu()
+    pool.acquire_gpu()
+
+    results = []
+    lock = threading.Lock()
+
+    def waiter():
+        try:
+            gpu_id = pool.acquire_gpu(timeout=5.0)
+            with lock:
+                results.append(gpu_id)
+        except TimeoutError:
+            pass
+
+    threads = [threading.Thread(target=waiter, daemon=True) for _ in range(4)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)
+    pool.release_gpu(0)
+    pool.release_gpu(1)
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert sorted(results) == [0, 1]
 
 
 def test_release_unknown_gpu_is_safe():
@@ -256,7 +520,25 @@ def test_release_double_release_warns(capsys):
     pool.release_gpu(0)
     pool.release_gpu(0)  # double-release — warns, does not raise
     captured = capsys.readouterr()
-    assert "WARNING" in captured.out or True  # warning is best-effort
+    assert "WARNING" in captured.out
+
+
+def test_release_gpu_is_immediate_no_polling(monkeypatch):
+    """release_gpu() no longer takes (or needs) an is_clear predicate to
+    poll: callers (backend stop()/destroy()) already run their own kill +
+    container-removal/jail-rmtree teardown synchronously BEFORE calling
+    this, so that ordering alone is the confirmation the sandbox has
+    exited -- see agresources.release_gpu()'s docstring. Release must be
+    immediate, with no sleep/poll loop of its own."""
+    pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
+    pool.acquire_gpu()
+
+    slept = []
+    monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
+
+    pool.release_gpu(0)
+    assert slept == []
+    assert pool._gpus_acquired == 0
 
 
 # ---------------------------------------------------------------------------

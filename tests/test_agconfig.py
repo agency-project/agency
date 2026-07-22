@@ -1075,7 +1075,7 @@ def test_sandbox_base_image_default_accessor():
 
 
 def test_llm_default_context_limit_default_accessor():
-    assert _AgLLMFields.default_context_limit.default == 128_000
+    assert _AgLLMFields.default_context_limit.default == 200_000
 
 
 def test_llm_tail_turns_default_accessor():

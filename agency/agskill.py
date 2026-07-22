@@ -300,7 +300,6 @@ class agskill:
         agpause.tag_producer(result_future, ag)
         agpause.tag_producer(ctx_future, ag)
         ts_start = _ts()
-        resource_pool = type(ag).agresource_pool
 
         def _task() -> None:
             outer_result: agdata | None = None
@@ -393,13 +392,34 @@ class agskill:
                 history_before = list(prev_ctx.messages)
                 ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
             finally:
-                # ── 4. Teardown — release GPU slot, commit container filesystem.
+                # ── 4. Teardown — commit or discard the sandbox; this is
+                # now the only rollback boundary (per-tool rollback no
+                # longer exists -- see agtool.py's dispatch_tools()).
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 ag._set_ui_state("error" if _had_error else "finished")
-                if ag.sandbox is not None and ag.sandbox._gpu_id is not None:
-                    resource_pool.release_gpu(ag.sandbox._gpu_id)
                 if ag.sandbox is not None:
-                    ag.sandbox.stop(commit=True)
+                    if _had_error:
+                        # Discard everything since the last successful
+                        # skill's commit(). The notice can't go into this
+                        # skill's own result (already final by this point)
+                        # -- it goes on the inbox instead, so the NEXT
+                        # skill call's execute_react loop (via
+                        # ag._drain_inbox(), run before its first LLM call)
+                        # surfaces it right as the agent resumes sandbox
+                        # work, rather than never telling it at all.
+                        ag.sandbox.rm_container()
+                        ag.inbox.put(
+                            "Note: the previous skill call failed. Its sandbox "
+                            "workspace changes have been discarded and the "
+                            "workspace has been reverted to the last "
+                            "successful checkpoint."
+                        )
+                    else:
+                        # commit() squashes automatically once the layer
+                        # chain's actual depth crosses checkpoint_squash_
+                        # max_depth -- see its docstring for why that's a
+                        # depth-triggered check, not a fixed commit count.
+                        ag.sandbox.commit()
                 if sandbox_lock is not None:
                     sandbox_lock.release()
                 agpause.set_current_worker_agent(None)

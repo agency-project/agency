@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import threading
 import time
@@ -28,9 +29,6 @@ class _AgResourcePoolFields:
     memory_detect_fallback_mb = GlobalConfigParam(
         "agResourcePool", default=4096
     )  # Safe fallback total RAM in MB when detection fails on both Linux and macOS
-    gpu_acquire_poll_interval_s = GlobalConfigParam(
-        "agResourcePool", default=0.25
-    )  # Seconds between polls waiting for a free GPU semaphore
     marker_mb = GlobalConfigParam(
         "agResourcePool", default=128
     )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
@@ -61,33 +59,42 @@ class agResourcePoolConfig(_AgConfigViewBase):
     _OWNER = "agResourcePool"
 
 
-def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
-    """Allocate marker_mb of VRAM on each GPU directly in the calling process.
+def _visible_device_remap(env_names: "tuple[str, ...]") -> dict[int, int]:
+    """Build a physical-id -> remapped-index map from whichever of env_names
+    is set (e.g. CUDA_VISIBLE_DEVICES="0,3,5,7" -> {0:0, 3:1, 5:2, 7:3}),
+    mirroring how the driver itself remaps physical GPUs to indices 0..N-1
+    inside a process that only sees a restricted device list."""
+    for name in env_names:
+        val = os.environ.get(name, "")
+        if not val or val.lower() in ("nodevfiles", "none"):
+            continue
+        try:
+            ids = [int(x.strip()) for x in val.split(",") if x.strip().lstrip("-").isdigit()]
+            if ids:
+                return {phys: idx for idx, phys in enumerate(ids)}
+        except Exception as _e:
+            print(f"[agresources] WARNING: could not parse {name}={val!r}: {_e}")
+    return {}
 
-    Uses the CUDA driver API via ctypes — no torch dependency required.
-    Allocations live for the process lifetime, which is fine: the memory is
-    tiny (128 MB per GPU by default) and there is no need to release it mid-run.
-    Runs silently if CUDA is unavailable.
-    """
-    marker_bytes = _AgResourcePoolFields().marker_mb * 1024 * 1024
+
+def _allocate_gpu_markers_cuda(gpu_ids: list[int], marker_bytes: int) -> bool:
+    """Try the CUDA driver API. Returns True if libcuda was found at all
+    (regardless of whether individual per-GPU allocations went on to
+    succeed) so the caller knows not to also try the ROCm/HIP path -- a
+    cuInit failure means a broken/inaccessible NVIDIA driver, not "try AMD
+    instead," since there's no AMD hardware to fall back to on an NVIDIA
+    host anyway. Returns False only when libcuda.so.1 isn't present at all."""
     try:
         cuda = ctypes.CDLL("libcuda.so.1")
     except OSError:
-        return
+        return False
     if cuda.cuInit(0) != 0:
-        return
+        return True
 
     # When CUDA_VISIBLE_DEVICES is set (e.g. "0,3,5,7"), the CUDA driver
     # remaps physical GPUs to indices 0..N-1.  gpu_ids are physical IDs, so
     # we must convert to the remapped index before calling CUDA APIs.
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    cuda_index: dict[int, int] = {}
-    if cvd and cvd.lower() not in ("nodevfiles", "none"):
-        try:
-            cvd_list = [int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()]
-            cuda_index = {phys: idx for idx, phys in enumerate(cvd_list)}
-        except Exception:
-            pass
+    cuda_index = _visible_device_remap(("CUDA_VISIBLE_DEVICES",))
 
     for gpu_id in gpu_ids:
         try:
@@ -98,21 +105,68 @@ def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
                 continue
             cuda.cuMemAlloc_v2(ctypes.byref(ptr), marker_bytes)
             # Leave context current; allocation persists for the process lifetime.
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[agresources] WARNING: CUDA marker allocation failed for GPU {gpu_id}: {_e}")
+    return True
+
+
+def _allocate_gpu_markers_rocm(gpu_ids: list[int], marker_bytes: int) -> None:
+    """ROCm/HIP equivalent of _allocate_gpu_markers_cuda. HIP's runtime API
+    manages a context implicitly per device (hipSetDevice + hipMalloc)
+    rather than CUDA driver API's explicit per-device context object, so
+    there's no analogue of cuCtxCreate to call here."""
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+    except OSError:
+        return
+    if hip.hipInit(0) != 0:
+        return
+
+    hip_index = _visible_device_remap(("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"))
+
+    for gpu_id in gpu_ids:
+        try:
+            dev = hip_index.get(gpu_id, gpu_id)
+            if hip.hipSetDevice(dev) != 0:
+                continue
+            ptr = ctypes.c_void_p()
+            hip.hipMalloc(ctypes.byref(ptr), marker_bytes)
+            # Leave allocated; persists for the process lifetime, same as the
+            # CUDA path above.
+        except Exception as _e:
+            print(f"[agresources] WARNING: ROCm marker allocation failed for GPU {gpu_id}: {_e}")
+
+
+def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
+    """Allocate marker_mb of VRAM on each GPU directly in the calling process.
+
+    Tries the CUDA driver API first, falling back to ROCm/HIP — no torch
+    dependency required either way. Allocations live for the process
+    lifetime, which is fine: the memory is tiny (128 MB per GPU by default)
+    and there is no need to release it mid-run. Runs silently if neither
+    CUDA nor ROCm is available.
+    """
+    marker_bytes = _AgResourcePoolFields().marker_mb * 1024 * 1024
+    if _allocate_gpu_markers_cuda(gpu_ids, marker_bytes):
+        return
+    _allocate_gpu_markers_rocm(gpu_ids, marker_bytes)
 
 
 def _cvd_filter(gpu_ids: list[int]) -> list[int]:
-    """Filter gpu_ids to the subset allowed by CUDA_VISIBLE_DEVICES (if set)."""
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not cvd or cvd.lower() in ("nodevfiles", "none"):
-        return gpu_ids
-    try:
-        allowed = {int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()}
-        if allowed:
-            return [g for g in gpu_ids if g in allowed]
-    except Exception:
-        pass
+    """Filter gpu_ids to the subset allowed by CUDA_VISIBLE_DEVICES,
+    HIP_VISIBLE_DEVICES, or ROCR_VISIBLE_DEVICES (whichever is set; checked
+    in that order so a CUDA restriction always wins if somehow more than one
+    is set at once)."""
+    for _env in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+        cvd = os.environ.get(_env, "")
+        if not cvd or cvd.lower() in ("nodevfiles", "none"):
+            continue
+        try:
+            allowed = {int(x.strip()) for x in cvd.split(",") if x.strip().lstrip("-").isdigit()}
+            if allowed:
+                return [g for g in gpu_ids if g in allowed]
+        except Exception as _e:
+            print(f"[agresources] WARNING: could not parse {_env}={cvd!r}: {_e}")
     return gpu_ids
 
 
@@ -129,8 +183,10 @@ def detect_gpus() -> list[int]:
         if result.returncode == 0 and result.stdout.strip():
             ids = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
             return _cvd_filter(ids)
-    except Exception:
-        pass
+    except Exception as _e:
+        # Expected on any host without an NVIDIA driver/nvidia-smi installed --
+        # falls through to the ROCm probe below.
+        print(f"[agresources] nvidia-smi probe failed, trying rocm-smi: {_e}")
     try:
         result = subprocess.run(
             ["rocm-smi", "--showid", "--csv"],
@@ -158,9 +214,92 @@ def detect_gpus() -> list[int]:
                         pass
             if ids:
                 return _cvd_filter(ids)
-    except Exception:
-        pass
+    except Exception as _e:
+        # Expected on any host without an AMD driver/rocm-smi installed.
+        print(f"[agresources] rocm-smi probe failed, no GPUs detected: {_e}")
     return []
+
+
+# Matches the trailing PCI bus address segment of a resolved sysfs device
+# path (e.g. ".../0000:75:00.0" -> "0000:75:00.0").
+_PCI_BUS_RE = re.compile(r"([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$")
+
+
+def _amd_render_node_pci_bus(name: str) -> "str | None":
+    """Resolve the real PCI bus address (e.g. "0000:75:00.0") backing a
+    /dev/dri render node by name (e.g. "renderD128"), by following
+    /sys/class/drm/<name>/device. Returns None for XCD/compute-partition
+    sibling nodes: MI300/MI350-class GPUs expose one render node per
+    accelerator-complex-die under a "amdgpu_xcp_N" platform device even
+    while the GPU itself is in unpartitioned (SPX) mode, and only the one
+    node with a real PCI parent maps 1:1 to a physical GPU."""
+    target = os.path.realpath(f"/sys/class/drm/{name}/device")
+    match = _PCI_BUS_RE.search(target)
+    return match.group(1).lower() if match else None
+
+
+def amd_render_node_paths_by_pci_bus(candidates: "list[str]") -> "list[str] | None":
+    """Reorder *candidates* (absolute /dev/dri/renderD* paths) so index N is
+    the render node for rocm-smi's GPU N, by cross-referencing `rocm-smi
+    --showbus` (GPU index -> PCI bus) against each candidate's own resolved
+    PCI bus -- NOT by assuming sorted order already matches GPU index.
+
+    Confirmed necessary on real 8x MI350X hardware: each GPU there exposes
+    itself plus 7 XCD/compute-partition sibling render nodes (64 nodes total
+    for 8 GPUs), and even the primary node's number doesn't sort in the same
+    order as rocm-smi's GPU index -- e.g. GPU 3's real node was the
+    numerically LOWEST of the 64 present, not the 4th. Naively picking
+    sorted-index N (the old behavior) scoped several GPU IDs to nodes
+    belonging to a different physical GPU entirely.
+
+    Returns None (caller should fall back to naive sorted order) if
+    `rocm-smi --showbus` fails/is unavailable, or any GPU's bus can't be
+    matched to exactly one candidate -- a partial mapping is never applied,
+    since trusting it for some GPUs and not others would be worse than the
+    naive fallback it's meant to replace.
+    """
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showbus", "--csv"],
+            capture_output=True,
+            text=True,
+            timeout=_AgResourcePoolFields().gpu_detect_timeout_s,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+
+    bus_by_gpu_id: "dict[int, str]" = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("device"):
+            continue
+        parts = [c.strip() for c in line.split(",")]
+        if len(parts) < 2 or not parts[0].lower().startswith("card"):
+            continue
+        try:
+            gpu_id = int(parts[0][4:])
+        except ValueError:
+            continue
+        bus_by_gpu_id[gpu_id] = parts[1].lower()
+    if not bus_by_gpu_id:
+        return None
+
+    render_by_bus: "dict[str, str]" = {}
+    for path in candidates:
+        bus = _amd_render_node_pci_bus(os.path.basename(path))
+        if bus is not None:
+            render_by_bus.setdefault(bus, path)
+
+    ordered = []
+    for gpu_id in range(max(bus_by_gpu_id) + 1):
+        bus = bus_by_gpu_id.get(gpu_id)
+        path = render_by_bus.get(bus) if bus is not None else None
+        if path is None:
+            return None
+        ordered.append(path)
+    return ordered
 
 
 def detect_cpus() -> int:
@@ -175,8 +314,10 @@ def detect_memory_mb() -> int:
             for line in f:
                 if line.startswith("MemTotal:"):
                     return int(line.split()[1]) // 1024  # kB → MB
-    except Exception:
-        pass
+    except Exception as _e:
+        # Expected on non-Linux hosts (e.g. macOS has no /proc) -- falls
+        # through to the sysctl probe below.
+        print(f"[agresources] /proc/meminfo read failed, trying sysctl: {_e}")
     try:
         result = subprocess.run(
             ["sysctl", "-n", "hw.memsize"],
@@ -186,8 +327,8 @@ def detect_memory_mb() -> int:
         )
         if result.returncode == 0:
             return int(result.stdout.strip()) // (1024 * 1024)
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[agresources] sysctl memory probe failed, using configured fallback: {_e}")
     return _AgResourcePoolFields().memory_detect_fallback_mb
 
 
@@ -241,11 +382,22 @@ class agResourcePool(_AgResourcePoolFields):
         self.total_memory_mb = (
             total_memory_mb if total_memory_mb is not None else detect_memory_mb()
         )
-        self._gpu_locks: dict[int, threading.Semaphore] = {
-            gpu_id: threading.Semaphore(1) for gpu_id in self.gpus
-        }
-        self._res_lock = threading.Lock()
+        # A single Condition (rather than one BoundedSemaphore per GPU) so
+        # release_gpu() can directly wake a waiter instead of every
+        # acquire_gpu() call polling every GPU's own lock in a loop -- see
+        # acquire_gpu()/release_gpu() docstrings for the full reasoning.
+        # Guards only _free_gpus/_gpus_acquired -- NOT cpus_acquired/
+        # memory_acquired_mb, which have no invariant linking them to GPU
+        # state (a thread can reserve CPU while another concurrently
+        # acquires a GPU with no interaction between the two), so they get
+        # their own _cpu_mem_cond instead of sharing this one.
+        self._gpu_cond = threading.Condition()
+        self._free_gpus: set[int] = set(self.gpus)
         self._gpus_acquired: int = 0
+        # Plain mutex for cpus_acquired/memory_acquired_mb -- a Condition
+        # rather than a bare Lock only for consistency with _gpu_cond above;
+        # nothing here ever calls wait()/notify().
+        self._cpu_mem_cond = threading.Condition()
         self.cpus_acquired: float = 0.0
         self.memory_acquired_mb: int = 0
         if mark_gpus and self.gpus:
@@ -263,49 +415,107 @@ class agResourcePool(_AgResourcePoolFields):
         return self._agconfig.clone()
 
     def acquire_gpu(self, timeout: float | None = None) -> int:
-        """Block until any GPU is free; return its id."""
-        deadline = None if timeout is None else time.monotonic() + timeout
-        poll = _AgResourcePoolFields().gpu_acquire_poll_interval_s
+        """Block until any GPU is free; return its id.
 
-        while True:
-            for gpu_id, sem in self._gpu_locks.items():
-                if sem.acquire(blocking=False):
-                    with self._res_lock:
-                        self._gpus_acquired += 1
-                    self._emit_resource()
-                    return gpu_id
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
-            time.sleep(poll)
+        Waits on a single shared Condition rather than polling every GPU's
+        own lock in a loop -- release_gpu() notifies exactly one waiter the
+        moment a GPU frees up, instead of every waiter re-checking on a
+        fixed timer (which wasted CPU/context-switches under contention and
+        added up to one poll interval of latency before a freed GPU was
+        even noticed).
+
+        The `while not self._free_gpus` re-check after `wait()` returns is
+        required, not defensive style: `notify()` only guarantees the
+        woken thread gets a chance to recheck the condition, not that what
+        it was waiting for is still there by the time it reacquires the
+        lock -- another thread (a waiter woken earlier, or a fresh caller
+        that never waited at all) can win the race and take the last free
+        GPU first. `remaining` is recomputed from the original deadline on
+        each iteration (not reset to a fresh `timeout`) so a caller that
+        gets repeatedly out-raced still times out after its original
+        budget, not a fresh one per iteration.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._gpu_cond:
+            while not self._free_gpus:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
+                if not self._gpu_cond.wait(timeout=remaining):
+                    raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
+            gpu_id = self._free_gpus.pop()
+            self._gpus_acquired += 1
+        self._emit_resource()
+        return gpu_id
 
     def release_gpu(self, gpu_id: int) -> None:
-        sem = self._gpu_locks.get(gpu_id)
-        if sem is not None:
-            try:
-                sem.release()
-            except ValueError as _e:
-                print(
-                    f"[agresources] WARNING: GPU semaphore double-release for gpu_id={gpu_id}: {_e}"
-                )
-            with self._res_lock:
-                self._gpus_acquired = max(0, self._gpus_acquired - 1)
-            self._emit_resource()
+        """Release *gpu_id* back to the pool.
+
+        No separate "is this actually idle yet" wait: callers (backend
+        `stop()`/`destroy()`) already run their own teardown -- kill
+        watched processes, then remove the container / rmtree the chroot
+        jail -- synchronously, BEFORE calling this. That ordering is
+        already the confirmation that the sandbox has exited; a poll here
+        would just be re-checking, via the exact same tracked state the
+        teardown already acted on, something the sequencing already
+        guarantees. (A prior version of this threaded an `is_clear`
+        predicate through here for exactly that re-check; removed as
+        redundant -- see agsandbox_backends.chroot's module docstring for
+        the reasoning that led here.)
+
+        Explicitly guards against gpu_id not being one of this pool's GPUs,
+        and against double-releasing a gpu_id already in `_free_gpus` --
+        neither is caught for free by a plain set the way a
+        BoundedSemaphore used to reject an over-release on its own. The
+        second check matters even though a set can't hold two copies of
+        the same id: without it, a double-release (or releasing a gpu_id
+        another sandbox still legitimately holds) would silently mark an
+        in-use GPU as free, letting two sandboxes acquire the same physical
+        GPU at once -- the actual hazard, not just a cosmetic duplicate
+        entry.
+        """
+        with self._gpu_cond:
+            if gpu_id not in self.gpus:
+                print(f"[agresources] WARNING: release_gpu called with unknown gpu_id={gpu_id}")
+                return
+            if gpu_id in self._free_gpus:
+                print(f"[agresources] WARNING: GPU double-release for gpu_id={gpu_id}")
+                return
+            self._free_gpus.add(gpu_id)
+            self._gpus_acquired = max(0, self._gpus_acquired - 1)
+            self._gpu_cond.notify()
+        self._emit_resource()
 
     def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:
         """Record that a sandbox boosted its CPU/memory limits."""
-        with self._res_lock:
+        with self._cpu_mem_cond:
             self.cpus_acquired += cpus
             self.memory_acquired_mb += memory_mb
         self._emit_resource()
 
     def notify_cpu_released(self, cpus: float, memory_mb: int) -> None:
         """Record that a sandbox reset its CPU/memory limits to idle."""
-        with self._res_lock:
+        with self._cpu_mem_cond:
             self.cpus_acquired = max(0.0, self.cpus_acquired - cpus)
             self.memory_acquired_mb = max(0, self.memory_acquired_mb - memory_mb)
         self._emit_resource()
 
     def _emit_resource(self) -> None:
+        """Push a resource_update to the webui dashboard, if active.
+
+        Reads _gpus_acquired/cpus_acquired/memory_acquired_mb directly, with
+        no lock -- this is a live status gauge for a dashboard badge, not a
+        value anything computes with, so there's no invariant here worth
+        guarding: a plain int/float attribute read is already atomic under
+        the GIL (no torn reads), and the value is stale the instant it
+        crosses into the emitter/websocket/browser regardless of whether a
+        lock momentarily delayed a concurrent writer. Locking here would
+        narrow that inevitable staleness window by nothing -- it would just
+        relocate where the race happens, not remove it. (Contrast
+        _free_gpus in acquire_gpu()/release_gpu(), which DOES need locking:
+        two threads racing there can make two sandboxes believe they hold
+        the same physical GPU -- an actual invariant, not a status number.)
+        """
         try:
             from . import agwebui as _agwebui
 

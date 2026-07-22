@@ -6,17 +6,17 @@ All filesystem operations — bash commands, file reads, file writes, glob searc
 
 ## GPU device access
 
-`--gpus all` is passed to `run` when `nvidia-smi` detects GPUs on the host, mounting the NVIDIA device files into the container. On CPU-only hosts the flag is omitted.
+`--gpus all` (docker) / CDI `=all` (podman) / per-file device binds scoped to the currently-leased GPU (chroot, re-derived fresh on every `exec()`) make the host's GPU devices reachable, **once the sandbox has actually called `reserve_gpu()`** — a sandbox that never reserves a GPU gets nothing GPU-related passed/mounted at all, same as a CPU-only host. See [agsandbox_backends/container.md](agsandbox_backends/container.md)/[chroot.md](agsandbox_backends/chroot.md) for the backend-specific mechanics, including why the container backends attach *every* GPU rather than just the one currently leased (it's what lets `stop()` release the physical GPU between tool calls without ever needing to recreate the container).
 
-Even with `--gpus all`, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES=""` when no virtual reservation is active, making all GPUs invisible to CUDA. Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken. When `exec()` runs a bash command and the virtual flag is set, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected. After a foreground exec with no background processes, the physical GPU is returned to the pool immediately — freeing it for other agents while the LLM thinks. When background processes are alive, the GPU is held until `get_live_pids()` finds them all finished.
+Even so, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES="NoDevFiles"` when no GPU is currently leased, making all GPUs invisible to CUDA (`readonly`-exported, so a command can't hijack a different GPU by reassigning the variable inline). Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken yet. When `exec()` runs a bash command and the virtual flag is set but no GPU is currently held, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected — held across every subsequent `exec()` call, not reacquired each time.
 
-See [agsandbox_backends/container.md](agsandbox_backends/container.md) for the container-runtime-level mechanics (the actual `--gpus all`/`--device` flags passed to `run`) behind this.
+**GPU release now happens on every hibernate, not just at teardown.** There is no `gpu_release` tool and no `is_clear`/polling mechanism — `pool.release_gpu()` releases the semaphore immediately, unconditionally, with no wait. Safety comes purely from ordering: `stop()`/`rm_container()`/`destroy()` always stop or tear down whatever the sandbox was running *before* releasing the GPU, so by the time release happens, nothing this backend could see is still using it. A GPU, once actually acquired, is released every time the sandbox hibernates between tool calls (`sandbox.stop()`) and re-acquired (possibly a *different* physical GPU) on the next `exec()` — there's still no way for the agent to free it back to the pool explicitly mid-tool-call, but it's no longer held for the sandbox's whole lifetime either.
 
 ## Concurrent access
 
 Each `agSandbox` allocates `self._lock = threading.RLock()` in `__init__`. It exists because a single `agSandbox` instance can be handed to more than one agent (there's no ownership flag preventing this — see the lifecycle warning above), and two skill runs interleaving `exec()` / `stop()` / `_ensure_started()` calls against the same container would corrupt its state.
 
-The lock is **not self-enforcing** — `agSandbox`'s own methods don't acquire it. Instead, `agskill.py`'s `_task()` acquires `ag.sandbox._lock` right after provisioning and holds it for the *entire* skill run, releasing it only after the final teardown `stop()`. This makes "one skill run owns this sandbox at a time" an invariant enforced by the caller (agskill), not by `agSandbox` itself. Code that drives a shared `agSandbox` outside of an agskill run (harness scripts, custom orchestration) must coordinate its own access if it needs the same guarantee — see `Design_architecture.md`'s "Per-sandbox mutex" section for the full rationale.
+The lock is **not self-enforcing** — `agSandbox`'s own methods don't acquire it. Instead, `agskill.py`'s `_task()` acquires `ag.sandbox._lock` right after provisioning and holds it for the *entire* skill run, releasing it only after the final teardown (`commit()` on success, `rm_container()` on failure). This makes "one skill run owns this sandbox at a time" an invariant enforced by the caller (agskill), not by `agSandbox` itself. Code that drives a shared `agSandbox` outside of an agskill run (harness scripts, custom orchestration) must coordinate its own access if it needs the same guarantee — see `Design_architecture.md`'s "Per-sandbox mutex" section for the full rationale.
 
 Because `threading.RLock` isn't picklable, `agSandbox` defines `__getstate__`/`__setstate__` to drop `_lock` before pickling and allocate a fresh one on unpickling. This matters because custom tools with `run_in_subprocess=True` (the default) get `cloudpickle`d to a worker process — without this, capturing a sandbox in such a tool's closure would raise `TypeError: cannot pickle '_thread.RLock' object`. All built-in tools (bash, read, write, grep, glob, …) use `run_in_subprocess=False` and never hit this path.
 
@@ -43,6 +43,8 @@ Forking copies the parent's checkpoint image tag to a new tag for the fork via `
 Because forks wait for `src.ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
 ## exec wrapper
+
+> This section (and "Process tracking state" below) describes the **container backends'** before/after PID-diffing specifically. Chroot tracks background work differently — purely via process groups, with no before/after diff and no `_baseline_pids`/`_watched_pids` population at all — see [agsandbox_backends/chroot.md](agsandbox_backends/chroot.md#background-process-tracking).
 
 Every bash command is wrapped before being sent to the container shell:
 
@@ -123,8 +125,12 @@ sb.read_file(path) -> str           # UTF-8 text; raises UnicodeDecodeError for 
 sb.read_file_bytes(path) -> bytes   # raw bytes; no decode attempt
 sb.write_file(path, content)        # UTF-8 text via stdin pipe
 sb.write_file_bytes(path, data)     # raw bytes via base64 round-trip
-sb.commit(tag) -> bool  # False if backend was never started; True after a successful snapshot
-sb.stop(commit=False)   # tear down; if commit=True, snapshot to agency/lifecycle-<name> first
+sb.commit(tag=None) -> bool  # False if backend was never started; True after a successful snapshot
+                              # to agency/lifecycle-<name> (default) or tag -- container/workspace
+                              # stays running/intact either way, nothing is removed
+sb.stop()               # hibernate: pause without removing (docker/podman stop); releases the
+                         # runtime slot AND the GPU -- see container.md's "GPU device access"
+sb.rm_container()       # force-remove/discard outright; releases the runtime slot and the GPU
 sb.update_limits(cpus=4.0, memory="8g")   # no-op on the chroot backend -- no cgroup of its own
 sb.get_live_pids() -> set[int]
 sb.pid_status_summary() -> str

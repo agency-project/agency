@@ -432,6 +432,90 @@ class TestGpuMarkers:
             "Physical GPU IDs were passed directly instead of being remapped."
         )
 
+    def test_allocate_gpu_markers_falls_back_to_rocm_when_no_libcuda(self):
+        """On an AMD-only host (no libcuda.so.1 at all), markers must be
+        allocated via ROCm/HIP instead of silently doing nothing."""
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_hip = MagicMock()
+        mock_hip.hipInit.return_value = 0
+        mock_hip.hipSetDevice.return_value = 0
+        mock_hip.hipMalloc.return_value = 0
+
+        def _cdll(name, *a, **kw):
+            if name == "libcuda.so.1":
+                raise OSError("libcuda.so.1 not found")
+            assert name == "libamdhip64.so"
+            return mock_hip
+
+        with patch.object(ctypes, "CDLL", side_effect=_cdll):
+            _allocate_gpu_markers([0, 1])
+        assert mock_hip.hipSetDevice.call_count == 2
+        assert mock_hip.hipMalloc.call_count == 2
+
+    def test_allocate_gpu_markers_skips_rocm_on_hipinit_failure(self):
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_hip = MagicMock()
+        mock_hip.hipInit.return_value = 1  # failure
+
+        def _cdll(name, *a, **kw):
+            if name == "libcuda.so.1":
+                raise OSError("libcuda.so.1 not found")
+            return mock_hip
+
+        with patch.object(ctypes, "CDLL", side_effect=_cdll):
+            _allocate_gpu_markers([0])  # must not raise
+        mock_hip.hipSetDevice.assert_not_called()
+
+    def test_allocate_gpu_markers_skips_entirely_when_neither_cuda_nor_rocm_present(self):
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        with patch.object(ctypes, "CDLL", side_effect=OSError("not found")):
+            _allocate_gpu_markers([0, 1])  # must not raise
+
+    def test_allocate_gpu_markers_remaps_hip_device_indices_with_hip_visible_devices(self):
+        """When HIP_VISIBLE_DEVICES=1,3, physical IDs must be remapped to HIP
+        device indices 0-1 before calling hipSetDevice -- same remap bug class
+        as the CUDA/CUDA_VISIBLE_DEVICES case above, for the ROCm path."""
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_hip = MagicMock()
+        mock_hip.hipInit.return_value = 0
+        mock_hip.hipSetDevice.return_value = 0
+        mock_hip.hipMalloc.return_value = 0
+
+        def _cdll(name, *a, **kw):
+            if name == "libcuda.so.1":
+                raise OSError("libcuda.so.1 not found")
+            return mock_hip
+
+        with patch.object(ctypes, "CDLL", side_effect=_cdll):
+            with patch.dict(os.environ, {"HIP_VISIBLE_DEVICES": "1,3"}):
+                _allocate_gpu_markers([1, 3])
+        called_devs = [call.args[0] for call in mock_hip.hipSetDevice.call_args_list]
+        assert called_devs == [0, 1], (
+            f"Expected HIP device indices [0,1], got {called_devs}. "
+            "Physical GPU IDs were passed directly instead of being remapped."
+        )
+
+    def test_allocate_gpu_markers_does_not_try_rocm_when_cuda_available(self):
+        """CUDA present and working -- ROCm/HIP must never be attempted."""
+        from agency.agresources import _allocate_gpu_markers
+        import ctypes
+
+        mock_cuda = MagicMock()
+        mock_cuda.cuInit.return_value = 0
+        mock_cuda.cuCtxCreate_v2.return_value = 0
+        mock_cuda.cuMemAlloc_v2.return_value = 0
+        with patch.object(ctypes, "CDLL", return_value=mock_cuda) as cdll:
+            _allocate_gpu_markers([0])
+        cdll.assert_called_once_with("libcuda.so.1")
+
     def test_non_main_process_name_blocks_allocation(self):
         """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
         from agency import agresources
@@ -589,34 +673,51 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
-    def test_commit_works_when_started_false(self):
-        """commit() must succeed on a sandbox whose _started=False but whose container
-        is already running (started by a worker process or another sandbox instance).
+    def test_commit_works_on_a_sandbox_object_that_never_started_it_itself(self):
+        """commit() must succeed on a sandbox object that never itself ran
+        _ensure_started() but whose container is already running (started by
+        a worker process or another sandbox instance) -- it always checks
+        _container_running() directly, never a per-process memory flag.
 
-        Simulated by creating two sandbox objects with the same agname: sb_worker starts
-        the container, sb_main (with _started=False) tries to commit it."""
+        Simulated by creating two BACKEND objects with the same name:
+        sb_worker starts the container, main_backend (whose own copy never
+        touched it) tries to commit it. main_backend is built directly via
+        agsandbox_backend.for_config() rather than a second agSandbox(...)
+        call, since agSandbox's own agname is deduplicated on every
+        construction (see agsandbox.py's __init__) -- passing the same
+        agname through it again would produce a DIFFERENT identity, not
+        simulate a second view of the same one (matching what cloudpickle
+        actually does across worker processes: it preserves the
+        already-computed name rather than reallocating it)."""
         from agency.agconfig import agConfig
         from agency.agsandbox import agSandbox
-        from agency.agsandbox_backends import agSandboxBackendConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
 
         agname = str(uuid.uuid4())
         cfg = agConfig(agSandboxBackendConfig(backend="docker"))
         sb_worker = agSandbox(agname, agconfig=cfg)  # "worker" — starts the container
-        sb_main = agSandbox(agname, agconfig=cfg)  # "main process" — same name, _started=False
+        main_backend = agsandbox_backend.for_config(
+            cfg,
+            agname=sb_worker._backend._agname,
+            name=sb_worker._backend._name,
+            checkpoint_image=None,
+            base_image=sb_worker.base_image,
+            mounts={},
+        )  # "main process" — same name, never started it
         tag = f"agency/test-commit-started-false-{agname[:8]}"
         try:
             # Worker starts container and writes a file.
             sb_worker.write_file("/workspace/marker.txt", "worker-written\n")
-            # sb_main has _started=False but the container is already running.
-            assert sb_main._started is False
             # commit() must detect the running container via docker inspect and succeed.
-            assert sb_main.commit(tag) is True
+            assert main_backend.commit(tag) is True
             result = subprocess.run(
                 ["docker", "images", "-q", tag],
                 capture_output=True,
                 text=True,
             )
-            assert result.stdout.strip() != "", "image must exist even when _started was False"
+            assert result.stdout.strip() != "", (
+                "image must exist even though main_backend never started it"
+            )
         finally:
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
             sb_worker.destroy()
@@ -626,7 +727,7 @@ class TestAgSandboxLifecycle:
         """commit() must return False (not crash) if no container is running."""
         sb = _make_sandbox()
         tag = f"agency/test-commit-no-container-{sb._agname}"
-        # _started is False and no container was ever started — nothing to commit.
+        # No container was ever started — nothing to commit.
         assert sb.commit(tag) is False
         # No image should have been created.
         result = subprocess.run(
@@ -640,16 +741,31 @@ class TestAgSandboxLifecycle:
     def test_ensure_started_reuses_running_container(self):
         """_ensure_started() must reuse a container already running in Docker rather
         than destroying it and starting fresh — the cross-worker-process file-persistence fix."""
+        from agency.agconfig import agConfig
+        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
+
         sb = _make_sandbox()
         # Start the container and write a sentinel file.
         sb.write_file("/workspace/persist.txt", "still-here\n")
-        assert sb._started is True
-        # Simulate a fresh sandbox object (as deserialized in a new worker process):
-        # _started is False but the container is still running in Docker.
-        sb._started = False
-        # _ensure_started() must detect the running container and reuse it.
-        sb._backend._ensure_started()
-        assert sb._started is True
+        assert sb._backend._container_running() is True
+        # A second backend object with the SAME name, standing in for a fresh
+        # worker-process copy (matching what cloudpickle actually does --
+        # preserving the already-computed _name rather than reallocating it).
+        # Built directly via agsandbox_backend.for_config() rather than a
+        # second agSandbox(...) call: agSandbox's own agname is deduplicated
+        # on every construction (see agsandbox.py's __init__), so passing
+        # sb's agname through it again would produce a DIFFERENT name, not
+        # the same one this test needs to simulate reuse.
+        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
+        worker_backend = agsandbox_backend.for_config(
+            cfg,
+            agname=sb._backend._agname,
+            name=sb._backend._name,
+            checkpoint_image=None,
+            base_image=sb.base_image,
+            mounts={},
+        )
+        worker_backend._ensure_started()
         # The file written before the reset must still be present.
         content = sb.read_file("/workspace/persist.txt")
         assert "still-here" in content
@@ -677,17 +793,28 @@ class TestAgSandboxLifecycle:
 
     @docker
     def test_checkpoint_restore_preserves_files(self):
+        """sb2 must start its container FROM the tag (a real `docker run`,
+        which only needs the image to still exist at that moment) BEFORE
+        sb1.destroy() runs: commit(tag) sets self._checkpoint_image = tag
+        (see commit()'s docstring), and destroy() unconditionally removes
+        whatever image self._checkpoint_image points at -- exactly this
+        tag. Once sb2's container has actually been created from it,
+        removing the tag afterward is irrelevant (the container already
+        holds everything it needs)."""
         tag = f"agency/test-ckpt-restore-{__import__('uuid').uuid4().hex[:8]}"
         sb1 = _make_sandbox()
+        sb2 = None
         try:
             sb1.write_file("/workspace/data.txt", "restored\n")
             sb1.commit(tag)
-            sb1.destroy()
+
             sb2 = _make_sandbox(checkpoint_image=tag)
             content = sb2.read_file("/workspace/data.txt")
             assert content == "restored\n"
-            sb2.destroy()
         finally:
+            sb1.destroy()
+            if sb2 is not None:
+                sb2.destroy()
             subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
 
     @docker
@@ -717,28 +844,31 @@ class TestAgSandboxLifecycle:
         sb2.destroy()
 
     @docker
-    def test_stop_commit_true_creates_checkpoint_image_and_removes_container(self):
-        """stop(commit=True) commits state to agency/lifecycle-<name> and removes the container."""
+    def test_commit_creates_checkpoint_image_without_removing_container(self):
+        """commit() (the old stop(commit=True)'s checkpoint half, now a
+        standalone call) commits state to agency/lifecycle-<name> WITHOUT
+        touching the container's existence at all -- it keeps running
+        (checkpointing in place) exactly as before, no run/rm involved."""
         sb = _make_sandbox()
         name = sb._backend._container_name()
         lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             sb.write_file("/workspace/marker.txt", "lifecycle\n")
-            sb.stop(commit=True)
-            # Container must be gone
+            assert sb.commit() is True
+            # Container must still be running -- commit() never removes it.
             result = subprocess.run(
-                ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
+                ["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
                 capture_output=True,
                 text=True,
             )
-            assert name not in result.stdout, "container must be removed after stop()"
+            assert name in result.stdout, "container must still be running after commit()"
             # Lifecycle image must exist
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
                 capture_output=True,
                 text=True,
             )
-            assert img.stdout.strip() != "", "lifecycle image must exist after stop(commit=True)"
+            assert img.stdout.strip() != "", "lifecycle image must exist after commit()"
             # _checkpoint_image must be set
             assert sb._checkpoint_image == lifecycle_tag
         finally:
@@ -746,22 +876,44 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
-    def test_stop_commit_false_removes_container_without_image(self):
-        """stop(commit=False) removes the container but does not create a lifecycle image."""
+    def test_rm_container_removes_container_after_commit(self):
+        """rm_container() removes the container as a separate, explicit step
+        from commit() -- the old single stop(commit=True) call is now this
+        composition of two independent calls."""
+        sb = _make_sandbox()
+        name = sb._backend._container_name()
+        lifecycle_tag = sb._backend._lifecycle_tag()
+        try:
+            sb.write_file("/workspace/marker.txt", "lifecycle\n")
+            sb.commit()
+            sb.rm_container()
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
+                capture_output=True,
+                text=True,
+            )
+            assert name not in result.stdout, "container must be removed after rm_container()"
+        finally:
+            subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
+            sb.destroy()
+
+    @docker
+    def test_rm_container_removes_container_without_image(self):
+        """rm_container() removes the container but does not create a lifecycle image."""
         sb = _make_sandbox()
         name = sb._backend._container_name()
         lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             sb.write_file("/workspace/dirty.txt", "dirty\n")
             previous_lifecycle = sb._checkpoint_image  # None on first call
-            sb.stop(commit=False)
+            sb.rm_container()
             # Container must be gone
             result = subprocess.run(
                 ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
                 capture_output=True,
                 text=True,
             )
-            assert name not in result.stdout, "container must be removed after stop()"
+            assert name not in result.stdout, "container must be removed after rm_container()"
             # _checkpoint_image must not have changed
             assert sb._checkpoint_image == previous_lifecycle
             # No lifecycle image should have been created
@@ -770,20 +922,23 @@ class TestAgSandboxLifecycle:
                 capture_output=True,
                 text=True,
             )
-            assert img.stdout.strip() == "", "stop(commit=False) must not create a lifecycle image"
+            assert img.stdout.strip() == "", "rm_container() must not create a lifecycle image"
         finally:
             subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
             sb.destroy()
 
     @docker
-    def test_checkpoint_image_restores_workspace_on_next_start(self):
-        """After stop(commit=True), _ensure_started() restores /workspace from the lifecycle image."""
+    def test_commit_then_rm_container_restores_workspace_on_next_start(self):
+        """After commit()+rm_container() (the old stop(commit=True)'s full
+        effect, now two explicit calls), _ensure_started() restores
+        /workspace from the lifecycle image via a fresh `docker run`."""
         sb = _make_sandbox()
         lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             sb.write_file("/workspace/persistent.txt", "saved\n")
-            sb.stop(commit=True)
-            assert sb._started is False
+            sb.commit()
+            sb.rm_container()
+            assert not sb._backend._container_running()
             # Next exec triggers _ensure_started() which runs docker run from lifecycle image.
             out, rc = sb.exec("cat /workspace/persistent.txt")
             assert rc == 0
@@ -793,35 +948,79 @@ class TestAgSandboxLifecycle:
             sb.destroy()
 
     @docker
-    def test_stop_commit_false_reverts_to_last_checkpoint(self):
-        """stop(commit=False) discards dirty state; next start restores from last lifecycle image."""
+    def test_stop_then_exec_resumes_same_container_with_workspace_intact(self):
+        """The core new capability this refactor exists for: stop() alone
+        (hibernate -- no commit, no image, no rm at all) followed by a
+        later exec() resumes the SAME container via `docker start`, with
+        the workspace fully intact and untouched. This is materially
+        cheaper than commit()+rm_container()+run, and is now the ordinary
+        per-tool-call path (see agtool.py)."""
+        sb = _make_sandbox()
+        name = sb._backend._container_name()
+        try:
+            sb.write_file("/workspace/persistent.txt", "saved\n")
+            container_id_before = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Id}}", name],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            sb.stop()
+            assert not sb._backend._container_running()
+            assert sb._checkpoint_image is None, (
+                "stop() must not create or touch any checkpoint image"
+            )
+
+            out, rc = sb.exec("cat /workspace/persistent.txt")
+            assert rc == 0
+            assert "saved" in out
+
+            container_id_after = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Id}}", name],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert container_id_after == container_id_before, (
+                "exec() after stop() must resume the SAME container (docker "
+                "start), not create a fresh one"
+            )
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_rm_container_reverts_to_last_checkpoint(self):
+        """commit() then rm_container() discards dirty state; next start
+        restores from the last committed lifecycle image -- the old
+        stop(commit=True)-then-stop(commit=False) revert sequence,
+        expressed with the new split API."""
         sb = _make_sandbox()
         lifecycle_tag = sb._backend._lifecycle_tag()
         try:
             # First successful tool call: write file and commit.
             sb.write_file("/workspace/good.txt", "good\n")
-            sb.stop(commit=True)
+            sb.commit()
+            sb.rm_container()
             # Second tool call that fails: write a dirty file without committing.
             sb.exec("true")  # restarts from lifecycle image
             sb.write_file("/workspace/dirty.txt", "dirty\n")
-            sb.stop(commit=False)
+            sb.rm_container()
             # Next start must restore from lifecycle image — dirty.txt must not exist.
             sb.exec("true")
             content = sb.read_file("/workspace/good.txt")
             assert "good" in content
             _, dirty_rc = sb.exec("test -f /workspace/dirty.txt")
-            assert dirty_rc != 0, "dirty file must not exist after stop(commit=False)"
+            assert dirty_rc != 0, "dirty file must not exist after rm_container()"
         finally:
             subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
             sb.destroy()
 
     @docker
     def test_destroy_removes_checkpoint_image(self):
-        """destroy() cleans up the lifecycle image created by stop(commit=True)."""
+        """destroy() cleans up the lifecycle image created by commit()."""
         sb = _make_sandbox()
         lifecycle_tag = sb._backend._lifecycle_tag()
         sb.write_file("/workspace/x.txt", "x\n")
-        sb.stop(commit=True)
+        sb.commit()
         # Confirm image exists before destroy
         img = subprocess.run(
             ["docker", "images", "-q", lifecycle_tag],
@@ -839,8 +1038,8 @@ class TestAgSandboxLifecycle:
         assert img2.stdout.strip() == "", "destroy() must remove the lifecycle image"
 
     @docker
-    def test_stop_retries_rm_on_first_failure(self):
-        """stop() retries docker rm -f up to 3 times; succeeds if a later attempt works."""
+    def test_rm_container_retries_rm_on_first_failure(self):
+        """rm_container() retries docker rm -f up to 3 times; succeeds if a later attempt works."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
         name = sb._backend._container_name()
@@ -856,10 +1055,10 @@ class TestAgSandboxLifecycle:
             return real_run(cmd, **kwargs)
 
         sb._backend._run = flaky_run
-        sb.stop(commit=False)
+        sb.rm_container()
 
         assert call_count[0] == 2, "expected one failure then one success"
-        assert sb._started is False
+        assert not sb._backend._container_running()
         # Container must actually be gone after the successful retry
         result = subprocess.run(
             ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
@@ -869,11 +1068,9 @@ class TestAgSandboxLifecycle:
         assert name not in result.stdout
 
     @docker
-    def test_stop_emits_warning_after_all_retries_fail(self):
-        """stop() emits a WARNING to stderr when rm -f fails all 3 attempts."""
-        import io
-        import sys
-
+    def test_rm_container_raises_after_all_retries_fail(self):
+        """rm_container() raises rather than silently warning when rm -f fails all 3
+        attempts -- the caller must see that the container was not confirmed removed."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
 
@@ -885,19 +1082,97 @@ class TestAgSandboxLifecycle:
             return real_run(cmd, **kwargs)
 
         sb._backend._run = always_fail_rm
-        captured = io.StringIO()
-        old_stderr = sys.stderr
-        sys.stderr = captured
         try:
-            sb.stop(commit=False)
+            with pytest.raises(RuntimeError, match="simulated persistent failure"):
+                sb.rm_container()
         finally:
-            sys.stderr = old_stderr
             # Force cleanup bypassing our mock
             sb._backend._run = real_run
             sb.destroy()
 
-        assert "WARNING" in captured.getvalue()
-        assert sb._started is False  # _started cleared even on failure
+    @docker
+    def test_rm_container_then_destroy_after_rm_failure_releases_slot_once(self):
+        """If rm_container()'s rm -f exhausts retries, the runtime slot is still held.
+
+        destroy() must be the one that releases it -- exactly once -- when
+        the container is actually removed. Regression test for a double
+        release of _container_semaphore when both rm_container() and
+        destroy() each independently believed they owed a release.
+        """
+        from agency.agsandbox_backends.container import _container_semaphore
+
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+
+        real_run = sb._backend._run
+
+        def always_fail_rm(cmd, **kwargs):
+            if "rm" in cmd and "-f" in cmd:
+                raise RuntimeError("simulated persistent failure")
+            return real_run(cmd, **kwargs)
+
+        # write_file() above already forced _ensure_started(), which
+        # acquired the sandbox's runtime slot -- capture the value with that
+        # slot already held.
+        held = _container_semaphore._semlock._get_value()
+
+        sb._backend._run = always_fail_rm
+        try:
+            with pytest.raises(RuntimeError, match="simulated persistent failure"):
+                sb.rm_container()
+        finally:
+            sb._backend._run = real_run
+
+        # rm never actually succeeded, so the slot must NOT have been
+        # released yet -- the container is still really running.
+        assert _container_semaphore._semlock._get_value() == held
+
+        sb.destroy()
+
+        # destroy() removes the container for real this time and releases
+        # the slot exactly once -- not twice (which would over-credit the
+        # semaphore above its true capacity).
+        assert _container_semaphore._semlock._get_value() == held + 1
+
+    @docker
+    def test_rm_container_on_already_hibernating_container_releases_slot_once(self):
+        """rm_container() called on a container that's ALREADY hibernating
+        (stop() already ran and already released the runtime slot) must NOT
+        release the slot a second time.
+
+        This is the exact shape of a real skill-failure teardown: every
+        prior tool call already hibernated the sandbox via stop() before
+        agskill.py calls rm_container() on it. multiprocessing.Semaphore
+        does not raise on over-release (confirmed empirically -- unlike
+        threading.BoundedSemaphore), so a double-release here would
+        silently over-credit the semaphore, eventually letting more
+        containers run concurrently than the kernel keyring quota actually
+        supports -- the same class of bug the quota exists to prevent.
+        """
+        from agency.agsandbox_backends.container import _container_semaphore
+
+        sb = _make_sandbox()
+        sb.write_file("/workspace/x.txt", "x\n")
+        # write_file() above already forced _ensure_started(), which
+        # acquired the sandbox's runtime slot -- capture the value with that
+        # slot already held.
+        held = _container_semaphore._semlock._get_value()
+
+        sb.stop()
+        assert _container_semaphore._semlock._get_value() == held + 1, (
+            "stop() must release the slot exactly once"
+        )
+
+        sb.rm_container()
+        assert _container_semaphore._semlock._get_value() == held + 1, (
+            "rm_container() on an already-hibernating container must not "
+            "release the slot again -- it was never re-acquired"
+        )
+
+        sb.destroy()
+        assert _container_semaphore._semlock._get_value() == held + 1, (
+            "destroy() on an already-removed container must not release the slot again either"
+        )
 
     @docker
     def test_concurrent_docker_calls_gated_by_docker_semaphore(self):
@@ -929,10 +1204,9 @@ class TestAgSandboxLifecycle:
         _docker_semaphore.acquire = counting_acquire
         _docker_semaphore.release = counting_release
         try:
-            # stop(commit=True) exercises commit + rm -f; both must go through the semaphore.
-            threads = [
-                threading.Thread(target=sb.stop, kwargs={"commit": True}) for sb in sandboxes
-            ]
+            # commit() exercises docker commit + the depth-check inspect; both
+            # must go through the semaphore.
+            threads = [threading.Thread(target=sb.commit) for sb in sandboxes]
             for t in threads:
                 t.start()
             for t in threads:
@@ -969,15 +1243,15 @@ class TestAgSandboxLifecycle:
             assert status.stdout.strip() == "created"
             # _ensure_started() must remove the stuck container and start fresh.
             sb._backend._ensure_started()
-            assert sb._started is True
+            assert sb._backend._container_running() is True
             out, rc = sb.exec("echo ok")
             assert rc == 0 and "ok" in out
         finally:
             sb.destroy()
 
     @docker
-    def test_stop_retries_commit_on_first_failure(self):
-        """stop(commit=True) retries docker commit up to 3 times; succeeds if a later attempt works."""
+    def test_commit_retries_on_first_failure(self):
+        """commit() retries docker commit up to 3 times; succeeds if a later attempt works."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
         lifecycle_tag = sb._backend._lifecycle_tag()
@@ -994,10 +1268,12 @@ class TestAgSandboxLifecycle:
 
         sb._backend._run = flaky_run
         try:
-            sb.stop(commit=True)
+            assert sb.commit() is True
             assert call_count[0] == 2, "expected one failure then one success"
             assert sb._checkpoint_image == lifecycle_tag
-            assert sb._started is False
+            assert sb._backend._container_running(), (
+                "commit() must never touch the container's existence"
+            )
             img = subprocess.run(
                 ["docker", "images", "-q", lifecycle_tag],
                 capture_output=True,
@@ -1005,15 +1281,18 @@ class TestAgSandboxLifecycle:
             )
             assert img.stdout.strip() != "", "lifecycle image must exist after successful retry"
         finally:
+            sb._backend._run = real_run
             subprocess.run(["docker", "rmi", "-f", lifecycle_tag], capture_output=True)
             sb.destroy()
 
     @docker
-    def test_stop_emits_warning_after_all_commit_retries_fail(self):
-        """stop(commit=True) emits a WARNING to stderr when all 3 commit attempts fail;
-        _checkpoint_image is not updated so the next start restores from the prior checkpoint."""
-        import io
-
+    def test_commit_raises_after_all_retries_fail_container_still_running(self):
+        """commit() raises when all 3 commit attempts fail -- and, unlike the
+        old stop(commit=True), never touches the container's existence at
+        all: the container must still exist and still be running afterward,
+        exactly as before the failed commit attempt. _checkpoint_image stays
+        at the prior tag (or None) so a subsequent successful commit() -- or
+        a later rm_container() revert -- is unaffected."""
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
         previous_lifecycle = sb._checkpoint_image
@@ -1026,43 +1305,53 @@ class TestAgSandboxLifecycle:
             return real_run(cmd, **kwargs)
 
         sb._backend._run = always_fail_commit
-        captured = io.StringIO()
-        old_stderr = sys.stderr
-        sys.stderr = captured
         try:
-            sb.stop(commit=True)
+            with pytest.raises(RuntimeError, match="simulated persistent commit failure"):
+                sb.commit()
         finally:
-            sys.stderr = old_stderr
             sb._backend._run = real_run
-            sb.destroy()
 
-        assert "WARNING" in captured.getvalue()
         assert sb._checkpoint_image == previous_lifecycle  # not updated on all-retry failure
-        assert sb._started is False
+        assert sb._backend._container_running(), (
+            "commit() must never remove or stop the container, even on total failure"
+        )
+        sb.destroy()
 
     @docker
-    def test_ensure_started_removes_exited_container(self):
-        """Exited containers are force-removed and recreated (no docker start fast-path).
-
-        State is preserved across stop()/start() cycles via checkpoint_image commits,
-        not via docker stop/start.  An exited container is treated as a zombie and
-        removed so the name is free for a fresh docker run.
+    def test_ensure_started_resumes_exited_container(self):
+        """An externally `docker stop`-ped container (state 'exited', not
+        removed) is now RESUMED in place via `docker start` -- the core new
+        hibernate/resume capability this refactor exists for -- rather than
+        force-removed and recreated. The file written before the external
+        stop must survive, and the exact same container (verified by
+        container ID) must be reused, not recreated.
         """
         sb = _make_sandbox()
         name = sb._backend._container_name()
         try:
             sb.write_file("/workspace/exited.txt", "still-here\n")
+            container_id_before = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Id}}", name],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             # Externally stop (not remove) the container — puts it in exited state.
             subprocess.run(["docker", "stop", "-t", "0", name], capture_output=True)
-            sb._started = False
-            # _ensure_started() must remove the exited container and do a fresh docker run.
+            # _ensure_started() must resume (docker start) this SAME container.
             sb._backend._ensure_started()
-            assert sb._started is True
-            # The fresh container has no /workspace/exited.txt — the exited container
-            # was force-removed.  State would only survive if stop(commit=True) had been
-            # called before the stop to commit a checkpoint_image.
-            with pytest.raises(FileNotFoundError):
-                sb.read_file("/workspace/exited.txt")
+            assert sb._backend._container_running() is True
+            container_id_after = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Id}}", name],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert container_id_after == container_id_before, (
+                "an exited container must be resumed via `docker start`, "
+                "not force-removed and recreated"
+            )
+            # The file survives, since the container was resumed, not recreated.
+            content = sb.read_file("/workspace/exited.txt")
+            assert content == "still-here\n"
         finally:
             sb.destroy()
 
@@ -1167,7 +1456,6 @@ class TestAgSandboxReadFileUnit:
         from agency.agsandbox_backends.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
-        sb._started = True
         return sb
 
     def test_read_file_returns_text_content(self):
@@ -1434,7 +1722,7 @@ class TestIngestPtracePidsUnit:
 
     def test_ingest_skips_baseline_and_daemon_pids(self):
         backend = self._make_backend()
-        backend._baseline_pids.add(111)
+        backend._baseline_pids = {111}
         backend._daemon_pids.add(222)
         backend.ingest_ptrace_pids(spawned={111, 222, 333})
         assert 111 not in backend._watched_pids
@@ -1627,10 +1915,10 @@ class TestResourceTools:
         """exec() claims a physical GPU from the pool when _gpu_virtual is True."""
         self.tools["reserve_gpu"].fn(agdata())
         assert self.pool._gpus_acquired == 0
-        # During the command a GPU is held; after a foreground exec it is released.
         self.sb.exec("echo hello")
-        # Foreground exec with no background processes releases immediately.
-        assert self.pool._gpus_acquired == 0
+        # Held until stop() (container-exit clear); there is no mid-skill release tool.
+        assert self.pool._gpus_acquired == 1
+        assert self.sb._gpu_id is not None
 
     def test_exec_sets_cuda_visible_devices(self):
         """CUDA_VISIBLE_DEVICES is set to a digit (the physical GPU ID) during exec()."""
@@ -1647,28 +1935,31 @@ class TestResourceTools:
 
     # ── physical GPU release after foreground exec ─────────────────────────
 
-    def test_foreground_exec_releases_physical_gpu_immediately(self):
-        """Physical GPU is released at the end of exec() when no background processes remain."""
+    def test_foreground_exec_holds_physical_gpu_until_stop(self):
+        """Physical GPU stays held after exec(); release waits on container exit (stop)."""
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("echo hello")
-        assert self.sb._gpu_id is None
-        assert self.pool._gpus_acquired == 0
-        assert self.sb._gpu_virtual is True  # virtual reservation persists
+        assert self.sb._gpu_id is not None
+        assert self.pool._gpus_acquired == 1
+        assert self.sb._gpu_virtual is True
 
-    def test_consecutive_foreground_execs_each_acquire_and_release(self):
-        """Each foreground exec() acquires a physical GPU then releases it; pool stays free."""
+    def test_consecutive_foreground_execs_reuse_same_physical_gpu(self):
+        """Each foreground exec() reuses the already-held physical GPU."""
         self.tools["reserve_gpu"].fn(agdata())
+        self.sb.exec("echo first")
+        first = self.sb._gpu_id
+        assert first is not None
         for _ in range(3):
             self.sb.exec("echo iteration")
-            assert self.sb._gpu_id is None
-            assert self.pool._gpus_acquired == 0
+            assert self.sb._gpu_id == first
+            assert self.pool._gpus_acquired == 1
 
-    def test_virtual_reservation_persists_after_physical_release(self):
-        """_gpu_virtual stays True after a foreground exec so the next bash call can re-acquire."""
+    def test_virtual_reservation_and_physical_gpu_persist_across_execs(self):
+        """_gpu_virtual and the leased GPU stay set across successive exec() calls."""
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("echo first")
         assert self.sb._gpu_virtual is True
-        # Second exec() should re-acquire a physical GPU and set CUDA_VISIBLE_DEVICES.
+        assert self.sb._gpu_id is not None
         out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
         assert rc == 0
         assert out.strip().isdigit()
@@ -1701,15 +1992,15 @@ class TestResourceTools:
         assert self.sb._gpu_id == first_gpu_id  # same physical GPU, not re-acquired
         self.sb.exec("kill %1 2>/dev/null || true")
 
-    def test_physical_gpu_released_after_background_process_finishes(self):
-        """Physical GPU is released by get_live_pids() once the background process exits."""
+    def test_physical_gpu_held_after_background_process_finishes(self):
+        """Physical GPU stays held after background work exits; stop() frees it."""
         self.tools["reserve_gpu"].fn(agdata())
         self.sb.exec("sleep 0.1 &")
         time.sleep(1.0)
-        self.sb.get_live_pids()  # triggers release since alive set is now empty
-        assert self.sb._gpu_id is None
-        assert self.pool._gpus_acquired == 0
-        assert self.sb._gpu_virtual is True  # virtual reservation persists
+        self.sb.get_live_pids()
+        assert self.sb._gpu_id is not None
+        assert self.pool._gpus_acquired == 1
+        assert self.sb._gpu_virtual is True
 
     # ── waiting for physical GPU when pool is exhausted ────────────────────
 
@@ -1741,34 +2032,6 @@ class TestResourceTools:
         exec_done.wait(timeout=60)  # container startup (docker run) can take >5 s
         assert exec_done.is_set()
         sb2.destroy()
-
-    # ── gpu_release ────────────────────────────────────────────────────────
-
-    def test_gpu_release_clears_virtual_flag(self):
-        """gpu_release clears _gpu_virtual even when no physical GPU is currently held."""
-        self.tools["reserve_gpu"].fn(agdata())
-        self.tools["gpu_release"].fn(agdata())
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
-
-    def test_gpu_release_also_frees_physical_gpu_held_by_background_process(self):
-        """gpu_release forcibly releases a physical GPU even while a background process runs."""
-        self.tools["reserve_gpu"].fn(agdata())
-        self.sb.exec("sleep 30 &")
-        self.sb.get_live_pids()
-        assert self.sb._gpu_id is not None
-        self.tools["gpu_release"].fn(agdata())
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
-        assert self.pool._gpus_acquired == 0
-        self.sb.exec("kill %1 2>/dev/null || true")
-
-    def test_gpu_release_without_reserve_is_safe(self):
-        """gpu_release is a no-op when nothing is reserved."""
-        result = self.tools["gpu_release"].fn(agdata())
-        assert result.message is not None
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
 
     # ── release_resources ─────────────────────────────────────────────────
 

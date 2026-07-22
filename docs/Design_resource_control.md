@@ -32,18 +32,18 @@ The Docker/Podman daemon serializes most operations internally (GPU init via the
 ### `_container_semaphore` — simultaneously running container cap
 | | |
 |---|---|
-| **File** | `agency/agsandbox.py:86` |
-| **Type** | `multiprocessing.Semaphore(_docker_container_limit())` |
-| **Resource** | Number of simultaneously running Docker containers, derived from the Linux kernel session-keyring quota |
-| **Acquisition** | `_container_semaphore.acquire()` inside `_ensure_started()`, immediately before `docker run` |
-| **Release** | `_container_semaphore.release()` inside `stop()` — always, including when `docker rm -f` fails after retries |
+| **File** | `agency/agsandbox_backends/container.py` |
+| **Type** | `multiprocessing.Semaphore(_keyring_container_limit())` |
+| **Resource** | Number of simultaneously running containers — **docker and podman share one cap**, not one each, since both are subject to the same kernel session-keyring quota (see below) |
+| **Acquisition** | `_acquire_runtime_slot()` → `_container_semaphore.acquire()` inside `_ensure_started()`, immediately before `docker`/`podman run` |
+| **Release** | `_release_runtime_slot()` → `_container_semaphore.release()` inside `stop()` — always, including when `rm -f` fails after retries |
 | **Timeout** | None — blocks until a slot is free |
 
 **Why `multiprocessing.Semaphore`:** backed by a POSIX IPC semaphore (not an in-process counter), so the limit is shared across all worker processes spawned by `ProcessPoolExecutor`. Worker processes inherit the parent's `_RUN_ID` at import time and therefore share container names with the parent; a cross-process counter prevents them from collectively exceeding the kernel keyring limit.
 
-**`_docker_container_limit()`** reads `/proc/sys/kernel/keys/maxkeys` at module import and returns `max(4, maxkeys − 5)`, leaving a 5-slot margin for external tools (ssh, sudo, gpg). Podman is exempt: rootless Podman uses independent user-namespace keyrings and is not subject to this quota.
+**`_keyring_container_limit()`** reads `/proc/sys/kernel/keys/maxkeys` at module import and returns `max(4, maxkeys − 5)`, leaving a 5-slot margin for external tools (ssh, sudo, gpg). **Podman is not exempt** despite earlier assumptions to the contrary: rootless Podman's per-container user namespaces do not give it an independent keyring quota, because `runc` joins/creates the session keyring against the real host UID before the container process finishes transitioning into its remapped identity. Confirmed empirically (watching `/proc/keys` gain a `_ses.*` entry owned by the real host UID across a plain `podman run`/`rm` cycle, identical to docker) and upstream (containers/podman#13363, kubernetes-sigs/kind#3806).
 
-**Why each running container consumes a keyring slot.** Every `docker run` invocation creates a Linux session keyring under the calling user's UID. The kernel enforces a per-user cap (`/proc/sys/kernel/keys/maxkeys`, typically 200). When the cap is reached, the next `docker run` fails with `"unable to create session key: disk quota exceeded"`. Stopping or removing a container releases its keyring immediately.
+**Why each running container consumes a keyring slot.** Every `docker run`/`podman run` invocation creates a Linux session keyring under the calling user's real UID. The kernel enforces a per-user cap (`/proc/sys/kernel/keys/maxkeys`, typically 200). When the cap is reached, the next `run` (either runtime) fails with `"unable to create session key: disk quota exceeded"`. Stopping or removing a container releases its keyring immediately.
 
 **Zombie container problem.** `_container_semaphore` counts only THIS process's containers. If a previous process crashed without cleanup, its containers remain running and consume keyring slots outside the semaphore's accounting. If N zombie containers from a prior run are alive, the effective free slots are `maxkeys − (semaphore_limit + N)`, which can reach 0 even when `_container_semaphore` has available slots.
 
