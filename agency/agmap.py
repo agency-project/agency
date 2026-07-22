@@ -43,6 +43,7 @@ from concurrent.futures import Future
 from typing import Callable
 
 from .agdata import agdata, agerror
+from .profiler import agprof
 from .agutil import format_exception
 
 
@@ -59,10 +60,13 @@ class agtask(agdata):
 def _spawn(fn: "Callable[[object], object]", arg: object) -> agtask:
     """Run ``fn(arg)`` on a daemon thread; return a pending agtask immediately."""
     future: "Future[agdata]" = Future()
+    _prof_label = f"agmap:{getattr(fn, '__name__', 'fn')}[{agprof.next_index('agmap')}]"
 
     def _run() -> None:
         try:
-            out = fn(arg)
+            agprof.thread_name(_prof_label)
+            with agprof.span(_prof_label):
+                out = fn(arg)
             result = out if isinstance(out, agdata) else agdata(result=out)
         except Exception as e:  # noqa: BLE001 — mirror skills: never propagate
             result = agerror(format_exception(e))

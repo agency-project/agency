@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 
+from .profiler import agprof
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
 
@@ -436,7 +437,7 @@ class agResourcePool(_AgResourcePoolFields):
         budget, not a fresh one per iteration.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._gpu_cond:
+        with agprof.span("sync:gpu_wait"), self._gpu_cond:
             while not self._free_gpus:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:

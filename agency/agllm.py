@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
+from .profiler import agprof
 from .agutil import _iter_batched, _strip_thinking, _extract_thinking, _LLMIdleTimeout
 from .agllm_backends import (
     agllm_backend,
@@ -160,7 +161,8 @@ that must be respected going forward>
 @contextmanager
 def _llm_call_semaphore_slot():
     sem = _get_llm_call_semaphore()
-    sem.acquire()
+    with agprof.span("llm:sync"):
+        sem.acquire()
     try:
         yield
     finally:
@@ -303,7 +305,7 @@ class agllm(_AgLLMFields):
             _retry_err: "Exception | None" = None
             _retry_sleep_s: float = self.retry_sleep_s
 
-            with _llm_call_semaphore_slot():
+            with _llm_call_semaphore_slot(), agprof.span(f"llm:attempt[{attempt}]"):
                 client = self.backend.make_client(
                     httpx.Timeout(
                         connect=self.http_connect_timeout,
@@ -477,7 +479,8 @@ class agllm(_AgLLMFields):
                     full_history_fn(
                         {"type": "llm_retry", "error": str(_retry_err), "attempt": attempt + 1}
                     )
-                time.sleep(_retry_sleep_s)
+                with agprof.span("llm:retry_backoff"):
+                    time.sleep(_retry_sleep_s)
                 continue
             break  # success
 
@@ -799,18 +802,19 @@ class agllm(_AgLLMFields):
         # `[]` below is scratch space call() uses to append/pop a live-streaming
         # placeholder -- it's not what's sent over the wire (that's
         # compact_kwargs["messages"] above), so an empty list is fine here.
-        result = self.call(
-            compact_kwargs,
-            [],
-            term,
-            None,
-            None,
-            None,
-            0,
-            0,
-            "compact",
-            call_tag="compact",
-        )
+        with agprof.span("llm:compact"):
+            result = self.call(
+                compact_kwargs,
+                [],
+                term,
+                None,
+                None,
+                None,
+                0,
+                0,
+                "compact",
+                call_tag="compact",
+            )
         if not result.ok:
             raise result.conn_error or RuntimeError(
                 "compact(): summarisation request itself exceeded the context limit"

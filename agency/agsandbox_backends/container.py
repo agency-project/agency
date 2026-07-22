@@ -39,6 +39,7 @@ import time
 import uuid as _uuid
 from pathlib import Path
 
+from ..profiler import agprof
 from ..agconfig import agConfig
 from ..agresources import amd_render_node_paths_by_pci_bus, detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
@@ -92,6 +93,21 @@ def _get_docker_semaphore() -> threading.Semaphore:
     return _docker_semaphore
 
 
+from contextlib import contextmanager as _contextmanager
+
+
+@_contextmanager
+def _docker_semaphore_slot():
+    """Hold a docker/podman CLI slot; the span covers only the acquire wait."""
+    sem = _get_docker_semaphore()
+    with agprof.span("sync:container"):
+        sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
 def _runtime_works(runtime: str) -> bool:
     try:
         proc = subprocess.run(
@@ -110,10 +126,13 @@ def get_container_runtime() -> str:
     if _RUNTIME is not None:
         return _RUNTIME
 
-    has_docker = shutil.which("docker") is not None
-    has_podman = shutil.which("podman") is not None
-    docker_ok = has_docker and _runtime_works("docker")
-    podman_ok = has_podman and _runtime_works("podman")
+    # Span covers only the uncached probe: one `docker info`/`podman info`
+    # subprocess each, a one-time per-process cost of several hundred ms.
+    with agprof.span("runtime:detect"):
+        has_docker = shutil.which("docker") is not None
+        has_podman = shutil.which("podman") is not None
+        docker_ok = has_docker and _runtime_works("docker")
+        podman_ok = has_podman and _runtime_works("podman")
 
     if podman_ok:
         _RUNTIME = "podman"
@@ -850,80 +869,81 @@ class _ContainerBackendBase(agsandbox_backend):
             if self._baseline_pids is None:
                 self._baseline_pids = self._snapshot_pids_started()
             return
-        if status:
-            # Hibernating (stopped(), not removed) -- resume it in place.
-            # No image, no `docker/podman run`: the container's writable
-            # layer already holds everything from before it was stopped.
+        with agprof.span("sandbox:start"):
+            if status:
+                # Hibernating (stopped(), not removed) -- resume it in place.
+                # No image, no `docker/podman run`: the container's writable
+                # layer already holds everything from before it was stopped.
+                self._acquire_runtime_slot()
+                try:
+                    self._start_with_quota_retry(name)
+                except Exception:
+                    self._release_runtime_slot()
+                    raise
+                if self._baseline_pids is None:
+                    self._baseline_pids = self._snapshot_pids_started()
+                return
+            # Acquire the physical GPU (if reserve_gpu was called) before the
+            # container is created, not just in exec() -- this method can be
+            # reached first via read_file()/write_file() rather than exec(), so
+            # exec()'s own lazy acquire (base.py) can't be relied on to have
+            # already run. Guarded by `self._gpu_id is None` the same way
+            # exec()'s does, so whichever entry point gets here first acquires it
+            # exactly once. Note this only affects which physical GPU
+            # CUDA_VISIBLE_DEVICES points at -- _gpu_flags() below attaches every
+            # GPU device to the container unconditionally, so it no longer
+            # matters whether this runs before or after reserve_gpu().
+            if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
+                self._gpu_id = self._gpu_acquire_fn()
+            gpu_flags = _gpu_flags(self._runtime)
             self._acquire_runtime_slot()
             try:
-                self._start_with_quota_retry(name)
+                if self._checkpoint_image is not None:
+                    # Restart from last committed checkpoint (set by stop(commit=True)).
+                    # /workspace and all state from the previous tool call are preserved.
+                    image = self._checkpoint_image
+                    run_cmd = (
+                        [self._runtime, "run", "-d", "--init", "--name", name]
+                        + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
+                        + gpu_flags
+                        + self._vol_flags
+                        + [image, "tail", "-f", "/dev/null"]
+                    )
+                    self._run_with_conflict_retry(run_cmd, name)
+                    # Keep _checkpoint_image — not a one-shot restore, needed for future restarts.
+                else:
+                    image = self._resolve_image(self._base_image)
+                    _pool_fields = _AgResourcePoolFields(self._agconfig)
+                    limit_flags = []
+                    if _pool_fields.idle_memory is not None:
+                        limit_flags.append(f"--memory={_pool_fields.idle_memory}")
+                    if self._cfs_supported():
+                        limit_flags.append(f"--cpus={_pool_fields.idle_cpus}")
+                    run_cmd = (
+                        [self._runtime, "run", "-d", "--init", "--name", name]
+                        + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
+                        + limit_flags
+                        + gpu_flags
+                        + self._vol_flags
+                        + [image, "tail", "-f", "/dev/null"]
+                    )
+                    self._run_with_conflict_retry(run_cmd, name)
+                    self._run(
+                        [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
+                        check=True,
+                    )
+            except _ContainerAlreadyRunning:
+                # Another process started the container while we were retrying;
+                # that process owns the slot — release ours.
+                self._release_runtime_slot()
+                if self._baseline_pids is None:
+                    self._baseline_pids = self._snapshot_pids_started()
+                return
             except Exception:
                 self._release_runtime_slot()
                 raise
             if self._baseline_pids is None:
                 self._baseline_pids = self._snapshot_pids_started()
-            return
-        # Acquire the physical GPU (if reserve_gpu was called) before the
-        # container is created, not just in exec() -- this method can be
-        # reached first via read_file()/write_file() rather than exec(), so
-        # exec()'s own lazy acquire (base.py) can't be relied on to have
-        # already run. Guarded by `self._gpu_id is None` the same way
-        # exec()'s does, so whichever entry point gets here first acquires it
-        # exactly once. Note this only affects which physical GPU
-        # CUDA_VISIBLE_DEVICES points at -- _gpu_flags() below attaches every
-        # GPU device to the container unconditionally, so it no longer
-        # matters whether this runs before or after reserve_gpu().
-        if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
-            self._gpu_id = self._gpu_acquire_fn()
-        gpu_flags = _gpu_flags(self._runtime)
-        self._acquire_runtime_slot()
-        try:
-            if self._checkpoint_image is not None:
-                # Restart from last committed checkpoint (set by stop(commit=True)).
-                # /workspace and all state from the previous tool call are preserved.
-                image = self._checkpoint_image
-                run_cmd = (
-                    [self._runtime, "run", "-d", "--init", "--name", name]
-                    + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
-                    + gpu_flags
-                    + self._vol_flags
-                    + [image, "tail", "-f", "/dev/null"]
-                )
-                self._run_with_conflict_retry(run_cmd, name)
-                # Keep _checkpoint_image — not a one-shot restore, needed for future restarts.
-            else:
-                image = self._resolve_image(self._base_image)
-                _pool_fields = _AgResourcePoolFields(self._agconfig)
-                limit_flags = []
-                if _pool_fields.idle_memory is not None:
-                    limit_flags.append(f"--memory={_pool_fields.idle_memory}")
-                if self._cfs_supported():
-                    limit_flags.append(f"--cpus={_pool_fields.idle_cpus}")
-                run_cmd = (
-                    [self._runtime, "run", "-d", "--init", "--name", name]
-                    + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
-                    + limit_flags
-                    + gpu_flags
-                    + self._vol_flags
-                    + [image, "tail", "-f", "/dev/null"]
-                )
-                self._run_with_conflict_retry(run_cmd, name)
-                self._run(
-                    [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
-                    check=True,
-                )
-        except _ContainerAlreadyRunning:
-            # Another process started the container while we were retrying;
-            # that process owns the slot — release ours.
-            self._release_runtime_slot()
-            if self._baseline_pids is None:
-                self._baseline_pids = self._snapshot_pids_started()
-            return
-        except Exception:
-            self._release_runtime_slot()
-            raise
-        if self._baseline_pids is None:
-            self._baseline_pids = self._snapshot_pids_started()
 
     def _snapshot_pids_started(self) -> set[int]:
         """Same PID listing as base._snapshot_pids(), routed through
@@ -1074,7 +1094,8 @@ class _ContainerBackendBase(agsandbox_backend):
         rationale).
         """
         sem = _get_docker_semaphore()
-        sem.acquire()
+        with agprof.span("sync:container"):
+            sem.acquire()
         released = False
 
         def _release_once() -> None:
@@ -1974,7 +1995,7 @@ class _ContainerBackendBase(agsandbox_backend):
     def tag_image(source: str, dest: str) -> None:
         """Retag an image from *source* to *dest* (docker/podman tag)."""
         runtime = get_container_runtime()
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             subprocess.run(
                 [runtime, "tag", source, dest],
                 capture_output=True,
@@ -1989,7 +2010,7 @@ class _ContainerBackendBase(agsandbox_backend):
         if force:
             cmd.append("-f")
         cmd.append(tag)
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             subprocess.run(cmd, capture_output=True)
 
     @staticmethod
@@ -2001,7 +2022,7 @@ class _ContainerBackendBase(agsandbox_backend):
         Raises ``subprocess.CalledProcessError`` on failure.
         """
         runtime = get_container_runtime()
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             result = subprocess.run(
                 [runtime, "save", tag],
                 capture_output=True,
@@ -2017,7 +2038,7 @@ class _ContainerBackendBase(agsandbox_backend):
         Raises ``subprocess.CalledProcessError`` on failure.
         """
         runtime = get_container_runtime()
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             subprocess.run(
                 [runtime, "load"],
                 input=image_bytes,
@@ -2055,7 +2076,7 @@ class _ContainerBackendBase(agsandbox_backend):
         """
         runtime = get_container_runtime()
         value = "" if owner_pid is None else str(owner_pid)
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             created = subprocess.run(
                 [runtime, "create", tag],
                 capture_output=True,

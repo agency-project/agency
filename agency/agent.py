@@ -32,6 +32,7 @@ from .agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname
+from .profiler import agprof
 
 
 # Exists only to register agent's config fields (via __set_name__ at import
@@ -231,83 +232,84 @@ class agent:
         sandbox: "agSandbox | None" = None,
         agconfig: "agConfig | None" = None,
     ):
-        _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
+        with agprof.span("agent:create"):
+            _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
-        if llm is None:
-            if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
-                from ._context import _active_team as _at
+            if llm is None:
+                if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
+                    from ._context import _active_team as _at
 
-                _t = _at.get(None)
-                if (
-                    _t is not None
-                    and _t.agconfig is not None
-                    and _t.agconfig.data.get("agllm_backend")
-                ):
-                    # Adopt the team's agconfig outright (not just for the LLM
-                    # fields) -- log_dir/output_dir/sandbox settings etc. should
-                    # also come from it, matching "agents inherit the team's
-                    # agconfig automatically" (see agteam's docstring).
-                    _src_agconfig = _t.agconfig
-                else:
-                    raise TypeError(
-                        "agent() requires an agconfig with LLM fields set "
-                        "(e.g. cfg.agllm_backend.model = ...), or llm=, "
-                        "when called outside an agteam context"
-                    )
+                    _t = _at.get(None)
+                    if (
+                        _t is not None
+                        and _t.agconfig is not None
+                        and _t.agconfig.data.get("agllm_backend")
+                    ):
+                        # Adopt the team's agconfig outright (not just for the LLM
+                        # fields) -- log_dir/output_dir/sandbox settings etc. should
+                        # also come from it, matching "agents inherit the team's
+                        # agconfig automatically" (see agteam's docstring).
+                        _src_agconfig = _t.agconfig
+                    else:
+                        raise TypeError(
+                            "agent() requires an agconfig with LLM fields set "
+                            "(e.g. cfg.agllm_backend.model = ...), or llm=, "
+                            "when called outside an agteam context"
+                        )
 
-        # Cloned so this agent's own agconfig is independent of whatever
-        # source it was built from (an explicit agconfig=, agent.default_agconfig,
-        # or the active agteam's agconfig) -- mutating that source afterward
-        # must not silently change an already-constructed agent. Use
-        # ag.change_config(new_cfg) to change it live -- see that method.
-        self.agconfig: "agConfig | None" = (
-            _src_agconfig.clone() if _src_agconfig is not None else None
-        )
+            # Cloned so this agent's own agconfig is independent of whatever
+            # source it was built from (an explicit agconfig=, agent.default_agconfig,
+            # or the active agteam's agconfig) -- mutating that source afterward
+            # must not silently change an already-constructed agent. Use
+            # ag.change_config(new_cfg) to change it live -- see that method.
+            self.agconfig: "agConfig | None" = (
+                _src_agconfig.clone() if _src_agconfig is not None else None
+            )
 
-        self.agname: _agname = _agname.allocate_agname(agname)
+            self.agname: _agname = _agname.allocate_agname(agname)
 
-        self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
-        self.ctx: agcontext = agcontext()
-        # Sandbox is created lazily on first skill run; container provisioning
-        # is expensive and agents may be constructed without ever running a skill.
-        self.sandbox: "agSandbox | None" = sandbox
+            self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
+            self.ctx: agcontext = agcontext()
+            # Sandbox is created lazily on first skill run; container provisioning
+            # is expensive and agents may be constructed without ever running a skill.
+            self.sandbox: "agSandbox | None" = sandbox
 
-        _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
-        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        log_path = log_dir / f"{self.agname}_timeline.jsonl"
-        self.log = aglog(path=log_path, agconfig=self.agconfig)
-        self._full_history: list[dict] = []
-        self._full_history_path: Path = log_dir / f"{self.agname}_history.jsonl"
-        self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
-        self.terminal = agterm(self.agname)
+            _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
+            log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
+            log_path = log_dir / f"{self.agname}_timeline.jsonl"
+            self.log = aglog(path=log_path, agconfig=self.agconfig)
+            self._full_history: list[dict] = []
+            self._full_history_path: Path = log_dir / f"{self.agname}_history.jsonl"
+            self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
+            self.terminal = agterm(self.agname)
 
-        self._snapshot_messages: list[dict] = []
-        self.inbox: queue.Queue[str] = queue.Queue()
-        self._state = agent_state(str(self.agname))
+            self._snapshot_messages: list[dict] = []
+            self.inbox: queue.Queue[str] = queue.Queue()
+            self._state = agent_state(str(self.agname))
 
-        _live_agents.add(self)
+            _live_agents.add(self)
 
-        from ._context import _active_team
+            from ._context import _active_team
 
-        _team = _active_team.get(None)
-        if _team is not None:
-            _team._agents.add(self)
+            _team = _active_team.get(None)
+            if _team is not None:
+                _team._agents.add(self)
 
-        team_name = _team.team_name if _team is not None else None
+            team_name = _team.team_name if _team is not None else None
 
-        ctx = (
-            f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
-        )
-        team_tag = f"  team={team_name}" if team_name else ""
-        self.terminal.log("CREATED  ", f"model={self.llm.backend.model or '?'}{ctx}{team_tag}")
-        self.log._lifecycle(
-            "created",
-            agname=self.agname,
-            team=team_name,
-            llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
-            context_limit=self.llm.context_limit,
-        )
-        self._emit_config()
+            ctx = (
+                f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
+            )
+            team_tag = f"  team={team_name}" if team_name else ""
+            self.terminal.log("CREATED  ", f"model={self.llm.backend.model or '?'}{ctx}{team_tag}")
+            self.log._lifecycle(
+                "created",
+                agname=self.agname,
+                team=team_name,
+                llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
+                context_limit=self.llm.context_limit,
+            )
+            self._emit_config()
 
     def change_config(self, agconfig: "agConfig") -> None:
         """Replace this agent's agconfig with a clone of the given one, and

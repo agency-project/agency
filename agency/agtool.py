@@ -11,6 +11,7 @@ from concurrent.futures import (
 import json
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
+from .profiler import agprof
 from .agutil import format_exception
 from .agtype import type_hint_to_string_type, get_return_tool_description_prompt
 from .agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
@@ -368,7 +369,8 @@ def dispatch_tools(
                     pass
                 if _tool_timeout is None:
                     _tool_timeout = _default_tool_timeout
-                result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
+                with agprof.span(f"tool:{fn_name}"):
+                    result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)
                 # Offload large tool outputs regardless of whether the tool

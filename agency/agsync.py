@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-def agsync(*targets) -> None:
+def _agsync_impl(*targets) -> None:
     """Block until every in-flight agent task in *targets* has finished.
 
     *targets* may be any combination of:
@@ -87,3 +87,13 @@ def agsync(*targets) -> None:
         if len(errors) == 1:
             raise errors[0]
         raise ExceptionGroup(f"agsync: {len(errors)} team(s) failed", errors)
+
+
+def agsync(*targets) -> None:
+    from .profiler import agprof
+
+    with agprof.span("agsync:join"):
+        return _agsync_impl(*targets)
+
+
+agsync.__doc__ = _agsync_impl.__doc__

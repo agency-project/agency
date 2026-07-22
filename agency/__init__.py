@@ -14,6 +14,7 @@ from .agpause import wait_all_paused, wait_all_resumed
 from .agsandbox import agSandbox, get_container_runtime
 from .agresources import agResourcePool
 from .agutil import sigterm_as_exit
+from .profiler import agprof
 
 __all__ = [
     "agdata",
@@ -42,4 +43,5 @@ __all__ = [
     "agResourcePool",
     "get_container_runtime",
     "sigterm_as_exit",
+    "agprof",
 ]
