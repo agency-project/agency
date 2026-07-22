@@ -188,11 +188,38 @@ CREATE INDEX idx_events_ts     ON events(ts);
 CREATE INDEX idx_events_type   ON events(type);
 CREATE INDEX idx_events_agname ON events(agname);
 
--- Latest state per agent (for cold-start reconnects)
+-- Latest-value tables: one row per key, upserted on every emit() for the
+-- corresponding event type (see agwebui_emitter._UPSERT_TABLES). Every
+-- event type with a meaningful "current value" gets one of these, in
+-- ADDITION to its normal append-only row in `events` above -- the
+-- append-only row is what an already-connected client sees live; the
+-- upsert is what a client connecting or reconnecting LATER recovers,
+-- regardless of how long the run has been going. None of these are ever
+-- pruned or subject to TAIL_EVENTS' replay-window cap, since each only
+-- ever holds one row per key.
+CREATE TABLE agent_tokens (
+    agname TEXT PRIMARY KEY,
+    data   TEXT NOT NULL   -- most recent token_update JSON
+);
+CREATE TABLE agent_messages (
+    agname TEXT PRIMARY KEY,
+    data   TEXT NOT NULL   -- most recent messages_snapshot JSON
+);
 CREATE TABLE agent_state (
-    agname   TEXT PRIMARY KEY,
-    tokens   TEXT,   -- most recent token_update JSON
-    messages TEXT    -- most recent messages_snapshot JSON
+    agname TEXT PRIMARY KEY,
+    data   TEXT NOT NULL   -- most recent agent_state (status/skill/tool) JSON
+);
+CREATE TABLE agent_config_state (
+    agname TEXT PRIMARY KEY,
+    data   TEXT NOT NULL   -- most recent agent_config JSON
+);
+CREATE TABLE agent_registry (
+    agname TEXT PRIMARY KEY,
+    data   TEXT NOT NULL   -- agent_registered JSON
+);
+CREATE TABLE team_registry (
+    team_name TEXT PRIMARY KEY,
+    data      TEXT NOT NULL  -- team_registered JSON
 );
 
 -- Latest resource pool state (single row)
@@ -208,19 +235,21 @@ WAL mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL`) allows the serve
 
 Every event has `type` and `ts`. `agname` is present for per-agent events.
 
-| `type` | `agname` | Key payload fields | Emitted by |
-|---|---|---|---|
-| `log` | yes | `line: str` | `agterm.log()` |
-| `agent_registered` | yes | `color: str` (hex) | `agterm.__init__()` |
-| `agent_state` | yes | `state, skill, tool` — `state` includes `paused`/`blocked_on_dependency` alongside the original `inactive/skill/llm/tool/proc_wait/human/finished/error` | `agent._set_ui_state()` (thin wrapper around `agent._state.update_state(...)`) |
-| `agent_config` | yes | `config: {owner: {field: value}}` — `agConfig.dynamic_snapshot()`, Dynamic-tier fields only | `agent._emit_config()`, called from `__init__`/`fork()`/`load()`/`change_config()` |
-| `team_registered` | no | `team_name, agents: list[str]` | `agteam.__init__()` |
-| `messages_snapshot` | yes | `messages: list[dict]` | `agent._push_live_messages()` |
-| `token_update` | yes | `agent_input, agent_output, global_input, global_output` | `agskill` via `agent.push_token_count_update_to_ui()` after each LLM call completes |
-| `resource_update` | no | `gpus_acquired/total, cpus_acquired/total, memory_acquired/total_mb` | `agresources` on acquire/release |
-| `ask_human` | yes | `ask_id, question` | `ask_human` tool |
-| `human_reply` | yes | `ask_id, reply` | emitter after reply file is read |
-| `done` | no | — | `agwebui.run()` on completion |
+| `type` | `agname` | Key payload fields | Emitted by | Latest-value table |
+|---|---|---|---|---|
+| `log` | yes | `line: str` | `agterm.log()` | — |
+| `agent_registered` | yes | `color: str` (hex) | `agterm.__init__()` | `agent_registry` |
+| `agent_state` | yes | `state, skill, tool` — `state` includes `paused`/`blocked_on_dependency` alongside the original `inactive/skill/llm/tool/proc_wait/human/finished/error` | `agent._set_ui_state()` (thin wrapper around `agent._state.update_state(...)`) | `agent_state` |
+| `agent_config` | yes | `config: {owner: {field: value}}` — `agConfig.dynamic_snapshot()`, Dynamic-tier fields only | `agent._emit_config()`, called from `__init__`/`fork()`/`load()`/`change_config()` | `agent_config_state` |
+| `team_registered` | no | `team_name, agents: list[str]` | `agteam.__init__()` | `team_registry` (keyed by `team_name`) |
+| `messages_snapshot` | yes | `messages: list[dict]` | `agent._push_live_messages()` | `agent_messages` |
+| `token_update` | yes | `agent_input, agent_output, global_input, global_output` | `agskill` via `agent.push_token_count_update_to_ui()` after each LLM call completes | `agent_tokens` |
+| `resource_update` | no | `gpus_acquired/total, cpus_acquired/total, memory_acquired/total_mb` | `agresources` on acquire/release | `resource_state` |
+| `ask_human` | yes | `ask_id, question` | `ask_human` tool | — |
+| `human_reply` | yes | `ask_id, reply` | emitter after reply file is read | — |
+| `done` | no | — | `agwebui.run()` on completion | — |
+
+Every type with a latest-value table gets its current value upserted there on **every** `emit()`, in addition to its normal append-only row in `events` — see [Latest-value tables](#latest-value-tables-surviving-reconnects) below for why, and what this replaced.
 
 ### What each event type drives in the UI
 
@@ -238,25 +267,39 @@ Every event has `type` and `ts`. `agname` is present for per-agent events.
 | `human_reply` | Clears the pending question indicator |
 | `done` | Marks the run as complete in the header |
 
+### Latest-value tables — surviving reconnects
+
+Six event types (marked in the table above) have a meaningful "current value" — a client only ever cares about the *latest* `agent_config`, not a history of every config it's ever had. Each of these gets its own table (one row per key, upserted in place on every `emit()`) in addition to its normal append-only row in `events`. `_fetch_state_preamble()` reads every one of these tables in full on every client connect — so a client joining or reconnecting at any point in a run recovers the true current value for every agent/team/resource gauge, regardless of how long the run has been going.
+
+This matters because the append-only `events` table alone is not durable enough for that purpose:
+- **`TAIL_EVENTS`' replay window is fixed-size** (see [Timeline scrubbing](#timeline-scrubbing) below) — a type that fires rarely (like `agent_config`, once per agent at construction) can fall outside the last-N-events window long before the run ends, once enough higher-frequency events accumulate after it.
+- **Pruning downsamples high-frequency types** (see below) — without its own durable table, a type subject to pruning would only ever be recoverable at whatever coarse bucket resolution survived, not its true latest value.
+
+Before this table existed for `agent_config`, `agent_state` (the real status/skill/tool), `agent_registered`, and `team_registered`, a client reconnecting to a long-running batch could see a stale or empty config editor, or an agent list that never fully rebuilt after a server restart — the registration types happened to work most of the time only because they're never pruned and re-scanning the full `events` log for them was cheap, but that was incidental, not a designed guarantee, and it still didn't help `agent_config`, which has no such special-cased scan. One mechanism now covers all six types uniformly.
+
 ### Pruning — keeping the database small
 
-`token_update` and `messages_snapshot` are emitted at high frequency (every LLM token chunk and every LLM call respectively). `resource_update` fires on every GPU/CPU acquire and release. Storing every row would produce gigabytes for long multi-agent runs.
+`token_update`, `messages_snapshot`, `agent_state`, and `resource_update` (`agwebui_emitter._PRUNE_TYPES`) are emitted at high frequency (every LLM token chunk, every LLM call, every ReAct-loop state transition, every GPU/CPU acquire-release respectively). Storing every row would produce gigabytes for long multi-agent runs.
 
-**Pruning strategy**: every 500 inserts into the `events` table, the emitter deletes redundant rows for these three types, keeping the last event per `(type, agname, time bucket)`:
+**Pruning strategy**: every `_PRUNE_EVERY` (default **500**) inserts into the `events` table, the emitter deletes redundant rows for these four types, keeping the last event per `(type, agname, time bucket)` — but only among rows older than the most recent `_PRUNE_KEEP_RAW` (default **500**) by `id`:
 
 ```sql
 DELETE FROM events
-WHERE type IN ('token_update', 'messages_snapshot', 'resource_update')
+WHERE type IN ('token_update', 'messages_snapshot', 'resource_update', 'agent_state')
+  AND id <= (SELECT MAX(id) FROM events) - 500   -- _PRUNE_KEEP_RAW cutoff
   AND id NOT IN (
     SELECT MAX(id) FROM events
-    WHERE type IN ('token_update', 'messages_snapshot', 'resource_update')
+    WHERE type IN ('token_update', 'messages_snapshot', 'resource_update', 'agent_state')
+      AND id <= (SELECT MAX(id) FROM events) - 500
     GROUP BY type, agname, CAST(ts / 60.0 AS INTEGER)
   )
 ```
 
-The default bucket size is **60 seconds** (`agwebui_emitter._PRUNE_BUCKET_S`). Within each 60-second window, only the last row per agent per type survives. Events of all other types (`log`, `agent_state`, `agent_registered`, etc.) are **never pruned**.
+The default bucket size is **60 seconds** (`agwebui_emitter._PRUNE_BUCKET_S`). Within each 60-second window, only the last row per agent per type survives — but a sweep never even considers the most recent `_PRUNE_KEEP_RAW` rows, regardless of their type or bucket. Events of all other types (`log`, `agent_registered`, `agent_config`, `ask_human`, etc.) are **never pruned** at all.
 
-Additionally, the latest value for each pruned type is always upserted into `agent_state` / `resource_state` regardless of pruning, so reconnecting clients always receive the current state.
+**Why the raw-tail cutoff exists**: `TAIL_EVENTS` (server.py, default **1000**) replays the most recent N rows verbatim to a newly connecting client. Without `_PRUNE_KEEP_RAW`, a sweep firing at just the wrong moment could bucket-compact some rows inside that replay window while leaving others untouched, handing a connecting client a tail that's an inconsistent mix of raw and compacted history for the same type/agent. `_PRUNE_KEEP_RAW` guarantees the newest `_PRUNE_KEEP_RAW` rows are always fully raw. Combined with `_PRUNE_EVERY`'s own accumulation before the next sweep, the raw (never-yet-eligible-for-pruning) tail at any moment is between `_PRUNE_KEEP_RAW` and `_PRUNE_KEEP_RAW + _PRUNE_EVERY` rows — with both at 500, that's **500–1000 rows**, which is exactly why `TAIL_EVENTS` is set to 1000: it's sized to the worst case of that range, so a connecting client's replay window is never partially compacted.
+
+Additionally, the latest value for every type in [Latest-value tables](#latest-value-tables-surviving-reconnects) above is always upserted regardless of pruning, so reconnecting clients always receive the true current state for those types independent of whatever the raw/pruned tail happens to contain — the raw-tail guarantee above matters mainly for narrative continuity (recent `log` lines interleaved with recent `token_update`/`agent_state` history), not for correctness of "what is the current value."
 
 **Storage budget (60 s buckets, 2-hour run, 100 agents)**:
 
@@ -285,9 +328,9 @@ The browser shows a timeline slider covering the full run duration. Dragging it 
 
 This gives an accurate snapshot of all agent states, log lines, and token counts as they existed at `end_ts`.
 
-**Scrubbing fidelity for pruned types**: because `token_update`, `messages_snapshot`, and `resource_update` are pruned to one sample per 60-second bucket, a scrub to time T will show the token counts / message history from the last sample at or before T — at most 60 seconds stale. The `WHERE ts BETWEEN first_ts AND end_ts` query naturally picks up the surviving sample as long as `end_ts` is past the bucket boundary.
+**Scrubbing fidelity for pruned types**: because `token_update`, `messages_snapshot`, `agent_state`, and `resource_update` are pruned to one sample per 60-second bucket (outside the always-raw `_PRUNE_KEEP_RAW` tail — see [Pruning](#pruning--keeping-the-database-small) above), a scrub to time T will show the token counts / message history from the last sample at or before T — at most 60 seconds stale. The `WHERE ts BETWEEN first_ts AND end_ts` query naturally picks up the surviving sample as long as `end_ts` is past the bucket boundary.
 
-**Live mode**: clicking the "Live" button or dragging the slider to maximum reloads the page, reconnecting the WebSocket and resuming the live event stream. The server replays the last 500 events on connect so the client catches up instantly.
+**Live mode**: clicking the "Live" button or dragging the slider to maximum reloads the page, reconnecting the WebSocket and resuming the live event stream. The server replays the last `TAIL_EVENTS` (default 1000) events on connect, followed by the full latest-value state preamble (see above) — so the client catches up instantly regardless of how long the run has been going.
 
 ---
 
