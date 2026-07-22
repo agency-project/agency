@@ -48,6 +48,20 @@ def _merge_config_fields(agconfig: Any, config: dict) -> None:
             agconfig.set(owner, name, value)
 
 
+def _apply_config_update(target: Any, config: dict, agConfig_cls: Any) -> None:
+    """Merge *config* into *target*'s existing agconfig, then push via
+    ``change_config``. Falls back to a fresh agConfig when the target has
+    none yet. Never replaces a live agconfig with only the editor payload
+    -- that payload is a dynamic_snapshot() and omits static fields such as
+    sandbox mounts."""
+    if target.agconfig is not None:
+        merged = target.agconfig.clone()
+        _merge_config_fields(merged, config)
+        target.change_config(merged)
+    else:
+        target.change_config(agConfig_cls(config))
+
+
 def _all_agteam_subclasses(cls):
     """Every agteam subclass currently defined, at any depth -- found via
     Python's own subclass tracking (__subclasses__()), not a framework
@@ -81,27 +95,34 @@ def _dispatch_command(cmd: dict) -> None:
         for a in _agent_cls.all():
             (a.pause if ctype == "pause_all" else a.resume)()
     elif ctype == "update_config":
-        new_cfg = _agConfig_cls(cmd.get("config") or {})
+        # Merge into the agent's existing agconfig. The webui editor only
+        # ships a dynamic_snapshot() (LLM knobs etc.) -- replacing the whole
+        # object would drop static fields the editor never sees, notably
+        # agSandbox.mounts / base_image. Forks after a wipe then recreate
+        # sandboxes without the shared HF cache bind and bake model weights
+        # into lifecycle image layers.
+        config = cmd.get("config") or {}
         for a in _agent_cls.all():
             if a.agname == agname:
-                a.change_config(new_cfg)
+                _apply_config_update(a, config, _agConfig_cls)
                 break
     elif ctype == "update_config_all":
         from ..agteam import agteam as _agteam_cls
 
         config = cmd.get("config") or {}
-        new_cfg = _agConfig_cls(config)
 
         # 1. Agents that already exist -- each already cloned its own
         #    agconfig at construction time, so it needs a direct push.
+        #    Merge (not replace) so sandbox mounts / base_image survive.
         for a in _agent_cls.all():
-            a.change_config(new_cfg)
+            _apply_config_update(a, config, _agConfig_cls)
 
         # 2. Team instances that already exist -- change_config() replaces
         #    the team's own live agconfig *and* cascades to every agent it
         #    tracks, covering agents added to this team from here on.
+        #    Same merge rule as agents: the editor payload is partial.
         for t in _agteam_cls.all():
-            t.change_config(new_cfg)
+            _apply_config_update(t, config, _agConfig_cls)
 
         # 3. Every agteam subclass's class-level agconfig, mutated in place
         #    (not replaced) -- so a team constructed *after* this point,

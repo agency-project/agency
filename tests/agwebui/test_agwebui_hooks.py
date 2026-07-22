@@ -301,6 +301,68 @@ def test_dispatch_update_config_all_applies_to_every_agent():
     assert b.agconfig.get("agskill", "react_max_steps") == 11
 
 
+def test_dispatch_update_config_preserves_sandbox_mounts():
+    """Webui editor payloads are dynamic_snapshot() only. Replacing the whole
+    agconfig would drop agSandbox.mounts; forks after that bake HF weights
+    into lifecycle images instead of using the shared host cache bind."""
+    from agency.agwebui import _dispatch_command
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+    from agency.agsandbox import agSandboxConfig
+
+    cfg = agConfig({"agllm_backend": {"api_key": "k", "model": "", "base_url": "http://old"}})
+    agSandboxConfig(cfg).add_mount("hf_cache", "/tmp/hf-cache", "/root/.cache/huggingface")
+    ag = agent(agconfig=cfg)
+
+    _dispatch_command(
+        {
+            "type": "update_config",
+            "agname": ag.agname,
+            "config": {"agllm_backend": {"base_url": "http://new"}},
+        }
+    )
+
+    assert ag.agconfig.get("agllm_backend", "base_url") == "http://new"
+    mounts = ag.agconfig.get("agSandbox", "mounts") or {}
+    assert "hf_cache" in mounts
+    assert mounts["hf_cache"][1] == "/root/.cache/huggingface"
+
+
+def test_dispatch_update_config_all_preserves_sandbox_mounts():
+    from agency.agwebui import _dispatch_command
+    from agency.agent import agent
+    from agency.agconfig import agConfig
+    from agency.agsandbox import agSandboxConfig
+    from agency.agteam import agteam
+
+    cfg = agConfig({"agllm_backend": {"api_key": "k", "model": "", "base_url": "http://old"}})
+    agSandboxConfig(cfg).add_mount("hf_cache", "/tmp/hf-cache", "/root/.cache/huggingface")
+
+    class _MountPreserveTeam(agteam):
+        agconfig = cfg
+
+        def setup(self):
+            self.ag = agent()
+
+        def run(self):
+            pass
+
+    team = _MountPreserveTeam()
+    assert "hf_cache" in (team.ag.agconfig.get("agSandbox", "mounts") or {})
+
+    _dispatch_command(
+        {
+            "type": "update_config_all",
+            "config": {"agllm_backend": {"base_url": "http://new"}},
+        }
+    )
+
+    assert team.ag.agconfig.get("agllm_backend", "base_url") == "http://new"
+    assert "hf_cache" in (team.ag.agconfig.get("agSandbox", "mounts") or {})
+    assert "hf_cache" in (team.agconfig.get("agSandbox", "mounts") or {})
+    assert "hf_cache" in (_MountPreserveTeam.agconfig.get("agSandbox", "mounts") or {})
+
+
 def test_dispatch_update_config_all_mutates_default_agconfig():
     """A bare agent() with no team context falls back to agent.default_agconfig
     -- update_config_all must mutate it in place so a future such agent

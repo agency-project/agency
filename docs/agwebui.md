@@ -359,12 +359,14 @@ The Pause/Pause All/Resume All/Update Config buttons need the reverse flow: serv
 4. For each file, `agwebui._dispatch_command()` parses it and applies it via real objects: `agent.pause()`/`resume()` (looked up by `agname` via `agent.all()`), `agent.change_config()`, or for `update_config_all`, all four targets described below. The file is then deleted.
 
 `update_config_all` specifically reaches four separate objects, each sitting behind its own `agConfig.clone()` boundary (cloning is a one-time snapshot, so a mutation after the fact only reaches whoever hasn't cloned yet):
-- **Existing agents** (`agent.all()`) — direct `change_config()`.
-- **Existing team instances** (`agteam.all()`) — `agteam.change_config()`, which replaces the team's own live `agconfig` *and* cascades to every agent it tracks.
+- **Existing agents** (`agent.all()`) — merge the editor payload into each agent's current `agconfig`, then `change_config()` the merged result.
+- **Existing team instances** (`agteam.all()`) — same merge-then-`change_config()` pattern; `agteam.change_config()` also cascades to every agent the team tracks.
 - **Every `agteam` subclass's class-level `agconfig`** — found via a recursive walk of `agteam.__subclasses__()` (Python's own subclass tracking, no framework registry needed) and mutated in place field-by-field, so a team constructed *after* the click clones fresh data. This is what reaches a user script's own `agconfig = LLM_CONFIG`-style class attribute without the framework needing to know that variable exists.
 - **`agent.default_agconfig`** — mutated in place if set, for a bare `agent()` call made with no active team context.
 
-`update_config` (single-agent) only touches that one agent — it does not reach team classes or `default_agconfig`, so you can deliberately run mixed backends across agents.
+The editor payload is a `dynamic_snapshot()` (LLM knobs and other live fields). Live agents/teams therefore **merge** those fields into their existing `agconfig` rather than replacing it outright — a replace would drop static fields the editor never sends (notably `agSandbox.mounts` / `base_image`), and later `agent.fork()` sandboxes would come up without shared bind mounts.
+
+`update_config` (single-agent) only touches that one agent — it does not reach team classes or `default_agconfig`, so you can deliberately run mixed backends across agents. Same merge rule as above.
 
 ## Framework hooks
 
@@ -379,7 +381,7 @@ The Pause/Pause All/Resume All/Update Config buttons need the reverse flow: serv
 | `agent._emit_config()` (called from `__init__`/`fork()`/`load()`/`change_config()`) | `agent_config` |
 | `agteam.__init__()` (after `setup()`) | `team_registered` |
 | `ask_human` tool `fn()` | `ask_human`, file-based reply |
-| `agwebui._dispatch_command()` | applies `pause`/`resume`/`pause_all`/`resume_all`/`update_config`/`update_config_all` commands via `agent.pause()`/`resume()`/`change_config()`, `agteam.change_config()` |
+| `agwebui._dispatch_command()` | applies `pause`/`resume`/`pause_all`/`resume_all`/`update_config`/`update_config_all` commands via `agent.pause()`/`resume()`/`change_config()` (config updates merge into the existing agconfig), `agteam.change_config()` |
 
 ## Dependencies
 
