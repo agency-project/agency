@@ -33,7 +33,12 @@ _STATIC = Path(__file__).parent / "static"
 # Config
 # ---------------------------------------------------------------------------
 
-TAIL_EVENTS = 500  # events replayed to new clients on connect
+# Events replayed to new clients on connect. Matches
+# agwebui_emitter._PRUNE_KEEP_RAW + _PRUNE_EVERY (500 + 500) -- the maximum
+# possible size of the always-fully-raw tail that mechanism guarantees (see
+# _PRUNE_KEEP_RAW's docstring), so a connecting client's replay window is
+# never partially bucket-compacted mid-window.
+TAIL_EVENTS = 1000
 INDEX_INTERVAL = 1_000  # events between sample points in the timeline index
 
 # ---------------------------------------------------------------------------
@@ -52,11 +57,6 @@ _last_ts: float | None = None
 
 _clients: set[WebSocket] = set()
 _lock: asyncio.Lock | None = None  # created at startup
-
-# In-memory registry rebuilt from the database on startup and updated live.
-# Used to inject a "state preamble" for clients that connect mid-run.
-_agent_registry: dict[str, str] = {}  # agname -> raw JSON string
-_team_registry: dict[str, str] = {}  # team_name -> raw JSON string
 
 
 # ---------------------------------------------------------------------------
@@ -91,54 +91,54 @@ def _open_db(path: Path):
     return con
 
 
-def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None, dict, dict]:
-    """Read initial state from an existing database.
+def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None]:
+    """Read initial event-count/timestamp bookkeeping from an existing
+    database. Registration/state recovery no longer happens here -- it's
+    covered unconditionally by _fetch_state_preamble() on every connect (see
+    that function and agwebui_emitter._UPSERT_TABLES' docstring), so there's
+    no separate in-memory registry to rebuild at startup any more.
 
-    Returns (last_event_id, event_count, first_ts, last_ts, agent_reg, team_reg).
+    Returns (last_event_id, event_count, first_ts, last_ts).
     """
-    agent_reg: dict[str, str] = {}
-    team_reg: dict[str, str] = {}
     if not path.exists():
-        return 0, 0, None, None, agent_reg, team_reg
+        return 0, 0, None, None
     try:
         con = _open_db(path)
-        for (data,) in con.execute(
-            "SELECT data FROM events WHERE type IN ('agent_registered','team_registered') ORDER BY ts"
-        ):
-            try:
-                ev = json.loads(data)
-                t = ev.get("type")
-                if t == "agent_registered":
-                    agn = ev.get("agname")
-                    if agn:
-                        agent_reg[agn] = data
-                elif t == "team_registered":
-                    tn = ev.get("team_name")
-                    if tn:
-                        team_reg[tn] = data
-            except Exception as _e:
-                print(f"[agwebui] skipping malformed registration event row: {_e}")
         row = con.execute("SELECT MAX(id), COUNT(*), MIN(ts), MAX(ts) FROM events").fetchone()
         con.close()
         if row and row[0] is not None:
-            return row[0], row[1], row[2], row[3], agent_reg, team_reg
+            return row[0], row[1], row[2], row[3]
     except Exception as _e:
         print(f"[agwebui] WARNING: failed to read event summary from {path}: {_e}")
-    return 0, 0, None, None, agent_reg, team_reg
+    return 0, 0, None, None
+
+
+# Every latest-value table maintained by agwebui_emitter._UPSERT_TABLES,
+# plus resource_state -- read in full on every client connect so a client
+# joining or rejoining at any point in a run recovers the true current
+# value for every agent/team/resource gauge, not just whatever survived
+# TAIL_EVENTS' fixed-size replay window or _PRUNE_TYPES' downsampling.
+_STATE_TABLES = (
+    "agent_registry",
+    "team_registry",
+    "agent_tokens",
+    "agent_messages",
+    "agent_state",
+    "agent_config_state",
+)
 
 
 def _fetch_state_preamble(path: Path) -> list[str]:
-    """Return current token/messages/resource state for cold-start clients."""
+    """Return current registration/token/messages/agent-state/config/resource
+    state for cold-start (or reconnecting) clients."""
     if not path.exists():
         return []
     rows: list[str] = []
     try:
         con = _open_db(path)
-        for tokens, messages in con.execute("SELECT tokens, messages FROM agent_state"):
-            if tokens:
-                rows.append(tokens)
-            if messages:
-                rows.append(messages)
+        for table in _STATE_TABLES:
+            for (data,) in con.execute(f"SELECT data FROM {table}"):
+                rows.append(data)
         row = con.execute("SELECT data FROM resource_state WHERE id=1").fetchone()
         if row:
             rows.append(row[0])
@@ -231,11 +231,13 @@ def _fetch_events_range(path: Path, start_ts: float, end_ts: float) -> list[str]
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     global _lock, _last_event_id, _event_count, _first_ts, _last_ts
-    global _agent_registry, _team_registry
     _lock = asyncio.Lock()
-    # Seed state from an existing database (e.g. server restart mid-run).
+    # Seed event-count/timestamp bookkeeping from an existing database (e.g.
+    # server restart mid-run). Registration/state recovery no longer needs
+    # seeding here -- _fetch_state_preamble() reads the durable state tables
+    # fresh on every connect regardless of server restarts.
     seed = await asyncio.to_thread(_seed_from_db, _db_path())
-    _last_event_id, _event_count, _first_ts, _last_ts, _agent_registry, _team_registry = seed
+    _last_event_id, _event_count, _first_ts, _last_ts = seed
     task = asyncio.create_task(_tail_events())
     yield
     task.cancel()
@@ -300,16 +302,13 @@ async def websocket_endpoint(ws: WebSocket):
                 "tz_offset": _TZ_OFFSET,
             }
         )
-        reg_preamble = list(_agent_registry.values()) + list(_team_registry.values())
         try:
             await ws.send_text(sync)
             for line in tail_lines:
                 await ws.send_text(line)
-            # Registration preamble: agent/team roster.
-            for line in reg_preamble:
-                await ws.send_text(line)
-            # State preamble: latest token counts, message snapshots, resource state.
-            # Sent last so they overwrite any stale values from the tail replay.
+            # State preamble: registration roster, latest token counts,
+            # message snapshots, agent state, config, resource state. Sent
+            # after the tail replay so it overwrites any stale values there.
             for line in state_preamble:
                 await ws.send_text(line)
         except Exception:
@@ -368,22 +367,9 @@ async def _tail_events() -> None:
 
                 assert _lock is not None
                 async with _lock:
-                    for event_id, data in rows:
+                    for event_id, _ in rows:
                         _last_event_id = event_id
                         _event_count += 1
-                        try:
-                            ev = json.loads(data)
-                            t = ev.get("type")
-                            if t == "agent_registered":
-                                agn = ev.get("agname")
-                                if agn:
-                                    _agent_registry[agn] = data
-                            elif t == "team_registered":
-                                tn = ev.get("team_name")
-                                if tn:
-                                    _team_registry[tn] = data
-                        except Exception as _e:
-                            print(f"[agwebui] skipping malformed registration event row: {_e}")
 
                     dead: set[WebSocket] = set()
                     for _, data in rows:
