@@ -6,6 +6,20 @@ the framework's hot paths (`agskill`, `agllm`, `agtool`, `agsandbox`, `agmap`,
 off-path cost is one global check, and torch is never imported unless profiling
 is turned on.
 
+## Installation
+
+Install Agency with the optional profiling dependencies:
+
+```bash
+uv pip install -e ".[profiler]"
+```
+
+The extra installs `torch` for trace collection and `nvidia-ml-py` (imported
+as `pynvml`) for NVIDIA GPU sampling. These dependencies are intentionally not
+part of the default install because PyTorch is large and profiling is optional.
+The profiler runs in the host Python environment, so the copy of `torch`
+included in Agency's sandbox image does not satisfy this requirement.
+
 ## Usage
 
 ```python

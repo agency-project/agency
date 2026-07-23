@@ -25,12 +25,18 @@ uv venv --python 3.12 --seed --managed-python
 source .venv/bin/activate
 
 uv pip install -e .
+uv pip install -e ".[profiler]"   # profiling (PyTorch traces + NVIDIA GPU sampling)
 uv pip install -e ".[dev]"   # dev dependencies (pytest, ruff, pre-commit)
 
 pre-commit install   # one-time; runs ruff (lint + format) and hygiene checks on every commit
 ```
 
 The sandbox image comes with `torch torchvision transformers datasets accelerate numpy scipy matplotlib` pre-installed, and the `Qwen/Qwen3.5-4B` model weights and `wikitext-2-raw-v1` dataset pre-cached. Run `python /opt/model_smoke.py` inside any container to verify the setup.
+
+The profiler runs in the host Python environment, not inside the sandbox
+image. Install the `profiler` extra before using it; this provides `torch` for
+trace collection and `nvidia-ml-py` for NVIDIA GPU sampling. See
+[`agency/profiler/README.md`](agency/profiler/README.md) for usage.
 
 ## Quick start
 
