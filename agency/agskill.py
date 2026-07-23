@@ -410,7 +410,28 @@ class agskill:
                         # chain's actual depth crosses checkpoint_squash_
                         # max_depth -- see its docstring for why that's a
                         # depth-triggered check, not a fixed commit count.
-                        ag.sandbox.commit()
+                        #
+                        # Hibernate afterward: execute_react()'s output path
+                        # (recover_outputs / remove_files) re-wakes a
+                        # container that the last tool call already
+                        # hibernated, and commit() itself leaves the
+                        # container running. Without this stop(), finished
+                        # agents (especially one-shot forks) hold a session
+                        # keyring forever while sitting on `tail -f
+                        # /dev/null`. Same pending-work deferral as
+                        # agtool.py -- wait_for_processes() should already
+                        # have drained background jobs before we get here.
+                        try:
+                            ag.sandbox.commit()
+                        finally:
+                            if not ag.sandbox._has_pending_background_work():
+                                try:
+                                    ag.sandbox.stop()
+                                except Exception as _e:
+                                    print(
+                                        f"[agskill] WARNING: post-commit hibernate "
+                                        f"failed for {ag.agname}: {_e}"
+                                    )
                 if sandbox_lock is not None:
                     sandbox_lock.release()
                 agpause.set_current_worker_agent(None)

@@ -1361,7 +1361,10 @@ def test_long_output_no_duplicate_read_when_already_present():
 # call via ag._drain_inbox() (see execute_react()'s loop), since the failed
 # skill's own result is already final by the time _task() reaches teardown.
 # On success, it calls ag.sandbox.commit() (no args -- squashing is now
-# fully automatic, the old force_squash parameter is gone).
+# fully automatic, the old force_squash parameter is gone) and then
+# ag.sandbox.stop() to hibernate again (releasing the session keyring);
+# execute_react()'s output path may have re-woken the container after the
+# last tool-call hibernate, and commit() itself does not stop it.
 #
 # These tests exercise that finally block directly by running skills through
 # the real agent.run()/_task() path (not execute_react() in isolation, which
@@ -1399,8 +1402,8 @@ def _run_skill_via_agent(s, sandbox, skill_input=None):
 
 def test_tool_success_commits_and_stops():
     """A skill run that completes successfully must call sandbox.commit()
-    (no args) in agskill.py's _task() finally block, and must not
-    rm_container() or push anything onto the inbox."""
+    (no args) then sandbox.stop() in agskill.py's _task() finally block,
+    and must not rm_container() or push anything onto the inbox."""
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
     s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
@@ -1412,8 +1415,29 @@ def test_tool_success_commits_and_stops():
     ag, _ = _run_skill_via_agent(s, sandbox)
 
     sandbox.commit.assert_called_once_with()
+    sandbox.stop.assert_called_once_with()
+    method_names = [c[0] for c in sandbox.method_calls]
+    assert method_names.index("commit") < method_names.index("stop")
     sandbox.rm_container.assert_not_called()
     ag.inbox.put.assert_not_called()
+
+
+def test_tool_success_defers_hibernate_when_background_work_pending():
+    """Same deferral as per-tool stop(): do not hibernate over live
+    background work at skill teardown."""
+    sandbox = _make_sandbox_with_tracking()
+    sandbox._has_pending_background_work.return_value = True
+    s = make_skill()
+    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(result="ok"),
+        prev_ctx,
+        [],
+    )
+
+    _run_skill_via_agent(s, sandbox)
+
+    sandbox.commit.assert_called_once_with()
+    sandbox.stop.assert_not_called()
 
 
 def test_tool_failure_triggers_stop_without_commit():
@@ -1506,6 +1530,7 @@ def test_run_in_subprocess_false_still_stops():
     ag.run(bad_skill, agdata(x=1)).wait()
 
     assert sandbox.commit.call_count == 1
+    assert sandbox.stop.call_count == 1  # success path hibernates after commit
     assert sandbox.rm_container.call_count == 1
     ag.inbox.put.assert_called_once()
 
@@ -1557,6 +1582,7 @@ def test_run_in_subprocess_false_success_still_commits():
 
     assert sandbox.rm_container.call_count == 1
     assert sandbox.commit.call_count == 1
+    assert sandbox.stop.call_count == 1  # success path hibernates after commit
 
 
 def test_pending_background_work_defers_stop_entirely():
