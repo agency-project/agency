@@ -13,7 +13,7 @@ acts accordingly:
         team.run()
 
     # or, zero application changes:
-    #   AGENCY_PROFILE=1 [AGENCY_PROFILE_DIR=path] python app.py
+    #   AGENCY_PROFILE=1 [AGENCY_PROFILE_SCOPE=workload|process] python app.py
 
 Backend: torch.profiler (kineto). ``span()`` maps to
 ``torch.profiler.record_function`` and the session wraps ``profile(...)`` with
@@ -35,6 +35,7 @@ per-span ``args`` (click a span in the viewer):
 GPU activity is deliberately NOT part of this split — it happens outside the
 host thread and is attributed via lease intervals + device sampling, not thread clocks.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -66,7 +67,7 @@ _tls = threading.local()
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []      # (t_mono_ns, series, value)
-_sampler: "._Sampler | None" = None
+_sampler: "_Sampler | None" = None
 _leases_open: "dict[int, tuple[int, str]]" = {}    # gpu_id -> (t0_ns, label)
 _leases: "list[tuple[int, int, int, str]]" = []    # (gpu_id, t0_ns, t1_ns, label)
 _leases_lock = threading.Lock()
@@ -791,12 +792,47 @@ def session(
         stop()
 
 
+def profile_scope() -> str:
+    """Configured environment profiling scope.
+
+    Only ``process`` opts into process-lifetime profiling. Unset, empty, and
+    invalid values all select the deterministic ``workload`` default.
+    """
+    value = os.environ.get("AGENCY_PROFILE_SCOPE", "").strip().lower()
+    return "process" if value == "process" else "workload"
+
+
+def _env_enabled() -> bool:
+    return os.environ.get("AGENCY_PROFILE", "").strip().lower() in ("1", "true")
+
+
+def _env_out_dir() -> str:
+    return os.environ.get("AGENCY_PROFILE_DIR", "agprof_trace")
+
+
+@contextmanager
+def workload():
+    """Profile a workload boundary when environment profiling requests it.
+
+    The context owns a session only for ``AGENCY_PROFILE_SCOPE=workload`` (the
+    default) and only when no explicit session is already active. This keeps
+    callers free of scope conditionals and prevents the context from stopping
+    a session it did not start.
+    """
+    owns_session = _env_enabled() and profile_scope() == "workload" and not enabled()
+    prof = start(_env_out_dir()) if owns_session else _profiler
+    try:
+        yield prof
+    finally:
+        if owns_session:
+            stop()
+
+
 def _maybe_autostart() -> None:
-    """AGENCY_PROFILE=1 profiles an unmodified application for its whole life."""
-    if os.environ.get("AGENCY_PROFILE", "").lower() not in ("1", "true"):
+    """Start process-lifetime profiling when explicitly requested."""
+    if not _env_enabled() or profile_scope() != "process":
         return
-    out_dir = os.environ.get("AGENCY_PROFILE_DIR", "agprof_trace")
-    start(out_dir)
+    start(_env_out_dir())
     atexit.register(stop)
 
 

@@ -35,6 +35,12 @@ Or profile an **unmodified** application:
 AGENCY_PROFILE=1 [AGENCY_PROFILE_DIR=path] python app.py
 ```
 
+Environment profiling defaults to `AGENCY_PROFILE_SCOPE=workload`: with the Web
+UI, profiling starts immediately before the function passed to
+`agwebui.run(...)` and stops as soon as it returns, excluding dashboard startup
+and linger time. Set `AGENCY_PROFILE_SCOPE=process` to opt into the previous
+process-lifetime behavior. Unset or invalid scope values use `workload`.
+
 View traces with `tensorboard --logdir <runs dir>` (PYTORCH_PROFILER tab →
 Views → Trace; needs `tensorboard` + `torch-tb-profiler`) or drag the
 `.pt.trace.json` into <https://ui.perfetto.dev>. After a session,
