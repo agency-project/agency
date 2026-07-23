@@ -177,7 +177,9 @@ def _seed_base():
 
     base = agSandbox("agmap-base")
     base.write_file("/workspace/repo/data.txt", "hello-from-checkpoint\n")
-    base.stop(commit=True)  # sets _checkpoint_image for forks
+    # commit() checkpoints for forks; stop() hibernates (old stop(commit=True)).
+    base.commit()
+    base.stop()
     return base
 
 

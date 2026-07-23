@@ -879,7 +879,7 @@ class _ContainerBackendBase(agsandbox_backend):
         self._acquire_runtime_slot()
         try:
             if self._checkpoint_image is not None:
-                # Restart from last committed checkpoint (set by stop(commit=True)).
+                # Restart from last committed checkpoint (set by commit()).
                 # /workspace and all state from the previous tool call are preserved.
                 image = self._checkpoint_image
                 run_cmd = (
