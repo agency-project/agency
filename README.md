@@ -213,6 +213,7 @@ Runs the same checks as the `pre-commit` git hook and the CI `pre-commit` job: `
 | [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, webui routing |
 | [agwebui.md](docs/agwebui.md) | Web UI — browser dashboard, event stream, WebSocket, ask_human path |
 | [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
+| [agmap.md](docs/agmap.md) | `agmap` — run non-agent functions over items concurrently, sync or async |
 | [agname.md](docs/agname.md) | Agent naming — auto-generated unique names for agents and run directories |
 | [agutil.md](docs/agutil.md) | Shared utilities — helpers used across the framework |
 | [agschema.md](docs/agschema.md) | Schema validation — output field validation, type error fixes, field handler construction |

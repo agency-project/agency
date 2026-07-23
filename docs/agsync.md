@@ -30,6 +30,8 @@ For an `agteam`, "currently tracked agents" means:
 
 Agents that have already completed and have no other live reference are GC'd from the `WeakSet` automatically — `agsync` skips them since they are already done.
 
+`agsync` also accepts **[`agtask`](agmap.md) targets** — pending results from `agmap(..., is_asynchronous=True)`. Pass them explicitly (`agsync(pending)`, or mixed: `agsync(team, pending)`); each is resolved like a team result. Bare `agsync()` never waits on agmap tasks — only on the targets you pass — so keep the handle if you intend to join. A failed task resolves to `agerror` rather than re-raising here.
+
 ## Usage
 
 ### Single agent
