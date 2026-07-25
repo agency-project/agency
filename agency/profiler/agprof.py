@@ -72,6 +72,46 @@ _leases: "list[tuple[int, int, int, str]]" = []    # (gpu_id, t0_ns, t1_ns, labe
 _leases_lock = threading.Lock()
 _clock_mark_ns: "int | None" = None
 
+# Container cgroup registry — filled by the sandbox backends at container
+# start (docker + podman)
+_cg_registry: "dict[str, str]" = {}      # label (agname) -> cgroup dir
+_daemon_cg: "dict[str, str]" = {}        # cgroup dir -> agg kind ("conmon"/"dockerd")
+_cg_lock = threading.Lock()
+
+
+def container_started(label: str, cgroup_dir: str,
+                      daemon_cgroup_dir: "str | None" = None,
+                      daemon_kind: str = "conmon") -> None:
+    """Register a container's cgroup for sampling (called by sandbox backends).
+
+    *cgroup_dir* must be the kernel-reported cgroup v2 directory of the
+    container (from /proc/<pid>/cgroup). Raises while a session is active if
+    the directory has no cpu.stat — only docker/podman on cgroup v2 are
+    supported, and a profiled run on anything else should fail loudly rather
+    than silently produce no container metrics.
+    """
+    if _session is not None and not os.path.isfile(f"{cgroup_dir}/cpu.stat"):
+        raise RuntimeError(
+            f"agprof: cannot sample container cgroup {cgroup_dir!r} (no cpu.stat). "
+            "Only docker/podman on cgroup v2 are supported."
+        )
+    with _cg_lock:
+        _cg_registry[label] = cgroup_dir
+        if daemon_cgroup_dir is not None:
+            _daemon_cg[daemon_cgroup_dir] = daemon_kind
+
+
+def container_stopped(label: str) -> None:
+    """Drop a removed container from the sampling registry."""
+    with _cg_lock:
+        _cg_registry.pop(label, None)
+
+
+def container_registered(label: str) -> bool:
+    """True if *label* currently has a registered cgroup dir."""
+    with _cg_lock:
+        return label in _cg_registry
+
 
 def _read_schedstat() -> "int | None":
     """This thread's cumulative run-queue wait (ns), or None if unavailable.
@@ -237,77 +277,58 @@ class _Sampler(threading.Thread):
             self._clk_tck = os.sysconf("SC_CLK_TCK")
         except (ValueError, OSError):
             self._clk_tck = 100
-        # Per-container cgroup accounting (rootless podman, cgroup v2 systemd
-        # layout). Scopes appear/disappear with container incarnations; they
-        # are re-discovered every tick by listing the user slice. Container
-        # id -> name comes from podman's storage db (no CLI round-trips).
-        uid = os.getuid()
-        self._cg_base = Path(
-            f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/user.slice"
-        )
-        self._cg_db = Path.home() / ".local/share/containers/storage/overlay-containers/containers.json"
-        self._cg_labels: "dict[str, str]" = {}   # container full id -> label
-        self._cg_db_mtime = -1.0
+        # Containers are sampled from the registry the sandbox backends fill
+        # at container start (see container_started()) — no filesystem
+        # discovery, no runtime naming assumptions.
         self._pid_labels: "dict[int, str]" = {}  # pid -> label (container or comm)
         self._proc_util_last: "dict[int, int]" = {}  # gpu idx -> last NVML sample ts
 
-    def _cg_label(self, cid: str) -> str:
-        """Label for a container id: the agname part of 'sandbox-<run>-<agname>'."""
-        label = self._cg_labels.get(cid)
-        if label is not None:
-            return label
-        try:
-            mtime = self._cg_db.stat().st_mtime
-            if mtime != self._cg_db_mtime:
-                self._cg_db_mtime = mtime
-                db = json.loads(self._cg_db.read_text())
-                for c in db:
-                    names = c.get("names") or []
-                    name = names[0] if names else c["id"][:12]
-                    if name.startswith("sandbox-"):
-                        # "sandbox-<runid>-sandbox_<agname>_<dedup>" -> "<agname>"
-                        # (agSandbox allocates its own agname as sandbox_{agname}
-                        # plus a 4-char dedup suffix — agsandbox.py __init__).
-                        name = name.split("-", 2)[-1]
-                        name = name.removeprefix("sandbox_")
-                        base, _, suffix = name.rpartition("_")
-                        if base and len(suffix) == 4:
-                            name = base
-                    self._cg_labels[c["id"]] = name
-        except Exception:
-            pass
-        return self._cg_labels.get(cid, cid[:12])
-
     def _pid_label(self, pid: int) -> str:
-        """Label for a GPU-using PID: its container's agname when the PID lives
-        in a libpod cgroup (same id space as the CPU collector), else the
-        process comm name (e.g. vLLM's server process)."""
+        """Label for a GPU-using PID: the owning container's agname when the
+        PID's cgroup falls under a registered container dir (same registry the
+        CPU collector samples — runtime-agnostic), else the process comm name
+        (e.g. vLLM's server process)."""
         label = self._pid_labels.get(pid)
         if label is not None:
             return label
         label = f"pid{pid}"
+        cacheable = True
         try:
             cg = Path(f"/proc/{pid}/cgroup").read_text()
-            idx = cg.find("libpod-")
-            if idx != -1 and not cg[idx:].startswith("libpod-conmon"):
-                cid = cg[idx + 7 : idx + 7 + 64]
-                label = self._cg_label(cid)
+            path = next(
+                (l.split("::", 1)[1] for l in cg.splitlines() if l.startswith("0::")), ""
+            )
+            full = "/sys/fs/cgroup" + path
+            with _cg_lock:
+                entries = list(_cg_registry.items())
+            for reg_label, reg_dir in entries:
+                if full == reg_dir or full.startswith(reg_dir + "/"):
+                    label = reg_label
+                    break
             else:
                 label = Path(f"/proc/{pid}/comm").read_text().strip() or label
         except Exception:
-            pass
+            cacheable = False
         # comm names may contain ':' (e.g. "VLLM::EngineCor") — keep series
         # names parseable as gpu{i}:{label}:{metric}.
         label = label.replace(":", "_")
-        self._pid_labels[pid] = label
+        if cacheable:
+            self._pid_labels[pid] = label
         return label
 
-    def _tick_gpu_procs(self, t: int, i: int, h) -> None:
+    def _tick_gpu_procs(
+        self, t: int, i: int, h, dev_util: float = 0.0, dev_power_w: float = 0.0
+    ) -> None:
         """Per-PID GPU accounting for device *i*: VRAM per process (compute
         procs list) and SM utilization per process (NVML's sample buffer since
         the previous tick). This is what splits a device-wide curve into
         per-agent/per-process series under concurrency — cgroups can't meter
-        GPUs, so this is the container-attribution path for the device."""
+        GPUs, so this is the container-attribution path for the device.
+
+        Power has NO per-process accounting anywhere (board sensors measure
+        the whole card), so ``power_w_est`` is the device draw apportioned by
+        utilization share — an APPORTIONED ESTIMATE, never a measurement, 
+        hence the ``_est`` suffix."""
         try:
             for pr in self._nvml.nvmlDeviceGetComputeRunningProcesses(h):
                 if pr.usedGpuMemory:
@@ -328,61 +349,73 @@ class _Sampler(threading.Thread):
                     newest = max(newest, s.timeStamp)
             self._proc_util_last[i] = newest
             for pid, utils in per_pid.items():
-                _samples.append(
-                    (t, f"gpu{i}:{self._pid_label(pid)}:util_pct",
-                     sum(utils) / len(utils))
-                )
+                label = self._pid_label(pid)
+                pid_util = sum(utils) / len(utils)
+                _samples.append((t, f"gpu{i}:{label}:util_pct", pid_util))
+                if dev_power_w > 0 and pid_util > 0:
+                    share = min(1.0, pid_util / max(dev_util, 1.0))
+                    _samples.append(
+                        (t, f"gpu{i}:{label}:power_w_est", dev_power_w * share)
+                    )
         except Exception:
             pass  # NVMLError_NotFound when no samples since `last` — normal
 
     def _tick_cgroups(self, t: int) -> None:
-        if not self._cg_base.is_dir():
-            return
-        conmon_cpu_us = 0
-        saw_conmon = False
-        try:
-            entries = list(os.scandir(self._cg_base))
-        except OSError:
-            return
-        for entry in entries:
-            n = entry.name
-            if not (n.startswith("libpod-") and n.endswith(".scope")):
-                continue
-            cid = n[len("libpod-"):-len(".scope")]
-            if cid.startswith("conmon-"):
-                # Container-runtime helper processes: aggregate as daemon cost.
-                try:
-                    with open(f"{entry.path}/cpu.stat", "rb") as f:
-                        conmon_cpu_us += int(f.readline().split()[1])
-                    saw_conmon = True
-                except Exception:
-                    pass
-                continue
-            label = self._cg_label(cid)
+        """Sample every REGISTERED container (see container_started()) plus the
+        registered runtime-daemon cgroups (conmon scopes / docker services),
+        aggregated per kind. No discovery: the registry is the whole truth."""
+        with _cg_lock:
+            containers = list(_cg_registry.items())
+            daemons = list(_daemon_cg.items())
+        for label, cdir in containers:
+            self._sample_container(t, label, cdir)
+        agg: "dict[str, int]" = {}
+        for ddir, kind in daemons:
             try:
-                with open(f"{entry.path}/cpu.stat", "rb") as f:
-                    cpu_us = int(f.readline().split()[1])  # usage_usec
-                _samples.append((t, f"cg:{label}:cpu_us", float(cpu_us)))
-                with open(f"{entry.path}/memory.current", "rb") as f:
-                    _samples.append((t, f"sandbox:{label}:mem_mb", int(f.read()) / 2**20))
+                with open(f"{ddir}/cpu.stat", "rb") as f:
+                    agg[kind] = agg.get(kind, 0) + int(f.readline().split()[1])
             except Exception:
-                pass  # scope vanished mid-read (container stopped) — skip
-            self._tick_io_net(t, label, entry.path)
-        if saw_conmon:
-            _samples.append((t, "cg:conmon:cpu_us", float(conmon_cpu_us)))
+                pass  # daemon scope gone (its container stopped) — skip
+        for kind, cpu_us in agg.items():
+            _samples.append((t, f"cg:{kind}:cpu_us", float(cpu_us)))
 
-    def _tick_io_net(self, t: int, label: str, scope_path: str) -> None:
-        """Disk IO + network for one container, without the io controller.
+    def _sample_container(self, t: int, label: str, cdir: str) -> None:
+        try:
+            with open(f"{cdir}/cpu.stat", "rb") as f:
+                _samples.append((t, f"cg:{label}:cpu_us", float(int(f.readline().split()[1]))))
+            with open(f"{cdir}/memory.current", "rb") as f:
+                _samples.append((t, f"sandbox:{label}:mem_mb", int(f.read()) / 2**20))
+        except Exception:
+            return  # cgroup vanished (container stopped/hibernated) — skip all
+        # Disk IO, tier 1: the cgroup's own io.stat (exact; present under
+        # rootful docker and io-delegated rootless slices).
+        io_done = False
+        try:
+            rb = wb = 0
+            with open(f"{cdir}/io.stat", "rb") as f:
+                for line in f:
+                    for tok in line.split():
+                        if tok.startswith(b"rbytes="):
+                            rb += int(tok[7:])
+                        elif tok.startswith(b"wbytes="):
+                            wb += int(tok[7:])
+            _samples.append((t, f"cg:{label}:io_r", float(rb)))
+            _samples.append((t, f"cg:{label}:io_w", float(wb)))
+            io_done = True
+        except Exception:
+            pass
+        self._tick_io_net(t, label, cdir, io_from_pids=not io_done)
 
-        Rootless user slices typically don't get the `io` cgroup controller
-        delegated, so instead: the scope's cgroup.procs lists the container's
-        PIDs; /proc/<pid>/io (summed) gives cumulative disk bytes, and any one
-        PID's /proc/<pid>/net/dev gives the container's network-namespace
-        counters (the netns is per-container and stable across its PIDs).
-        Caveats: per-PID io of processes under other subuids is unreadable and
-        skipped; bytes of processes that exited between ticks are lost; the
-        summed series can step down when a PID exits (negative deltas are
-        dropped at injection).
+    def _tick_io_net(self, t: int, label: str, scope_path: str, io_from_pids: bool = True) -> None:
+        """Network (always) and disk IO (tier-2 fallback only) for one
+        container, via its PIDs.
+
+        Network has no cgroup controller, so it must come from the container's
+        netns: any one PID's /proc/<pid>/net/dev (per-container, stable across
+        PIDs). Disk IO via summed /proc/<pid>/io is only used when the cgroup
+        had no io.stat (io controller not delegated — typical rootless);
+        caveats: subuid-owned PIDs unreadable, PIDs exiting between ticks lose
+        their bytes, negative deltas dropped at injection.
         """
         # systemd cgroup driver parks the processes in a child cgroup of the
         # scope (scope/container/cgroup.procs); the scope's own procs file is
@@ -397,22 +430,23 @@ class _Sampler(threading.Thread):
             return
         if not pids:
             return
-        io_r = io_w = 0
-        io_seen = False
-        for pid in pids:
-            try:
-                with open(f"/proc/{pid}/io", "rb") as f:
-                    for line in f:
-                        if line.startswith(b"read_bytes:"):
-                            io_r += int(line.split()[1])
-                        elif line.startswith(b"write_bytes:"):
-                            io_w += int(line.split()[1])
-                io_seen = True
-            except Exception:
-                continue  # subuid-owned or exited — skip
-        if io_seen:
-            _samples.append((t, f"cg:{label}:io_r", float(io_r)))
-            _samples.append((t, f"cg:{label}:io_w", float(io_w)))
+        if io_from_pids:
+            io_r = io_w = 0
+            io_seen = False
+            for pid in pids:
+                try:
+                    with open(f"/proc/{pid}/io", "rb") as f:
+                        for line in f:
+                            if line.startswith(b"read_bytes:"):
+                                io_r += int(line.split()[1])
+                            elif line.startswith(b"write_bytes:"):
+                                io_w += int(line.split()[1])
+                    io_seen = True
+                except Exception:
+                    continue  # subuid-owned or exited — skip
+            if io_seen:
+                _samples.append((t, f"cg:{label}:io_r", float(io_r)))
+                _samples.append((t, f"cg:{label}:io_w", float(io_w)))
         for pid in pids:
             try:
                 with open(f"/proc/{pid}/net/dev", "rb") as f:
@@ -471,7 +505,7 @@ class _Sampler(threading.Thread):
                     _samples.append((t, f"gpu{i}:util_pct", float(u.gpu)))
                     _samples.append((t, f"gpu{i}:mem_mb", m.used / 2**20))
                     _samples.append((t, f"gpu{i}:power_w", p / 1000.0))
-                    self._tick_gpu_procs(t, i, h)
+                    self._tick_gpu_procs(t, i, h, float(u.gpu), p / 1000.0)
                 except Exception:
                     pass
         self._tick_cgroups(t)
@@ -685,8 +719,8 @@ def _inject_timelines(data) -> "tuple[int, int]":
                 rate = 100.0 * d_cpu_s / dt_s
                 if series == "host:cpu_s":
                     cname = "host cpu %"
-                elif label == "conmon":
-                    cname = "conmon cpu %"
+                elif label in ("conmon", "dockerd"):
+                    cname = f"{label} cpu %"
                 else:
                     cname = f"sandbox:{label}:cpu_pct"
             elif series.startswith("host:"):
