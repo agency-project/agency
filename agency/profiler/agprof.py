@@ -35,6 +35,7 @@ per-span ``args`` (click a span in the viewer):
 GPU activity is deliberately NOT part of this split — it happens outside the
 host thread and is attributed via lease intervals + device sampling, not thread clocks.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -48,8 +49,8 @@ from pathlib import Path
 
 _NULL = nullcontext()
 
-_session = None            # None = profiling off (the fast path checks only this)
-_profiler = None           # the live torch.profiler.profile object, if any
+_session = None  # None = profiling off (the fast path checks only this)
+_profiler = None  # the live torch.profiler.profile object, if any
 _out_dir: "Path | None" = None
 _state_lock = threading.Lock()
 
@@ -65,23 +66,23 @@ _last_summary: "dict[str, dict] | None" = None
 _tls = threading.local()
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
-_samples: "list[tuple[int, str, float]]" = []      # (t_mono_ns, series, value)
+_samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
 _sampler: "._Sampler | None" = None
-_leases_open: "dict[int, tuple[int, str]]" = {}    # gpu_id -> (t0_ns, label)
-_leases: "list[tuple[int, int, int, str]]" = []    # (gpu_id, t0_ns, t1_ns, label)
+_leases_open: "dict[int, tuple[int, str]]" = {}  # gpu_id -> (t0_ns, label)
+_leases: "list[tuple[int, int, int, str]]" = []  # (gpu_id, t0_ns, t1_ns, label)
 _leases_lock = threading.Lock()
 _clock_mark_ns: "int | None" = None
 
 # Container cgroup registry — filled by the sandbox backends at container
 # start (docker + podman)
-_cg_registry: "dict[str, str]" = {}      # label (agname) -> cgroup dir
-_daemon_cg: "dict[str, str]" = {}        # cgroup dir -> agg kind ("conmon"/"dockerd")
+_cg_registry: "dict[str, str]" = {}  # label (agname) -> cgroup dir
+_daemon_cg: "dict[str, str]" = {}  # cgroup dir -> agg kind ("conmon"/"dockerd")
 _cg_lock = threading.Lock()
 
 
-def container_started(label: str, cgroup_dir: str,
-                      daemon_cgroup_dir: "str | None" = None,
-                      daemon_kind: str = "conmon") -> None:
+def container_started(
+    label: str, cgroup_dir: str, daemon_cgroup_dir: "str | None" = None, daemon_kind: str = "conmon"
+) -> None:
     """Register a container's cgroup for sampling (called by sandbox backends).
 
     *cgroup_dir* must be the kernel-reported cgroup v2 directory of the
@@ -266,8 +267,7 @@ class _Sampler(threading.Thread):
                 pynvml.nvmlInit()
                 self._nvml = pynvml
                 self._handles = [
-                    pynvml.nvmlDeviceGetHandleByIndex(i)
-                    for i in range(pynvml.nvmlDeviceGetCount())
+                    pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())
                 ]
             except Exception:
                 self._nvml = None
@@ -295,9 +295,7 @@ class _Sampler(threading.Thread):
         cacheable = True
         try:
             cg = Path(f"/proc/{pid}/cgroup").read_text()
-            path = next(
-                (l.split("::", 1)[1] for l in cg.splitlines() if l.startswith("0::")), ""
-            )
+            path = next((l.split("::", 1)[1] for l in cg.splitlines() if l.startswith("0::")), "")
             full = "/sys/fs/cgroup" + path
             with _cg_lock:
                 entries = list(_cg_registry.items())
@@ -327,14 +325,13 @@ class _Sampler(threading.Thread):
 
         Power has NO per-process accounting anywhere (board sensors measure
         the whole card), so ``power_w_est`` is the device draw apportioned by
-        utilization share — an APPORTIONED ESTIMATE, never a measurement, 
+        utilization share — an APPORTIONED ESTIMATE, never a measurement,
         hence the ``_est`` suffix."""
         try:
             for pr in self._nvml.nvmlDeviceGetComputeRunningProcesses(h):
                 if pr.usedGpuMemory:
                     _samples.append(
-                        (t, f"gpu{i}:{self._pid_label(pr.pid)}:mem_mb",
-                         pr.usedGpuMemory / 2**20)
+                        (t, f"gpu{i}:{self._pid_label(pr.pid)}:mem_mb", pr.usedGpuMemory / 2**20)
                     )
         except Exception:
             pass
@@ -354,9 +351,7 @@ class _Sampler(threading.Thread):
                 _samples.append((t, f"gpu{i}:{label}:util_pct", pid_util))
                 if dev_power_w > 0 and pid_util > 0:
                     share = min(1.0, pid_util / max(dev_util, 1.0))
-                    _samples.append(
-                        (t, f"gpu{i}:{label}:power_w_est", dev_power_w * share)
-                    )
+                    _samples.append((t, f"gpu{i}:{label}:power_w_est", dev_power_w * share))
         except Exception:
             pass  # NVMLError_NotFound when no samples since `last` — normal
 
@@ -699,8 +694,12 @@ def _inject_timelines(data) -> "tuple[int, int]":
     # means the counter reset (new container incarnation under the same
     # label, or a PID exited from a summed series) and that interval is
     # skipped. Everything else is a direct gauge.
-    _BYTE_KINDS = {"io_r": "io read MB/s", "io_w": "io write MB/s",
-                   "net_rx": "net rx MB/s", "net_tx": "net tx MB/s"}
+    _BYTE_KINDS = {
+        "io_r": "io read MB/s",
+        "io_w": "io write MB/s",
+        "net_rx": "net rx MB/s",
+        "net_tx": "net tx MB/s",
+    }
     prev: "dict[str, tuple[int, float]]" = {}
     for t, series, value in _samples:
         kind = series.rsplit(":", 1)[-1] if series.startswith(("cg:", "host:")) else None
@@ -730,13 +729,25 @@ def _inject_timelines(data) -> "tuple[int, int]":
                 rate = delta / 2**20 / dt_s
                 cname = f"sandbox:{label}:{_BYTE_KINDS[kind]}"
             new.append(
-                {"ph": "C", "pid": pid, "tid": 0, "ts": to_us(t),
-                 "name": cname, "args": {"value": round(rate, 2)}}
+                {
+                    "ph": "C",
+                    "pid": pid,
+                    "tid": 0,
+                    "ts": to_us(t),
+                    "name": cname,
+                    "args": {"value": round(rate, 2)},
+                }
             )
         else:
             new.append(
-                {"ph": "C", "pid": pid, "tid": 0, "ts": to_us(t),
-                 "name": series, "args": {"value": round(value, 1)}}
+                {
+                    "ph": "C",
+                    "pid": pid,
+                    "tid": 0,
+                    "ts": to_us(t),
+                    "name": series,
+                    "args": {"value": round(value, 1)},
+                }
             )
     # Lease lanes: one synthetic "thread" per device, spans labeled by acquirer.
     lease_tids = set()
@@ -744,14 +755,25 @@ def _inject_timelines(data) -> "tuple[int, int]":
         tid = f"gpu{gpu_id}-lease"
         lease_tids.add((gpu_id, tid))
         new.append(
-            {"ph": "X", "pid": pid, "tid": tid, "ts": to_us(t0),
-             "dur": max(1.0, (t1 - t0) / 1e3), "name": f"lease:{label}",
-             "cat": "gpu_lease"}
+            {
+                "ph": "X",
+                "pid": pid,
+                "tid": tid,
+                "ts": to_us(t0),
+                "dur": max(1.0, (t1 - t0) / 1e3),
+                "name": f"lease:{label}",
+                "cat": "gpu_lease",
+            }
         )
     for gpu_id, tid in lease_tids:
         new.append(
-            {"ph": "M", "pid": pid, "tid": tid, "name": "thread_name",
-             "args": {"name": f"GPU {gpu_id} lease"}}
+            {
+                "ph": "M",
+                "pid": pid,
+                "tid": tid,
+                "name": "thread_name",
+                "args": {"name": f"GPU {gpu_id} lease"},
+            }
         )
     evs.extend(new)
     return sum(1 for e in new if e.get("ph") == "C"), len(_leases)
@@ -792,8 +814,8 @@ def summary_table(sort_by: str = "wall_ms", row_limit: int = 30) -> str:
     for name, r in rows[:row_limit]:
         cpu_pct = 100 * r["cpu_ms"] / r["wall_ms"] if r["wall_ms"] else 0.0
         lines.append(
-            f"{name:<28} {r['calls']:>5} {r['wall_ms']/1e3:>9.2f} {r['cpu_ms']/1e3:>8.2f} "
-            f"{r['runq_ms']/1e3:>8.2f} {r['blocked_ms']/1e3:>9.2f} {cpu_pct:>5.1f}%"
+            f"{name:<28} {r['calls']:>5} {r['wall_ms'] / 1e3:>9.2f} {r['cpu_ms'] / 1e3:>8.2f} "
+            f"{r['runq_ms'] / 1e3:>8.2f} {r['blocked_ms'] / 1e3:>9.2f} {cpu_pct:>5.1f}%"
         )
     return "\n".join(lines)
 

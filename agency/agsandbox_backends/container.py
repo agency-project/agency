@@ -827,7 +827,7 @@ class _ContainerBackendBase(agsandbox_backend):
         # unexpected '|' in the middle.
         running_str, status, pid_str = parts[0], "|".join(parts[1:-1]), parts[-1]
         try:
-            pid = int(pid_str) or None   # stopped containers report Pid 0
+            pid = int(pid_str) or None  # stopped containers report Pid 0
         except ValueError:
             pid = None
         return (running_str == "true", status, pid)
@@ -966,7 +966,7 @@ class _ContainerBackendBase(agsandbox_backend):
         """
         name = str(self._agname)
         if name.startswith("sandbox_"):
-            name = name[len("sandbox_"):]
+            name = name[len("sandbox_") :]
             base, _, suffix = name.rpartition("_")
             if base and len(suffix) == 4:
                 name = base
@@ -994,9 +994,7 @@ class _ContainerBackendBase(agsandbox_backend):
         try:
             cg_text = Path(f"/proc/{pid}/cgroup").read_text()
         except OSError as e:
-            raise RuntimeError(
-                f"agprof: cannot read cgroup of container PID {pid}: {e}"
-            ) from e
+            raise RuntimeError(f"agprof: cannot read cgroup of container PID {pid}: {e}") from e
         rel = next(
             (l.split("::", 1)[1].strip() for l in cg_text.splitlines() if l.startswith("0::")),
             None,
@@ -1016,7 +1014,7 @@ class _ContainerBackendBase(agsandbox_backend):
             scope = os.path.dirname(scope)
         base = os.path.basename(scope)
         if base.startswith("libpod-"):
-            cand = os.path.join(os.path.dirname(scope), f"libpod-conmon-{base[len('libpod-'):]}")
+            cand = os.path.join(os.path.dirname(scope), f"libpod-conmon-{base[len('libpod-') :]}")
             if os.path.isdir(cand):
                 daemon_dir = cand
         elif base.startswith("docker-"):

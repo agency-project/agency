@@ -496,6 +496,7 @@ class agskill:
         # which would otherwise let wait_all_paused() race past a run that
         # hasn't had a chance to update its own state yet.
         ag._set_ui_state("skill", skill=self.name)
+
         def _traced_task() -> None:
             _label = f"run{agprof.next_index()}:{self.name}:{ag.agname}"
             agprof.thread_name(_label)
@@ -557,7 +558,7 @@ class agskill:
                 )
                 if self.input_schema is not None
                 else ([], [])
-        )
+            )
 
         _extra_system: str | None = None
         if auto_fields:
@@ -735,7 +736,9 @@ class agskill:
                             agconfig=ag.agconfig,
                         )
                     # Continue looping unless all required output fields are collected.
-                    if not (_use_return_output and not (_required_fields - set(_collected_outputs))):
+                    if not (
+                        _use_return_output and not (_required_fields - set(_collected_outputs))
+                    ):
                         continue
 
                 else:
@@ -785,7 +788,11 @@ class agskill:
                             agerror(
                                 f"output schema error: missing fields after retries: {sorted(missing)}"
                                 + f"\ncollected: {sorted(_collected_outputs.keys())}"
-                                + (f"\nlast model output: {_last_out_str!r}" if _last_out_str else "")
+                                + (
+                                    f"\nlast model output: {_last_out_str!r}"
+                                    if _last_out_str
+                                    else ""
+                                )
                             ),
                             prev_ctx,
                             [messages[0]] + messages[1:][n_before:],
@@ -825,7 +832,9 @@ class agskill:
                     f"BUG: reached raw-text path with structured output_schema on skill '{self.name}'. "
                     "This should be unreachable — _use_return_output covers all schema cases."
                 )
-                out_key = self.output_schema.raw_key() if self.output_schema is not None else "result"
+                out_key = (
+                    self.output_schema.raw_key() if self.output_schema is not None else "result"
+                )
                 result = agdata(**{out_key: msg_dict.get("content") or ""})
                 with agprof.span("proc_wait"):
                     proc_msg = agSandbox.wait_for_processes(

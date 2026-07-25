@@ -298,7 +298,9 @@ class agent:
             team_name = _team.team_name if _team is not None else None
 
             ctx = (
-                f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
+                f"  context={self.llm.context_limit}"
+                if self.llm.context_limit
+                else "  context=unknown"
             )
             team_tag = f"  team={team_name}" if team_name else ""
             self.terminal.log("CREATED  ", f"model={self.llm.backend.model or '?'}{ctx}{team_tag}")

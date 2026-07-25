@@ -148,7 +148,9 @@ class agSandbox(_AgSandboxFields):
         with agprof.span("sandbox:create"):
             base_image = self.base_image
             mounts: dict[str, tuple[str, str, str]] = {}
-            for mount_name, (host, container, mode) in agSandboxConfig(self._agconfig).mounts.items():
+            for mount_name, (host, container, mode) in agSandboxConfig(
+                self._agconfig
+            ).mounts.items():
                 host_path = Path(host)
                 host_path.mkdir(parents=True, exist_ok=True)
                 mounts[mount_name] = (str(host_path.resolve()), container, mode)
