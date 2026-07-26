@@ -210,6 +210,11 @@ def test_real_claude_raw_text_end_to_end():
     # /v1/messages route, the gateway must be able to actually answer, not
     # just accept the connection. Uses the same Bedrock bearer-token
     # credential (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
+    from agency.agharness_internal.agproxy_llm import get_shared_gateway
+
+    gateway = get_shared_gateway()
+    log_before = len(gateway.request_log)
+
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
@@ -222,6 +227,18 @@ def test_real_claude_raw_text_end_to_end():
     result = ag.run(skill, agdata(instruction="Say hi in exactly two words."))
     result.wait()
     raw = result.to_dict()
+
+    # The correct answer alone doesn't prove the gateway was actually used --
+    # HOME is deliberately left untouched (see this backend's docstring), so
+    # a real OAuth-logged-in `claude` on this host could in principle answer
+    # correctly via its OWN credentials if ANTHROPIC_BASE_URL/AUTH_TOKEN were
+    # somehow ignored. Assert directly against the gateway's own request log
+    # instead of inferring "it must have gone through the gateway" from the
+    # result looking right.
+    new_entries = gateway.request_log[log_before:]
+    assert len(new_entries) >= 1, "claude's request never reached agproxy_llm"
+    assert all(e["route"] == "/v1/messages" for e in new_entries)
+    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in new_entries)
     assert "error" not in raw, raw
     assert isinstance(raw.get("result"), str) and raw["result"]
 
@@ -233,6 +250,11 @@ def test_real_claude_structured_output_end_to_end():
     # /v1/messages route, the gateway must be able to actually answer, not
     # just accept the connection. Uses the same Bedrock bearer-token
     # credential (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
+    from agency.agharness_internal.agproxy_llm import get_shared_gateway
+
+    gateway = get_shared_gateway()
+    log_before = len(gateway.request_log)
+
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
@@ -248,6 +270,11 @@ def test_real_claude_structured_output_end_to_end():
     )
     result.wait()
     raw = result.to_dict()
+
+    new_entries = gateway.request_log[log_before:]
+    assert len(new_entries) >= 1, "claude's request never reached agproxy_llm"
+    assert all(e["route"] == "/v1/messages" for e in new_entries)
+    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in new_entries)
     assert "error" not in raw, raw
     assert isinstance(raw.get("greeting"), str)
     assert isinstance(raw.get("word_count"), int)

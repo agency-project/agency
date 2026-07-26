@@ -300,6 +300,58 @@ def test_openai_responses_route_streaming_returns_responses_sse():
     assert "event: response.completed" in resp.text
 
 
+def test_request_log_records_authenticated_chat_completions_calls():
+    px, _, _ = _make_gateway_with_agent(token="tok")
+    client = _client_for(px)
+    assert px.request_log == []
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [], "stream": False},
+        headers={"Authorization": "Bearer tok"},
+    )
+    assert len(px.request_log) == 1
+    assert px.request_log[0]["route"] == "/v1/chat/completions"
+    assert px.request_log[0]["token"] == "tok"
+
+
+def test_request_log_does_not_record_unauthenticated_calls():
+    px, _, _ = _make_gateway_with_agent(token="tok")
+    client = _client_for(px)
+    client.post("/v1/chat/completions", json={"model": "m", "messages": []})
+    assert px.request_log == []
+
+
+def test_request_log_records_anthropic_messages_calls():
+    px, ag, fake_client = _make_gateway_with_agent(token="tok")
+    fake_client.chat.completions.create.return_value = _Response(
+        [_Choice(message=_Message(content="hi"), finish_reason="stop")], usage=_Usage(1, 1)
+    )
+    client = _client_for(px)
+    client.post(
+        "/v1/messages",
+        json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+        headers={"Authorization": "Bearer tok"},
+    )
+    assert len(px.request_log) == 1
+    assert px.request_log[0]["route"] == "/v1/messages"
+    assert px.request_log[0]["model"] == "configured-model"  # overridden, not "claude-x"
+
+
+def test_request_log_records_responses_calls():
+    px, ag, fake_client = _make_gateway_with_agent(token="tok")
+    fake_client.chat.completions.create.return_value = _Response(
+        [_Choice(message=_Message(content="hi"))], usage=_Usage(1, 1)
+    )
+    client = _client_for(px)
+    client.post(
+        "/v1/responses",
+        json={"model": "m", "input": "hi", "stream": False},
+        headers={"Authorization": "Bearer tok"},
+    )
+    assert len(px.request_log) == 1
+    assert px.request_log[0]["route"] == "/v1/responses"
+
+
 def test_agproxy_llm_config_view():
     # port is a DynamicConfigParam (per-instance, freely settable/re-settable);
     # bind_host/request_timeout_s are tier-1 GlobalConfigParams like other

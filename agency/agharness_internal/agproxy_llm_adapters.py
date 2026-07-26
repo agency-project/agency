@@ -97,12 +97,35 @@ def anthropic_messages_to_openai(body: dict) -> dict:
     openai_messages: list[dict] = []
 
     system_text = _anthropic_system_to_text(body.get("system"))
-    if system_text:
-        openai_messages.append({"role": "system", "content": system_text})
+
+    # Claude Code injects its own mid-conversation `system`-role messages
+    # directly into `messages` (a "system reminder"), not just the
+    # top-level `system` field above -- confirmed against a real captured
+    # request: `[('user', list), ('system', str), ('assistant', list),
+    # ...]`. Every mid-array occurrence is collected here (not just the
+    # first -- there is no guarantee only one ever appears) and folded
+    # into the SAME leading system message below, mirroring exactly what
+    # `_openai_messages_to_anthropic` (agllm_backends/anthropic.py:100-144)
+    # already does for the reverse direction: accumulate every
+    # `role == "system"` message's text, wherever it appears, and join
+    # them into one system context -- never leave a second `system` entry
+    # in the messages array. Confirmed via a real captured Bedrock-native
+    # request that this is also what Claude Code's own properly-targeted
+    # Bedrock client does (system-role content never appears mid-array on
+    # that path either; it's absorbed into a single leading `system`
+    # field). Folding preserves the content's actual semantic weight
+    # (system-level authority), instead of recasting it as if the user
+    # said it, and never inserts anything at its original array position.
+    extra_system_parts: list[str] = []
 
     for m in body.get("messages", []):
         role = m.get("role")
         content = m.get("content")
+        if role == "system":
+            extra_text = _anthropic_system_to_text(content)
+            if extra_text:
+                extra_system_parts.append(extra_text)
+            continue
         if isinstance(content, str):
             openai_messages.append({"role": role, "content": content})
             continue
@@ -154,6 +177,10 @@ def anthropic_messages_to_openai(body: dict) -> dict:
                 msg["tool_calls"] = tool_calls
             openai_messages.append(msg)
         # unrecognized roles are dropped rather than sent to a backend that would reject them
+
+    combined_system = "\n\n".join([system_text] + extra_system_parts) if system_text else "\n\n".join(extra_system_parts)
+    if combined_system:
+        openai_messages.insert(0, {"role": "system", "content": combined_system})
 
     kwargs: dict = {
         "model": body.get("model", ""),

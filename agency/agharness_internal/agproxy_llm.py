@@ -25,6 +25,8 @@ wire-format detail.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 import uuid
@@ -78,6 +80,63 @@ class agProxyLLMConfig(_AgConfigViewBase):
     _OWNER = "agproxy_llm"
 
 
+_DEBUG_CAPTURE_MARKERS = ("Available agent types", "task tools haven't been used", "gentle reminder")
+
+
+def _debug_log_anthropic_messages_body(path: str, body: dict) -> None:
+    """Temporary diagnostic: dump raw incoming /v1/messages shape (roles,
+    mid-array system messages, reminder markers) to `path` for direct
+    inspection of what the harness actually sent, before any adapter
+    transformation. Opt-in only, via AGENCY_DEBUG_CAPTURE_LOG."""
+    messages = body.get("messages", [])
+    roles = [m.get("role") for m in messages]
+    mid_array_system = "system" in roles[1:] if roles else False
+    lines = [f"\n=== num_messages={len(roles)} roles={roles} "
+             f"{'!!! MID-ARRAY SYSTEM !!!' if mid_array_system else ''}"]
+    sys_field = body.get("system")
+    if sys_field:
+        sys_text = sys_field if isinstance(sys_field, str) else json.dumps(sys_field)
+        lines.append(f"    top-level system ({len(sys_text)} chars)")
+        for marker in _DEBUG_CAPTURE_MARKERS:
+            if marker in sys_text:
+                lines.append(f"    >>> top-level system contains marker: {marker!r}")
+    else:
+        lines.append("    top-level system: ABSENT")
+    for i, m in enumerate(messages):
+        if m.get("role") == "system":
+            content = m.get("content")
+            text = content if isinstance(content, str) else json.dumps(content)
+            lines.append(f"    >>> MID-ARRAY SYSTEM MESSAGE at index {i} ({len(text)} chars): {text[:300]!r}")
+            for marker in _DEBUG_CAPTURE_MARKERS:
+                if marker in text:
+                    lines.append(f"        >>> contains marker: {marker!r}")
+    with open(path, "a") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _warn_mid_array_system_messages(ag: "agent", body: dict) -> None:
+    """Claude Code's generic (ANTHROPIC_BASE_URL) client sometimes emits its
+    own dynamic reminders (e.g. an Agent-tool-availability nudge) as a
+    `role: "system"` entry inside `messages`, not the top-level `system`
+    field -- a shape the real Anthropic Messages API and AWS Bedrock's
+    Anthropic-invoke endpoint both reject outright (confirmed directly
+    against both). `anthropic_messages_to_openai` below folds every such
+    occurrence into the one leading system message so it never reaches a
+    real backend, but that's a silent correctness workaround for what looks
+    like an inconsistency in Claude Code's own request serialization on
+    this client path -- surface it instead of absorbing it invisibly."""
+    n = sum(1 for m in body.get("messages", []) if m.get("role") == "system")
+    if n:
+        ag.terminal.log(
+            "WARNING  ",
+            f"harness emitted {n} mid-conversation system-role message(s) in "
+            "its /v1/messages request -- not valid per the Anthropic Messages "
+            "API (system must be the top-level `system` field, never a "
+            "`messages` entry); folding into the leading system message "
+            "before forwarding to the real backend",
+        )
+
+
 def _extract_bearer_token(request) -> "str | None":
     auth = request.headers.get("authorization") or request.headers.get("x-api-key")
     if not auth:
@@ -101,6 +160,37 @@ class agProxyLLM:
         self._server = None
         self._thread: "threading.Thread | None" = None
         self.base_url: "str | None" = None
+        # Separate from the TCP listener above -- a docker/podman-backed
+        # harness launch runs inside the container's own network namespace,
+        # where the TCP listener's host-bound address (127.0.0.1 by default)
+        # is unreachable, and this host's actual container-to-host
+        # networking (rootless Docker: neither the bridge gateway IP nor
+        # `host.docker.internal` reached a host-bound port here) can't be
+        # relied on either. A Unix domain socket sidesteps that entirely: it
+        # crosses the container boundary as a bind-mounted filesystem
+        # object (agsandbox's existing, universally-supported mechanism),
+        # not a network hop, so it works the same regardless of the
+        # container runtime's networking mode. See
+        # docs/Design_harness_integration.md and the in-container relay
+        # script (`agharness_internal/agproxy_ptrace_internal/
+        # _tcp_to_uds_relay.py`) that bridges a container-local TCP port to
+        # this socket. Started lazily, independent of `start()` -- a process
+        # that never runs a container-backed harness never pays for this.
+        self._uds_server = None
+        self._uds_thread: "threading.Thread | None" = None
+        self.uds_path: "str | None" = None
+        # Every successfully-authenticated request across all three routes,
+        # appended as {"route", "token", "model"} -- this is what lets a
+        # test against a REAL harness binary prove its traffic actually
+        # transited this gateway, rather than just checking the final
+        # answer looks right (which a harness falling back to its own real
+        # credentials could produce too). See test_claude_code.py's
+        # `real_claude`-marked tests.
+        self.request_log: "list[dict]" = []
+
+    def _log_request(self, route: str, token: str, model: str) -> None:
+        with self._lock:
+            self.request_log.append({"route": route, "token": token, "model": model})
 
     # -- token <-> agent registry ---------------------------------------
 
@@ -132,6 +222,7 @@ class agProxyLLM:
                     {"error": {"message": "unknown or missing bearer token"}}, status_code=401
                 )
             body = await request.json()
+            self._log_request("/v1/chat/completions", token, body.get("model", ""))
             timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
             client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
             if body.get("stream"):
@@ -161,6 +252,9 @@ class agProxyLLM:
                     status_code=401,
                 )
             body = await request.json()
+            _debug_capture_path = os.environ.get("AGENCY_DEBUG_CAPTURE_LOG")
+            if _debug_capture_path:
+                _debug_log_anthropic_messages_body(_debug_capture_path, body)
             # Route to the model THIS agent is configured for, not whatever
             # model name the harness itself happened to request -- Claude
             # Code's own default model id has no reason to match this
@@ -169,10 +263,26 @@ class agProxyLLM:
             # against the real backend rather than actually routing through
             # agency's own configured LLM. Hit and fixed against the real
             # `claude` CLI during development.
-            model = getattr(ag.llm.backend, "model", "") or body.get("model", "")
+            #
+            # Deliberately does NOT fall back to body.get("model") when
+            # this agent's own model is unset -- that would mean an empty
+            # config silently starts trusting the harness's own guess,
+            # exactly the thing this whole gateway exists to prevent (hit
+            # for real: an empty agVLLMBackendConfig(model="") launch
+            # forwarded Claude Code's own internal model alias to a vLLM
+            # server that had no such model, 404). Native's own call sites
+            # (agllm.py:541,790) never had this fallback either -- they
+            # just send `backend.model or ""` unconditionally and let the
+            # real server do whatever it does with an empty value (a vLLM
+            # server serving exactly one model uses it regardless). This
+            # route now matches that exactly, instead of being the one
+            # place that second-guesses an intentionally-empty model.
+            model = ag.llm.backend.model or ""
             request_id = f"msg_{uuid.uuid4().hex}"
+            self._log_request("/v1/messages", token, model)
             timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
             client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
+            _warn_mid_array_system_messages(ag, body)
             openai_kwargs = anthropic_messages_to_openai(body)
             openai_kwargs["model"] = model
 
@@ -187,6 +297,33 @@ class agProxyLLM:
 
             resp = client.chat.completions.create(**openai_kwargs)
             return JSONResponse(openai_response_to_anthropic_message(resp, model, request_id))
+
+        @app.post("/agpolicy/check_tool")
+        async def agpolicy_check_tool(request: Request):
+            # Bridges a harness's own native permission-check mechanism
+            # (e.g. Claude Code's `PreToolUse` hook, invoked as a subprocess
+            # that can't reach into this process's Python state directly)
+            # to `agpolicy` -- the same mediation interface `agproxy_ptrace`
+            # already calls for syscall-level events, now also reachable
+            # over the one channel a hook subprocess actually has: HTTP,
+            # through the same per-run bearer token already used for LLM
+            # traffic. See docs/Design_harness_integration.md.
+            token = _extract_bearer_token(request)
+            ag = self._agent_for_token(token)
+            if ag is None:
+                return JSONResponse(
+                    {"decision": "deny", "reason": "unknown or missing bearer token"},
+                    status_code=401,
+                )
+            body = await request.json()
+            tool_name = body.get("tool_name", "")
+            tool_input = body.get("tool_input") or {}
+
+            from .. import agharness
+
+            policy = agharness.default_policy(ag)
+            decision = policy.check_tool(ag, tool_name, tool_input)
+            return JSONResponse({"decision": decision.kind, "reason": decision.reason})
 
         @app.post("/v1/messages/count_tokens")
         async def anthropic_count_tokens(request: Request):
@@ -222,9 +359,13 @@ class agProxyLLM:
             body = await request.json()
             # Same reasoning as /v1/messages above: route to this agent's
             # own configured model, not whatever Codex's own default
-            # happened to request.
-            model = getattr(ag.llm.backend, "model", "") or body.get("model", "")
+            # happened to request -- including when this agent's own model
+            # is unset, in which case pass that through as-is (matching
+            # native's `backend.model or ""`), never substitute Codex's own
+            # guess.
+            model = ag.llm.backend.model or ""
             request_id = f"resp_{uuid.uuid4().hex}"
+            self._log_request("/v1/responses", token, model)
             timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
             client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
             openai_kwargs = responses_request_to_openai(body)
@@ -286,6 +427,49 @@ class agProxyLLM:
         self._server = None
         self._thread = None
         self.base_url = None
+        self.stop_uds()
+
+    def ensure_uds_started(self) -> str:
+        """Start (idempotently) a second listener for the same `self._app`
+        bound to a Unix domain socket instead of TCP, and return its path.
+        Independent of `start()`/`base_url` -- a docker/podman-backed
+        harness launch uses this path via the in-container TCP-to-UDS
+        relay; a bare host-level/chroot launch never calls this at all and
+        never pays for it."""
+        if self.uds_path is not None:
+            return self.uds_path
+
+        import uuid
+
+        from ..agutil import agharness_llm_gateway_dir
+
+        sock_path = str(agharness_llm_gateway_dir() / f"agproxy_llm-{uuid.uuid4().hex}.sock")
+        config = uvicorn.Config(self._app, uds=sock_path, log_level="warning")
+        server = uvicorn.Server(config)
+        self._uds_server = server
+
+        self._uds_thread = threading.Thread(
+            target=server.run, daemon=True, name="agproxy_llm-uds"
+        )
+        self._uds_thread.start()
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not server.started:
+            time.sleep(0.01)
+        if not server.started:
+            raise RuntimeError("agProxyLLM UDS server did not start within 10s")
+
+        self.uds_path = sock_path
+        return sock_path
+
+    def stop_uds(self) -> None:
+        if self._uds_server is not None:
+            self._uds_server.should_exit = True
+        if self._uds_thread is not None:
+            self._uds_thread.join(timeout=10)
+        self._uds_server = None
+        self._uds_thread = None
+        self.uds_path = None
 
 
 _shared_gateway: "agProxyLLM | None" = None

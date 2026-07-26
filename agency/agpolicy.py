@@ -43,9 +43,21 @@ class agdecision:
 
 
 class agpolicy:
-    """Base class for a mediation policy. Subclass and override `check()`."""
+    """Base class for a mediation policy. Subclass and override `check()`
+    and `check_tool()`."""
 
     def check(self, ag: "agent", event: "agsyscallevent") -> agdecision:
+        raise NotImplementedError
+
+    def check_tool(self, ag: "agent", tool_name: str, tool_input: dict) -> agdecision:
+        """Mediate a harness's own tool call, reported through its native
+        permission-check mechanism (e.g. Claude Code's `PreToolUse` hook)
+        rather than observed at the syscall level -- a harness's tools
+        (Write, Bash, ...) don't map 1:1 onto individual syscalls, so this
+        is a second, harness-native mediation point alongside `check()`,
+        not a replacement for it. See `agproxy_llm.py`'s
+        `/agpolicy/check_tool` route, which is what a harness's hook
+        script actually calls."""
         raise NotImplementedError
 
 
@@ -55,4 +67,7 @@ class agAllowAllPolicy(agpolicy):
     rewrite logic is wired up -- not a real security boundary."""
 
     def check(self, ag: "agent", event: "agsyscallevent") -> agdecision:
+        return agdecision.allow()
+
+    def check_tool(self, ag: "agent", tool_name: str, tool_input: dict) -> agdecision:
         return agdecision.allow()

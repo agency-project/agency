@@ -1,0 +1,530 @@
+"""Standalone in-container ptrace supervisor entrypoint.
+
+This file is deliberately self-contained -- stdlib + ctypes only, ZERO
+imports from the `agency` package and ZERO third-party dependencies
+(notably not `pyseccomp`, which the host-side `_seccomp_filter.py` uses --
+that requires `libseccomp` to be present in whatever image the sandbox
+container happens to be built from, which cannot be assumed). It is written
+to a fixed path inside the sandbox container (via `agsandbox`'s existing
+`write_file_bytes`) and invoked with `docker exec -i <container> python3
+<path>` (or the podman equivalent) by the host-side launcher in
+`_in_container_launcher.py`. Every Python 3 install ships `ctypes`, so this
+has no dependency beyond "the sandbox image has a `python3` on PATH."
+
+See docs/Design_harness_integration.md's "Prerequisites" (Component 3) for
+why this exists: `agproxy_ptrace.launch()` forks from the *calling*
+process's own PID namespace, which for a docker/podman-backed sandbox is
+the host, not the container. A `docker exec`'d process is attached into the
+container's namespaces by the container runtime itself, so a `fork()`
+inside THIS process (not the host-side launcher) lands the traced child in
+the container's namespace -- the actual fix; a parent cannot relocate an
+already-running child into a different namespace after the fact.
+
+Mechanically this replicates `_tracer_loop.py`'s fork/PTRACE_TRACEME/
+seccomp-install/execve/waitpid-dispatch loop almost exactly (see that
+module's docstrings for the "why" behind each step -- per-thread tracer
+identity, WNOHANG polling instead of waitpid(-1, ...), the SIGSTOP
+synchronization point, etc. -- none of that is re-explained here). The one
+structural difference: instead of calling a same-process Python
+`syscall_hook` callback synchronously, each interceptable stop is written
+as a JSON line to this process's own stdout and this process blocks
+reading a JSON decision line back on its own stdin -- `docker exec -i`
+gives exactly that duplex stdio channel back to the host-side launcher,
+which is where the real `agpolicy.check()` call (and the `agent`/sandbox
+objects it needs) actually lives. See "Protocol" below.
+
+Protocol (newline-delimited JSON, one object per line):
+
+  host -> entrypoint (stdin):
+    first line:  {"argv": [...], "envp": {...}, "cwd": "...", "syscalls": [...]}
+    thereafter:  {"type": "decision", "kind": "allow"|"deny"|"rewrite",
+                  "new_args": [...] | null}
+                 -- exactly one decision line per "event" line this process
+                 emits, in order; nothing else is ever read from stdin.
+
+  entrypoint -> host (stdout):
+    {"type": "spawn", "pid": N}
+    {"type": "exit", "pid": N, "code": N}
+    {"type": "event", "pid": N, "syscall": "...", "argv": [...] | null,
+     "envp": {...} | null, "path": "..." | null, "timestamp": T}
+      -- blocks until the matching "decision" line arrives on stdin.
+    {"type": "result", "stdout": "...", "stderr": "...", "returncode": N}
+      -- always the last line written; process exits immediately after.
+    {"type": "error", "message": "..."}
+      -- written instead of "result" if launch failed before any process
+      ever ran (e.g. fork() itself failed); process exits immediately after.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import platform
+import signal
+import struct
+import sys
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# ptrace(2) ctypes bindings -- x86_64 only, mirrors
+# agproxy_ptrace_internal/_ctypes_defs.py's subset actually needed here.
+# Kept as a private copy (not imported) because this file must survive being
+# copied alone into an arbitrary container with no `agency` package present.
+# ---------------------------------------------------------------------------
+
+if platform.machine() not in ("x86_64", "AMD64"):
+    raise RuntimeError(
+        f"in-container ptrace entrypoint only supports x86_64 "
+        f"(running on {platform.machine()!r})"
+    )
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace.restype = ctypes.c_long
+libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+libc.process_vm_readv.restype = ctypes.c_ssize_t
+libc.process_vm_writev.restype = ctypes.c_ssize_t
+libc.prctl.restype = ctypes.c_int
+
+PTRACE_TRACEME = 0
+PTRACE_PEEKDATA = 2
+PTRACE_CONT = 7
+PTRACE_GETREGS = 12
+PTRACE_SETREGS = 13
+PTRACE_SETOPTIONS = 0x4200
+PTRACE_GETEVENTMSG = 0x4201
+
+PTRACE_O_TRACEFORK = 0x00000002
+PTRACE_O_TRACEVFORK = 0x00000004
+PTRACE_O_TRACECLONE = 0x00000008
+PTRACE_O_TRACEEXEC = 0x00000010
+PTRACE_O_TRACEEXIT = 0x00000040
+PTRACE_O_TRACESECCOMP = 0x00000080
+ALL_TRACE_OPTIONS = (
+    PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE
+    | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT | PTRACE_O_TRACESECCOMP
+)
+
+PTRACE_EVENT_FORK = 1
+PTRACE_EVENT_VFORK = 2
+PTRACE_EVENT_CLONE = 3
+PTRACE_EVENT_EXEC = 4
+PTRACE_EVENT_EXIT = 6
+PTRACE_EVENT_SECCOMP = 7
+
+# Same table as _ctypes_defs.SYSCALL_NUMBERS -- kept in sync by hand; see
+# that module's comment: verify against
+# /usr/include/x86_64-linux-gnu/asm/unistd_64.h, never guess.
+SYSCALL_NUMBERS = {
+    "execve": 59, "execveat": 322, "open": 2, "openat": 257,
+    "connect": 42, "unlink": 87, "unlinkat": 263, "rename": 82, "renameat2": 316,
+}
+SYSCALL_NAMES_BY_NUMBER = {v: k for k, v in SYSCALL_NUMBERS.items()}
+
+_EPERM = 1
+REWRITE_SCRATCH_SIZE = 8192
+
+
+class UserRegsStruct(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_ulonglong)
+        for name in (
+            "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10", "r9", "r8",
+            "rax", "rcx", "rdx", "rsi", "rdi", "orig_rax", "rip", "cs", "eflags",
+            "rsp", "ss", "fs_base", "gs_base", "ds", "es", "fs", "gs",
+        )
+    ]
+
+
+class _IoVec(ctypes.Structure):
+    _fields_ = [("iov_base", ctypes.c_void_p), ("iov_len", ctypes.c_size_t)]
+
+
+def ptrace(request: int, pid: int, addr: int = 0, data: int = 0) -> int:
+    ctypes.set_errno(0)
+    result = libc.ptrace(request, pid, ctypes.c_void_p(addr), ctypes.c_void_p(data))
+    if result == -1 and ctypes.get_errno() != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"ptrace(request={request}, pid={pid}) failed: {os.strerror(errno)}")
+    return result
+
+
+def get_regs(pid: int) -> UserRegsStruct:
+    regs = UserRegsStruct()
+    ptrace(PTRACE_GETREGS, pid, 0, ctypes.addressof(regs))
+    return regs
+
+
+def set_regs(pid: int, regs: UserRegsStruct) -> None:
+    ptrace(PTRACE_SETREGS, pid, 0, ctypes.addressof(regs))
+
+
+def get_eventmsg(pid: int) -> int:
+    msg = ctypes.c_ulong()
+    ptrace(PTRACE_GETEVENTMSG, pid, 0, ctypes.addressof(msg))
+    return msg.value
+
+
+def read_bytes(pid: int, addr: int, length: int) -> bytes:
+    try:
+        buf = ctypes.create_string_buffer(length)
+        local = _IoVec(ctypes.cast(buf, ctypes.c_void_p), length)
+        remote = _IoVec(ctypes.c_void_p(addr), length)
+        ctypes.set_errno(0)
+        n = libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+        if n < 0:
+            raise OSError(ctypes.get_errno(), "process_vm_readv failed")
+        return buf.raw[:n]
+    except OSError:
+        out = bytearray()
+        a = addr
+        while len(out) < length:
+            ctypes.set_errno(0)
+            word = libc.ptrace(PTRACE_PEEKDATA, pid, ctypes.c_void_p(a), None)
+            if word == -1 and ctypes.get_errno() != 0:
+                raise OSError(ctypes.get_errno(), "PTRACE_PEEKDATA failed")
+            out += struct.pack("<q", word)
+            a += 8
+        return bytes(out[:length])
+
+
+def read_cstring(pid: int, addr: int, max_len: int = 4096) -> str:
+    if addr == 0:
+        return ""
+    raw = read_bytes(pid, addr, max_len)
+    return raw.split(b"\x00", 1)[0].decode(errors="replace")
+
+
+def resolve_argv(pid: int, argv_ptr: int, max_entries: int = 4096) -> "list[str]":
+    if argv_ptr == 0:
+        return []
+    pointers = []
+    addr = argv_ptr
+    for _ in range(max_entries):
+        raw = read_bytes(pid, addr, 8)
+        (ptr,) = struct.unpack("<Q", raw)
+        if ptr == 0:
+            break
+        pointers.append(ptr)
+        addr += 8
+    return [read_cstring(pid, p) for p in pointers]
+
+
+def resolve_envp(pid: int, envp_ptr: int, max_entries: int = 8192) -> "dict[str, str]":
+    entries = resolve_argv(pid, envp_ptr, max_entries)
+    result = {}
+    for entry in entries:
+        key, sep, value = entry.partition("=")
+        if sep:
+            result[key] = value
+    return result
+
+
+def write_bytes(pid: int, addr: int, data: bytes) -> None:
+    buf = ctypes.create_string_buffer(data, len(data))
+    local = _IoVec(ctypes.cast(buf, ctypes.c_void_p), len(data))
+    remote = _IoVec(ctypes.c_void_p(addr), len(data))
+    ctypes.set_errno(0)
+    n = libc.process_vm_writev(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+    if n != len(data):
+        raise OSError(ctypes.get_errno(), f"process_vm_writev wrote {n}/{len(data)} bytes")
+
+
+def inject_argv(pid: int, rsp: int, path: str, argv: "list[str]") -> "tuple[int, int]":
+    scratch = (rsp - REWRITE_SCRATCH_SIZE) & ~0xF
+    blob = bytearray()
+    str_addrs = []
+    for s in argv:
+        str_addrs.append(scratch + len(blob))
+        blob += s.encode() + b"\x00"
+    path_addr = scratch + len(blob)
+    blob += path.encode() + b"\x00"
+    ptrarr_addr = (scratch + len(blob) + 7) & ~0x7
+    if ptrarr_addr - scratch + (len(argv) + 1) * 8 > REWRITE_SCRATCH_SIZE:
+        raise ValueError("rewritten argv too large for scratch space")
+    ptrs = b"".join(struct.pack("<Q", a) for a in str_addrs) + struct.pack("<Q", 0)
+    write_bytes(pid, scratch, bytes(blob))
+    write_bytes(pid, ptrarr_addr, ptrs)
+    return path_addr, ptrarr_addr
+
+
+def _resolve_syscall_args(pid: int, regs: UserRegsStruct, syscall_nr: int):
+    if syscall_nr == SYSCALL_NUMBERS["execve"]:
+        path_ptr, argv_ptr, envp_ptr = regs.rdi, regs.rsi, regs.rdx
+        return resolve_argv(pid, argv_ptr), resolve_envp(pid, envp_ptr), read_cstring(pid, path_ptr)
+    if syscall_nr == SYSCALL_NUMBERS["execveat"]:
+        path_ptr, argv_ptr, envp_ptr = regs.rsi, regs.rdx, regs.r10
+        return resolve_argv(pid, argv_ptr), resolve_envp(pid, envp_ptr), read_cstring(pid, path_ptr)
+    if syscall_nr == SYSCALL_NUMBERS["open"]:
+        return None, None, read_cstring(pid, regs.rdi)
+    if syscall_nr == SYSCALL_NUMBERS["openat"]:
+        return None, None, read_cstring(pid, regs.rsi)
+    return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Raw BPF seccomp filter -- NOT pyseccomp/libseccomp (see module docstring
+# for why: cannot assume libseccomp is installed in an arbitrary sandbox
+# image). Hand-built classic BPF program, same shape libseccomp itself
+# would generate for "TRACE these syscall numbers, ALLOW everything else":
+#
+#   [0] LD  nr                      -- load seccomp_data.nr (offset 0)
+#   [1..N] JEQ syscalls[i], jt=T    -- jt jumps to the RET TRACE instruction
+#                                       at the end if this syscall matches;
+#                                       jf=0 falls through to the next check
+#   [N+1] RET ALLOW                 -- fallthrough: no syscall matched
+#   [N+2] RET TRACE                 -- jump target for every JEQ match
+#
+# BPF jump offsets are counted from the NEXT instruction, so for a JEQ at
+# 0-indexed position i (i = 1..N), jt = (N+2) - (i+1) = N+1-i.
+# ---------------------------------------------------------------------------
+
+_BPF_LD, _BPF_W, _BPF_ABS = 0x00, 0x00, 0x20
+_BPF_JMP, _BPF_JEQ, _BPF_K = 0x05, 0x10, 0x00
+_BPF_RET = 0x06
+_SECCOMP_RET_ALLOW = 0x7FFF0000
+_SECCOMP_RET_TRACE = 0x7FF00000
+_SECCOMP_DATA_NR_OFFSET = 0  # offsetof(struct seccomp_data, nr)
+
+_PR_SET_NO_NEW_PRIVS = 38
+_PR_SET_SECCOMP = 22
+_SECCOMP_MODE_FILTER = 2
+
+
+class _SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8),
+                ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(_SockFilter))]
+
+
+def install_trace_filter(syscall_names: "list[str]") -> None:
+    nrs = [SYSCALL_NUMBERS[name] for name in syscall_names]
+    n = len(nrs)
+    instrs = [_SockFilter(_BPF_LD | _BPF_W | _BPF_ABS, 0, 0, _SECCOMP_DATA_NR_OFFSET)]
+    for i, nr in enumerate(nrs, start=1):
+        jt = (n + 1) - i
+        instrs.append(_SockFilter(_BPF_JMP | _BPF_JEQ | _BPF_K, jt, 0, nr))
+    instrs.append(_SockFilter(_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ALLOW))
+    instrs.append(_SockFilter(_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_TRACE))
+
+    ArrayType = _SockFilter * len(instrs)
+    prog_array = ArrayType(*instrs)
+    fprog = _SockFprog(len(instrs), ctypes.cast(prog_array, ctypes.POINTER(_SockFilter)))
+
+    if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
+    if libc.prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_SECCOMP) failed")
+
+
+# ---------------------------------------------------------------------------
+# stdio protocol
+# ---------------------------------------------------------------------------
+
+_stdin_lock = threading.Lock()
+_stdout_lock = threading.Lock()
+
+
+def _send(obj: dict) -> None:
+    with _stdout_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def _recv_decision() -> dict:
+    # Only ever called from the single tracer thread, immediately after
+    # _send({"type": "event", ...}) -- one decision line per event line,
+    # in order, so no correlation id is needed on the wire.
+    with _stdin_lock:
+        line = sys.stdin.readline()
+    if not line:
+        raise EOFError("host closed stdin while awaiting a decision")
+    return json.loads(line)
+
+
+# ---------------------------------------------------------------------------
+# Tracer loop -- same shape as agproxy_ptrace_internal/_tracer_loop.py,
+# adapted to synchronous stdio instead of an in-process Python callback.
+# ---------------------------------------------------------------------------
+
+class _Tracer:
+    def __init__(self, syscalls: "list[str]") -> None:
+        self._syscalls = syscalls
+        self.root_pid: "int | None" = None
+        self._known_pids: "set[int]" = set()
+        self._options_applied: "set[int]" = set()
+        self._returncode = None
+        self._stdout_buf = bytearray()
+        self._stderr_buf = bytearray()
+        self._buf_lock = threading.Lock()
+
+    def run(self, argv: "list[str]", envp: "dict[str, str]", cwd: str) -> None:
+        stdout_r, stdout_w = os.pipe()
+        stderr_r, stderr_w = os.pipe()
+
+        pid = os.fork()
+        if pid == 0:
+            self._child_exec(argv, envp, cwd, stdout_r, stdout_w, stderr_r, stderr_w)
+            os._exit(127)  # unreachable
+
+        os.close(stdout_w)
+        os.close(stderr_w)
+        self.root_pid = pid
+        self._remember_spawn(pid)
+
+        threading.Thread(target=self._drain_pipe, args=(stdout_r, self._stdout_buf), daemon=True).start()
+        threading.Thread(target=self._drain_pipe, args=(stderr_r, self._stderr_buf), daemon=True).start()
+
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSTOPPED(status), f"expected initial stop, got status={status:#x}"
+        ptrace(PTRACE_SETOPTIONS, pid, 0, ALL_TRACE_OPTIONS)
+        self._options_applied.add(pid)
+        ptrace(PTRACE_CONT, pid, 0, 0)
+
+        self._wait_loop()
+
+    def _child_exec(self, argv, envp, cwd, stdout_r, stdout_w, stderr_r, stderr_w) -> None:
+        os.close(stdout_r)
+        os.close(stderr_r)
+        os.dup2(stdout_w, 1)
+        os.dup2(stderr_w, 2)
+        os.close(stdout_w)
+        os.close(stderr_w)
+        if cwd:
+            os.chdir(cwd)
+        ptrace(PTRACE_TRACEME, 0, 0, 0)
+        os.kill(os.getpid(), signal.SIGSTOP)
+        install_trace_filter(self._syscalls)
+        try:
+            os.execve(argv[0], argv, dict(envp))
+        except BaseException as exc:
+            os.write(2, f"in_container_entrypoint: execve({argv[0]!r}) failed: {exc!r}\n".encode())
+            os._exit(126)
+
+    def _drain_pipe(self, fd: int, buf: bytearray) -> None:
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            with self._buf_lock:
+                buf += chunk
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def _wait_loop(self) -> None:
+        while self._known_pids:
+            made_progress = False
+            for wpid in list(self._known_pids):
+                try:
+                    got_pid, status = os.waitpid(wpid, os.WNOHANG)
+                except ChildProcessError:
+                    self._forget(wpid, -1)
+                    continue
+                if got_pid == 0:
+                    continue
+                made_progress = True
+                self._dispatch(wpid, status)
+            if not made_progress:
+                time.sleep(0.002)
+
+    def _dispatch(self, pid: int, status: int) -> None:
+        if os.WIFEXITED(status):
+            self._forget(pid, os.WEXITSTATUS(status))
+            return
+        if os.WIFSIGNALED(status):
+            self._forget(pid, -os.WTERMSIG(status))
+            return
+        assert os.WIFSTOPPED(status), (pid, status)
+        sig = os.WSTOPSIG(status)
+        event = (status >> 16) & 0xFF
+
+        if pid not in self._options_applied:
+            ptrace(PTRACE_SETOPTIONS, pid, 0, ALL_TRACE_OPTIONS)
+            self._options_applied.add(pid)
+            ptrace(PTRACE_CONT, pid, 0, 0)
+            return
+
+        if sig == signal.SIGTRAP and event == PTRACE_EVENT_SECCOMP:
+            self._handle_seccomp_stop(pid)
+            return
+        if sig == signal.SIGTRAP and event in (PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_CLONE):
+            new_pid = get_eventmsg(pid)
+            self._remember_spawn(new_pid)
+            ptrace(PTRACE_CONT, pid, 0, 0)
+            return
+        if sig == signal.SIGTRAP and event in (PTRACE_EVENT_EXEC, PTRACE_EVENT_EXIT):
+            ptrace(PTRACE_CONT, pid, 0, 0)
+            return
+        forward = 0 if sig == signal.SIGTRAP else sig
+        ptrace(PTRACE_CONT, pid, 0, forward)
+
+    def _handle_seccomp_stop(self, pid: int) -> None:
+        regs = get_regs(pid)
+        nr = regs.orig_rax
+        name = SYSCALL_NAMES_BY_NUMBER.get(nr, f"nr:{nr}")
+        argv, envp, path = _resolve_syscall_args(pid, regs, nr)
+
+        _send({
+            "type": "event", "pid": pid, "syscall": name,
+            "argv": argv, "envp": envp, "path": path, "timestamp": time.time(),
+        })
+        decision = _recv_decision()
+        kind = decision.get("kind", "allow")
+
+        if kind == "deny":
+            regs.orig_rax = ctypes.c_ulonglong(-1).value
+            set_regs(pid, regs)
+            regs2 = get_regs(pid)
+            regs2.rax = ctypes.c_ulonglong((-_EPERM) & 0xFFFFFFFFFFFFFFFF).value
+            set_regs(pid, regs2)
+        elif kind == "rewrite" and decision.get("new_args"):
+            if nr in (SYSCALL_NUMBERS["execve"], SYSCALL_NUMBERS["execveat"]):
+                new_args = decision["new_args"]
+                path_addr, argv_addr = inject_argv(pid, regs.rsp, new_args[0], new_args)
+                regs.rdi = path_addr
+                regs.rsi = argv_addr
+                set_regs(pid, regs)
+        ptrace(PTRACE_CONT, pid, 0, 0)
+
+    def _remember_spawn(self, pid: int) -> None:
+        self._known_pids.add(pid)
+        _send({"type": "spawn", "pid": pid})
+
+    def _forget(self, pid: int, exit_code: int) -> None:
+        self._known_pids.discard(pid)
+        self._options_applied.discard(pid)
+        if pid == self.root_pid:
+            self._returncode = exit_code
+        _send({"type": "exit", "pid": pid, "code": exit_code})
+
+
+def main() -> None:
+    first_line = sys.stdin.readline()
+    if not first_line:
+        _send({"type": "error", "message": "no launch spec received on stdin"})
+        return
+    spec = json.loads(first_line)
+
+    tracer = _Tracer(syscalls=spec.get("syscalls") or ["execve", "execveat"])
+    try:
+        tracer.run(spec["argv"], spec.get("envp") or {}, spec.get("cwd") or "")
+    except BaseException as exc:  # noqa: BLE001 -- always report, never crash silently
+        _send({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        return
+
+    stdout = bytes(tracer._stdout_buf).decode(errors="replace")
+    stderr = bytes(tracer._stderr_buf).decode(errors="replace")
+    _send({"type": "result", "stdout": stdout, "stderr": stderr, "returncode": tracer._returncode or 0})
+
+
+if __name__ == "__main__":
+    main()

@@ -257,3 +257,52 @@ def _b36_suffix(n: int, width: int = 4) -> str:
         digits.append(_B36[n % base])
         n //= base
     return "".join(reversed(digits))
+
+
+def agharness_llm_gateway_dir():
+    """Fixed, well-known host directory a docker/podman-backed harness
+    launch's Unix-domain-socket LLM gateway lives in. Shared between
+    `agsandbox.py` (which bind-mounts this directory into every
+    container-backed sandbox unconditionally -- cheap and harmless for a
+    sandbox that never runs a harness, the same "attach unconditionally,
+    gate on use" pattern already used for GPU passthrough flags) and
+    `agharness_internal/agproxy_llm.py` (which places its UDS socket file
+    inside it once a container-backed harness actually launches). Kept
+    here, not in either of those two modules, specifically to avoid a
+    layering dependency in either direction -- `agsandbox` sits below
+    `agharness`/`agproxy_llm` in this codebase's intended import graph, so
+    neither should import from the other just for this constant. A bind
+    mount is a live view of the host directory, not a snapshot, so it's
+    safe for the socket file to not exist yet at container-creation time
+    and appear later once a harness actually launches."""
+    import tempfile
+    from pathlib import Path
+
+    d = Path(tempfile.gettempdir()) / "agency_llm_gateway"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def agharness_binary_cache_dir():
+    """Fixed, well-known host directory holding a cached copy of each
+    external harness binary (e.g. `claude`), bind-mounted read-only into
+    every docker/podman-backed sandbox unconditionally -- same
+    "attach unconditionally, gate on use" pattern as
+    `agharness_llm_gateway_dir`. Exists because the sandbox's own base
+    image (built for arbitrary agent tasks) has no reason to carry a
+    ~250MB+ harness binary, and re-copying one into every fresh container
+    on every launch would be slow and, for a network-isolated sandbox,
+    impossible. Populated lazily, on the host, the first time a
+    container-backed launch needs a binary this cache doesn't have yet
+    (see `agharness_backends/claude_code.py`'s in-container binary
+    resolution) -- never fetched from the network by Agency itself, only
+    copied from whatever the host's own `shutil.which()` already resolves,
+    so this never depends on knowing an install URL. Under the user's home
+    directory rather than a tempdir (unlike the gateway socket dir above):
+    this should survive process restarts so the ~250MB copy happens once
+    per host, not once per Agency process lifetime."""
+    from pathlib import Path
+
+    d = Path.home() / ".cache" / "agency_harness_bin"
+    d.mkdir(parents=True, exist_ok=True)
+    return d

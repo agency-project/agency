@@ -13,6 +13,18 @@
 > interference in how they already operate, and with total, ground-truth visibility into every
 > file and process operation they perform.** Linux/POSIX is the primary target; see
 > "Platform scope" below.
+>
+> **One superseded extension, one active:** [Design_harness_filesystem.md](Design_harness_filesystem.md)
+> proposed closing the docker/podman filesystem-visibility gap *without* running the harness inside
+> the container (a FUSE-backed filesystem around a host-resident harness process) — **superseded**;
+> the project decided to run the harness inside the container after all, which is this document's
+> original direction and makes that gap moot (see "Prerequisites" and "Design Tensions" below, which
+> briefly documented the FUSE direction before being corrected back). The active in-container
+> supervisor bridge described there is now being implemented directly.
+> [Design_harness_history.md](Design_harness_history.md) — cross-invocation history/continuity for
+> harness-driven agents, decoupled from any specific sandbox instance, matching the portability
+> `agcontext` already gives native agents — unaffected by the filesystem-direction reversal, still
+> active.
 
 ## Core Principle
 
@@ -259,23 +271,34 @@ both the native `dispatch_tools` retrofit (future work, unchanged from before) a
   supervisor should perform the `unshare`/chroot setup itself (as the direct ancestor process) and
   fork the harness as its traced child from inside that same namespace, so credential/namespace
   checks resolve the same way they already do for the backend's own `_container_exec`.
-- **Cross-namespace tracing — real prerequisite still open, now narrowed.** The capability finding
-  above only covers a supervisor whose `fork()` happens *inside* the same PID namespace the traced
-  harness will run in. That's automatically true for a bare host-level launch and for the chroot
-  backend (shares the host namespace) — but a docker/podman-backed `agSandbox` runs its container
-  in its own separate PID namespace, and `agproxy_ptrace`'s Python code today forks from wherever
-  the *calling* process runs (typically the host-side agency process, not inside that container).
-  For a harness that must execute inside an existing container-backed sandbox's namespace (so its
-  filesystem writes land in the same workspace the rest of that agent's tools see), the supervisor
-  itself needs to run inside that namespace too — e.g. via `docker exec` invoking a small
-  in-container entrypoint that does the fork/trace loop, with intercepted events relayed back to
-  the host-side `agpolicy` over that exec'd process's stdio. This bidirectional IPC bridge is
-  **not implemented** — `agproxy_ptrace.launch()` as built forks directly from the calling
-  process's own namespace, which is correct and sufficient for a bare host-level harness launch
-  (what Phase 3's `agharness_backends` actually exercise, since none of the target harness CLIs
-  were runnable inside a container in this environment either) but not yet for "run the harness
-  inside this docker/podman-backed agent's own sandbox." Building and testing that bridge is
-  explicitly deferred, not silently assumed solved.
+- **Cross-namespace tracing — adopted direction: bridge it, not avoid it.** A docker/podman-backed
+  `agSandbox` runs its container in its own separate PID namespace, and `agproxy_ptrace`'s Python
+  code today forks from wherever the *calling* process runs (typically the host-side agency
+  process, not inside that container). The harness must execute *inside* that container's namespace
+  — so its filesystem writes land in the same workspace the rest of that agent's tools see, and so
+  its own built-in tools resolve real container-native paths with no interception layer standing
+  in for the kernel — which means the supervisor itself needs to run inside that namespace too.
+
+  An intermediate draft of this section considered the opposite shape — keep the harness on the
+  bare host, in a private namespace of its own, with a FUSE-backed filesystem making the container's
+  files visible without the harness ever entering it (see
+  [Design_harness_filesystem.md](Design_harness_filesystem.md), now superseded) — specifically to
+  avoid building this bridge. That direction was reconsidered: running the harness inside the
+  container is the adopted design after all, so the bridge has to be built rather than designed
+  around. Concretely: a small in-container entrypoint, launched via `docker exec` (or the
+  equivalent `podman exec`) into the already-running sandbox container, performs the same
+  fork/`PTRACE_TRACEME`/seccomp-install/`execve` sequence `agproxy_ptrace.launch()` already does on
+  the host — but since `docker exec` attaches its process into the container's existing namespaces,
+  the `fork()` inside it lands the traced child in the *container's* PID namespace, which is the
+  actual fix (a parent cannot relocate an already-running child into a different namespace after
+  the fact; the fork has to happen from inside it). This entrypoint carries no policy logic of its
+  own — it relays each trapped syscall event to the host-side `agpolicy.check()` over its own
+  stdio (the `docker exec` process's stdin/stdout are already a persistent bidirectional stream, so
+  no separate socket is required for a first implementation) and applies whatever
+  allow/deny/rewrite decision comes back, exactly as the host-level tracer loop does today. Building
+  and testing this bridge is now the active implementation task — see
+  `agharness_internal/agproxy_ptrace_internal/` for where the host-side tracer loop already lives
+  and what's being extended.
 - **Interaction with a harness's own internal OS-level sandboxing** (Codex's bwrap/seatbelt/landlock
   Bash sandbox, Claude Code's `sandbox.enabled`) has not been separately verified — those run as
   descendants of the traced harness process, so the same ancestor-of-descendant permission argument
@@ -324,6 +347,57 @@ is unaffected, exactly as in the prior draft.
 
 ---
 
+## Component 5: Cross-cutting concerns for harness-driven agents (logging, webui, schema retry, GPU)
+
+**Status: proposed, not yet implemented.** The native ReAct loop (`agskill.py:execute_react`) drives
+five things inline as it runs: `aglog` tool-call/turn logging, webui push (`_push_live_messages`/
+`_set_ui_state`/`token_update`), input/output schema validation with reprompt-on-failure, sandbox
+lifecycle (lazy-start/hibernate), and GPU/resource acquisition. A harness-driven run needs all five
+too, but can't hook into a loop it doesn't control. Each one maps onto a different existing seam:
+
+- **Sandbox lifecycle has no gap at the skill-run boundary.** Container create/`commit()`/
+  `rm_container()` already wraps *either* engine identically, at the `agskill.py:run()` boundary
+  outside both `execute_react` and `execute_harness` — nothing harness-specific to add here. The
+  finer-grained per-call lazy-start/hibernate (`_ensure_started()`/`stop()`) is a different
+  question, and running the harness inside the container genuinely coarsens it: native's per-tool-
+  call hibernation (`agtool.py:455-470`, `container.py:1521-1573`, explicitly to release "the
+  runtime slot ... AND the GPU") works because nothing lives inside the container between tool
+  calls — only the tool's own transient exec needs it up. Once the harness's own reasoning process
+  is what's alive inside the container, there's no safe point to fully stop it without killing that
+  process, so container liveness for a harness-driven call coarsens from per-tool-call to
+  per-skill-call — up for the duration of one harness invocation, torn down after, same boundary
+  `agskill.py:400-422` already uses. `docker pause`/`unpause` doesn't recover this: a frozen cgroup
+  still holds the GPU context/memory, so it only reclaims CPU scheduling, not the resource native's
+  `stop()` actually releases. Accept this as the real cost of this design rather than building
+  speculative pause-point detection.
+- **Logging and webui should be driven by tool-call boundaries parsed at the LLM proxy, not a
+  separate stream-json parser.** `agproxy_llm_adapters.py` already parses `tool_use`/`tool_result`
+  (Claude Code) and `function_call`/`function_call_output` (Codex) content blocks out of every
+  request/response crossing the gateway, as a byproduct of wire-format translation — real,
+  protocol-level, unambiguous tool-call visibility, not yet logged or acted on. Extending each route
+  handler to open a "tool call in flight" window on the outgoing call and close it on the matching
+  result gives (a) `aglog._tool_call` the real tool name/args/result instead of today's coarse
+  ptrace-argv-only logging (`agharness.py:77-89`), and (b) webui pushes at the same granularity
+  native gets. Keep `agproxy_ptrace`'s syscall stream as a second, parallel ground-truth feed into
+  `aglog` — it answers "what actually happened at the OS level," the proxy-level window answers
+  "what tool, semantically" — neither replaces the other. Note this window is a logging/webui signal
+  only now, not a sandbox lazy-start/hibernate trigger — the sandbox is already up for the whole
+  invocation per the bullet above, so there's nothing left for it to trigger on that axis.
+- **Output schema reprompting** can't inject a mid-loop correction message the way native does,
+  since the harness's internal loop is opaque. Coarsen the retry unit instead: on validation
+  failure, issue the correction as a new top-level turn against the harness, bounded by the same
+  `output_schema_retries_left` counter `execute_react` already uses. How that turn reaches the
+  harness with the right context depends on the continuity mechanism —
+  see [Design_harness_history.md](Design_harness_history.md).
+- **GPU/resource control has no native-loop precedent to break**, since it's already tool-mediated
+  and opt-in even for native agents (`gpu_reserve` calling `agResourcePool.acquire_gpu`, not a fixed
+  once-per-run acquire). The right channel for a harness-driven agent is MCP — already the one
+  sanctioned, additive-only path into a harness's own tool list (reserved for `skill.add_tools`,
+  never for replacing built-ins). Expose `gpu_reserve`/`gpu_release` as an MCP tool when a skill
+  needs the model to request GPU access dynamically from within a harness-driven turn; for a fixed
+  budget, pre-allocate before launch at the sandbox-creation boundary instead and skip the dynamic
+  path entirely.
+
 ## Design Tensions
 
 **ptrace/seccomp overhead is real but bounded.** `SECCOMP_RET_TRACE` only traps the filtered
@@ -339,16 +413,21 @@ wanted (`execve`-only tracing is cheap and covers the highest-value case — pro
 "why/which-model-turn." Neither replaces the other — `aglog` should record and correlate both
 rather than treating one as a superset of the other.
 
-**No container hardening tradeoff, but a real namespace-boundary gap remains.** An earlier draft of
-this section assumed granting `SYS_PTRACE` plus a custom seccomp profile inside a docker/podman
-sandbox was required, and treated that as a meaningful loosening of the container's default
-confinement worth calling out. Empirical testing corrected this: since `agproxy_ptrace` only ever
-traces its own forked descendants, no extra capability or profile is needed, so that specific
-hardening tradeoff doesn't exist. What *does* remain open is the namespace-boundary question this
-masked — a docker/podman container has its own separate PID namespace, so a supervisor forked on
-the host (today's implementation) cannot usefully trace a process that's meant to run *inside* that
-container's namespace; bridging that (an in-container supervisor entrypoint via `docker exec` plus
-an IPC channel back to the host-side `agpolicy`) is unimplemented, see "Prerequisites" above.
+**No container hardening tradeoff, but a real namespace-boundary gap remains, and it's being
+bridged, not designed around.** An earlier draft of this section assumed granting `SYS_PTRACE` plus
+a custom seccomp profile inside a docker/podman sandbox was required, and treated that as a
+meaningful loosening of the container's default confinement worth calling out. Empirical testing
+corrected this: since `agproxy_ptrace` only ever traces its own forked descendants, no extra
+capability or profile is needed, so that specific hardening tradeoff doesn't exist. What *does*
+remain open is the namespace-boundary question this masked — a docker/podman container has its own
+separate PID namespace, so a supervisor forked on the host (today's implementation) cannot usefully
+trace a process that's meant to run *inside* that container's namespace. An intermediate draft of
+this document proposed avoiding this by keeping the harness on the host entirely (see
+[Design_harness_filesystem.md](Design_harness_filesystem.md), now superseded) — that direction was
+reconsidered in favor of the original plan: the harness runs inside the container, and the
+namespace boundary is bridged with an in-container supervisor entrypoint via `docker exec` plus an
+IPC channel back to the host-side `agpolicy`, per "Prerequisites" above. This is real, nontrivial
+engineering, not a gap that dissolves on its own — it's the current implementation focus.
 
 **Nested harness-native sandboxing interactions need per-harness verification**, not just the
 Yama-default-allows-descendants argument above — seccomp filters *stack* (all installed filters

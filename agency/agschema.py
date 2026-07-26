@@ -319,6 +319,11 @@ class agschema:
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError as exc:
+            import os as _os
+            _dbg = _os.environ.get("AGENCY_DEBUG_RAW_TEXT_DUMP")
+            if _dbg:
+                with open(_dbg, "a") as _f:
+                    _f.write(repr(raw_text) + "\n---\n")
             return agerror(f"could not parse harness output as JSON: {exc}"), []
         if not isinstance(parsed, dict):
             return (

@@ -39,6 +39,39 @@ def cleanup_config_home(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+def is_container_backed(sandbox) -> bool:
+    """True for a docker/podman-backed sandbox (`IMAGE_KIND == "container"`),
+    False for chroot or no sandbox at all. See
+    docs/Design_harness_integration.md's "Prerequisites": a container-backed
+    harness launch needs the in-container ptrace bridge and in-container
+    config-home materialization below; chroot's harness launch already runs
+    on the bare host (the jail IS a real host directory) and needs neither."""
+    return sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"
+
+
+def materialize_config_home_in_container(ag: "agent", sandbox, token: str) -> str:
+    """In-container counterpart to `materialize_config_home` -- creates a
+    fresh, isolated directory INSIDE *sandbox*'s own container filesystem
+    instead of a host tempdir. Required once the harness process itself
+    runs inside the container: a host tempdir is invisible to a process in
+    the container's own mount namespace, so `cwd`/`CLAUDE_CONFIG_DIR` (or
+    each other harness's equivalent) must point somewhere the harness can
+    actually see. Returns the in-container path; paired with
+    `cleanup_config_home_in_container` in the caller's `finally`, mirroring
+    `materialize_config_home`/`cleanup_config_home`'s own pairing."""
+    import shlex
+
+    path = f"/tmp/agharness-{ag.agname}-{token}"
+    sandbox.exec(f"mkdir -p {shlex.quote(path)}", workdir="/")
+    return path
+
+
+def cleanup_config_home_in_container(sandbox, path: str) -> None:
+    import shlex
+
+    sandbox.exec(f"rm -rf {shlex.quote(path)}", workdir="/")
+
+
 def build_user_turn_prompt(skill: "agskill", skill_input: "agdata") -> "str | list":
     """The skill's task, delivered as a plain user-turn prompt -- reuses
     agskill's own prompt-construction code so a harness sees exactly the
@@ -88,6 +121,15 @@ class _LoggingAllowAllPolicy:
             pass  # logging is best-effort; never let it block the traced process
         return agdecision.allow()
 
+    def check_tool(self, ag, tool_name: str, tool_input: dict):
+        from .agpolicy import agdecision
+
+        try:
+            self._ag.log._tool_call(tool_name, tool_input, {}, 0)
+        except Exception:
+            pass  # logging is best-effort; never let it block the harness
+        return agdecision.allow()
+
 
 def default_policy(ag: "agent"):
     return _LoggingAllowAllPolicy(ag)
@@ -96,6 +138,9 @@ def default_policy(ag: "agent"):
 __all__ = [
     "materialize_config_home",
     "cleanup_config_home",
+    "is_container_backed",
+    "materialize_config_home_in_container",
+    "cleanup_config_home_in_container",
     "build_user_turn_prompt",
     "build_output_format_instruction",
     "default_policy",

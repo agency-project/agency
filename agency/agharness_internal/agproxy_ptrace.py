@@ -207,8 +207,24 @@ class agProxyPtrace:
         cwd: str = "",
         policy: "agpolicy",
         ag: "agent | None" = None,
+        sandbox=None,
     ) -> agProxyPtraceHandle:
+        """*sandbox*, when given, selects the launch path: a docker/podman-
+        backed sandbox (`IMAGE_KIND == "container"`) forks the traced child
+        *inside the container* via a `docker/podman exec`-launched
+        entrypoint (see `agproxy_ptrace_internal/_in_container_launcher.py`
+        for why a host-side `fork()` cannot land a child in a different PID
+        namespace). Any other sandbox (chroot, or none at all -- a bare
+        host-level launch) uses the existing host-fork `TracerLoop` path,
+        unchanged."""
         syscalls = _AgPtraceFields(self._agconfig).syscalls
+
+        if sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container":
+            from .agproxy_ptrace_internal._in_container_launcher import InContainerRelay
+
+            relay = InContainerRelay(sandbox=sandbox, policy=policy, ag=ag)
+            relay.start(argv, envp, cwd, syscalls)
+            return agProxyPtraceHandle(relay)
 
         def syscall_hook(stop: SeccompStop) -> StopDecision:
             event = agsyscallevent(

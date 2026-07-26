@@ -293,6 +293,16 @@ class agent:
         self._snapshot_messages: list[dict] = []
         self.inbox: queue.Queue[str] = queue.Queue()
         self._state = agent_state(str(self.agname))
+        # Per-harness-engine native session continuity (see
+        # docs/Design_harness_history.md) -- {"claude_code": {"session_id":
+        # ..., "blob_b64": ...}, ...}. Deliberately NOT part of `self.ctx`:
+        # `agcontext` stays the portable, engine-agnostic history object
+        # (attachable to any sandbox); this is a per-engine optimization
+        # layered on top, extracted from and reinjected into whatever
+        # sandbox handles the next call, never a replacement for it. Empty
+        # until a harness backend that supports this (currently only
+        # claude_code.py) actually populates it after a run.
+        self._harness_sessions: "dict[str, dict]" = {}
 
         _live_agents.add(self)
 
@@ -709,6 +719,12 @@ class agent:
             # container.tar is in -- a chroot snapshot directory and a
             # docker/podman image tag are unrelated formats.
             state["sandbox_image_kind"] = self.sandbox.image_kind
+        if self._harness_sessions:
+            # See docs/Design_harness_history.md -- travels with the
+            # agent's own checkpoint, not with container.tar, so it's
+            # available regardless of which sandbox this checkpoint is
+            # later restored onto.
+            state["harness_sessions"] = self._harness_sessions
         state_bytes = json.dumps(state, indent=2).encode()
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -829,6 +845,7 @@ class agent:
         ag._snapshot_messages: list[dict] = []
         ag.inbox: queue.Queue = queue.Queue()
         ag._state = agent_state(str(ag.agname))
+        ag._harness_sessions = state.get("harness_sessions", {})
 
         _live_agents.add(ag)
 

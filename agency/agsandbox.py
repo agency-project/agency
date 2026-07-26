@@ -151,6 +151,34 @@ class agSandbox(_AgSandboxFields):
             host_path.mkdir(parents=True, exist_ok=True)
             mounts[mount_name] = (str(host_path.resolve()), container, mode)
 
+        # Unconditional, harmless-if-unused default mount for a
+        # docker/podman-backed harness launch's Unix-domain-socket LLM
+        # gateway bridge (see agutil.agharness_llm_gateway_dir's docstring
+        # and agharness_internal/agproxy_ptrace_internal/
+        # _tcp_to_uds_relay.py). Added here rather than requiring each
+        # harness backend to configure it per-agent, for the same reason
+        # GPU passthrough flags are attached to every container
+        # unconditionally (container.py's _gpu_flags): neither runtime
+        # supports adding a bind mount to an already-created container, so
+        # this must be present at creation time regardless of whether this
+        # particular agent ever actually runs a harness. A bind mount is a
+        # live view, not a copy -- the socket file inside this directory
+        # doesn't need to exist yet.
+        from .agutil import agharness_binary_cache_dir, agharness_llm_gateway_dir
+
+        mounts.setdefault(
+            "_agharness_llm_gateway",
+            (str(agharness_llm_gateway_dir()), "/var/run/agency_llm_gateway", "rw"),
+        )
+        # Same rationale, for the harness binary cache (see
+        # agutil.agharness_binary_cache_dir's docstring): read-only,
+        # since a container should never be able to write back into a
+        # cache shared across every sandbox on this host.
+        mounts.setdefault(
+            "_agharness_bin_cache",
+            (str(agharness_binary_cache_dir()), "/opt/agency_harness_bin", "ro"),
+        )
+
         self._backend = agsandbox_backend.for_config(
             self._agconfig,
             agname=self._agname,
