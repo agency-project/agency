@@ -3,8 +3,9 @@
 import importlib
 import os
 from unittest.mock import MagicMock, patch
-from agency.agdata import agdata
-from agency.agtool import agtool
+from agency.agdata import agdata, agerror
+from agency.agtool import agtool, dispatch_tools
+from agency.profiler import agprof
 
 # `agency/__init__.py` does `from .agtool import agtool`, which overwrites the
 # `agtool` attribute on the `agency` package with the class — so a plain
@@ -66,6 +67,52 @@ def test_to_openai_tool_shape():
 def test_repr():
     t = make_tool()
     assert "echo" in repr(t)
+
+
+def test_dispatch_failure_is_recorded_in_profiler_metadata(monkeypatch):
+    class FakeRecordFunction:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setattr(agprof, "_records", [])
+    monkeypatch.setattr(agprof, "_open_spans", {})
+    monkeypatch.setattr(agprof, "_session", agprof._TorchSession(FakeRecordFunction))
+
+    failing = agtool(
+        name="failing",
+        description="",
+        fn=lambda arg: agerror("boom"),
+        run_in_subprocess=False,
+    )
+    sandbox = MagicMock()
+    sandbox._has_pending_background_work.return_value = False
+    messages = []
+    dispatch_tools(
+        [
+            {
+                "id": "call-1",
+                "function": {"name": "failing", "arguments": "{}"},
+            }
+        ],
+        {"failing": failing},
+        messages,
+        sandbox,
+        "test",
+        None,
+        None,
+        None,
+        None,
+    )
+
+    tool_record = next(record for record in agprof._records if record[1] == "tool:failing")
+    assert tool_record[6]["outcome"] == "failure"
+    assert tool_record[6]["error_type"] == "tool_error"
 
 
 def test_default_params():

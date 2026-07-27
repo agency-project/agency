@@ -14,6 +14,7 @@ from agency.agconfig import agConfig
 from agency.agdata import agdata as _agdata, agerror as _agerror
 from agency.agcontext import agcontext
 from agency.agllm import _AgLLMFields
+from agency.profiler import agprof as _agprof
 
 
 def _cfg(**fields) -> agConfig:
@@ -482,8 +483,41 @@ def test_llm_call_empty_content_ok():
 def test_llm_call_accumulates_token_counts():
     chunks = [_Chunk(content="hi"), _Chunk(usage=_Usage(prompt=10, completion=5))]
     result = _run_call(chunks)
+    assert result.prompt_tokens == 10
+    assert result.completion_tokens == 5
     assert result.total_input_tokens == 10
     assert result.total_output_tokens == 5
+    assert result.ttft_ms is not None
+    assert result.ttft_ms >= 0
+    assert result.generation_ms is not None
+    assert result.generation_ms >= 0
+
+
+def test_llm_attempt_profiler_metadata_includes_tokens_ttft_and_outcome(monkeypatch):
+    class FakeRecordFunction:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setattr(_agprof, "_records", [])
+    monkeypatch.setattr(_agprof, "_open_spans", {})
+    monkeypatch.setattr(_agprof, "_session", _agprof._TorchSession(FakeRecordFunction))
+
+    chunks = [_Chunk(content="hi"), _Chunk(usage=_Usage(prompt=10, completion=5))]
+    _run_call(chunks)
+
+    attempt = next(record for record in _agprof._records if record[1] == "llm:attempt[0]")
+    metadata = attempt[6]
+    assert metadata["outcome"] == "success"
+    assert metadata["input_tokens"] == 10
+    assert metadata["output_tokens"] == 5
+    assert metadata["ttft_ms"] is not None
+    assert metadata["generation_ms"] is not None
 
 
 def test_llm_call_elapsed_ms_set():
