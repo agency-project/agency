@@ -1075,7 +1075,7 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
         assert sb._gpu_virtual is False  # reserve_gpu() has NOT been called yet
 
         with patch.object(_container, "_gpu_flags", return_value=["--device", "sentinel"]) as gf:
-            with patch.object(sb, "_inspect_container_state", return_value=(False, "")):
+            with patch.object(sb, "_inspect_container_state", return_value=(False, "", None)):
                 with patch.object(sb, "_acquire_runtime_slot"):
                     with patch.object(sb, "_resolve_image", return_value="img"):
                         with patch.object(sb, "_cfs_supported", return_value=False):

@@ -796,32 +796,41 @@ class _ContainerBackendBase(agsandbox_backend):
                 pids.add(int(line))
         return pids
 
-    def _inspect_container_state(self) -> "tuple[bool, str]":
-        """Return (running, status) from a SINGLE docker/podman inspect call
-        -- merges what _container_running()/_container_status() would
-        otherwise need two separate inspect round-trips for, since
+    def _inspect_container_state(self) -> "tuple[bool, str, int | None]":
+        """Return (running, status, init_pid) from a SINGLE docker/podman
+        inspect call -- merges what _container_running()/_container_status()
+        would otherwise need two separate inspect round-trips for, since
         _ensure_started() (its only caller that needs both) always wants to
         know both facts together. status is '' if the container doesn't
-        exist at all, same convention as _container_status(). Ground truth,
-        same as those two -- no caching across calls (see _ensure_started()'s
-        docstring for why)."""
+        exist at all, same convention as _container_status(). init_pid is the
+        container's init process on the host, used by _register_prof_cgroup()
+        to resolve the container's cgroup path from /proc/<pid>/cgroup --
+        carried in the same inspect so profiling costs no extra round-trip;
+        None when the container doesn't exist or isn't running (a stopped
+        container reports Pid 0). Ground truth, same as those two -- no
+        caching across calls (see _ensure_started()'s docstring for why)."""
         result = self._run(
             [
                 self._runtime,
                 "inspect",
                 "--format",
-                "{{.State.Running}}|{{.State.Status}}",
+                "{{.State.Running}}|{{.State.Status}}|{{.State.Pid}}",
                 self._name,
             ],
             check=False,
             timeout=self.inspect_timeout_s,
         )
         if result.returncode != 0:
-            return (False, "")
-        running_str, _, status = (
-            result.stdout.decode("utf-8", errors="replace").strip().partition("|")
-        )
-        return (running_str == "true", status)
+            return (False, "", None)
+        parts = result.stdout.decode("utf-8", errors="replace").strip().split("|")
+        # running and pid anchor to the ends; only status could absorb an
+        # unexpected '|' in the middle.
+        running_str, status, pid_str = parts[0], "|".join(parts[1:-1]), parts[-1]
+        try:
+            pid = int(pid_str) or None  # stopped containers report Pid 0
+        except ValueError:
+            pid = None
+        return (running_str == "true", status, pid)
 
     def _ensure_started(self) -> None:
         """Start the Docker/Podman container on first use.
@@ -861,11 +870,12 @@ class _ContainerBackendBase(agsandbox_backend):
         to re-enter here.
         """
         name = self._name
-        running, status = self._inspect_container_state()
+        running, status, pid = self._inspect_container_state()
         if running:
             # Reuse an already-running container — it already holds whatever
             # slot _acquire_runtime_slot() would take, so we must NOT acquire
             # it again here.
+            self._register_prof_cgroup(pid)
             if self._baseline_pids is None:
                 self._baseline_pids = self._snapshot_pids_started()
             return
@@ -880,6 +890,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 except Exception:
                     self._release_runtime_slot()
                     raise
+                self._register_prof_cgroup(None)
                 if self._baseline_pids is None:
                     self._baseline_pids = self._snapshot_pids_started()
                 return
@@ -942,8 +953,78 @@ class _ContainerBackendBase(agsandbox_backend):
             except Exception:
                 self._release_runtime_slot()
                 raise
+            self._register_prof_cgroup(None)
             if self._baseline_pids is None:
                 self._baseline_pids = self._snapshot_pids_started()
+
+    def _prof_container_label(self) -> str:
+        """Profiler label for this container: the plain agname.
+
+        The backend's _agname is agSandbox's allocated 'sandbox_<agname>_<dedup>'
+        (see agsandbox.py __init__) — unwrap it so profiler series line up with
+        the agent's span lanes.
+        """
+        name = str(self._agname)
+        if name.startswith("sandbox_"):
+            name = name[len("sandbox_") :]
+            base, _, suffix = name.rpartition("_")
+            if base and len(suffix) == 4:
+                name = base
+        return name
+
+    def _register_prof_cgroup(self, pid: "int | None") -> None:
+        """Register this container's cgroup with the profiler.
+
+        The cgroup dir comes from the kernel (/proc/<pid>/cgroup) — exact for
+        both docker and podman, no runtime naming assumptions. No-op when
+        profiling is off; raises during a profiling session if the layout
+        cannot be resolved (only docker/podman on cgroup v2 are supported —
+        a profiled run should fail loudly, not silently lack container data).
+        """
+        if not agprof.enabled():
+            return
+        label = self._prof_container_label()
+        if pid is None:
+            _running, _status, pid = self._inspect_container_state()
+        if not pid:
+            raise RuntimeError(
+                f"agprof: cannot resolve init PID for container {self._name!r} — "
+                "only docker/podman on cgroup v2 are supported"
+            )
+        try:
+            cg_text = Path(f"/proc/{pid}/cgroup").read_text()
+        except OSError as e:
+            raise RuntimeError(f"agprof: cannot read cgroup of container PID {pid}: {e}") from e
+        rel = next(
+            (l.split("::", 1)[1].strip() for l in cg_text.splitlines() if l.startswith("0::")),
+            None,
+        )
+        if rel is None:
+            raise RuntimeError(
+                f"agprof: container PID {pid} has no cgroup v2 entry — "
+                "cgroup v1 hosts are not supported"
+            )
+        cdir = "/sys/fs/cgroup" + rel
+        # Runtime-daemon cgroup for the "daemon cost" aggregate: podman's
+        # per-container conmon scope, or docker's system services.
+        daemon_dir = None
+        daemon_kind = "conmon"
+        scope = cdir
+        while scope and not scope.endswith(".scope") and scope != "/sys/fs/cgroup":
+            scope = os.path.dirname(scope)
+        base = os.path.basename(scope)
+        if base.startswith("libpod-"):
+            cand = os.path.join(os.path.dirname(scope), f"libpod-conmon-{base[len('libpod-') :]}")
+            if os.path.isdir(cand):
+                daemon_dir = cand
+        elif base.startswith("docker-"):
+            daemon_kind = "dockerd"
+            for svc in ("docker.service", "containerd.service"):
+                cand = f"/sys/fs/cgroup/system.slice/{svc}"
+                if os.path.isdir(cand):
+                    agprof.container_started(label, cdir, cand, daemon_kind)
+            daemon_dir = None  # registered above (possibly twice, one per service)
+        agprof.container_started(label, cdir, daemon_dir, daemon_kind)
 
     def _snapshot_pids_started(self) -> set[int]:
         """Same PID listing as base._snapshot_pids(), routed through
@@ -1609,6 +1690,11 @@ class _ContainerBackendBase(agsandbox_backend):
         already removed) -- a no-op in that case, aside from a GPU release
         if one was still held.
         """
+        # Deregister from the profiler's container sampling (no-op with no
+        # profiling session). Deliberately NOT done in stop()/hibernate: the
+        # cgroup reappears at the same path on resume, so the registration
+        # stays valid across hibernation.
+        agprof.container_stopped(self._prof_container_label())
         gpu_id_to_release = (
             self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
         )
