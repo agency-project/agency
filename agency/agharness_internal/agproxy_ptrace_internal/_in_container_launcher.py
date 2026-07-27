@@ -1,7 +1,24 @@
 """Host-side counterpart to `_in_container_entrypoint.py` -- deploys that
 self-contained script into a docker/podman-backed sandbox container and
-drives it over `docker/podman exec -i`'s stdio, translating its JSON event
-protocol into real `agpolicy.check()` calls.
+drives it over a Unix domain socket (bind-mounted into the container the
+same way `agproxy_llm`'s own LLM-traffic UDS gateway is), translating its
+JSON event protocol into real `agpolicy.check()` calls.
+
+`docker/podman exec -i` is still what actually starts the entrypoint
+process inside the container -- there's no way around that, it's what
+attaches a new process into the container's own namespaces -- but its
+stdio is no longer the protocol channel. An earlier version drove the
+same JSON protocol over that stdio pipe directly; confirmed empirically
+that it stalls permanently under real load (a real, heavily
+multi-threaded harness process plus its own PreToolUse-hook subprocess
+churn) in a way a direct UDS connection carrying the identical protocol
+does not. The working theory: `docker exec -i`'s pipe is relayed through
+several extra hops -- the `docker` CLI client, the daemon's own API
+connection, the container-runtime shim -- each re-buffering the same
+bytes, versus a UDS being one direct kernel-mediated hop between exactly
+the two processes on each end. `exec -i`'s stdout/stderr are still
+captured, but now only drained best-effort for startup-failure
+diagnostics, never relied on for correctness.
 
 Exposes `InContainerRelay`, which duck-types the same surface
 `agProxyPtraceHandle` (agproxy_ptrace.py) already expects from a `TracerLoop`
@@ -26,8 +43,11 @@ decision correctly blocking one specific execve while allowing others.
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 import threading
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -40,6 +60,25 @@ _ENTRYPOINT_CONTAINER_PATH = "/tmp/.agproxy_ptrace_entrypoint.py"
 _RELAY_SOURCE = (Path(__file__).parent / "_tcp_to_uds_relay.py").read_bytes()
 _RELAY_CONTAINER_PATH = "/tmp/.agproxy_tcp_to_uds_relay.py"
 _MOUNTED_GATEWAY_DIR = "/var/run/agency_llm_gateway"
+
+
+def _create_ptrace_uds_socket() -> "tuple[socket.socket, str, str]":
+    """Bind+listen a fresh Unix domain socket in the same bind-mounted
+    directory `agproxy_llm`'s own LLM-traffic UDS gateway uses
+    (`agsandbox.py` already mounts it into every container-backed sandbox
+    unconditionally, so this needs no new mount) -- one socket per launch,
+    matching one `InContainerRelay` per launch. Returns (listening_socket,
+    host_path, container_path); the caller accepts exactly one connection
+    (the entrypoint connecting back) then can close/unlink the listener."""
+    from ...agutil import agharness_llm_gateway_dir
+
+    host_path = str(agharness_llm_gateway_dir() / f"agproxy_ptrace-{uuid.uuid4().hex}.sock")
+    container_path = f"{_MOUNTED_GATEWAY_DIR}/{Path(host_path).name}"
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(host_path)
+    sock.listen(1)
+    return sock, host_path, container_path
 
 
 def deploy_entrypoint(sandbox) -> str:
@@ -80,8 +119,11 @@ class InContainerRelay:
         self._spawn_log: "list[int]" = []
         self._exit_log: "list[tuple[int, int]]" = []
 
-        self._stdin_lock = threading.Lock()
+        self._conn: "socket.socket | None" = None
+        self._conn_file = None  # socket.makefile("rw"); the actual protocol channel
+        self._send_lock = threading.Lock()
         self._reader_thread: "threading.Thread | None" = None
+        self._diag: "list[str]" = []  # best-effort exec -i stdio, diagnostics only
 
     # -- registration: same replay-safe contract as TracerLoop -------------
 
@@ -109,24 +151,52 @@ class InContainerRelay:
         entrypoint_path = deploy_entrypoint(self._sandbox)
         runtime, container_name = self._runtime_and_container_name()
 
+        listen_sock, host_sock_path, container_sock_path = _create_ptrace_uds_socket()
+
+        exec_argv = [runtime, "exec", "-i"]
+        if os.environ.get("AGENCY_DEBUG_PTRACE_EVENTS"):
+            exec_argv += ["-e", "AGENCY_DEBUG_PTRACE_EVENTS=1"]
+        exec_argv += [container_name, "python3", entrypoint_path, container_sock_path]
         self._proc = subprocess.Popen(
-            [runtime, "exec", "-i", container_name, "python3", entrypoint_path],
+            exec_argv,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
+        # exec -i's own stdio is no longer the protocol channel (see module
+        # docstring) -- drain it in the background purely so a startup
+        # failure (e.g. a traceback before the entrypoint ever reaches its
+        # own socket-connect step) is visible in the RuntimeError below,
+        # and so the child can never block on a full pipe buffer.
+        threading.Thread(target=self._drain_diagnostics, daemon=True).start()
+
+        listen_sock.settimeout(30)
+        try:
+            conn, _addr = listen_sock.accept()
+        except OSError as exc:
+            diag = "".join(self._diag)[-2000:]
+            raise RuntimeError(
+                f"in-container ptrace entrypoint never connected back over its UDS socket: {exc}"
+                + (f"; diagnostics: {diag}" if diag else "")
+            )
+        finally:
+            listen_sock.close()
+            try:
+                os.unlink(host_sock_path)
+            except OSError:
+                pass
+        self._conn = conn
+        self._conn_file = conn.makefile("rw")
+
         spec = {"argv": argv, "envp": envp, "cwd": cwd, "syscalls": list(syscalls)}
-        with self._stdin_lock:
-            self._proc.stdin.write(json.dumps(spec) + "\n")
-            self._proc.stdin.flush()
+        with self._send_lock:
+            self._conn_file.write(json.dumps(spec) + "\n")
+            self._conn_file.flush()
 
         # Block until the root process is confirmed spawned (or launch
         # failed) -- same contract as TracerLoop.start(): the caller gets
         # a live handle back, not one that might still silently fail to
         # ever start.
         started = threading.Event()
-
-        def _unblock_on_first_event(*_args) -> None:
-            started.set()
 
         self._reader_thread = threading.Thread(
             target=self._read_loop, args=(started,), name="agproxy_ptrace-in-container", daemon=True,
@@ -136,6 +206,17 @@ class InContainerRelay:
         if self._error is not None:
             raise RuntimeError(f"in-container ptrace entrypoint failed to launch: {self._error}")
 
+    def _drain_diagnostics(self) -> None:
+        def _drain(stream) -> None:
+            try:
+                for line in stream:
+                    self._diag.append(line)
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain, args=(self._proc.stdout,), daemon=True).start()
+        threading.Thread(target=_drain, args=(self._proc.stderr,), daemon=True).start()
+
     def _runtime_and_container_name(self) -> "tuple[str, str]":
         # Reaches into the sandbox backend's private runtime/name accessors
         # -- the same established convention `wire_to_sandbox` already uses
@@ -144,9 +225,8 @@ class InContainerRelay:
         return _runtime_and_container_name(self._sandbox)
 
     def _read_loop(self, started: threading.Event) -> None:
-        proc = self._proc
         while True:
-            line = proc.stdout.readline()
+            line = self._conn_file.readline()
             if not line:
                 break
             try:
@@ -171,10 +251,6 @@ class InContainerRelay:
                 self._error = msg.get("message", "unknown error")
                 started.set()
                 break
-        try:
-            proc.stderr.read()
-        except Exception:
-            pass
         self._finished.set()
 
     def _handle_event(self, msg: dict) -> None:
@@ -188,9 +264,9 @@ class InContainerRelay:
         )
         decision = self._policy.check(self._ag, event)
         reply = {"type": "decision", "kind": decision.kind, "new_args": decision.new_args}
-        with self._stdin_lock:
-            self._proc.stdin.write(json.dumps(reply) + "\n")
-            self._proc.stdin.flush()
+        with self._send_lock:
+            self._conn_file.write(json.dumps(reply) + "\n")
+            self._conn_file.flush()
 
     def _remember_spawn(self, pid: int) -> None:
         with self._options_lock:

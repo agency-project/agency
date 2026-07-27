@@ -7,6 +7,7 @@ internally.  All internal schema operations use ``agschema``.
 
 from __future__ import annotations
 import json
+import re
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -56,6 +57,46 @@ class agSchemaConfig(_AgConfigViewBase):
     """
 
     _OWNER = "agschema"
+
+
+def _lenient_json_object(raw_text: str) -> dict:
+    """Parse *raw_text* as a JSON object, tolerating a harness's model
+    wrapping its final answer in prose and/or a markdown code fence
+    despite being asked for raw JSON only
+    (`agharness.build_output_format_instruction`'s instruction is not
+    always followed strictly -- confirmed against a real response from a
+    real Claude model: 'Perfect! All tasks have been completed
+    successfully. Let me provide the final status:\\n\\n```json\\n{...}\\n```').
+
+    Tries, in order: the raw text as-is; the contents of a ```...```
+    fence if one is present; the substring from the first '{' to the
+    last '}'. Raises the ORIGINAL `json.JSONDecodeError` (from the
+    raw-text attempt) if every strategy fails, so a genuinely non-JSON
+    response still reports its own real parse error instead of a
+    fallback attempt's more confusing one."""
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        # `except ... as name` is implicitly deleted once this block exits
+        # (Python avoids a traceback reference cycle) -- keep it alive
+        # under a different name so it's still raiseable at the bottom.
+        original_exc = exc
+
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", raw_text, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    start, end = raw_text.find("{"), raw_text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(raw_text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    raise original_exc
 
 
 def _type_error_fix(field_name: str, type_hint, value) -> str:
@@ -317,13 +358,8 @@ class agschema:
         isn't valid JSON, isn't a JSON object, or fails schema validation.
         """
         try:
-            parsed = json.loads(raw_text)
+            parsed = _lenient_json_object(raw_text)
         except json.JSONDecodeError as exc:
-            import os as _os
-            _dbg = _os.environ.get("AGENCY_DEBUG_RAW_TEXT_DUMP")
-            if _dbg:
-                with open(_dbg, "a") as _f:
-                    _f.write(repr(raw_text) + "\n---\n")
             return agerror(f"could not parse harness output as JSON: {exc}"), []
         if not isinstance(parsed, dict):
             return (

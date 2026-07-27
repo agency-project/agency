@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import shutil
 import uuid
@@ -326,8 +327,6 @@ class _ClaudeCodeBackend(agharness_backend):
                 # default HOME applies.
                 pass
             else:
-                import os
-
                 # Deliberately does NOT override HOME: Claude Code's OAuth
                 # credentials live under the real $HOME (~/.claude/
                 # .credentials.json), and --setting-sources "" above is
@@ -352,6 +351,10 @@ class _ClaudeCodeBackend(agharness_backend):
                 wire_to_sandbox(handle, ag.sandbox)
 
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
+            _dbg = os.environ.get("AGENCY_DEBUG_RAW_STDOUT_DUMP")
+            if _dbg:
+                with open(_dbg, "a") as _f:
+                    _f.write(f"rc={rc!r}\nstdout={stdout!r}\nstderr={stderr!r}\n---\n")
 
             # Capture the (possibly new/updated) session blob for next time
             # -- MUST happen before config_home is torn down in `finally`

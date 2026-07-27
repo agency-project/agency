@@ -27,27 +27,52 @@ identity, WNOHANG polling instead of waitpid(-1, ...), the SIGSTOP
 synchronization point, etc. -- none of that is re-explained here). The one
 structural difference: instead of calling a same-process Python
 `syscall_hook` callback synchronously, each interceptable stop is written
-as a JSON line to this process's own stdout and this process blocks
-reading a JSON decision line back on its own stdin -- `docker exec -i`
-gives exactly that duplex stdio channel back to the host-side launcher,
-which is where the real `agpolicy.check()` call (and the `agent`/sandbox
-objects it needs) actually lives. See "Protocol" below.
+as a JSON line over a Unix domain socket connected back to the host-side
+launcher, and this process blocks reading a JSON decision line back over
+that same connection -- which is where the real `agpolicy.check()` call
+(and the `agent`/sandbox objects it needs) actually lives. See "Protocol"
+below.
 
-Protocol (newline-delimited JSON, one object per line):
+This connection is NOT `docker exec -i`'s own stdio (an earlier version
+used that): a `docker exec -i` pipe is relayed through several extra
+hops -- the `docker` CLI client, the Docker daemon's own API connection,
+and the container-runtime shim (containerd/runc) each re-buffer the same
+bytes -- versus a UDS being one direct kernel-mediated hop between
+exactly the two processes on each end. Confirmed empirically: routing
+this same protocol over `docker exec -i` stdio stalled permanently on a
+later event under real load (a real, heavily multi-threaded harness
+process plus its own PreToolUse-hook subprocess churn) in a way a direct
+UDS connection carrying the identical protocol did not reproduce.
+`docker exec -i` is still used to actually *start* this process inside
+the container (there is no way around that -- it is what attaches a new
+process into the container's namespaces at all), but nothing needed for
+correctness travels over its stdio anymore; that's only drained
+best-effort for startup-failure diagnostics on the host side now.
 
-  host -> entrypoint (stdin):
+The socket path is bind-mounted into the container the same way
+`agproxy_llm`'s own LLM-traffic UDS gateway is (`agsandbox.py` attaches
+that directory into every container-backed sandbox unconditionally) --
+this entrypoint is handed the *container-side* path into that same
+directory as its one command-line argument and connects to it itself,
+rather than the host writing anything to this process's stdin.
+
+Protocol (newline-delimited JSON, one object per line, over the UDS
+connection):
+
+  host -> entrypoint:
     first line:  {"argv": [...], "envp": {...}, "cwd": "...", "syscalls": [...]}
     thereafter:  {"type": "decision", "kind": "allow"|"deny"|"rewrite",
                   "new_args": [...] | null}
                  -- exactly one decision line per "event" line this process
-                 emits, in order; nothing else is ever read from stdin.
+                 emits, in order; nothing else is ever read from this
+                 connection.
 
-  entrypoint -> host (stdout):
+  entrypoint -> host:
     {"type": "spawn", "pid": N}
     {"type": "exit", "pid": N, "code": N}
     {"type": "event", "pid": N, "syscall": "...", "argv": [...] | null,
      "envp": {...} | null, "path": "..." | null, "timestamp": T}
-      -- blocks until the matching "decision" line arrives on stdin.
+      -- blocks until the matching "decision" line arrives back.
     {"type": "result", "stdout": "...", "stderr": "...", "returncode": N}
       -- always the last line written; process exits immediately after.
     {"type": "error", "message": "..."}
@@ -62,6 +87,7 @@ import json
 import os
 import platform
 import signal
+import socket
 import struct
 import sys
 import threading
@@ -322,27 +348,27 @@ def install_trace_filter(syscall_names: "list[str]") -> None:
 
 
 # ---------------------------------------------------------------------------
-# stdio protocol
+# UDS protocol -- see module docstring's "Protocol" section. _conn_file is
+# set once, in main(), before any of this is used.
 # ---------------------------------------------------------------------------
 
-_stdin_lock = threading.Lock()
-_stdout_lock = threading.Lock()
+_send_lock = threading.Lock()
+_conn_file = None  # socket.makefile("rw"), assigned in main() after connect()
 
 
 def _send(obj: dict) -> None:
-    with _stdout_lock:
-        sys.stdout.write(json.dumps(obj) + "\n")
-        sys.stdout.flush()
+    with _send_lock:
+        _conn_file.write(json.dumps(obj) + "\n")
+        _conn_file.flush()
 
 
 def _recv_decision() -> dict:
     # Only ever called from the single tracer thread, immediately after
     # _send({"type": "event", ...}) -- one decision line per event line,
     # in order, so no correlation id is needed on the wire.
-    with _stdin_lock:
-        line = sys.stdin.readline()
+    line = _conn_file.readline()
     if not line:
-        raise EOFError("host closed stdin while awaiting a decision")
+        raise EOFError("host closed the UDS connection while awaiting a decision")
     return json.loads(line)
 
 
@@ -394,6 +420,16 @@ class _Tracer:
         os.dup2(stderr_w, 2)
         os.close(stdout_w)
         os.close(stderr_w)
+        # The traced target always receives its prompt via argv, never
+        # stdin -- but without this, it inherits this entrypoint's own fd 0,
+        # which is `docker exec -i`'s pipe (no longer used for anything
+        # since the switch to the UDS control channel, but still open and
+        # unfed). Newer Claude Code CLI builds detect that non-tty stdin
+        # and stall for a few seconds waiting for data that will never
+        # arrive before giving up (confirmed against the real CLI).
+        devnull_fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull_fd, 0)
+        os.close(devnull_fd)
         if cwd:
             os.chdir(cwd)
         ptrace(PTRACE_TRACEME, 0, 0, 0)
@@ -421,18 +457,33 @@ class _Tracer:
             pass
 
     def _wait_loop(self) -> None:
+        # Wildcard-reap (waitpid(-1, ...)), not per-known-pid polling: a
+        # ptrace tracer sees status changes for every tracee via -1
+        # regardless of direct-parentage (a fork/clone-attached grandchild
+        # included), and draining -1 until it returns 0 guarantees every
+        # pending zombie is reaped before the kernel could ever hand its
+        # number to a new process -- individually polling waitpid(pid,
+        # WNOHANG) per known pid instead left a window where a just-exited
+        # pid's own slot hadn't been reaped yet while the tracer was
+        # blocked elsewhere (in _handle_seccomp_stop's decision round
+        # trip), so a *different*, newly-forked process could be assigned
+        # that exact recycled pid number before this loop ever saw the
+        # original's exit -- then got misdispatched as if it were the old,
+        # already-`_options_applied` process continuing, instead of a
+        # brand-new one needing PTRACE_SETOPTIONS + its own initial
+        # PTRACE_CONT, leaving it permanently stuck in tracing-stop.
         while self._known_pids:
             made_progress = False
-            for wpid in list(self._known_pids):
+            while True:
                 try:
-                    got_pid, status = os.waitpid(wpid, os.WNOHANG)
+                    got_pid, status = os.waitpid(-1, os.WNOHANG)
                 except ChildProcessError:
-                    self._forget(wpid, -1)
-                    continue
+                    self._known_pids.clear()
+                    break
                 if got_pid == 0:
-                    continue
+                    break
                 made_progress = True
-                self._dispatch(wpid, status)
+                self._dispatch(got_pid, status)
             if not made_progress:
                 time.sleep(0.002)
 
@@ -446,6 +497,16 @@ class _Tracer:
         assert os.WIFSTOPPED(status), (pid, status)
         sig = os.WSTOPSIG(status)
         event = (status >> 16) & 0xFF
+        if os.environ.get("AGENCY_DEBUG_PTRACE_EVENTS"):
+            try:
+                sig_name = signal.Signals(sig).name if sig else sig
+            except ValueError:
+                sig_name = sig
+            try:
+                with open("/tmp/.agency_ptrace_debug.log", "a") as _f:
+                    _f.write(f"pid={pid} status={status:#x} sig={sig_name} event={event}\n")
+            except OSError:
+                pass
 
         if pid not in self._options_applied:
             ptrace(PTRACE_SETOPTIONS, pid, 0, ALL_TRACE_OPTIONS)
@@ -473,11 +534,23 @@ class _Tracer:
         name = SYSCALL_NAMES_BY_NUMBER.get(nr, f"nr:{nr}")
         argv, envp, path = _resolve_syscall_args(pid, regs, nr)
 
+        if os.environ.get("AGENCY_DEBUG_PTRACE_EVENTS"):
+            try:
+                with open("/tmp/.agency_ptrace_debug.log", "a") as _f:
+                    _f.write(f"SECCOMP pid={pid} syscall={name} argv={argv} path={path} -- sending event...\n")
+            except OSError:
+                pass
         _send({
             "type": "event", "pid": pid, "syscall": name,
             "argv": argv, "envp": envp, "path": path, "timestamp": time.time(),
         })
         decision = _recv_decision()
+        if os.environ.get("AGENCY_DEBUG_PTRACE_EVENTS"):
+            try:
+                with open("/tmp/.agency_ptrace_debug.log", "a") as _f:
+                    _f.write(f"SECCOMP pid={pid} syscall={name} -- got decision={decision}\n")
+            except OSError:
+                pass
         kind = decision.get("kind", "allow")
 
         if kind == "deny":
@@ -508,9 +581,39 @@ class _Tracer:
 
 
 def main() -> None:
-    first_line = sys.stdin.readline()
+    global _conn_file
+
+    if len(sys.argv) < 2:
+        # No connection to _send an error over yet -- best-effort stderr,
+        # matching the "always report, never crash silently" intent as far
+        # as it can go without a channel to report it on.
+        os.write(2, b"in_container_entrypoint: missing UDS socket path argument\n")
+        return
+    sock_path = sys.argv[1]
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    deadline = time.monotonic() + 10
+    last_exc: "Exception | None" = None
+    connected = False
+    while time.monotonic() < deadline:
+        try:
+            sock.connect(sock_path)
+            connected = True
+            break
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            last_exc = exc
+            time.sleep(0.05)
+    if not connected:
+        os.write(
+            2,
+            f"in_container_entrypoint: could not connect to {sock_path!r}: {last_exc!r}\n".encode(),
+        )
+        return
+    _conn_file = sock.makefile("rw")
+
+    first_line = _conn_file.readline()
     if not first_line:
-        _send({"type": "error", "message": "no launch spec received on stdin"})
+        _send({"type": "error", "message": "no launch spec received over the UDS connection"})
         return
     spec = json.loads(first_line)
 

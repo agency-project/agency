@@ -264,6 +264,16 @@ class TracerLoop:
         os.dup2(stderr_w, 2)
         os.close(stdout_w)
         os.close(stderr_w)
+        # The traced target always receives its prompt via argv, never
+        # stdin -- but without this, it inherits whatever fd 0 the parent
+        # Python process happened to have. If that's an open, unfed,
+        # non-tty pipe (e.g. this launch itself was invoked from something
+        # piping stdin), newer Claude Code CLI builds detect the non-tty
+        # stdin and stall for a few seconds waiting for data that will
+        # never arrive before giving up (confirmed against the real CLI).
+        devnull_fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull_fd, 0)
+        os.close(devnull_fd)
         if cwd:
             os.chdir(cwd)
         pt.ptrace(pt.PTRACE_TRACEME, 0, 0, 0)
