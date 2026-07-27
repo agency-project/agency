@@ -8,6 +8,10 @@ is turned on.
 
 ## Installation
 
+Profiling requires Linux. Other operating systems are currently unsupported
+because resource isolation and accounting depend on cgroups v2 and Linux
+kernel interfaces under `/proc`.
+
 Install Agency with the optional profiling dependencies:
 
 ```bash
@@ -35,6 +39,18 @@ Or profile an **unmodified** application:
 AGENCY_PROFILE=1 [AGENCY_PROFILE_DIR=path] python app.py
 ```
 
+When `AGENCY_PROFILE` is enabled, Agency validates the operating system before
+the workload or profiler starts. On Linux it relaunches the complete command in
+a dedicated transient systemd cgroup. The benchmark harness, its child
+processes, and Agency-managed Docker containers are placed beneath the same
+slice, so unrelated machine processes are excluded. Creating the transient
+scope requires cgroup v2, `systemd-run`, `setpriv`, and non-interactive `sudo`
+permission for `systemd-run`; the workload itself is immediately dropped back
+to the invoking user and supplementary groups.
+
+On a non-Linux system the command fails immediately with a Linux-only error,
+and no trace directory or profiler artifacts are created.
+
 Environment profiling defaults to `AGENCY_PROFILE_SCOPE=workload`: with the Web
 UI, profiling starts immediately before the function passed to
 `agwebui.run(...)` and stops as soon as it returns, excluding dashboard startup
@@ -50,7 +66,7 @@ Every completed session with an output directory also writes:
 
 - `summary.json`: a versioned machine-readable document containing run
   outcomes/throughput, LLM and tool metrics, span latency distributions,
-  sampled host/sandbox/GPU resource statistics, energy/totals, interrupted
+  sampled process/sandbox/GPU resource statistics, energy/totals, interrupted
   spans, and GPU lease statistics.
 - `summary.md`: the same metrics as human-readable Markdown tables.
 
@@ -152,8 +168,8 @@ Two reading rules:
 
 ## Known limits (where torch.profiler ends and agprof begins)
 
-- CPU/run-queue timing requires Linux `/proc/.../schedstat`; other platforms
-  still report wall/thread-CPU timing but run-queue time is unavailable.
+- Profiling is Linux-only. CPU/run-queue timing uses
+  `/proc/.../schedstat`, and process resource accounting uses cgroups v2.
 - Sandbox metrics require cgroup v2 paths readable by the host process.
 - GPU metrics require NVIDIA NVML. GPU work is attributed with device sampling,
   per-process sampling, and explicit lease intervals rather than host-thread

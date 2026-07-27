@@ -907,6 +907,10 @@ class _ContainerBackendBase(agsandbox_backend):
             if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
                 self._gpu_id = self._gpu_acquire_fn()
             gpu_flags = _gpu_flags(self._runtime)
+            cgroup_flags = []
+            cgroup_parent = agprof.container_cgroup_parent()
+            if cgroup_parent is not None and self._runtime == "docker":
+                cgroup_flags = [f"--cgroup-parent={cgroup_parent}"]
             self._acquire_runtime_slot()
             try:
                 if self._checkpoint_image is not None:
@@ -916,6 +920,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     run_cmd = (
                         [self._runtime, "run", "-d", "--init", "--name", name]
                         + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
+                        + cgroup_flags
                         + gpu_flags
                         + self._vol_flags
                         + [image, "tail", "-f", "/dev/null"]
@@ -934,6 +939,7 @@ class _ContainerBackendBase(agsandbox_backend):
                         [self._runtime, "run", "-d", "--init", "--name", name]
                         + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
                         + limit_flags
+                        + cgroup_flags
                         + gpu_flags
                         + self._vol_flags
                         + [image, "tail", "-f", "/dev/null"]

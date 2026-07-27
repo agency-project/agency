@@ -33,7 +33,7 @@ per-span ``args`` (click a span in the viewer):
 
 ``summary_table()`` aggregates the same numbers per label after a session.
 GPU activity is deliberately NOT part of this split — it happens outside the
-host thread and is attributed via lease intervals + device sampling, not thread clocks.
+calling thread and is attributed via lease intervals + device sampling, not thread clocks.
 """
 
 from __future__ import annotations
@@ -43,9 +43,12 @@ import copy
 import itertools
 import json
 import os
+import re
+import sys
 import threading
 import time
-from contextlib import contextmanager, nullcontext
+import uuid
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -82,11 +85,126 @@ _session_started_ns: "int | None" = None
 _session_sample_hz = 0.0
 _session_sample_gpu = False
 
+# Environment profiling is relaunched in a transient systemd slice before the
+# workload starts.  The slice is the aggregate accounting boundary; its child
+# scope contains the harness and Docker containers are placed alongside that
+# scope by the sandbox backend.
+_CGROUP_DIR_ENV = "AGENCY_PROFILE_CGROUP"
+_CGROUP_PARENT_ENV = "AGENCY_PROFILE_CGROUP_PARENT"
+_CGROUP_SLICE_RE = re.compile(r"^agprof-[0-9a-f]+\.slice$")
+
 # Container cgroup registry — filled by the sandbox backends at container
 # start (docker + podman)
 _cg_registry: "dict[str, str]" = {}  # label (agname) -> cgroup dir
 _daemon_cg: "dict[str, str]" = {}  # cgroup dir -> agg kind ("conmon"/"dockerd")
 _cg_lock = threading.Lock()
+
+
+def _require_linux() -> None:
+    """Reject profiling before any profiler output or workload is started."""
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "agprof: profiling is Linux-only; this operating system is unsupported "
+            "because profiling requires cgroups v2 and Linux /proc kernel interfaces"
+        )
+
+
+def _current_cgroup_dir() -> Path:
+    """Resolve this process's unified cgroup v2 directory."""
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+        relative = next(line.split("::", 1)[1] for line in lines if line.startswith("0::"))
+    except (OSError, StopIteration, IndexError) as e:
+        raise RuntimeError("agprof: profiling requires a readable Linux cgroup v2 hierarchy") from e
+    return Path("/sys/fs/cgroup") / relative.lstrip("/")
+
+
+def _process_cgroup_dir() -> Path:
+    """Return the cgroup whose counters represent the profiled workload."""
+    configured = os.environ.get(_CGROUP_DIR_ENV)
+    cgroup_dir = Path(configured) if configured else _current_cgroup_dir()
+    required = ("cpu.stat", "memory.current", "cgroup.procs")
+    missing = [name for name in required if not (cgroup_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"agprof: workload cgroup {str(cgroup_dir)!r} is unusable "
+            f"(missing {', '.join(missing)}); profiling requires Linux cgroups v2"
+        )
+    return cgroup_dir
+
+
+def container_cgroup_parent() -> "str | None":
+    """Docker cgroup parent for containers created by the profiled workload."""
+    value = os.environ.get(_CGROUP_PARENT_ENV, "")
+    return value if _CGROUP_SLICE_RE.fullmatch(value) else None
+
+
+def _cgroup_reexec_command(slice_name: str, cgroup_dir: str) -> list[str]:
+    """Build the privilege-separated systemd command used by env profiling."""
+    uid = os.getuid()
+    gid = os.getgid()
+    user = os.environ.get("USER") or str(uid)
+    home = os.environ.get("HOME") or str(Path.home())
+    original_argv = list(getattr(sys, "orig_argv", ())) or [sys.executable, *sys.argv]
+    scope_name = slice_name.removesuffix(".slice") + ".scope"
+    profiler_environment = [
+        f"{key}={os.environ[key]}"
+        for key in ("AGENCY_PROFILE", "AGENCY_PROFILE_DIR", "AGENCY_PROFILE_SCOPE")
+        if key in os.environ
+    ]
+    return [
+        "sudo",
+        "-n",
+        "-E",
+        "systemd-run",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--same-dir",
+        f"--slice={slice_name}",
+        f"--unit={scope_name}",
+        "setpriv",
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--init-groups",
+        "env",
+        f"HOME={home}",
+        f"USER={user}",
+        f"LOGNAME={user}",
+        f"{_CGROUP_DIR_ENV}={cgroup_dir}",
+        f"{_CGROUP_PARENT_ENV}={slice_name}",
+        *profiler_environment,
+        *original_argv,
+    ]
+
+
+def _ensure_environment_cgroup() -> None:
+    """Re-exec environment-enabled profiling inside a dedicated cgroup."""
+    configured = os.environ.get(_CGROUP_DIR_ENV)
+    if configured:
+        cgroup_dir = _process_cgroup_dir()
+        current = _current_cgroup_dir()
+        try:
+            current.relative_to(cgroup_dir)
+        except ValueError as e:
+            raise RuntimeError(
+                f"agprof: process cgroup {current} is outside configured workload "
+                f"cgroup {cgroup_dir}"
+            ) from e
+        return
+
+    run_id = f"{os.getpid():x}{uuid.uuid4().hex[:8]}"
+    slice_name = f"agprof-{run_id}.slice"
+    cgroup_dir = f"/sys/fs/cgroup/agprof.slice/{slice_name}"
+    command = _cgroup_reexec_command(slice_name, cgroup_dir)
+    try:
+        os.execvp(command[0], command)
+    except OSError as e:
+        raise RuntimeError(
+            "agprof: unable to create the dedicated workload cgroup with "
+            "sudo/systemd-run; profiling requires Linux cgroups v2 and "
+            "passwordless permission to create a transient systemd scope"
+        ) from e
 
 
 def container_started(
@@ -277,14 +395,12 @@ def thread_name(name: str) -> None:
     if _session is None:
         return
     global _libc
-    try:
+    with suppress(Exception):
         if _libc is None:
             import ctypes
 
             _libc = ctypes.CDLL(None, use_errno=True)
         _libc.prctl(_PR_SET_NAME, name[:15].encode(), 0, 0, 0)
-    except Exception:
-        pass
 
 
 def _os_thread_name() -> str:
@@ -319,9 +435,7 @@ def gpu_lease_end(gpu_id: int) -> None:
 
 
 class _Sampler(threading.Thread):
-    """Background gauge poller: GPU util/VRAM/power per device (NVML) and host
-    process CPU/RSS (/proc), appended to the _samples timeline. Never touches
-    the span hot path; one batch of reads per tick (~1 ms with NVML)."""
+    """Background poller for workload-cgroup and GPU resource metrics."""
 
     def __init__(self, hz: float, sample_gpu: bool) -> None:
         super().__init__(daemon=True, name="agprof-sampler")
@@ -340,12 +454,7 @@ class _Sampler(threading.Thread):
                 ]
             except Exception:
                 self._nvml = None
-        self._page_mb = 4096 / 2**20
-        try:
-            self._page_mb = os.sysconf("SC_PAGE_SIZE") / 2**20
-            self._clk_tck = os.sysconf("SC_CLK_TCK")
-        except (ValueError, OSError):
-            self._clk_tck = 100
+        self._process_cgroup = _process_cgroup_dir()
         # Containers are sampled from the registry the sandbox backends fill
         # at container start (see container_started()) — no filesystem
         # discovery, no runtime naming assumptions.
@@ -396,15 +505,13 @@ class _Sampler(threading.Thread):
         the whole card), so ``power_w_est`` is the device draw apportioned by
         utilization share — an APPORTIONED ESTIMATE, never a measurement,
         hence the ``_est`` suffix."""
-        try:
+        with suppress(Exception):
             for pr in self._nvml.nvmlDeviceGetComputeRunningProcesses(h):
                 if pr.usedGpuMemory:
                     _samples.append(
                         (t, f"gpu{i}:{self._pid_label(pr.pid)}:mem_mb", pr.usedGpuMemory / 2**20)
                     )
-        except Exception:
-            pass
-        try:
+        with suppress(Exception):
             last = self._proc_util_last.get(i, 0)
             util_samples = self._nvml.nvmlDeviceGetProcessUtilization(h, last)
             per_pid: "dict[int, list[int]]" = {}
@@ -421,8 +528,6 @@ class _Sampler(threading.Thread):
                 if dev_power_w > 0 and pid_util > 0:
                     share = min(1.0, pid_util / max(dev_util, 1.0))
                     _samples.append((t, f"gpu{i}:{label}:power_w_est", dev_power_w * share))
-        except Exception:
-            pass  # NVMLError_NotFound when no samples since `last` — normal
 
     def _tick_cgroups(self, t: int) -> None:
         """Sample every REGISTERED container (see container_started()) plus the
@@ -435,11 +540,9 @@ class _Sampler(threading.Thread):
             self._sample_container(t, label, cdir)
         agg: "dict[str, int]" = {}
         for ddir, kind in daemons:
-            try:
+            with suppress(Exception):  # daemon scope may disappear when its container stops
                 with open(f"{ddir}/cpu.stat", "rb") as f:
                     agg[kind] = agg.get(kind, 0) + int(f.readline().split()[1])
-            except Exception:
-                pass  # daemon scope gone (its container stopped) — skip
         for kind, cpu_us in agg.items():
             _samples.append((t, f"cg:{kind}:cpu_us", float(cpu_us)))
 
@@ -454,7 +557,7 @@ class _Sampler(threading.Thread):
         # Disk IO, tier 1: the cgroup's own io.stat (exact; present under
         # rootful docker and io-delegated rootless slices).
         io_done = False
-        try:
+        with suppress(Exception):
             rb = wb = 0
             with open(f"{cdir}/io.stat", "rb") as f:
                 for line in f:
@@ -466,8 +569,6 @@ class _Sampler(threading.Thread):
             _samples.append((t, f"cg:{label}:io_r", float(rb)))
             _samples.append((t, f"cg:{label}:io_w", float(wb)))
             io_done = True
-        except Exception:
-            pass
         self._tick_io_net(t, label, cdir, io_from_pids=not io_done)
 
     def _tick_io_net(self, t: int, label: str, scope_path: str, io_from_pids: bool = True) -> None:
@@ -498,7 +599,7 @@ class _Sampler(threading.Thread):
             io_r = io_w = 0
             io_seen = False
             for pid in pids:
-                try:
+                with suppress(Exception):  # subuid-owned or exited PIDs are skipped
                     with open(f"/proc/{pid}/io", "rb") as f:
                         for line in f:
                             if line.startswith(b"read_bytes:"):
@@ -506,13 +607,12 @@ class _Sampler(threading.Thread):
                             elif line.startswith(b"write_bytes:"):
                                 io_w += int(line.split()[1])
                     io_seen = True
-                except Exception:
-                    continue  # subuid-owned or exited — skip
             if io_seen:
                 _samples.append((t, f"cg:{label}:io_r", float(io_r)))
                 _samples.append((t, f"cg:{label}:io_w", float(io_w)))
         for pid in pids:
-            try:
+            sampled_network = False
+            with suppress(Exception):
                 with open(f"/proc/{pid}/net/dev", "rb") as f:
                     rx = tx = 0
                     for line in f.readlines()[2:]:
@@ -524,45 +624,45 @@ class _Sampler(threading.Thread):
                         tx += int(parts[8])
                 _samples.append((t, f"cg:{label}:net_rx", float(rx)))
                 _samples.append((t, f"cg:{label}:net_tx", float(tx)))
+                sampled_network = True
+            if sampled_network:
                 break  # one PID suffices — netns counters are container-wide
-            except Exception:
-                continue
+
+    def _tick_process_cgroup(self, t: int) -> None:
+        """Sample the dedicated workload cgroup, including all descendants."""
+        try:
+            cpu_fields = {}
+            with (self._process_cgroup / "cpu.stat").open("rb") as f:
+                for line in f:
+                    key, value = line.split()[:2]
+                    cpu_fields[key] = int(value)
+            _samples.append((t, "process:cpu_us", float(cpu_fields[b"usage_usec"])))
+
+            with (self._process_cgroup / "memory.current").open("rb") as f:
+                _samples.append((t, "process:rss_mb", int(f.read()) / 2**20))
+
+            io_r = io_w = 0
+            with (self._process_cgroup / "io.stat").open("rb") as f:
+                for line in f:
+                    for token in line.split():
+                        if token.startswith(b"rbytes="):
+                            io_r += int(token[7:])
+                        elif token.startswith(b"wbytes="):
+                            io_w += int(token[7:])
+            _samples.append((t, "process:io_r", float(io_r)))
+            _samples.append((t, "process:io_w", float(io_w)))
+        except (OSError, KeyError, ValueError):
+            # A configured workload cgroup is validated before sampling. It
+            # may disappear only during teardown, when dropping a final tick
+            # is preferable to turning a completed benchmark into a failure.
+            return
 
     def _tick(self) -> None:
         t = time.perf_counter_ns()
-        try:
-            with open("/proc/self/stat", "rb") as f:
-                fields = f.read().rsplit(b") ", 1)[-1].split()
-            cpu_s = (int(fields[11]) + int(fields[12])) / self._clk_tck
-            _samples.append((t, "host:cpu_s", cpu_s))  # cumulative; %-ified at injection
-            with open("/proc/self/statm", "rb") as f:
-                rss_mb = int(f.read().split()[1]) * self._page_mb
-            _samples.append((t, "host:rss_mb", rss_mb))
-            # This process's own disk IO
-            with open("/proc/self/io", "rb") as f:
-                for line in f:
-                    if line.startswith(b"read_bytes:"):
-                        _samples.append((t, "host:io_r", float(line.split()[1])))
-                    elif line.startswith(b"write_bytes:"):
-                        _samples.append((t, "host:io_w", float(line.split()[1])))
-            # Host-netns interface totals — SYSTEM scope: includes every
-            # process on the box (vLLM traffic, ssh, ...), not just ours.
-            with open("/proc/net/dev", "rb") as f:
-                rx = tx = 0
-                for line in f.readlines()[2:]:
-                    iface, _, rest = line.partition(b":")
-                    if iface.strip() == b"lo":
-                        continue
-                    parts = rest.split()
-                    rx += int(parts[0])
-                    tx += int(parts[8])
-            _samples.append((t, "host:net_rx", float(rx)))
-            _samples.append((t, "host:net_tx", float(tx)))
-        except Exception:
-            pass
+        self._tick_process_cgroup(t)
         if self._nvml is not None:
             for i, h in enumerate(self._handles):
-                try:
+                with suppress(Exception):
                     u = self._nvml.nvmlDeviceGetUtilizationRates(h)
                     m = self._nvml.nvmlDeviceGetMemoryInfo(h)
                     p = self._nvml.nvmlDeviceGetPowerUsage(h)
@@ -570,18 +670,14 @@ class _Sampler(threading.Thread):
                     _samples.append((t, f"gpu{i}:mem_mb", m.used / 2**20))
                     _samples.append((t, f"gpu{i}:power_w", p / 1000.0))
                     self._tick_gpu_procs(t, i, h, float(u.gpu), p / 1000.0)
-                except Exception:
-                    pass
         self._tick_cgroups(t)
 
     def run(self) -> None:
         while not self._stop_ev.wait(self._interval):
             self._tick()
         if self._nvml is not None:
-            try:
+            with suppress(Exception):
                 self._nvml.nvmlShutdown()
-            except Exception:
-                pass
 
     def halt(self) -> None:
         self._stop_ev.set()
@@ -612,6 +708,7 @@ def start(
     ``summary_table()`` still works). *sample_hz*/*sample_gpu* control the
     background gauge sampler (0 disables it entirely).
     """
+    _require_linux()
     global _session, _profiler, _out_dir, _last_summary, _last_run_summary
     global _sampler, _clock_mark_ns
     global _session_started_ns, _session_sample_hz, _session_sample_gpu
@@ -825,7 +922,7 @@ def _resource_observations(samples) -> list[dict]:
     observations: list[dict] = []
     prev: "dict[str, tuple[int, float]]" = {}
     for t, series, value in samples:
-        kind = series.rsplit(":", 1)[-1] if series.startswith(("cg:", "host:")) else None
+        kind = series.rsplit(":", 1)[-1] if series.startswith(("cg:", "process:")) else None
         if kind in ("cpu_us", "cpu_s") or kind in _BYTE_KINDS:
             prior = prev.get(series)
             prev[series] = (t, value)
@@ -842,10 +939,10 @@ def _resource_observations(samples) -> list[dict]:
                 unit = "percent"
                 total_value = cpu_s
                 total_unit = "CPU seconds"
-                if series == "host:cpu_s":
-                    name = "host:cpu_pct"
-                    display_name = "host process CPU"
-                    trace_name = "host cpu %"
+                if series == "process:cpu_us":
+                    name = "process:cpu_pct"
+                    display_name = "process CPU"
+                    trace_name = "process cpu %"
                 elif label in ("conmon", "dockerd"):
                     name = f"{label}:cpu_pct"
                     display_name = f"{label} CPU"
@@ -860,14 +957,10 @@ def _resource_observations(samples) -> list[dict]:
                 total_value = delta / 2**20
                 total_unit = "MB"
                 canonical_kind, trace_kind = _BYTE_KINDS[kind]
-                if series.startswith("host:"):
-                    name = f"host:{canonical_kind}"
-                    display_name = (
-                        f"host process {trace_kind}"
-                        if kind.startswith("io_")
-                        else f"host network {trace_kind}"
-                    )
-                    trace_name = f"host {trace_kind}"
+                if series.startswith("process:"):
+                    name = f"process:{canonical_kind}"
+                    display_name = f"process {trace_kind}"
+                    trace_name = f"process {trace_kind}"
                 else:
                     name = f"sandbox:{label}:{canonical_kind}"
                     display_name = f"sandbox {label} {trace_kind}"
@@ -905,8 +998,8 @@ def _gauge_description(series: str) -> "tuple[str, str]":
         "rss_mb": "MB",
     }.get(suffix, "value")
     parts = series.split(":")
-    if series == "host:rss_mb":
-        return "host process RSS", unit
+    if series == "process:rss_mb":
+        return "process RSS", unit
     if parts[0] == "sandbox" and suffix == "mem_mb":
         return f"sandbox {parts[1]} memory", unit
     if parts[0].startswith("gpu"):
@@ -1281,21 +1374,21 @@ def _build_run_summary(
             }
         )
 
-    host_metrics = {}
-    host_cpu = resource_by_name.get("host:cpu_pct")
-    host_rss = resource_by_name.get("host:rss_mb")
-    if host_cpu:
-        host_metrics.update(
-            cpu_average_percent=host_cpu["mean"],
-            cpu_peak_percent=host_cpu["max"],
-            cpu_time_seconds=host_cpu.get("total"),
+    process_metrics = {}
+    process_cpu = resource_by_name.get("process:cpu_pct")
+    process_rss = resource_by_name.get("process:rss_mb")
+    if process_cpu:
+        process_metrics.update(
+            cpu_average_percent=process_cpu["mean"],
+            cpu_peak_percent=process_cpu["max"],
+            cpu_time_seconds=process_cpu.get("total"),
         )
-    if host_rss:
-        host_metrics.update(rss_average_mb=host_rss["mean"], rss_peak_mb=host_rss["max"])
-    for kind in ("io_read", "io_write", "net_receive", "net_transmit"):
-        row = resource_by_name.get(f"host:{kind}_mb_s")
+    if process_rss:
+        process_metrics.update(rss_average_mb=process_rss["mean"], rss_peak_mb=process_rss["max"])
+    for kind in ("io_read", "io_write"):
+        row = resource_by_name.get(f"process:{kind}_mb_s")
         if row:
-            host_metrics[f"{kind}_mb"] = row.get("total", 0.0)
+            process_metrics[f"{kind}_mb"] = row.get("total", 0.0)
 
     gpu_ids = sorted(
         {
@@ -1353,14 +1446,14 @@ def _build_run_summary(
     tick_times = sorted({timestamp for timestamp, _series, _value in samples})
     sampled_duration_s = (tick_times[-1] - tick_times[0]) / 1e9 if len(tick_times) >= 2 else 0.0
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "data_source": "measured",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "duration_ms": round(duration_ms, 3),
         "run_metrics": run_metrics,
         "llm_metrics": llm_metrics,
         "tool_metrics": tool_metrics,
-        "host_metrics": host_metrics,
+        "process_metrics": process_metrics,
         "gpu_metrics": gpu_metrics,
         "sandbox_metrics": sandbox_metrics,
         "sampling": {
@@ -1472,20 +1565,17 @@ def _render_summary_markdown(summary: dict) -> str:
     lines.extend(
         [
             "",
-            "## Host metrics",
+            "## Process metrics",
             "",
-            "| CPU avg | CPU peak | CPU time | RSS avg | RSS peak | Disk read | Disk write | "
-            "Net receive | Net transmit |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-            f"| {number(summary['host_metrics'].get('cpu_average_percent'))}% | "
-            f"{number(summary['host_metrics'].get('cpu_peak_percent'))}% | "
-            f"{number(summary['host_metrics'].get('cpu_time_seconds'))} s | "
-            f"{number(summary['host_metrics'].get('rss_average_mb'))} MB | "
-            f"{number(summary['host_metrics'].get('rss_peak_mb'))} MB | "
-            f"{number(summary['host_metrics'].get('io_read_mb'), 6)} MB | "
-            f"{number(summary['host_metrics'].get('io_write_mb'), 6)} MB | "
-            f"{number(summary['host_metrics'].get('net_receive_mb'), 6)} MB | "
-            f"{number(summary['host_metrics'].get('net_transmit_mb'), 6)} MB |",
+            "| CPU avg | CPU peak | CPU time | RSS avg | RSS peak | Disk read | Disk write |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+            f"| {number(summary['process_metrics'].get('cpu_average_percent'))}% | "
+            f"{number(summary['process_metrics'].get('cpu_peak_percent'))}% | "
+            f"{number(summary['process_metrics'].get('cpu_time_seconds'))} s | "
+            f"{number(summary['process_metrics'].get('rss_average_mb'))} MB | "
+            f"{number(summary['process_metrics'].get('rss_peak_mb'))} MB | "
+            f"{number(summary['process_metrics'].get('io_read_mb'), 6)} MB | "
+            f"{number(summary['process_metrics'].get('io_write_mb'), 6)} MB |",
             "",
             "## GPU metrics",
             "",
@@ -1726,4 +1816,13 @@ def _maybe_autostart() -> None:
     atexit.register(stop)
 
 
-_maybe_autostart()
+def _initialize_environment_profiling() -> None:
+    """Validate and isolate env-requested profiling before workload startup."""
+    if not _env_enabled():
+        return
+    _require_linux()
+    _ensure_environment_cgroup()
+    _maybe_autostart()
+
+
+_initialize_environment_profiling()
