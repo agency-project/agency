@@ -10,6 +10,8 @@ Agents are non-blocking by default. `agent.run()` returns a pending `agdata` imm
 - [uv](https://docs.astral.sh/uv/) — package manager ([installation](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer))
 - Docker or Podman
 - GPU (optional): NVIDIA (CUDA) or AMD (ROCm)
+- Profiling: Linux only (cgroups v2 and Linux `/proc` kernel interfaces);
+  other operating systems are currently unsupported
 
 ## Install
 
@@ -35,7 +37,10 @@ The sandbox image comes with `torch torchvision transformers datasets accelerate
 
 The profiler runs in the host Python environment, not inside the sandbox
 image. Install the `profiler` extra before using it; this provides `torch` for
-trace collection and `nvidia-ml-py` for NVIDIA GPU sampling. See
+trace collection and `nvidia-ml-py` for NVIDIA GPU sampling. Environment-enabled
+profiling places the complete benchmark and its Docker containers in a
+dedicated transient cgroup, which requires `systemd-run`, `setpriv`, and
+non-interactive `sudo` permission for `systemd-run`. See
 [`agency/profiler/README.md`](agency/profiler/README.md) for usage.
 
 ## Quick start

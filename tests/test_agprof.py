@@ -16,14 +16,14 @@ def test_complete_summary_includes_spans_resources_and_gpu_leases():
         (7, "turn0", 0, 100_000_000, 25_000_000, 5_000_000),
     ]
     samples = [
-        (0, "host:cpu_s", 1.0),
-        (0, "host:rss_mb", 100.0),
-        (0, "host:io_r", 0.0),
+        (0, "process:cpu_us", 1_000_000.0),
+        (0, "process:rss_mb", 100.0),
+        (0, "process:io_r", 0.0),
         (0, "cg:writer:cpu_us", 0.0),
         (0, "gpu0:util_pct", 10.0),
-        (second, "host:cpu_s", 1.5),
-        (second, "host:rss_mb", 120.0),
-        (second, "host:io_r", 2.0 * mebibyte),
+        (second, "process:cpu_us", 1_500_000.0),
+        (second, "process:rss_mb", 120.0),
+        (second, "process:io_r", 2.0 * mebibyte),
         (second, "cg:writer:cpu_us", 250_000.0),
         (second, "gpu0:util_pct", 30.0),
     ]
@@ -52,10 +52,10 @@ def test_complete_summary_includes_spans_resources_and_gpu_leases():
     assert span["p50_ms"] == 100.0
     assert span["p95_ms"] == 100.0
     resources = {row["name"]: row for row in summary["resource_metrics"]}
-    assert resources["host:cpu_pct"]["mean"] == 50.0
-    assert resources["host:rss_mb"]["mean"] == 110.0
-    assert resources["host:io_read_mb_s"]["mean"] == 2.0
-    assert resources["host:io_read_mb_s"]["total"] == 2.0
+    assert resources["process:cpu_pct"]["mean"] == 50.0
+    assert resources["process:rss_mb"]["mean"] == 110.0
+    assert resources["process:io_read_mb_s"]["mean"] == 2.0
+    assert resources["process:io_read_mb_s"]["total"] == 2.0
     assert resources["sandbox:writer:cpu_pct"]["mean"] == 25.0
     assert resources["sandbox:writer:cpu_pct"]["total"] == 0.25
     assert resources["gpu0:util_pct"]["mean"] == 20.0
@@ -101,7 +101,9 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
 
     machine_summary = json.loads((tmp_path / "summary.json").read_text())
     human_summary = (tmp_path / "summary.md").read_text()
-    assert machine_summary["schema_version"] == 2
+    assert machine_summary["schema_version"] == 3
+    assert "process_metrics" in machine_summary
+    assert "host_metrics" not in machine_summary
     assert machine_summary["span_metrics"][0]["label"] == "stage:work"
     assert "# agprof summary" in human_summary
     assert "| stage:work |" in human_summary
@@ -209,6 +211,8 @@ def test_derived_rollups_include_outcomes_percentiles_tokens_energy_and_interrup
     assert "### Tool outcomes" in markdown
     assert "| read | 1/1 | 0 | 1 | 0 |" in markdown
     assert "| ask_human | 0/1 | 0 | 0 | 1 | n/a | n/a |" in markdown
+    assert "## Process metrics" in markdown
+    assert "Host metrics" not in markdown
 
 
 def test_stop_snapshots_open_spans_as_interrupted(monkeypatch, tmp_path):
@@ -277,6 +281,78 @@ def test_profile_scope(monkeypatch, value, expected):
         monkeypatch.setenv("AGENCY_PROFILE_SCOPE", value)
 
     assert agprof.profile_scope() == expected
+
+
+def test_non_linux_environment_profiling_fails_before_cgroup_or_profiler(monkeypatch):
+    monkeypatch.setenv("AGENCY_PROFILE", "1")
+    monkeypatch.setattr(agprof.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        agprof,
+        "_ensure_environment_cgroup",
+        lambda: pytest.fail("must reject before cgroup setup"),
+    )
+    monkeypatch.setattr(
+        agprof,
+        "_maybe_autostart",
+        lambda: pytest.fail("must reject before profiler startup"),
+    )
+
+    with pytest.raises(RuntimeError, match="profiling is Linux-only"):
+        agprof._initialize_environment_profiling()
+
+
+def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
+    captured = {}
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py", "--quick"])
+    monkeypatch.setattr(agprof.os, "getuid", lambda: 1234)
+    monkeypatch.setattr(agprof.os, "getgid", lambda: 5678)
+    monkeypatch.setenv("USER", "benchmark")
+    monkeypatch.setenv("HOME", "/home/benchmark")
+    monkeypatch.setattr(agprof.uuid, "uuid4", lambda: type("U", (), {"hex": "abcdef012345"})())
+    monkeypatch.setattr(
+        agprof.os,
+        "execvp",
+        lambda executable, argv: captured.update(executable=executable, argv=argv),
+    )
+
+    agprof._ensure_environment_cgroup()
+
+    assert captured["executable"] == "sudo"
+    command = captured["argv"]
+    slice_arg = next(arg for arg in command if arg.startswith("--slice="))
+    slice_name = slice_arg.split("=", 1)[1]
+    assert slice_name.startswith("agprof-")
+    assert f"AGENCY_PROFILE_CGROUP_PARENT={slice_name}" in command
+    assert any(
+        arg == f"AGENCY_PROFILE_CGROUP=/sys/fs/cgroup/agprof.slice/{slice_name}" for arg in command
+    )
+    assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
+
+
+def test_process_cgroup_sampler_reads_aggregate_cpu_memory_and_io(tmp_path, monkeypatch):
+    (tmp_path / "cpu.stat").write_text("usage_usec 2500000\nuser_usec 2000000\n")
+    (tmp_path / "memory.current").write_text(str(64 * 2**20))
+    (tmp_path / "io.stat").write_text("8:0 rbytes=1048576 wbytes=2097152 rios=1 wios=2\n")
+    sampler = object.__new__(agprof._Sampler)
+    sampler._process_cgroup = tmp_path
+    monkeypatch.setattr(agprof, "_samples", [])
+
+    sampler._tick_process_cgroup(99)
+
+    assert agprof._samples == [
+        (99, "process:cpu_us", 2_500_000.0),
+        (99, "process:rss_mb", 64.0),
+        (99, "process:io_r", 1_048_576.0),
+        (99, "process:io_w", 2_097_152.0),
+    ]
+
+
+def test_container_cgroup_parent_accepts_only_profiler_slice(monkeypatch):
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "agprof-12ab.slice")
+    assert agprof.container_cgroup_parent() == "agprof-12ab.slice"
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "../../system.slice")
+    assert agprof.container_cgroup_parent() is None
 
 
 def test_workload_scope_owns_session_exactly_around_workload(monkeypatch):

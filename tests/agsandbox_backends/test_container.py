@@ -1093,6 +1093,37 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
             f"called before container creation: {run_cmd}"
         )
 
+    def test_docker_run_uses_profile_workload_cgroup_parent(self):
+        from agency.agsandbox_backends.docker import _DockerBackend
+
+        sb = _DockerBackend(
+            "agent",
+            name="docker-profile-cgroup-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=None,
+        )
+        with patch.object(_container, "_gpu_flags", return_value=[]):
+            with patch.object(
+                _container.agprof,
+                "container_cgroup_parent",
+                return_value="agprof-12ab.slice",
+            ):
+                with patch.object(sb, "_inspect_container_state", return_value=(False, "", None)):
+                    with patch.object(sb, "_acquire_runtime_slot"):
+                        with patch.object(sb, "_resolve_image", return_value="img"):
+                            with patch.object(sb, "_cfs_supported", return_value=False):
+                                with patch.object(sb, "_run_with_conflict_retry") as run_retry:
+                                    with patch.object(sb, "_run"):
+                                        with patch.object(
+                                            sb, "_snapshot_pids_started", return_value=set()
+                                        ):
+                                            sb._ensure_started()
+
+        run_cmd = run_retry.call_args_list[0].args[0]
+        assert "--cgroup-parent=agprof-12ab.slice" in run_cmd
+
 
 def _host_rocm_available() -> bool:
     try:
