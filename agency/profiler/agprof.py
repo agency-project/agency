@@ -76,6 +76,7 @@ _tls = threading.local()
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
+_process_info: "dict[str, dict]" = {}  # pid-start_ticks identity -> trace/display metadata
 _sampler: "_Sampler | None" = None
 _leases_open: "dict[int, tuple[int, str]]" = {}  # gpu_id -> (t0_ns, label)
 _leases: "list[tuple[int, int, int, str]]" = []  # (gpu_id, t0_ns, t1_ns, label)
@@ -435,7 +436,7 @@ def gpu_lease_end(gpu_id: int) -> None:
 
 
 class _Sampler(threading.Thread):
-    """Background poller for workload-cgroup and GPU resource metrics."""
+    """Background poller for per-PID, workload-cgroup, and GPU metrics."""
 
     def __init__(self, hz: float, sample_gpu: bool) -> None:
         super().__init__(daemon=True, name="agprof-sampler")
@@ -455,11 +456,129 @@ class _Sampler(threading.Thread):
             except Exception:
                 self._nvml = None
         self._process_cgroup = _process_cgroup_dir()
+        self._proc_root = Path("/proc")
+        self._clock_ticks = os.sysconf("SC_CLK_TCK")
+        self._page_mb = os.sysconf("SC_PAGE_SIZE") / 2**20
         # Containers are sampled from the registry the sandbox backends fill
         # at container start (see container_started()) — no filesystem
         # discovery, no runtime naming assumptions.
         self._pid_labels: "dict[int, str]" = {}  # pid -> label (container or comm)
         self._proc_util_last: "dict[int, int]" = {}  # gpu idx -> last NVML sample ts
+
+    def _workload_pids(self) -> "dict[int, str]":
+        """Return every PID in the workload cgroup tree and its cgroup path.
+
+        Reading every ``cgroup.procs`` file is the cgroup-v2 source of truth.
+        A process may exit or move immediately afterward; callers therefore
+        treat every subsequent /proc read as best-effort.
+        """
+        pids: "dict[int, str]" = {}
+        try:
+            for root, _dirs, files in os.walk(self._process_cgroup):
+                if "cgroup.procs" not in files:
+                    continue
+                try:
+                    with open(Path(root) / "cgroup.procs", "rb") as f:
+                        for raw_pid in f.read().split():
+                            pids[int(raw_pid)] = root
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            return {}
+        return pids
+
+    def _process_scope(self, cgroup_dir: str) -> "str | None":
+        """Registered sandbox label owning *cgroup_dir*, if any."""
+        with _cg_lock:
+            entries = list(_cg_registry.items())
+        for label, registered in entries:
+            if cgroup_dir == registered or cgroup_dir.startswith(registered + "/"):
+                return label
+        return None
+
+    def _sample_process(self, t: int, pid: int, cgroup_dir: str) -> None:
+        """Sample one current cgroup member directly from /proc/<pid>."""
+        try:
+            process_dir = self._proc_root / str(pid)
+            stat = (process_dir / "stat").read_bytes()
+            close = stat.rfind(b") ")
+            if close < 0:
+                return
+            comm = stat[stat.find(b"(") + 1 : close].decode(errors="replace")
+            fields = stat[close + 2 :].split()
+            cpu_s = (int(fields[11]) + int(fields[12])) / self._clock_ticks
+            start_ticks = int(fields[19])
+            vms_mb = int(fields[20]) / 2**20
+            rss_mb = int(fields[21]) * self._page_mb
+        except (OSError, ValueError, IndexError):
+            return
+
+        identity = f"{pid}-{start_ticks}"
+        info = _process_info.get(identity)
+        if info is None:
+            sandbox = self._process_scope(cgroup_dir)
+            try:
+                cmdline = (
+                    (process_dir / "cmdline")
+                    .read_bytes()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                    .strip()
+                )
+            except OSError:
+                cmdline = ""
+            display_name = f"{comm} (PID {pid})"
+            if sandbox is not None:
+                display_name = f"{comm} [{sandbox}] (PID {pid})"
+            prior_pid_identity = next(
+                (key for key, prior in _process_info.items() if prior["pid"] == pid),
+                None,
+            )
+            trace_pid = pid if prior_pid_identity is None else 1_000_000_000 + len(_process_info)
+            info = {
+                "identity": identity,
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "comm": comm,
+                "cmdline": cmdline,
+                "sandbox": sandbox,
+                "cgroup": cgroup_dir,
+                "display_name": display_name,
+                "trace_pid": trace_pid,
+                "first_seen_ns": t,
+                "last_seen_ns": t,
+            }
+            _process_info[identity] = info
+        else:
+            info["last_seen_ns"] = t
+            if info["sandbox"] is None:
+                sandbox = self._process_scope(cgroup_dir)
+                if sandbox is not None:
+                    info["sandbox"] = sandbox
+                    info["display_name"] = f"{comm} [{sandbox}] (PID {pid})"
+
+        prefix = f"proc:{identity}:"
+        _samples.append((t, prefix + "cpu_s", cpu_s))
+        _samples.append((t, prefix + "rss_mb", rss_mb))
+        _samples.append((t, prefix + "vms_mb", vms_mb))
+        try:
+            io_fields = {}
+            with (process_dir / "io").open("rb") as f:
+                for line in f:
+                    key, value = line.split(b":", 1)
+                    io_fields[key] = int(value)
+            _samples.append((t, prefix + "io_r", float(io_fields[b"read_bytes"])))
+            _samples.append((t, prefix + "io_w", float(io_fields[b"write_bytes"])))
+        except (OSError, ValueError, KeyError):
+            # Linux may deny /proc/<pid>/io for a differently-owned container
+            # process. CPU/RSS/VMS remain valid and the sandbox cgroup retains
+            # its exact aggregate I/O counters.
+            pass
+
+    def _tick_processes(self, t: int) -> None:
+        """Refresh workload membership and sample every PID still alive."""
+        for pid, cgroup_dir in self._workload_pids().items():
+            self._sample_process(t, pid, cgroup_dir)
 
     def _pid_label(self, pid: int) -> str:
         """Label for a GPU-using PID: the owning container's agname when the
@@ -628,18 +747,18 @@ class _Sampler(threading.Thread):
             if sampled_network:
                 break  # one PID suffices — netns counters are container-wide
 
-    def _tick_process_cgroup(self, t: int) -> None:
-        """Sample the dedicated workload cgroup, including all descendants."""
+    def _tick_workload_cgroup(self, t: int) -> None:
+        """Sample the clearly named aggregate workload cgroup."""
         try:
             cpu_fields = {}
             with (self._process_cgroup / "cpu.stat").open("rb") as f:
                 for line in f:
                     key, value = line.split()[:2]
                     cpu_fields[key] = int(value)
-            _samples.append((t, "process:cpu_us", float(cpu_fields[b"usage_usec"])))
+            _samples.append((t, "workload:cpu_us", float(cpu_fields[b"usage_usec"])))
 
             with (self._process_cgroup / "memory.current").open("rb") as f:
-                _samples.append((t, "process:rss_mb", int(f.read()) / 2**20))
+                _samples.append((t, "workload:memory_mb", int(f.read()) / 2**20))
 
             io_r = io_w = 0
             with (self._process_cgroup / "io.stat").open("rb") as f:
@@ -649,8 +768,8 @@ class _Sampler(threading.Thread):
                             io_r += int(token[7:])
                         elif token.startswith(b"wbytes="):
                             io_w += int(token[7:])
-            _samples.append((t, "process:io_r", float(io_r)))
-            _samples.append((t, "process:io_w", float(io_w)))
+            _samples.append((t, "workload:io_r", float(io_r)))
+            _samples.append((t, "workload:io_w", float(io_w)))
         except (OSError, KeyError, ValueError):
             # A configured workload cgroup is validated before sampling. It
             # may disappear only during teardown, when dropping a final tick
@@ -659,7 +778,8 @@ class _Sampler(threading.Thread):
 
     def _tick(self) -> None:
         t = time.perf_counter_ns()
-        self._tick_process_cgroup(t)
+        self._tick_workload_cgroup(t)
+        self._tick_processes(t)
         if self._nvml is not None:
             for i, h in enumerate(self._handles):
                 with suppress(Exception):
@@ -740,6 +860,7 @@ def start(
         with _open_spans_lock:
             _open_spans.clear()
         _samples.clear()
+        _process_info.clear()
         _leases.clear()
         _leases_open.clear()
         _last_summary = None
@@ -922,8 +1043,15 @@ def _resource_observations(samples) -> list[dict]:
     observations: list[dict] = []
     prev: "dict[str, tuple[int, float]]" = {}
     for t, series, value in samples:
-        kind = series.rsplit(":", 1)[-1] if series.startswith(("cg:", "process:")) else None
+        parts = series.split(":")
+        scope = parts[0]
+        kind = parts[-1]
+        identity = parts[1] if scope == "proc" and len(parts) == 3 else None
+        process = _process_info.get(identity) if identity is not None else None
+        cumulative_scope = scope in ("cg", "workload", "proc")
         if kind in ("cpu_us", "cpu_s") or kind in _BYTE_KINDS:
+            if not cumulative_scope:
+                continue
             prior = prev.get(series)
             prev[series] = (t, value)
             if prior is None or t <= prior[0]:
@@ -939,10 +1067,14 @@ def _resource_observations(samples) -> list[dict]:
                 unit = "percent"
                 total_value = cpu_s
                 total_unit = "CPU seconds"
-                if series == "process:cpu_us":
-                    name = "process:cpu_pct"
-                    display_name = "process CPU"
-                    trace_name = "process cpu %"
+                if scope == "proc":
+                    name = f"process:{identity}:cpu_pct"
+                    display_name = f"{process['display_name'] if process else identity} CPU"
+                    trace_name = "cpu_percent"
+                elif scope == "workload":
+                    name = "workload_total:cpu_pct"
+                    display_name = "workload total CPU"
+                    trace_name = "workload_total cpu %"
                 elif label in ("conmon", "dockerd"):
                     name = f"{label}:cpu_pct"
                     display_name = f"{label} CPU"
@@ -957,33 +1089,53 @@ def _resource_observations(samples) -> list[dict]:
                 total_value = delta / 2**20
                 total_unit = "MB"
                 canonical_kind, trace_kind = _BYTE_KINDS[kind]
-                if series.startswith("process:"):
-                    name = f"process:{canonical_kind}"
-                    display_name = f"process {trace_kind}"
-                    trace_name = f"process {trace_kind}"
+                if scope == "proc":
+                    name = f"process:{identity}:{canonical_kind}"
+                    display_name = (
+                        f"{process['display_name'] if process else identity} {trace_kind}"
+                    )
+                    trace_name = canonical_kind
+                elif scope == "workload":
+                    name = f"workload_total:{canonical_kind}"
+                    display_name = f"workload total {trace_kind}"
+                    trace_name = f"workload_total {trace_kind}"
                 else:
                     name = f"sandbox:{label}:{canonical_kind}"
                     display_name = f"sandbox {label} {trace_kind}"
                     trace_name = display_name.replace(f"sandbox {label} ", f"sandbox:{label}:")
         else:
             measured = value
-            name = series
-            trace_name = series
-            display_name, unit = _gauge_description(series)
+            if scope == "proc" and identity is not None:
+                name = f"process:{identity}:{kind}"
+                trace_name = kind
+                display_name = f"{process['display_name'] if process else identity} {kind}"
+                unit = "MB" if kind in ("rss_mb", "vms_mb") else "value"
+            elif scope == "workload" and kind == "memory_mb":
+                name = "workload_total:memory_mb"
+                trace_name = "workload_total memory_mb"
+                display_name = "workload total memory"
+                unit = "MB"
+            else:
+                name = series
+                trace_name = series
+                display_name, unit = _gauge_description(series)
             total_value = None
             total_unit = None
-        observations.append(
-            {
-                "timestamp_ns": t,
-                "name": name,
-                "display_name": display_name,
-                "trace_name": trace_name,
-                "unit": unit,
-                "value": float(measured),
-                "interval_total": total_value,
-                "total_unit": total_unit,
-            }
-        )
+        observation = {
+            "timestamp_ns": t,
+            "name": name,
+            "display_name": display_name,
+            "trace_name": trace_name,
+            "unit": unit,
+            "value": float(measured),
+            "interval_total": total_value,
+            "total_unit": total_unit,
+        }
+        if process is not None:
+            observation["process_identity"] = identity
+            observation["trace_pid"] = process["trace_pid"]
+            observation["process_name"] = process["display_name"]
+        observations.append(observation)
     return observations
 
 
@@ -998,8 +1150,6 @@ def _gauge_description(series: str) -> "tuple[str, str]":
         "rss_mb": "MB",
     }.get(suffix, "value")
     parts = series.split(":")
-    if series == "process:rss_mb":
-        return "process RSS", unit
     if parts[0] == "sandbox" and suffix == "mem_mb":
         return f"sandbox {parts[1]} memory", unit
     if parts[0].startswith("gpu"):
@@ -1032,13 +1182,57 @@ def _inject_timelines(data) -> "tuple[int, int]":
         return t_ns / 1e3 + offset_us
 
     new: list = []
+    observations = _resource_observations(_samples)
+    process_identities = {
+        observation["process_identity"]
+        for observation in observations
+        if observation.get("process_identity") is not None
+    }
+    for sort_index, identity in enumerate(
+        sorted(
+            process_identities,
+            key=lambda key: _process_info.get(key, {}).get("first_seen_ns", 0),
+        ),
+        start=1,
+    ):
+        info = _process_info.get(identity)
+        if info is None:
+            continue
+        trace_pid = info["trace_pid"]
+        new.extend(
+            [
+                {
+                    "ph": "M",
+                    "pid": trace_pid,
+                    "tid": 0,
+                    "name": "process_name",
+                    "args": {"name": info["display_name"]},
+                },
+                {
+                    "ph": "M",
+                    "pid": trace_pid,
+                    "tid": 0,
+                    "name": "process_sort_index",
+                    "args": {"sort_index": sort_index},
+                },
+                {
+                    "ph": "M",
+                    "pid": trace_pid,
+                    "tid": 0,
+                    "name": "process_labels",
+                    "args": {
+                        "labels": f"cgroup={info['cgroup']}; cmdline={info['cmdline'] or info['comm']}"
+                    },
+                },
+            ]
+        )
     # Cumulative series become rates; direct series stay gauges. A negative
     # delta means a counter reset and is dropped by _resource_observations.
-    for observation in _resource_observations(_samples):
+    for observation in observations:
         new.append(
             {
                 "ph": "C",
-                "pid": pid,
+                "pid": observation.get("trace_pid", pid),
                 "tid": 0,
                 "ts": to_us(observation["timestamp_ns"]),
                 "name": observation["trace_name"],
@@ -1374,21 +1568,66 @@ def _build_run_summary(
             }
         )
 
-    process_metrics = {}
-    process_cpu = resource_by_name.get("process:cpu_pct")
-    process_rss = resource_by_name.get("process:rss_mb")
-    if process_cpu:
-        process_metrics.update(
-            cpu_average_percent=process_cpu["mean"],
-            cpu_peak_percent=process_cpu["max"],
-            cpu_time_seconds=process_cpu.get("total"),
+    workload_metrics = {}
+    workload_cpu = resource_by_name.get("workload_total:cpu_pct")
+    workload_memory = resource_by_name.get("workload_total:memory_mb")
+    if workload_cpu:
+        workload_metrics.update(
+            cpu_average_percent=workload_cpu["mean"],
+            cpu_peak_percent=workload_cpu["max"],
+            cpu_time_seconds=workload_cpu.get("total"),
         )
-    if process_rss:
-        process_metrics.update(rss_average_mb=process_rss["mean"], rss_peak_mb=process_rss["max"])
+    if workload_memory:
+        workload_metrics.update(
+            memory_average_mb=workload_memory["mean"],
+            memory_peak_mb=workload_memory["max"],
+        )
     for kind in ("io_read", "io_write"):
-        row = resource_by_name.get(f"process:{kind}_mb_s")
+        row = resource_by_name.get(f"workload_total:{kind}_mb_s")
         if row:
-            process_metrics[f"{kind}_mb"] = row.get("total", 0.0)
+            workload_metrics[f"{kind}_mb"] = row.get("total", 0.0)
+
+    process_identities = sorted(
+        {
+            name.split(":", 2)[1]
+            for name in resource_by_name
+            if name.startswith("process:") and name.count(":") >= 2
+        },
+        key=lambda identity: _process_info.get(identity, {}).get("first_seen_ns", 0),
+    )
+    process_metrics = []
+    for identity in process_identities:
+        info = _process_info.get(identity, {})
+        prefix = f"process:{identity}:"
+        cpu = resource_by_name.get(prefix + "cpu_pct")
+        rss = resource_by_name.get(prefix + "rss_mb")
+        vms = resource_by_name.get(prefix + "vms_mb")
+        read = resource_by_name.get(prefix + "io_read_mb_s")
+        write = resource_by_name.get(prefix + "io_write_mb_s")
+        process_metrics.append(
+            {
+                "identity": identity,
+                "pid": info.get("pid"),
+                "name": info.get("comm", identity),
+                "display_name": info.get("display_name", identity),
+                "cmdline": info.get("cmdline", ""),
+                "sandbox": info.get("sandbox"),
+                "cgroup": info.get("cgroup"),
+                "cpu_average_percent": cpu["mean"] if cpu else None,
+                "cpu_peak_percent": cpu["max"] if cpu else None,
+                "cpu_time_seconds": cpu.get("total") if cpu else None,
+                "rss_average_mb": rss["mean"] if rss else None,
+                "rss_peak_mb": rss["max"] if rss else None,
+                "vms_average_mb": vms["mean"] if vms else None,
+                "vms_peak_mb": vms["max"] if vms else None,
+                "io_read_mb": read.get("total") if read else None,
+                "io_write_mb": write.get("total") if write else None,
+                "samples": max(
+                    (metric["samples"] for metric in (cpu, rss, vms, read, write) if metric),
+                    default=0,
+                ),
+            }
+        )
 
     gpu_ids = sorted(
         {
@@ -1446,13 +1685,14 @@ def _build_run_summary(
     tick_times = sorted({timestamp for timestamp, _series, _value in samples})
     sampled_duration_s = (tick_times[-1] - tick_times[0]) / 1e9 if len(tick_times) >= 2 else 0.0
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "data_source": "measured",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "duration_ms": round(duration_ms, 3),
         "run_metrics": run_metrics,
         "llm_metrics": llm_metrics,
         "tool_metrics": tool_metrics,
+        "workload_metrics": workload_metrics,
         "process_metrics": process_metrics,
         "gpu_metrics": gpu_metrics,
         "sandbox_metrics": sandbox_metrics,
@@ -1565,17 +1805,49 @@ def _render_summary_markdown(summary: dict) -> str:
     lines.extend(
         [
             "",
-            "## Process metrics",
+            "## Workload aggregate",
             "",
-            "| CPU avg | CPU peak | CPU time | RSS avg | RSS peak | Disk read | Disk write |",
+            "| CPU avg | CPU peak | CPU time | Memory avg | Memory peak | Disk read | Disk write |",
             "|---:|---:|---:|---:|---:|---:|---:|",
-            f"| {number(summary['process_metrics'].get('cpu_average_percent'))}% | "
-            f"{number(summary['process_metrics'].get('cpu_peak_percent'))}% | "
-            f"{number(summary['process_metrics'].get('cpu_time_seconds'))} s | "
-            f"{number(summary['process_metrics'].get('rss_average_mb'))} MB | "
-            f"{number(summary['process_metrics'].get('rss_peak_mb'))} MB | "
-            f"{number(summary['process_metrics'].get('io_read_mb'), 6)} MB | "
-            f"{number(summary['process_metrics'].get('io_write_mb'), 6)} MB |",
+            f"| {number(summary['workload_metrics'].get('cpu_average_percent'))}% | "
+            f"{number(summary['workload_metrics'].get('cpu_peak_percent'))}% | "
+            f"{number(summary['workload_metrics'].get('cpu_time_seconds'))} s | "
+            f"{number(summary['workload_metrics'].get('memory_average_mb'))} MB | "
+            f"{number(summary['workload_metrics'].get('memory_peak_mb'))} MB | "
+            f"{number(summary['workload_metrics'].get('io_read_mb'), 6)} MB | "
+            f"{number(summary['workload_metrics'].get('io_write_mb'), 6)} MB |",
+            "",
+            "## Per-process metrics",
+            "",
+        ]
+    )
+    if summary["process_metrics"]:
+        lines.extend(
+            [
+                "| Process | PID | Sandbox | Samples | CPU avg | CPU peak | CPU time | "
+                "RSS avg | RSS peak | VMS avg | VMS peak | Disk read | Disk write |",
+                "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for process in summary["process_metrics"]:
+            lines.append(
+                f"| {_markdown_escape(process['name'])} | "
+                f"{process['pid'] if process['pid'] is not None else 'n/a'} | "
+                f"{_markdown_escape(process['sandbox'] or '')} | {process['samples']} | "
+                f"{number(process['cpu_average_percent'])}% | "
+                f"{number(process['cpu_peak_percent'])}% | "
+                f"{number(process['cpu_time_seconds'])} s | "
+                f"{number(process['rss_average_mb'])} MB | "
+                f"{number(process['rss_peak_mb'])} MB | "
+                f"{number(process['vms_average_mb'])} MB | "
+                f"{number(process['vms_peak_mb'])} MB | "
+                f"{number(process['io_read_mb'], 6)} MB | "
+                f"{number(process['io_write_mb'], 6)} MB |"
+            )
+    else:
+        lines.append("_No workload processes were sampled._")
+    lines.extend(
+        [
             "",
             "## GPU metrics",
             "",

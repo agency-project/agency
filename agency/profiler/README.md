@@ -66,8 +66,8 @@ Every completed session with an output directory also writes:
 
 - `summary.json`: a versioned machine-readable document containing run
   outcomes/throughput, LLM and tool metrics, span latency distributions,
-  sampled process/sandbox/GPU resource statistics, energy/totals, interrupted
-  spans, and GPU lease statistics.
+  per-process/workload/sandbox/GPU resource statistics, energy/totals,
+  interrupted spans, and GPU lease statistics.
 - `summary.md`: the same metrics as human-readable Markdown tables.
 
 Span rows report completed/started/succeeded/failed/interrupted counts; total
@@ -81,6 +81,21 @@ Cumulative CPU, disk, and network counters are converted to utilization or
 throughput while their non-negative deltas are also summed into CPU seconds or
 MB totals. GPU power samples are trapezoidally integrated into joules. The
 report shows the effective sampling frequency alongside the configured rate.
+
+### Process resource tracks
+
+The workload cgroup is recursively scanned on every sampler tick. Every PID
+found in any descendant `cgroup.procs` file is sampled independently from
+`/proc/<pid>/stat`, `/proc/<pid>/cmdline`, and `/proc/<pid>/io`. TensorBoard
+receives a separate process group such as `python (PID 85418)` for each stable
+`(PID, start time)` identity, with independent `cpu_percent`, `rss_mb`,
+`vms_mb`, `io_read_mb_s`, and `io_write_mb_s` tracks. PID start time prevents
+PID reuse from merging two different processes. Processes that exit between
+cgroup discovery and `/proc` reads are skipped without failing the run.
+
+The cgroup-wide counters remain available under the explicit
+`workload_total` name; they are not labeled as a process. Agency-managed
+container cgroups also keep their `sandbox:*` aggregate tracks.
 
 If profiling stops while background work is live, open spans are listed under
 `incomplete_spans` with `outcome: "interrupted"` and elapsed time at the stop
@@ -171,6 +186,9 @@ Two reading rules:
 - Profiling is Linux-only. CPU/run-queue timing uses
   `/proc/.../schedstat`, and process resource accounting uses cgroups v2.
 - Sandbox metrics require cgroup v2 paths readable by the host process.
+- Linux may restrict `/proc/<pid>/io` for processes owned by another UID. Such
+  processes still receive CPU, RSS, and VMS tracks; their exact container-level
+  I/O remains available through the corresponding `sandbox:*` cgroup track.
 - GPU metrics require NVIDIA NVML. GPU work is attributed with device sampling,
   per-process sampling, and explicit lease intervals rather than host-thread
   timing.
