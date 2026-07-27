@@ -182,9 +182,13 @@ class LLMCallResult:
     reasoning_parts: "list[str]" = field(default_factory=list)
     tool_calls_raw: "dict[int, dict]" = field(default_factory=dict)
     prompt_tokens: "int | None" = None
+    completion_tokens: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     elapsed_ms: int = 0
+    ttft_ms: "float | None" = None
+    generation_ms: "float | None" = None
+    output_tokens_per_second: "float | None" = None
 
     @property
     def ok(self) -> bool:
@@ -300,10 +304,13 @@ class agllm(_AgLLMFields):
             reasoning_parts: list[str] = []
             tool_calls_raw: dict[int, dict] = {}
             prompt_tokens: int | None = None
+            completion_tokens = 0
             total_input_tokens = _initial_input_tokens
             total_output_tokens = _initial_output_tokens
             _retry_err: "Exception | None" = None
             _retry_sleep_s: float = self.retry_sleep_s
+            _ttft_ms: "float | None" = None
+            _generation_ms: "float | None" = None
 
             with _llm_call_semaphore_slot(), agprof.span(f"llm:attempt[{attempt}]"):
                 client = self.backend.make_client(
@@ -325,6 +332,36 @@ class agllm(_AgLLMFields):
 
                 _llm_t0 = time.monotonic()
 
+                def _annotate_attempt(
+                    outcome: str,
+                    *,
+                    error_type: "str | None" = None,
+                    retrying: bool = False,
+                ) -> None:
+                    elapsed_ms = (time.monotonic() - _llm_t0) * 1000
+                    generation_ms = (
+                        max(0.0, elapsed_ms - _ttft_ms) if _ttft_ms is not None else None
+                    )
+                    output_tps = (
+                        completion_tokens / (generation_ms / 1000)
+                        if generation_ms and completion_tokens
+                        else None
+                    )
+                    agprof.annotate(
+                        outcome=outcome,
+                        error_type=error_type,
+                        retrying=retrying,
+                        ttft_ms=round(_ttft_ms, 3) if _ttft_ms is not None else None,
+                        generation_ms=round(generation_ms, 3)
+                        if generation_ms is not None
+                        else None,
+                        input_tokens=prompt_tokens or 0,
+                        output_tokens=completion_tokens,
+                        output_tokens_per_second=round(output_tps, 3)
+                        if output_tps is not None
+                        else None,
+                    )
+
                 partial_msg: dict = {"role": "assistant", "content": ""}
                 messages.append(partial_msg)
                 if live_messages_fn:
@@ -340,10 +377,11 @@ class agllm(_AgLLMFields):
                         for chunk in batch:
                             if chunk.usage is not None:
                                 prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
-                                total_input_tokens += prompt_tokens
-                                total_output_tokens += (
+                                completion_tokens = (
                                     getattr(chunk.usage, "completion_tokens", 0) or 0
                                 )
+                                total_input_tokens += prompt_tokens
+                                total_output_tokens += completion_tokens
                                 if term is not None:
                                     term._tokens = prompt_tokens
                             if not chunk.choices:
@@ -356,6 +394,10 @@ class agllm(_AgLLMFields):
                                 rc = extra.get("reasoning_content")
                             if not isinstance(rc, str):
                                 rc = extra.get("reasoning")
+                            if _ttft_ms is None and (
+                                (isinstance(rc, str) and rc) or delta.content or delta.tool_calls
+                            ):
+                                _ttft_ms = (time.monotonic() - _llm_t0) * 1000
                             if isinstance(rc, str) and rc:
                                 reasoning_parts.append(rc)
                                 partial_msg["_thinking"] = "".join(reasoning_parts)
@@ -424,12 +466,14 @@ class agllm(_AgLLMFields):
                                 "LLM ✗    ",
                                 f"{_tag}model={(backend.model or '?')}  context length exceeded — will compact and retry",
                             )
+                        _annotate_attempt("failure", error_type="context_exceeded")
                         return LLMCallResult(context_exceeded=True, elapsed_ms=_llm_elapsed_ms)
                     if term:
                         term.log(
                             "LLM ✗    ",
                             f"{_tag}model={(backend.model or '?')}  bad request: {_bad_req}",
                         )
+                    _annotate_attempt("failure", error_type=type(_bad_req).__name__)
                     return LLMCallResult(conn_error=_bad_req, elapsed_ms=_llm_elapsed_ms)
 
                 except RATE_LIMIT_EXCS + (
@@ -462,17 +506,30 @@ class agllm(_AgLLMFields):
                                 f"retry {attempt + 1}/{self.max_retries - 1} in {_retry_sleep_s:.1f}s",
                             )
                         _retry_err = _transient_err
+                        _annotate_attempt(
+                            "failure",
+                            error_type=type(_transient_err).__name__,
+                            retrying=True,
+                        )
                     else:
                         if term:
                             term.log(
                                 "LLM ✗    ",
                                 f"{_tag}model={(backend.model or '?')}  {_err_desc}  all retries exhausted",
                             )
+                        _annotate_attempt(
+                            "failure",
+                            error_type=type(_transient_err).__name__,
+                        )
                         return LLMCallResult(conn_error=_transient_err, elapsed_ms=_llm_elapsed_ms)
 
                 else:
                     messages.pop()  # remove partial placeholder
                     _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
+                    _generation_ms = (
+                        max(0.0, _llm_elapsed_ms - _ttft_ms) if _ttft_ms is not None else None
+                    )
+                    _annotate_attempt("success")
 
             if _retry_err is not None:
                 if full_history_fn:
@@ -495,9 +552,17 @@ class agllm(_AgLLMFields):
             reasoning_parts=reasoning_parts,
             tool_calls_raw=tool_calls_raw,
             prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             total_input_tokens=total_input_tokens,
             total_output_tokens=total_output_tokens,
             elapsed_ms=_llm_elapsed_ms,
+            ttft_ms=round(_ttft_ms, 3) if _ttft_ms is not None else None,
+            generation_ms=round(_generation_ms, 3) if _generation_ms is not None else None,
+            output_tokens_per_second=(
+                round(completion_tokens / (_generation_ms / 1000), 3)
+                if _generation_ms and completion_tokens
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -814,6 +879,19 @@ class agllm(_AgLLMFields):
                 0,
                 "compact",
                 call_tag="compact",
+            )
+            agprof.annotate(
+                outcome="success" if result.ok else "failure",
+                error_type=(
+                    type(result.conn_error).__name__
+                    if result.conn_error is not None
+                    else ("context_exceeded" if result.context_exceeded else None)
+                ),
+                ttft_ms=result.ttft_ms,
+                generation_ms=result.generation_ms,
+                input_tokens=result.prompt_tokens or 0,
+                output_tokens=result.completion_tokens,
+                output_tokens_per_second=result.output_tokens_per_second,
             )
         if not result.ok:
             raise result.conn_error or RuntimeError(

@@ -46,6 +46,32 @@ Views → Trace; needs `tensorboard` + `torch-tb-profiler`) or drag the
 `.pt.trace.json` into <https://ui.perfetto.dev>. After a session,
 `prof.key_averages().table(sort_by="cpu_time_total")` prints a per-span summary.
 
+Every completed session with an output directory also writes:
+
+- `summary.json`: a versioned machine-readable document containing run
+  outcomes/throughput, LLM and tool metrics, span latency distributions,
+  sampled host/sandbox/GPU resource statistics, energy/totals, interrupted
+  spans, and GPU lease statistics.
+- `summary.md`: the same metrics as human-readable Markdown tables.
+
+Span rows report completed/started/succeeded/failed/interrupted counts; total
+wall/CPU/run-queue/blocked time; and mean/min/p50/p95/p99/max latency. Run,
+LLM, and tool rollups add throughput and outcome counts. Streaming LLM calls
+record time to first token (TTFT), input/output tokens, generation time, retry
+state, and output tokens/s.
+
+Resource rows report sample count, mean, minimum, maximum, and last value.
+Cumulative CPU, disk, and network counters are converted to utilization or
+throughput while their non-negative deltas are also summed into CPU seconds or
+MB totals. GPU power samples are trapezoidally integrated into joules. The
+report shows the effective sampling frequency alongside the configured rate.
+
+If profiling stops while background work is live, open spans are listed under
+`incomplete_spans` with `outcome: "interrupted"` and elapsed time at the stop
+boundary; they are not misreported as completed latency samples.
+`agprof.summary_metrics()` returns a copy of the JSON document for the most
+recently completed session, including sessions started with `out_dir=None`.
+
 Custom app-level phases use the same public API:
 
 ```python
@@ -126,11 +152,15 @@ Two reading rules:
 
 ## Known limits (where torch.profiler ends and agprof begins)
 
-- Spans record wall time only — no CPU-vs-wait split within a span
-  (needs a `thread_time_ns`/schedstat session backend).
-- Container/daemon CPU, tool-worker subprocesses, and the SSE drain thread are
-  outside the profiled process.
-- No resource counters (energy, GPU, IO) yet — sampler + counter-track
-  injection planned.
+- CPU/run-queue timing requires Linux `/proc/.../schedstat`; other platforms
+  still report wall/thread-CPU timing but run-queue time is unavailable.
+- Sandbox metrics require cgroup v2 paths readable by the host process.
+- GPU metrics require NVIDIA NVML. GPU work is attributed with device sampling,
+  per-process sampling, and explicit lease intervals rather than host-thread
+  timing.
+- Token counts depend on the backend returning streaming usage. TTFT is the
+  first non-empty content, reasoning, or tool-call delta.
+- Resource sampling is discrete. Energy integration and counter totals cover
+  the sampled interval, which is reported separately from session duration.
 - Durations vary with live model load; benchmark-grade numbers need the
   mock endpoint.

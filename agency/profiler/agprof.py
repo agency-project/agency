@@ -39,18 +39,20 @@ host thread and is attributed via lease intervals + device sampling, not thread 
 from __future__ import annotations
 
 import atexit
+import copy
 import itertools
 import json
 import os
 import threading
 import time
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 _NULL = nullcontext()
 
-_session = None            # None = profiling off (the fast path checks only this)
-_profiler = None           # the live torch.profiler.profile object, if any
+_session = None  # None = profiling off (the fast path checks only this)
+_profiler = None  # the live torch.profiler.profile object, if any
 _out_dir: "Path | None" = None
 _state_lock = threading.Lock()
 
@@ -58,20 +60,27 @@ _counters: "dict[str, itertools.count]" = {}
 _counters_lock = threading.Lock()
 
 # Completed-span records for the CPU-vs-wait split:
-# (tid, name, t0_wall_ns, wall_ns, cpu_ns, runq_ns | None).
+# (tid, name, t0_wall_ns, wall_ns, cpu_ns, runq_ns | None, metadata).
 # list.append is atomic under the GIL, so no lock on the hot path.
-_records: "list[tuple[int, str, int, int, int, int | None]]" = []
+_records: list[tuple] = []
+_open_spans: "dict[int, _TimedSpan]" = {}
+_open_spans_lock = threading.Lock()
+_interrupted_spans: "list[dict]" = []
 _last_summary: "dict[str, dict] | None" = None
+_last_run_summary: "dict | None" = None
 
 _tls = threading.local()
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
-_samples: "list[tuple[int, str, float]]" = []      # (t_mono_ns, series, value)
+_samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
 _sampler: "_Sampler | None" = None
-_leases_open: "dict[int, tuple[int, str]]" = {}    # gpu_id -> (t0_ns, label)
-_leases: "list[tuple[int, int, int, str]]" = []    # (gpu_id, t0_ns, t1_ns, label)
+_leases_open: "dict[int, tuple[int, str]]" = {}  # gpu_id -> (t0_ns, label)
+_leases: "list[tuple[int, int, int, str]]" = []  # (gpu_id, t0_ns, t1_ns, label)
 _leases_lock = threading.Lock()
 _clock_mark_ns: "int | None" = None
+_session_started_ns: "int | None" = None
+_session_sample_hz = 0.0
+_session_sample_gpu = False
 
 
 def _read_schedstat() -> "int | None":
@@ -95,35 +104,75 @@ class _TimedSpan:
     """Composite span: kineto record_function (the trace box) + wall/CPU/runq
     deltas captured on this thread (the numbers injected as the box's args)."""
 
-    __slots__ = ("_name", "_rf", "_t0", "_cpu0", "_rq0")
+    __slots__ = (
+        "_name",
+        "_rf",
+        "_t0",
+        "_cpu0",
+        "_rq0",
+        "_tid",
+        "_metadata",
+        "_interrupted",
+    )
 
     def __init__(self, record_function_cls, name: str) -> None:
         self._name = name
         self._rf = record_function_cls(name)
+        self._metadata: dict = {}
+        self._interrupted = False
 
     def __enter__(self) -> "_TimedSpan":
         self._t0 = time.perf_counter_ns()
         self._cpu0 = time.thread_time_ns()
         self._rq0 = _read_schedstat()
+        self._tid = threading.get_native_id()
+        stack = getattr(_tls, "span_stack", None)
+        if stack is None:
+            stack = _tls.span_stack = []
+        stack.append(self)
+        with _open_spans_lock:
+            _open_spans[id(self)] = self
         self._rf.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self._rf.__exit__(exc_type, exc_val, exc_tb)
+        stack = getattr(_tls, "span_stack", None)
+        if stack:
+            if stack[-1] is self:
+                stack.pop()
+            else:
+                try:
+                    stack.remove(self)
+                except ValueError:
+                    pass
+        with _open_spans_lock:
+            _open_spans.pop(id(self), None)
+        if self._interrupted:
+            return
         t1 = time.perf_counter_ns()
         cpu1 = time.thread_time_ns()
         rq1 = _read_schedstat()
         runq = (rq1 - self._rq0) if (rq1 is not None and self._rq0 is not None) else None
+        metadata = dict(self._metadata)
+        metadata.setdefault("outcome", "failure" if exc_type is not None else "success")
+        if exc_type is not None:
+            metadata.setdefault("error_type", exc_type.__name__)
         _records.append(
             (
-                threading.get_native_id(),
+                self._tid,
                 self._name,
                 self._t0,
                 t1 - self._t0,
                 cpu1 - self._cpu0,
                 runq,
+                metadata,
             )
         )
+
+    def annotate(self, **metadata) -> None:
+        """Attach JSON-safe outcome/metric fields to this span."""
+        self._metadata.update(metadata)
 
 
 class _TorchSession:
@@ -154,6 +203,26 @@ def span(name: str):
     if s is None:
         return _NULL
     return s.span(name)
+
+
+def annotate(**metadata) -> None:
+    """Attach fields to the innermost active span on this thread.
+
+    This is a no-op when profiling is disabled or the current thread has no
+    open span. Framework call sites use it for outcomes, token counts, TTFT,
+    and other per-invocation metrics without adding work to the off path.
+    """
+    if _session is None:
+        return
+    stack = getattr(_tls, "span_stack", None)
+    if stack:
+        stack[-1].annotate(**metadata)
+
+
+def _unpack_record(record) -> tuple:
+    """Return the six clock fields plus metadata from old/new record tuples."""
+    metadata = record[6] if len(record) > 6 else {}
+    return (*record[:6], metadata)
 
 
 _PR_SET_NAME = 15  # linux prctl option
@@ -227,8 +296,7 @@ class _Sampler(threading.Thread):
                 pynvml.nvmlInit()
                 self._nvml = pynvml
                 self._handles = [
-                    pynvml.nvmlDeviceGetHandleByIndex(i)
-                    for i in range(pynvml.nvmlDeviceGetCount())
+                    pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())
                 ]
             except Exception:
                 self._nvml = None
@@ -246,8 +314,10 @@ class _Sampler(threading.Thread):
         self._cg_base = Path(
             f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/user.slice"
         )
-        self._cg_db = Path.home() / ".local/share/containers/storage/overlay-containers/containers.json"
-        self._cg_labels: "dict[str, str]" = {}   # container full id -> label
+        self._cg_db = (
+            Path.home() / ".local/share/containers/storage/overlay-containers/containers.json"
+        )
+        self._cg_labels: "dict[str, str]" = {}  # container full id -> label
         self._cg_db_mtime = -1.0
         self._pid_labels: "dict[int, str]" = {}  # pid -> label (container or comm)
         self._proc_util_last: "dict[int, int]" = {}  # gpu idx -> last NVML sample ts
@@ -313,8 +383,7 @@ class _Sampler(threading.Thread):
             for pr in self._nvml.nvmlDeviceGetComputeRunningProcesses(h):
                 if pr.usedGpuMemory:
                     _samples.append(
-                        (t, f"gpu{i}:{self._pid_label(pr.pid)}:mem_mb",
-                         pr.usedGpuMemory / 2**20)
+                        (t, f"gpu{i}:{self._pid_label(pr.pid)}:mem_mb", pr.usedGpuMemory / 2**20)
                     )
         except Exception:
             pass
@@ -330,8 +399,7 @@ class _Sampler(threading.Thread):
             self._proc_util_last[i] = newest
             for pid, utils in per_pid.items():
                 _samples.append(
-                    (t, f"gpu{i}:{self._pid_label(pid)}:util_pct",
-                     sum(utils) / len(utils))
+                    (t, f"gpu{i}:{self._pid_label(pid)}:util_pct", sum(utils) / len(utils))
                 )
         except Exception:
             pass  # NVMLError_NotFound when no samples since `last` — normal
@@ -349,7 +417,7 @@ class _Sampler(threading.Thread):
             n = entry.name
             if not (n.startswith("libpod-") and n.endswith(".scope")):
                 continue
-            cid = n[len("libpod-"):-len(".scope")]
+            cid = n[len("libpod-") : -len(".scope")]
             if cid.startswith("conmon-"):
                 # Container-runtime helper processes: aggregate as daemon cost.
                 try:
@@ -515,7 +583,9 @@ def start(
     ``summary_table()`` still works). *sample_hz*/*sample_gpu* control the
     background gauge sampler (0 disables it entirely).
     """
-    global _session, _profiler, _out_dir, _last_summary, _sampler, _clock_mark_ns
+    global _session, _profiler, _out_dir, _last_summary, _last_run_summary
+    global _sampler, _clock_mark_ns
+    global _session_started_ns, _session_sample_hz, _session_sample_gpu
     # Imported lazily: the framework must not require torch unless profiling.
     from torch.profiler import (
         ProfilerActivity,
@@ -540,13 +610,20 @@ def start(
         )
         prof.start()
         _records.clear()
+        _interrupted_spans.clear()
+        with _open_spans_lock:
+            _open_spans.clear()
         _samples.clear()
         _leases.clear()
         _leases_open.clear()
         _last_summary = None
+        _last_run_summary = None
         _out_dir = Path(out_dir) if out_dir is not None else None
         _profiler = prof
         _session = _TorchSession(record_function)
+        _session_started_ns = time.perf_counter_ns()
+        _session_sample_hz = sample_hz
+        _session_sample_gpu = sample_gpu
         # Clock-sync marker: pairs a perf_counter_ns stamp with a kineto event
         # so sampler/lease timestamps can be mapped onto kineto's timebase at
         # injection time (spans don't need this — they match by order).
@@ -563,37 +640,75 @@ def stop():
     """Stop the active session: write the trace, inject per-span CPU/wait args
     into it, and build the label-level summary. Returns the profiler, or None
     if no session was active."""
-    global _session, _profiler, _out_dir, _last_summary, _sampler
+    global _session, _profiler, _out_dir, _last_summary, _last_run_summary, _sampler
+    global _session_started_ns
     with _state_lock:
         if _session is None:
             return None
         prof = _profiler
         out_dir = _out_dir
         sampler = _sampler
+        started_ns = _session_started_ns
         _session = None
         _profiler = None
         _out_dir = None
         _sampler = None
+        _session_started_ns = None
     if sampler is not None:
         sampler.halt()
+    t_end = time.perf_counter_ns()
+    with _open_spans_lock:
+        open_spans = list(_open_spans.values())
+        _open_spans.clear()
+        for open_span in open_spans:
+            open_span._interrupted = True
+            _interrupted_spans.append(
+                {
+                    "thread_id": open_span._tid,
+                    "label": open_span._name,
+                    "started_ns": open_span._t0,
+                    "duration_ms": round(max(0, t_end - open_span._t0) / 1e6, 3),
+                    **copy.deepcopy(open_span._metadata),
+                    "outcome": "interrupted",
+                }
+            )
     # Close any lease still open at session end so it renders to the stop edge.
     with _leases_lock:
-        t_end = time.perf_counter_ns()
         for gpu_id, (t0, label) in _leases_open.items():
             _leases.append((gpu_id, t0, t_end, label))
         _leases_open.clear()
     prof.stop()
     records = list(_records)
     _last_summary = _build_summary(records)
+    try:
+        _last_run_summary = _build_run_summary(
+            records,
+            list(_samples),
+            list(_leases),
+            interrupted_spans=list(_interrupted_spans),
+            started_ns=started_ns,
+            ended_ns=t_end,
+            sample_hz=_session_sample_hz,
+            sample_gpu=_session_sample_gpu,
+            gpu_sampling_available=sampler is not None and sampler._nvml is not None,
+        )
+    except Exception as _e:  # never let reporting kill the run
+        _last_run_summary = None
+        print(f"[agprof] WARNING: summary generation failed: {_e}")
     if out_dir is not None:
         try:
-            _inject_trace_args(out_dir, records)
+            _inject_trace_args(out_dir, records, _interrupted_spans)
         except Exception as _e:  # never let post-processing kill the run
             print(f"[agprof] WARNING: trace arg injection failed: {_e}")
+        if _last_run_summary is not None:
+            try:
+                _write_summary_files(out_dir, _last_run_summary)
+            except Exception as _e:  # never let reporting kill the run
+                print(f"[agprof] WARNING: summary output failed: {_e}")
     return prof
 
 
-def _inject_trace_args(out_dir: Path, records) -> None:
+def _inject_trace_args(out_dir: Path, records, interrupted_spans=()) -> None:
     """Write cpu/runqueue/blocked args onto the matching spans in the newest
     trace file under *out_dir*.
 
@@ -609,8 +724,9 @@ def _inject_trace_args(out_dir: Path, records) -> None:
     data = json.loads(path.read_text())
 
     by_key_recs: "dict[tuple[int, str], list]" = {}
-    for tid, name, t0, wall, cpu, runq in records:
-        by_key_recs.setdefault((tid, name), []).append((t0, wall, cpu, runq))
+    for record in records:
+        tid, name, t0, wall, cpu, runq, metadata = _unpack_record(record)
+        by_key_recs.setdefault((tid, name), []).append((t0, wall, cpu, runq, metadata))
     for v in by_key_recs.values():
         v.sort()
 
@@ -624,7 +740,7 @@ def _inject_trace_args(out_dir: Path, records) -> None:
     matched = 0
     for k, evs in by_key_evs.items():
         evs.sort(key=lambda e: e["ts"])
-        for e, (t0, wall, cpu, runq) in zip(evs, by_key_recs[k]):
+        for e, (t0, wall, cpu, runq, metadata) in zip(evs, by_key_recs[k]):
             blocked = max(0, wall - cpu - (runq or 0))
             args = dict(e.get("args") or {})
             args.update(
@@ -633,8 +749,31 @@ def _inject_trace_args(out_dir: Path, records) -> None:
                 blocked_ms=round(blocked / 1e6, 3),
                 cpu_pct=(round(100 * cpu / wall, 1) if wall > 0 else 0.0),
             )
+            args.update(metadata)
             e["args"] = args
             matched += 1
+
+    for interrupted in interrupted_spans:
+        candidates = [
+            e
+            for e in data.get("traceEvents", [])
+            if e.get("ph") == "X"
+            and e.get("tid") == interrupted["thread_id"]
+            and e.get("name") == interrupted["label"]
+            and "outcome" not in (e.get("args") or {})
+        ]
+        if candidates:
+            event = max(candidates, key=lambda e: e.get("ts", 0))
+            args = dict(event.get("args") or {})
+            args.update(
+                {
+                    key: value
+                    for key, value in interrupted.items()
+                    if key not in ("thread_id", "label", "started_ns", "duration_ms")
+                }
+            )
+            args["outcome"] = "interrupted"
+            event["args"] = args
 
     n_counters, n_leases = _inject_timelines(data)
     path.write_text(json.dumps(data))
@@ -642,6 +781,114 @@ def _inject_trace_args(out_dir: Path, records) -> None:
         f"[agprof] injected: cpu/wait args on {matched} spans, "
         f"{n_counters} counter samples, {n_leases} lease intervals ({path.name})"
     )
+
+
+_BYTE_KINDS = {
+    "io_r": ("io_read_mb_s", "io read MB/s"),
+    "io_w": ("io_write_mb_s", "io write MB/s"),
+    "net_rx": ("net_receive_mb_s", "net rx MB/s"),
+    "net_tx": ("net_transmit_mb_s", "net tx MB/s"),
+}
+
+
+def _resource_observations(samples) -> list[dict]:
+    """Convert raw sampler series into gauges/rates with stable names and units."""
+    observations: list[dict] = []
+    prev: "dict[str, tuple[int, float]]" = {}
+    for t, series, value in samples:
+        kind = series.rsplit(":", 1)[-1] if series.startswith(("cg:", "host:")) else None
+        if kind in ("cpu_us", "cpu_s") or kind in _BYTE_KINDS:
+            prior = prev.get(series)
+            prev[series] = (t, value)
+            if prior is None or t <= prior[0]:
+                continue
+            delta = value - prior[1]
+            if delta < 0:
+                continue
+            dt_s = (t - prior[0]) / 1e9
+            label = series.split(":")[1]
+            if kind in ("cpu_us", "cpu_s"):
+                cpu_s = delta * (1e-6 if kind == "cpu_us" else 1.0)
+                measured = 100.0 * cpu_s / dt_s
+                unit = "percent"
+                total_value = cpu_s
+                total_unit = "CPU seconds"
+                if series == "host:cpu_s":
+                    name = "host:cpu_pct"
+                    display_name = "host process CPU"
+                    trace_name = "host cpu %"
+                elif label == "conmon":
+                    name = "conmon:cpu_pct"
+                    display_name = "conmon CPU"
+                    trace_name = "conmon cpu %"
+                else:
+                    name = f"sandbox:{label}:cpu_pct"
+                    display_name = f"sandbox {label} CPU"
+                    trace_name = name
+            else:
+                measured = delta / 2**20 / dt_s
+                unit = "MB/s"
+                total_value = delta / 2**20
+                total_unit = "MB"
+                canonical_kind, trace_kind = _BYTE_KINDS[kind]
+                if series.startswith("host:"):
+                    name = f"host:{canonical_kind}"
+                    display_name = (
+                        f"host process {trace_kind}"
+                        if kind.startswith("io_")
+                        else f"host network {trace_kind}"
+                    )
+                    trace_name = f"host {trace_kind}"
+                else:
+                    name = f"sandbox:{label}:{canonical_kind}"
+                    display_name = f"sandbox {label} {trace_kind}"
+                    trace_name = display_name.replace(f"sandbox {label} ", f"sandbox:{label}:")
+        else:
+            measured = value
+            name = series
+            trace_name = series
+            display_name, unit = _gauge_description(series)
+            total_value = None
+            total_unit = None
+        observations.append(
+            {
+                "timestamp_ns": t,
+                "name": name,
+                "display_name": display_name,
+                "trace_name": trace_name,
+                "unit": unit,
+                "value": float(measured),
+                "interval_total": total_value,
+                "total_unit": total_unit,
+            }
+        )
+    return observations
+
+
+def _gauge_description(series: str) -> "tuple[str, str]":
+    """Human label and unit for a direct (non-cumulative) sampler series."""
+    suffix = series.rsplit(":", 1)[-1]
+    unit = {
+        "util_pct": "percent",
+        "mem_mb": "MB",
+        "power_w": "W",
+        "rss_mb": "MB",
+    }.get(suffix, "value")
+    parts = series.split(":")
+    if series == "host:rss_mb":
+        return "host process RSS", unit
+    if parts[0] == "sandbox" and suffix == "mem_mb":
+        return f"sandbox {parts[1]} memory", unit
+    if parts[0].startswith("gpu"):
+        gpu = parts[0][3:]
+        owner = f" {parts[1]}" if len(parts) == 3 else ""
+        metric = {
+            "util_pct": "utilization",
+            "mem_mb": "memory",
+            "power_w": "power",
+        }.get(suffix, suffix)
+        return f"GPU {gpu}{owner} {metric}", unit
+    return series, unit
 
 
 def _inject_timelines(data) -> "tuple[int, int]":
@@ -661,64 +908,44 @@ def _inject_timelines(data) -> "tuple[int, int]":
         return t_ns / 1e3 + offset_us
 
     new: list = []
-    # Counters. Cumulative series are emitted as rates over each sample
-    # interval ("cg:*" CPU -> %, byte counters -> MB/s); a negative delta
-    # means the counter reset (new container incarnation under the same
-    # label, or a PID exited from a summed series) and that interval is
-    # skipped. Everything else is a direct gauge.
-    _BYTE_KINDS = {"io_r": "io read MB/s", "io_w": "io write MB/s",
-                   "net_rx": "net rx MB/s", "net_tx": "net tx MB/s"}
-    prev: "dict[str, tuple[int, float]]" = {}
-    for t, series, value in _samples:
-        kind = series.rsplit(":", 1)[-1] if series.startswith(("cg:", "host:")) else None
-        if kind in ("cpu_us", "cpu_s") or kind in _BYTE_KINDS:
-            p = prev.get(series)
-            prev[series] = (t, value)
-            if p is None or t <= p[0]:
-                continue
-            delta = value - p[1]
-            if delta < 0:
-                continue  # incarnation reset / PID exit
-            dt_s = (t - p[0]) / 1e9
-            label = series.split(":")[1]
-            if kind in ("cpu_us", "cpu_s"):
-                d_cpu_s = delta * (1e-6 if kind == "cpu_us" else 1.0)
-                rate = 100.0 * d_cpu_s / dt_s
-                if series == "host:cpu_s":
-                    cname = "host cpu %"
-                elif label == "conmon":
-                    cname = "conmon cpu %"
-                else:
-                    cname = f"sandbox:{label}:cpu_pct"
-            elif series.startswith("host:"):
-                rate = delta / 2**20 / dt_s
-                cname = f"host {_BYTE_KINDS[kind]}"
-            else:
-                rate = delta / 2**20 / dt_s
-                cname = f"sandbox:{label}:{_BYTE_KINDS[kind]}"
-            new.append(
-                {"ph": "C", "pid": pid, "tid": 0, "ts": to_us(t),
-                 "name": cname, "args": {"value": round(rate, 2)}}
-            )
-        else:
-            new.append(
-                {"ph": "C", "pid": pid, "tid": 0, "ts": to_us(t),
-                 "name": series, "args": {"value": round(value, 1)}}
-            )
+    # Cumulative series become rates; direct series stay gauges. A negative
+    # delta means a counter reset and is dropped by _resource_observations.
+    for observation in _resource_observations(_samples):
+        new.append(
+            {
+                "ph": "C",
+                "pid": pid,
+                "tid": 0,
+                "ts": to_us(observation["timestamp_ns"]),
+                "name": observation["trace_name"],
+                "args": {"value": round(observation["value"], 2)},
+            }
+        )
     # Lease lanes: one synthetic "thread" per device, spans labeled by acquirer.
     lease_tids = set()
     for gpu_id, t0, t1, label in _leases:
         tid = f"gpu{gpu_id}-lease"
         lease_tids.add((gpu_id, tid))
         new.append(
-            {"ph": "X", "pid": pid, "tid": tid, "ts": to_us(t0),
-             "dur": max(1.0, (t1 - t0) / 1e3), "name": f"lease:{label}",
-             "cat": "gpu_lease"}
+            {
+                "ph": "X",
+                "pid": pid,
+                "tid": tid,
+                "ts": to_us(t0),
+                "dur": max(1.0, (t1 - t0) / 1e3),
+                "name": f"lease:{label}",
+                "cat": "gpu_lease",
+            }
         )
     for gpu_id, tid in lease_tids:
         new.append(
-            {"ph": "M", "pid": pid, "tid": tid, "name": "thread_name",
-             "args": {"name": f"GPU {gpu_id} lease"}}
+            {
+                "ph": "M",
+                "pid": pid,
+                "tid": tid,
+                "name": "thread_name",
+                "args": {"name": f"GPU {gpu_id} lease"},
+            }
         )
     evs.extend(new)
     return sum(1 for e in new if e.get("ph") == "C"), len(_leases)
@@ -727,7 +954,8 @@ def _inject_timelines(data) -> "tuple[int, int]":
 def _build_summary(records) -> "dict[str, dict]":
     """Aggregate records per label: calls, wall/cpu/runq/blocked totals (ms)."""
     out: "dict[str, dict]" = {}
-    for _tid, name, _t0, wall, cpu, runq in records:
+    for record in records:
+        _tid, name, _t0, wall, cpu, runq, _metadata = _unpack_record(record)
         # Collapse per-instance labels (run3:..., turn2, llm:attempt[1], agmap:f[0])
         # onto stable keys so the table stays readable.
         key = name.split("[")[0]
@@ -747,6 +975,637 @@ def _build_summary(records) -> "dict[str, dict]":
     return out
 
 
+def _span_key(name: str) -> str:
+    """Collapse per-instance suffixes onto the stable summary label."""
+    key = name.split("[")[0]
+    if key.startswith("run") and ":" in key:
+        key = "run:" + key.split(":", 2)[1]
+    elif key.startswith("turn"):
+        key = "turn"
+    return key
+
+
+def _percentile(values: list[float], quantile: float) -> "float | None":
+    """Linearly interpolated percentile, matching common dataframe defaults."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _latency_stats(values: list[float]) -> dict:
+    if not values:
+        return {
+            "mean_ms": None,
+            "min_ms": None,
+            "p50_ms": None,
+            "p95_ms": None,
+            "p99_ms": None,
+            "max_ms": None,
+        }
+    return {
+        "mean_ms": round(sum(values) / len(values), 3),
+        "min_ms": round(min(values), 3),
+        "p50_ms": round(_percentile(values, 0.50), 3),
+        "p95_ms": round(_percentile(values, 0.95), 3),
+        "p99_ms": round(_percentile(values, 0.99), 3),
+        "max_ms": round(max(values), 3),
+    }
+
+
+def _build_run_summary(
+    records,
+    samples,
+    leases,
+    *,
+    interrupted_spans=(),
+    started_ns: "int | None",
+    ended_ns: int,
+    sample_hz: float,
+    sample_gpu: bool,
+    gpu_sampling_available: bool,
+) -> dict:
+    """Build the complete, JSON-safe summary for one profiler session."""
+    completed_records = [_unpack_record(record) for record in records]
+    interrupted = [copy.deepcopy(span) for span in interrupted_spans]
+    for span in interrupted:
+        started = span.pop("started_ns", None)
+        if started is not None and started_ns is not None:
+            span["started_offset_ms"] = round(max(0, started - started_ns) / 1e6, 3)
+    interrupted.sort(key=lambda span: span["duration_ms"], reverse=True)
+
+    interrupted_by_label: "dict[str, list[dict]]" = {}
+    for span in interrupted:
+        interrupted_by_label.setdefault(_span_key(span["label"]), []).append(span)
+
+    completed_by_label: "dict[str, list[tuple]]" = {}
+    for record in completed_records:
+        completed_by_label.setdefault(_span_key(record[1]), []).append(record)
+
+    span_rows = []
+    base_summary = _build_summary(records)
+    for label in sorted(
+        set(completed_by_label) | set(interrupted_by_label),
+        key=lambda key: -base_summary.get(key, {}).get("wall_ms", 0),
+    ):
+        row = base_summary.get(
+            label,
+            {
+                "calls": 0,
+                "wall_ms": 0.0,
+                "cpu_ms": 0.0,
+                "runq_ms": 0.0,
+                "blocked_ms": 0.0,
+            },
+        )
+        label_records = completed_by_label.get(label, [])
+        outcomes = [record[6].get("outcome", "success") for record in label_records]
+        wall_values = [record[3] / 1e6 for record in label_records]
+        wall_ms = row["wall_ms"]
+        span_rows.append(
+            {
+                "label": label,
+                "calls": row["calls"],
+                "started": row["calls"] + len(interrupted_by_label.get(label, [])),
+                "succeeded": outcomes.count("success"),
+                "failed": sum(outcome not in ("success", "interrupted") for outcome in outcomes),
+                "interrupted": len(interrupted_by_label.get(label, [])),
+                "wall_ms": round(wall_ms, 3),
+                "cpu_ms": round(row["cpu_ms"], 3),
+                "runqueue_ms": round(row["runq_ms"], 3),
+                "blocked_ms": round(row["blocked_ms"], 3),
+                "cpu_percent": round(100 * row["cpu_ms"] / wall_ms, 1) if wall_ms else 0.0,
+                **_latency_stats(wall_values),
+            }
+        )
+
+    grouped: "dict[str, list[dict]]" = {}
+    observations = _resource_observations(samples)
+    for observation in observations:
+        grouped.setdefault(observation["name"], []).append(observation)
+    resource_rows = []
+    for name, observations in sorted(grouped.items()):
+        values = [observation["value"] for observation in observations]
+        resource_rows.append(
+            {
+                "name": name,
+                "display_name": observations[0]["display_name"],
+                "unit": observations[0]["unit"],
+                "samples": len(values),
+                "mean": round(sum(values) / len(values), 3),
+                "min": round(min(values), 3),
+                "max": round(max(values), 3),
+                "last": round(values[-1], 3),
+            }
+        )
+        totals = [
+            observation["interval_total"]
+            for observation in observations
+            if observation["interval_total"] is not None
+        ]
+        if totals:
+            resource_rows[-1]["total"] = round(sum(totals), 6)
+            resource_rows[-1]["total_unit"] = observations[0]["total_unit"]
+
+    raw_series: "dict[str, list[tuple[int, float]]]" = {}
+    for timestamp, series, value in samples:
+        raw_series.setdefault(series, []).append((timestamp, value))
+    resource_by_name = {row["name"]: row for row in resource_rows}
+    for series, points in raw_series.items():
+        if not series.endswith(":power_w") or len(points) < 2:
+            continue
+        points.sort()
+        energy_j = 0.0
+        for (t0, v0), (t1, v1) in zip(points, points[1:]):
+            if t1 > t0:
+                energy_j += (t1 - t0) / 1e9 * (v0 + v1) / 2
+        if series in resource_by_name:
+            resource_by_name[series]["energy_j"] = round(energy_j, 3)
+
+    lease_groups: "dict[tuple[int, str], list[float]]" = {}
+    for gpu_id, t0, t1, label in leases:
+        lease_groups.setdefault((gpu_id, label), []).append(max(0, t1 - t0) / 1e6)
+    lease_rows = []
+    for (gpu_id, label), durations in sorted(lease_groups.items()):
+        lease_rows.append(
+            {
+                "gpu_id": gpu_id,
+                "label": label,
+                "leases": len(durations),
+                "total_ms": round(sum(durations), 3),
+                "mean_ms": round(sum(durations) / len(durations), 3),
+                "max_ms": round(max(durations), 3),
+            }
+        )
+
+    if started_ns is None:
+        duration_ms = 0.0
+    else:
+        duration_ms = max(0, ended_ns - started_ns) / 1e6
+
+    def is_run_label(name: str) -> bool:
+        prefix, separator, _rest = name.partition(":")
+        return separator == ":" and prefix.startswith("run") and prefix[3:].isdigit()
+
+    completed_runs = [record for record in completed_records if is_run_label(record[1])]
+    interrupted_runs = [span for span in interrupted if is_run_label(span["label"])]
+    run_outcomes = [record[6].get("outcome", "success") for record in completed_runs]
+    duration_s = duration_ms / 1e3
+    run_metrics = {
+        "started": len(completed_runs) + len(interrupted_runs),
+        "completed": len(completed_runs),
+        "succeeded": run_outcomes.count("success"),
+        "failed": sum(outcome != "success" for outcome in run_outcomes),
+        "interrupted": len(interrupted_runs),
+        "completed_per_second": round(len(completed_runs) / duration_s, 6) if duration_s else 0.0,
+        "successful_per_second": round(run_outcomes.count("success") / duration_s, 6)
+        if duration_s
+        else 0.0,
+        **_latency_stats([record[3] / 1e6 for record in completed_runs]),
+    }
+
+    attempt_records = [
+        record for record in completed_records if record[1].startswith("llm:attempt[")
+    ]
+    interrupted_attempts = [
+        span for span in interrupted if span["label"].startswith("llm:attempt[")
+    ]
+    attempt_metadata = [record[6] for record in attempt_records]
+    ttft_values = [
+        float(metadata["ttft_ms"])
+        for metadata in attempt_metadata
+        if metadata.get("ttft_ms") is not None
+    ]
+    generation_ms = sum(float(metadata.get("generation_ms") or 0) for metadata in attempt_metadata)
+    input_tokens = sum(int(metadata.get("input_tokens") or 0) for metadata in attempt_metadata)
+    output_tokens = sum(int(metadata.get("output_tokens") or 0) for metadata in attempt_metadata)
+    calls = sum(record[1].startswith("llm:attempt[0]") for record in attempt_records) + sum(
+        span["label"].startswith("llm:attempt[0]") for span in interrupted_attempts
+    )
+    retries = len(attempt_records) + len(interrupted_attempts) - calls
+    llm_metrics = {
+        "calls": calls,
+        "successful_calls": sum(
+            metadata.get("outcome", "success") == "success" for metadata in attempt_metadata
+        ),
+        "failed_calls": sum(
+            metadata.get("outcome", "success") != "success" and not metadata.get("retrying")
+            for metadata in attempt_metadata
+        ),
+        "interrupted_calls": len(interrupted_attempts),
+        "attempts": len(attempt_records) + len(interrupted_attempts),
+        "retries": retries,
+        "successful_attempts": sum(
+            metadata.get("outcome", "success") == "success" for metadata in attempt_metadata
+        ),
+        "failed_attempts": sum(
+            metadata.get("outcome", "success") != "success" for metadata in attempt_metadata
+        ),
+        "interrupted_attempts": len(interrupted_attempts),
+        "total_wait_ms": round(sum(record[3] for record in attempt_records) / 1e6, 3),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "output_tokens_per_second": round(output_tokens / (generation_ms / 1e3), 3)
+        if generation_ms
+        else None,
+        "latency": _latency_stats([record[3] / 1e6 for record in attempt_records]),
+        "ttft": _latency_stats(ttft_values),
+    }
+
+    tool_records = [record for record in completed_records if record[1].startswith("tool:")]
+    interrupted_tools = [span for span in interrupted if span["label"].startswith("tool:")]
+    tool_outcomes = [record[6].get("outcome", "success") for record in tool_records]
+    tool_metrics = {
+        "started": len(tool_records) + len(interrupted_tools),
+        "completed": len(tool_records),
+        "succeeded": tool_outcomes.count("success"),
+        "failed": sum(outcome != "success" for outcome in tool_outcomes),
+        "interrupted": len(interrupted_tools),
+        "latency": _latency_stats([record[3] / 1e6 for record in tool_records]),
+        "by_tool": [],
+    }
+    tool_names = sorted(
+        {record[1].removeprefix("tool:") for record in tool_records}
+        | {span["label"].removeprefix("tool:") for span in interrupted_tools}
+    )
+    for tool_name in tool_names:
+        matching = [record for record in tool_records if record[1] == f"tool:{tool_name}"]
+        matching_interrupted = [
+            span for span in interrupted_tools if span["label"] == f"tool:{tool_name}"
+        ]
+        matching_outcomes = [record[6].get("outcome", "success") for record in matching]
+        tool_metrics["by_tool"].append(
+            {
+                "name": tool_name,
+                "started": len(matching) + len(matching_interrupted),
+                "completed": len(matching),
+                "succeeded": matching_outcomes.count("success"),
+                "failed": sum(outcome != "success" for outcome in matching_outcomes),
+                "interrupted": len(matching_interrupted),
+                **_latency_stats([record[3] / 1e6 for record in matching]),
+            }
+        )
+
+    host_metrics = {}
+    host_cpu = resource_by_name.get("host:cpu_pct")
+    host_rss = resource_by_name.get("host:rss_mb")
+    if host_cpu:
+        host_metrics.update(
+            cpu_average_percent=host_cpu["mean"],
+            cpu_peak_percent=host_cpu["max"],
+            cpu_time_seconds=host_cpu.get("total"),
+        )
+    if host_rss:
+        host_metrics.update(rss_average_mb=host_rss["mean"], rss_peak_mb=host_rss["max"])
+    for kind in ("io_read", "io_write", "net_receive", "net_transmit"):
+        row = resource_by_name.get(f"host:{kind}_mb_s")
+        if row:
+            host_metrics[f"{kind}_mb"] = row.get("total", 0.0)
+
+    gpu_ids = sorted(
+        {
+            int(name[3:].split(":", 1)[0])
+            for name in resource_by_name
+            if name.startswith("gpu")
+            and name[3:].split(":", 1)[0].isdigit()
+            and name.count(":") == 1
+        }
+    )
+    gpu_metrics = []
+    for gpu_id in gpu_ids:
+        prefix = f"gpu{gpu_id}:"
+        util = resource_by_name.get(prefix + "util_pct")
+        memory = resource_by_name.get(prefix + "mem_mb")
+        power = resource_by_name.get(prefix + "power_w")
+        gpu_metrics.append(
+            {
+                "gpu_id": gpu_id,
+                "utilization_average_percent": util["mean"] if util else None,
+                "utilization_peak_percent": util["max"] if util else None,
+                "memory_average_mb": memory["mean"] if memory else None,
+                "memory_peak_mb": memory["max"] if memory else None,
+                "power_average_w": power["mean"] if power else None,
+                "power_peak_w": power["max"] if power else None,
+                "energy_j": power.get("energy_j") if power else None,
+            }
+        )
+
+    sandbox_labels = sorted(
+        {
+            name.split(":", 2)[1]
+            for name in resource_by_name
+            if name.startswith("sandbox:") and name.count(":") >= 2
+        }
+    )
+    sandbox_metrics = []
+    for label in sandbox_labels:
+        prefix = f"sandbox:{label}:"
+        cpu = resource_by_name.get(prefix + "cpu_pct")
+        memory = resource_by_name.get(prefix + "mem_mb")
+        row = {
+            "label": label,
+            "cpu_average_percent": cpu["mean"] if cpu else None,
+            "cpu_peak_percent": cpu["max"] if cpu else None,
+            "cpu_time_seconds": cpu.get("total") if cpu else None,
+            "memory_average_mb": memory["mean"] if memory else None,
+            "memory_peak_mb": memory["max"] if memory else None,
+        }
+        for kind in ("io_read", "io_write", "net_receive", "net_transmit"):
+            metric = resource_by_name.get(prefix + f"{kind}_mb_s")
+            row[f"{kind}_mb"] = metric.get("total", 0.0) if metric else 0.0
+        sandbox_metrics.append(row)
+
+    tick_times = sorted({timestamp for timestamp, _series, _value in samples})
+    sampled_duration_s = (tick_times[-1] - tick_times[0]) / 1e9 if len(tick_times) >= 2 else 0.0
+    return {
+        "schema_version": 2,
+        "data_source": "measured",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "duration_ms": round(duration_ms, 3),
+        "run_metrics": run_metrics,
+        "llm_metrics": llm_metrics,
+        "tool_metrics": tool_metrics,
+        "host_metrics": host_metrics,
+        "gpu_metrics": gpu_metrics,
+        "sandbox_metrics": sandbox_metrics,
+        "sampling": {
+            "configured_hz": sample_hz,
+            "effective_hz": round((len(tick_times) - 1) / sampled_duration_s, 3)
+            if sampled_duration_s
+            else 0.0,
+            "sampled_duration_ms": round(sampled_duration_s * 1e3, 3),
+            "gpu_requested": sample_gpu,
+            "gpu_available": gpu_sampling_available,
+            "raw_samples": len(samples),
+        },
+        "span_metrics": span_rows,
+        "resource_metrics": resource_rows,
+        "gpu_lease_metrics": lease_rows,
+        "incomplete_spans": interrupted,
+    }
+
+
+def summary_metrics() -> "dict | None":
+    """A copy of the complete metrics document for the last completed session."""
+    return copy.deepcopy(_last_run_summary)
+
+
+def _markdown_escape(value) -> str:
+    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def _render_summary_markdown(summary: dict) -> str:
+    """Render a complete profiler summary as a standalone Markdown report."""
+    sampling = summary["sampling"]
+    runs = summary["run_metrics"]
+    llm = summary["llm_metrics"]
+    tools = summary["tool_metrics"]
+
+    def number(value, digits=3):
+        return "n/a" if value is None else f"{value:.{digits}f}"
+
+    def milliseconds(value):
+        return "n/a" if value is None else f"{value:.3f} ms"
+
+    lines = [
+        "# agprof summary",
+        "",
+    ]
+    if summary.get("data_source") != "measured":
+        lines.extend(
+            [
+                "> **MOCK DATA — illustrative only. These values were not measured.**",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            f"- Duration: **{summary['duration_ms'] / 1e3:.3f} s**",
+            f"- Runs: **{runs['completed']}/{runs['started']} completed**, "
+            f"{runs['succeeded']} succeeded, {runs['failed']} failed, "
+            f"{runs['interrupted']} interrupted",
+            f"- Completed throughput: **{runs['completed_per_second']:.3f} runs/s**",
+            f"- LLM: **{llm['calls']} calls**, {llm['successful_calls']} succeeded, "
+            f"{llm['failed_calls']} failed, {llm['interrupted_calls']} interrupted, "
+            f"{llm['retries']} {'retry' if llm['retries'] == 1 else 'retries'}, "
+            f"{llm['total_wait_ms'] / 1e3:.3f} s total wait",
+            f"- Tools: **{tools['completed']}/{tools['started']} completed**, "
+            f"{tools['failed']} failed, {tools['interrupted']} interrupted",
+            f"- Raw resource samples: **{sampling['raw_samples']}** "
+            f"at {sampling['effective_hz']:g} Hz effective "
+            f"({sampling['configured_hz']:g} Hz configured)",
+            f"- GPU sampling: **{'available' if sampling['gpu_available'] else 'unavailable'}** "
+            f"({'requested' if sampling['gpu_requested'] else 'not requested'})",
+            "",
+            "## Run, LLM, and tool metrics",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| Run latency p50 / p95 | {number(runs['p50_ms'])} / {number(runs['p95_ms'])} ms |",
+            f"| LLM latency p50 / p95 | {number(llm['latency']['p50_ms'])} / "
+            f"{number(llm['latency']['p95_ms'])} ms |",
+            f"| LLM TTFT p50 / p95 | {number(llm['ttft']['p50_ms'])} / "
+            f"{number(llm['ttft']['p95_ms'])} ms |",
+            f"| LLM input / output tokens | {llm['input_tokens']} / {llm['output_tokens']} |",
+            f"| LLM output throughput | {number(llm['output_tokens_per_second'])} tokens/s |",
+            f"| LLM attempts | {llm['attempts']} total, {llm['successful_attempts']} succeeded, "
+            f"{llm['failed_attempts']} failed, {llm['interrupted_attempts']} interrupted |",
+            f"| Tool latency p50 / p95 | {number(tools['latency']['p50_ms'])} / "
+            f"{number(tools['latency']['p95_ms'])} ms |",
+            "",
+            "### Tool outcomes",
+            "",
+        ]
+    )
+    if tools["by_tool"]:
+        lines.extend(
+            [
+                "| Tool | Completed/started | Succeeded | Failed | Interrupted | "
+                "p50 latency | p95 latency |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for tool in tools["by_tool"]:
+            lines.append(
+                f"| {_markdown_escape(tool['name'])} | "
+                f"{tool['completed']}/{tool['started']} | {tool['succeeded']} | "
+                f"{tool['failed']} | {tool['interrupted']} | "
+                f"{milliseconds(tool['p50_ms'])} | {milliseconds(tool['p95_ms'])} |"
+            )
+    else:
+        lines.append("_No tool spans were recorded._")
+    lines.extend(
+        [
+            "",
+            "## Host metrics",
+            "",
+            "| CPU avg | CPU peak | CPU time | RSS avg | RSS peak | Disk read | Disk write | "
+            "Net receive | Net transmit |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            f"| {number(summary['host_metrics'].get('cpu_average_percent'))}% | "
+            f"{number(summary['host_metrics'].get('cpu_peak_percent'))}% | "
+            f"{number(summary['host_metrics'].get('cpu_time_seconds'))} s | "
+            f"{number(summary['host_metrics'].get('rss_average_mb'))} MB | "
+            f"{number(summary['host_metrics'].get('rss_peak_mb'))} MB | "
+            f"{number(summary['host_metrics'].get('io_read_mb'), 6)} MB | "
+            f"{number(summary['host_metrics'].get('io_write_mb'), 6)} MB | "
+            f"{number(summary['host_metrics'].get('net_receive_mb'), 6)} MB | "
+            f"{number(summary['host_metrics'].get('net_transmit_mb'), 6)} MB |",
+            "",
+            "## GPU metrics",
+            "",
+        ]
+    )
+    if summary["gpu_metrics"]:
+        lines.extend(
+            [
+                "| GPU | Util avg | Util peak | VRAM avg | VRAM peak | Power avg | "
+                "Power peak | Energy |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for gpu in summary["gpu_metrics"]:
+            lines.append(
+                f"| {gpu['gpu_id']} | {number(gpu['utilization_average_percent'])}% | "
+                f"{number(gpu['utilization_peak_percent'])}% | "
+                f"{number(gpu['memory_average_mb'])} MB | {number(gpu['memory_peak_mb'])} MB | "
+                f"{number(gpu['power_average_w'])} W | {number(gpu['power_peak_w'])} W | "
+                f"{number(gpu['energy_j'])} J |"
+            )
+    else:
+        lines.append("_No GPU samples were collected._")
+
+    lines.extend(["", "## Sandbox metrics", ""])
+    if summary["sandbox_metrics"]:
+        lines.extend(
+            [
+                "| Sandbox | CPU avg | CPU peak | CPU time | Memory avg | Memory peak | "
+                "Disk read | Disk write | Net receive | Net transmit |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for sandbox in summary["sandbox_metrics"]:
+            lines.append(
+                f"| {_markdown_escape(sandbox['label'])} | "
+                f"{number(sandbox['cpu_average_percent'])}% | "
+                f"{number(sandbox['cpu_peak_percent'])}% | "
+                f"{number(sandbox['cpu_time_seconds'])} s | "
+                f"{number(sandbox['memory_average_mb'])} MB | "
+                f"{number(sandbox['memory_peak_mb'])} MB | "
+                f"{number(sandbox['io_read_mb'], 6)} MB | "
+                f"{number(sandbox['io_write_mb'], 6)} MB | "
+                f"{number(sandbox['net_receive_mb'], 6)} MB | "
+                f"{number(sandbox['net_transmit_mb'], 6)} MB |"
+            )
+    else:
+        lines.append("_No sandbox resource samples were collected._")
+
+    lines.extend(["", "## Incomplete spans", ""])
+    if summary["incomplete_spans"]:
+        lines.extend(
+            [
+                "| Label | Thread | Elapsed at stop (s) | Outcome |",
+                "|---|---:|---:|---|",
+            ]
+        )
+        for interrupted in summary["incomplete_spans"]:
+            lines.append(
+                f"| {_markdown_escape(interrupted['label'])} | "
+                f"{interrupted['thread_id']} | {interrupted['duration_ms'] / 1e3:.3f} | "
+                f"{interrupted['outcome']} |"
+            )
+    else:
+        lines.append("_No spans were still open when profiling stopped._")
+
+    lines.extend(
+        [
+            "",
+            "## Span metrics",
+            "",
+        ]
+    )
+    if summary["span_metrics"]:
+        lines.extend(
+            [
+                "| Label | Completed/started | Failed | Interrupted | Wall (s) | CPU (s) | "
+                "Blocked (s) | Mean (ms) | p50 (ms) | p95 (ms) |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in summary["span_metrics"]:
+            lines.append(
+                f"| {_markdown_escape(row['label'])} | {row['calls']}/{row['started']} | "
+                f"{row['failed']} | {row['interrupted']} | "
+                f"{row['wall_ms'] / 1e3:.3f} | {row['cpu_ms'] / 1e3:.3f} | "
+                f"{row['blocked_ms'] / 1e3:.3f} | {number(row['mean_ms'])} | "
+                f"{number(row['p50_ms'])} | {number(row['p95_ms'])} |"
+            )
+    else:
+        lines.append("_No completed spans._")
+
+    lines.extend(["", "## Resource metrics", ""])
+    if summary["resource_metrics"]:
+        lines.extend(
+            [
+                "| Metric | Unit | Samples | Mean | Min | Max | Last | Total | Energy |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in summary["resource_metrics"]:
+            total_text = (
+                f"{number(row['total'], 6)} {row['total_unit']}"
+                if row.get("total") is not None
+                else "n/a"
+            )
+            energy_text = (
+                f"{number(row['energy_j'])} J" if row.get("energy_j") is not None else "n/a"
+            )
+            lines.append(
+                f"| {_markdown_escape(row['display_name'])} | {row['unit']} | "
+                f"{row['samples']} | {row['mean']:.3f} | {row['min']:.3f} | "
+                f"{row['max']:.3f} | {row['last']:.3f} | {total_text} | {energy_text} |"
+            )
+    else:
+        lines.append("_No resource samples were collected._")
+
+    lines.extend(["", "## GPU lease metrics", ""])
+    if summary["gpu_lease_metrics"]:
+        lines.extend(
+            [
+                "| GPU | Holder | Leases | Total (s) | Mean (s) | Max (s) |",
+                "|---:|---|---:|---:|---:|---:|",
+            ]
+        )
+        for row in summary["gpu_lease_metrics"]:
+            lines.append(
+                f"| {row['gpu_id']} | {_markdown_escape(row['label'])} | "
+                f"{row['leases']} | {row['total_ms'] / 1e3:.3f} | "
+                f"{row['mean_ms'] / 1e3:.3f} | {row['max_ms'] / 1e3:.3f} |"
+            )
+    else:
+        lines.append("_No GPU leases were recorded._")
+    return "\n".join(lines) + "\n"
+
+
+def _write_summary_files(out_dir: Path, summary: dict) -> "tuple[Path, Path]":
+    """Atomically write the machine- and human-readable per-run summaries."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / "summary.json"
+    markdown_path = out_dir / "summary.md"
+    json_tmp = out_dir / f".summary.json.{os.getpid()}.tmp"
+    markdown_tmp = out_dir / f".summary.md.{os.getpid()}.tmp"
+    json_tmp.write_text(json.dumps(summary, indent=2) + "\n")
+    markdown_tmp.write_text(_render_summary_markdown(summary))
+    json_tmp.replace(json_path)
+    markdown_tmp.replace(markdown_path)
+    print(f"[agprof] summaries: {json_path}, {markdown_path}")
+    return json_path, markdown_path
+
+
 def summary_table(sort_by: str = "wall_ms", row_limit: int = 30) -> str:
     """Formatted per-label CPU-vs-wait table for the last completed session."""
     if not _last_summary:
@@ -759,8 +1618,8 @@ def summary_table(sort_by: str = "wall_ms", row_limit: int = 30) -> str:
     for name, r in rows[:row_limit]:
         cpu_pct = 100 * r["cpu_ms"] / r["wall_ms"] if r["wall_ms"] else 0.0
         lines.append(
-            f"{name:<28} {r['calls']:>5} {r['wall_ms']/1e3:>9.2f} {r['cpu_ms']/1e3:>8.2f} "
-            f"{r['runq_ms']/1e3:>8.2f} {r['blocked_ms']/1e3:>9.2f} {cpu_pct:>5.1f}%"
+            f"{name:<28} {r['calls']:>5} {r['wall_ms'] / 1e3:>9.2f} {r['cpu_ms'] / 1e3:>8.2f} "
+            f"{r['runq_ms'] / 1e3:>8.2f} {r['blocked_ms'] / 1e3:>9.2f} {cpu_pct:>5.1f}%"
         )
     return "\n".join(lines)
 

@@ -496,11 +496,18 @@ class agskill:
         # which would otherwise let wait_all_paused() race past a run that
         # hasn't had a chance to update its own state yet.
         ag._set_ui_state("skill", skill=self.name)
+
         def _traced_task() -> None:
             _label = f"run{agprof.next_index()}:{self.name}:{ag.agname}"
             agprof.thread_name(_label)
             with agprof.span(_label):
                 _task()
+                _profile_result = result_future.result()
+                _profile_error = _profile_result._data.get("error")
+                agprof.annotate(
+                    outcome="failure" if _profile_error else "success",
+                    error_type="skill_error" if _profile_error else None,
+                )
 
         threading.Thread(target=_traced_task, daemon=True).start()
         ag.ctx = agcontext(_future=ctx_future)
@@ -557,7 +564,7 @@ class agskill:
                 )
                 if self.input_schema is not None
                 else ([], [])
-        )
+            )
 
         _extra_system: str | None = None
         if auto_fields:
@@ -645,6 +652,19 @@ class agskill:
                         prev_ctx.total_output_tokens,
                         self.name,
                         full_history_fn=ag._append_full_history,
+                    )
+                    agprof.annotate(
+                        outcome="success" if llm_result.ok else "failure",
+                        error_type=(
+                            type(llm_result.conn_error).__name__
+                            if llm_result.conn_error is not None
+                            else ("context_exceeded" if llm_result.context_exceeded else None)
+                        ),
+                        ttft_ms=llm_result.ttft_ms,
+                        generation_ms=llm_result.generation_ms,
+                        input_tokens=llm_result.prompt_tokens or 0,
+                        output_tokens=llm_result.completion_tokens,
+                        output_tokens_per_second=llm_result.output_tokens_per_second,
                     )
                 if llm_result.context_exceeded:
                     if ag._append_full_history:
@@ -735,7 +755,9 @@ class agskill:
                             agconfig=ag.agconfig,
                         )
                     # Continue looping unless all required output fields are collected.
-                    if not (_use_return_output and not (_required_fields - set(_collected_outputs))):
+                    if not (
+                        _use_return_output and not (_required_fields - set(_collected_outputs))
+                    ):
                         continue
 
                 else:
@@ -785,7 +807,11 @@ class agskill:
                             agerror(
                                 f"output schema error: missing fields after retries: {sorted(missing)}"
                                 + f"\ncollected: {sorted(_collected_outputs.keys())}"
-                                + (f"\nlast model output: {_last_out_str!r}" if _last_out_str else "")
+                                + (
+                                    f"\nlast model output: {_last_out_str!r}"
+                                    if _last_out_str
+                                    else ""
+                                )
                             ),
                             prev_ctx,
                             [messages[0]] + messages[1:][n_before:],
@@ -825,7 +851,9 @@ class agskill:
                     f"BUG: reached raw-text path with structured output_schema on skill '{self.name}'. "
                     "This should be unreachable — _use_return_output covers all schema cases."
                 )
-                out_key = self.output_schema.raw_key() if self.output_schema is not None else "result"
+                out_key = (
+                    self.output_schema.raw_key() if self.output_schema is not None else "result"
+                )
                 result = agdata(**{out_key: msg_dict.get("content") or ""})
                 with agprof.span("proc_wait"):
                     proc_msg = agSandbox.wait_for_processes(

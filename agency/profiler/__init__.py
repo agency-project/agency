@@ -12,6 +12,7 @@ Import styles supported:
 
 from . import agprof
 from .agprof import (
+    annotate,
     enabled,
     next_index,
     profile_scope,
@@ -19,6 +20,7 @@ from .agprof import (
     span,
     start,
     stop,
+    summary_metrics,
     summary_table,
     thread_name,
     workload,
@@ -26,6 +28,7 @@ from .agprof import (
 
 __all__ = [
     "agprof",
+    "annotate",
     "enabled",
     "next_index",
     "profile_scope",
@@ -33,6 +36,7 @@ __all__ = [
     "span",
     "start",
     "stop",
+    "summary_metrics",
     "summary_table",
     "thread_name",
     "workload",
