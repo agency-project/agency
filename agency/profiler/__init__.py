@@ -7,29 +7,37 @@ Import styles supported:
 
     from agency import agprof              # re-exported at package root
     from agency.profiler import agprof     # explicit
-    from agency.profiler import span, session, enabled   # direct API
+    from agency.profiler import span, session, workload, enabled  # direct API
 """
 
 from . import agprof
 from .agprof import (
+    annotate,
     enabled,
     next_index,
+    profile_scope,
     session,
     span,
     start,
     stop,
+    summary_metrics,
     summary_table,
     thread_name,
+    workload,
 )
 
 __all__ = [
     "agprof",
+    "annotate",
     "enabled",
     "next_index",
+    "profile_scope",
     "session",
     "span",
     "start",
     "stop",
+    "summary_metrics",
     "summary_table",
     "thread_name",
+    "workload",
 ]

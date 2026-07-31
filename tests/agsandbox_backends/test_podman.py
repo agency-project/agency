@@ -1335,7 +1335,7 @@ class TestPodmanCommandHelpers:
             with patch.object(sb, "_container_running", return_value=True):
                 with patch.object(sb, "_container_status", return_value=""):
                     with patch.object(
-                        sb, "_inspect_container_state", return_value=(False, "exited")
+                        sb, "_inspect_container_state", return_value=(False, "exited", None)
                     ):
                         sb._ensure_started()
 

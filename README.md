@@ -10,6 +10,8 @@ Agents are non-blocking by default. `agent.run()` returns a pending `agdata` imm
 - [uv](https://docs.astral.sh/uv/) — package manager ([installation](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer))
 - Docker or Podman
 - GPU (optional): NVIDIA (CUDA) or AMD (ROCm)
+- Profiling: Linux only (cgroups v2 and Linux `/proc` kernel interfaces);
+  other operating systems are currently unsupported
 
 ## Install
 
@@ -25,12 +27,30 @@ uv venv --python 3.12 --seed --managed-python
 source .venv/bin/activate
 
 uv pip install -e .
+uv pip install -e ".[profiler]"   # profiling (PyTorch traces + NVIDIA GPU sampling)
 uv pip install -e ".[dev]"   # dev dependencies (pytest, ruff, pre-commit)
 
 pre-commit install   # one-time; runs ruff (lint + format) and hygiene checks on every commit
 ```
 
 The sandbox image comes with `torch torchvision transformers datasets accelerate numpy scipy matplotlib` pre-installed, and the `Qwen/Qwen3.5-4B` model weights and `wikitext-2-raw-v1` dataset pre-cached. Run `python /opt/model_smoke.py` inside any container to verify the setup.
+
+The profiler runs in the host Python environment, not inside the sandbox
+image. Install the `profiler` extra before using it; this provides `torch` for
+trace collection and `nvidia-ml-py` for NVIDIA GPU sampling. Environment-enabled
+profiling places the complete benchmark and its Docker containers in a
+dedicated transient cgroup, which requires `systemd-run`, `setpriv`, and
+non-interactive `sudo` permission for `systemd-run`. See
+[`agency/profiler/README.md`](agency/profiler/README.md) for usage.
+For an unmodified non-Web-UI application, set
+`AGENCY_PROFILE_SCOPE=process`; workload scope is opened automatically by
+`agwebui.run(...)` or explicitly with `agprof.workload()`.
+
+Within that workload cgroup, the profiler discovers PIDs recursively and adds
+an independent TensorBoard process group for each stable PID/start-time
+identity. CPU, RSS, virtual memory, and permitted per-process I/O counters are
+therefore shown separately; the cgroup aggregate is labeled
+`workload_total`.
 
 ## Quick start
 

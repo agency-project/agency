@@ -6,6 +6,24 @@ the framework's hot paths (`agskill`, `agllm`, `agtool`, `agsandbox`, `agmap`,
 off-path cost is one global check, and torch is never imported unless profiling
 is turned on.
 
+## Installation
+
+Profiling requires Linux. Other operating systems are currently unsupported
+because resource isolation and accounting depend on cgroups v2 and Linux
+kernel interfaces under `/proc`.
+
+Install Agency with the optional profiling dependencies:
+
+```bash
+uv pip install -e ".[profiler]"
+```
+
+The extra installs `torch` for trace collection and `nvidia-ml-py` (imported
+as `pynvml`) for NVIDIA GPU sampling. These dependencies are intentionally not
+part of the default install because PyTorch is large and profiling is optional.
+The profiler runs in the host Python environment, so the copy of `torch`
+included in Agency's sandbox image does not satisfy this requirement.
+
 ## Usage
 
 ```python
@@ -15,16 +33,79 @@ with agprof.session(run_dir / "tb_trace"):   # owns the torch.profiler lifecycle
     team.run()
 ```
 
-Or profile an **unmodified** application:
+Or profile an **unmodified, non-Web-UI application** for its full process
+lifetime:
 
 ```bash
-AGENCY_PROFILE=1 [AGENCY_PROFILE_DIR=path] python app.py
+AGENCY_PROFILE=1 AGENCY_PROFILE_SCOPE=process [AGENCY_PROFILE_DIR=path] python app.py
 ```
+
+When `AGENCY_PROFILE` is enabled, Agency validates the operating system before
+the workload or profiler starts. On Linux it relaunches the complete command in
+a dedicated transient systemd cgroup. The benchmark harness, its child
+processes, and Agency-managed Docker containers are placed beneath the same
+slice, so unrelated machine processes are excluded. Creating the transient
+scope requires cgroup v2, `systemd-run`, `setpriv`, and non-interactive `sudo`
+permission for `systemd-run`; the workload itself is immediately dropped back
+to the invoking user and supplementary groups.
+
+On a non-Linux system the command fails immediately with a Linux-only error,
+and no trace directory or profiler artifacts are created.
+
+Environment profiling defaults to `AGENCY_PROFILE_SCOPE=workload`. The Web UI
+automatically opens that boundary immediately before the function passed to
+`agwebui.run(...)` and closes it as soon as the function returns, excluding
+dashboard startup and linger time. A non-Web-UI application can use the same
+scope by wrapping its entry point in `with agprof.workload():`; because Agency
+cannot infer an arbitrary application's workload boundary, an otherwise
+unmodified non-Web-UI application must explicitly select
+`AGENCY_PROFILE_SCOPE=process`. Unset or invalid scope values use `workload`.
 
 View traces with `tensorboard --logdir <runs dir>` (PYTORCH_PROFILER tab →
 Views → Trace; needs `tensorboard` + `torch-tb-profiler`) or drag the
 `.pt.trace.json` into <https://ui.perfetto.dev>. After a session,
 `prof.key_averages().table(sort_by="cpu_time_total")` prints a per-span summary.
+
+Every completed session with an output directory also writes:
+
+- `summary.json`: a versioned machine-readable document containing run
+  outcomes/throughput, LLM and tool metrics, span latency distributions,
+  per-process/workload/sandbox/GPU resource statistics, energy/totals,
+  interrupted spans, and GPU lease statistics.
+- `summary.md`: the same metrics as human-readable Markdown tables.
+
+Span rows report completed/started/succeeded/failed/interrupted counts; total
+wall/CPU/run-queue/blocked time; and mean/min/p50/p95/p99/max latency. Run,
+LLM, and tool rollups add throughput and outcome counts. Streaming LLM calls
+record time to first token (TTFT), input/output tokens, generation time, retry
+state, and output tokens/s.
+
+Resource rows report sample count, mean, minimum, maximum, and last value.
+Cumulative CPU, disk, and network counters are converted to utilization or
+throughput while their non-negative deltas are also summed into CPU seconds or
+MB totals. GPU power samples are trapezoidally integrated into joules. The
+report shows the effective sampling frequency alongside the configured rate.
+
+### Process resource tracks
+
+The workload cgroup is recursively scanned on every sampler tick. Every PID
+found in any descendant `cgroup.procs` file is sampled independently from
+`/proc/<pid>/stat`, `/proc/<pid>/cmdline`, and `/proc/<pid>/io`. TensorBoard
+receives a separate process group such as `python (PID 85418)` for each stable
+`(PID, start time)` identity, with independent `cpu_percent`, `rss_mb`,
+`vms_mb`, `io_read_mb_s`, and `io_write_mb_s` tracks. PID start time prevents
+PID reuse from merging two different processes. Processes that exit between
+cgroup discovery and `/proc` reads are skipped without failing the run.
+
+The cgroup-wide counters remain available under the explicit
+`workload_total` name; they are not labeled as a process. Agency-managed
+container cgroups also keep their `sandbox:*` aggregate tracks.
+
+If profiling stops while background work is live, open spans are listed under
+`incomplete_spans` with `outcome: "interrupted"` and elapsed time at the stop
+boundary; they are not misreported as completed latency samples.
+`agprof.summary_metrics()` returns a copy of the JSON document for the most
+recently completed session, including sessions started with `out_dir=None`.
 
 Custom app-level phases use the same public API:
 
@@ -106,11 +187,18 @@ Two reading rules:
 
 ## Known limits (where torch.profiler ends and agprof begins)
 
-- Spans record wall time only — no CPU-vs-wait split within a span
-  (needs a `thread_time_ns`/schedstat session backend).
-- Container/daemon CPU, tool-worker subprocesses, and the SSE drain thread are
-  outside the profiled process.
-- No resource counters (energy, GPU, IO) yet — sampler + counter-track
-  injection planned.
+- Profiling is Linux-only. CPU/run-queue timing uses
+  `/proc/.../schedstat`, and process resource accounting uses cgroups v2.
+- Sandbox metrics require cgroup v2 paths readable by the host process.
+- Linux may restrict `/proc/<pid>/io` for processes owned by another UID. Such
+  processes still receive CPU, RSS, and VMS tracks; their exact container-level
+  I/O remains available through the corresponding `sandbox:*` cgroup track.
+- GPU metrics require NVIDIA NVML. GPU work is attributed with device sampling,
+  per-process sampling, and explicit lease intervals rather than host-thread
+  timing.
+- Token counts depend on the backend returning streaming usage. TTFT is the
+  first non-empty content, reasoning, or tool-call delta.
+- Resource sampling is discrete. Energy integration and counter totals cover
+  the sampled interval, which is reported separately from session duration.
 - Durations vary with live model load; benchmark-grade numbers need the
   mock endpoint.

@@ -2073,7 +2073,9 @@ class TestDockerCommandHelpers:
             with patch.object(sb._backend, "_container_running", return_value=True):
                 with patch.object(sb._backend, "_container_status", return_value=""):
                     with patch.object(
-                        sb._backend, "_inspect_container_state", return_value=(False, "exited")
+                        sb._backend,
+                        "_inspect_container_state",
+                        return_value=(False, "exited", None),
                     ):
                         sb._backend._ensure_started()
 

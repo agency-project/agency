@@ -350,9 +350,11 @@ def dispatch_tools(
 
         t = toolkit.get(fn_name)
         if t is None:
-            if _term:
-                _term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
-            result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
+            with agprof.span(f"tool:{fn_name}"):
+                agprof.annotate(outcome="failure", error_type="unknown_tool")
+                if _term:
+                    _term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
+                result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
         else:
             try:
                 if _state_fn:
@@ -370,7 +372,13 @@ def dispatch_tools(
                 if _tool_timeout is None:
                     _tool_timeout = _default_tool_timeout
                 with agprof.span(f"tool:{fn_name}"):
-                    result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
+                    _tool_result = t(agdata.from_json(fn_args), timeout=_tool_timeout)
+                    _tool_error = _tool_result._data.get("error")
+                    agprof.annotate(
+                        outcome="failure" if _tool_error else "success",
+                        error_type="tool_error" if _tool_error else None,
+                    )
+                    result_content = _tool_result.to_json()
                 if _state_fn:
                     _state_fn("skill", skill=skill_name)
                 # Offload large tool outputs regardless of whether the tool

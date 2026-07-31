@@ -502,6 +502,12 @@ class agskill:
             agprof.thread_name(_label)
             with agprof.span(_label):
                 _task()
+                _profile_result = result_future.result()
+                _profile_error = _profile_result._data.get("error")
+                agprof.annotate(
+                    outcome="failure" if _profile_error else "success",
+                    error_type="skill_error" if _profile_error else None,
+                )
 
         threading.Thread(target=_traced_task, daemon=True).start()
         ag.ctx = agcontext(_future=ctx_future)
@@ -646,6 +652,19 @@ class agskill:
                         prev_ctx.total_output_tokens,
                         self.name,
                         full_history_fn=ag._append_full_history,
+                    )
+                    agprof.annotate(
+                        outcome="success" if llm_result.ok else "failure",
+                        error_type=(
+                            type(llm_result.conn_error).__name__
+                            if llm_result.conn_error is not None
+                            else ("context_exceeded" if llm_result.context_exceeded else None)
+                        ),
+                        ttft_ms=llm_result.ttft_ms,
+                        generation_ms=llm_result.generation_ms,
+                        input_tokens=llm_result.prompt_tokens or 0,
+                        output_tokens=llm_result.completion_tokens,
+                        output_tokens_per_second=llm_result.output_tokens_per_second,
                     )
                 if llm_result.context_exceeded:
                     if ag._append_full_history:
