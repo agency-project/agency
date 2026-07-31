@@ -12,8 +12,8 @@ acts accordingly:
     with agprof.session(run_dir / "tb_trace"):   # torch.profiler lifecycle
         team.run()
 
-    # or, zero application changes:
-    #   AGENCY_PROFILE=1 [AGENCY_PROFILE_SCOPE=workload|process] python app.py
+    # or, zero application changes with process-lifetime scope:
+    #   AGENCY_PROFILE=1 AGENCY_PROFILE_SCOPE=process python app.py
 
 Backend: torch.profiler (kineto). ``span()`` maps to
 ``torch.profiler.record_function`` and the session wraps ``profile(...)`` with
@@ -140,6 +140,7 @@ def container_cgroup_parent() -> "str | None":
     return value if _CGROUP_SLICE_RE.fullmatch(value) else None
 
 
+# wraps in cgroup
 def _cgroup_reexec_command(slice_name: str, cgroup_dir: str) -> list[str]:
     """Build the privilege-separated systemd command used by env profiling."""
     uid = os.getuid()

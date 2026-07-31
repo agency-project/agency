@@ -42,6 +42,15 @@ profiling places the complete benchmark and its Docker containers in a
 dedicated transient cgroup, which requires `systemd-run`, `setpriv`, and
 non-interactive `sudo` permission for `systemd-run`. See
 [`agency/profiler/README.md`](agency/profiler/README.md) for usage.
+For an unmodified non-Web-UI application, set
+`AGENCY_PROFILE_SCOPE=process`; workload scope is opened automatically by
+`agwebui.run(...)` or explicitly with `agprof.workload()`.
+
+Within that workload cgroup, the profiler discovers PIDs recursively and adds
+an independent TensorBoard process group for each stable PID/start-time
+identity. CPU, RSS, virtual memory, and permitted per-process I/O counters are
+therefore shown separately; the cgroup aggregate is labeled
+`workload_total`.
 
 ## Quick start
 

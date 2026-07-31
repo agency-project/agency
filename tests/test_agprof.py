@@ -9,21 +9,46 @@ import pytest
 from agency.profiler import agprof
 
 
-def test_complete_summary_includes_spans_resources_and_gpu_leases():
+def test_complete_summary_includes_per_process_workload_and_gpu_metrics(monkeypatch):
     second = 1_000_000_000
     mebibyte = 2**20
     records = [
         (7, "turn0", 0, 100_000_000, 25_000_000, 5_000_000),
     ]
+    monkeypatch.setattr(
+        agprof,
+        "_process_info",
+        {
+            "101-10": {
+                "identity": "101-10",
+                "pid": 101,
+                "comm": "python",
+                "cmdline": "python benchmark.py",
+                "sandbox": None,
+                "cgroup": "/agprof.slice/run.scope",
+                "display_name": "python (PID 101)",
+                "trace_pid": 101,
+                "first_seen_ns": 0,
+            }
+        },
+    )
     samples = [
-        (0, "process:cpu_us", 1_000_000.0),
-        (0, "process:rss_mb", 100.0),
-        (0, "process:io_r", 0.0),
+        (0, "workload:cpu_us", 1_000_000.0),
+        (0, "workload:memory_mb", 100.0),
+        (0, "workload:io_r", 0.0),
+        (0, "proc:101-10:cpu_s", 1.0),
+        (0, "proc:101-10:rss_mb", 30.0),
+        (0, "proc:101-10:vms_mb", 90.0),
+        (0, "proc:101-10:io_r", 0.0),
         (0, "cg:writer:cpu_us", 0.0),
         (0, "gpu0:util_pct", 10.0),
-        (second, "process:cpu_us", 1_500_000.0),
-        (second, "process:rss_mb", 120.0),
-        (second, "process:io_r", 2.0 * mebibyte),
+        (second, "workload:cpu_us", 1_500_000.0),
+        (second, "workload:memory_mb", 120.0),
+        (second, "workload:io_r", 2.0 * mebibyte),
+        (second, "proc:101-10:cpu_s", 1.2),
+        (second, "proc:101-10:rss_mb", 40.0),
+        (second, "proc:101-10:vms_mb", 100.0),
+        (second, "proc:101-10:io_r", 1.0 * mebibyte),
         (second, "cg:writer:cpu_us", 250_000.0),
         (second, "gpu0:util_pct", 30.0),
     ]
@@ -52,10 +77,17 @@ def test_complete_summary_includes_spans_resources_and_gpu_leases():
     assert span["p50_ms"] == 100.0
     assert span["p95_ms"] == 100.0
     resources = {row["name"]: row for row in summary["resource_metrics"]}
-    assert resources["process:cpu_pct"]["mean"] == 50.0
-    assert resources["process:rss_mb"]["mean"] == 110.0
-    assert resources["process:io_read_mb_s"]["mean"] == 2.0
-    assert resources["process:io_read_mb_s"]["total"] == 2.0
+    assert resources["workload_total:cpu_pct"]["mean"] == 50.0
+    assert resources["workload_total:memory_mb"]["mean"] == 110.0
+    assert resources["workload_total:io_read_mb_s"]["mean"] == 2.0
+    assert resources["workload_total:io_read_mb_s"]["total"] == 2.0
+    assert resources["process:101-10:cpu_pct"]["mean"] == 20.0
+    assert resources["process:101-10:rss_mb"]["mean"] == 35.0
+    assert resources["process:101-10:vms_mb"]["max"] == 100.0
+    assert resources["process:101-10:io_read_mb_s"]["total"] == 1.0
+    assert summary["process_metrics"][0]["pid"] == 101
+    assert summary["process_metrics"][0]["name"] == "python"
+    assert summary["workload_metrics"]["cpu_average_percent"] == 50.0
     assert resources["sandbox:writer:cpu_pct"]["mean"] == 25.0
     assert resources["sandbox:writer:cpu_pct"]["total"] == 0.25
     assert resources["gpu0:util_pct"]["mean"] == 20.0
@@ -101,8 +133,9 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
 
     machine_summary = json.loads((tmp_path / "summary.json").read_text())
     human_summary = (tmp_path / "summary.md").read_text()
-    assert machine_summary["schema_version"] == 3
-    assert "process_metrics" in machine_summary
+    assert machine_summary["schema_version"] == 4
+    assert "workload_metrics" in machine_summary
+    assert machine_summary["process_metrics"] == []
     assert "host_metrics" not in machine_summary
     assert machine_summary["span_metrics"][0]["label"] == "stage:work"
     assert "# agprof summary" in human_summary
@@ -211,7 +244,8 @@ def test_derived_rollups_include_outcomes_percentiles_tokens_energy_and_interrup
     assert "### Tool outcomes" in markdown
     assert "| read | 1/1 | 0 | 1 | 0 |" in markdown
     assert "| ask_human | 0/1 | 0 | 0 | 1 | n/a | n/a |" in markdown
-    assert "## Process metrics" in markdown
+    assert "## Per-process metrics" in markdown
+    assert "## Workload aggregate" in markdown
     assert "Host metrics" not in markdown
 
 
@@ -330,7 +364,7 @@ def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
     assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
 
 
-def test_process_cgroup_sampler_reads_aggregate_cpu_memory_and_io(tmp_path, monkeypatch):
+def test_workload_cgroup_sampler_reads_aggregate_cpu_memory_and_io(tmp_path, monkeypatch):
     (tmp_path / "cpu.stat").write_text("usage_usec 2500000\nuser_usec 2000000\n")
     (tmp_path / "memory.current").write_text(str(64 * 2**20))
     (tmp_path / "io.stat").write_text("8:0 rbytes=1048576 wbytes=2097152 rios=1 wios=2\n")
@@ -338,14 +372,216 @@ def test_process_cgroup_sampler_reads_aggregate_cpu_memory_and_io(tmp_path, monk
     sampler._process_cgroup = tmp_path
     monkeypatch.setattr(agprof, "_samples", [])
 
-    sampler._tick_process_cgroup(99)
+    sampler._tick_workload_cgroup(99)
 
     assert agprof._samples == [
-        (99, "process:cpu_us", 2_500_000.0),
-        (99, "process:rss_mb", 64.0),
-        (99, "process:io_r", 1_048_576.0),
-        (99, "process:io_w", 2_097_152.0),
+        (99, "workload:cpu_us", 2_500_000.0),
+        (99, "workload:memory_mb", 64.0),
+        (99, "workload:io_r", 1_048_576.0),
+        (99, "workload:io_w", 2_097_152.0),
     ]
+
+
+def _write_fake_proc(proc_root, pid, *, start_ticks, cpu_ticks, comm="python", io=True):
+    process_dir = proc_root / str(pid)
+    process_dir.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "S",
+        "1",
+        "1",
+        "1",
+        "0",
+        "-1",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        str(cpu_ticks),
+        "0",
+        "0",
+        "0",
+        "20",
+        "0",
+        "1",
+        "0",
+        str(start_ticks),
+        str(100 * 2**20),
+        "256",
+    ]
+    (process_dir / "stat").write_text(f"{pid} ({comm}) " + " ".join(fields))
+    (process_dir / "cmdline").write_bytes(f"{comm}\0worker.py\0".encode())
+    if io:
+        (process_dir / "io").write_text("read_bytes: 1048576\nwrite_bytes: 2097152\n")
+
+
+def test_sampler_discovers_recursive_cgroup_pids_and_samples_each_process(tmp_path, monkeypatch):
+    cgroup = tmp_path / "cgroup"
+    child_cgroup = cgroup / "docker.scope"
+    child_cgroup.mkdir(parents=True)
+    (cgroup / "cgroup.procs").write_text("101\n")
+    (child_cgroup / "cgroup.procs").write_text("202\n")
+    proc_root = tmp_path / "proc"
+    _write_fake_proc(proc_root, 101, start_ticks=10, cpu_ticks=150)
+    _write_fake_proc(proc_root, 202, start_ticks=20, cpu_ticks=75, comm="container-python")
+
+    sampler = object.__new__(agprof._Sampler)
+    sampler._process_cgroup = cgroup
+    sampler._proc_root = proc_root
+    sampler._clock_ticks = 100
+    sampler._page_mb = 4096 / 2**20
+    monkeypatch.setattr(agprof, "_samples", [])
+    monkeypatch.setattr(agprof, "_process_info", {})
+    monkeypatch.setattr(agprof, "_cg_registry", {"worker": str(child_cgroup)})
+
+    sampler._tick_processes(99)
+
+    assert set(agprof._process_info) == {"101-10", "202-20"}
+    assert agprof._process_info["101-10"]["display_name"] == "python (PID 101)"
+    assert agprof._process_info["202-20"]["display_name"] == ("container-python [worker] (PID 202)")
+    assert (99, "proc:101-10:cpu_s", 1.5) in agprof._samples
+    assert (99, "proc:101-10:rss_mb", 1.0) in agprof._samples
+    assert (99, "proc:101-10:vms_mb", 100.0) in agprof._samples
+    assert (99, "proc:202-20:io_w", 2_097_152.0) in agprof._samples
+
+
+def test_sampler_skips_pid_that_exits_between_discovery_and_proc_read(tmp_path, monkeypatch):
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "cgroup.procs").write_text("303\n")
+    sampler = object.__new__(agprof._Sampler)
+    sampler._process_cgroup = cgroup
+    sampler._proc_root = tmp_path / "proc"
+    sampler._clock_ticks = 100
+    sampler._page_mb = 4096 / 2**20
+    monkeypatch.setattr(agprof, "_samples", [])
+    monkeypatch.setattr(agprof, "_process_info", {})
+
+    sampler._tick_processes(99)
+
+    assert agprof._samples == []
+    assert agprof._process_info == {}
+
+
+def test_sampler_keeps_pid_reuse_as_two_process_identities(tmp_path, monkeypatch):
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "cgroup.procs").write_text("404\n")
+    proc_root = tmp_path / "proc"
+    sampler = object.__new__(agprof._Sampler)
+    sampler._process_cgroup = cgroup
+    sampler._proc_root = proc_root
+    sampler._clock_ticks = 100
+    sampler._page_mb = 4096 / 2**20
+    monkeypatch.setattr(agprof, "_samples", [])
+    monkeypatch.setattr(agprof, "_process_info", {})
+
+    _write_fake_proc(proc_root, 404, start_ticks=10, cpu_ticks=10)
+    sampler._tick_processes(1)
+    _write_fake_proc(proc_root, 404, start_ticks=20, cpu_ticks=5)
+    sampler._tick_processes(2)
+
+    assert set(agprof._process_info) == {"404-10", "404-20"}
+    assert agprof._process_info["404-10"]["trace_pid"] == 404
+    assert agprof._process_info["404-20"]["trace_pid"] >= 1_000_000_000
+
+
+def test_sampler_updates_container_label_when_registry_arrives_late(tmp_path, monkeypatch):
+    cgroup = tmp_path / "cgroup"
+    container_cgroup = cgroup / "docker.scope"
+    container_cgroup.mkdir(parents=True)
+    (container_cgroup / "cgroup.procs").write_text("505\n")
+    proc_root = tmp_path / "proc"
+    _write_fake_proc(proc_root, 505, start_ticks=50, cpu_ticks=10)
+    sampler = object.__new__(agprof._Sampler)
+    sampler._process_cgroup = cgroup
+    sampler._proc_root = proc_root
+    sampler._clock_ticks = 100
+    sampler._page_mb = 4096 / 2**20
+    monkeypatch.setattr(agprof, "_samples", [])
+    monkeypatch.setattr(agprof, "_process_info", {})
+    monkeypatch.setattr(agprof, "_cg_registry", {})
+
+    sampler._tick_processes(1)
+    assert agprof._process_info["505-50"]["sandbox"] is None
+    agprof._cg_registry["worker"] = str(container_cgroup)
+    sampler._tick_processes(2)
+
+    assert agprof._process_info["505-50"]["sandbox"] == "worker"
+    assert agprof._process_info["505-50"]["display_name"] == "python [worker] (PID 505)"
+
+
+def test_trace_injection_creates_independent_tensorboard_process_groups(monkeypatch):
+    second = 1_000_000_000
+    monkeypatch.setattr(agprof, "_clock_mark_ns", 0)
+    monkeypatch.setattr(agprof, "_leases", [])
+    monkeypatch.setattr(
+        agprof,
+        "_process_info",
+        {
+            "101-10": {
+                "pid": 101,
+                "comm": "python",
+                "cmdline": "python main.py",
+                "cgroup": "/agprof/run.scope",
+                "display_name": "python (PID 101)",
+                "trace_pid": 101,
+                "first_seen_ns": 0,
+            },
+            "202-20": {
+                "pid": 202,
+                "comm": "python",
+                "cmdline": "python child.py",
+                "cgroup": "/agprof/run.scope",
+                "display_name": "python (PID 202)",
+                "trace_pid": 202,
+                "first_seen_ns": 1,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        agprof,
+        "_samples",
+        [
+            (0, "proc:101-10:cpu_s", 1.0),
+            (0, "proc:101-10:rss_mb", 10.0),
+            (0, "proc:202-20:cpu_s", 2.0),
+            (0, "proc:202-20:rss_mb", 20.0),
+            (second, "proc:101-10:cpu_s", 1.5),
+            (second, "proc:101-10:rss_mb", 11.0),
+            (second, "proc:202-20:cpu_s", 2.25),
+            (second, "proc:202-20:rss_mb", 21.0),
+        ],
+    )
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "pid": 101,
+                "tid": 1,
+                "ts": 1000.0,
+                "dur": 1.0,
+                "name": "agprof:clock_sync",
+            }
+        ]
+    }
+
+    counters, _leases = agprof._inject_timelines(trace)
+
+    process_names = {
+        event["pid"]: event["args"]["name"]
+        for event in trace["traceEvents"]
+        if event.get("ph") == "M" and event.get("name") == "process_name"
+    }
+    assert process_names[101] == "python (PID 101)"
+    assert process_names[202] == "python (PID 202)"
+    child_counters = {
+        event["name"]
+        for event in trace["traceEvents"]
+        if event.get("ph") == "C" and event["pid"] == 202
+    }
+    assert child_counters == {"cpu_percent", "rss_mb"}
+    assert counters == 6
 
 
 def test_container_cgroup_parent_accepts_only_profiler_slice(monkeypatch):

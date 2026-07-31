@@ -33,10 +33,11 @@ with agprof.session(run_dir / "tb_trace"):   # owns the torch.profiler lifecycle
     team.run()
 ```
 
-Or profile an **unmodified** application:
+Or profile an **unmodified, non-Web-UI application** for its full process
+lifetime:
 
 ```bash
-AGENCY_PROFILE=1 [AGENCY_PROFILE_DIR=path] python app.py
+AGENCY_PROFILE=1 AGENCY_PROFILE_SCOPE=process [AGENCY_PROFILE_DIR=path] python app.py
 ```
 
 When `AGENCY_PROFILE` is enabled, Agency validates the operating system before
@@ -51,11 +52,14 @@ to the invoking user and supplementary groups.
 On a non-Linux system the command fails immediately with a Linux-only error,
 and no trace directory or profiler artifacts are created.
 
-Environment profiling defaults to `AGENCY_PROFILE_SCOPE=workload`: with the Web
-UI, profiling starts immediately before the function passed to
-`agwebui.run(...)` and stops as soon as it returns, excluding dashboard startup
-and linger time. Set `AGENCY_PROFILE_SCOPE=process` to opt into the previous
-process-lifetime behavior. Unset or invalid scope values use `workload`.
+Environment profiling defaults to `AGENCY_PROFILE_SCOPE=workload`. The Web UI
+automatically opens that boundary immediately before the function passed to
+`agwebui.run(...)` and closes it as soon as the function returns, excluding
+dashboard startup and linger time. A non-Web-UI application can use the same
+scope by wrapping its entry point in `with agprof.workload():`; because Agency
+cannot infer an arbitrary application's workload boundary, an otherwise
+unmodified non-Web-UI application must explicitly select
+`AGENCY_PROFILE_SCOPE=process`. Unset or invalid scope values use `workload`.
 
 View traces with `tensorboard --logdir <runs dir>` (PYTORCH_PROFILER tab →
 Views → Trace; needs `tensorboard` + `torch-tb-profiler`) or drag the
