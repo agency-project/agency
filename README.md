@@ -192,6 +192,7 @@ Runs the same checks as the `pre-commit` git hook and the CI `pre-commit` job: `
 | [Design_resource_control.md](docs/Design_resource_control.md) | All semaphores and locks — what each guards and how it is acquired |
 | [Design_error_handling.md](docs/Design_error_handling.md) | All try/except blocks, retry loops, error emissions, and propagation paths |
 | [Design_configuration.md](docs/Design_configuration.md) | Configuring agents/teams, the tiered parameter system, adding custom config params |
+| [Design_benchmarks.md](docs/Design_benchmarks.md) | Benchmark integration — AgentBackend/ExecutionEnvironment split, SWE-bench and Terminal-Bench adapters |
 
 
 ### Implementation
