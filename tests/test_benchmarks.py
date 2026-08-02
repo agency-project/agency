@@ -3,7 +3,7 @@ import json
 import pytest
 from agency.agconfig import agConfig
 
-from benchmarks.backends.agency import AgencyBackend
+from benchmarks.backends import agency as agency_backend_module
 from benchmarks.base import (
     BenchmarkResult,
     BenchmarkTask,
@@ -88,8 +88,6 @@ class _RecordingEnvironment(ExecutionEnvironment):
 
 
 def test_agency_backend_runs_agent_independent_of_environment(monkeypatch):
-    import benchmarks.backends.agency as agency_backend_module
-
     created_agents = []
 
     def fake_agent(agconfig):
@@ -108,7 +106,7 @@ def test_agency_backend_runs_agent_independent_of_environment(monkeypatch):
     monkeypatch.setattr(agency_backend_module, "agdata", lambda **kw: kw)
 
     environment = _RecordingEnvironment()
-    backend = AgencyBackend(agconfig=agConfig(), environment=environment)
+    backend = agency_backend_module.AgencyBackend(agconfig=agConfig(), environment=environment)
     task = BenchmarkTask(task_id="t1", benchmark="fake-bench", instructions="do the thing")
 
     result = backend.run_task(task)
