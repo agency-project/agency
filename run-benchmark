@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Thin CLI shim — see `benchmarks/cli.py` for the actual implementation
+(kept there, not here, because this filename's hyphen makes it unimportable
+by pytest)."""
+
+from benchmarks.cli import main
+
+if __name__ == "__main__":
+    main()
