@@ -74,17 +74,44 @@ Every completed session with an output directory also writes:
   interrupted spans, and GPU lease statistics.
 - `summary.md`: the same metrics as human-readable Markdown tables.
 
-Span rows report completed/started/succeeded/failed/interrupted counts; total
-wall/CPU/run-queue/blocked time; and mean/min/p50/p95/p99/max latency. Run,
-LLM, and tool rollups add throughput and outcome counts. Streaming LLM calls
-record time to first token (TTFT), input/output tokens, generation time, retry
-state, and output tokens/s.
+### Metrics collected
+
+A profiling session collects:
+
+- **End-to-end runs:** session duration; started, completed, succeeded, failed,
+  and interrupted counts; completed and successful runs per second; and
+  mean/min/p50/p95/p99/max latency.
+- **Spans:** wall, on-CPU, run-queue, and blocked time; CPU percentage; outcome
+  and error type; call counts; and mean/min/p50/p95/p99/max latency. This covers
+  skill runs, LLM calls, tools, sandbox operations, synchronization, and custom
+  application spans.
+- **LLM calls:** calls, attempts, retries, outcomes, total wait, latency, time to
+  first token (TTFT), input/output tokens, generation time, and output tokens
+  per second.
+- **Tools:** started, completed, succeeded, failed, and interrupted counts plus
+  overall and per-tool latency distributions.
+- **Whole workload:** average and peak sampled CPU utilization, cumulative CPU
+  time, average and peak sampled memory, and disk bytes read and written.
+- **Processes:** PID, command line, cgroup and owning sandbox; average and peak
+  CPU utilization, cumulative CPU time, average and peak RSS/VMS, and disk bytes
+  read and written.
+- **Sandboxes:** average and peak CPU utilization, cumulative CPU time, average
+  and peak sampled memory, disk bytes read/written, and network bytes
+  received/transmitted.
+- **NVIDIA GPUs:** device utilization, memory, and power averages/peaks; energy
+  in joules; per-process GPU memory and utilization; apportioned per-process
+  power estimates; and GPU lease counts and durations.
+- **Sampling health:** configured/effective frequency, sampled duration, raw
+  sample count, GPU availability, and spans still incomplete when profiling
+  stopped.
 
 Resource rows report sample count, mean, minimum, maximum, and last value.
 Cumulative CPU, disk, and network counters are converted to utilization or
 throughput while their non-negative deltas are also summed into CPU seconds or
-MB totals. GPU power samples are trapezoidally integrated into joules. The
-report shows the effective sampling frequency alongside the configured rate.
+MB totals. GPU power samples are trapezoidally integrated into joules. Memory
+"peaks" are the maximum observed samples rather than kernel high-water marks.
+GPU metrics require NVIDIA NVML. The report shows the effective sampling
+frequency alongside the configured rate.
 
 ### Process resource tracks
 
