@@ -1,19 +1,9 @@
 from __future__ import annotations
-import atexit
-import threading
 import time
-import multiprocessing as _mp
-from concurrent.futures import (
-    ProcessPoolExecutor,
-    TimeoutError as _FutureTimeoutError,
-    BrokenExecutor,
-)
-import json
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agutil import format_exception
-from .agtype import type_hint_to_string_type, get_return_tool_description_prompt
-from .agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
+from .agconfig import DynamicConfigParam, _AgConfigViewBase
 
 if TYPE_CHECKING:
     from .aglog import aglog
@@ -23,38 +13,17 @@ if TYPE_CHECKING:
     from .agpolicy import agpolicy
     from .agent import agent
 
-# ---------------------------------------------------------------------------
-# Process pool — workers are created lazily on first tool call and scale up
-# to match concurrent demand (one worker per in-flight tool call, up to 256).
-# Uses "spawn" start method to avoid fork-in-multithreaded-process deadlocks.
-# ---------------------------------------------------------------------------
-_pool: ProcessPoolExecutor | None = None
-_pool_lock: threading.Lock = threading.Lock()
-
-
-def _ignore_sigint_in_worker() -> None:
-    import signal
-
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
 
 # Exists only to register agtool's config fields (via __set_name__ at import
-# time). Other code in this file needing the same hardcoded value -- e.g.
-# agtool.__call__'s own timeout fallback -- reads the descriptor's frozen
-# default directly (_AgToolFields.timeout_s.default) instead of going through
-# a separate plain constant, so there's a single source of truth.
-# Reads use a throwaway instance -- _AgToolFields(agconfig) -- since __init__
-# does nothing but (optionally) store an agconfig; there's no persistent
-# agtool instance to hang descriptors on for reading.
+# time). Reads use a throwaway instance -- _AgToolFields(agconfig) -- since
+# __init__ does nothing but (optionally) store an agconfig; there's no
+# persistent agtool instance to hang descriptors on for reading.
 class _AgToolFields:
-    pool_max_workers = GlobalConfigParam(
-        "agtool", default=256
-    )  # Max worker processes in the tool executor pool; one per in-flight tool call.
     timeout_s = DynamicConfigParam(
         "agtool", default=1800
-    )  # Default ceiling on tool execution time (seconds). Prevents a crashed or
-    # hung worker process from blocking an agent thread forever via future.result();
-    # agents can pass "timeout": <seconds> in tool arguments to override per-call.
+    )  # Historical ceiling on tool execution time -- no longer enforced now
+    # that tool calls run directly in the caller's own process/thread (see
+    # agtool.__call__), kept only as a config field other code may still read.
     output_offload_chars = DynamicConfigParam(
         "agtool", default=40_000
     )  # minimum floor for tool-output offloading
@@ -77,48 +46,14 @@ class agToolConfig(_AgConfigViewBase):
     _OWNER = "agtool"
 
 
-def _get_pool() -> ProcessPoolExecutor:
-    global _pool
-    if _pool is None:
-        with _pool_lock:
-            if _pool is None:
-                max_workers = _AgToolFields().pool_max_workers
-                _pool = ProcessPoolExecutor(
-                    max_workers=max_workers,
-                    mp_context=_mp.get_context("spawn"),
-                    initializer=_ignore_sigint_in_worker,
-                )
-    return _pool
-
-
-def shutdown_tool_pool(*, wait: bool = False, cancel_futures: bool = True) -> None:
-    global _pool
-    with _pool_lock:
-        pool = _pool
-        _pool = None
-    if pool is not None:
-        pool.shutdown(wait=wait, cancel_futures=cancel_futures)
-
-
-atexit.register(shutdown_tool_pool)
-
-
-def _process_worker(fn_bytes: bytes, arg_bytes: bytes) -> bytes:
-    """Worker entry-point: unpickle the tool fn and call it."""
-    import cloudpickle
-    import pickle
-
-    fn: Callable[[agdata], agdata] = cloudpickle.loads(fn_bytes)
-    arg: agdata = pickle.loads(arg_bytes)
-    return pickle.dumps(fn(arg))
-
-
 class agtool:
     """A named callable tool that an LLM can invoke via function calling.
 
-    Provides the OpenAI tool schema and executes when called.  Each call is
-    offloaded to a dedicated worker process so CPU-bound tools cannot block
-    the agent thread pool and the GIL cannot starve other agents.
+    Provides the OpenAI tool schema and executes when called, directly in
+    the calling thread/process -- whichever process actually holds the real
+    `fn` closure and whatever host state it references (a sandbox object, a
+    live resource pool, etc.), never shipped across a process boundary to
+    run elsewhere.
 
     Logging
     -------
@@ -147,8 +82,9 @@ class agtool:
         self._aglog: "aglog  | None" = None
 
     # ------------------------------------------------------------------
-    # Pickle support — exclude loggers; they hold locks / file handles and
-    # are not needed in the worker process.
+    # Pickle support — exclude loggers; they hold locks/file handles that
+    # don't survive serialization (needed if a caller ever ships an agtool
+    # elsewhere, e.g. cloudpickle-ing `fn` into a container process).
     # ------------------------------------------------------------------
 
     def __getstate__(self) -> dict:
@@ -206,47 +142,20 @@ class agtool:
     # ------------------------------------------------------------------
 
     def __call__(self, arg: agdata, timeout: int | None = None) -> agdata:
+        # Always runs directly in the calling thread/process -- no
+        # subprocess isolation, no pickling `fn` across a process boundary
+        # (a host-authored closure often captures host-only state, like a
+        # sandbox object or a live resource pool, that has no meaning
+        # anywhere else). `timeout` is accepted for call-site compatibility
+        # but not enforced -- there is no separate process/thread to bound
+        # without reintroducing the isolation this deliberately avoids;
+        # the caller controls blocking behavior instead (e.g. ask_human).
         self.log_start(arg)
         t0 = time.monotonic()
-
-        if not self.run_in_subprocess:
-            # Run directly in the calling thread — no subprocess isolation or
-            # timeout needed (caller controls blocking behaviour, e.g. ask_human).
-            try:
-                result = self.fn(arg)
-            except Exception as e:
-                result = agerror(format_exception(e))
-            self.log(arg, result, int((time.monotonic() - t0) * 1000))
-            return result
-
-        import cloudpickle
-        import pickle
-
-        fn_bytes = cloudpickle.dumps(self.fn)
-        arg_bytes = pickle.dumps(arg)
-        effective_timeout = timeout if timeout is not None else _AgToolFields.timeout_s.default
         try:
-            result_bytes = (
-                _get_pool()
-                .submit(_process_worker, fn_bytes, arg_bytes)
-                .result(timeout=effective_timeout)
-            )
-        except _FutureTimeoutError:
-            elapsed = int((time.monotonic() - t0) * 1000)
-            result = agerror(f"tool timed out after {effective_timeout}s")
-            self.log(arg, result, elapsed)
-            return result
-        except BrokenExecutor:
-            # Worker process died (OOM kill, crash). Reset the pool so future
-            # calls get fresh workers, then report the error.
-            global _pool
-            with _pool_lock:
-                _pool = None
-            elapsed = int((time.monotonic() - t0) * 1000)
-            result = agerror("tool worker process died unexpectedly")
-            self.log(arg, result, elapsed)
-            return result
-        result = pickle.loads(result_bytes)
+            result = self.fn(arg)
+        except Exception as e:
+            result = agerror(format_exception(e))
         self.log(arg, result, int((time.monotonic() - t0) * 1000))
         return result
 
@@ -264,222 +173,4 @@ class agtool:
         return f"agtool(name={self.name!r})"
 
 
-# ---------------------------------------------------------------------------
-# Return-output tool builders
-# ---------------------------------------------------------------------------
-
-
-def make_return_output_tools(schema) -> list[dict]:
-    """Build one typed tool per output field from the schema.
-
-    Each tool is named ``return_<field>`` and has a single parameter named
-    after the field itself with the correct JSON Schema type.
-    schema is an agdata instance; accessed via duck typing.
-    """
-    tools = []
-    for field, hint in schema._data.items():
-        json_type = type_hint_to_string_type(hint)
-        tool_desc, value_desc = get_return_tool_description_prompt(field, hint)
-        value_schema: dict = {"type": json_type, "description": value_desc}
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": f"return_{field}",
-                    "description": tool_desc,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {field: value_schema},
-                        "required": [field],
-                    },
-                },
-            }
-        )
-    return tools
-
-
-def _make_return_output_tool(schema) -> list[dict]:
-    """Alias kept for test compatibility — returns the full per-field tool list."""
-    return make_return_output_tools(schema)
-
-
-# ---------------------------------------------------------------------------
-# Tool dispatch
-# ---------------------------------------------------------------------------
-
-
-def dispatch_tools(
-    tool_calls: list[dict],
-    toolkit: dict,
-    messages: list[dict],
-    sandbox: "agSandbox",
-    skill_name: str,
-    state_fn: "Callable | None",
-    live_messages_fn: "Callable | None",
-    full_history_fn: "Callable | None",
-    term: "agterm | None",
-    tool_offload_chars: "int | None" = None,
-    agconfig: "agConfig | None" = None,
-    policy: "agpolicy | None" = None,
-    ag: "agent | None" = None,
-) -> None:
-    """Execute all tool calls from one LLM response, appending results to messages.
-
-    Mutates toolkit in place if the read tool is lazily injected due to a large
-    tool output being offloaded — the caller derives wire-format schemas from the
-    toolkit each iteration, so the injection is automatically visible to the LLM.
-
-    If *policy* is given, every call is mediated through `policy.check(ag,
-    event)` before dispatch -- the same `agpolicy` interface
-    `agproxy_ptrace` uses for harness-driven agents (see agpolicy.py and
-    docs/Design_harness_integration.md), so one policy implementation can
-    govern a mixed team of native and harness-driven agents. `event` is an
-    `agsyscallevent` with `syscall="tool_call"`, `tool_name`/`tool_args`
-    populated, and `argv`/`envp`/`path` left `None` -- a `deny` decision
-    skips the actual tool call and reports the denial reason as the tool's
-    result, matching how a denied syscall reports EPERM back to a harness's
-    own model turn rather than silently substituting a fabricated success.
-    `rewrite` is NOT supported for native tool calls (there is no single
-    argv-shaped string to rewrite the way there is for a traced `execve` --
-    a tool call's arguments are an arbitrary JSON object) and is treated as
-    `allow` if a policy returns it here.
-    """
-    _state_fn = state_fn
-    _live_fn = live_messages_fn
-    _hist_fn = full_history_fn
-    _term = term
-    _fields = _AgToolFields(agconfig)
-    if tool_offload_chars is None:
-        tool_offload_chars = _fields.output_offload_chars
-    _default_tool_timeout = _fields.timeout_s
-
-    for tc in tool_calls:
-        fn_name = tc["function"]["name"]
-        fn_args = tc["function"]["arguments"]
-        tc_id = tc["id"]
-        # Ensure arguments is valid JSON before it goes back into history.
-        # A malformed string (truncated generation, Python repr, etc.) causes
-        # vLLM to crash on the next request when it re-parses the history.
-        try:
-            json.loads(fn_args)
-        except (json.JSONDecodeError, TypeError):
-            fn_args = "{}"
-            tc["function"]["arguments"] = fn_args
-
-        t = toolkit.get(fn_name)
-        _policy_denial: "str | None" = None
-        if t is not None and policy is not None:
-            # Lazy import: agproxy_ptrace_internal transitively guards on
-            # x86_64/Linux at import time (see _ctypes_defs.py's
-            # _arch_guard()), so importing agsyscallevent at agtool.py's
-            # module level would break importing this module at all on
-            # unsupported platforms -- pay that cost only when a caller
-            # actually opts into policy-mediated dispatch.
-            from .agharness_internal.agproxy_ptrace import agsyscallevent
-
-            try:
-                _policy_args = json.loads(fn_args)
-            except (json.JSONDecodeError, TypeError):
-                _policy_args = {}
-            _event = agsyscallevent(
-                syscall="tool_call",
-                pid=-1,
-                tid=-1,
-                argv=None,
-                envp=None,
-                path=None,
-                timestamp=time.time(),
-                tool_name=fn_name,
-                tool_args=_policy_args,
-            )
-            _decision = policy.check(ag, _event)
-            if _decision.kind == "deny":
-                _policy_denial = _decision.reason or f"tool call to {fn_name!r} denied by policy"
-
-        if t is None:
-            if _term:
-                _term.log("TOOL ✗   ", f"{fn_name}  → unknown tool")
-            result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
-        elif _policy_denial is not None:
-            if _term:
-                _term.log("TOOL ✗   ", f"{fn_name}  → denied by policy: {_policy_denial}")
-            result_content = json.dumps({"error": _policy_denial})
-        else:
-            try:
-                if _state_fn:
-                    _state_fn("tool", skill=skill_name, tool=fn_name)
-                # Let the agent specify a custom timeout (seconds) via a
-                # "timeout" key in the tool arguments.
-                _tool_timeout: int | None = None
-                try:
-                    _parsed = json.loads(fn_args)
-                    if isinstance(_parsed.get("timeout"), int):
-                        _tool_timeout = _parsed["timeout"]
-                except (json.JSONDecodeError, TypeError, AttributeError):
-                    # Malformed/non-dict arguments -- fall back to the default timeout below.
-                    pass
-                if _tool_timeout is None:
-                    _tool_timeout = _default_tool_timeout
-                result_content = t(agdata.from_json(fn_args), timeout=_tool_timeout).to_json()
-                if _state_fn:
-                    _state_fn("skill", skill=skill_name)
-                # Offload large tool outputs regardless of whether the tool
-                # itself uses the sandbox — fetch_paper and other add_tools have
-                # run_in_subprocess=False but can still produce huge outputs that
-                # bloat the context.
-                if len(result_content) > tool_offload_chars:
-                    safe_id = tc_id.replace("-", "")[: _fields.offload_id_prefix_len]
-                    offload_path = f"/workspace/long_tool_call_outputs/{fn_name}_{safe_id}.txt"
-                    try:
-                        try:
-                            file_body = json.loads(result_content).get("content", result_content)
-                        except (json.JSONDecodeError, AttributeError):
-                            file_body = result_content
-                        sandbox.write_file(offload_path, file_body)
-                        result_content = json.dumps(
-                            {
-                                "note": f"Output was too large and has been saved to {offload_path}. Use the read tool to access it."
-                            }
-                        )
-                        # Inject read into the toolkit so the LLM can access the file.
-                        # The caller derives wire-format schemas from the toolkit each
-                        # iteration, so this is automatically visible on the next step.
-                        if "read" not in toolkit:
-                            from .tools import make_read as _make_read
-
-                            toolkit["read"] = _make_read(sandbox)
-                    except Exception as _e:
-                        print(
-                            f"[agtool] WARNING: failed to offload large tool output to {offload_path}: {_e}"
-                        )
-                # stop() (hibernate) runs after every tool call regardless
-                # of run_in_subprocess -- releasing the sandbox's runtime
-                # slot between calls isn't specific to subprocess-isolated
-                # tools. Rollback no longer happens at this granularity: a
-                # tool call's own success or failure no longer decides
-                # whether the sandbox gets checkpointed or discarded --
-                # only the skill as a whole does, at its own teardown (see
-                # agskill.py). The one exception here: if this tool call
-                # left background work still running inside the sandbox
-                # (e.g. a bash `cmd &`), stop() must NOT run yet -- it kills
-                # every process inside, which would end that work before the
-                # agent ever gets a chance to check on it in a later tool
-                # call. Skipping here just defers the hibernate; the next
-                # tool call that finds nothing pending will catch it up.
-                if not sandbox._has_pending_background_work():
-                    sandbox.stop()
-            except Exception as e:
-                if _state_fn:
-                    _state_fn("skill", skill=skill_name)
-                result_content = json.dumps({"error": format_exception(e)})
-                # An exception escaping tool dispatch is handled the same
-                # way as an ordinary result at this granularity -- hibernate,
-                # not discard. Same pending-work deferral as above.
-                if not sandbox._has_pending_background_work():
-                    sandbox.stop()
-        tool_msg = {"role": "tool", "tool_call_id": tc_id, "content": result_content}
-        messages.append(tool_msg)
-        if _live_fn:
-            _live_fn(messages[1:])
-        if _hist_fn:
-            _hist_fn(tool_msg)
+__all__ = ["agtool", "agToolConfig", "_AgToolFields"]

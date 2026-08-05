@@ -82,16 +82,47 @@ def build_user_turn_prompt(skill: "agskill", skill_input: "agdata") -> "str | li
 
 def build_output_format_instruction(skill: "agskill") -> "str | None":
     """A plain-text instruction describing the required JSON response shape,
-    appended to the prompt for skills with a structured output_schema --
-    the harness-driven counterpart to the native loop's `return_<field>`
-    tools, without adding a tool to the harness's tool list. Returns None
-    for a raw-text/no-schema skill, which needs no such instruction."""
+    appended to the prompt for skills with a structured output_schema,
+    parsed post-hoc by `agschema.validate_and_recover`. Used by every
+    harness backend that hasn't been wired to the shared MCP server's
+    `submit_output` tool yet (codex/opencode/grok -- see
+    build_mcp_output_format_instruction's docstring for the ones that
+    have). Returns None for a raw-text/no-schema skill, which needs no such
+    instruction."""
     if skill.output_schema is None or skill.output_schema.raw_key() is not None:
         return None
     return (
         "\n\nWhen you are done, respond with a final message containing ONLY a single "
         "JSON object (no surrounding prose, no markdown code fence) matching this shape:\n"
         f"{skill.output_schema.to_json()}"
+    )
+
+
+def build_mcp_output_format_instruction(skill: "agskill") -> "str | None":
+    """A plain-text instruction directing the harness to call the shared
+    MCP server's `submit_output` tool (see agharness_internal/agmcp_server.py,
+    Phase 4) once per required output field -- the harness-driven
+    counterpart to the native loop's `return_<field>` tools, reusing the
+    same MCP server every engine already gets `reserve_cpu`/`cpu_release`/
+    `daemon_release` from rather than a second, harness-only mechanism.
+    Only for backends that actually register this skill's tokens against
+    that server and wire `--mcp-config` (today: claude_code.py only --
+    codex/opencode/grok still use `build_output_format_instruction` above
+    until they get the same wiring, task #11). Returns None for a
+    raw-text/no-schema skill, which needs no such instruction."""
+    if skill.output_schema is None or skill.output_schema.raw_key() is not None:
+        return None
+    field_lines = "\n".join(
+        f"  - {f}: {skill.output_schema.field_desc(f)}" for f in skill.output_schema._data
+    )
+    return (
+        "\n\nThis task requires structured output. Call the `submit_output` tool once for "
+        f"each of the following required fields (do not respond with a JSON object in your "
+        f"final message instead):\n{field_lines}\n\n"
+        "- Call submit_output separately for each field -- one field per call.\n"
+        "- `value` must be the field's value encoded as a JSON literal (a quoted string for "
+        "a string field, a bare number for int/float, true/false for bool).\n"
+        "- Only call submit_output once you have the final value ready for that field."
     )
 
 
@@ -143,5 +174,6 @@ __all__ = [
     "cleanup_config_home_in_container",
     "build_user_turn_prompt",
     "build_output_format_instruction",
+    "build_mcp_output_format_instruction",
     "default_policy",
 ]

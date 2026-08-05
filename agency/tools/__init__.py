@@ -1,73 +1,33 @@
+"""Host-side sandboxed tool factories.
+
+`make_sandboxed_tools()` (bundling every factory below into one toolkit)
+and `make_bash`/`make_write`/`make_edit`/`make_gpu_reserve`/
+`make_cpu_reserve`/`make_cpu_release`/`make_daemon_release` were retired
+along with `agskill.py`'s `execute_react()` -- `_build_toolkit()` (its own
+`_ensure_read` fallback aside) was their only caller, host-side dispatch
+via `agtool.py`'s `dispatch_tools()` their only consumer. `make_read`/
+`make_grep`/`make_glob`/`make_ask_human` remain: `agency/common_skills/
+agplan.py` still names the first three (itself currently unreachable --
+see that module's own callers, or lack thereof -- a pre-existing,
+unrelated vestige left as-is rather than pulled on here), and
+`make_ask_human`'s underlying blocking implementation (`ask_human_and_wait`,
+in `.human`) is still used directly by `agharness_internal/agmcp_server.py`.
+"""
+
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-from .bash import make_bash
 from .read import make_read
-from .write import make_write
-from .edit import make_edit
 from .glob import make_glob
 from .grep import make_grep
 from .webfetch import webfetch
 from .todowrite import todowrite
-from .resource import (
-    make_gpu_reserve,
-    make_cpu_reserve,
-    make_cpu_release,
-    make_daemon_release,
-)
 from .human import make_ask_human
-from ..agtool import agtool as _tool_cls
-
-if TYPE_CHECKING:
-    from ..agsandbox import agSandbox
-    from ..agresources import agResourcePool
-
-
-def make_sandboxed_tools(
-    sandbox: "agSandbox",
-    pool: "agResourcePool | None" = None,
-) -> list[_tool_cls]:
-    """Build the tool list for a sandboxed agent.
-
-    All filesystem tools route through *sandbox*'s container.
-    ``webfetch`` and ``todowrite`` remain host-side.
-    GPU/CPU resource tools are added when *pool* is provided.
-    """
-    tools: list[_tool_cls] = [
-        make_bash(sandbox),
-        make_read(sandbox),
-        make_write(sandbox),
-        make_edit(sandbox),
-        make_glob(sandbox),
-        make_grep(sandbox),
-        webfetch,
-        todowrite,
-        make_daemon_release(sandbox),
-        make_ask_human(sandbox._agname),
-    ]
-    if pool is not None:
-        tools += [
-            make_gpu_reserve(sandbox, pool),
-            make_cpu_reserve(sandbox, pool),
-            make_cpu_release(sandbox, pool),
-        ]
-    return tools
-
 
 __all__ = [
     "webfetch",
     "todowrite",
-    "make_bash",
     "make_read",
-    "make_write",
-    "make_edit",
     "make_glob",
     "make_grep",
-    "make_gpu_reserve",
-    "make_cpu_reserve",
-    "make_cpu_release",
-    "make_daemon_release",
     "make_ask_human",
-    "make_sandboxed_tools",
 ]

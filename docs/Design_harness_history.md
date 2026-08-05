@@ -157,8 +157,9 @@ runs against a real host directory (the jail), so `materialize_config_home`'s ex
 The native session file only ever covers that one engine's own turns. It's the wrong mechanism —
 and shouldn't be attempted — when:
 
-- the agent's history crosses between native `execute_react` and a harness, or between two
-  different harness engines (the file is meaningless to the other side);
+- the agent's history crosses between the native engine (its own in-container process, not the
+  retired host-process `execute_react()`) and a harness, or between two different harness engines
+  (the file is meaningless to the other side);
 - the agent is deliberately moving to a materially different environment (fresh base image, clean
   workspace) where the old session's tool-call results reference files/state that no longer match —
   resuming natively there risks feeding the model stale, misleading context rather than helping it.

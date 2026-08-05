@@ -30,14 +30,16 @@ import os
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 from ..agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
+from .agllm_terminus import agLLMTerminus, get_shared_terminus
 from .agproxy_llm_adapters import (
     anthropic_messages_to_openai,
     openai_response_to_anthropic_message,
@@ -114,7 +116,7 @@ def _debug_log_anthropic_messages_body(path: str, body: dict) -> None:
         f.write("\n".join(lines) + "\n")
 
 
-def _warn_mid_array_system_messages(ag: "agent", body: dict) -> None:
+def _warn_mid_array_system_messages(log_fn: "Callable[[str], None]", body: dict) -> None:
     """Claude Code's generic (ANTHROPIC_BASE_URL) client sometimes emits its
     own dynamic reminders (e.g. an Agent-tool-availability nudge) as a
     `role: "system"` entry inside `messages`, not the top-level `system`
@@ -124,11 +126,16 @@ def _warn_mid_array_system_messages(ag: "agent", body: dict) -> None:
     occurrence into the one leading system message so it never reaches a
     real backend, but that's a silent correctness workaround for what looks
     like an inconsistency in Claude Code's own request serialization on
-    this client path -- surface it instead of absorbing it invisibly."""
+    this client path -- surface it instead of absorbing it invisibly.
+
+    Takes a `log_fn` callable rather than a live `ag` object -- routed
+    through `agProxyLLM._log_warning()` (itself forwarding to
+    `agllm_terminus`'s `/internal/log_warning`), not `ag.terminal.log`
+    directly, since `ag` isn't reachable from wherever this routing/
+    translation layer eventually runs (see agllm_terminus.py)."""
     n = sum(1 for m in body.get("messages", []) if m.get("role") == "system")
     if n:
-        ag.terminal.log(
-            "WARNING  ",
+        log_fn(
             f"harness emitted {n} mid-conversation system-role message(s) in "
             "its /v1/messages request -- not valid per the Anthropic Messages "
             "API (system must be the top-level `system` field, never a "
@@ -150,12 +157,43 @@ class agProxyLLM:
     """One local HTTP server, shared across every harness-driven agent in
     this process. Each `launch()` (agharness_backends) mints a token via
     `register()` before starting its harness subprocess, and calls
-    `unregister()` once that subprocess exits."""
+    `unregister()` once that subprocess exits.
 
-    def __init__(self, agconfig: "agConfig | None" = None) -> None:
+    Routing/translation only -- real backend credentials are never touched
+    here, and neither is the token<->agent registry: unlike an earlier
+    version of this class, there is no local `_agents_by_token` dict at
+    all. Every route's auth check and every piece of per-agent state
+    (model, policy, logging, credentialed dispatch) goes through
+    `agllm_terminus.agLLMTerminus` over real HTTP -- constructed either
+    from a live `agLLMTerminus` object (`terminus=`, when both live in the
+    same host process) or a bind-mounted UDS path (`terminus_uds_path=`,
+    when this class itself runs inside the sandbox container and the
+    terminus is a separate host-side process reachable only over that
+    socket). Removing the local registry is what makes those two
+    constructions genuinely interchangeable: a same-process Python dict
+    lookup is simply impossible once this class runs in a different
+    process from whatever called `register()`, so EVERY request always
+    asks the terminus, regardless of where this instance happens to run."""
+
+    def __init__(
+        self,
+        agconfig: "agConfig | None" = None,
+        terminus: "agLLMTerminus | None" = None,
+        terminus_uds_path: "str | None" = None,
+    ) -> None:
         self._agconfig = agconfig
-        self._agents_by_token: "dict[str, agent]" = {}
         self._lock = threading.Lock()
+        # terminus_uds_path takes precedence when both are somehow given --
+        # it signals "this instance runs somewhere `terminus` (a live
+        # Python object) cannot be shared to," which get_shared_terminus()'s
+        # default would silently violate by spinning up a SEPARATE terminus
+        # in this process instead of reaching the real one.
+        if terminus_uds_path is not None:
+            self._terminus: "agLLMTerminus | None" = None
+        else:
+            self._terminus = terminus if terminus is not None else get_shared_terminus(agconfig)
+        self._terminus_uds_path = terminus_uds_path
+        self._terminus_client: "httpx.Client | None" = None
         self._app = self._build_app()
         self._server = None
         self._thread: "threading.Thread | None" = None
@@ -192,21 +230,112 @@ class agProxyLLM:
         with self._lock:
             self.request_log.append({"route": route, "token": token, "model": model})
 
-    # -- token <-> agent registry ---------------------------------------
+    # -- token <-> agent registry -- lives entirely on the terminus now ----
 
     def register(self, token: str, ag: "agent") -> None:
-        with self._lock:
-            self._agents_by_token[token] = ag
+        # A no-op when constructed with terminus_uds_path= (this instance
+        # runs somewhere `ag` -- a live Python object -- can't be shared
+        # to): nothing calls register() on THIS instance in that case
+        # anyway, since the caller registers directly on the real
+        # host-side terminus before ever launching the process this
+        # instance runs inside. See claude_code.py's execute() for the
+        # concrete split.
+        if self._terminus is not None:
+            self._terminus.register(token, ag)
 
     def unregister(self, token: str) -> None:
-        with self._lock:
-            self._agents_by_token.pop(token, None)
+        if self._terminus is not None:
+            self._terminus.unregister(token)
 
-    def _agent_for_token(self, token: "str | None"):
+    def _token_valid(self, token: "str | None") -> bool:
         if token is None:
-            return None
-        with self._lock:
-            return self._agents_by_token.get(token)
+            return False
+        client = self._terminus_http_client()
+        resp = client.post("/internal/validate_token", json={"token": token})
+        if resp.status_code != 200:
+            return False
+        return bool(resp.json().get("valid"))
+
+    # -- dispatch, via the terminus, never in-process ----------------------
+
+    def _terminus_http_client(self) -> httpx.Client:
+        if self._terminus_client is None:
+            timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
+            if self._terminus_uds_path is not None:
+                transport = httpx.HTTPTransport(uds=self._terminus_uds_path)
+                self._terminus_client = httpx.Client(
+                    transport=transport, base_url="http://agllm-terminus", timeout=timeout_s
+                )
+            else:
+                base_url = self._terminus.start()
+                self._terminus_client = httpx.Client(base_url=base_url, timeout=timeout_s)
+        return self._terminus_client
+
+    def _dispatch(self, token: "str | None", kwargs: dict):
+        """POST `kwargs` (already-uniform chat-completions arguments) to the
+        terminus's `/internal/dispatch`, keyed by `token`, and reconstruct
+        real `ChatCompletion`/`ChatCompletionChunk` SDK objects from its
+        response -- so `agproxy_llm_adapters.py`'s contract (attribute
+        access like `resp.choices[0]`, not dict indexing) is unaffected by
+        the fact that the real backend call now happens in a different
+        process. Non-streaming: returns a `ChatCompletion`. Streaming:
+        returns a generator of `ChatCompletionChunk`."""
+        client = self._terminus_http_client()
+
+        if kwargs.get("stream"):
+
+            def gen():
+                with client.stream(
+                    "POST", "/internal/dispatch", json={"token": token, "kwargs": kwargs}
+                ) as resp:
+                    if resp.status_code != 200:
+                        resp.read()
+                        raise RuntimeError(
+                            f"terminus dispatch failed: {resp.status_code} {resp.text}"
+                        )
+                    for line in resp.iter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        payload = line[len("data: ") :]
+                        if payload == "[DONE]":
+                            return
+                        yield ChatCompletionChunk.model_validate(json.loads(payload))
+
+            return gen()
+
+        resp = client.post("/internal/dispatch", json={"token": token, "kwargs": kwargs})
+        if resp.status_code != 200:
+            raise RuntimeError(f"terminus dispatch failed: {resp.status_code} {resp.text}")
+        return ChatCompletion.model_validate(resp.json())
+
+    # -- everything else that needs the real `ag` object, routed through the
+    # terminus rather than this class's own registry -- the prerequisite for
+    # this routing/translation layer to run somewhere `ag` isn't reachable
+    # at all (e.g. inside the sandbox container). See agllm_terminus.py's
+    # resolve_model/log_warning/check_tool_policy routes.
+
+    def _resolve_model(self, token: "str | None") -> str:
+        client = self._terminus_http_client()
+        resp = client.post("/internal/resolve_model", json={"token": token})
+        if resp.status_code != 200:
+            raise RuntimeError(f"terminus resolve_model failed: {resp.status_code} {resp.text}")
+        return resp.json()["model"]
+
+    def _log_warning(self, token: "str | None", message: str) -> None:
+        client = self._terminus_http_client()
+        client.post("/internal/log_warning", json={"token": token, "message": message})
+
+    def _check_tool_policy(self, token: "str | None", tool_name: str, tool_input: dict) -> dict:
+        client = self._terminus_http_client()
+        resp = client.post(
+            "/internal/check_tool_policy",
+            json={"token": token, "tool_name": tool_name, "tool_input": tool_input},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"terminus check_tool_policy failed: {resp.status_code} {resp.text}"
+            )
+        return resp.json()
 
     # -- app / routes -----------------------------------------------------
 
@@ -216,31 +345,27 @@ class agProxyLLM:
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
             token = _extract_bearer_token(request)
-            ag = self._agent_for_token(token)
-            if ag is None:
+            if not self._token_valid(token):
                 return JSONResponse(
                     {"error": {"message": "unknown or missing bearer token"}}, status_code=401
                 )
             body = await request.json()
             self._log_request("/v1/chat/completions", token, body.get("model", ""))
-            timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
-            client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
             if body.get("stream"):
 
                 def sse_gen():
-                    for chunk in client.chat.completions.create(**body):
+                    for chunk in self._dispatch(token, body):
                         yield f"data: {chunk.model_dump_json()}\n\n"
                     yield "data: [DONE]\n\n"
 
                 return StreamingResponse(sse_gen(), media_type="text/event-stream")
-            result = client.chat.completions.create(**body)
+            result = self._dispatch(token, body)
             return JSONResponse(result.model_dump())
 
         @app.post("/v1/messages")
         async def anthropic_messages(request: Request):
             token = _extract_bearer_token(request)
-            ag = self._agent_for_token(token)
-            if ag is None:
+            if not self._token_valid(token):
                 return JSONResponse(
                     {
                         "type": "error",
@@ -277,25 +402,23 @@ class agProxyLLM:
             # server serving exactly one model uses it regardless). This
             # route now matches that exactly, instead of being the one
             # place that second-guesses an intentionally-empty model.
-            model = ag.llm.backend.model or ""
+            model = self._resolve_model(token)
             request_id = f"msg_{uuid.uuid4().hex}"
             self._log_request("/v1/messages", token, model)
-            timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
-            client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
-            _warn_mid_array_system_messages(ag, body)
+            _warn_mid_array_system_messages(lambda msg: self._log_warning(token, msg), body)
             openai_kwargs = anthropic_messages_to_openai(body)
             openai_kwargs["model"] = model
 
             if body.get("stream"):
 
                 def sse_gen():
-                    chunks = client.chat.completions.create(**openai_kwargs)
+                    chunks = self._dispatch(token, openai_kwargs)
                     for frame in openai_chunks_to_anthropic_sse(chunks, model, request_id):
                         yield frame
 
                 return StreamingResponse(sse_gen(), media_type="text/event-stream")
 
-            resp = client.chat.completions.create(**openai_kwargs)
+            resp = self._dispatch(token, openai_kwargs)
             return JSONResponse(openai_response_to_anthropic_message(resp, model, request_id))
 
         @app.post("/agpolicy/check_tool")
@@ -309,8 +432,7 @@ class agProxyLLM:
             # through the same per-run bearer token already used for LLM
             # traffic. See docs/Design_harness_integration.md.
             token = _extract_bearer_token(request)
-            ag = self._agent_for_token(token)
-            if ag is None:
+            if not self._token_valid(token):
                 return JSONResponse(
                     {"decision": "deny", "reason": "unknown or missing bearer token"},
                     status_code=401,
@@ -318,12 +440,8 @@ class agProxyLLM:
             body = await request.json()
             tool_name = body.get("tool_name", "")
             tool_input = body.get("tool_input") or {}
-
-            from .. import agharness
-
-            policy = agharness.default_policy(ag)
-            decision = policy.check_tool(ag, tool_name, tool_input)
-            return JSONResponse({"decision": decision.kind, "reason": decision.reason})
+            decision = self._check_tool_policy(token, tool_name, tool_input)
+            return JSONResponse(decision)
 
         @app.post("/v1/messages/count_tokens")
         async def anthropic_count_tokens(request: Request):
@@ -331,7 +449,7 @@ class agProxyLLM:
             # good enough for Claude Code's own context-usage estimates,
             # which this endpoint only feeds informationally.
             token = _extract_bearer_token(request)
-            if self._agent_for_token(token) is None:
+            if not self._token_valid(token):
                 return JSONResponse(
                     {
                         "type": "error",
@@ -351,8 +469,7 @@ class agProxyLLM:
         @app.post("/v1/responses")
         async def openai_responses(request: Request):
             token = _extract_bearer_token(request)
-            ag = self._agent_for_token(token)
-            if ag is None:
+            if not self._token_valid(token):
                 return JSONResponse(
                     {"error": {"message": "unknown or missing bearer token"}}, status_code=401
                 )
@@ -363,24 +480,22 @@ class agProxyLLM:
             # is unset, in which case pass that through as-is (matching
             # native's `backend.model or ""`), never substitute Codex's own
             # guess.
-            model = ag.llm.backend.model or ""
+            model = self._resolve_model(token)
             request_id = f"resp_{uuid.uuid4().hex}"
             self._log_request("/v1/responses", token, model)
-            timeout_s = _AgProxyLLMFields(self._agconfig).request_timeout_s
-            client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
             openai_kwargs = responses_request_to_openai(body)
             openai_kwargs["model"] = model
 
             if body.get("stream"):
 
                 def sse_gen():
-                    chunks = client.chat.completions.create(**openai_kwargs)
+                    chunks = self._dispatch(token, openai_kwargs)
                     for frame in openai_chunks_to_responses_sse(chunks, model, request_id):
                         yield frame
 
                 return StreamingResponse(sse_gen(), media_type="text/event-stream")
 
-            resp = client.chat.completions.create(**openai_kwargs)
+            resp = self._dispatch(token, openai_kwargs)
             return JSONResponse(openai_response_to_responses_api(resp, model, request_id))
 
         return app
@@ -428,6 +543,13 @@ class agProxyLLM:
         self._thread = None
         self.base_url = None
         self.stop_uds()
+        # Only closes this instance's own client to the terminus -- the
+        # terminus itself is a separate, possibly-shared object (see
+        # get_shared_terminus) and is never stopped as a side effect of
+        # stopping this routing layer.
+        if self._terminus_client is not None:
+            self._terminus_client.close()
+            self._terminus_client = None
 
     def ensure_uds_started(self) -> str:
         """Start (idempotently) a second listener for the same `self._app`

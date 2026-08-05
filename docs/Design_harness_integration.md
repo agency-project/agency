@@ -339,9 +339,11 @@ ag = agent(agconfig=cfg, engine="claude_code")
 result = ag.run(my_existing_skill, agdata(task=...))    # completely unchanged call site
 ```
 
-`agskill.run`'s `_task()` gains the same single branch as before: `engine == "native"` →
-`execute_react` (untouched); any other value → `agharness_backend.for_config(ag.agconfig).execute(...)`,
-which now launches its process through `agproxy_ptrace` rather than a direct `sandbox.exec`. Everything
+**Update: this branch is gone.** `execute_react()` (the old host-process ReAct loop this section
+originally described as staying "untouched") has since been retired entirely -- `agskill.run`'s
+`_task()` now unconditionally calls `agharness_backend.for_config(ag.agconfig).execute(...)` for
+every engine, `"native"` included (see `agharness_backends/native.py`: a persistent in-container
+process, not a host-process loop). Everything
 above `agent.run()` — teams, `agsync`, dataflow, pause/fork/checkpointing, inbox injection, webui —
 is unaffected, exactly as in the prior draft.
 
@@ -349,8 +351,31 @@ is unaffected, exactly as in the prior draft.
 
 ## Component 5: Cross-cutting concerns for harness-driven agents (logging, webui, schema retry, GPU)
 
-**Status: proposed, not yet implemented.** The native ReAct loop (`agskill.py:execute_react`) drives
-five things inline as it runs: `aglog` tool-call/turn logging, webui push (`_push_live_messages`/
+**Status: partially built.** Resource-control and output-submission are no longer proposed --
+`agharness_internal/agmcp_server.py`'s shared `agMCPServer` (Phase 4 of the container-unification
+plan; see the plan's own doc/PR for the full design) exposes `reserve_cpu`/`cpu_release`/
+`daemon_release`/`submit_output` as real MCP tools, reached by `claude_code.py` today via
+`--mcp-config`/`--strict-mcp-config` (bridged into the container over the same UDS mount as the
+in-container LLM gateway, via a revived generic TCP-to-UDS relay -- see
+`agproxy_ptrace_internal/_in_container_launcher.py`'s `start_tcp_relay`) and by `native.py`'s
+in-container react loop via a real `mcp` client. `submit_output` replaces the schema-reprompting
+approach described below FOR THOSE TWO ENGINES: structured output is now collected via tool calls
+and read back through `agmcp_server.collected_output(token)`, not parsed post-hoc from the harness's
+final text. `codex.py`/`opencode.py`/`grok.py` are NOT wired to this server yet (no container support
+at all currently -- a separate, larger task) and still use the free-text JSON + `validate_and_recover`
+path described below unchanged. **`reserve_gpu`/`gpu_release` remain unimplemented** -- see
+`agmcp_server.py`'s own module docstring for the specific gap (GPU env-var injection only reaches
+`agsandbox_backends/base.py`'s `exec()`, a path neither an in-container harness's own tool execution
+nor `native.py`'s bash tool goes through) -- the paragraph below describing the intended MCP-based
+GPU design is still accurate as a target, just not yet built.
+
+**Update: `execute_react()` itself is gone (see the retirement note above); the five concerns below
+are now split between `execute_harness()` (input/output schema validation+recovery, sandbox
+lifecycle) and `native.py`'s `_NativeBackend.execute()` (`aglog`/webui push, now reconstructed via a
+background thread polling `agllm_terminus`'s live per-token transcript rather than driven inline by
+an in-process loop -- see that module's own docstring).** Originally, the native ReAct loop
+(`agskill.py:execute_react`, now retired) drove
+five things inline as it ran: `aglog` tool-call/turn logging, webui push (`_push_live_messages`/
 `_set_ui_state`/`token_update`), input/output schema validation with reprompt-on-failure, sandbox
 lifecycle (lazy-start/hibernate), and GPU/resource acquisition. A harness-driven run needs all five
 too, but can't hook into a loop it doesn't control. Each one maps onto a different existing seam:
@@ -386,7 +411,8 @@ too, but can't hook into a loop it doesn't control. Each one maps onto a differe
 - **Output schema reprompting** can't inject a mid-loop correction message the way native does,
   since the harness's internal loop is opaque. Coarsen the retry unit instead: on validation
   failure, issue the correction as a new top-level turn against the harness, bounded by the same
-  `output_schema_retries_left` counter `execute_react` already uses. How that turn reaches the
+  `output_schema_retries_left` counter every engine (native included, via its own bounded reprompt
+  loop in `_NativeBackend.execute()`) shares. How that turn reaches the
   harness with the right context depends on the continuity mechanism —
   see [Design_harness_history.md](Design_harness_history.md).
 - **GPU/resource control has no native-loop precedent to break**, since it's already tool-mediated

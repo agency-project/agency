@@ -54,12 +54,13 @@ class _CodexBackend(agharness_backend):
         max_steps: "int | None",
         *,
         skill: "agskill",
+        extra_system: "str | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from ... import agharness
         from ..agproxy_llm import get_shared_gateway
         from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
 
-        sys_msg = {"role": "system", "content": skill._build_system_prompt()}
+        sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
 
         binary = self.binary_path or self._DEFAULT_BINARY
         resolved = shutil.which(binary)

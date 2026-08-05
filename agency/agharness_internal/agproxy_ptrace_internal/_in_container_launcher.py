@@ -328,19 +328,22 @@ class InContainerRelay:
                 pass
 
 
-def start_llm_relay(sandbox, uds_path: str) -> "tuple[subprocess.Popen, int]":
+def start_tcp_relay(sandbox, uds_path: str) -> "tuple[subprocess.Popen, int]":
     """Deploy and launch `_tcp_to_uds_relay.py` inside *sandbox*'s container,
     forwarding a container-local TCP port to the host's *uds_path* (already
-    started via `agProxyLLM.ensure_uds_started()`, and already visible
-    inside the container at `_MOUNTED_GATEWAY_DIR` because
-    `agsandbox.agSandbox.__init__` bind-mounts that directory into every
-    container-backed sandbox unconditionally). Returns `(process, port)` --
-    the caller owns the process's lifetime (`stop_llm_relay`) and points
-    the harness's `ANTHROPIC_BASE_URL` at `http://127.0.0.1:<port>`, which
-    is the CONTAINER's own loopback (the relay listens there), not the
-    host's -- reachable regardless of the container runtime's networking
-    mode, since neither side of this hop ever leaves the container's
-    network namespace."""
+    started via one of the shared bridge servers' own `ensure_uds_started()`
+    -- `agLLMTerminus`, `agProxyLLM`, or `agMCPServer` all place their socket
+    in the same bind-mounted directory, so this relay is generic across all
+    of them -- and already visible inside the container at
+    `_MOUNTED_GATEWAY_DIR` because `agsandbox.agSandbox.__init__` bind-mounts
+    that directory into every container-backed sandbox unconditionally).
+    Returns `(process, port)` -- the caller owns the process's lifetime
+    (`stop_tcp_relay`) and points whatever needs a plain `http://host:port`
+    URL (e.g. a harness's own `--mcp-config`, which has no notion of a Unix
+    socket) at `http://127.0.0.1:<port>`, which is the CONTAINER's own
+    loopback (the relay listens there), not the host's -- reachable
+    regardless of the container runtime's networking mode, since neither
+    side of this hop ever leaves the container's network namespace."""
     sandbox.write_file_bytes(_RELAY_CONTAINER_PATH, _RELAY_SOURCE)
     runtime, container_name = _runtime_and_container_name(sandbox)
     container_sock_path = f"{_MOUNTED_GATEWAY_DIR}/{Path(uds_path).name}"
@@ -366,7 +369,7 @@ def start_llm_relay(sandbox, uds_path: str) -> "tuple[subprocess.Popen, int]":
     return proc, port
 
 
-def stop_llm_relay(proc: "subprocess.Popen | None") -> None:
+def stop_tcp_relay(proc: "subprocess.Popen | None") -> None:
     if proc is not None:
         proc.terminate()
 
@@ -377,4 +380,4 @@ def _runtime_and_container_name(sandbox) -> "tuple[str, str]":
     return backend._runtime, backend._container_name()
 
 
-__all__ = ["InContainerRelay", "deploy_entrypoint", "start_llm_relay", "stop_llm_relay"]
+__all__ = ["InContainerRelay", "deploy_entrypoint", "start_tcp_relay", "stop_tcp_relay"]

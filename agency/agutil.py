@@ -306,3 +306,65 @@ def agharness_binary_cache_dir():
     d = Path.home() / ".cache" / "agency_harness_bin"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# Fixed container-side mount point for agency_package_dir() below -- shared
+# between agsandbox.py (which bind-mounts it) and any in-container
+# entrypoint (agharness_backends/native.py's react-loop process, or a
+# container-relocated agproxy_llm) that needs to know where to point
+# PYTHONPATH to import agency.
+AGENCY_PACKAGE_CONTAINER_MOUNT = "/opt/agency_pkg"
+
+
+def agency_package_dir():
+    """Host directory containing the `agency` package currently running in
+    *this* process -- the parent of `agency/__init__.py`'s own directory,
+    i.e. what needs to be on `PYTHONPATH` for `import agency` to resolve.
+    Bind-mounted read-only into every container-backed sandbox at
+    `AGENCY_PACKAGE_CONTAINER_MOUNT`, same "attach unconditionally, gate on
+    use" pattern as `agharness_llm_gateway_dir`/`agharness_binary_cache_dir`
+    above -- so an in-container entrypoint always runs the EXACT same code
+    the host process is running, not a second, potentially-stale copy
+    baked into the sandbox's base image.
+
+    Unlike those two, this is not a fixed scratch location -- it's resolved
+    dynamically from `agency.__file__`, since it has to be wherever *this*
+    process's own code actually lives (a dev checkout, an editable install,
+    a site-packages install are all valid; none should be hardcoded)."""
+    import agency as _agency_pkg
+    from pathlib import Path
+
+    return Path(_agency_pkg.__file__).resolve().parent.parent
+
+
+def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 180) -> None:
+    """Ensure each of `packages` (import names, e.g. `"fastapi"`) is
+    importable inside `sandbox`'s container, installing any that are
+    missing via `pip3 install`. Confirmed real gap: `agency-sandbox:latest`
+    carries `httpx`/`pydantic` but not `fastapi`/`uvicorn`/`openai` --
+    needed by both a container-relocated `agproxy_llm` and a future
+    full react-loop entrypoint that imports `agency` itself.
+
+    Checks each package's actual importability first, not just its
+    presence in `pip list` (a package can be listed but broken, or absent
+    but shadowed by something else on the path) -- and only invokes pip for
+    the ones genuinely missing, so a container whose checkpoint image
+    already has everything installed (reused across skill calls, see
+    agskill.py's commit() boundary) pays this cost exactly once per fresh
+    container, not on every launch. Requires the container to have
+    outbound network access -- true today (see docs/Design_harness_
+    integration.md's network lockdown discussion, deferred).
+
+    Raises RuntimeError if pip itself fails (e.g. no network, a genuinely
+    broken package name) -- this is a real prerequisite-provisioning
+    failure, not something to silently swallow."""
+    import shlex
+
+    missing = [pkg for pkg in packages if sandbox.exec(f'python3 -c "import {pkg}"', timeout=30)[1] != 0]
+    if not missing:
+        return
+
+    install_cmd = "pip3 install --quiet " + " ".join(shlex.quote(p) for p in missing)
+    out, rc = sandbox.exec(install_cmd, timeout=timeout_s)
+    if rc != 0:
+        raise RuntimeError(f"failed to install {missing} inside container: {out}")

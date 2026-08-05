@@ -771,25 +771,15 @@ class TestAgSandboxLifecycle:
         assert "still-here" in content
         sb.destroy()
 
-    @docker
-    def test_files_persist_across_process_pool_tool_calls(self):
-        """Files written by the write tool in one worker process must be readable
-        by the read tool in a subsequent worker process call (regression test for
-        the cross-worker container-destruction bug)."""
-        sb = _make_sandbox()
-        from agency.tools import make_sandboxed_tools
-
-        tools = {t.name: t for t in make_sandboxed_tools(sb)}
-        try:
-            # write runs in a process-pool worker
-            w = tools["write"](agdata(file_path="/workspace/cross.txt", content="cross-worker\n"))
-            assert not isinstance(w, agerror), f"write failed: {w}"
-            # read also runs in a process-pool worker; must find the file
-            r = tools["read"](agdata(file_path="/workspace/cross.txt"))
-            assert not isinstance(r, agerror), f"read failed after cross-worker write: {r}"
-            assert "cross-worker" in r.content
-        finally:
-            sb.destroy()
+    # test_files_persist_across_process_pool_tool_calls was retired here:
+    # its whole premise (files written by a real run_in_subprocess=True tool
+    # call, in a ProcessPoolExecutor worker, readable by a subsequent
+    # separately-dispatched worker call) no longer exists -- agtool.__call__
+    # always runs in the calling thread/process now (see agtool.py's own
+    # module docstring), and agency/tools/{write,read}.py's `write`/`read`
+    # tool factories it used are themselves retired (make_write is gone;
+    # test_agsandbox.py's own direct sb.write_file()/read_file() tests
+    # already cover file persistence without any tool-dispatch layer).
 
     @docker
     def test_checkpoint_restore_preserves_files(self):
@@ -1357,6 +1347,23 @@ class TestAgSandboxLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# agSandbox — persistent sandboxes skip per-tool-call hibernation
+# (agtool.py:dispatch_tools(), agsandbox.py's _AgSandboxFields.persistent)
+# ---------------------------------------------------------------------------
+
+
+class TestAgSandboxPersistentDispatch:
+    """Retired: both tests here (test_persistent_sandbox_stays_running_
+    after_a_tool_call, test_non_persistent_sandbox_hibernates_after_a_
+    tool_call) verified that agtool.py's dispatch_tools() respected
+    sandbox.persistent's per-tool-call hibernate-or-not decision --
+    dispatch_tools() itself (execute_react()'s only tool-dispatch path) is
+    retired, and the per-tool-call hibernate model it implemented was
+    already superseded for every engine by Phase 1 (persistent containers
+    for the whole skill call, not decided per tool call anymore)."""
+
+
+# ---------------------------------------------------------------------------
 # agSandbox — exec
 # ---------------------------------------------------------------------------
 
@@ -1395,6 +1402,189 @@ class TestAgSandboxExec:
         assert rc == 0
         assert "3" in out
         self.sb._gpu_id = None
+
+
+# ---------------------------------------------------------------------------
+# agSandbox — exec_detached (Phase 3 foundation: launching a persistent
+# in-container process, e.g. agharness_backends/native.py's react-loop
+# entrypoint or a container-relocated agproxy_llm)
+# ---------------------------------------------------------------------------
+
+
+class TestAgSandboxExecDetached:
+    @docker
+    def setup_method(self, _):
+        self.sb = _make_sandbox()
+
+    @docker
+    def teardown_method(self, _):
+        self.sb.destroy()
+
+    def test_exec_detached_returns_immediately(self):
+        # Warm up first -- the container's own cold-start (docker run/init)
+        # happens lazily on the first call of any kind and would otherwise
+        # be conflated with exec_detached()'s own latency.
+        self.sb.exec("true")
+
+        start = time.monotonic()
+        self.sb.exec_detached("sleep 3 && touch /workspace/detached_marker.txt")
+        elapsed = time.monotonic() - start
+        # Must only wait for docker to register the exec, not for the
+        # 3-second sleep inside it to finish.
+        assert elapsed < 1.5, f"exec_detached() blocked for {elapsed:.2f}s"
+
+        # The marker must not exist yet -- the detached command is still
+        # sleeping, proving this genuinely didn't wait for it.
+        _, rc = self.sb.exec("test -f /workspace/detached_marker.txt")
+        assert rc != 0
+
+    def test_exec_detached_process_actually_runs_to_completion(self):
+        self.sb.exec_detached("sleep 1 && touch /workspace/detached_marker2.txt")
+        deadline = time.monotonic() + 10
+        found = False
+        while time.monotonic() < deadline:
+            _, rc = self.sb.exec("test -f /workspace/detached_marker2.txt")
+            if rc == 0:
+                found = True
+                break
+            time.sleep(0.25)
+        assert found, "detached process never created its marker file"
+
+    def test_exec_detached_process_survives_after_call_returns(self):
+        """A long-lived detached process (not a one-shot command) must
+        still be alive well after exec_detached() itself returns -- the
+        actual property a persistent in-container entrypoint depends on."""
+        self.sb.exec_detached("sleep 5")
+        out, rc = self.sb.exec("pgrep -f 'sleep 5'")
+        assert rc == 0, f"detached 'sleep 5' process not found running: {out}"
+
+    def test_exec_detached_workdir(self):
+        self.sb.exec_detached("pwd > /tmp/detached_workdir.txt", workdir="/tmp")
+        deadline = time.monotonic() + 10
+        content = None
+        while time.monotonic() < deadline:
+            out, rc = self.sb.exec("cat /tmp/detached_workdir.txt")
+            if rc == 0 and out.strip():
+                content = out.strip()
+                break
+            time.sleep(0.25)
+        assert content == "/tmp"
+
+
+# ---------------------------------------------------------------------------
+# agSandbox — agency package bind-mount (Phase 3 foundation: an in-container
+# entrypoint runs the exact same code as the host, not a stale image-baked
+# copy -- see agutil.agency_package_dir).
+# ---------------------------------------------------------------------------
+
+
+class TestAgSandboxAgencyPackageMount:
+    @docker
+    def test_agency_package_is_mounted_and_matches_host(self):
+        from agency.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, agency_package_dir
+
+        sb = _make_sandbox()
+        try:
+            marker_path = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/agency/agskill.py"
+            out, rc = sb.exec(f"test -f {marker_path} && echo yes")
+            assert rc == 0 and "yes" in out, f"agskill.py not found at {marker_path}: {out}"
+
+            host_content = (agency_package_dir() / "agency" / "agskill.py").read_text()
+            container_content = sb.read_file(marker_path)
+            assert container_content == host_content, (
+                "bind-mounted content must be byte-identical to the host's own "
+                "agency package -- this is what avoids a second, driftable copy"
+            )
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_agency_package_mount_is_read_only(self):
+        from agency.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
+
+        sb = _make_sandbox()
+        try:
+            _, rc = sb.exec(f"touch {AGENCY_PACKAGE_CONTAINER_MOUNT}/agency/should_not_exist.txt")
+            assert rc != 0, "agency package mount must be read-only inside the container"
+        finally:
+            sb.destroy()
+
+
+# ---------------------------------------------------------------------------
+# agutil.ensure_python_packages_in_container -- resolves the dependency gap
+# a container-relocated agproxy_llm / full react-loop entrypoint (Phase 2b /
+# 3b) hits: agency-sandbox:latest carries httpx/pydantic but not
+# fastapi/uvicorn/openai.
+# ---------------------------------------------------------------------------
+
+
+class TestEnsurePythonPackagesInContainer:
+    @docker
+    def test_installs_a_missing_package(self):
+        from agency.agutil import ensure_python_packages_in_container
+
+        sb = _make_sandbox()
+        try:
+            _, rc = sb.exec('python3 -c "import fastapi"')
+            assert rc != 0, "fastapi must NOT already be present -- test assumes the gap"
+
+            ensure_python_packages_in_container(sb, ["fastapi"], timeout_s=120)
+
+            _, rc = sb.exec('python3 -c "import fastapi"')
+            assert rc == 0, "fastapi must be importable after ensure_python_packages_in_container"
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_noop_when_already_present(self):
+        """A package already importable (httpx, confirmed present in the
+        base image) must not trigger any pip install at all -- verified by
+        making pip3 itself unusable and confirming that doesn't matter."""
+        from agency.agutil import ensure_python_packages_in_container
+
+        sb = _make_sandbox()
+        try:
+            _, rc = sb.exec('python3 -c "import httpx"')
+            assert rc == 0, "httpx must already be present -- test assumes this baseline"
+
+            # Break pip3 so any real install attempt would fail loudly.
+            sb.exec("mv /usr/local/bin/pip3 /usr/local/bin/pip3.disabled")
+
+            ensure_python_packages_in_container(sb, ["httpx"], timeout_s=30)  # must not raise
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_raises_on_a_nonexistent_package(self):
+        from agency.agutil import ensure_python_packages_in_container
+
+        sb = _make_sandbox()
+        try:
+            with pytest.raises(RuntimeError):
+                ensure_python_packages_in_container(
+                    sb, ["this_package_definitely_does_not_exist_xyz"], timeout_s=30
+                )
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_installs_only_the_missing_subset(self):
+        """Mixed request (one present, one missing) must only pip-install
+        the missing one -- verified indirectly via the end state (both
+        importable afterward), plus the noop-when-present test above
+        already covers the "don't touch what's already there" contract
+        directly."""
+        from agency.agutil import ensure_python_packages_in_container
+
+        sb = _make_sandbox()
+        try:
+            ensure_python_packages_in_container(sb, ["httpx", "uvicorn"], timeout_s=120)
+            _, rc_httpx = sb.exec('python3 -c "import httpx"')
+            _, rc_uvicorn = sb.exec('python3 -c "import uvicorn"')
+            assert rc_httpx == 0
+            assert rc_uvicorn == 0
+        finally:
+            sb.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -1803,117 +1993,78 @@ class TestAgSandboxResourceLimits:
 
 
 class TestSandboxedTools:
+    """bash/write/edit/daemon_release-via-tool-wrapper coverage was retired
+    here along with agency/tools/{bash,write,edit,resource}.py themselves
+    (execute_react()-only factories, see agency/tools/__init__.py's own
+    retirement note) -- the underlying sandbox methods these tools were
+    thin wrappers over remain fully covered directly: sb.exec() by
+    TestAgSandboxExec, sb.write_file()/read_file() by TestAgSandboxFileIO,
+    sb.release_daemon() by TestAgSandboxPIDTracking. glob/grep (still-alive
+    factories) are exercised below via make_glob()/make_grep() directly and
+    sb.write_file() for fixture setup, rather than through the retired
+    make_sandboxed_tools() bundle."""
+
     @docker
     def setup_method(self, _):
         self.sb = _make_sandbox()
-        from agency.tools import make_sandboxed_tools
-
-        self.tools = {t.name: t for t in make_sandboxed_tools(self.sb)}
 
     @docker
     def teardown_method(self, _):
         self.sb.destroy()
 
-    def test_bash_tool_runs_in_container(self):
-        result = self.tools["bash"].fn(agdata(command="hostname"))
-        assert result.exit_code == 0
-        assert result.output.strip() != ""
-
-    def test_write_then_read_tool(self):
-        self.tools["write"].fn(agdata(file_path="/workspace/t.txt", content="abc\n"))
-        r = self.tools["read"].fn(agdata(file_path="/workspace/t.txt"))
-        assert "abc" in r.content
-
     def test_glob_tool_finds_files(self):
-        self.tools["write"].fn(agdata(file_path="/workspace/a.py", content="x\n"))
-        self.tools["write"].fn(agdata(file_path="/workspace/b.py", content="y\n"))
-        r = self.tools["glob"].fn(agdata(pattern="*.py", path="/workspace"))
+        from agency.tools.glob import make_glob
+
+        self.sb.write_file("/workspace/a.py", "x\n")
+        self.sb.write_file("/workspace/b.py", "y\n")
+        tool = make_glob(self.sb)
+        r = tool.fn(agdata(pattern="*.py", path="/workspace"))
         assert len(r.files) >= 2
 
     def test_grep_tool_finds_pattern(self):
-        self.tools["write"].fn(agdata(file_path="/workspace/src.py", content="SECRET=42\n"))
-        r = self.tools["grep"].fn(agdata(pattern="SECRET", path="/workspace"))
+        from agency.tools.grep import make_grep
+
+        self.sb.write_file("/workspace/src.py", "SECRET=42\n")
+        tool = make_grep(self.sb)
+        r = tool.fn(agdata(pattern="SECRET", path="/workspace"))
         assert any("SECRET" in m["text"] for m in r.matches)
-
-    def test_edit_tool_replaces_content(self):
-        self.tools["write"].fn(agdata(file_path="/workspace/edit_me.txt", content="foo bar\n"))
-        self.tools["edit"].fn(
-            agdata(
-                file_path="/workspace/edit_me.txt",
-                old_string="foo",
-                new_string="baz",
-            )
-        )
-        r = self.tools["read"].fn(agdata(file_path="/workspace/edit_me.txt"))
-        assert "baz" in r.content
-        assert "foo" not in r.content
-
-    def test_daemon_release_tool_stops_monitoring(self):
-        # Start a background process, get its PID, release it as daemon,
-        # verify the outer loop would no longer wait for it.
-        self.tools["bash"].fn(agdata(command="sleep 30 &"))
-        live_before = self.sb.get_live_pids()
-        assert len(live_before) > 0
-        for pid in list(live_before):
-            result = self.tools["daemon_release"].fn(agdata(pid=pid))
-            assert not isinstance(result, agerror)
-        assert self.sb.get_live_pids() == set()
-
-    def test_daemon_release_tool_invalid_pid(self):
-        result = self.tools["daemon_release"].fn(agdata(pid="notanint"))
-        assert isinstance(result, agerror)
-
-    def test_daemon_release_tool_missing_pid(self):
-        result = self.tools["daemon_release"].fn(agdata())
-        assert isinstance(result, agerror)
 
 
 class TestResourceTools:
+    """reserve_gpu/reserve_cpu/cpu_release-via-tool-wrapper coverage was
+    retired here along with agency/tools/resource.py itself
+    (execute_react()-only factories). The underlying agSandbox/
+    agResourcePool mechanics these tools were thin wrappers over (physical
+    GPU acquisition during exec(), CPU/memory limit application) remain
+    real and in active use (agharness_internal/agmcp_server.py's own
+    reserve_cpu/cpu_release tools call sandbox.update_limits()/pool.notify_
+    cpu_acquired() the same way) -- exercised below by setting sandbox/pool
+    state directly instead of through the retired tool wrappers. Tests that
+    only verified a wrapper's OWN argument validation/idempotency messaging
+    (not a sandbox/pool mechanic) were dropped, not ported -- there is no
+    wrapper left to validate."""
+
     @docker
     def setup_method(self, _):
         self.sb = _make_sandbox()
         self.pool = agResourcePool(gpus=[0, 1], idle_cpus=1.0, idle_memory="1024m")
-        from agency.tools import make_sandboxed_tools
-
-        self.tools = {t.name: t for t in make_sandboxed_tools(self.sb, self.pool)}
 
     @docker
     def teardown_method(self, _):
         self.sb.destroy()
 
-    # ── reserve_gpu — virtual reservation only ─────────────────────────────
-
-    def test_reserve_gpu_sets_virtual_flag_no_physical(self):
-        """reserve_gpu sets _gpu_virtual=True but takes no physical GPU from the pool."""
-        result = self.tools["reserve_gpu"].fn(agdata())
-        assert getattr(result, "warning", None) is None
-        assert self.sb._gpu_virtual is True
-        assert self.sb._gpu_id is None
-        assert self.pool._gpus_acquired == 0
-
-    def test_reserve_gpu_idempotent(self):
-        """Calling reserve_gpu twice returns an 'already acquired' message; flag unchanged."""
-        self.tools["reserve_gpu"].fn(agdata())
-        result = self.tools["reserve_gpu"].fn(agdata())
-        assert self.sb._gpu_virtual is True
-        assert "already" in result.message
-        assert self.pool._gpus_acquired == 0
-
-    def test_reserve_gpu_no_gpus_warns_and_does_not_set_flag(self):
-        """reserve_gpu returns a warning and leaves _gpu_virtual False when pool has no GPUs."""
-        from agency.tools.resource import make_gpu_reserve
-
-        pool_empty = agResourcePool(gpus=[])
-        tool = make_gpu_reserve(self.sb, pool_empty)
-        result = tool.fn(agdata())
-        assert result.warning is not None
-        assert self.sb._gpu_virtual is False
+    def _reserve_gpu(self) -> None:
+        """Mirrors the retired make_gpu_reserve tool's own _run body: a
+        virtual-only reservation, no physical GPU claimed yet."""
+        self.sb._gpu_virtual = True
+        self.sb._gpu_acquire_fn = self.pool.acquire_gpu
+        self.sb._gpu_release_fn = self.pool.release_gpu
 
     # ── physical GPU acquisition on bash exec ──────────────────────────────
 
     def test_exec_acquires_physical_gpu_when_virtual_flag_set(self):
         """exec() claims a physical GPU from the pool when _gpu_virtual is True."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         assert self.pool._gpus_acquired == 0
         self.sb.exec("echo hello")
         # Held until stop() (container-exit clear); there is no mid-skill release tool.
@@ -1922,13 +2073,13 @@ class TestResourceTools:
 
     def test_exec_sets_cuda_visible_devices(self):
         """CUDA_VISIBLE_DEVICES is set to a digit (the physical GPU ID) during exec()."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
         assert rc == 0
         assert out.strip().isdigit()
 
     def test_exec_without_reserve_hides_all_gpus(self):
-        """Without reserve_gpu, CUDA_VISIBLE_DEVICES is 'NoDevFiles'."""
+        """Without reserving, CUDA_VISIBLE_DEVICES is 'NoDevFiles'."""
         out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
         assert rc == 0
         assert "NoDevFiles" in out.strip()
@@ -1937,7 +2088,7 @@ class TestResourceTools:
 
     def test_foreground_exec_holds_physical_gpu_until_stop(self):
         """Physical GPU stays held after exec(); release waits on container exit (stop)."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         self.sb.exec("echo hello")
         assert self.sb._gpu_id is not None
         assert self.pool._gpus_acquired == 1
@@ -1945,7 +2096,7 @@ class TestResourceTools:
 
     def test_consecutive_foreground_execs_reuse_same_physical_gpu(self):
         """Each foreground exec() reuses the already-held physical GPU."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         self.sb.exec("echo first")
         first = self.sb._gpu_id
         assert first is not None
@@ -1956,7 +2107,7 @@ class TestResourceTools:
 
     def test_virtual_reservation_and_physical_gpu_persist_across_execs(self):
         """_gpu_virtual and the leased GPU stay set across successive exec() calls."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         self.sb.exec("echo first")
         assert self.sb._gpu_virtual is True
         assert self.sb._gpu_id is not None
@@ -1968,7 +2119,7 @@ class TestResourceTools:
 
     def test_physical_gpu_held_while_background_process_running(self):
         """Physical GPU stays held while a background process is alive."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         # A generous ceiling, not an actual wait -- killed explicitly below.
         # Needs enough margin over real `docker exec` round-trip latency
         # (get_live_pids() does its own exec to walk /proc, GPU-passthrough
@@ -1983,7 +2134,7 @@ class TestResourceTools:
 
     def test_same_physical_gpu_used_for_subsequent_exec_during_background_process(self):
         """While a background process holds the GPU, subsequent exec() calls use the same GPU."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         self.sb.exec("sleep 30 &")  # ceiling, not a real wait -- see comment above
         self.sb.get_live_pids()
         first_gpu_id = self.sb._gpu_id
@@ -1994,7 +2145,7 @@ class TestResourceTools:
 
     def test_physical_gpu_held_after_background_process_finishes(self):
         """Physical GPU stays held after background work exits; stop() frees it."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         self.sb.exec("sleep 0.1 &")
         time.sleep(1.0)
         self.sb.get_live_pids()
@@ -2006,14 +2157,13 @@ class TestResourceTools:
 
     def test_exec_blocks_until_pool_gpu_is_freed(self):
         """exec() waits indefinitely for a physical GPU and unblocks once one is released."""
-        from agency.tools.resource import make_gpu_reserve
-
         pool1 = agResourcePool(gpus=[0])
         pool1.acquire_gpu()  # exhaust the only GPU
 
         sb2 = _make_sandbox()
-        tool = make_gpu_reserve(sb2, pool1)
-        tool.fn(agdata())  # virtual reservation
+        sb2._gpu_virtual = True
+        sb2._gpu_acquire_fn = pool1.acquire_gpu
+        sb2._gpu_release_fn = pool1.release_gpu
 
         exec_started = threading.Event()
         exec_done = threading.Event()
@@ -2037,7 +2187,7 @@ class TestResourceTools:
 
     def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self):
         """release_resources() clears _gpu_virtual and returns any held physical GPU."""
-        self.tools["reserve_gpu"].fn(agdata())
+        self._reserve_gpu()
         self.sb.exec("sleep 30 &")
         self.sb.get_live_pids()
         assert self.sb._gpu_id is not None
@@ -2056,16 +2206,19 @@ class TestResourceTools:
     # ── reserve_cpu / cpu_release ─────────────────────────────────────────
 
     def test_reserve_cpu_applies_limits(self):
-        result = self.tools["reserve_cpu"].fn(agdata(cpus=2.0, memory="256m"))
-        assert not isinstance(result, agerror)
-
-    def test_reserve_cpu_requires_at_least_one_param(self):
-        result = self.tools["reserve_cpu"].fn(agdata())
-        assert isinstance(result, agerror)
+        self.sb.update_limits(cpus=2.0, memory="256m")
+        self.sb._cpu_acquired += 2.0
+        self.sb._memory_acquired_mb += 256
+        self.pool.notify_cpu_acquired(2.0, 256)
 
     def test_cpu_release_resets_to_idle(self):
-        self.tools["reserve_cpu"].fn(agdata(cpus=4.0, memory="2g"))
-        result = self.tools["cpu_release"].fn(agdata())
-        assert not isinstance(result, agerror)
-        assert "1.0" in result.message
-        assert "1024m" in result.message
+        self.sb.update_limits(cpus=4.0, memory="2g")
+        self.sb._cpu_acquired = 4.0
+        self.sb._memory_acquired_mb = 2048
+        self.pool.notify_cpu_acquired(4.0, 2048)
+
+        self.sb.update_limits(cpus=self.pool.idle_cpus, memory=self.pool.idle_memory)
+        held_cpus, held_mb = self.sb._cpu_acquired, self.sb._memory_acquired_mb
+        self.sb._cpu_acquired = 0.0
+        self.sb._memory_acquired_mb = 0
+        self.pool.notify_cpu_released(held_cpus, held_mb)

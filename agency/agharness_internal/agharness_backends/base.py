@@ -92,12 +92,21 @@ class agharness_backend(AgHarnessFields):
         max_steps: "int | None",
         *,
         skill: "agskill",
+        extra_system: "str | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         """Same return contract as `agskill.execute_react()`/
         `execute_harness()`: `ctx` is the SAME `prev_ctx` object, mutated in
         place (`.messages`/`.total_input_tokens`/`.total_output_tokens`);
         `delta` is `[system_prompt_message] + every message appended since
-        this call started`. Concrete backends implement this."""
+        this call started`. Concrete backends implement this.
+
+        `extra_system`, if given, is appended to the skill's own system
+        prompt (`skill._build_system_prompt(extra_system)`) -- currently
+        used for the "these input fields were auto-offloaded to sandbox
+        files" notice `execute_harness()` computes via `agschema.
+        prepare_inputs_in_sandbox()` before calling this, uniformly for
+        every engine (shared with native's own `execute_react()`, which
+        computes and injects the equivalent notice itself in-process)."""
         raise NotImplementedError
 
     @staticmethod
@@ -105,8 +114,11 @@ class agharness_backend(AgHarnessFields):
         from .claude_code import _ClaudeCodeBackend
         from .codex import _CodexBackend
         from .grok import _GrokBackend
+        from .native import _NativeBackend
         from .opencode import _OpencodeBackend
 
+        if engine == "native":
+            return _NativeBackend(agconfig)
         if engine == "opencode":
             return _OpencodeBackend(agconfig)
         if engine == "claude_code":
@@ -117,5 +129,5 @@ class agharness_backend(AgHarnessFields):
             return _GrokBackend(agconfig)
         raise ValueError(
             f"Unknown harness engine {engine!r} -- set agent(engine=...) to one of "
-            f"'opencode', 'claude_code', 'codex', 'grok' (or 'native' for the built-in ReAct loop)"
+            f"'native', 'opencode', 'claude_code', 'codex', 'grok'"
         )

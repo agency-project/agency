@@ -150,43 +150,12 @@ class TestOwnerPidLabel:
         run_cmd = self._captured_run_cmd(sb)
         assert self._label_value(run_cmd) == str(sentinel_pid)
 
-    @podman
-    def test_real_sandboxed_tool_call_labels_container_with_main_process_pid(self):
-        """End-to-end, no mocks: a real run_in_subprocess=True tool call (the
-        default) cloudpickles this backend to a real ProcessPoolExecutor
-        worker, which is the process that actually issues `podman run` --
-        confirms the resulting container's real label still names *this*
-        (main, test) process, not the worker's own distinct PID."""
-        import os
-
-        from agency.agdata import agdata, agerror
-        from agency.tools import make_sandboxed_tools
-
-        sb = _make_sandbox()
-        tools = {t.name: t for t in make_sandboxed_tools(sb)}
-        try:
-            result = tools["bash"](agdata(command="true"))
-            assert not isinstance(result, agerror), f"bash failed: {result}"
-
-            inspected = subprocess.run(
-                [
-                    "podman",
-                    "inspect",
-                    "--format",
-                    '{{index .Config.Labels "agency.owner_pid"}}',
-                    sb._backend._name,
-                ],
-                capture_output=True,
-                check=True,
-            )
-            label_pid = inspected.stdout.decode().strip()
-            assert label_pid == str(os.getpid()), (
-                f"container labeled with pid {label_pid}, expected this test "
-                f"process's own pid {os.getpid()} -- the worker that actually "
-                f"ran `podman run` must not have used its own os.getpid()"
-            )
-        finally:
-            sb.destroy()
+    # test_real_sandboxed_tool_call_labels_container_with_main_process_pid
+    # was retired here: same reason as test_docker.py's identically-named
+    # test -- its premise (a real run_in_subprocess=True tool call
+    # cloudpickling this backend to a ProcessPoolExecutor worker) no longer
+    # exists at all (agtool.__call__ always runs in the calling thread/
+    # process now). The other two tests in this class remain valid.
 
 
 class TestDanglingImageEagerCleanup:

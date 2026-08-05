@@ -64,6 +64,29 @@ def test_build_output_format_instruction_present_for_structured_schema():
     assert "count" in instruction
 
 
+def test_build_mcp_output_format_instruction_none_when_no_schema():
+    skill = agskill(name="s", system_prompt="do the thing")
+    assert agharness.build_mcp_output_format_instruction(skill) is None
+
+
+def test_build_mcp_output_format_instruction_none_for_raw_string_schema():
+    from agency.agtype import agrawstring
+
+    skill = agskill(name="s", system_prompt="do the thing", output_schema=agdata(text=agrawstring))
+    assert agharness.build_mcp_output_format_instruction(skill) is None
+
+
+def test_build_mcp_output_format_instruction_present_for_structured_schema():
+    skill = agskill(
+        name="s", system_prompt="do the thing", output_schema=agdata(answer=str, count=int)
+    )
+    instruction = agharness.build_mcp_output_format_instruction(skill)
+    assert instruction is not None
+    assert "submit_output" in instruction
+    assert "answer" in instruction
+    assert "count" in instruction
+
+
 def test_default_policy_check_returns_allow():
     from agency.agpolicy import agdecision
 

@@ -1041,7 +1041,10 @@ class TestStaticFieldAcrossOwners:
 
 _GLOBAL_OWNER_CASES = [
     (_AgLLMFields, "agllm", "call_max_concurrency"),
-    (_AgToolFields, "agtool", "pool_max_workers"),
+    # _AgToolFields' only GlobalConfigParam (pool_max_workers, the tool
+    # process-pool's size) was retired along with the pool itself -- every
+    # remaining agtool field is a DynamicConfigParam, so there's no global
+    # field left on this owner to represent in this sweep.
     (AgSandboxBackendFields, "agsandbox_backend", "docker_semaphore_limit"),
     (_AgResourcePoolFields, "agResourcePool", "memory_detect_fallback_mb"),
     (_AgUtilFields, "agutil", "idle_check_interval_s"),

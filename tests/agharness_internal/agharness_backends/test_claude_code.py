@@ -157,6 +157,22 @@ def test_execute_nonzero_exit_returns_agerror(_patch_which_finds_claude):
     assert "auth error" in result.error
 
 
+def _patched_mcp_server(collected=None):
+    """A fake agmcp_server -- structured output no longer comes from
+    parsing the harness's own final text (see agharness.py's
+    build_output_format_instruction and claude_code.py's execute()): it's
+    whatever `submit_output` calls landed against the real server during
+    the run, read back via `collected_output(token)`. Faking that return
+    value here is the mocked-tier equivalent of a real submit_output call
+    having happened -- test_real_claude_structured_output_end_to_end (Tier
+    2) is what proves the real MCP round trip itself works."""
+    mock_server = MagicMock()
+    mock_server.start.return_value = "http://127.0.0.1:1"
+    mock_server.ensure_uds_started.return_value = "/tmp/fake.sock"
+    mock_server.collected_output.return_value = collected or {}
+    return mock_server
+
+
 def test_execute_recovers_structured_output_schema(_patch_which_finds_claude):
     backend = _ClaudeCodeBackend(agConfig())
     skill = agskill(
@@ -165,20 +181,158 @@ def test_execute_recovers_structured_output_schema(_patch_which_finds_claude):
     ag = _make_agent()
     prev_ctx = agcontext()
 
-    payload = json.dumps({"result": '{"greeting": "hi there friend", "word_count": 3}'})
-    handle = _make_handle(stdout=payload)
+    handle = _make_handle(stdout=json.dumps({"result": "hi there friend"}))
+    mock_mcp_server = _patched_mcp_server({"greeting": "hi there friend", "word_count": 3})
     with (
         patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
+        patch("agency.agharness_internal.agmcp_server.get_shared_mcp_server") as mock_mcp_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         apply(mock_gateway_getter, mock_px_cls)
+        mock_mcp_getter.return_value = mock_mcp_server
         result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
 
     assert not isinstance(result, agerror)
     assert result.greeting == "hi there friend"
     assert result.word_count == 3
+    mock_mcp_server.register.assert_called_once()
+    mock_mcp_server.unregister.assert_called_once()
+
+
+def test_execute_reports_missing_fields_when_submit_output_never_called(_patch_which_finds_claude):
+    """A harness that never calls submit_output (or misses a field), even
+    after exhausting its retries, must surface a clear agerror, not
+    silently return a partial/empty agdata."""
+    backend = _ClaudeCodeBackend(agConfig())
+    skill = agskill(
+        name="s", system_prompt="do the thing", output_schema=agdata(greeting=str, word_count=int),
+        max_output_schema_retries=2,
+    )
+    ag = _make_agent()
+    prev_ctx = agcontext()
+
+    handle = _make_handle(stdout=json.dumps({"result": "I forgot to submit"}))
+    mock_mcp_server = _patched_mcp_server({"greeting": "hi"})
+    with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
+        patch("agency.agharness_internal.agmcp_server.get_shared_mcp_server") as mock_mcp_getter,
+        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
+        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
+    ):
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
+        mock_mcp_getter.return_value = mock_mcp_server
+        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+
+    assert isinstance(result, agerror)
+    assert "word_count" in result.error
+    # 1 initial attempt + 2 retries -- never gives up silently, never loops
+    # unbounded either.
+    assert mock_px_cls.return_value.launch.call_count == 3
+
+
+def test_execute_retries_and_recovers_when_submit_output_arrives_on_retry(
+    _patch_which_finds_claude,
+):
+    """The Phase 6 'outer' retry: a first attempt that's missing a field
+    must trigger a reprompted relaunch (via --resume, not a fresh session),
+    and a subsequent attempt that completes the fields must succeed --
+    proving this isn't just a give-up-immediately path."""
+    backend = _ClaudeCodeBackend(agConfig())
+    skill = agskill(
+        name="s", system_prompt="do the thing", output_schema=agdata(greeting=str, word_count=int),
+        max_output_schema_retries=3,
+    )
+    ag = _make_agent()
+    prev_ctx = agcontext()
+
+    handle1 = _make_handle(
+        stdout=json.dumps({"result": "partial", "session_id": "sess-abc"})
+    )
+    handle2 = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
+    mock_mcp_server = _patched_mcp_server()
+    # First call: only "greeting" landed. Second call (after the reprompt
+    # relaunch): both fields present -- simulates the model completing the
+    # missing field once reminded.
+    mock_mcp_server.collected_output.side_effect = [
+        {"greeting": "hi"},
+        {"greeting": "hi", "word_count": 2},
+    ]
+    captured_argvs = []
+
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+        captured_argvs.append(argv)
+        return handle1 if len(captured_argvs) == 1 else handle2
+
+    with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
+        patch("agency.agharness_internal.agmcp_server.get_shared_mcp_server") as mock_mcp_getter,
+        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
+        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
+    ):
+        mock_gateway, _ = _patched_gateway_and_ptrace(handle1)
+        mock_gateway_getter.return_value = mock_gateway
+        mock_px_cls.return_value.launch.side_effect = fake_launch
+        mock_mcp_getter.return_value = mock_mcp_server
+        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+
+    assert not isinstance(result, agerror), result
+    assert result.greeting == "hi"
+    assert result.word_count == 2
+    assert len(captured_argvs) == 2
+    # First attempt is a fresh session (no --resume yet).
+    assert "--resume" not in captured_argvs[0]
+    # Second attempt resumes the first's session and carries a reprompt,
+    # not the original task prompt again.
+    assert "--resume" in captured_argvs[1]
+    assert captured_argvs[1][captured_argvs[1].index("--resume") + 1] == "sess-abc"
+    assert "still missing" in captured_argvs[1][-1].lower()
+
+
+def test_execute_uses_terminus_transcript_for_history_when_available(_patch_which_finds_claude):
+    """Phase 5 (history unification): once agllm_terminus has recorded a
+    real transcript for this token, prev_ctx.messages/the returned delta
+    must come from THAT (tool calls/results included), not the old
+    flattened [user_msg, assistant_msg] collapse."""
+    backend = _ClaudeCodeBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    ag = _make_agent()
+    prev_ctx = agcontext()
+
+    handle = _make_handle(stdout=json.dumps({"result": "the command printed ok"}))
+    recorded_transcript = [
+        {"role": "system", "content": "claude code's own system prompt"},
+        {"role": "user", "content": "run echo ok"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "ok"},
+        {"role": "assistant", "content": "the command printed ok"},
+    ]
+    mock_terminus = MagicMock()
+    mock_terminus.transcript_for_token.return_value = recorded_transcript
+    with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
+        patch("agency.agharness_internal.agllm_terminus.get_shared_terminus") as mock_terminus_getter,
+        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
+        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
+    ):
+        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
+        apply(mock_gateway_getter, mock_px_cls)
+        mock_terminus_getter.return_value = mock_terminus
+        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+
+    assert not isinstance(result, agerror)
+    # System message dropped from ctx.messages (matching agskill.py's own
+    # native-loop convention), but present in the returned delta.
+    assert ctx.messages == recorded_transcript[1:]
+    assert any(m.get("role") == "tool" for m in ctx.messages), "tool turn was flattened away"
+    assert delta[0]["role"] == "system"
+    assert delta[1:] == recorded_transcript[1:]
 
 
 def test_parse_result_json_extracts_result_and_usage():
@@ -206,19 +360,20 @@ real_claude = pytest.mark.skipif(
 @real_claude
 def test_real_claude_raw_text_end_to_end():
     # A genuinely-working backend, not a placeholder -- now that this
-    # backend routes claude's LLM traffic through agproxy_llm's translated
-    # /v1/messages route, the gateway must be able to actually answer, not
-    # just accept the connection. Uses the same Bedrock bearer-token
-    # credential (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
-    from agency.agharness_internal.agproxy_llm import get_shared_gateway
-
-    gateway = get_shared_gateway()
-    log_before = len(gateway.request_log)
+    # backend routes claude's LLM traffic through an in-container
+    # agproxy_llm instance (Phase 2b-ii) to the host-side agllm_terminus,
+    # the real credentialed dispatch must actually happen, not just accept
+    # the connection. Uses the same Bedrock bearer-token credential
+    # (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
+    from agency.agharness_internal.agllm_terminus import get_shared_terminus
 
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
+    terminus = get_shared_terminus(cfg)
+    log_before = len(terminus.request_log)
+
     ag = agent(agconfig=cfg, engine="claude_code")
     skill = agskill(
         name="two_word_greeting_test",
@@ -228,37 +383,72 @@ def test_real_claude_raw_text_end_to_end():
     result.wait()
     raw = result.to_dict()
 
-    # The correct answer alone doesn't prove the gateway was actually used --
-    # HOME is deliberately left untouched (see this backend's docstring), so
-    # a real OAuth-logged-in `claude` on this host could in principle answer
-    # correctly via its OWN credentials if ANTHROPIC_BASE_URL/AUTH_TOKEN were
-    # somehow ignored. Assert directly against the gateway's own request log
-    # instead of inferring "it must have gone through the gateway" from the
-    # result looking right.
-    new_entries = gateway.request_log[log_before:]
-    assert len(new_entries) >= 1, "claude's request never reached agproxy_llm"
-    assert all(e["route"] == "/v1/messages" for e in new_entries)
+    # The correct answer alone doesn't prove the real backend was actually
+    # used -- HOME is deliberately left untouched (see this backend's
+    # docstring), so a real OAuth-logged-in `claude` on this host could in
+    # principle answer correctly via its OWN credentials if
+    # ANTHROPIC_BASE_URL/AUTH_TOKEN were somehow ignored. Assert directly
+    # against the terminus's own request log -- the one place a real
+    # credentialed dispatch is ever recorded, regardless of which process
+    # (host-side gateway, or now an in-container agproxy_llm) routed the
+    # request here -- instead of inferring "it must have gone through" from
+    # the result looking right.
+    new_entries = terminus.request_log[log_before:]
+    assert len(new_entries) >= 1, "claude's request never reached agllm_terminus"
     assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in new_entries)
     assert "error" not in raw, raw
     assert isinstance(raw.get("result"), str) and raw["result"]
 
 
 @real_claude
-def test_real_claude_structured_output_end_to_end():
-    # A genuinely-working backend, not a placeholder -- now that this
-    # backend routes claude's LLM traffic through agproxy_llm's translated
-    # /v1/messages route, the gateway must be able to actually answer, not
-    # just accept the connection. Uses the same Bedrock bearer-token
-    # credential (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
-    from agency.agharness_internal.agproxy_llm import get_shared_gateway
+def test_real_claude_tool_call_history_is_not_flattened():
+    """Phase 5: a real run that uses a tool must produce a `ctx.messages`
+    with the actual tool-call/tool-result turns in it -- not the old
+    2-message [user, final-assistant-text] collapse, which would silently
+    discard exactly this kind of turn."""
+    cfg = agConfig(
+        agSandboxBackendConfig(backend="docker"),
+        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
+    )
+    ag = agent(agconfig=cfg, engine="claude_code")
+    skill = agskill(
+        name="claude_tool_history_test",
+        system_prompt=(
+            "You have a bash tool. Use it to run the exact command the user "
+            "gives you, then report its output back in one short sentence."
+        ),
+    )
+    result = ag.run(skill, agdata(instruction="Run: echo agency-history-marker"))
+    result.wait()
+    raw = result.to_dict()
 
-    gateway = get_shared_gateway()
-    log_before = len(gateway.request_log)
+    assert "error" not in raw, raw
+    assert "agency-history-marker" in raw.get("result", "")
+    # ag.ctx is a future-backed placeholder until resolved -- reading
+    # .messages directly would just see the unresolved default `[]`.
+    messages = ag.ctx.get_resolved_messages()
+    assert any(m.get("role") == "tool" for m in messages), (
+        "no tool-role message in ctx.messages -- history fell back to the "
+        f"flattened 2-message shape instead of the real transcript: {messages}"
+    )
+    assert len(messages) > 2, "transcript should have more than [user, assistant]"
+
+
+@real_claude
+def test_real_claude_structured_output_end_to_end():
+    # A genuinely-working backend, not a placeholder -- see
+    # test_real_claude_raw_text_end_to_end's comment for why the request
+    # log check is against agllm_terminus, not agproxy_llm's own (no longer
+    # host-side-readable once its routing layer runs in-container).
+    from agency.agharness_internal.agllm_terminus import get_shared_terminus
 
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
+    terminus = get_shared_terminus(cfg)
+    log_before = len(terminus.request_log)
+
     ag = agent(agconfig=cfg, engine="claude_code")
     skill = agskill(
         name="structured_greeting_test",
@@ -271,9 +461,8 @@ def test_real_claude_structured_output_end_to_end():
     result.wait()
     raw = result.to_dict()
 
-    new_entries = gateway.request_log[log_before:]
-    assert len(new_entries) >= 1, "claude's request never reached agproxy_llm"
-    assert all(e["route"] == "/v1/messages" for e in new_entries)
+    new_entries = terminus.request_log[log_before:]
+    assert len(new_entries) >= 1, "claude's request never reached agllm_terminus"
     assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in new_entries)
     assert "error" not in raw, raw
     assert isinstance(raw.get("greeting"), str)

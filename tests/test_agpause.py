@@ -295,7 +295,7 @@ def make_looping_skill(name: str, counter: list, steps: int = 200, step_delay: f
             time.sleep(step_delay)
         return agdata(done=True), prev_ctx, []
 
-    sk.execute_react = fake_execute_react
+    sk.execute_harness = fake_execute_react
     return sk
 
 
@@ -338,7 +338,7 @@ def test_pause_before_run_blocks_before_execute_react_starts():
         started.append(1)
         return agdata(ok=True), prev_ctx, []
 
-    skill.execute_react = fake_execute_react
+    skill.execute_harness = fake_execute_react
 
     ag.pause()
     result = ag.run(skill, agdata())
@@ -355,7 +355,7 @@ def test_pause_before_run_blocks_before_execute_react_starts():
 def test_wait_all_paused_settles_immediately_for_finished_agent():
     ag = make_agent()
     skill = agskill("s", "")
-    skill.execute_react = lambda a, prev_ctx, inp, max_steps=None, **_: (
+    skill.execute_harness = lambda a, prev_ctx, inp, max_steps=None, **_: (
         agdata(ok=True),
         prev_ctx,
         [],
@@ -383,7 +383,7 @@ def test_pause_avoids_deadlock_on_cross_agent_dependency():
         calls.append("a")
         return agdata(val=1), prev_ctx, []
 
-    skill_a.execute_react = fake_a
+    skill_a.execute_harness = fake_a
 
     skill_b = agskill("skillB", "")
 
@@ -391,7 +391,7 @@ def test_pause_avoids_deadlock_on_cross_agent_dependency():
         calls.append("b")
         return agdata(val=inp.dep.val + 1), prev_ctx, []
 
-    skill_b.execute_react = fake_b
+    skill_b.execute_harness = fake_b
 
     a.pause()
     pending_a = a.run(skill_a, agdata())
@@ -430,14 +430,14 @@ def test_wait_all_paused_does_not_falsely_settle_when_upstream_genuinely_running
         time.sleep(0.3)
         return agdata(val=1), prev_ctx, []
 
-    skill_a.execute_react = slow_a
+    skill_a.execute_harness = slow_a
 
     skill_b = agskill("skillB", "")
 
     def fake_b(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(val=inp.dep.val + 1), prev_ctx, []
 
-    skill_b.execute_react = fake_b
+    skill_b.execute_harness = fake_b
 
     pending_a = a.run(skill_a, agdata())
     time.sleep(0.05)
@@ -511,7 +511,7 @@ def _make_dag_skill(name: str, idx: int, rng: random.Random):
         time.sleep(rng.uniform(0, 0.02))
         return agdata(val=idx), prev_ctx, []
 
-    sk.execute_react = fake_execute_react
+    sk.execute_harness = fake_execute_react
     return sk
 
 

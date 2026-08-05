@@ -1,23 +1,12 @@
 from __future__ import annotations
 
-import shlex
 from typing import TYPE_CHECKING
 from ..agdata import agdata
 from ..agtool import agtool
+from ..agtool_pure import glob_command, parse_glob_output, GLOB_PARAMS as _GLOB_PARAMS
 
 if TYPE_CHECKING:
     from ..agsandbox import agSandbox
-
-_LIMIT = 100
-
-_GLOB_PARAMS = {
-    "type": "object",
-    "properties": {
-        "pattern": {"type": "string", "description": "Glob pattern to match files against"},
-        "path": {"type": "string", "description": "Directory to search (defaults to /workspace)"},
-    },
-    "required": ["pattern"],
-}
 
 
 def make_glob(sandbox: "agSandbox") -> agtool:
@@ -27,15 +16,8 @@ def make_glob(sandbox: "agSandbox") -> agtool:
         pattern: str = str(arg.pattern)  # type: ignore[arg-type]
         path: str = str(getattr(arg, "path", "/workspace") or "/workspace")
 
-        output, _ = sandbox.exec(
-            f"rg --files --glob {shlex.quote(pattern)} {shlex.quote(path)} 2>/dev/null "
-            f"|| find {shlex.quote(path)} -name {shlex.quote(pattern)} -type f 2>/dev/null",
-            timeout=30,
-        )
-        files = [line.strip() for line in output.splitlines() if line.strip()]
-        truncated = len(files) > _LIMIT
-        files = sorted(files[:_LIMIT])
-        return agdata(files=files, count=len(files), truncated=truncated)
+        output, _ = sandbox.exec(glob_command(pattern, path), timeout=30)
+        return agdata(**parse_glob_output(output))
 
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:
         if tool._term is None:

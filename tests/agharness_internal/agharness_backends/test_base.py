@@ -11,9 +11,14 @@ from agency.agharness_internal.agharness_backends.opencode import _OpencodeBacke
 from agency.agharness_internal.agharness_backends.claude_code import _ClaudeCodeBackend
 from agency.agharness_internal.agharness_backends.codex import _CodexBackend
 from agency.agharness_internal.agharness_backends.grok import _GrokBackend
+from agency.agharness_internal.agharness_backends.native import _NativeBackend
 
 
 class TestForConfigDispatch:
+    def test_native_engine_returns_native_backend(self):
+        backend = agharness_backend.for_config("native", agConfig())
+        assert isinstance(backend, _NativeBackend)
+
     def test_opencode_engine_returns_opencode_backend(self):
         backend = agharness_backend.for_config("opencode", agConfig())
         assert isinstance(backend, _OpencodeBackend)

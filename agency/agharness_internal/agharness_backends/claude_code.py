@@ -137,15 +137,14 @@ class _ClaudeCodeBackend(agharness_backend):
         max_steps: "int | None",
         *,
         skill: "agskill",
+        extra_system: "str | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         import shlex
 
         from ... import agharness
-        from ..agproxy_llm import get_shared_gateway
         from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
-        from ..agproxy_ptrace_internal._in_container_launcher import start_llm_relay, stop_llm_relay
 
-        sys_msg = {"role": "system", "content": skill._build_system_prompt()}
+        sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
 
         binary = self.binary_path or self._DEFAULT_BINARY
         # See docs/Design_harness_integration.md's Prerequisites: a
@@ -169,28 +168,107 @@ class _ClaudeCodeBackend(agharness_backend):
             )
             return agerror(f"claude binary {binary!r} not found {where}"), prev_ctx, [sys_msg]
 
-        gateway = get_shared_gateway(ag.agconfig)
-        token = uuid.uuid4().hex
-        gateway.register(token, ag)
+        # A container-backed launch registers directly on the host-side
+        # terminus and reaches its own LLM traffic through an in-container
+        # agproxy_llm instance (Phase 2b-ii) -- no host-side agProxyLLM
+        # gateway involved at all for this launch. A bare-host/chroot
+        # launch keeps using the existing host-side shared gateway
+        # unchanged, since there's no container boundary to relocate
+        # anything across.
+        if in_container:
+            from ..agllm_terminus import get_shared_terminus
+            from ..agproxy_llm_in_container import ensure_agproxy_llm_in_container
+
+            gateway = None
+            terminus = get_shared_terminus(ag.agconfig)
+            token = uuid.uuid4().hex
+            terminus.register(token, ag)
+        else:
+            from ..agllm_terminus import get_shared_terminus
+            from ..agproxy_llm import get_shared_gateway
+
+            gateway = get_shared_gateway(ag.agconfig)
+            # Same shared singleton the in_container branch grabs directly
+            # above -- agProxyLLM.register()/unregister() already delegate
+            # to it internally (see agproxy_llm.py's own docstring: "the
+            # registry lives entirely on the terminus now"), so this is
+            # just naming a reference to state that already exists, not a
+            # second registration -- needed here only to read back this
+            # launch's recorded transcript after the run (Phase 5, below).
+            terminus = get_shared_terminus(ag.agconfig)
+            token = uuid.uuid4().hex
+            gateway.register(token, ag)
+
+        # Shared MCP server (Phase 4): the same resource-control
+        # (reserve_cpu/cpu_release/daemon_release) and output-submission
+        # (submit_output) tools native's in-container loop uses, reached
+        # here through Claude Code's own `--mcp-config` -- its one
+        # sanctioned "additive tool" extensibility seam, per
+        # docs/Design_harness_integration.md. Registered/bridged
+        # unconditionally (not just for structured-output skills) since
+        # resource tools are useful to every launch regardless of its
+        # output shape.
+        from ..agmcp_server import get_shared_mcp_server
+
+        mcp_server = get_shared_mcp_server(ag.agconfig)
+        mcp_server.register(token, ag, skill)
+        mcp_relay_proc = None
+        if in_container:
+            from ..agproxy_ptrace_internal._in_container_launcher import start_tcp_relay
+
+            # Same reasoning as agproxy_llm's pre-Phase-2b-ii relay: Claude
+            # Code's `--mcp-config` only understands a plain `http://host:port`
+            # URL, not a Unix domain socket path, so the bind-mounted UDS
+            # bridge to agmcp_server needs a container-local TCP front end.
+            mcp_relay_proc, mcp_relay_port = start_tcp_relay(
+                ag.sandbox, mcp_server.ensure_uds_started()
+            )
+            mcp_base_url = f"http://127.0.0.1:{mcp_relay_port}"
+        else:
+            # A bare-host/chroot launch runs directly on this host, so it
+            # can reach agmcp_server's own TCP listener with no bridging at
+            # all -- same reasoning as the non-container LLM gateway path
+            # above.
+            mcp_base_url = mcp_server.start()
 
         if in_container:
             config_home = agharness.materialize_config_home_in_container(ag, ag.sandbox, token)
         else:
             config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
 
-        relay_proc = None
-        try:
-            prompt = agharness.build_user_turn_prompt(skill, skill_input)
-            if not isinstance(prompt, str):
-                prompt = json.dumps(prompt)
-            extra = agharness.build_output_format_instruction(skill)
-            if extra:
-                prompt = prompt + extra
+        # Structured output requires collecting every required field via
+        # submit_output before this call can succeed (see
+        # build_mcp_output_format_instruction) -- bounded relaunch on
+        # incomplete output (Phase 6's "Outer" layer) only applies here; a
+        # raw-text/no-schema skill has nothing to retry on.
+        _use_structured_output = (
+            skill.output_schema is not None and skill.output_schema.raw_key() is None
+        )
+        output_schema_retries_left = skill.max_output_schema_retries
 
+        first_prompt = agharness.build_user_turn_prompt(skill, skill_input)
+        if not isinstance(first_prompt, str):
+            first_prompt = json.dumps(first_prompt)
+        extra = agharness.build_mcp_output_format_instruction(skill)
+        if extra:
+            first_prompt = first_prompt + extra
+
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        try:
             # Resume the prior native session for this agent, if any --
             # written into THIS launch's config_home before the CLI starts,
             # never persisted on the sandbox itself (see module docstring
-            # above / docs/Design_harness_history.md).
+            # above / docs/Design_harness_history.md). Also doubles as the
+            # resume target for a same-call output-schema retry below: once
+            # set (here, or by a completed attempt further down), every
+            # subsequent attempt in this same execute() call passes
+            # `--resume` too, since the physical session file lives in this
+            # same `config_home` the whole time -- no cross-directory blob
+            # copy needed for a same-call retry, only for the NEXT
+            # execute() call (a possibly different config_home), which is
+            # what the blob capture after each attempt is for.
             resume_session_id = None
             prior = ag._harness_sessions.get(_ENGINE_KEY)
             if prior and prior.get("session_id"):
@@ -234,47 +312,41 @@ class _ClaudeCodeBackend(agharness_backend):
                 }
             )
 
-            # --setting-sources "" -- load none of the user/project/local
-            # settings that would normally apply, so this run doesn't
-            # inherit the caller's own Claude Code configuration (matching
-            # the same isolated-config-home intent as opencode's own
-            # OPENCODE_CONFIG, just via a flag here instead of a file,
-            # since --settings/--setting-sources are what Claude Code
-            # itself provides for this). --settings is a separate flag
-            # that loads its JSON regardless of --setting-sources, which
-            # is what makes the agpolicy hook above reach `claude` at all.
-            argv = [
-                resolved,
-                "-p",
-                "--output-format",
-                "json",
-                "--setting-sources",
-                "",
-                "--settings",
-                hooks_settings,
-            ]
-            if resume_session_id:
-                argv += ["--resume", resume_session_id]
-            argv.append(prompt)
+            # --mcp-config -- point Claude Code's own native MCP client at
+            # the shared agmcp_server bridge set up above (resource-control
+            # + submit_output tools). --strict-mcp-config restricts this
+            # launch to ONLY that server, ignoring any other MCP config
+            # source -- redundant with the isolated config_home/cwd (no
+            # `.mcp.json` lives there) but cheap, explicit insurance against
+            # ever silently inheriting some other server.
+            mcp_config = json.dumps(
+                {
+                    "mcpServers": {
+                        "agency": {
+                            "type": "http",
+                            "url": f"{mcp_base_url}/mcp",
+                            "headers": {"Authorization": f"Bearer {token}"},
+                        }
+                    }
+                }
+            )
 
             if in_container:
-                # A harness running inside the container can't reach the
-                # gateway's TCP listener the way a host-level launch does
-                # (the gateway is bound on the HOST; this host's rootless
-                # Docker networking didn't make that reachable via either
-                # the bridge gateway IP or host.docker.internal, confirmed
-                # empirically). Bridge via a Unix domain socket instead --
-                # it crosses the container boundary as the bind-mounted
-                # filesystem object agsandbox already attaches to every
-                # container-backed sandbox (agutil.agharness_llm_gateway_dir),
-                # not a network hop, so it's unaffected by the runtime's
-                # networking mode. start_llm_relay() runs a small in-
-                # container process forwarding a container-local TCP port
-                # to that socket; ANTHROPIC_BASE_URL points at THAT port
-                # (the container's own loopback), not gateway.base_url.
-                uds_path = gateway.ensure_uds_started()
-                relay_proc, relay_port = start_llm_relay(ag.sandbox, uds_path)
-                base_url = f"http://127.0.0.1:{relay_port}"
+                # A harness running inside the container can't reach a
+                # host-bound TCP listener the way a host-level launch does
+                # (this host's rootless Docker networking didn't make that
+                # reachable via either the bridge gateway IP or
+                # host.docker.internal, confirmed empirically). Rather than
+                # relaying a container-local port to a host-side gateway
+                # (the previous design), agproxy_llm itself now runs AS an
+                # in-container process (Phase 2b-ii) -- ANTHROPIC_BASE_URL
+                # points directly at its own local port, no relay in
+                # between. It reaches the real, credential-holding
+                # agllm_terminus (registered above) over the same
+                # bind-mounted Unix domain socket
+                # (agutil.agharness_llm_gateway_dir) the old relay used,
+                # just terminating in a different process now.
+                base_url = ensure_agproxy_llm_in_container(ag.sandbox, ag.agconfig)
             else:
                 base_url = gateway.base_url
 
@@ -343,28 +415,65 @@ class _ClaudeCodeBackend(agharness_backend):
 
             px = agProxyPtrace(ag.agconfig)
             policy = agharness.default_policy(ag)
-            handle = px.launch(
-                argv, envp, cwd=str(config_home), policy=policy, ag=ag,
-                sandbox=ag.sandbox if in_container else None,
-            )
-            if ag.sandbox is not None:
-                wire_to_sandbox(handle, ag.sandbox)
 
-            stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
-            _dbg = os.environ.get("AGENCY_DEBUG_RAW_STDOUT_DUMP")
-            if _dbg:
-                with open(_dbg, "a") as _f:
-                    _f.write(f"rc={rc!r}\nstdout={stdout!r}\nstderr={stderr!r}\n---\n")
+            # Bounded relaunch on incomplete structured output (Phase 6's
+            # "Outer" layer, docs/Design_harness_integration.md): each
+            # attempt is a fresh `claude -p` process (one-shot by design),
+            # resumed via `--resume` from the 2nd attempt on so the model
+            # sees its own prior turn and the reprompt as one continuous
+            # conversation -- the same native session-continuity mechanism
+            # this backend already uses across SEPARATE execute() calls,
+            # just invoked within one call here. Only structured-output
+            # skills loop at all; a raw-text/no-schema skill runs once.
+            prompt = first_prompt
+            while True:
+                argv = [
+                    resolved,
+                    "-p",
+                    "--output-format",
+                    "json",
+                    "--setting-sources",
+                    "",
+                    "--settings",
+                    hooks_settings,
+                    "--mcp-config",
+                    mcp_config,
+                    "--strict-mcp-config",
+                ]
+                if resume_session_id:
+                    argv += ["--resume", resume_session_id]
+                argv.append(prompt)
 
-            # Capture the (possibly new/updated) session blob for next time
-            # -- MUST happen before config_home is torn down in `finally`
-            # below, since that's where this file physically lives for an
-            # in-container launch. Best-effort: a failure here means the
-            # NEXT call starts a fresh session instead of resuming, not
-            # that this call's own result is lost.
-            if rc == 0:
-                _, _, session_id = self._parse_result_json(stdout)
+                handle = px.launch(
+                    argv, envp, cwd=str(config_home), policy=policy, ag=ag,
+                    sandbox=ag.sandbox if in_container else None,
+                )
+                if ag.sandbox is not None:
+                    wire_to_sandbox(handle, ag.sandbox)
+
+                stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
+                _dbg = os.environ.get("AGENCY_DEBUG_RAW_STDOUT_DUMP")
+                if _dbg:
+                    with open(_dbg, "a") as _f:
+                        _f.write(f"rc={rc!r}\nstdout={stdout!r}\nstderr={stderr!r}\n---\n")
+
+                if rc != 0:
+                    break  # handled after the loop -- no retry on a hard launch failure
+
+                final_text, usage, session_id = self._parse_result_json(stdout)
+                if usage:
+                    total_input_tokens += usage.get("input_tokens", 0)
+                    total_output_tokens += usage.get("output_tokens", 0)
+
+                # Capture the (possibly new/updated) session blob for the
+                # NEXT execute() call -- MUST happen before config_home is
+                # torn down in `finally` below, since that's where this
+                # file physically lives for an in-container launch.
+                # Best-effort: a failure here means the next call starts a
+                # fresh session instead of resuming, not that this call's
+                # own result is lost.
                 if session_id:
+                    resume_session_id = session_id
                     try:
                         blob = _read_session_blob(
                             ag.sandbox, in_container, _session_path(str(config_home), session_id)
@@ -376,9 +485,51 @@ class _ClaudeCodeBackend(agharness_backend):
                             }
                     except Exception:
                         pass
+
+                # Snapshot whatever submit_output calls landed so far --
+                # read fresh every attempt (agmcp_server accumulates across
+                # calls for the same token, so a field submitted on attempt
+                # 1 is still there after a reprompt on attempt 2).
+                collected_output = mcp_server.collected_output(token)
+                if not _use_structured_output:
+                    break
+                required = set(skill.output_schema._data.keys())
+                missing = sorted(required - set(collected_output.keys()))
+                if not missing or output_schema_retries_left <= 0:
+                    break
+                output_schema_retries_left -= 1
+                prompt = (
+                    "[HARNESS SYSTEM] You have not yet provided all required output "
+                    f"fields. Still missing: {missing}. Call the submit_output tool "
+                    "once for each of them."
+                )
+
+            # Phase 5 (history unification): every wire-format-translating
+            # engine resends its full conversation on each LLM call, so the
+            # LAST dispatch agllm_terminus recorded for this token -- read
+            # ONCE here, after the whole retry loop (not per-attempt) --
+            # already covers every turn across every attempt, including a
+            # --resume'd reprompt. MUST happen before `unregister()` below
+            # discards it. None if this token's process never actually
+            # reached agllm_terminus at all (e.g. a mocked test, or a launch
+            # that failed before making any LLM call) -- callers fall back
+            # to the coarser 2-message shape in that case.
+            transcript = terminus.transcript_for_token(token)
         finally:
-            gateway.unregister(token)
-            stop_llm_relay(relay_proc)
+            if in_container:
+                terminus.unregister(token)
+            else:
+                gateway.unregister(token)
+            mcp_server.unregister(token)
+            if mcp_relay_proc is not None:
+                # Per-launch relay subprocess -- torn down every time. Never
+                # `mcp_server.stop()` here: it's the same shared, lazily-
+                # started singleton `get_shared_gateway`'s own TCP listener
+                # is (never stopped per-launch either), reused by every
+                # subsequent launch in this process.
+                from ..agproxy_ptrace_internal._in_container_launcher import stop_tcp_relay
+
+                stop_tcp_relay(mcp_relay_proc)
             if in_container:
                 agharness.cleanup_config_home_in_container(ag.sandbox, config_home)
             else:
@@ -391,21 +542,46 @@ class _ClaudeCodeBackend(agharness_backend):
                 [sys_msg],
             )
 
-        final_text, usage, _session_id = self._parse_result_json(stdout)
-        user_msg = {"role": "user", "content": prompt}
-        assistant_msg = {"role": "assistant", "content": final_text}
-
-        if skill.output_schema is not None and skill.output_schema.raw_key() is None:
-            result, _paths = skill.output_schema.validate_and_recover(final_text, ag.sandbox)
+        if _use_structured_output:
+            required = set(skill.output_schema._data.keys())
+            missing = sorted(required - set(collected_output.keys()))
+            if missing:
+                result = agerror(
+                    "structured output incomplete after "
+                    f"{skill.max_output_schema_retries - output_schema_retries_left} retry/retries "
+                    "-- submit_output was never called for: " + ", ".join(missing)
+                )
+            else:
+                result = agdata(**collected_output)
         else:
             out_key = skill.output_schema.raw_key() if skill.output_schema is not None else "result"
             result = agdata(**{out_key: final_text})
 
-        if usage:
-            prev_ctx.total_input_tokens += usage.get("input_tokens", 0)
-            prev_ctx.total_output_tokens += usage.get("output_tokens", 0)
-        prev_ctx.messages = [user_msg, assistant_msg]
-        return result, prev_ctx, [sys_msg, user_msg, assistant_msg]
+        prev_ctx.total_input_tokens += total_input_tokens
+        prev_ctx.total_output_tokens += total_output_tokens
+
+        if transcript:
+            # Drop the leading system message the same way agskill.py's own
+            # native loop drops messages[0] when building prev_ctx.messages
+            # (agskill.py's `messages[1:]`) -- callers get `sys_msg` above
+            # for logging/the returned delta, never inside `ctx.messages`
+            # itself. This is the real turn-by-turn conversation (tool
+            # calls/results included), not the old flattened 2-message
+            # collapse -- retiring that collapse is the whole point of
+            # Phase 5 (docs/Design_harness_integration.md).
+            history = transcript[1:] if transcript[0].get("role") == "system" else transcript
+            prev_ctx.messages = history
+            delta = [sys_msg] + history
+        else:
+            # This token's launch never reached agllm_terminus at all (a
+            # mocked test double, or a real launch that failed before any
+            # LLM call happened) -- fall back to the coarse shape rather
+            # than silently returning an empty history.
+            user_msg = {"role": "user", "content": first_prompt}
+            assistant_msg = {"role": "assistant", "content": final_text}
+            prev_ctx.messages = [user_msg, assistant_msg]
+            delta = [sys_msg, user_msg, assistant_msg]
+        return result, prev_ctx, delta
 
     @staticmethod
     def _parse_result_json(stdout: str) -> "tuple[str, dict, str | None]":

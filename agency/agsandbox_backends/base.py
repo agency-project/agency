@@ -529,6 +529,20 @@ class agsandbox_backend(AgSandboxBackendFields):
 
         return clean_output, rc
 
+    def exec_detached(self, cmd: str, workdir: str = "/workspace") -> None:
+        """Launch a long-lived process inside the container and return as
+        soon as it's registered, without waiting for it to finish or
+        tracking its output/exit code -- for a persistent in-container
+        process the caller will reach afterward over its own bridge (e.g.
+        agharness_backends/native.py's react-loop entrypoint, or a
+        container-relocated agproxy_llm), not via this call's return value.
+        No GPU/PID-tracking wiring here, unlike `exec()` -- a persistent
+        process manages its own environment for the lifetime of the
+        container, it isn't a single bounded command. Only implemented by
+        container-backed backends (docker/podman) so far -- see
+        `_container_exec_detached` in agsandbox_backends/container.py."""
+        self._container_exec_detached(cmd, workdir=workdir)
+
     def read_file(self, path: str) -> str:
         """Read a text file from the container.
 

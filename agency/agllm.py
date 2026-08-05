@@ -1,29 +1,12 @@
 from __future__ import annotations
-import random
 import re
-import ssl
-import threading
 import time
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
-from .agutil import _iter_batched, _strip_thinking, _extract_thinking, _LLMIdleTimeout
-from .agllm_backends import (
-    agllm_backend,
-    AgLLMBackendFields,
-    BAD_REQUEST_EXCS,
-    API_CONN_EXCS,
-    RATE_LIMIT_EXCS,
-    API_ERROR_EXCS,
-)
+from . import agllm_pure
+from .agutil import _strip_thinking, _extract_thinking
+from .agllm_backends import agllm_backend, AgLLMBackendFields
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
-
-if TYPE_CHECKING:
-    from .agterm import agterm
-    from .aglog import aglog
-    from .agcontext import agcontext
 
 
 # Exists to register agllm's config fields (via __set_name__ at import time)
@@ -102,92 +85,18 @@ class agLLMConfig(_AgConfigViewBase):
     _OWNER = "agllm"
 
 
-# Tier-1 (global class) config: lazily created on first use so a caller can
-# override the limit via agllm.call_max_concurrency = N (or cfg.agllm.call_max_concurrency
-# = N before any agllm exists) before the first LLM call in the process.
-_llm_call_semaphore: threading.Semaphore | None = None
-_llm_call_semaphore_init_lock = threading.Lock()
+# _llm_call_semaphore/_get_llm_call_semaphore/_llm_call_semaphore_slot were
+# retired here along with agllm.call() itself, their only caller.
 
 
-def _get_llm_call_semaphore() -> threading.Semaphore:
-    global _llm_call_semaphore
-    if _llm_call_semaphore is None:
-        with _llm_call_semaphore_init_lock:
-            if _llm_call_semaphore is None:
-                limit = _AgLLMFields().call_max_concurrency
-                _llm_call_semaphore = threading.Semaphore(limit)
-    return _llm_call_semaphore
+# _SUMMARY_SYSTEM lives in agllm_pure.py now (agllm_pure.SUMMARY_SYSTEM) --
+# shared, unmodified, with the in-container native entrypoint's own
+# compaction (see that module's docstring for why it's split out).
 
 
-_SUMMARY_SYSTEM = """\
-You are a conversation summariser. Produce a concise structured summary of \
-the conversation history provided. Preserve ALL critical details: decisions, \
-file paths, error messages, constraints, user preferences, and tool outputs.
 
-Format exactly (keep every heading, even if a section is empty):
-
-## Goal
-<one sentence describing the overall task>
-
-## Constraints & Preferences
-<bullet list — coding style, output format, naming conventions, user instructions \
-that must be respected going forward>
-
-## Progress
-- Done: <completed subtasks>
-- In progress: <current subtask>
-- Blocked: <anything stuck and why>
-
-## Key Decisions
-<bullet list of decisions made and the reasons>
-
-## Next Steps
-<ordered bullet list of what remains to be done>
-
-## Critical Context
-<facts the agent must remember: variable values, flags, invariants, API responses>
-
-## Relevant Files
-<bullet list of every file path created, read, or modified>\
-"""
-
-
-# ---------------------------------------------------------------------------
-# Semaphore slot context manager
-# ---------------------------------------------------------------------------
-
-
-@contextmanager
-def _llm_call_semaphore_slot():
-    sem = _get_llm_call_semaphore()
-    sem.acquire()
-    try:
-        yield
-    finally:
-        sem.release()
-
-
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class LLMCallResult:
-    conn_error: "Exception | None" = None
-    context_exceeded: bool = False
-    content_parts: "list[str]" = field(default_factory=list)
-    reasoning_parts: "list[str]" = field(default_factory=list)
-    tool_calls_raw: "dict[int, dict]" = field(default_factory=dict)
-    prompt_tokens: "int | None" = None
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    elapsed_ms: int = 0
-
-    @property
-    def ok(self) -> bool:
-        return self.conn_error is None and not self.context_exceeded
-
+# LLMCallResult was retired here along with agllm.call() itself, its only
+# production constructor.
 
 # ---------------------------------------------------------------------------
 # agllm class
@@ -229,273 +138,11 @@ class agllm(_AgLLMFields):
     def build_kwargs(self, messages: list[dict], openai_tools: "list | None" = None) -> dict:
         return agllm.build_llm_kwargs(self.backend, messages, openai_tools)
 
-    def _retry_backoff_s(self, exc: Exception, attempt: int) -> float:
-        """Seconds to sleep before retrying `exc` at 0-indexed `attempt`.
-
-        A rate limit honors the server's Retry-After header when present (it
-        knows exactly when the org's per-minute window resets); otherwise --
-        and for connection/timeout/API errors, which an overloaded backend
-        raises just as often as a 429 -- this falls back to bounded
-        exponential backoff with full jitter, so a sustained overload gets a
-        growing wait instead of every retry hammering the backend at the same
-        fixed interval.
-        """
-        if isinstance(exc, RATE_LIMIT_EXCS):
-            _retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("retry-after")
-            try:
-                # Jitter is added on top, never subtracted -- the header is a
-                # floor, not a target, so we never retry sooner than the
-                # server said to.
-                return float(_retry_after) + random.uniform(0, self.rate_limit_retry_after_jitter_s)
-            except (TypeError, ValueError):
-                pass
-            _base = self.rate_limit_base_backoff_s
-        else:
-            _base = self.retry_sleep_s
-        _backoff = min(self.rate_limit_max_backoff_s, _base * (2**attempt))
-        return random.uniform(0, _backoff)
-
-    def call(
-        self,
-        kwargs: dict,
-        messages: list[dict],
-        term: "agterm | None",
-        state_fn: "Callable | None",
-        live_messages_fn: "Callable | None",
-        update_ui_token_count_fn: "Callable | None",
-        total_input_tokens: int,
-        total_output_tokens: int,
-        skill_name: str,
-        full_history_fn: "Callable | None" = None,
-        call_tag: str = "",
-    ) -> "LLMCallResult":
-        """Execute a streaming LLM call, retrying on transient connection errors.
-
-        `call_tag` is purely cosmetic -- it's stamped onto this call's log lines
-        (e.g. "[compact]") so a caller that isn't the main ReAct loop (compact(),
-        or any future one-off completion) is distinguishable in the log from a
-        regular skill turn. Leave it blank for the default ReAct-loop call.
-
-        Returns an LLMCallResult. Caller checks .ok and .conn_error.
-        """
-        backend = self.backend
-        _tag = f"[{call_tag}] " if call_tag else ""
-
-        kwargs = dict(kwargs)  # shallow copy so we don't mutate caller's dict
-        kwargs["stream"] = True
-        kwargs["stream_options"] = {"include_usage": True}
-
-        _initial_input_tokens = total_input_tokens
-        _initial_output_tokens = total_output_tokens
-        _llm_elapsed_ms = 0
-
-        _PARTIAL_THINK_RE = re.compile(
-            r"<think(?:ing)?>(.*?)(?:</think(?:ing)?>|$)", re.DOTALL | re.IGNORECASE
-        )
-
-        for attempt in range(self.max_retries):
-            content_parts: list[str] = []
-            reasoning_parts: list[str] = []
-            tool_calls_raw: dict[int, dict] = {}
-            prompt_tokens: int | None = None
-            total_input_tokens = _initial_input_tokens
-            total_output_tokens = _initial_output_tokens
-            _retry_err: "Exception | None" = None
-            _retry_sleep_s: float = self.retry_sleep_s
-
-            with _llm_call_semaphore_slot():
-                client = self.backend.make_client(
-                    httpx.Timeout(
-                        connect=self.http_connect_timeout,
-                        read=None,
-                        write=self.http_write_timeout,
-                        pool=self.http_pool_timeout,
-                    ),
-                )
-
-                if term:
-                    term.log(
-                        "LLM ▶    ",
-                        f"{_tag}model={(backend.model or '?')}  messages={len(messages)}  idle_timeout={self.idle_timeout:.0f}s  stream_timeout={self.stream_timeout:.0f}s",
-                    )
-                if state_fn:
-                    state_fn("llm", skill=skill_name)
-
-                _llm_t0 = time.monotonic()
-
-                partial_msg: dict = {"role": "assistant", "content": ""}
-                messages.append(partial_msg)
-                if live_messages_fn:
-                    live_messages_fn(messages[1:])
-                _live_chars = 0
-
-                try:
-                    for batch in _iter_batched(
-                        client.chat.completions.create(**kwargs),
-                        idle_timeout=self.idle_timeout,
-                        stream_timeout=self.stream_timeout,
-                    ):
-                        for chunk in batch:
-                            if chunk.usage is not None:
-                                prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
-                                total_input_tokens += prompt_tokens
-                                total_output_tokens += (
-                                    getattr(chunk.usage, "completion_tokens", 0) or 0
-                                )
-                                if term is not None:
-                                    term._tokens = prompt_tokens
-                            if not chunk.choices:
-                                continue
-                            delta = chunk.choices[0].delta
-
-                            extra = getattr(delta, "model_extra", None) or {}
-                            rc = getattr(delta, "reasoning_content", None)
-                            if not isinstance(rc, str):
-                                rc = extra.get("reasoning_content")
-                            if not isinstance(rc, str):
-                                rc = extra.get("reasoning")
-                            if isinstance(rc, str) and rc:
-                                reasoning_parts.append(rc)
-                                partial_msg["_thinking"] = "".join(reasoning_parts)
-
-                            if delta.content:
-                                content_parts.append(delta.content)
-                                raw = "".join(content_parts)
-                                m = _PARTIAL_THINK_RE.search(raw)
-                                if m:
-                                    partial_msg["_thinking"] = m.group(1).strip()
-                                    partial_msg["content"] = _strip_thinking(raw)
-                                else:
-                                    partial_msg["content"] = raw
-
-                            new_chars = len(partial_msg.get("content", "")) + len(
-                                partial_msg.get("_thinking", "")
-                            )
-                            if (
-                                live_messages_fn
-                                and new_chars - _live_chars >= self.live_redraw_char_threshold
-                            ):
-                                live_messages_fn(messages[1:])
-                                _live_chars = new_chars
-                            if delta.tool_calls:
-                                for tc_delta in delta.tool_calls:
-                                    slot = tool_calls_raw.setdefault(
-                                        tc_delta.index,
-                                        {
-                                            "id": "",
-                                            "type": "function",
-                                            "function": {"name": "", "arguments": ""},
-                                        },
-                                    )
-                                    if tc_delta.id:
-                                        slot["id"] = tc_delta.id
-                                    if tc_delta.function:
-                                        if tc_delta.function.name:
-                                            slot["function"]["name"] += tc_delta.function.name
-                                        if tc_delta.function.arguments:
-                                            slot["function"]["arguments"] += (
-                                                tc_delta.function.arguments
-                                            )
-
-                except BAD_REQUEST_EXCS as _bad_req:
-                    try:
-                        client.close()
-                    except Exception as _close_err:
-                        print(
-                            f"[agllm] WARNING: failed to close client during error handling: {_close_err}"
-                        )
-                    messages.pop()
-                    _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-                    _err_str = str(_bad_req).lower()
-                    if any(
-                        kw in _err_str
-                        for kw in (
-                            "context_length_exceeded",
-                            "maximum context length",
-                            "context length",
-                            "too long",
-                            "reduce the length",
-                        )
-                    ):
-                        if term:
-                            term.log(
-                                "LLM ✗    ",
-                                f"{_tag}model={(backend.model or '?')}  context length exceeded — will compact and retry",
-                            )
-                        return LLMCallResult(context_exceeded=True, elapsed_ms=_llm_elapsed_ms)
-                    if term:
-                        term.log(
-                            "LLM ✗    ",
-                            f"{_tag}model={(backend.model or '?')}  bad request: {_bad_req}",
-                        )
-                    return LLMCallResult(conn_error=_bad_req, elapsed_ms=_llm_elapsed_ms)
-
-                except RATE_LIMIT_EXCS + (
-                    (_LLMIdleTimeout, ssl.SSLError, OSError, httpx.TransportError)
-                    + API_CONN_EXCS
-                    + API_ERROR_EXCS
-                ) as _transient_err:
-                    try:
-                        client.close()
-                    except Exception as _close_err:
-                        print(
-                            f"[agllm] WARNING: failed to close client during error handling: {_close_err}"
-                        )
-                    messages.pop()
-                    _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-                    if isinstance(_transient_err, RATE_LIMIT_EXCS):
-                        _err_desc = f"rate limited: {_transient_err}"
-                    elif isinstance(_transient_err, API_CONN_EXCS):
-                        _err_desc = f"Connection error: LLM backend unreachable ({_transient_err.__cause__ or _transient_err})"
-                    elif isinstance(_transient_err, API_ERROR_EXCS):
-                        _err_desc = f"API error: {_transient_err}"
-                    else:
-                        _err_desc = str(_transient_err)
-                    _retry_sleep_s = self._retry_backoff_s(_transient_err, attempt)
-                    if attempt < self.max_retries - 1:
-                        if term:
-                            term.log(
-                                "LLM ✗    ",
-                                f"{_tag}model={(backend.model or '?')}  {_err_desc}  "
-                                f"retry {attempt + 1}/{self.max_retries - 1} in {_retry_sleep_s:.1f}s",
-                            )
-                        _retry_err = _transient_err
-                    else:
-                        if term:
-                            term.log(
-                                "LLM ✗    ",
-                                f"{_tag}model={(backend.model or '?')}  {_err_desc}  all retries exhausted",
-                            )
-                        return LLMCallResult(conn_error=_transient_err, elapsed_ms=_llm_elapsed_ms)
-
-                else:
-                    messages.pop()  # remove partial placeholder
-                    _llm_elapsed_ms = int((time.monotonic() - _llm_t0) * 1000)
-
-            if _retry_err is not None:
-                if full_history_fn:
-                    full_history_fn(
-                        {"type": "llm_retry", "error": str(_retry_err), "attempt": attempt + 1}
-                    )
-                time.sleep(_retry_sleep_s)
-                continue
-            break  # success
-
-        if update_ui_token_count_fn is not None:
-            try:
-                update_ui_token_count_fn(total_input_tokens, total_output_tokens)
-            except Exception as _e:
-                print(f"[agllm] WARNING: update_ui_token_count_fn raised: {_e}")
-
-        return LLMCallResult(
-            content_parts=content_parts,
-            reasoning_parts=reasoning_parts,
-            tool_calls_raw=tool_calls_raw,
-            prompt_tokens=prompt_tokens,
-            total_input_tokens=total_input_tokens,
-            total_output_tokens=total_output_tokens,
-            elapsed_ms=_llm_elapsed_ms,
-        )
+    # _retry_backoff_s()/call() were retired here along with execute_react()
+    # itself: call()'s only production caller. The terminus does its own
+    # single-attempt streaming dispatch (never calls agllm.call()); native's
+    # entrypoint dispatches via its own _dispatch_via_terminus with its own,
+    # differently-scoped retry policy (see that function's docstring).
 
     # ------------------------------------------------------------------
     # Static methods — pure functions on config/data, no instance needed
@@ -629,15 +276,14 @@ class agllm(_AgLLMFields):
 
     @staticmethod
     def estimate_messages_tokens(messages: list[dict]) -> int:
-        """Rough total token count for a list of messages (~4 chars per token)."""
-        return sum(agllm._estimate_tokens(m) for m in messages)
+        """Rough total token count for a list of messages (~4 chars per
+        token) -- delegates to agllm_pure, shared with the in-container
+        native entrypoint's own compaction (see that module's docstring)."""
+        return agllm_pure.estimate_messages_tokens(messages)
 
     @staticmethod
     def _estimate_tokens(msg: dict) -> int:
-        chars = len(msg.get("content") or "")
-        for tc in msg.get("tool_calls") or []:
-            chars += len(tc.get("function", {}).get("arguments", ""))
-        return max(1, chars // _AgLLMFields.CHARS_PER_TOKEN)
+        return agllm_pure.estimate_tokens(msg)
 
     @staticmethod
     def count_messages_tokens(messages: list[dict], llm_config: "agConfig | agllm_backend") -> int:
@@ -672,215 +318,24 @@ class agllm(_AgLLMFields):
 
     @staticmethod
     def should_compact(prompt_tokens: int, context_limit: int) -> bool:
-        return prompt_tokens >= int(context_limit * _AgLLMFields.COMPACT_THRESHOLD)
+        return agllm_pure.should_compact(prompt_tokens, context_limit)
 
     @staticmethod
     def _tail_start(
         conv: list[dict], context_limit: int, tail_turns: int = _AgLLMFields.tail_turns.default
     ) -> int:
-        if not conv:
-            return 0
-        usable = int(context_limit * _AgLLMFields.COMPACT_THRESHOLD)
-        tail_budget = max(
-            _AgLLMFields.TAIL_MIN_TOKENS,
-            min(_AgLLMFields.TAIL_MAX_TOKENS, int(usable * _AgLLMFields.TAIL_FRACTION)),
-        )
-        turns_kept = 0
-        tokens_kept = 0
-        result = len(conv)
-        i = len(conv) - 1
-        while i >= 0 and turns_kept < tail_turns:
-            if conv[i]["role"] != "assistant":
-                i -= 1
-                continue
-            turn_end = i + 1
-            while turn_end < len(conv) and conv[turn_end]["role"] == "tool":
-                turn_end += 1
-            turn_tokens = sum(agllm._estimate_tokens(conv[k]) for k in range(i, turn_end))
-            if tokens_kept + turn_tokens > tail_budget and turns_kept > 0:
-                break
-            tokens_kept += turn_tokens
-            turns_kept += 1
-            result = i
-            i -= 1
-        return result
+        return agllm_pure.tail_start(conv, context_limit, tail_turns)
 
     @staticmethod
     def _prune_tool_outputs(messages: list[dict]) -> list[dict]:
-        """Trim oversized tool results; only activates when savings reach _AgLLMFields.PRUNE_MIN_FREE_TOKENS."""
-        savings_chars = sum(
-            len(m.get("content") or "") - _AgLLMFields.TOOL_OUTPUT_MAX_CHARS
-            for m in messages
-            if m["role"] == "tool"
-            and len(m.get("content") or "") > _AgLLMFields.TOOL_OUTPUT_MAX_CHARS
-        )
-        if savings_chars // 4 < _AgLLMFields.PRUNE_MIN_FREE_TOKENS:
-            return messages
-        result = []
-        for m in messages:
-            if m["role"] == "tool":
-                content = m.get("content") or ""
-                if len(content) > _AgLLMFields.TOOL_OUTPUT_MAX_CHARS:
-                    m = {
-                        **m,
-                        "content": content[: _AgLLMFields.TOOL_OUTPUT_MAX_CHARS] + "\n[truncated]",
-                    }
-            result.append(m)
-        return result
+        """Trim oversized tool results; only activates when savings reach
+        agllm_pure.PRUNE_MIN_FREE_TOKENS."""
+        return agllm_pure.prune_tool_outputs(messages)
 
-    def compact(
-        self,
-        messages: list[dict],
-        *,
-        context_limit: "int | None" = None,
-        tail_turns: "int | None" = None,
-        previous_summary: "str | None" = None,
-        term: "agterm | None" = None,
-    ) -> "tuple[list[dict], str]":
-        """Summarise old messages; return compacted list and new summary."""
-        # tail_turns can't default to self.tail_turns in the signature — a default
-        # expression binds once at function-definition time, so it would never
-        # see a later agconfig override. Resolve it here instead.
-        if tail_turns is None:
-            tail_turns = self.tail_turns
-        cl = (
-            context_limit
-            if context_limit is not None
-            else (self.context_limit or self.default_context_limit)
-        )
-        if messages and messages[0]["role"] == "system":
-            sys_msg: list[dict] = [messages[0]]
-            conv = messages[1:]
-        else:
-            sys_msg = []
-            conv = list(messages)
-        ts = agllm._tail_start(conv, cl, tail_turns)
-        task_input: list[dict] = conv[:1]
-        head = conv[1:ts]
-        tail = conv[ts:]
-        if not head:
-            return messages, previous_summary or ""
-        head = agllm._prune_tool_outputs(head)
-        lines: list[str] = []
-        if previous_summary:
-            lines.append(
-                f"Previous summary (update it — keep true facts, remove stale ones, "
-                f"add new ones):\n{previous_summary}\n\nNew conversation to integrate:"
-            )
-        else:
-            lines.append("Conversation to summarise:")
-        if task_input:
-            lines.append(
-                f"[task input]: {(task_input[0].get('content') or '')[: self.summary_task_input_max_chars]}"
-            )
-        for m in head:
-            role = m.get("role", "?")
-            content = (m.get("content") or "").strip()
-            tool_calls = m.get("tool_calls")
-            if role == "assistant" and tool_calls:
-                names = ", ".join(tc["function"]["name"] for tc in tool_calls)
-                lines.append(f"[assistant → tools: {names}]")
-                if content:
-                    lines.append(f"  {content[: self.summary_assistant_content_max_chars]}")
-            elif role == "tool":
-                lines.append(f"[tool result]: {content[: _AgLLMFields.TOOL_OUTPUT_MAX_CHARS]}")
-            elif content:
-                lines.append(f"[{role}]: {content[: self.summary_role_content_max_chars]}")
-        compact_kwargs: dict = dict(
-            model=self.backend.model or "",
-            messages=[
-                {"role": "system", "content": _SUMMARY_SYSTEM},
-                {"role": "user", "content": "\n".join(lines)},
-            ],
-        )
-        compact_kwargs["max_completion_tokens"] = self.summary_max_tokens
-        if self.backend.extra_body:
-            compact_kwargs["extra_body"] = self.backend.extra_body
-        # `[]` below is scratch space call() uses to append/pop a live-streaming
-        # placeholder -- it's not what's sent over the wire (that's
-        # compact_kwargs["messages"] above), so an empty list is fine here.
-        result = self.call(
-            compact_kwargs,
-            [],
-            term,
-            None,
-            None,
-            None,
-            0,
-            0,
-            "compact",
-            call_tag="compact",
-        )
-        if not result.ok:
-            raise result.conn_error or RuntimeError(
-                "compact(): summarisation request itself exceeded the context limit"
-            )
-        summary = "".join(result.content_parts).strip()
-        injection: list[dict] = [
-            {
-                "role": "user",
-                "content": (
-                    "[HARNESS SYSTEM] [Conversation history summary — treat as established context, "
-                    "do not ask to re-confirm]\n" + summary
-                ),
-            },
-            {
-                "role": "assistant",
-                "content": "[HARNESS SYSTEM] Understood. I'll continue from this context.",
-            },
-        ]
-        return sys_msg + task_input + injection + tail, summary
-
-    def maybe_compact(
-        self,
-        ctx: "agcontext",
-        messages: list[dict],
-        prompt_tokens: "int | None",
-        *,
-        term: "agterm | None" = None,
-        log: "aglog | None" = None,
-        _live_messages_fn: "Callable | None" = None,
-        skill_name: str = "",
-        agname: str = "",
-        force: bool = False,
-    ) -> "tuple[list[dict], int]":
-        """Compact history if needed; mutates ctx.compaction_summary in place.
-
-        Returns (messages, token_estimate) where token_estimate is:
-          - chars/4 estimate of the messages when prompt_tokens is None
-          - the API-reported count when prompt_tokens is provided
-          - re-estimated on the compacted messages after compaction fires
-          - 0 when context_limit is None (caller should not rely on the value)
-        """
-        if self.context_limit is None:
-            return messages, 0
-        if prompt_tokens is None:
-            token_count = agllm.estimate_messages_tokens(messages)
-            label = f"tokens~{token_count}/{self.context_limit}  msgs={len(messages)}  (pre-call estimate)"
-        else:
-            token_count = prompt_tokens
-            label = f"tokens={token_count}/{self.context_limit}  msgs={len(messages)}"
-        if not force and not agllm.should_compact(token_count, self.context_limit):
-            return messages, token_count
-        if term:
-            term.log("COMPACT  ", f"skill={skill_name}  {label}")
-        msgs_before = len(messages)
-        messages, ctx.compaction_summary = self.compact(
-            messages,
-            context_limit=self.context_limit,
-            previous_summary=ctx.compaction_summary,
-            term=term,
-        )
-        if log:
-            log._lifecycle(
-                "compacted",
-                agname=agname,
-                skill=skill_name,
-                prompt_tokens=token_count,
-                context_limit=self.context_limit,
-                msgs_before=msgs_before,
-                msgs_after=len(messages),
-            )
-        if _live_messages_fn:
-            _live_messages_fn(messages[1:])
-        return messages, agllm.estimate_messages_tokens(messages)
+    # compact()/maybe_compact() were retired here along with execute_react()
+    # itself: their only production caller. Native's own compaction
+    # (_native_in_container_entrypoint.py's _maybe_compact) uses the same
+    # algorithm via the still-alive, still-tested agllm_pure.py (see
+    # tests/test_agllm_pure.py and this file's own estimate_tokens/prune/
+    # tail_start/should_compact static methods above, all thin delegates to
+    # that module).
