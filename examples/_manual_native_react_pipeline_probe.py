@@ -1,18 +1,17 @@
-"""Manual probe (not pytest): same engine="claude_code" Agency harness
-pipeline as claude_code_example.py, but running the same 6-step
-multi-file task used in the direct-CLI native-Bedrock vs ANTHROPIC_BASE_URL
-comparison, so the two can be compared apples-to-apples.
+"""Manual probe (not pytest): Agency's native in-container ReAct loop.
 
-Set AGENCY_DEBUG_CAPTURE_LOG to a file path to have agproxy_llm dump raw
-incoming /v1/messages bodies (roles, mid-array system messages, reminder
-markers) before any adapter transformation.
+This is deliberately parallel to ``_manual_v1messages_pipeline_probe.py``:
+it runs the same 6-step multi-file task with the same schemas and LLM
+configuration, but selects ``engine="native"``. It therefore tests the
+native backend through the same public ``agent.run()`` harness abstraction
+that the Claude Code probe uses, without the Claude CLI or its /v1/messages
+adapter in the path.
 
 Run:
     LLM_BASE_URL=https://your-openai-compatible-endpoint/v1 \
     LLM_API_KEY=your-api-key \
     LLM_MODEL=your-tool-capable-model \
-    AGENCY_DEBUG_CAPTURE_LOG=/tmp/agproxy_v1msgs_pipeline.log \
-    .venv/bin/python3 examples/_manual_v1messages_pipeline_probe.py
+    .venv/bin/python3 examples/_manual_native_react_pipeline_probe.py
 
 With no LLM_BASE_URL, this falls back to Bedrock and requires AWS credentials.
 Set LLM_REGION to select the Bedrock region (default: us-east-1).
@@ -20,10 +19,12 @@ Set LLM_REGION to select the Bedrock region (default: us-east-1).
 
 import os
 from pathlib import Path
-from agency import agent, agskill, agdata
+
+from agency import agent, agdata, agskill
 from agency.agconfig import agConfig
 from agency.agllm_backends import agBedrockBackendConfig, agVLLMBackendConfig
 from agency.agtype import agpath
+
 
 if os.environ.get("LLM_BASE_URL"):
     cfg = agConfig(
@@ -62,7 +63,7 @@ TASK_PROMPT = (
 
 
 def main():
-    run_dir = _make_run_dir("v1messages_pipeline_probe")
+    run_dir = _make_run_dir("native_react_pipeline_probe")
     agent.log_dir = run_dir / "logs"
     agent.output_dir = run_dir / "agent_output"
     print(f"Run dir  : {run_dir}\n")
@@ -86,7 +87,10 @@ def main():
         ),
     )
 
-    ag = agent(agconfig=cfg, engine="claude_code")
+    # ``native`` is an agharness backend too: its ReAct loop runs inside
+    # the sandbox container and is reached through the same agent.run()
+    # dispatch contract as an external harness engine.
+    ag = agent(agconfig=cfg, engine="native")
 
     print(">> [file_manager] 6-step multi-file ocean-facts task")
     r1 = ag.run(

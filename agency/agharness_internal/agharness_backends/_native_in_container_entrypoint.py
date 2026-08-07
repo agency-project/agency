@@ -308,7 +308,9 @@ def _run_glob_tool(arguments_json: str) -> str:
     try:
         proc = subprocess.run(
             ["bash", "-c", _agtool_pure.glob_command(pattern, path)],
-            capture_output=True, timeout=30, text=True,
+            capture_output=True,
+            timeout=30,
+            text=True,
         )
         return json.dumps(_agtool_pure.parse_glob_output(proc.stdout))
     except Exception as e:
@@ -323,7 +325,9 @@ def _run_grep_tool(arguments_json: str) -> str:
     try:
         proc = subprocess.run(
             ["bash", "-c", _agtool_pure.grep_command(pattern, path, include)],
-            capture_output=True, timeout=30, text=True,
+            capture_output=True,
+            timeout=30,
+            text=True,
         )
         return json.dumps(_agtool_pure.parse_grep_json_output(proc.stdout))
     except Exception as e:
@@ -434,7 +438,9 @@ def _offload_if_oversized(fn_name: str, tc_id: str, result_content: str) -> str:
         return result_content
     try:
         parsed = json.loads(result_content)
-        file_body = parsed.get("content", result_content) if isinstance(parsed, dict) else result_content
+        file_body = (
+            parsed.get("content", result_content) if isinstance(parsed, dict) else result_content
+        )
     except json.JSONDecodeError:
         file_body = result_content
     if not isinstance(file_body, str):
@@ -452,7 +458,9 @@ def _offload_if_oversized(fn_name: str, tc_id: str, result_content: str) -> str:
             }
         )
     except Exception as e:
-        print(f"[native-entrypoint] WARNING: failed to offload large tool output to {offload_path}: {e}")
+        print(
+            f"[native-entrypoint] WARNING: failed to offload large tool output to {offload_path}: {e}"
+        )
         return result_content
 
 
@@ -469,7 +477,10 @@ _TOOL_DISPATCH = {
 
 
 def _tool_schema(name: str, description: str, params: dict) -> dict:
-    return {"type": "function", "function": {"name": name, "description": description, "parameters": params}}
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": params},
+    }
 
 
 # Same name/params/description as the host-side sandboxed tools
@@ -549,9 +560,10 @@ def _mcp_tool_schemas(mcp_sock: str, token: str) -> list:
         http_client = httpx2.AsyncClient(
             transport=transport, headers={"Authorization": f"Bearer {token}"}
         )
-        async with streamable_http_client(
-            "http://agmcp-server/mcp", http_client=http_client
-        ) as (read, write):
+        async with streamable_http_client("http://agmcp-server/mcp", http_client=http_client) as (
+            read,
+            write,
+        ):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.list_tools()
@@ -582,9 +594,10 @@ def _call_mcp_tool(mcp_sock: str, token: str, tool_name: str, arguments: dict) -
         http_client = httpx2.AsyncClient(
             transport=transport, headers={"Authorization": f"Bearer {token}"}
         )
-        async with streamable_http_client(
-            "http://agmcp-server/mcp", http_client=http_client
-        ) as (read, write):
+        async with streamable_http_client("http://agmcp-server/mcp", http_client=http_client) as (
+            read,
+            write,
+        ):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments)
@@ -746,8 +759,10 @@ def _make_custom_tool_handler(tool_name: str, fn_b64: str):
                 loaded.append(_load_custom_tool_fn(fn_b64))
             except Exception as e:
                 return json.dumps(
-                    {"error": f"tool '{tool_name}' failed to load inside the container: "
-                              f"{type(e).__name__}: {e}"}
+                    {
+                        "error": f"tool '{tool_name}' failed to load inside the container: "
+                        f"{type(e).__name__}: {e}"
+                    }
                 )
         fn = loaded[0]
         agdata_pure_mod = _load_agdata_pure()
@@ -780,7 +795,10 @@ def _dispatch_retry_backoff_s(attempt: int) -> float:
 
 
 def _dispatch_via_terminus(
-    terminus_sock: str, token: str, kwargs: dict, timeout_s: float = 300,
+    terminus_sock: str,
+    token: str,
+    kwargs: dict,
+    timeout_s: float = 300,
     max_retries: int = _DISPATCH_MAX_RETRIES,
 ) -> dict:
     """POST to the terminus with `stream=True` and reassemble the streamed
@@ -843,7 +861,9 @@ def _dispatch_via_terminus(
                         return {"error": last_error}
                     if resp.status_code != 200:
                         resp.read()
-                        return {"error": f"terminus dispatch failed: {resp.status_code} {resp.text}"}
+                        return {
+                            "error": f"terminus dispatch failed: {resp.status_code} {resp.text}"
+                        }
 
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data: "):
@@ -869,7 +889,11 @@ def _dispatch_via_terminus(
                             idx = tc_delta.get("index", 0)
                             slot = tool_calls_raw.setdefault(
                                 idx,
-                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                                {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
                             )
                             if tc_delta.get("id"):
                                 slot["id"] = tc_delta["id"]
@@ -955,7 +979,9 @@ def _maybe_compact(
         return messages, previous_summary
     head = _agllm_pure.prune_tool_outputs(head)
     summary_messages = _agllm_pure.build_summary_prompt_messages(task_input, head, previous_summary)
-    resp = _dispatch_via_terminus(terminus_sock, token, {"model": model, "messages": summary_messages})
+    resp = _dispatch_via_terminus(
+        terminus_sock, token, {"model": model, "messages": summary_messages}
+    )
     if "error" in resp:
         return messages, previous_summary
     summary = (resp["message"].get("content") or "").strip()
@@ -1086,7 +1112,8 @@ def _run_react_loop(req: dict) -> dict:
             fn_args = tc["function"]["arguments"]
             handler = dispatch.get(fn_name)
             result_content = (
-                handler(fn_args) if handler is not None
+                handler(fn_args)
+                if handler is not None
                 else json.dumps({"error": f"unknown tool: {fn_name}"})
             )
             result_content = _offload_if_oversized(fn_name, tc["id"], result_content)
@@ -1136,14 +1163,19 @@ class _Server(socketserver.ThreadingUnixStreamServer):
 def main(argv: "list[str] | None" = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
-        raise SystemExit(
-            "usage: python3 _native_in_container_entrypoint.py <uds-path>"
-        )
+        raise SystemExit("usage: python3 _native_in_container_entrypoint.py <uds-path>")
     sock_path = argv[0]
     if os.path.exists(sock_path):
         os.remove(sock_path)
 
     server = _Server(sock_path, _Handler)
+    # The entrypoint runs as the container's root user, while the host-side
+    # caller commonly runs as an unprivileged user. The socket lives in a
+    # bind mount, so the default root-owned 0755 socket rejects that caller
+    # with EACCES even though it can see the path. Restrict this permission
+    # change to the per-sandbox, randomly named UDS itself; the directory is
+    # still the host-managed gateway mount.
+    os.chmod(sock_path, 0o666)
     try:
         server.serve_forever()
     finally:
