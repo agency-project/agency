@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agtype import agtype
 from . import agpause
-from .agschema import agschema, _AgSchemaFields
+from .agschema import agschema
 from .agcontext import agcontext
-from .agtool import agtool, dispatch_tools, _AgToolFields
+from .agtool import agtool
 from .agllm import agllm
 from .agsandbox import agSandbox, agSandboxConfig
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
@@ -196,56 +196,6 @@ class agskill:
         content.extend(extra_blocks)
         return content
 
-    def _build_toolkit(
-        self,
-        agent_sandbox: "agSandbox",
-        resource_pool: "agResourcePool | None",
-        agent_terminal: "agterm | None",
-        agent_log: "aglog | None",
-        _ensure_read: bool = False,
-        agconfig: "agConfig | None" = None,
-    ) -> "tuple[dict[str, agtool], dict, set[str]]":
-        """Build toolkit and structured-output collection state.
-
-        Returns (toolkit, collected_outputs, required_fields).
-        collected_outputs and required_fields are mutable containers that the
-        return_<field> tools write into as they are called during the ReAct loop.
-        required_fields is empty when the skill has no structured output schema.
-        """
-        _agbinary_validate_exec_timeout = _AgSkillFields(agconfig).agbinary_validate_exec_timeout
-        if self.replace_tools is not None:
-            active_tools: list[agtool] = list(self.replace_tools)
-        else:
-            from .tools import make_sandboxed_tools, make_read
-
-            active_tools = make_sandboxed_tools(agent_sandbox, resource_pool)
-            if self.add_tools:
-                active_tools.extend(self.add_tools)
-
-        if _ensure_read:
-            if not any(getattr(t, "name", None) == "read" for t in active_tools):
-                from .tools import make_read
-
-                active_tools.append(make_read(agent_sandbox))
-
-        collected_outputs: dict = {}
-        required_fields: set[str] = set()
-        if self.output_schema is not None and self.output_schema.raw_key() is None:
-            required_fields = set(self.output_schema._data.keys())
-            active_tools.extend(
-                self.output_schema.make_return_output_agtool(
-                    agent_sandbox,
-                    collected_outputs,
-                    required_fields,
-                    _agbinary_validate_exec_timeout,
-                )
-            )
-
-        for t in active_tools:
-            t.attach_logger(agent_terminal, agent_log)
-
-        return {t.name: t for t in active_tools}, collected_outputs, required_fields
-
     def _build_initial_messages(
         self,
         skill_input: agdata,
@@ -291,7 +241,7 @@ class agskill:
     ) -> agdata:
         """Submit a skill run on *ag* and return a pending agdata immediately.
 
-        Spawns a daemon thread that runs execute_react() and resolves futures
+        Spawns a daemon thread that runs execute_harness() and resolves futures
         when done.  Same-agent calls are serialized via the context future chain.
         """
         prev_ctx = ag.ctx
@@ -321,7 +271,7 @@ class agskill:
                 skill_input.resolve_input_dependencies()
 
                 # Defensive shallow copy: prepare_inputs_in_sandbox() (called
-                # below, via execute_react) mutates its skill_input argument
+                # below, via execute_harness) mutates its skill_input argument
                 # in place (offloading oversized/agtype fields to sandbox
                 # paths). If a caller hands the same agdata object to more
                 # than one concurrent run() call (e.g. one shared input
@@ -368,8 +318,13 @@ class agskill:
                 ag._set_ui_state("skill", skill=self.name)
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
-                # ── 3. Run the ReAct loop.
-                outer_result, updated_ctx, outer_delta = self.execute_react(
+                # ── 3. Run the skill via this agent's configured engine.
+                # Every engine, "native" included, is now an
+                # agharness_backend (see agharness_backends/base.py's
+                # for_config()) -- native.py's own in-container react loop
+                # is just the one whose "binary" happens to be agency's
+                # own code. See execute_harness().
+                outer_result, updated_ctx, outer_delta = self.execute_harness(
                     ag,
                     prev_ctx,
                     local_skill_input,
@@ -384,8 +339,8 @@ class agskill:
                 ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
             finally:
                 # ── 4. Teardown — commit or discard the sandbox; this is
-                # now the only rollback boundary (per-tool rollback no
-                # longer exists -- see agtool.py's dispatch_tools()).
+                # the only rollback boundary (no per-tool rollback -- the
+                # container is persistent for the whole skill call).
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 ag._set_ui_state("error" if _had_error else "finished")
                 if ag.sandbox is not None:
@@ -394,10 +349,12 @@ class agskill:
                         # skill's commit(). The notice can't go into this
                         # skill's own result (already final by this point)
                         # -- it goes on the inbox instead, so the NEXT
-                        # skill call's execute_react loop (via
-                        # ag._drain_inbox(), run before its first LLM call)
-                        # surfaces it right as the agent resumes sandbox
-                        # work, rather than never telling it at all.
+                        # skill call's loop (via ag._drain_inbox(), run
+                        # before its first LLM call -- native's own loop
+                        # does this in-process; harness-driven engines have
+                        # no equivalent drain point today) surfaces it right
+                        # as the agent resumes sandbox work, rather than
+                        # never telling it at all.
                         ag.sandbox.rm_container()
                         ag.inbox.put(
                             "Note: the previous skill call failed. Its sandbox "
@@ -530,21 +487,56 @@ class agskill:
         return pending
 
     # ------------------------------------------------------------------
-    # ReAct loop — synchronous execution
+    # execute_react() (the old host-process ReAct loop -- LLM calls direct
+    # from the host, tool dispatch via agtool.py's dispatch_tools() with a
+    # per-tool-call sandbox hibernate) was retired here. Every engine,
+    # native included, now runs through execute_harness() below -- native's
+    # own loop lives in a persistent in-container process
+    # (agharness_backends/native.py), not in this host process.
     # ------------------------------------------------------------------
 
-    def execute_react(
+    def execute_harness(
         self,
         ag: "agent",
         prev_ctx: agcontext,
         skill_input: agdata,
         max_steps: "int | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
-        """Run the ReAct loop synchronously against *ag*, return (result, ctx, delta)."""
-        if max_steps is None:
-            max_steps = _AgSkillFields(ag.agconfig).react_max_steps
+        """Run this skill against *ag* via its configured `agharness_backend`
+        -- called unconditionally by `agskill.run()`'s `_task()` for every
+        engine, native included (native is just another backend whose
+        "binary" happens to be agency's own code). Same contract
+        `execute_react()` used to promise on its own: `ctx` is the SAME
+        `prev_ctx` object passed in, mutated in place (`.messages`/
+        `.total_input_tokens`/`.total_output_tokens`); `delta` is
+        `[system_prompt_message] + every message appended since this call
+        started`. By the time `_task()` reaches this branch,
+        `prev_ctx.resolve_prev_dependencies()` has already run (agskill.py's
+        `_task()`), so `.messages` is already a concrete resolved list --
+        this method does not need to resolve futures itself.
 
-        # ── 1. Validate input against the skill's input schema.
+        See docs/Design_harness_integration.md for the design this
+        implements: the skill's system prompt + input become a plain
+        user-turn prompt (never injected as the harness's own system
+        prompt or a tool), and the harness's own built-in tools/compaction
+        run untouched -- mediation happens at the syscall level via
+        agproxy_ptrace, not through this method.
+
+        Also where every engine gets agtype/oversized-input offloading and
+        agtype-output recovery -- the same `agschema.prepare_inputs_in_
+        sandbox()`/`recover_outputs()` operations `execute_react()` used to
+        call itself, hoisted up here so they're one shared, engine-agnostic
+        implementation instead of five. A background-job wait
+        (`agSandbox.wait_for_processes()`, `execute_react()`'s third such
+        operation) is only called here for the `native` engine, NOT hoisted
+        for all five -- see the call site's own comment for why the other
+        four engines' ptrace-tracked child processes make that unsafe today.
+        Both hoisted operations are
+        host-side, sandbox-based operations with no dependency on which
+        backend actually dispatched the call.
+        """
+        from .agharness_internal.agharness_backends.base import agharness_backend
+
         input_error = (
             self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
         )
@@ -552,7 +544,6 @@ class agskill:
             sys_msg = {"role": "system", "content": self._build_system_prompt()}
             return agerror(input_error), prev_ctx, [sys_msg]
 
-        # ── 2. Prepare inputs — write agtype fields and offload oversized strings.
         _input_suffix = f"_{int(time.time() * 1000)}"
         _offloaded_paths, auto_fields = (
             self.input_schema.prepare_inputs_in_sandbox(
@@ -566,11 +557,10 @@ class agskill:
             if self.input_schema is not None
             else ([], [])
         )
-
-        _extra_system: str | None = None
+        extra_system: "str | None" = None
         if auto_fields:
             field_list = ", ".join(f"`{f}`" for f in auto_fields)
-            _extra_system = (
+            extra_system = (
                 f"\nNote: The following input fields contain large content "
                 f"that has been automatically saved to temporary files in "
                 f"your sandbox: {field_list}. The file paths are shown in "
@@ -579,225 +569,39 @@ class agskill:
                 f"automatically deleted after this task ends."
             )
 
-        # ── 3. Build toolkit with return_<field> tools for structured output.
-        toolkit, _collected_outputs, _required_fields = self._build_toolkit(
-            ag.sandbox,
-            type(ag).agresource_pool,
-            ag.terminal,
-            ag.log,
-            _ensure_read=bool(_offloaded_paths),
-            agconfig=ag.agconfig,
-        )
-        _use_return_output = bool(_required_fields)
-
-        # ── 5. Build the initial message list (system prompt + history + user turn).
-        messages, n_before = self._build_initial_messages(
-            skill_input,
-            prev_ctx,
-            _extra_system,
-            ag._push_live_messages,
-            ag._append_full_history,
-        )
-        output_schema_retries_left = self.max_output_schema_retries
-        _skill_tokens_in_start = prev_ctx.total_input_tokens
-        _skill_tokens_out_start = prev_ctx.total_output_tokens
-
-        # ── 6. ReAct loop — each iteration is one LLM call + tool dispatch cycle.
-        for _ in range(max_steps):
-            # 6-checkpoint. Block here while a pause is in effect — always
-            # between steps, never mid-LLM-call or mid-tool-call.
-            ag._check_pause(self.name)
-
-            # Derive wire-format tool schemas fresh each iteration — the toolkit dict
-            # may grow mid-loop (e.g. read injected on large output offload).
-            _tool_schemas = [t.to_openai_tool() for t in toolkit.values()] or None
-            kwargs: dict = ag.llm.build_kwargs(messages, _tool_schemas)
-
-            # 6a. Drain any inbox messages injected by the orchestrator mid-loop.
-            had_inbox = ag._drain_inbox(messages)
-
-            # 6b. Compact history if needed.
-            messages, _pre_estimate = ag.llm.maybe_compact(
-                prev_ctx,
-                messages,
-                None,
-                term=ag.terminal,
-                log=ag.log,
-                _live_messages_fn=ag._push_live_messages,
-                skill_name=self.name,
-                agname=str(ag.agname),
+        backend = agharness_backend.for_config(ag.engine, ag.agconfig)
+        try:
+            result, updated_ctx, delta = backend.execute(
+                ag, prev_ctx, skill_input, max_steps, skill=self, extra_system=extra_system
             )
-
-            ag.push_token_count_update_to_ui(
-                prev_ctx.total_input_tokens - _skill_tokens_in_start + _pre_estimate,
-                prev_ctx.total_output_tokens - _skill_tokens_out_start,
-            )
-
-            if ag.llm.context_limit is not None:
-                _headroom = max(1, ag.llm.context_limit - _pre_estimate)
-                if kwargs.get("max_completion_tokens", _headroom) > _headroom:
-                    kwargs = dict(kwargs)
-                    kwargs["max_completion_tokens"] = _headroom
-
-            # 6c. Call the LLM (with internal retry on transient errors).
-            llm_result = ag.llm.call(
-                kwargs,
-                messages,
-                ag.terminal,
-                ag._set_ui_state,
-                ag._push_live_messages,
-                ag.push_token_count_update_to_ui,
-                prev_ctx.total_input_tokens,
-                prev_ctx.total_output_tokens,
-                self.name,
-                full_history_fn=ag._append_full_history,
-            )
-            if llm_result.context_exceeded:
-                if ag._append_full_history:
-                    ag._append_full_history({"type": "llm_context_exceeded"})
-                messages, _ = ag.llm.maybe_compact(
-                    prev_ctx,
-                    messages,
-                    None,
-                    term=ag.terminal,
-                    log=ag.log,
-                    _live_messages_fn=ag._push_live_messages,
-                    skill_name=self.name,
-                    agname=str(ag.agname),
-                    force=True,
-                )
-                continue
-            if not llm_result.ok:
-                _err_msg = f"LLM connection error after retries: {llm_result.conn_error}"
-                if ag._append_full_history:
-                    ag._append_full_history({"type": "llm_error", "error": _err_msg})
-                ag.sandbox.remove_files(_offloaded_paths)
-                return agerror(_err_msg), prev_ctx, []
-            prev_ctx.total_input_tokens = llm_result.total_input_tokens
-            prev_ctx.total_output_tokens = llm_result.total_output_tokens
-            if ag.terminal:
-                _ctx_str = f"/{ag.llm.context_limit}" if ag.llm.context_limit else ""
-                _tok_str = (
-                    f"  tokens={llm_result.prompt_tokens}{_ctx_str}"
-                    if llm_result.prompt_tokens
-                    else ""
-                )
-                ag.terminal.log(
-                    "LLM ✓    ",
-                    f"model={ag.llm.backend.model or '?'}  ({llm_result.elapsed_ms}ms){_tok_str}",
-                )
-            if ag._set_ui_state:
-                ag._set_ui_state("skill", skill=self.name)
-
-            # 6d. Post-response compaction.
-            messages, _ = ag.llm.maybe_compact(
-                prev_ctx,
-                messages,
-                llm_result.prompt_tokens,
-                term=ag.terminal,
-                log=ag.log,
-                _live_messages_fn=ag._push_live_messages,
-                skill_name=self.name,
-                agname=str(ag.agname),
-            )
-
-            # 6e. Append the assistant turn to the message list.
-            msg_dict: dict = agllm.build_assistant_msg(
-                llm_result.content_parts, llm_result.reasoning_parts, llm_result.tool_calls_raw
-            )
-            messages.append(msg_dict)
-            if ag._push_live_messages:
-                ag._push_live_messages(messages[1:])
-            if ag._append_full_history:
-                ag._append_full_history(msg_dict)
-
-            # 6f. Dispatch tool calls, or check if we can move to the output path.
-            if msg_dict.get("tool_calls"):
-                _base_offload_chars = _AgToolFields(ag.agconfig).output_offload_chars
-                _schema_fields = _AgSchemaFields(ag.agconfig)
-                dispatch_tools(
-                    msg_dict["tool_calls"],
-                    toolkit,
-                    messages,
-                    ag.sandbox,
-                    self.name,
-                    ag._set_ui_state,
-                    ag._push_live_messages,
-                    ag._append_full_history,
-                    ag.terminal,
-                    tool_offload_chars=(
-                        max(
-                            _base_offload_chars,
-                            int(
-                                ag.llm.context_limit
-                                * _schema_fields.offload_context_fraction
-                                * _schema_fields.chars_per_token
-                            ),
-                        )
-                        if ag.llm.context_limit
-                        else _base_offload_chars
-                    ),
-                    agconfig=ag.agconfig,
-                )
-                # Continue looping unless all required output fields are collected.
-                if not (_use_return_output and not (_required_fields - set(_collected_outputs))):
-                    continue
-
-            else:
-                # No tool calls — only continue if a mid-loop inbox message arrived. If not, move onto the output path (step 7).
-                if had_inbox:
-                    continue
-
-            # ── 7. Output-ready path.
-            if _use_return_output:
-                missing = _required_fields - set(_collected_outputs)
-                if missing:
-                    # 7a. Missing fields — reprompt the model up to the retry limit.
-                    if output_schema_retries_left > 0:
-                        output_schema_retries_left -= 1
-                        _missing_tools = " and ".join(f"return_{f}" for f in sorted(missing))
-                        reprompt = {
-                            "role": "user",
-                            "content": (
-                                f"[HARNESS SYSTEM] You have not yet provided all required output fields. "
-                                f"Still missing: {sorted(missing)}. "
-                                f"Call {_missing_tools} tool(s) with your output as tool argument."
-                            ),
-                        }
-                        messages.append(reprompt)
-                        if ag._push_live_messages:
-                            ag._push_live_messages(messages[1:])
-                        if ag._append_full_history:
-                            ag._append_full_history(reprompt)
-                        continue
-                    _last_asst = next(
-                        (m for m in reversed(messages) if m.get("role") == "assistant"), None
-                    )
-                    _last_out_str = ""
-                    if _last_asst:
-                        if _last_asst.get("content"):
-                            _truncate = _AgSkillFields(ag.agconfig).last_output_log_truncate
-                            _last_out_str = str(_last_asst["content"])[:_truncate]
-                        elif _last_asst.get("tool_calls"):
-                            _names = [
-                                tc.get("function", {}).get("name", "?")
-                                for tc in _last_asst["tool_calls"]
-                            ]
-                            _last_out_str = f"[tool calls: {_names}]"
-                    prev_ctx.messages = messages[1:]
-                    ag.sandbox.remove_files(_offloaded_paths)
-                    return (
-                        agerror(
-                            f"output schema error: missing fields after retries: {sorted(missing)}"
-                            + f"\ncollected: {sorted(_collected_outputs.keys())}"
-                            + (f"\nlast model output: {_last_out_str!r}" if _last_out_str else "")
-                        ),
-                        prev_ctx,
-                        [messages[0]] + messages[1:][n_before:],
-                    )
-                # 7b. All fields collected — wait for any background sandbox processes.
-                result = agdata(**_collected_outputs)
-                proc_msg = agSandbox.wait_for_processes(
+        finally:
+            ag.sandbox.remove_files(_offloaded_paths)
+        if not isinstance(result, agerror):
+            # Give a background job the agent kicked off (e.g. `cmd &` via
+            # a bash-style tool call) a chance to finish before this skill
+            # call's container gets committed/stopped -- same protection
+            # `execute_react()` gives itself.
+            #
+            # Scoped to `native` only, NOT hoisted for every engine as
+            # originally planned: a real-Bedrock/real-`claude` regression
+            # test run surfaced that the 4 external-harness engines leave
+            # ptrace-tracked child PIDs in `agsandbox_backend._watched_pids`
+            # that never receive an `ingest_ptrace_pids(exited=...)` call
+            # even long after the harness CLI's own top-level process has
+            # exited (confirmed: `wait_for_processes()` blocked for the
+            # full 5-minute `ping_interval_s` on 7 real claude_code.py
+            # end-to-end tests before this was narrowed to native-only).
+            # That looks like a pre-existing gap in agproxy_ptrace's PID
+            # exit-event delivery, never exercised before because nothing
+            # called `wait_for_processes()` for a harness-driven engine
+            # until this hoist -- a separate investigation, not something
+            # to paper over here. Native's own persistent entrypoint
+            # process is deliberately excluded from monitoring instead
+            # (`agSandbox.release_daemon()`, see native.py's
+            # `launch_in_container_entrypoint`), which is what makes this
+            # safe for native specifically.
+            if ag.engine == "native":
+                agSandbox.wait_for_processes(
                     ag.sandbox,
                     self.name,
                     ag.terminal,
@@ -807,55 +611,9 @@ class agskill:
                     type(ag).poll_interval_s,
                     ag._set_ui_state,
                 )
-                if proc_msg is not None:
-                    messages.append({"role": "user", "content": proc_msg})
-                    if ag._push_live_messages:
-                        ag._push_live_messages(messages[1:])
-                    if ag._append_full_history:
-                        ag._append_full_history(messages[-1])
-                    continue
-                # 7c. Recover agtype outputs then clean up auto-offloaded input files.
-                prev_ctx.messages = messages[1:]
+            if self.output_schema is not None:
                 self.output_schema.recover_outputs(result, ag.sandbox)
-                ag.sandbox.remove_files(_offloaded_paths)
-                return (
-                    result,
-                    prev_ctx,
-                    [messages[0]] + messages[1:][n_before:],
-                )
-
-            # ── 8. Raw-text output path (agrawstring schema or no schema).
-            assert self.output_schema is None or self.output_schema.raw_key() is not None, (
-                f"BUG: reached raw-text path with structured output_schema on skill '{self.name}'. "
-                "This should be unreachable — _use_return_output covers all schema cases."
-            )
-            out_key = self.output_schema.raw_key() if self.output_schema is not None else "result"
-            result = agdata(**{out_key: msg_dict.get("content") or ""})
-            proc_msg = agSandbox.wait_for_processes(
-                ag.sandbox,
-                self.name,
-                ag.terminal,
-                ag.log,
-                str(ag.agname),
-                type(ag).ping_interval_s,
-                type(ag).poll_interval_s,
-                ag._set_ui_state,
-            )
-            if proc_msg is not None:
-                messages.append({"role": "user", "content": proc_msg})
-                if ag._push_live_messages:
-                    ag._push_live_messages(messages[1:])
-                if ag._append_full_history:
-                    ag._append_full_history(messages[-1])
-                continue
-            prev_ctx.messages = messages[1:]
-            ag.sandbox.remove_files(_offloaded_paths)
-            return (result, prev_ctx, [messages[0]] + messages[1:][n_before:])
-
-        # ── 9. Max steps exhausted.
-        prev_ctx.messages = messages[1:]
-        ag.sandbox.remove_files(_offloaded_paths)
-        return agerror("max_steps exceeded"), prev_ctx, [messages[0]] + messages[1:][n_before:]
+        return result, updated_ctx, delta
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

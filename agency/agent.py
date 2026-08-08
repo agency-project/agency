@@ -41,6 +41,13 @@ from .agname import agname as _agname
 class _AgAgentFields:
     checkpoint_save_timeout_s = DynamicConfigParam("agent", default=600)
     checkpoint_load_timeout_s = DynamicConfigParam("agent", default=600)
+    engine = DynamicConfigParam(
+        "agent", default="native"
+    )  # Looked up via agharness_backend.for_config() and run through
+    # agskill.execute_harness() -- see agskill.py's _task(). "native" runs
+    # agency's own react loop as a persistent in-container process
+    # (agharness_backends/native.py); any other value names an external
+    # harness engine (claude_code/codex/opencode/grok).
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
@@ -230,6 +237,7 @@ class agent:
         llm: "agllm | None" = None,
         sandbox: "agSandbox | None" = None,
         agconfig: "agConfig | None" = None,
+        engine: "str | None" = None,
     ):
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
@@ -267,6 +275,9 @@ class agent:
         self.agname: _agname = _agname.allocate_agname(agname)
 
         self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
+        self.engine: str = (
+            engine if engine is not None else _AgAgentFields(self.agconfig).engine
+        )
         self.ctx: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -284,6 +295,16 @@ class agent:
         self._snapshot_messages: list[dict] = []
         self.inbox: queue.Queue[str] = queue.Queue()
         self._state = agent_state(str(self.agname))
+        # Per-harness-engine native session continuity (see
+        # docs/Design_harness_history.md) -- {"claude_code": {"session_id":
+        # ..., "blob_b64": ...}, ...}. Deliberately NOT part of `self.ctx`:
+        # `agcontext` stays the portable, engine-agnostic history object
+        # (attachable to any sandbox); this is a per-engine optimization
+        # layered on top, extracted from and reinjected into whatever
+        # sandbox handles the next call, never a replacement for it. Empty
+        # until a harness backend that supports this (currently only
+        # claude_code.py) actually populates it after a run.
+        self._harness_sessions: "dict[str, dict]" = {}
 
         _live_agents.add(self)
 
@@ -586,6 +607,7 @@ class agent:
         # the matching comment in __init__.
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.llm = agllm(ag.agconfig)
+        ag.engine = src.engine
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
@@ -689,6 +711,7 @@ class agent:
 
         state = {
             "agname": self.agname,
+            "engine": self.engine,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             "history": self.ctx.messages,
             "ts": _ts(),
@@ -698,6 +721,12 @@ class agent:
             # container.tar is in -- a chroot snapshot directory and a
             # docker/podman image tag are unrelated formats.
             state["sandbox_image_kind"] = self.sandbox.image_kind
+        if self._harness_sessions:
+            # See docs/Design_harness_history.md -- travels with the
+            # agent's own checkpoint, not with container.tar, so it's
+            # available regardless of which sandbox this checkpoint is
+            # later restored onto.
+            state["harness_sessions"] = self._harness_sessions
         state_bytes = json.dumps(state, indent=2).encode()
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -785,6 +814,7 @@ class agent:
             if k not in _already_set:
                 ag.agconfig.set("agllm_backend", k, v)
         ag.llm = agllm(ag.agconfig)
+        ag.engine = state.get("engine", "native")
         ag.ctx = agcontext(messages=list(state.get("history", [])))
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
@@ -817,6 +847,7 @@ class agent:
         ag._snapshot_messages: list[dict] = []
         ag.inbox: queue.Queue = queue.Queue()
         ag._state = agent_state(str(ag.agname))
+        ag._harness_sessions = state.get("harness_sessions", {})
 
         _live_agents.add(ag)
 

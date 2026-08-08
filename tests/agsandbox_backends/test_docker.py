@@ -128,44 +128,16 @@ class TestOwnerPidLabel:
         run_cmd = self._captured_run_cmd(sb)
         assert self._label_value(run_cmd) == str(sentinel_pid)
 
-    @docker
-    def test_real_sandboxed_tool_call_labels_container_with_main_process_pid(self):
-        """End-to-end, no mocks: a real run_in_subprocess=True tool call (the
-        default) cloudpickles this backend to a real ProcessPoolExecutor
-        worker, which is the process that actually issues `docker run` --
-        confirms the resulting container's real label still names *this*
-        (main, test) process, not the worker's own distinct PID, i.e. the
-        fix survives the real dispatch mechanism, not just a mock of it."""
-        import os
-
-        from agency.agdata import agdata, agerror
-        from agency.tools import make_sandboxed_tools
-
-        sb = _make_sandbox()
-        tools = {t.name: t for t in make_sandboxed_tools(sb)}
-        try:
-            result = tools["bash"](agdata(command="true"))
-            assert not isinstance(result, agerror), f"bash failed: {result}"
-
-            inspected = subprocess.run(
-                [
-                    "docker",
-                    "inspect",
-                    "--format",
-                    '{{index .Config.Labels "agency.owner_pid"}}',
-                    sb._backend._name,
-                ],
-                capture_output=True,
-                check=True,
-            )
-            label_pid = inspected.stdout.decode().strip()
-            assert label_pid == str(os.getpid()), (
-                f"container labeled with pid {label_pid}, expected this test "
-                f"process's own pid {os.getpid()} -- the worker that actually "
-                f"ran `docker run` must not have used its own os.getpid()"
-            )
-        finally:
-            sb.destroy()
+    # test_real_sandboxed_tool_call_labels_container_with_main_process_pid
+    # was retired here: its whole premise was a real run_in_subprocess=True
+    # tool call cloudpickling this backend to a ProcessPoolExecutor worker --
+    # that dispatch mechanism no longer exists at all (agtool.__call__ always
+    # runs in the calling thread/process now, see agtool.py's own module
+    # docstring), so there's no separate worker process left to prove the
+    # label survives crossing into. The other two tests in this class remain
+    # valid: they exercise _owner_pid's own semantics directly (construction-
+    # time default, and the cross-process-simulation regression case) without
+    # depending on how a tool call is dispatched.
 
 
 class TestDanglingImageEagerCleanup:

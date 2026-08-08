@@ -257,3 +257,114 @@ def _b36_suffix(n: int, width: int = 4) -> str:
         digits.append(_B36[n % base])
         n //= base
     return "".join(reversed(digits))
+
+
+def agharness_llm_gateway_dir():
+    """Fixed, well-known host directory a docker/podman-backed harness
+    launch's Unix-domain-socket LLM gateway lives in. Shared between
+    `agsandbox.py` (which bind-mounts this directory into every
+    container-backed sandbox unconditionally -- cheap and harmless for a
+    sandbox that never runs a harness, the same "attach unconditionally,
+    gate on use" pattern already used for GPU passthrough flags) and
+    `agharness_internal/agproxy_llm.py` (which places its UDS socket file
+    inside it once a container-backed harness actually launches). Kept
+    here, not in either of those two modules, specifically to avoid a
+    layering dependency in either direction -- `agsandbox` sits below
+    `agharness`/`agproxy_llm` in this codebase's intended import graph, so
+    neither should import from the other just for this constant. A bind
+    mount is a live view of the host directory, not a snapshot, so it's
+    safe for the socket file to not exist yet at container-creation time
+    and appear later once a harness actually launches."""
+    import tempfile
+    from pathlib import Path
+
+    d = Path(tempfile.gettempdir()) / "agency_llm_gateway"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def agharness_binary_cache_dir():
+    """Fixed, well-known host directory holding a cached copy of each
+    external harness binary (e.g. `claude`), bind-mounted read-only into
+    every docker/podman-backed sandbox unconditionally -- same
+    "attach unconditionally, gate on use" pattern as
+    `agharness_llm_gateway_dir`. Exists because the sandbox's own base
+    image (built for arbitrary agent tasks) has no reason to carry a
+    ~250MB+ harness binary, and re-copying one into every fresh container
+    on every launch would be slow and, for a network-isolated sandbox,
+    impossible. Populated lazily, on the host, the first time a
+    container-backed launch needs a binary this cache doesn't have yet
+    (see `agharness_backends/claude_code.py`'s in-container binary
+    resolution) -- never fetched from the network by Agency itself, only
+    copied from whatever the host's own `shutil.which()` already resolves,
+    so this never depends on knowing an install URL. Under the user's home
+    directory rather than a tempdir (unlike the gateway socket dir above):
+    this should survive process restarts so the ~250MB copy happens once
+    per host, not once per Agency process lifetime."""
+    from pathlib import Path
+
+    d = Path.home() / ".cache" / "agency_harness_bin"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# Fixed container-side mount point for agency_package_dir() below -- shared
+# between agsandbox.py (which bind-mounts it) and any in-container
+# entrypoint (agharness_backends/native.py's react-loop process, or a
+# container-relocated agproxy_llm) that needs to know where to point
+# PYTHONPATH to import agency.
+AGENCY_PACKAGE_CONTAINER_MOUNT = "/opt/agency_pkg"
+
+
+def agency_package_dir():
+    """Host directory containing the `agency` package currently running in
+    *this* process -- the parent of `agency/__init__.py`'s own directory,
+    i.e. what needs to be on `PYTHONPATH` for `import agency` to resolve.
+    Bind-mounted read-only into every container-backed sandbox at
+    `AGENCY_PACKAGE_CONTAINER_MOUNT`, same "attach unconditionally, gate on
+    use" pattern as `agharness_llm_gateway_dir`/`agharness_binary_cache_dir`
+    above -- so an in-container entrypoint always runs the EXACT same code
+    the host process is running, not a second, potentially-stale copy
+    baked into the sandbox's base image.
+
+    Unlike those two, this is not a fixed scratch location -- it's resolved
+    dynamically from `agency.__file__`, since it has to be wherever *this*
+    process's own code actually lives (a dev checkout, an editable install,
+    a site-packages install are all valid; none should be hardcoded)."""
+    import agency as _agency_pkg
+    from pathlib import Path
+
+    return Path(_agency_pkg.__file__).resolve().parent.parent
+
+
+def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 180) -> None:
+    """Ensure each of `packages` (import names, e.g. `"fastapi"`) is
+    importable inside `sandbox`'s container, installing any that are
+    missing via `pip3 install`. Confirmed real gap: `agency-sandbox:latest`
+    carries `httpx`/`pydantic` but not `fastapi`/`uvicorn`/`openai` --
+    needed by both a container-relocated `agproxy_llm` and a future
+    full react-loop entrypoint that imports `agency` itself.
+
+    Checks each package's actual importability first, not just its
+    presence in `pip list` (a package can be listed but broken, or absent
+    but shadowed by something else on the path) -- and only invokes pip for
+    the ones genuinely missing, so a container whose checkpoint image
+    already has everything installed (reused across skill calls, see
+    agskill.py's commit() boundary) pays this cost exactly once per fresh
+    container, not on every launch. Requires the container to have
+    outbound network access -- true today (see docs/Design_harness_
+    integration.md's network lockdown discussion, deferred).
+
+    Raises RuntimeError if pip itself fails (e.g. no network, a genuinely
+    broken package name) -- this is a real prerequisite-provisioning
+    failure, not something to silently swallow."""
+    import shlex
+
+    missing = [pkg for pkg in packages if sandbox.exec(f'python3 -c "import {pkg}"', timeout=30)[1] != 0]
+    if not missing:
+        return
+
+    install_cmd = "pip3 install --quiet " + " ".join(shlex.quote(p) for p in missing)
+    out, rc = sandbox.exec(install_cmd, timeout=timeout_s)
+    if rc != 0:
+        raise RuntimeError(f"failed to install {missing} inside container: {out}")

@@ -41,7 +41,10 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
         # otherwise auto-mock to a truthy value, making agtool.py's
         # dispatch_tools() defer stop() forever -- default to "nothing
         # pending" so tests get the common case without configuring it.
+        # Same reasoning for `.persistent` -- a bare MagicMock auto-mocks
+        # it truthy too (see agtool.py's `not sandbox.persistent and ...`).
         ag.sandbox._has_pending_background_work.return_value = False
+        ag.sandbox.persistent = False
     ag.terminal = MagicMock()
     ag._state = _agent_state_cls("test")
     ag.log = MagicMock()
@@ -140,32 +143,12 @@ def test_name_and_repr():
     assert "summarise" in repr(s)
 
 
-def test_run_returns_agdata_and_history():
-    s = make_skill()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"summary": "ok"}')
-        result, ctx, delta = s.execute_react(
-            make_mock_agent(LLM), agcontext(), agdata(text="hello")
-        )
-    assert isinstance(result, agdata)
-    assert isinstance(ctx, agcontext)
-    assert isinstance(delta, list)
-
-
-def test_run_no_schema_returns_raw_content():
-    s = make_skill()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "42"}')
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="6*7"))
-    assert result.result == '{"answer": "42"}'
-
-
-def test_run_plain_text_fallback():
-    s = make_skill()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct("hello world")
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="hi"))
-    assert result.result == "hello world"
+# test_run_returns_agdata_and_history / test_run_no_schema_returns_raw_content /
+# test_run_plain_text_fallback were retired here along with execute_react()
+# itself -- basic "the loop returns the model's content correctly" coverage
+# now lives in tests/agharness_internal/agharness_backends/test_native_loop_fast.py
+# (test_bash_tool_round_trip, test_final_text_preserves_raw_content_verbatim),
+# exercising the native loop that replaces execute_react() for every engine.
 
 
 # ---------------------------------------------------------------------------
@@ -207,26 +190,23 @@ def test_system_prompt_type_names_shown_correctly():
 
 
 def test_system_prompt_prepended_to_llm_call():
+    # _build_initial_messages() is the shared, engine-agnostic method both
+    # execute_react() and every agharness_backend's execute() build their
+    # first turn from -- calling it directly tests the same contract
+    # without needing a real (or execute_react-only) loop around it.
     s = make_skill()
-    captured = {}
-
-    def capture(*args, **kwargs):
-        captured["messages"] = kwargs.get("messages", [])
-        return _direct("{}")
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = capture
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert captured["messages"][0]["role"] == "system"
-    assert captured["messages"][0]["content"] == "You are a summarisation assistant."
+    messages, _n_before = s._build_initial_messages(agdata(x=1), agcontext(), None, None, None)
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == "You are a summarisation assistant."
 
 
 def test_system_prompt_not_in_returned_history():
     s = make_skill()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    roles = [m["role"] for m in ctx.messages]
+    messages, _n_before = s._build_initial_messages(agdata(x=1), agcontext(), None, None, None)
+    # The delta a caller appends back to agcontext.messages is messages[1:]
+    # (dropping the system prompt) -- see _build_initial_messages()'s own
+    # docstring on n_before/messages[n_before+1:].
+    roles = [m["role"] for m in messages[1:]]
     assert "system" not in roles
 
 
@@ -235,18 +215,10 @@ def test_existing_history_included_in_call():
     prior = agcontext(
         messages=[{"role": "user", "content": "prior"}, {"role": "assistant", "content": "ok"}]
     )
-    captured = {}
-
-    def capture(*args, **kwargs):
-        captured["messages"] = list(kwargs.get("messages", []))  # snapshot before list is mutated
-        return _direct("{}")
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = capture
-        s.execute_react(make_mock_agent(LLM), prior, agdata(x=1))
+    messages, _n_before = s._build_initial_messages(agdata(x=1), prior, None, None, None)
     # system at [0], prior messages at [1] and [2], new user at [-1]
-    assert captured["messages"][1]["content"] == "prior"
-    assert captured["messages"][-1]["role"] == "user"
+    assert messages[1]["content"] == "prior"
+    assert messages[-1]["role"] == "user"
 
 
 # ---------------------------------------------------------------------------
@@ -254,120 +226,21 @@ def test_existing_history_included_in_call():
 # ---------------------------------------------------------------------------
 
 
-def test_tool_call_executes_and_continues():
-    def fn(arg: agdata) -> agdata:
-        return agdata(val=arg.x * 10)
-
-    t = agtool(
-        name="calc",
-        description="",
-        fn=fn,
-        params={"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]},
-    )
-
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("calc", {"x": 7}), _direct('{"result": 70}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, ctx, delta = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(task="calc"))
-
-    # Verify the tool ran with the right args and its output reached the LLM
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert len(tool_msgs) == 1
-    assert json.loads(tool_msgs[0]["content"]) == {"val": 70}
-    assert result.result == '{"result": 70}'
-
-
-def test_unknown_tool_error_in_history():
-    s = make_skill()
-    responses = [_tool_call("ghost", {}), _direct("{}")]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert any("unknown tool" in m["content"] for m in tool_msgs)
-
-
-def test_max_steps_exceeded():
-    s = make_skill()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = lambda **kw: _tool_call(
-            "x", {}
-        )
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1), max_steps=3)
-    assert result.error == "max_steps exceeded"
+# test_tool_call_executes_and_continues / test_replace_tools_overrides_defaults /
+# test_replace_tools_empty_list_gives_no_tools / test_add_tools_extends_sandbox_defaults
+# were retired here along with execute_react() itself: add_tools/
+# replace_tools are host-authored Python tool closures with no execution
+# path today for ANY engine -- execute_react() was the only one that ever
+# ran them, and native.py's `_NativeBackend.execute()` explicitly rejects
+# them (a real, currently-open gap -- see that module's "Known gaps"
+# docstring section; building real container-side support, e.g. shipping a
+# picklable closure into the container plus a minimal pure-agdata shim
+# there, is deliberately scoped as separate follow-up work, not done here).
 
 
 # ---------------------------------------------------------------------------
 # replace_tools / add_tools
 # ---------------------------------------------------------------------------
-
-
-def test_replace_tools_overrides_defaults():
-    """replace_tools replaces the tool list entirely; no sandbox tools included."""
-    my_tool = agtool(name="mt", description="my tool", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", replace_tools=[my_tool])
-    captured = {}
-
-    def capture(**kwargs):
-        captured["tools"] = kwargs.get("tools")
-        return _direct("{}")
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = capture
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert captured["tools"] is not None
-    assert len(captured["tools"]) == 1
-    assert captured["tools"][0]["function"]["name"] == "mt"
-
-
-def test_replace_tools_empty_list_gives_no_tools():
-    """replace_tools=[] means no tools at all."""
-    s = agskill(name="s", system_prompt="", replace_tools=[])
-    captured = {}
-
-    def capture(**kwargs):
-        captured["tools"] = kwargs.get("tools")
-        return _direct("{}")
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = capture
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert captured["tools"] is None
-
-
-def test_add_tools_extends_sandbox_defaults():
-    """add_tools appends to whatever make_sandboxed_tools returns."""
-    extra = agtool(name="extra", description="extra", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", add_tools=[extra])
-    captured = {}
-    fake_default = agtool(name="bash", description="", fn=_noop_r1)
-
-    def fake_make_sandboxed(sandbox, pool):
-        return [fake_default]
-
-    import agency.tools as _tools_mod
-
-    with (
-        patch("openai.OpenAI") as MockClient,
-        patch.object(_tools_mod, "make_sandboxed_tools", side_effect=fake_make_sandboxed),
-    ):
-
-        def capture(**kwargs):
-            captured["tools"] = kwargs.get("tools")
-            return _direct("{}")
-
-        MockClient.return_value.chat.completions.create.side_effect = capture
-        sb = MagicMock()
-        sb.get_live_pids.return_value = set()
-        sb.pid_status_summary.return_value = ""
-        sb.commit.return_value = False
-        sb._has_pending_background_work.return_value = False
-        s.execute_react(make_mock_agent(LLM, sb), agcontext(), agdata(x=1))
-    names = [t["function"]["name"] for t in (captured.get("tools") or [])]
-    assert "bash" in names
-    assert "extra" in names
-
 
 # ---------------------------------------------------------------------------
 # input_schema and output_schema
@@ -375,14 +248,18 @@ def test_add_tools_extends_sandbox_defaults():
 
 
 def test_input_schema_missing_field_returns_error():
+    # input_schema validation is shared, engine-agnostic code
+    # (self.input_schema.validate_input(), called directly by both
+    # execute_react() and execute_harness() before any engine/backend is
+    # touched) -- testing it directly here needs no LLM/loop at all.
     s = agskill(
         name="s",
         system_prompt="",
         input_schema=agdata(question=str, context=str),
     )
-    result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(question="hi"))
-    assert result.error is not None
-    assert "context" in result.error
+    error = s.input_schema.validate_input(agdata(question="hi"))
+    assert error is not None
+    assert "context" in error
 
 
 def test_input_schema_type_error_returns_error():
@@ -391,9 +268,9 @@ def test_input_schema_type_error_returns_error():
         system_prompt="",
         input_schema=agdata(count=int),
     )
-    result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(count="not-an-int"))
-    assert result.error is not None
-    assert "count" in result.error
+    error = s.input_schema.validate_input(agdata(count="not-an-int"))
+    assert error is not None
+    assert "count" in error
 
 
 def test_input_schema_valid_proceeds():
@@ -402,10 +279,7 @@ def test_input_schema_valid_proceeds():
         system_prompt="",
         input_schema=agdata(text=str),
     )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": true}')
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(text="hello"))
-    assert getattr(result, "error", None) is None
+    assert s.input_schema.validate_input(agdata(text="hello")) is None
 
 
 def test_input_schema_description_value_only_checks_presence():
@@ -415,100 +289,23 @@ def test_input_schema_description_value_only_checks_presence():
         system_prompt="",
         input_schema=agdata(query="the search query"),
     )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(query=42))
-    assert getattr(result, "error", None) is None  # 42 is not type-checked
+    assert s.input_schema.validate_input(agdata(query=42)) is None  # 42 is not type-checked
 
 
-def test_output_schema_missing_field_triggers_retry():
-    """Model doesn't call return_<field> first attempt; re-prompted; correct on retry."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(summary=str),
-        max_output_schema_retries=2,
-    )
-    responses = [
-        _direct("I'm done."),  # no return_summary → reprompt
-        _tool_call("return_summary", {"summary": "good"}),  # field provided
-        _direct(""),  # done
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(text="hi"))
-    assert result.summary == "good"
-
-
-def test_output_schema_retry_exhausted_returns_error():
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(answer=str),
-        max_output_schema_retries=2,
-    )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"wrong": 1}')
-        result, _, _ = s.execute_react(
-            make_mock_agent(LLM), agcontext(), agdata(q="hi"), max_steps=10
-        )
-    assert result.error is not None
-    assert "output schema error" in result.error
-
-
-def test_output_schema_type_mismatch_triggers_retry():
-    """return_<field> with wrong type returns error; reprompt on missing field; correct on retry."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(count=int),
-        max_output_schema_retries=2,
-    )
-    responses = [
-        _tool_call("return_count", {"count": "not-an-int"}),  # type error
-        _direct(""),  # stops → reprompt
-        _tool_call("return_count", {"count": 5}),  # correct
-        _direct(""),  # done
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.count == 5
-
-
-def test_correction_message_appended_on_retry():
-    """The missing-fields reprompt is appended before the next LLM call."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(answer=str),
-        max_output_schema_retries=1,
-    )
-    call_messages: list[list[dict]] = []
-    call_idx = 0
-    responses = [
-        _direct("I'm done."),  # no return_answer → correction injected
-        _tool_call("return_answer", {"answer": "fixed"}),  # provide field → done
-    ]
-
-    def side_effect(**kwargs):
-        nonlocal call_idx
-        call_messages.append(list(kwargs.get("messages", [])))
-        r = responses[call_idx]
-        call_idx += 1
-        return r
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = side_effect
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(q="hi"))
-
-    assert result.answer == "fixed"
-    assert len(call_messages) == 2
-    # Second call should have the missing-fields reprompt as a user message
-    second_msgs = call_messages[1]
-    assert any(
-        "missing" in m.get("content", "").lower() for m in second_msgs if m["role"] == "user"
-    )
+# test_output_schema_missing_field_triggers_retry,
+# test_output_schema_retry_exhausted_returns_error,
+# test_output_schema_type_mismatch_triggers_retry, and
+# test_correction_message_appended_on_retry were retired here: they tested
+# execute_react()'s own inline retry loop around the (also retired)
+# per-field `return_<field>` tool mechanism. Native's structured output
+# uses a different mechanism entirely -- a single `submit_output` MCP tool
+# validated per-call (fast coverage:
+# tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# test_submit_output_all_fields_collected /
+# test_submit_output_type_error_returns_immediate_feedback) plus a bounded
+# reprompt-across-turns loop one level up in native.py's
+# `_NativeBackend.execute()` (Docker-only coverage today, see
+# test_native.py's TestNativeBackendRealEndToEnd).
 
 
 def test_schemas_appended_to_system_prompt():
@@ -532,821 +329,40 @@ def test_no_schemas_system_prompt_unchanged():
     assert s._build_system_prompt() == "Be helpful."
 
 
-# ---------------------------------------------------------------------------
-# return_output tool-based output collection
-# ---------------------------------------------------------------------------
-
-
-def test_return_output_all_fields_correct():
-    """Model calls return_<field> for every field; result agdata assembled correctly."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(summary=str, is_duplicate=bool, score=int),
-    )
-    responses = [
-        _tool_call("return_summary", {"summary": "great paper"}),
-        _tool_call("return_is_duplicate", {"is_duplicate": False}),
-        _tool_call("return_score", {"score": 9}),
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.summary == "great paper"
-    assert result.is_duplicate is False
-    assert result.score == 9
-
-
-def test_return_output_type_error_immediate_feedback():
-    """Wrong type for a return_<field> call: tool returns error, model can retry."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(count=int),
-        max_output_schema_retries=2,
-    )
-    # Capture tool result messages to verify the error was reported inline.
-    all_messages: list[list[dict]] = []
-    call_idx = 0
-    responses = [
-        _tool_call("return_count", {"count": "not-int"}),  # error
-        _tool_call("return_count", {"count": 42}),  # correct
-        _direct(""),
-    ]
-
-    def side_effect(**kwargs):
-        nonlocal call_idx
-        all_messages.append(list(kwargs.get("messages", [])))
-        r = responses[call_idx]
-        call_idx += 1
-        return r
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = side_effect
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.count == 42
-    # Second LLM call should see the tool error message in history.
-    second_call_msgs = all_messages[1]
-    tool_results = [m for m in second_call_msgs if m.get("role") == "tool"]
-    assert any("error" in m.get("content", "").lower() for m in tool_results)
-
-
-def test_return_output_unknown_field_error():
-    """Calling a non-existent return_<field> tool name gets 'unknown tool' feedback."""
-    from agency.agtool import make_return_output_tools
-    from agency.agdata import agdata
-
-    schema = agdata(summary=str)
-    tools = make_return_output_tools(schema)
-    assert len(tools) == 1
-    assert tools[0]["function"]["name"] == "return_summary"
-    assert tools[0]["function"]["parameters"]["properties"]["summary"]["type"] == "string"
-
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(summary=str),
-        max_output_schema_retries=2,
-    )
-    call_idx = 0
-    responses = [
-        _tool_call("return_WRONG", {"WRONG": "oops"}),  # unknown → "unknown tool" feedback
-        _tool_call("return_summary", {"summary": "correct"}),
-        _direct(""),
-    ]
-
-    def side_effect(**kwargs):
-        nonlocal call_idx
-        r = responses[call_idx]
-        call_idx += 1
-        return r
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = side_effect
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.summary == "correct"
-
-
-def test_return_output_list_of_dicts():
-    """list-of-dicts schema field is validated and assembled correctly."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(papers=[{"title": str, "url": str}]),
-    )
-    papers = [{"title": "A", "url": "http://a"}, {"title": "B", "url": "http://b"}]
-    responses = [
-        _tool_call("return_papers", {"papers": papers}),
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.papers == papers
-
-
-def test_return_output_list_str():
-    """list[str] schema field is validated per-element."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(tags=list[str]),
-    )
-    responses = [
-        _tool_call("return_tags", {"tags": ["ml", "nlp"]}),
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.tags == ["ml", "nlp"]
-
-
-def test_return_output_bare_list():
-    """bare list type maps to JSON array and accepts any list value."""
-    from agency.agtool import make_return_output_tools
-
-    schema = agdata(items=list)
-    tools = make_return_output_tools(schema)
-    assert tools[0]["function"]["parameters"]["properties"]["items"]["type"] == "array"
-
-    s = agskill(name="s", system_prompt="", output_schema=agdata(items=list))
-    responses = [
-        _tool_call("return_items", {"items": [{"a": 1}, {"b": 2}]}),
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.items == [{"a": 1}, {"b": 2}]
-
-
-def test_return_output_bare_dict():
-    """bare dict type maps to JSON object and the LLM can return a dict value."""
-    from agency.agtool import make_return_output_tools
-
-    schema = agdata(meta=dict)
-    tools = make_return_output_tools(schema)
-    assert tools[0]["function"]["parameters"]["properties"]["meta"]["type"] == "object"
-
-    s = agskill(name="s", system_prompt="", output_schema=agdata(meta=dict))
-    responses = [
-        _tool_call("return_meta", {"meta": {"a": 1, "b": "x"}}),
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.meta == {"a": 1, "b": "x"}
-
-
-def test_return_output_agrawstring_unchanged():
-    """agrawstring output schema bypasses return_output entirely."""
-    from agency.agtype import agrawstring
-
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(text=agrawstring),
-    )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct("hello world")
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert result.text == "hello world"
-
-
-def test_return_output_tool_in_openai_tools():
-    """When output_schema is set, per-field return_<field> tools appear first in openai_tools."""
-    s = agskill(
-        name="s",
-        system_prompt="",
-        output_schema=agdata(summary=str, score=int),
-    )
-    captured_kwargs: list[dict] = []
-    responses_iter = iter(
-        [
-            _tool_call("return_summary", {"summary": "x"}),
-            _tool_call("return_score", {"score": 1}),
-            _direct(""),
-        ]
-    )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = lambda **kw: (
-            captured_kwargs.append(kw) or next(responses_iter)
-        )
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    first_tools = captured_kwargs[0].get("tools", [])
-    assert first_tools is not None
-    names = [t["function"]["name"] for t in first_tools]
-    # Per-field tools come first; one per schema field with typed value parameter.
-    assert "return_summary" in names
-    assert "return_score" in names
-    assert (
-        names.index("return_summary") < names.index("return_score") or True
-    )  # order matches schema
-    # Verify the value parameters are correctly typed.
-    by_name = {t["function"]["name"]: t for t in first_tools}
-    assert (
-        by_name["return_summary"]["function"]["parameters"]["properties"]["summary"]["type"]
-        == "string"
-    )
-    assert (
-        by_name["return_score"]["function"]["parameters"]["properties"]["score"]["type"]
-        == "integer"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Return tool parameter naming and logging
-# ---------------------------------------------------------------------------
-
-
-def test_return_tool_parameter_named_after_field():
-    """Each return_<field> tool has a single parameter named after the field, not 'value'."""
-    from agency.agtool import make_return_output_tools
-
-    schema = agdata(title=str, count=int, passed=bool)
-    tools = make_return_output_tools(schema)
-    by_name = {t["function"]["name"]: t for t in tools}
-    for field in ("title", "count", "passed"):
-        params = by_name[f"return_{field}"]["function"]["parameters"]
-        assert field in params["properties"], f"expected '{field}' as parameter name"
-        assert "value" not in params["properties"], "'value' should not be the parameter name"
-        assert params["required"] == [field]
-
-
-def test_return_tool_accepts_any_key_name():
-    """_handle extracts value via next(iter(args.values())) regardless of key name."""
-    s = agskill(name="s", system_prompt="", output_schema=agdata(summary=str))
-    responses = [
-        _tool_call("return_summary", {"summary": "hello"}),
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata())
-    assert result.summary == "hello"
-
-
-def test_return_tool_accepts_wrong_key_name():
-    """Even if the model uses a different key name, the single value is still extracted."""
-    s = agskill(name="s", system_prompt="", output_schema=agdata(summary=str))
-    responses = [
-        _tool_call("return_summary", {"value": "hello"}),  # old-style key
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata())
-    assert result.summary == "hello"
-
-
-def test_return_tool_logs_success_to_term():
-    """Successful return_<field> call emits TOOL ✓ to the term passed to run()."""
-    s = agskill(name="s", system_prompt="", output_schema=agdata(summary=str))
-    responses = [
-        _tool_call("return_summary", {"summary": "ok"}),
-        _direct(""),
-    ]
-    mock_term = MagicMock()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _ag = make_mock_agent(LLM)
-        _ag.terminal = mock_term
-        s.execute_react(_ag, agcontext(), agdata())
-    calls = [str(c) for c in mock_term.log.call_args_list]
-    assert any("TOOL ✓" in c for c in calls), f"Expected TOOL ✓ log call, got: {calls}"
-    assert any("return_summary" in c for c in calls)
-
-
-def test_return_tool_logs_validation_error_to_term():
-    """A type-mismatched return_<field> call emits TOOL ✗ with the tool call args."""
-    s = agskill(
-        name="s", system_prompt="", output_schema=agdata(count=int), max_output_schema_retries=1
-    )
-    responses = [
-        _tool_call("return_count", {"count": "not-an-int"}),  # type error → logged
-        _tool_call("return_count", {"count": 42}),  # correct on retry
-        _direct(""),
-    ]
-    mock_term = MagicMock()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _ag = make_mock_agent(LLM)
-        _ag.terminal = mock_term
-        s.execute_react(_ag, agcontext(), agdata())
-    calls = [str(c) for c in mock_term.log.call_args_list]
-    assert any("TOOL ✗" in c for c in calls), f"Expected TOOL ✗ log call, got: {calls}"
-    assert any("return_count" in c for c in calls)
-    assert any("not-an-int" in c for c in calls)
-
-
-# ---------------------------------------------------------------------------
-# Concurrency semaphore
-# ---------------------------------------------------------------------------
-
-from agency.agllm import _get_llm_call_semaphore, _AgLLMFields
-
-LLM_CALL_MAX_CONCURRENCY = _AgLLMFields.call_max_concurrency.default
-
-_sem = _get_llm_call_semaphore()
-
-
-def test_semaphore_released_after_success():
-    s = make_skill()
-    before = _sem._value
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    assert _sem._value == before
-
-
-def test_semaphore_released_after_timeout():
-    from agency.agutil import _LLMIdleTimeout as _IdleTimeout
-
-    s = make_skill()
-    before = _sem._value
-
-    def _timeout_iter(iterable, idle_timeout=None, stream_timeout=None):
-        raise _IdleTimeout("no chunk received")
-        yield  # makes this a generator function
-
-    with (
-        patch("openai.OpenAI") as MockClient,
-        patch("agency.agllm._iter_batched", _timeout_iter),
-        patch("agency.agllm.time.sleep"),
-    ):
-        MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert result.error is not None
-    assert _sem._value == before
-
-
-def test_semaphore_limits_concurrency():
-    """When all slots are held, an extra acquire blocks until one is released."""
-    sem = _sem
-    # Grab all but one slot
-    grabbed = []
-    for _ in range(LLM_CALL_MAX_CONCURRENCY - 1):
-        sem.acquire()
-        grabbed.append(True)
-    try:
-        # One slot remains — non-blocking acquire succeeds
-        assert sem.acquire(blocking=False)
-        grabbed.append(True)  # track so finally releases it
-        # Zero slots remain — non-blocking acquire fails
-        assert not sem.acquire(blocking=False)
-    finally:
-        for _ in grabbed:
-            sem.release()
-
-
-# ---------------------------------------------------------------------------
-# Exponential backoff timeout
-# ---------------------------------------------------------------------------
-
-
-def test_timeout_retries_all_attempts_then_error():
-    from agency.agutil import _LLMIdleTimeout as _IdleTimeout
-
-    s = make_skill()
-    call_count = 0
-
-    def _timeout_iter(iterable, idle_timeout=None, stream_timeout=None):
-        nonlocal call_count
-        call_count += 1
-        raise _IdleTimeout("no chunk received")
-        yield
-
-    with (
-        patch("openai.OpenAI") as MockClient,
-        patch("agency.agllm._iter_batched", _timeout_iter),
-        patch("agency.agllm.time.sleep"),
-    ):
-        MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert result.error is not None
-    assert "error" in result.error.lower()
-    assert call_count == LLM_MAX_RETRIES
-
-
-def test_timeout_values_fixed_on_retry():
-    """idle_timeout is fixed at _LLM_IDLE_TIMEOUT for every attempt.
-
-    The old design doubled the timeout on each retry (60→120→240→480→960 s).
-    The new design uses a fixed idle_timeout (60 s) for all attempts — the
-    retry counter only tracks the attempt number, not the timeout.  The
-    mid-stream timeout (stream_timeout) is separately configurable and constant.
-    """
-    from agency.agutil import _LLMIdleTimeout as _IdleTimeout
-
-    captured = []
-
-    def _capture_iter(iterable, idle_timeout=None, stream_timeout=None):
-        captured.append((idle_timeout, stream_timeout))
-        raise _IdleTimeout("no chunk received")
-        yield
-
-    s = make_skill()
-    with (
-        patch("openai.OpenAI") as MockClient,
-        patch("agency.agllm._iter_batched", _capture_iter),
-        patch("agency.agllm.time.sleep"),
-    ):
-        MockClient.return_value.chat.completions.create.return_value = []
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert len(captured) == LLM_MAX_RETRIES, (
-        f"expected {LLM_MAX_RETRIES} attempts, got {len(captured)}"
-    )
-    idle_vals = [t[0] for t in captured]
-    stream_vals = [t[1] for t in captured]
-    # idle_timeout must be fixed across all attempts — no longer doubling
-    assert len(set(idle_vals)) == 1, f"idle_timeout should be fixed across retries: {idle_vals}"
-    assert idle_vals[0] == LLM_IDLE_TIMEOUT, (
-        f"idle_timeout should be {LLM_IDLE_TIMEOUT} s: {idle_vals}"
-    )
-    # stream_timeout must also be fixed
-    assert len(set(stream_vals)) == 1, (
-        f"stream_timeout should be fixed across retries: {stream_vals}"
-    )
-    assert stream_vals[0] == LLM_STREAM_TIMEOUT, (
-        f"stream_timeout should be {LLM_STREAM_TIMEOUT} s: {stream_vals}"
-    )
-
-
-def test_timeout_succeeds_after_retry():
-    """If a later attempt succeeds, result is returned normally."""
-    from agency.agutil import _LLMIdleTimeout as _IdleTimeout
-    from agency.agutil import _iter_batched as _real_iter_batched
-
-    call_count = 0
-
-    def _maybe_timeout(iterable, idle_timeout=None, stream_timeout=None):
-        nonlocal call_count
-        call_count += 1
-        if call_count < 3:
-            raise _IdleTimeout("no chunk received")
-            yield  # makes this a generator function
-        else:
-            yield from _real_iter_batched(
-                iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout
-            )
-
-    s = make_skill()
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _maybe_timeout):
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert getattr(result, "error", None) is None
-    assert result.result == '{"answer": "ok"}'
-    assert call_count == 3
-
-
-# ---------------------------------------------------------------------------
-# SSL / OSError connection error retries
-# ---------------------------------------------------------------------------
-
-
-def test_ssl_error_retries_all_attempts_then_error():
-    import ssl
-
-    s = make_skill()
-    call_count = 0
-
-    def _ssl_error_iter(iterable, idle_timeout=None, stream_timeout=None):
-        nonlocal call_count
-        call_count += 1
-        raise ssl.SSLError("record layer failure")
-        yield
-
-    with (
-        patch("openai.OpenAI") as MockClient,
-        patch("agency.agllm._iter_batched", _ssl_error_iter),
-        patch("agency.agllm.time.sleep"),
-    ):
-        MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert result.error is not None
-    assert "error" in result.error.lower()
-    assert call_count == LLM_MAX_RETRIES
-
-
-def test_oserror_retries_all_attempts_then_error():
-    s = make_skill()
-    call_count = 0
-
-    def _oserror_iter(iterable, idle_timeout=None, stream_timeout=None):
-        nonlocal call_count
-        call_count += 1
-        raise OSError("connection reset by peer")
-        yield
-
-    with (
-        patch("openai.OpenAI") as MockClient,
-        patch("agency.agllm._iter_batched", _oserror_iter),
-        patch("agency.agllm.time.sleep"),
-    ):
-        MockClient.return_value.chat.completions.create.return_value = []
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert result.error is not None
-    assert "error" in result.error.lower()
-    assert call_count == LLM_MAX_RETRIES
-
-
-def test_ssl_error_releases_semaphore():
-    import ssl
-
-    s = make_skill()
-    before = _sem._value
-
-    def _ssl_error_iter(iterable, idle_timeout=None, stream_timeout=None):
-        raise ssl.SSLError("record layer failure")
-        yield
-
-    with (
-        patch("openai.OpenAI") as MockClient,
-        patch("agency.agllm._iter_batched", _ssl_error_iter),
-        patch("agency.agllm.time.sleep"),
-    ):
-        MockClient.return_value.chat.completions.create.return_value = []
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert _sem._value == before
-
-
-def test_ssl_error_succeeds_after_retry():
-    import ssl
-    from agency.agutil import _iter_batched as _real_iter_batched
-
-    call_count = 0
-
-    def _maybe_ssl(iterable, idle_timeout=None, stream_timeout=None):
-        nonlocal call_count
-        call_count += 1
-        if call_count < 2:
-            raise ssl.SSLError("record layer failure")
-            yield
-        else:
-            yield from _real_iter_batched(
-                iterable, idle_timeout=idle_timeout, stream_timeout=stream_timeout
-            )
-
-    s = make_skill()
-    with patch("openai.OpenAI") as MockClient, patch("agency.agllm._iter_batched", _maybe_ssl):
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"answer": "ok"}')
-        result, _, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert getattr(result, "error", None) is None
-    assert result.result == '{"answer": "ok"}'
-    assert call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# Long tool output offloading
-# ---------------------------------------------------------------------------
-
-
-def _make_sandbox(written=None):
-    """Return a mock sandbox that records write_file calls."""
-    sandbox = MagicMock()
-    sandbox._has_pending_background_work.return_value = False
-    if written is not None:
-        sandbox.write_file.side_effect = lambda path, content: written.update({path: content})
-    return sandbox
-
-
-def test_short_tool_output_not_offloaded():
-    written = {}
-    sandbox = _make_sandbox(written)
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(result="short")
-
-    t = agtool(name="mytool", description="", fn=fn)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("mytool", {}, "call-001"), _direct('{"ok": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    assert not written
-
-
-def test_long_tool_output_offloaded_to_file():
-    from agency.agtool import _AgToolFields
-
-    written = {}
-    sandbox = _make_sandbox(written)
-
-    _eff_thresh = max(
-        _AgToolFields.output_offload_chars.default,
-        int(
-            LLM.context_limit
-            * _AgSchemaFields.offload_context_fraction.default
-            * _AgSchemaFields.chars_per_token.default
-        ),
-    )
-    big_output = "x" * (_eff_thresh + 1)
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(data=big_output)
-
-    t = agtool(name="fetcher", description="", fn=fn)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("fetcher", {}, "abc-123-xyz"), _direct('{"ok": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    # File was written to the sandbox
-    assert len(written) == 1
-    path = next(iter(written))
-    assert path.startswith("/workspace/long_tool_call_outputs/fetcher_")
-    assert path.endswith(".txt")
-    assert big_output in next(iter(written.values()))
-
-    # Tool message in history has the note, not the raw content
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert len(tool_msgs) == 1
-    note = json.loads(tool_msgs[0]["content"])
-    assert "note" in note
-    assert path in note["note"]
-
-
-def test_long_tool_output_offloaded_to_sandbox():
-    from agency.agtool import _AgToolFields
-
-    _eff_thresh = max(
-        _AgToolFields.output_offload_chars.default,
-        int(
-            LLM.context_limit
-            * _AgSchemaFields.offload_context_fraction.default
-            * _AgSchemaFields.chars_per_token.default
-        ),
-    )
-    big_output = "y" * (_eff_thresh + 1)
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(data=big_output)
-
-    t = agtool(name="fetcher", description="", fn=fn)
-    s = make_skill(replace_tools=[t])
-    sandbox = MagicMock()
-    sandbox._has_pending_background_work.return_value = False
-    responses = [_tool_call("fetcher", {}, "call-999"), _direct('{"ok": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    # Large output must be offloaded to sandbox, not kept inline
-    sandbox.write_file.assert_called_once()
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    assert len(tool_msgs) == 1
-    assert "note" in tool_msgs[0]["content"]
-    assert "/workspace/long_tool_call_outputs/" in tool_msgs[0]["content"]
-
-
-def test_long_output_injects_read_tool_into_openai_tools():
-    """When a large output is offloaded, the read tool is added to the tool schema
-    passed to the LLM on the next step so the model can actually call it."""
-    from agency.agtool import _AgToolFields
-
-    _eff_thresh = max(
-        _AgToolFields.output_offload_chars.default,
-        int(
-            LLM.context_limit
-            * _AgSchemaFields.offload_context_fraction.default
-            * _AgSchemaFields.chars_per_token.default
-        ),
-    )
-    big_output = "z" * (_eff_thresh + 1)
-    recorded_tool_schemas = []
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(data=big_output)
-
-    t = agtool(name="fetcher", description="", fn=fn)
-    s = make_skill(replace_tools=[t])
-    sandbox = _make_sandbox()
-
-    responses = [_tool_call("fetcher", {}, "call-abc"), _direct('{"ok": 1}')]
-
-    with patch("openai.OpenAI") as MockClient:
-
-        def capturing_create(*args, **kwargs):
-            recorded_tool_schemas.append(kwargs.get("tools") or [])
-            return iter(responses.pop(0))
-
-        MockClient.return_value.chat.completions.create.side_effect = capturing_create
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    # First call: only fetcher
-    first_names = [t["function"]["name"] for t in recorded_tool_schemas[0]]
-    assert "fetcher" in first_names
-    assert "read" not in first_names
-
-    # Second call (after offload): read is now present
-    second_names = [t["function"]["name"] for t in recorded_tool_schemas[1]]
-    assert "read" in second_names
-
-
-def test_long_output_read_tool_persists_for_skill_run():
-    """Once the read tool is injected it stays in the tool list for subsequent
-    LLM calls — it is not removed between iterations."""
-    from agency.agtool import _AgToolFields
-
-    _eff_thresh = max(
-        _AgToolFields.output_offload_chars.default,
-        int(
-            LLM.context_limit
-            * _AgSchemaFields.offload_context_fraction.default
-            * _AgSchemaFields.chars_per_token.default
-        ),
-    )
-    big_output = "z" * (_eff_thresh + 1)
-    recorded_tool_schemas = []
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(data=big_output)
-
-    t = agtool(name="fetcher", description="", fn=fn)
-    s = make_skill(replace_tools=[t])
-    sandbox = _make_sandbox()
-
-    # Three LLM calls: fetch (offloads) → read → done
-    responses = [
-        _tool_call("fetcher", {}, "call-001"),
-        _tool_call(
-            "read", {"path": "/workspace/long_tool_call_outputs/fetcher_call001.txt"}, "call-002"
-        ),
-        _direct('{"ok": 1}'),
-    ]
-
-    with patch("openai.OpenAI") as MockClient:
-        resp_iter = iter(responses)
-
-        def capturing_create(*args, **kwargs):
-            recorded_tool_schemas.append(kwargs.get("tools") or [])
-            return iter(next(resp_iter))
-
-        MockClient.return_value.chat.completions.create.side_effect = capturing_create
-        # read tool in tool_map needs to return something non-empty
-        sandbox.read_file.return_value = "file content"
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    # All three calls see read in the schema from call 2 onward
-    assert "read" not in [t["function"]["name"] for t in recorded_tool_schemas[0]]
-    assert "read" in [t["function"]["name"] for t in recorded_tool_schemas[1]]
-    assert "read" in [t["function"]["name"] for t in recorded_tool_schemas[2]]
-
-
-def test_long_output_no_duplicate_read_when_already_present():
-    """If the skill already has the read tool (e.g. via make_sandboxed_tools),
-    offloading must not add a second read entry to openai_tools."""
-    from agency.agtool import _AgToolFields
-
-    _eff_thresh = max(
-        _AgToolFields.output_offload_chars.default,
-        int(
-            LLM.context_limit
-            * _AgSchemaFields.offload_context_fraction.default
-            * _AgSchemaFields.chars_per_token.default
-        ),
-    )
-    big_output = "z" * (_eff_thresh + 1)
-    recorded_tool_schemas = []
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(data=big_output)
-
-    t = agtool(name="fetcher", description="", fn=fn)
-    read_tool = agtool(name="read", description="read a file", fn=lambda a: agdata(content=""))
-    # Skill has read already in replace_tools
-    s = make_skill(replace_tools=[t, read_tool])
-    sandbox = _make_sandbox()
-
-    responses = [_tool_call("fetcher", {}, "call-dup"), _direct('{"ok": 1}')]
-
-    with patch("openai.OpenAI") as MockClient:
-
-        def capturing_create(*args, **kwargs):
-            recorded_tool_schemas.append(kwargs.get("tools") or [])
-            return iter(responses.pop(0))
-
-        MockClient.return_value.chat.completions.create.side_effect = capturing_create
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    # Second call must have exactly one read entry
-    second_names = [t["function"]["name"] for t in recorded_tool_schemas[1]]
-    assert second_names.count("read") == 1
-
+# test_return_output_* / test_return_tool_* (all fields correct, type
+# error feedback, unknown field, list/dict shapes, agrawstring passthrough,
+# tool schema shape/ordering, parameter naming, any/wrong key extraction,
+# term logging) were retired here: they tested the per-field `return_<field>`
+# tool mechanism (agschema.make_return_output_agtool/agtool.
+# make_return_output_tools), only ever called from execute_react()'s
+# _build_toolkit(). Native's structured output uses a single `submit_output`
+# MCP tool instead -- fast coverage for the all-fields-correct and
+# type-error-immediate-feedback cases now lives in
+# tests/agharness_internal/agharness_backends/test_native_loop_fast.py
+# (test_submit_output_all_fields_collected /
+# test_submit_output_type_error_returns_immediate_feedback).
+# test_semaphore_* / test_timeout_* / test_ssl_error_* / test_oserror_*
+# (concurrency semaphore, exponential-backoff retry on idle-timeout/SSL/OS
+# errors) were retired here: they all exercised agllm.py's own `call()`
+# method's retry-with-backoff and call-concurrency semaphore, only ever
+# invoked from execute_react(). Native's own retry lives in a different
+# place with different scope (_native_in_container_entrypoint.py's
+# _dispatch_via_terminus, retrying only a terminus 503/connection-failure,
+# not SSL/idle-timeout errors from a real openai SDK client -- see that
+# function's own docstring) -- already covered by test_native.py's real-
+# Docker test_dispatch_retries_transient_terminus_error_and_recovers.
+
+# _make_sandbox() helper and test_short_tool_output_not_offloaded /
+# test_long_tool_output_offloaded_to_file / _to_sandbox /
+# test_long_output_injects_read_tool_into_openai_tools /
+# _read_tool_persists_for_skill_run / _no_duplicate_read_when_already_present
+# were retired here: they tested agtool.py's dispatch_tools() host-side
+# tool-output-offload-to-sandbox-file mechanism (only ever called from
+# execute_react()) -- native has its own, simpler offload (a plain local
+# file write, no sandbox bridge, `read` always available so no lazy
+# tool-injection step exists), already covered fast by
+# tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# test_oversized_tool_output_is_offloaded_to_a_file.
 
 # ---------------------------------------------------------------------------
 # Skill-exit sandbox teardown (agskill.py's own run()/_task() finally block)
@@ -1383,6 +399,13 @@ def _make_sandbox_with_tracking():
     sandbox._name = "testbox"
     sandbox.stop.return_value = None
     sandbox._has_pending_background_work.return_value = False
+    # A bare MagicMock's auto-attribute for `.persistent` is a truthy Mock,
+    # not the real agSandbox default (False) -- since dispatch_tools() now
+    # short-circuits on `not sandbox.persistent` before ever consulting
+    # `_has_pending_background_work()` (see agtool.py), leaving this unset
+    # would silently skip that check (and any side_effect list queued on
+    # it) in every test using this helper. Match the real default here.
+    sandbox.persistent = False
     return sandbox
 
 
@@ -1406,7 +429,7 @@ def test_tool_success_commits_and_stops():
     and must not rm_container() or push anything onto the inbox."""
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
-    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
@@ -1446,7 +469,7 @@ def test_tool_failure_triggers_stop_without_commit():
     instead of sandbox.commit()."""
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
-    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("boom"),
         prev_ctx,
         [],
@@ -1468,7 +491,7 @@ def test_tool_failure_adds_workspace_reverted_note():
     call via ag._drain_inbox()."""
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
-    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("disk full"),
         prev_ctx,
         [],
@@ -1491,7 +514,7 @@ def test_tool_failure_reverts_even_without_subprocess():
     let alone in a subprocess; _task() only ever inspects outer_result."""
     sandbox = MagicMock()
     s = make_skill()
-    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("nope"),
         prev_ctx,
         [],
@@ -1511,13 +534,13 @@ def test_run_in_subprocess_false_still_stops():
     already committed successfully."""
     sandbox = _make_sandbox_with_tracking()
     ok_skill = make_skill(name="ok")
-    ok_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    ok_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
     )
     bad_skill = make_skill(name="bad")
-    bad_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    bad_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("second call failed"),
         prev_ctx,
         [],
@@ -1546,7 +569,7 @@ def test_tool_exception_triggers_stop_without_commit():
     def _raise(ag, prev_ctx, skill_input, max_steps=None):
         raise RuntimeError("exploded")
 
-    s.execute_react = _raise
+    s.execute_harness = _raise
 
     ag, pending = _run_skill_via_agent(s, sandbox)
 
@@ -1562,13 +585,13 @@ def test_run_in_subprocess_false_success_still_commits():
     triggered a revert."""
     sandbox = _make_sandbox_with_tracking()
     bad_skill = make_skill(name="bad")
-    bad_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    bad_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("first call failed"),
         prev_ctx,
         [],
     )
     ok_skill = make_skill(name="ok")
-    ok_skill.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    ok_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
@@ -1585,61 +608,15 @@ def test_run_in_subprocess_false_success_still_commits():
     assert sandbox.stop.call_count == 1  # success path hibernates after commit
 
 
-def test_pending_background_work_defers_stop_entirely():
-    """When the sandbox still has pending background work (e.g. a
-    backgrounded `cmd &`), stop() must not run at all after a successful
-    tool call -- running it would tear down/overwrite the sandbox's live
-    state out from under that still-running work."""
-    sandbox = _make_sandbox_with_tracking()
-    # True for dispatch_tools()'s own check (what this test targets), then
-    # False afterward -- execute_react() calls wait_for_processes() right
-    # after, whose very first gate check is this same predicate; leaving it
-    # permanently True would make that loop believe work is still pending
-    # forever and hang for the full ping interval instead of returning
-    # immediately (see agsandbox.py's wait_for_processes() docstring).
-    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
+# test_pending_background_work_defers_stop_entirely was retired here: it
+# tested agtool.py's dispatch_tools() deferring sandbox.stop() while
+# `_has_pending_background_work()` is true -- the per-tool-call hibernate
+# model itself was already retired in Phase 1 (persistent containers), so
+# this check (and the "wait_for_processes() right after" ordering the
+# comment describes) no longer exists in the new execute_harness() path.
 
-    def fn(arg: agdata) -> agdata:
-        return agdata(result="ok")
-
-    t = agtool(name="bgtool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("bgtool", {}, "c8"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_not_called()
-
-
-def test_pending_background_work_omits_workspace_reverted_note_on_error():
-    """Same deferral as above, but for an errored tool call: stop() must be
-    skipped, and the workspace_reverted note -- which claims a revert that
-    didn't actually happen -- must not be added either."""
-    sandbox = _make_sandbox_with_tracking()
-    # True for dispatch_tools()'s own check (what this test targets), then
-    # False afterward -- execute_react() calls wait_for_processes() right
-    # after, whose very first gate check is this same predicate; leaving it
-    # permanently True would make that loop believe work is still pending
-    # forever and hang for the full ping interval instead of returning
-    # immediately (see agsandbox.py's wait_for_processes() docstring).
-    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
-
-    def fn(arg: agdata) -> agdata:
-        return agerror("boom")
-
-    t = agtool(name="bgbadtool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("bgbadtool", {}, "c9"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_not_called()
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    content = json.loads(tool_msgs[0]["content"])
-    assert "error" in content
-    assert "workspace_reverted" not in content
+# test_pending_background_work_omits_workspace_reverted_note_on_error was
+# retired here: same retired mechanism, errored-tool-call path.
 
 
 def test_tool_exception_with_run_in_subprocess_false_still_stops():
@@ -1655,7 +632,7 @@ def test_tool_exception_with_run_in_subprocess_false_still_stops():
     def _raise_early(ag, prev_ctx, skill_input, max_steps=None):
         raise ValueError("early failure")
 
-    s.execute_react = _raise_early
+    s.execute_harness = _raise_early
 
     ag, pending = _run_skill_via_agent(s, sandbox)
 
@@ -1667,123 +644,20 @@ def test_tool_exception_with_run_in_subprocess_false_still_stops():
     assert "revert" in note.lower() or "discard" in note.lower()
 
 
-def test_tool_exception_with_pending_background_work_defers_stop():
-    """Exception-handler path, gated the same way as the success/error
-    path: pending background work must defer stop() here too."""
-    sandbox = _make_sandbox_with_tracking()
-    # True for dispatch_tools()'s own check (what this test targets), then
-    # False afterward -- execute_react() calls wait_for_processes() right
-    # after, whose very first gate check is this same predicate; leaving it
-    # permanently True would make that loop believe work is still pending
-    # forever and hang for the full ping interval instead of returning
-    # immediately (see agsandbox.py's wait_for_processes() docstring).
-    sandbox._has_pending_background_work.side_effect = [True] + [False] * 20
-
-    def fn(arg: agdata) -> agdata:
-        raise RuntimeError("exploded")
-
-    t = agtool(name="bgexctool", description="", fn=fn, run_in_subprocess=True)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("bgexctool", {}, "c11"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM, sandbox), agcontext(), agdata(x=1))
-
-    sandbox.stop.assert_not_called()
-    tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
-    content = json.loads(tool_msgs[0]["content"])
-    assert "error" in content
-    assert "workspace_reverted" not in content
+# test_tool_exception_with_pending_background_work_defers_stop was
+# retired here: same retired dispatch_tools() pending-background-work
+# stop-deferral mechanism, exception-handler path.
 
 
-def test_dispatch_tools_accepts_camel_case_llm_arguments():
-    """End-to-end: an LLM emitting camelCase tool-call JSON (e.g. `filePath`
-    instead of `file_path`) still reaches the tool fn correctly -- dispatch_tools
-    parses fn_args via agdata.from_json(), which normalizes top-level keys."""
-    received = {}
-
-    def fn(arg: agdata) -> agdata:
-        received["file_path"] = arg.file_path
-        received["old_string"] = arg.old_string
-        return agdata(result="ok")
-
-    t = agtool(
-        name="camel_tool",
-        description="",
-        fn=fn,
-        run_in_subprocess=False,
-        params={
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "old_string": {"type": "string"},
-            },
-        },
-    )
-    s = make_skill(replace_tools=[t])
-    responses = [
-        _tool_call("camel_tool", {"filePath": "/tmp/x.txt", "oldString": "a"}, "c8"),
-        _direct('{"done": 1}'),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert received == {"file_path": "/tmp/x.txt", "old_string": "a"}
-
-
-def test_tool_timeout_uses_agent_provided_value():
-    """When fn_args includes a 'timeout' int, agtool.__call__ receives it as keyword arg."""
-    received_timeout = {}
-
-    original_call = agtool.__call__
-
-    def patched_call(self, arg, timeout=None):
-        received_timeout["timeout"] = timeout
-        return original_call(self, arg, timeout=timeout)
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(result="ok")
-
-    t = agtool(
-        name="slow",
-        description="",
-        fn=fn,
-        run_in_subprocess=False,
-        params={"type": "object", "properties": {"timeout": {"type": "integer"}}},
-    )
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("slow", {"timeout": 120}, "c7"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient, patch.object(agtool, "__call__", patched_call):
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert received_timeout.get("timeout") == 120
-
-
-def test_tool_timeout_ignored_if_not_int():
-    """Non-integer 'timeout' in fn_args is silently ignored; dispatch_tools resolves
-    the default itself (agconfig-aware) before calling the tool, rather than passing
-    None through for agtool.__call__ to default internally."""
-    received_timeout = {}
-
-    original_call = agtool.__call__
-
-    def patched_call(self, arg, timeout=None):
-        received_timeout["timeout"] = timeout
-        return original_call(self, arg, timeout=timeout)
-
-    def fn(arg: agdata) -> agdata:
-        return agdata(result="ok")
-
-    t = agtool(name="slow", description="", fn=fn, run_in_subprocess=False)
-    s = make_skill(replace_tools=[t])
-    responses = [_tool_call("slow", {"timeout": "forever"}, "c8"), _direct('{"done": 1}')]
-    with patch("openai.OpenAI") as MockClient, patch.object(agtool, "__call__", patched_call):
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert received_timeout.get("timeout") == _AgToolFields.timeout_s.default
+# test_dispatch_tools_accepts_camel_case_llm_arguments /
+# test_tool_timeout_uses_agent_provided_value / test_tool_timeout_ignored_if_not_int
+# were retired here: all three tested agtool.py's dispatch_tools()-specific
+# mechanics (camelCase argument-key coercion via agdata.from_json(), and
+# per-call `timeout` override from LLM tool-call args) -- only ever
+# exercised via execute_react(). Native's built-in tools have fixed
+# timeouts and no camelCase-coercion step of their own (they parse JSON
+# arguments directly, see _native_in_container_entrypoint.py's
+# _parse_tool_args), so neither mechanism carries over.
 
 
 # ---------------------------------------------------------------------------
@@ -2113,172 +987,16 @@ def test_build_initial_messages_fires_full_history_fn():
 # ---------------------------------------------------------------------------
 
 
-def test_run_continues_loop_when_sandbox_has_live_pids():
-    """When sandbox has live PIDs after final answer, loop re-enters."""
-    call_count = [0]
-
-    class _TrackedSandbox:
-        def __init__(self):
-            self._watched_pids = {9999: 0.0}
-            self._cleared = False
-
-        def _has_pending_background_work(self):
-            return bool(self._watched_pids)
-
-        def get_live_pids(self):
-            if self._cleared:
-                return set()
-            return {9999}
-
-        def pid_status_summary(self):
-            return "PID 9999"
-
-        def commit(self, *a):
-            return False
-
-        def restore(self, *a):
-            pass
-
-        def write_file(self, *a):
-            pass
-
-        def remove_files(self, *a):
-            pass
-
-    sb = _TrackedSandbox()
-
-    def create_side_effect(**kw):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return _direct('{"done": true}')
-        # On second entry, clear pids so loop exits
-        sb._watched_pids.clear()
-        sb._cleared = True
-        return _direct('{"done": true}')
-
-    # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
-    s = agskill(
-        name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[]
-    )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = create_side_effect
-        result, _, _ = s.execute_react(
-            make_mock_agent(LLM, sb, ping_interval_s=0.05, poll_interval_s=0.01),
-            agcontext(),
-            agdata(x=1),
-        )
-
-    assert call_count[0] == 2  # loop re-entered once
-    assert result.result == '{"done": true}'
-
-
-def test_run_injects_process_completed_message():
-    """The continuation message injected when processes complete contains expected text."""
-
-    # The sandbox starts with live PIDs. After the first LLM response, wait_for_processes
-    # polls and sees them finish, then injects the "Background processes have completed"
-    # message. The second LLM call then receives that message and returns the final answer.
-    class _TrackedSandbox:
-        def __init__(self):
-            self._watched_pids = {1: 0.0}
-            self._call_count = 0
-
-        def _has_pending_background_work(self):
-            # wait_for_processes() polls THIS method in its loop, not
-            # get_live_pids() -- the state transition has to happen here.
-            # First call (the initial gate check): still alive.
-            self._call_count += 1
-            if self._call_count >= 2:
-                self._watched_pids.clear()
-            return bool(self._watched_pids)
-
-        def get_live_pids(self):
-            return set(self._watched_pids.keys())
-
-        def pid_status_summary(self):
-            return "PID 1"
-
-        def commit(self, *a):
-            return False
-
-        def restore(self, *a):
-            pass
-
-        def write_file(self, *a):
-            pass
-
-        def remove_files(self, *a):
-            pass
-
-    sb = _TrackedSandbox()
-    all_messages_per_call: list[list[dict]] = []
-
-    def create_side_effect(**kw):
-        all_messages_per_call.append(list(kw["messages"]))
-        return _direct('{"ok": 1}')
-
-    # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
-    s = agskill(
-        name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[]
-    )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = create_side_effect
-        s.execute_react(
-            make_mock_agent(LLM, sb, ping_interval_s=30, poll_interval_s=0.01),
-            agcontext(),
-            agdata(x=1),
-        )
-
-    # The second LLM call should have the injected proc message in its user messages
-    assert len(all_messages_per_call) == 2
-    second_call_contents = [
-        m.get("content", "") for m in all_messages_per_call[1] if m.get("role") == "user"
-    ]
-    assert any(
-        "Background processes" in c or "completed" in c.lower() for c in second_call_contents
-    )
-
-
-def test_run_clean_sandbox_returns_immediately():
-    """Sandbox with no PIDs does not delay return at all."""
-
-    class _CleanSandbox:
-        _watched_pids: dict = {}
-
-        def _has_pending_background_work(self):
-            return False
-
-        def get_live_pids(self):
-            return set()
-
-        def pid_status_summary(self):
-            return ""
-
-        def commit(self, *a):
-            return False
-
-        def restore(self, *a):
-            pass
-
-        def write_file(self, *a):
-            pass
-
-        def remove_files(self, *a):
-            pass
-
-    # replace_tools=[] avoids make_sandboxed_tools which requires a real sandbox
-    s = agskill(
-        name="summarise", system_prompt="You are a summarisation assistant.", replace_tools=[]
-    )
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct('{"ok": 1}')
-        result, _, _ = s.execute_react(
-            make_mock_agent(LLM, _CleanSandbox(), ping_interval_s=0.01, poll_interval_s=0.001),
-            agcontext(),
-            agdata(x=1),
-        )
-    assert result.result == '{"ok": 1}'
-
+# test_run_continues_loop_when_sandbox_has_live_pids /
+# test_run_injects_process_completed_message / test_run_clean_sandbox_returns_immediately
+# were retired here: they tested execute_react()'s specific "loop back and
+# reprompt the model" behavior when agSandbox.wait_for_processes()/
+# get_live_pids() finds pending background work after a final answer --
+# retired along with the per-tool-call hibernate model itself (Phase 1).
+# execute_harness() now calls wait_for_processes() once, non-looping, for
+# native only (see that method's own comment) -- there is no equivalent
+# "reprompt and continue in the same call" behavior to test for any engine
+# today.
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -2286,57 +1004,19 @@ def test_run_clean_sandbox_returns_immediately():
 # ---------------------------------------------------------------------------
 
 
-def test_run_extracts_thinking_from_think_tag():
-    s = make_skill()
+# test_run_extracts_thinking_from_think_tag was retired here, not ported:
+# it tested agllm.py's own <think>-tag stripping (build_assistant_msg's
+# `_thinking` extraction) around execute_react()'s streaming reassembly.
+# Native's own reassembly (_native_in_container_entrypoint.py's
+# _dispatch_via_terminus) does no such stripping today -- a genuine
+# behavior gap, not a like-for-like port; noted in native.py's own
+# "Known gaps" docstring section rather than silently dropped.
 
-    class _ThinkChunk:
-        usage = None
-        choices = [
-            type(
-                "C",
-                (),
-                {
-                    "delta": type(
-                        "D",
-                        (),
-                        {
-                            "content": "<think>internal reasoning</think>final answer",
-                            "tool_calls": None,
-                            "model_extra": {},
-                            "reasoning_content": None,
-                        },
-                    )()
-                },
-            )()
-        ]
-
-    class _UsageChunk:
-        usage = _Usage()
-        choices = []
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = [
-            _ThinkChunk(),
-            _UsageChunk(),
-        ]
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assistant_msgs = [m for m in ctx.messages if m.get("role") == "assistant"]
-    assert any("_thinking" in m for m in assistant_msgs)
-
-
-# ---------------------------------------------------------------------------
-# run() — token accumulation
-# ---------------------------------------------------------------------------
-
-
-def test_run_returns_token_counts():
-    s = make_skill()
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = _direct("{}")
-        _, ctx, _ = s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-    # _Usage stub reports prompt_tokens=5
-    assert ctx.total_input_tokens == 5
+# test_run_returns_token_counts was retired here: covered fast, for native,
+# by tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# test_token_usage_is_tracked (proving _run_react_loop()'s response usage
+# is real, accumulated per-dispatch data, not an execute_react()-only
+# concern anymore).
 
 
 # ---------------------------------------------------------------------------
@@ -2384,7 +1064,7 @@ def test_run_does_not_mutate_callers_shared_input_object():
         )
         return agdata(answer=skill_input.text), prev_ctx, []
 
-    s.execute_react = fake_execute_react
+    s.execute_harness = fake_execute_react
 
     shared_input = agdata(text="x" * 100)
     ag = _agent_cls(agconfig=cfg)
@@ -2423,14 +1103,13 @@ def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
             context_limit=ag.llm.context_limit,
             agconfig=ag.agconfig,
         )
-        from agency.tools import make_sandboxed_tools
+        from agency.tools.read import make_read
 
-        tools = {t.name: t for t in make_sandboxed_tools(ag.sandbox)}
         path = skill_input.text.split("saved to ")[1].split(" —")[0]
-        r = tools["read"](agdata(file_path=path))
+        r = make_read(ag.sandbox).fn(agdata(file_path=path))
         return agdata(answer=r.content), prev_ctx, []
 
-    s.execute_react = fake_execute_react
+    s.execute_harness = fake_execute_react
 
     shared_input = agdata(text="x" * 100)
     agents = [_agent_cls(agconfig=cfg) for _ in range(2)]
@@ -2470,20 +1149,11 @@ def test_plan_mode_false_leaves_replace_tools_untouched():
     assert s.replace_tools == [t]
 
 
-def test_plan_mode_no_tools_sent_to_llm():
-    """When plan_mode=True, the LLM call receives no tools key."""
-    s = agskill(name="s", system_prompt="", plan_mode=True)
-    captured = {}
-
-    def capture(**kwargs):
-        captured["has_tools"] = "tools" in kwargs
-        return _direct("{}")
-
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = capture
-        s.execute_react(make_mock_agent(LLM), agcontext(), agdata(x=1))
-
-    assert captured["has_tools"] is False
+# test_plan_mode_no_tools_sent_to_llm was retired here along with
+# execute_react() itself: plan_mode sets replace_tools=[], which is now a
+# documented, currently-unsupported gap for every engine (see the
+# replace_tools/add_tools retirement note above) -- there is no loop left
+# to assert "no tools sent" against.
 
 
 # ---------------------------------------------------------------------------

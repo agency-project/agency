@@ -6,7 +6,7 @@ import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from .agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
+from .agconfig import agConfig, StaticConfigParam, DynamicConfigParam, _AgConfigViewBase
 from .agname import agname as _agname
 from .agsandbox_backends import agsandbox_backend, backend_for_image_kind, _RUN_ID
 
@@ -27,6 +27,19 @@ if TYPE_CHECKING:
 # based backend, not to sandboxing in general.
 class _AgSandboxFields:
     base_image = StaticConfigParam("agSandbox", default="agency-sandbox:latest")
+    persistent = DynamicConfigParam(
+        "agSandbox", default=False
+    )  # If True, agtool.py:dispatch_tools() never hibernates (sandbox.stop())
+    # this sandbox between tool calls within a skill run -- it only
+    # stops/commits at the skill-run boundary (agskill.py). This trades away
+    # GPU/keyring-slot release during the LLM "think" turn between tool
+    # calls (today's whole reason dispatch_tools() hibernates) for a
+    # container that stays warm for the entire skill call -- required once
+    # an agent's LLM calls or harness process themselves run inside the
+    # container rather than hopping in only for each tool call, since there
+    # is then no safe point to stop the container without killing whatever
+    # is making that call. Default False preserves today's per-tool-call
+    # hibernate behavior unchanged.
 
 
 class agSandboxConfig(_AgConfigViewBase):
@@ -151,6 +164,50 @@ class agSandbox(_AgSandboxFields):
             host_path.mkdir(parents=True, exist_ok=True)
             mounts[mount_name] = (str(host_path.resolve()), container, mode)
 
+        # Unconditional, harmless-if-unused default mount for a
+        # docker/podman-backed harness launch's Unix-domain-socket LLM
+        # gateway bridge (see agutil.agharness_llm_gateway_dir's docstring
+        # and agharness_internal/agproxy_ptrace_internal/
+        # _tcp_to_uds_relay.py). Added here rather than requiring each
+        # harness backend to configure it per-agent, for the same reason
+        # GPU passthrough flags are attached to every container
+        # unconditionally (container.py's _gpu_flags): neither runtime
+        # supports adding a bind mount to an already-created container, so
+        # this must be present at creation time regardless of whether this
+        # particular agent ever actually runs a harness. A bind mount is a
+        # live view, not a copy -- the socket file inside this directory
+        # doesn't need to exist yet.
+        from .agutil import (
+            AGENCY_PACKAGE_CONTAINER_MOUNT,
+            agency_package_dir,
+            agharness_binary_cache_dir,
+            agharness_llm_gateway_dir,
+        )
+
+        mounts.setdefault(
+            "_agharness_llm_gateway",
+            (str(agharness_llm_gateway_dir()), "/var/run/agency_llm_gateway", "rw"),
+        )
+        # Same rationale, for the harness binary cache (see
+        # agutil.agharness_binary_cache_dir's docstring): read-only,
+        # since a container should never be able to write back into a
+        # cache shared across every sandbox on this host.
+        mounts.setdefault(
+            "_agharness_bin_cache",
+            (str(agharness_binary_cache_dir()), "/opt/agency_harness_bin", "ro"),
+        )
+        # Same rationale again, for the `agency` package itself (see
+        # agutil.agency_package_dir's docstring) -- needed by a persistent
+        # in-container entrypoint (agharness_backends/native.py's
+        # react-loop process, or a container-relocated agproxy_llm) to
+        # `import agency` and run the EXACT same code as the host process,
+        # not a second copy baked into the sandbox's base image. Read-only,
+        # same reasoning as the binary cache.
+        mounts.setdefault(
+            "_agency_package",
+            (str(agency_package_dir()), AGENCY_PACKAGE_CONTAINER_MOUNT, "ro"),
+        )
+
         self._backend = agsandbox_backend.for_config(
             self._agconfig,
             agname=self._agname,
@@ -273,6 +330,9 @@ class agSandbox(_AgSandboxFields):
 
     def exec(self, *args, **kwargs):
         return self._backend.exec(*args, **kwargs)
+
+    def exec_detached(self, *args, **kwargs) -> None:
+        return self._backend.exec_detached(*args, **kwargs)
 
     def read_file(self, *args, **kwargs):
         return self._backend.read_file(*args, **kwargs)

@@ -3,6 +3,7 @@ import html2text
 from ..agdata import agdata, agerror
 from ..agutil import format_exception
 from ..agtool import agtool
+from ..agtool_pure import WEBFETCH_PARAMS as _WEBFETCH_PARAMS
 
 _MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 _DEFAULT_TIMEOUT = 30
@@ -60,20 +61,5 @@ webfetch = agtool(
     fn=_run,
     run_in_subprocess=False,
     description="Fetch a URL and return its content as text, markdown, or raw HTML.",
-    params={
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "URL to fetch (must be http:// or https://)"},
-            "format": {
-                "type": "string",
-                "enum": ["markdown", "text", "html"],
-                "description": "Output format (default: markdown)",
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Timeout in seconds (max 120, default 30)",
-            },
-        },
-        "required": ["url"],
-    },
+    params=_WEBFETCH_PARAMS,
 )

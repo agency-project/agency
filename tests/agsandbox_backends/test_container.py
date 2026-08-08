@@ -1523,19 +1523,20 @@ class TestCvdOverrideProtectionIntegration:
         import uuid
 
         from agency.agconfig import agConfig
-        from agency.agdata import agdata
         from agency.agresources import agResourcePool
         from agency.agsandbox import agSandbox
         from agency.agsandbox_backends import agSandboxBackendConfig
-        from agency.tools import make_sandboxed_tools
 
         cfg = agConfig(agSandboxBackendConfig(backend=backend))
         sb = agSandbox(str(uuid.uuid4()), agconfig=cfg)
         pool = agResourcePool(mark_gpus=False)
         assert pool.gpus, "expected at least one real GPU to be detected on this host"
-        tools = {t.name: t for t in make_sandboxed_tools(sb, pool)}
         try:
-            tools["reserve_gpu"].fn(agdata())
+            # Mirrors the retired make_gpu_reserve tool's own _run body: a
+            # virtual-only reservation, no physical GPU claimed until exec().
+            sb._gpu_virtual = True
+            sb._gpu_acquire_fn = pool.acquire_gpu
+            sb._gpu_release_fn = pool.release_gpu
 
             leased_out, rc = sb.exec("echo $CUDA_VISIBLE_DEVICES")
             assert rc == 0

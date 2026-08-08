@@ -7,7 +7,8 @@ internally.  All internal schema operations use ``agschema``.
 
 from __future__ import annotations
 import json
-from typing import TYPE_CHECKING, Callable
+import re
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .agsandbox import agSandbox
@@ -17,13 +18,10 @@ from .agdata import agdata, agerror
 from .agtype import (
     agtype,
     agrawstring,
-    type_hint_to_string_type,
     get_return_tool_description_prompt,
     validate_value_against_type_hint,
-    get_json_example_for_type_hint,
     output_field_desc,
 )
-from .agutil import _looks_like_path
 from .agconfig import DynamicConfigParam, _AgConfigViewBase
 
 
@@ -58,21 +56,46 @@ class agSchemaConfig(_AgConfigViewBase):
     _OWNER = "agschema"
 
 
-def _type_error_fix(field_name: str, type_hint, value) -> str:
-    """Return a corrective hint string for a type-validation failure."""
-    ex = get_json_example_for_type_hint(type_hint)
-    got_str = isinstance(value, str)
-    if value is None:
-        return (
-            f"You called return_{field_name} without providing the required argument. "
-            f"You must pass your output as '{field_name}' keyed argument to the tool. Calling this tool without passing an argument will not work. "
-            f'Format Example (JSON): {{"{field_name}": {ex}}}'
-        )
-    if got_str and type_hint_to_string_type(type_hint) == "array":
-        return f"You passed a JSON-encoded string; pass a JSON array directly. Example: {ex}"
-    if got_str and type_hint_to_string_type(type_hint) == "object":
-        return f"You passed a JSON-encoded string; pass a JSON object directly. Example: {ex}"
-    return f"Expected format: {ex}"
+def _lenient_json_object(raw_text: str) -> dict:
+    """Parse *raw_text* as a JSON object, tolerating a harness's model
+    wrapping its final answer in prose and/or a markdown code fence
+    despite being asked for raw JSON only
+    (`agharness.build_output_format_instruction`'s instruction is not
+    always followed strictly -- confirmed against a real response from a
+    real Claude model: 'Perfect! All tasks have been completed
+    successfully. Let me provide the final status:\\n\\n```json\\n{...}\\n```').
+
+    Tries, in order: the raw text as-is; the contents of a ```...```
+    fence if one is present; the substring from the first '{' to the
+    last '}'. Raises the ORIGINAL `json.JSONDecodeError` (from the
+    raw-text attempt) if every strategy fails, so a genuinely non-JSON
+    response still reports its own real parse error instead of a
+    fallback attempt's more confusing one."""
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        # `except ... as name` is implicitly deleted once this block exits
+        # (Python avoids a traceback reference cycle) -- keep it alive
+        # under a different name so it's still raiseable at the bottom.
+        original_exc = exc
+
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", raw_text, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    start, end = raw_text.find("{"), raw_text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(raw_text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    raise original_exc
+
+
 
 
 class agschema:
@@ -291,6 +314,49 @@ class agschema:
             paths.extend(written)
         return paths
 
+    def validate_and_recover(
+        self,
+        raw_text: str,
+        sandbox: "agSandbox",
+    ) -> "tuple[agdata | agerror, list[str]]":
+        """Validate and recover a harness's single raw final-answer text
+        against this schema, in one call.
+
+        The native ReAct loop collects structured output incrementally,
+        one field at a time, through per-field `return_<field>` tool calls
+        (`make_return_output_agtool`/`make_field_handler` above) --
+        `agskill.execute_harness()`'s harness path instead gets one raw
+        text blob back and needs the whole-schema equivalent of that
+        validation + recovery in a single step, which didn't exist as a
+        single entry point before this method: this is pure composition of
+        `check()` (whole-schema field presence/type validation, already
+        used for input validation despite the name) and `recover_outputs()`
+        (per-agtype-field `.recover()`, already used by `execute_react()`'s
+        own success path) -- no new validation logic.
+
+        Returns `(data, paths)` on success (`paths` are the sandbox paths
+        `recover_outputs()` produced, for parity with `execute_react()`'s
+        own cleanup bookkeeping), or `(agerror(...), [])` if *raw_text*
+        isn't valid JSON, isn't a JSON object, or fails schema validation.
+        """
+        try:
+            parsed = _lenient_json_object(raw_text)
+        except json.JSONDecodeError as exc:
+            return agerror(f"could not parse harness output as JSON: {exc}"), []
+        if not isinstance(parsed, dict):
+            return (
+                agerror(f"harness output must be a JSON object, got {type(parsed).__name__}"),
+                [],
+            )
+
+        data = agdata(**parsed)
+        errors = self.check(data)
+        if errors:
+            return agerror(f"output schema error: {errors}"), []
+
+        paths = self.recover_outputs(data, sandbox)
+        return data, paths
+
     # ------------------------------------------------------------------
     # raw_schema_key equivalent
     # ------------------------------------------------------------------
@@ -319,163 +385,6 @@ class agschema:
     def get_return_tool_descriptions(self, field_name: str) -> "tuple[str, str]":
         """Return (tool_description, value_description) for a return_<field_name> tool."""
         return get_return_tool_description_prompt(field_name, self._data[field_name])
-
-    # ------------------------------------------------------------------
-    # Return output tools
-    # ------------------------------------------------------------------
-
-    def make_return_output_agtool(
-        self,
-        sandbox: "agSandbox",
-        collected_outputs: dict,
-        required_fields: set,
-        exec_timeout: int,
-    ) -> list:
-        """Build one agtool per output field, wired to collect into collected_outputs.
-
-        Each tool runs in the calling thread (run_in_subprocess=False) so the handler
-        closure can mutate collected_outputs and required_fields directly.
-        """
-        from .agtool import agtool as _agtool
-
-        def _return_log_fn(tool, arg, result, _elapsed_ms):
-            if tool._term is None:
-                return
-            arg_str = arg.to_json()
-            if "error" in result._data:
-                tool._term.log("TOOL ✗   ", f"{tool.name}({arg_str})  → {result._data['error']}")
-            else:
-                tool._term.log("TOOL ✓   ", f"{tool.name}({arg_str})")
-
-        tools = []
-        for field, hint in self._data.items():
-            json_type = type_hint_to_string_type(hint)
-            tool_desc, value_desc = get_return_tool_description_prompt(field, hint)
-            value_schema: dict = {"type": json_type, "description": value_desc}
-            handler = self.make_field_handler(
-                field, sandbox, collected_outputs, required_fields, exec_timeout
-            )
-
-            def _fn(arg, _h=handler):
-                return agdata.from_json(_h(arg._data))
-
-            tools.append(
-                _agtool(
-                    name=f"return_{field}",
-                    description=tool_desc,
-                    fn=_fn,
-                    params={
-                        "type": "object",
-                        "properties": {field: value_schema},
-                        "required": [field],
-                    },
-                    log_fn=_return_log_fn,
-                    run_in_subprocess=False,
-                )
-            )
-        return tools
-
-    def make_return_output_tools(self) -> list[dict]:
-        """Return raw OpenAI-wire dicts for each output field. Used by tests."""
-        tools = []
-        for field, hint in self._data.items():
-            json_type = type_hint_to_string_type(hint)
-            tool_desc, value_desc = get_return_tool_description_prompt(field, hint)
-            value_schema: dict = {"type": json_type, "description": value_desc}
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": f"return_{field}",
-                        "description": tool_desc,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {field: value_schema},
-                            "required": [field],
-                        },
-                    },
-                }
-            )
-        return tools
-
-    # ------------------------------------------------------------------
-    # Field handler factory
-    # ------------------------------------------------------------------
-
-    def make_field_handler(
-        self,
-        field_name: str,
-        sandbox: "agSandbox",
-        collected_outputs: dict,
-        required_fields: set,
-        exec_timeout: int,
-    ) -> "Callable[[dict], str]":
-        """Build a handler for a single return_<field_name> intercept tool call."""
-        type_hint = self._data[field_name]
-        agtype_cls = agtype.from_hint(type_hint)
-
-        def _handle(args: dict) -> str:
-            value = next(iter(args.values()), None)
-
-            err = self.check_field(field_name, value)
-            if err is not None:
-                return json.dumps(
-                    {
-                        "error": (
-                            f"field_name '{field_name}': {err}. "
-                            f"{_type_error_fix(field_name, type_hint, value)}"
-                        )
-                    }
-                )
-
-            if agtype_cls is not None:
-                err = agtype_cls.validate_output(field_name, value, sandbox, exec_timeout)
-                if err is not None:
-                    return json.dumps({"error": err})
-
-            if type_hint is str and isinstance(value, str) and _looks_like_path(value):
-                try:
-                    resolved = sandbox.read_file(value)
-                    if resolved and resolved.strip() and not _looks_like_path(resolved.strip()):
-                        print(
-                            f"[agschema] WARNING: output field '{field_name}' looked like a "
-                            f"path ('{value}') and was auto-resolved to that file's contents "
-                            f"because its type hint is plain str. If '{field_name}' is meant "
-                            f"to hold a path rather than content, declare it as agpath instead."
-                        )
-                        value = resolved
-                except Exception as _e:
-                    # Expected whenever the str value just isn't an actual
-                    # readable path in the sandbox -- leave it as a plain
-                    # string rather than auto-resolved content.
-                    print(
-                        f"[agschema] '{field_name}' looked like a path but could not be read: {_e}"
-                    )
-
-            if type_hint is float and isinstance(value, int):
-                value = float(value)
-            collected_outputs[field_name] = value
-            remaining = required_fields - set(collected_outputs)
-            if remaining:
-                _remaining_tools = ", ".join(f"return_{f}" for f in sorted(remaining))
-                return json.dumps(
-                    {
-                        "result": (
-                            f"[HARNESS SYSTEM] ✓ '{field_name}' registered. "
-                            f"Still needed: {sorted(remaining)}, call {_remaining_tools} tool(s)."
-                        )
-                    }
-                )
-            return json.dumps(
-                {
-                    "result": (
-                        f"[HARNESS SYSTEM] ✓ '{field_name}' registered. "
-                        f"All required fields complete, please end your response now."
-                    )
-                }
-            )
-
-        return _handle
 
     def __repr__(self) -> str:
         return f"agschema({self._data!r})"

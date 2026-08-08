@@ -680,6 +680,8 @@ class _ContainerBackendBase(agsandbox_backend):
         # captured exactly once and never recomputed on a later call.
         self._baseline_pids: "set[int] | None" = None
         self._daemon_pids: set[int] = set()
+        self._ptrace_managed_pids: set[int] = set()  # see ingest_ptrace_pids() in base.py
+        self._started = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
         # Transient squash-time "diff since reference chain" tar, built
@@ -1156,6 +1158,31 @@ class _ContainerBackendBase(agsandbox_backend):
         except Exception as e:
             return str(e), -1
 
+    def _container_exec_detached(
+        self,
+        sh_cmd: str,
+        workdir: str = "/workspace",
+        shell: str = "bash",
+    ) -> None:
+        """Launch sh_cmd inside the container (`docker/podman exec -d`) and
+        return as soon as it's registered, without waiting for it to finish
+        -- for starting a long-lived in-container process (an
+        agharness_backends/native.py react-loop entrypoint, or a
+        container-relocated agproxy_llm) that the caller reaches afterward
+        over its own bridge (a bind-mounted UDS -- see agsandbox.py's
+        `_agharness_llm_gateway` mount), not via this call's stdout/exit
+        code, unlike every other `_container_exec*` method here.
+
+        Raises if the container itself couldn't be reached (a real launch
+        failure), but has no way to know if sh_cmd's own process later
+        crashes -- detecting that is the caller's job (e.g. a heartbeat over
+        the bridge), not this method's, exactly as `docker exec -d` itself
+        offers no such feedback once the process is handed off.
+        """
+        self._ensure_started()
+        args = [self._runtime, "exec", "-d", "-w", workdir, self._container_name(), shell, "-c", sh_cmd]
+        self._run(args, check=True, timeout=self.exec_quick_timeout_s)
+
     def update_limits(
         self,
         *,
@@ -1549,6 +1576,7 @@ class _ContainerBackendBase(agsandbox_backend):
         # Clear PID tracking — stopping kills every process inside, same as rm.
         self._watched_pids = {}
         self._baseline_pids = None  # force a fresh capture on the next _ensure_started()
+        self._ptrace_managed_pids = set()
         name = self._container_name()
         stop_exc: Exception | None = None
         try:
@@ -1611,6 +1639,7 @@ class _ContainerBackendBase(agsandbox_backend):
         had_container = self._container_running()
         self._watched_pids = {}
         self._baseline_pids = None
+        self._ptrace_managed_pids = set()
         name = self._container_name()
         # rm_exc is raised at the end, after the release checks below still
         # run -- an unconfirmed removal must reach the caller, but shouldn't

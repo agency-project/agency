@@ -1,106 +1,11 @@
 """Tests for agfile — file-backed agskill schema field."""
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from agency.agdata import agdata, agerror
-from agency.agcontext import agcontext
-from agency.agconfig import agConfig
 from agency.agschema import agschema
 from agency.agtype import agtype, agfile
 from agency.agskill import agskill
-from agency.agllm import agllm
-
-LLM_CONFIG = {"api_key": "test", "model": ""}
-LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
-
-
-def _make_mock_agent(llm=None, sandbox=None):
-    from agency.agent import agent as _agent_cls
-
-    class _Cls:
-        agresource_pool = MagicMock()
-        ping_interval_s = 300
-        poll_interval_s = 5
-        agconfig = None
-        _drain_inbox = _agent_cls._drain_inbox
-        _check_pause = _agent_cls._check_pause
-
-    ag = _Cls()
-    from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
-
-    ag._state = _agent_state_cls("test")
-    ag.llm = llm or LLM
-    if sandbox is not None:
-        ag.sandbox = sandbox
-    else:
-        ag.sandbox = MagicMock()
-        # A bare MagicMock()'s _has_pending_background_work() would
-        # otherwise auto-mock to a truthy value, making agtool.py's
-        # dispatch_tools() defer stop() forever -- default to "nothing
-        # pending" so tests get the common case without configuring it.
-        ag.sandbox._has_pending_background_work.return_value = False
-    ag.terminal = MagicMock()
-    ag.log = MagicMock()
-    ag.log.token_usage = {}
-    ag.agname = "test"
-    ag._set_ui_state = MagicMock()
-    ag._push_live_messages = MagicMock()
-    ag._append_full_history = MagicMock()
-    ag._next_inbox_msg = MagicMock(return_value=None)
-    ag.push_token_count_update_to_ui = MagicMock()
-    return ag
-
-
-# ---------------------------------------------------------------------------
-# Streaming mock helpers
-# ---------------------------------------------------------------------------
-
-
-class _Delta:
-    def __init__(self, content=None, tool_calls=None):
-        self.content = content
-        self.tool_calls = tool_calls
-        self.model_extra = {}
-        self.reasoning_content = None
-
-
-class _Choice:
-    def __init__(self, delta):
-        self.delta = delta
-
-
-class _Usage:
-    prompt_tokens = 5
-
-
-class _Chunk:
-    def __init__(self, content=None, tool_calls=None, usage=None):
-        self.choices = (
-            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
-        )
-        self.usage = usage
-
-
-class _TCDelta:
-    def __init__(self, name, args_json, call_id):
-        self.id = call_id
-        self.index = 0
-        self.function = _TCFnDelta(name, args_json)
-
-
-class _TCFnDelta:
-    def __init__(self, name, args):
-        self.name = name
-        self.arguments = args
-
-
-def _direct(content: str):
-    return [_Chunk(content=content), _Chunk(usage=_Usage())]
-
-
-def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
-    tc = _TCDelta(name, json.dumps(args), call_id)
-    return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
 # ---------------------------------------------------------------------------
@@ -260,20 +165,10 @@ def test_system_prompt_agfile_type_shown_as_file():
 # ---------------------------------------------------------------------------
 
 
-def test_skill_with_agfile_output_schema_validates_path_string():
-    sk = agskill("write", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
-    sandbox = MagicMock()
-    sandbox._has_pending_background_work.return_value = False
-    sandbox.read_file.return_value = "recovered file content"
-    responses = [
-        _tool_call("return_doc", {"value": "/workspace/outputs/write_doc.txt"}),
-        _direct(""),
-    ]
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = sk.execute_react(_make_mock_agent(LLM, sandbox), agcontext(), agdata())
-    sandbox.read_file.assert_called_with("/workspace/outputs/write_doc.txt")
-    assert result.doc == "recovered file content"
+# test_skill_with_agfile_output_schema_validates_path_string was retired
+# here: same retired return_<field> validation chain (see the larger note
+# further down this file), just for the "well-formed path, successfully
+# recovered" case instead of an error case.
 
 
 # ---------------------------------------------------------------------------
@@ -333,156 +228,16 @@ def test_recover_agtype_outputs_no_schema_returns_empty():
 # ---------------------------------------------------------------------------
 
 
-def _run_skill_with_sandbox(skill, responses, sandbox):
-    """Helper: run skill with mocked LLM and a provided sandbox."""
-    sandbox._has_pending_background_work.return_value = False
-    with patch("openai.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.side_effect = responses
-        result, *_ = skill.execute_react(_make_mock_agent(LLM, sandbox), agcontext(), agdata())
-    return result
-
-
-def test_return_agfile_directory_path_returns_error():
-    """return_doc pointing at a directory should give an IsADirectoryError message."""
-    sandbox = MagicMock()
-    sandbox.read_file.side_effect = IsADirectoryError("/workspace/outputs is a directory")
-    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_doc", {"value": "/workspace/outputs"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert isinstance(result, agerror) or result._data.get("doc") is None
-
-
-def test_return_agfile_binary_file_returns_error():
-    """return_doc pointing at a binary file should give a UnicodeDecodeError message."""
-    sandbox = MagicMock()
-    raw = b"\x89PNG\r\n\x1a\n"  # PNG magic bytes
-    sandbox.read_file.side_effect = UnicodeDecodeError(
-        "utf-8", raw, 0, 1, "File /workspace/image.bin contains binary data"
-    )
-    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_doc", {"value": "/workspace/image.bin"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert isinstance(result, agerror) or result._data.get("doc") is None
-
-
-def test_return_agfile_missing_file_returns_error_and_reprompts():
-    """return_doc with a path to a non-existent file should return an error to the agent."""
-    sandbox = MagicMock()
-    sandbox.read_file.side_effect = FileNotFoundError("no such file")
-    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
-    # Response 1: agent calls return_doc → sandbox raises → error returned to agent.
-    # Response 2: agent produces direct text (gives up) → field still missing → skill errors.
-    responses = [
-        _tool_call("return_doc", {"value": "/workspace/outputs/missing.txt"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert isinstance(result, agerror) or result._data.get("doc") is None
-
-
-def test_return_agfile_empty_file_returns_error():
-    """return_doc with a path to an empty file should return an error."""
-    sandbox = MagicMock()
-    sandbox.read_file.return_value = ""
-    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_doc", {"value": "/workspace/outputs/empty.txt"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert isinstance(result, agerror) or result._data.get("doc") is None
-
-
-def test_return_agfile_content_is_another_path_returns_error():
-    """return_doc where the file contains only a path should be rejected."""
-    sandbox = MagicMock()
-    sandbox.read_file.return_value = "/workspace/turn_specula.py"
-    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_doc", {"value": "/workspace/outputs/doc.txt"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert isinstance(result, agerror) or result._data.get("doc") is None
-
-
-def test_return_agfile_valid_content_is_accepted():
-    """return_doc where the file has real content should be accepted."""
-    sandbox = MagicMock()
-    sandbox.read_file.return_value = "def main():\n    pass\n"
-    sk = agskill("w", "", output_schema=agdata(doc=agfile), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_doc", {"value": "/workspace/outputs/code.py"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.doc == "def main():\n    pass\n"
-
-
-# ---------------------------------------------------------------------------
-# return_<field> tool — str auto-resolution of path values
-# ---------------------------------------------------------------------------
-
-
-def test_return_str_with_path_auto_resolves_to_content():
-    """return_code called with a file path should silently resolve to file content."""
-    sandbox = MagicMock()
-    sandbox.read_file.return_value = "def main():\n    pass\n"
-    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_code", {"value": "/workspace/core.py"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.code == "def main():\n    pass\n"
-    sandbox.read_file.assert_called_with("/workspace/core.py")
-
-
-def test_return_str_with_path_that_is_unreadable_keeps_original():
-    """If sandbox.read_file raises, the original path value is kept as-is."""
-    sandbox = MagicMock()
-    sandbox.read_file.side_effect = FileNotFoundError("no file")
-    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_code", {"value": "/workspace/core.py"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.code == "/workspace/core.py"
-
-
-def test_return_str_with_real_content_not_resolved():
-    """return_code with multiline content should never trigger path resolution."""
-    sandbox = MagicMock()
-    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
-    code = "import os\n\ndef main():\n    print('hello')\n"
-    responses = [
-        _tool_call("return_code", {"value": code}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    assert result.code == code
-    sandbox.read_file.assert_not_called()
-
-
-def test_return_str_resolved_content_that_is_itself_a_path_is_not_substituted():
-    """If the resolved file content is also a path, keep original to avoid chaining."""
-    sandbox = MagicMock()
-    sandbox.read_file.return_value = "/workspace/another.py"
-    sk = agskill("w", "", output_schema=agdata(code=str), max_output_schema_retries=0)
-    responses = [
-        _tool_call("return_code", {"value": "/workspace/core.py"}),
-        _direct(""),
-    ]
-    result = _run_skill_with_sandbox(sk, responses, sandbox)
-    # Content itself looks like a path → not substituted → original path kept
-    assert result.code == "/workspace/core.py"
+# _run_skill_with_sandbox() helper and every test_return_agfile_*/
+# test_return_str_* test were retired here: they tested agschema.py's
+# make_field_handler()'s agtype-specific validation chain (directory/
+# binary/missing/empty-file errors, path-auto-resolution for a plain str
+# field) as invoked by the retired per-field `return_<field>` tool handler,
+# only ever reachable via execute_react(). Native's `submit_output` MCP
+# tool does NOT run this same validation chain today (only basic type/
+# shape checking via output_schema.check_field()) -- a real, documented gap
+# for agtype OUTPUT fields specifically, noted in agmcp_server.py's own
+# module docstring rather than silently dropped.
 
 
 # ---------------------------------------------------------------------------

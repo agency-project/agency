@@ -264,88 +264,13 @@ def test_get_return_tool_description_prompt_agpath_warns_against_content():
     assert "content" in val_desc.lower()
 
 
-# ---------------------------------------------------------------------------
-# make_return_output_tools
-# ---------------------------------------------------------------------------
-
-
-def test_make_return_output_tools_one_per_field():
-    s = agschema(agdata(answer=str, score=int))
-    tools = s.make_return_output_tools()
-    names = {t["function"]["name"] for t in tools}
-    assert names == {"return_answer", "return_score"}
-
-
-def test_make_return_output_tools_correct_json_type():
-    s = agschema(agdata(count=int))
-    tools = s.make_return_output_tools()
-    props = tools[0]["function"]["parameters"]["properties"]
-    assert props["count"]["type"] == "integer"
-
-
-def test_make_return_output_tools_required_field_listed():
-    s = agschema(agdata(answer=str))
-    tools = s.make_return_output_tools()
-    assert tools[0]["function"]["parameters"]["required"] == ["answer"]
-
-
-def test_make_return_output_tools_empty_schema():
-    s = agschema(agdata())
-    assert s.make_return_output_tools() == []
-
-
-# ---------------------------------------------------------------------------
-# make_field_handler
-# ---------------------------------------------------------------------------
-
-
-def _make_sandbox():
-    sb = MagicMock()
-    sb.read_file.side_effect = FileNotFoundError
-    return sb
-
-
-def test_make_field_handler_valid_value_collects():
-    s = agschema(agdata(answer=str))
-    collected = {}
-    handler = s.make_field_handler("answer", _make_sandbox(), collected, {"answer"}, 5)
-    result = json.loads(handler({"answer": "hello"}))
-    assert "result" in result
-    assert collected["answer"] == "hello"
-
-
-def test_make_field_handler_wrong_type_returns_error():
-    s = agschema(agdata(count=int))
-    collected = {}
-    handler = s.make_field_handler("count", _make_sandbox(), collected, {"count"}, 5)
-    result = json.loads(handler({"count": "not_an_int"}))
-    assert "error" in result
-    assert not collected
-
-
-def test_make_field_handler_null_value_returns_error():
-    s = agschema(agdata(answer=str))
-    collected = {}
-    handler = s.make_field_handler("answer", _make_sandbox(), collected, {"answer"}, 5)
-    result = json.loads(handler({}))
-    assert "error" in result
-
-
-def test_make_field_handler_remaining_fields_listed():
-    s = agschema(agdata(a=str, b=str))
-    collected = {}
-    handler = s.make_field_handler("a", _make_sandbox(), collected, {"a", "b"}, 5)
-    result = json.loads(handler({"a": "hello"}))
-    assert "result" in result
-    assert "b" in result["result"]
-
-
-def test_make_field_handler_all_fields_complete_message():
-    s = agschema(agdata(answer=str))
-    collected = {}
-    handler = s.make_field_handler("answer", _make_sandbox(), collected, {"answer"}, 5)
-    result = json.loads(handler({"answer": "done"}))
-    assert "complete" in result["result"].lower() or "end" in result["result"].lower()
+# make_return_output_tools/make_field_handler tests were retired here along
+# with execute_react() itself: both only ever supported the per-field
+# `return_<field>` tool mechanism (agschema.make_return_output_agtool),
+# whose only caller was agskill.py's (now-deleted) _build_toolkit(). Native's
+# structured output uses a different mechanism (`submit_output`, see
+# agmcp_server.py) -- fast coverage for that lives in
+# tests/agharness_internal/agharness_backends/test_native_loop_fast.py.
 
 
 # ---------------------------------------------------------------------------
@@ -421,3 +346,65 @@ def test_recover_outputs_no_agtype_fields_returns_empty():
     data = agdata(answer="done")
     paths = s.recover_outputs(data, sb)
     assert paths == []
+
+
+# ---------------------------------------------------------------------------
+# validate_and_recover() -- whole-schema validation + recovery from a
+# harness's single raw final-answer text (agskill.execute_harness()'s path)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_and_recover_valid_json_round_trips():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover('{"answer": "done"}', sb)
+    assert not isinstance(data, agerror)
+    assert data.answer == "done"
+    assert paths == []
+
+
+def test_validate_and_recover_malformed_json_returns_agerror():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover("not json at all {", sb)
+    assert isinstance(data, agerror)
+    assert "could not parse harness output as JSON" in data.error
+    assert paths == []
+
+
+def test_validate_and_recover_non_object_json_returns_agerror():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover("[1, 2, 3]", sb)
+    assert isinstance(data, agerror)
+    assert "must be a JSON object" in data.error
+    assert paths == []
+
+
+def test_validate_and_recover_missing_field_returns_agerror():
+    s = agschema(agdata(answer=str, confidence=float))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover('{"answer": "done"}', sb)
+    assert isinstance(data, agerror)
+    assert "output schema error" in data.error
+    assert "confidence" in data.error
+    assert paths == []
+
+
+def test_validate_and_recover_wrong_type_returns_agerror():
+    s = agschema(agdata(answer=str))
+    sb = MagicMock()
+    data, paths = s.validate_and_recover('{"answer": 42}', sb)
+    assert isinstance(data, agerror)
+    assert "output schema error" in data.error
+
+
+def test_validate_and_recover_recovers_agtype_field():
+    s = agschema(agdata(doc=agfile))
+    sb = MagicMock()
+    sb.read_file.return_value = "the recovered content"
+    data, paths = s.validate_and_recover('{"doc": "/workspace/out.txt"}', sb)
+    assert not isinstance(data, agerror)
+    sb.read_file.assert_called_once_with("/workspace/out.txt")
+    assert data.doc == "the recovered content"
+    assert paths == ["/workspace/out.txt"]

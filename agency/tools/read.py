@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from ..agdata import agdata, agerror
 from ..agutil import format_exception
 from ..agtool import agtool
+from ..agtool_pure import paginate_text as _paginate_text_dict, READ_PARAMS as _READ_PARAMS
 
 if TYPE_CHECKING:
     from ..agsandbox import agSandbox
@@ -19,50 +20,13 @@ _MAX_LINE_LEN = 2000
 READ_CHECK_TIMEOUT_S = 5  # Timeout in seconds for the shell command that checks whether a path is a file, directory, or missing.
 READ_LS_TIMEOUT_S = 10  # Timeout in seconds for the ls command used to list a directory's entries inside the sandbox container.
 
-_READ_PARAMS = {
-    "type": "object",
-    "properties": {
-        "file_path": {"type": "string", "description": "Absolute path to the file or directory"},
-        "offset": {
-            "type": "integer",
-            "description": "Line number to start reading from (1-indexed)",
-        },
-        "limit": {"type": "integer", "description": "Maximum number of lines to read"},
-    },
-    "required": ["file_path"],
-}
-
 
 def _paginate_text(content: str, offset: int, limit: int) -> agdata:
-    """Apply offset/limit pagination to text content and return agdata."""
-    all_lines = content.splitlines(keepends=True)
-    total = len(all_lines)
-    start = offset - 1
-    page_lines = all_lines[start : start + limit]
-
-    raw: list[str] = []
-    bytes_used = 0
-    cut = False
-    for i, line in enumerate(page_lines):
-        text = line.rstrip("\n")
-        if len(text) > _MAX_LINE_LEN:
-            text = text[:_MAX_LINE_LEN] + "... (truncated)"
-        size = len(text.encode()) + 1
-        if bytes_used + size > _MAX_BYTES:
-            cut = True
-            break
-        raw.append(f"{start + i + 1}: {text}")
-        bytes_used += size
-
-    more = cut or (start + len(page_lines) < total)
-    return agdata(
-        type="file",
-        content="\n".join(raw),
-        offset=offset,
-        lines_shown=len(raw),
-        total_lines=total,
-        truncated=more,
-    )
+    """Apply offset/limit pagination to text content and return agdata --
+    thin agdata wrapper over the shared, dependency-free
+    `agtool_pure.paginate_text` (see that module's docstring for why the
+    algorithm itself lives there)."""
+    return agdata(**_paginate_text_dict(content, offset, limit))
 
 
 def make_read(sandbox: "agSandbox") -> agtool:

@@ -1320,105 +1320,15 @@ class TestAgentSaveLoadWithChrootBackend:
 
 @chroot
 class TestChrootSandboxedToolsDispatch:
-    def _make_sandbox(self):
-        from agency.agconfig import agConfig
-        from agency.agsandbox import agSandbox
-        from agency.agsandbox_backends import agSandboxBackendConfig
-
-        cfg = agConfig(agSandboxBackendConfig(backend="chroot"))
-        return agSandbox(str(uuid.uuid4()), agconfig=cfg)
-
-    def test_files_persist_across_process_pool_tool_calls(self):
-        """Files written by the write tool in one worker process must be
-        readable by the read tool in a subsequent, separately-dispatched
-        worker process call -- the chroot-backend analogue of
-        test_docker.py's identically-named container-backend test."""
-        from agency.agdata import agdata, agerror
-        from agency.tools import make_sandboxed_tools
-
-        sb = self._make_sandbox()
-        tools = {t.name: t for t in make_sandboxed_tools(sb)}
-        try:
-            w = tools["write"](agdata(file_path="/workspace/cross.txt", content="cross-worker\n"))
-            assert not isinstance(w, agerror), f"write failed: {w}"
-            r = tools["read"](agdata(file_path="/workspace/cross.txt"))
-            assert not isinstance(r, agerror), f"read failed after cross-worker write: {r}"
-            assert "cross-worker" in r.content
-        finally:
-            sb.destroy()
-
-    def test_bash_then_read_across_process_pool_tool_calls(self):
-        """A file created by the bash tool in one worker process must be
-        readable by the read tool in the next, separately-dispatched call --
-        matches the exact real-world shape of the bug (agfile.prepare()'s
-        sandbox.write_file() in one dispatch, the read tool in the next)."""
-        from agency.agdata import agdata, agerror
-        from agency.tools import make_sandboxed_tools
-
-        sb = self._make_sandbox()
-        tools = {t.name: t for t in make_sandboxed_tools(sb)}
-        try:
-            b = tools["bash"](
-                agdata(
-                    command="mkdir -p /workspace/inputs && echo hi > /workspace/inputs/full_text_1.txt"
-                )
-            )
-            assert not isinstance(b, agerror), f"bash failed: {b}"
-            r = tools["read"](agdata(file_path="/workspace/inputs/full_text_1.txt"))
-            assert not isinstance(r, agerror), f"read failed after cross-worker bash write: {r}"
-            assert "hi" in r.content
-        finally:
-            sb.destroy()
-
-    def test_agent_run_offloads_and_reads_back_large_input(self):
-        """End-to-end: a real agskill run whose input schema triggers
-        agschema's size-based offload (sandbox.write_file in the prepare
-        step, executed in the calling thread) followed by the LLM calling
-        the read tool (a separate ProcessPoolExecutor dispatch) to read it
-        back -- the exact real-world flow that surfaced this bug."""
-        from agency.agconfig import agConfig
-        from agency.agdata import agdata
-        from agency.agskill import agskill
-        from agency.agschema import agSchemaConfig
-        from agency.agsandbox_backends import agSandboxBackendConfig
-        from agency.agent import agent
-
-        cfg = agConfig(
-            agSandboxBackendConfig(backend="chroot"),
-            agSchemaConfig(input_offload_chars=10),  # force offload for a short string
-            {"agllm_backend": {"api_key": "k", "model": "m"}},
-        )
-
-        skill = agskill(name="repro", system_prompt="", input_schema=agdata(text=str))
-
-        def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
-            # Replicate execute_react()'s real step 2 (input prep) explicitly,
-            # since replacing execute_react wholesale also removes that step
-            # -- it isn't called automatically just because ag.sandbox exists.
-            skill.input_schema.prepare_inputs_in_sandbox(
-                skill_input,
-                ag.sandbox,
-                skill.name,
-                context_limit=ag.llm.context_limit,
-                agconfig=ag.agconfig,
-            )
-            # skill_input.text has now been offloaded to a path reference --
-            # read it back via the same tool-dispatch path a real ReAct loop
-            # (running against an LLM) would use.
-            from agency.tools import make_sandboxed_tools
-
-            tools = {t.name: t for t in make_sandboxed_tools(ag.sandbox)}
-            path = skill_input.text.split("saved to ")[1].split(" —")[0]
-            r = tools["read"](agdata(file_path=path))
-            return agdata(answer=r.content), prev_ctx, []
-
-        skill.execute_react = fake_execute_react
-
-        ag = agent(agconfig=cfg)
-        try:
-            long_text = "x" * 100
-            result = ag.run(skill, agdata(text=long_text)).answer
-            assert long_text in result
-        finally:
-            if ag.sandbox is not None:
-                ag.sandbox.destroy()
+    """Retired: every test here (test_files_persist_across_process_pool_
+    tool_calls, test_bash_then_read_across_process_pool_tool_calls,
+    test_agent_run_offloads_and_reads_back_large_input) existed specifically
+    to prove state (files written via one tool call) survived being
+    dispatched to a SEPARATE ProcessPoolExecutor worker process for a
+    subsequent tool call. That dispatch mechanism no longer exists at all --
+    agtool.__call__ always runs in the calling thread/process now (see
+    agtool.py's own module docstring) -- so there is no separate worker
+    process left for state to need to survive crossing into; the underlying
+    concern (does the chroot backend correctly persist files across ordinary
+    sequential operations) is already covered by TestAgSandboxFileIO-style
+    direct sandbox.write_file()/read_file() tests elsewhere in this file."""

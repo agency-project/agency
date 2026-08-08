@@ -93,7 +93,7 @@ def main():
     print(">> Execution should fail.")
     time.sleep(3)
     try:
-        r1 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=3)
+        r1 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=10)
         print(f"Path    : {r1.path!r}\n")
         print(f"Content : {r1.content!r}\n")
         print("Execution succeeded.\n")
@@ -126,7 +126,7 @@ def main():
     print(">> [call 2] max_completion_tokens=4096")
     print(">> Execution should succeed.")
     try:
-        r2 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=3)
+        r2 = ag.run(write_note, agdata(text=_NOTE_TEXT, file_path="/data/note.txt"), max_steps=10)
         print(f"Path    : {r2.path!r}\n")
         print(f"Content : {r2.content!r}\n")
         print("Execution succeeded.\n")

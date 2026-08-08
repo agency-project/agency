@@ -446,6 +446,8 @@ class _ChrootBackend(agsandbox_backend):
         # release_daemon() reference self._watched_pids unconditionally.
         self._watched_pids: dict[int, float] = {}
         self._daemon_pids: set[int] = set()
+        self._ptrace_managed_pids: set[int] = set()  # see ingest_ptrace_pids() in base.py
+        self._started = False
         # Process-group ids captured from _exec_with_pid_tracking()'s own
         # invocations (see _run_unshared()) -- backs _has_pending_background_work()
         # and _kill_all_sandbox_processes(). See this module's docstring for
