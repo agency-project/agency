@@ -592,6 +592,37 @@ Difficulty: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 - **Outcome:** `parent_agent_id` hierarchy forms; W3C `traceparent` can ride the
   existing UDS HTTP bridge for free.
 
+**Follow-up — ordered shutdown of shared services.** `agLLMTerminus` runs
+Uvicorn on a daemon thread ([agllm_terminus.py:723](../agency/agharness_internal/agllm_terminus.py:723)).
+A caller can observe the SSE `[DONE]` chunk and return while
+`_ProfiledStreamingResponse.__call__`'s `finally` (which calls
+`_finish_span` to annotate usage and close the span) is still running on
+that thread. `agprof.stop()` ([agprof.py:989](../agency/profiler/agprof.py:989))
+does not wait for it — under `AGENCY_PROFILE_SCOPE=process`, the `atexit`
+hook nulls `_session` and force-`interrupt()`s any still-open spans
+synchronously, so a streaming span in flight at process exit gets truncated
+instead of properly closed. `workload()`-scoped profiling is unaffected
+(`stop()` runs explicitly, synchronously, after `ag.run()` already
+returned) — this only bites process-scope profiling with streaming
+dispatches, e.g. the manual EC2 examples, which currently work around it by
+calling `terminus.stop()` (joins the server thread) before `agprof.stop()`.
+That wrapper is a stopgap, not the intended interface: it only holds
+because those examples are single-run-per-process. It breaks once a
+process runs multiple agents/runs concurrently, since one run must not be
+able to tear down a shared terminus another run still needs, and the
+profiler shouldn't have to know about `agllm_terminus`'s private
+`_shared_terminus`. The real fix belongs here because it's process-wide
+shutdown ordering across shared services, the same territory as this
+milestone's correlation registry:
+1. Track active streaming responses in `agLLMTerminus`.
+2. Add a public `drain()` (or similar) lifecycle method that waits for
+   them to finish without tearing down the shared instance.
+3. At process shutdown, drain shared harness services (terminus included)
+   before anything else.
+4. Only then stop the profiler and write its trace/summaries.
+- **Difficulty:** S–M.
+- **Dependencies:** M4 (same shared-service shutdown-ordering concern).
+
 ### M5 — Native in-container emission — *recommended*
 - **Objective:** exact turn/tool timing for `native`.
 - **Files:** new `agency/profiler/agprof_emit.py` (**stdlib only** — see §5.4);

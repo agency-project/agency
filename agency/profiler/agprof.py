@@ -98,6 +98,13 @@ _cg_registry: "dict[str, str]" = {}  # label (agname) -> cgroup dir
 _daemon_cg: "dict[str, str]" = {}  # cgroup dir -> agg kind ("conmon"/"dockerd")
 _cg_lock = threading.Lock()
 
+# Pseudo thread-id lane for spans reconstructed after the fact (e.g.
+# agprof_derive's terminus-transcript-diffed turn/tool boundaries) rather
+# than measured live on a calling thread. Negative and out of range of any
+# real `threading.get_native_id()` value, so it never collides with a real
+# thread lane in the summary or the Perfetto trace.
+_DERIVED_TID = -1
+
 
 def _require_linux() -> None:
     """Reject profiling before any profiler output or workload is started."""
@@ -435,6 +442,61 @@ def annotate(**metadata) -> None:
     stack = _span_stack.get()
     if stack:
         stack[-1].annotate(**metadata)
+
+
+def record_derived_span(
+    name: str,
+    *,
+    start_perf_ns: int,
+    end_perf_ns: int,
+    start_wall_ns: int,
+    end_wall_ns: int,
+    metadata: "dict | None" = None,
+) -> None:
+    """Append a span for an interval reconstructed after the fact — e.g.
+    agprof_derive's terminus-transcript-diffed turn/tool boundaries — rather
+    than measured live on a calling thread via ``span()``'s enter/exit.
+
+    No thread ever executed on the interval as far as this process can see,
+    so there is nothing to attribute ``cpu_ns``/``runqueue_ms`` to; both stay
+    absent rather than reported as zero (a busy interval and an unmeasured
+    one must not render identically). Explicitly parentless — it starts a
+    new trace rather than adopting whatever span happens to be ambient in
+    the calling context, since that context (usually none, for the
+    terminus's own request-handling thread) has no relationship to the
+    interval being described. No-op when profiling is off.
+
+    *start_perf_ns*/*end_perf_ns* must be ``time.perf_counter_ns()`` values
+    (agprof's internal clock, see ``_records``' docstring); *start_wall_ns*/
+    *end_wall_ns* the corresponding ``time.time_ns()`` values, for the OTel
+    span's own timestamps.
+    """
+    s = _session
+    if s is None:
+        return
+    from opentelemetry.context import Context
+
+    metadata = dict(metadata or {})
+    metadata.setdefault("timing", "derived")
+    span = s.tracer.start_span(name, context=Context(), start_time=start_wall_ns)
+    for key, value in metadata.items():
+        span.set_attribute(key, _otel_attribute(value))
+    span.end(end_time=end_wall_ns)
+    span_context = span.get_span_context()
+    parent = span.parent
+    _records.append(
+        (
+            _DERIVED_TID,
+            name,
+            start_perf_ns,
+            max(0, end_perf_ns - start_perf_ns),
+            None,
+            None,
+            metadata,
+            span_context.span_id if span_context is not None else None,
+            parent.span_id if parent is not None else None,
+        )
+    )
 
 
 def _unpack_record(record) -> tuple:
@@ -1166,10 +1228,15 @@ def _build_summary(records) -> "dict[str, dict]":
         )
         row["calls"] += 1
         row["wall_ms"] += wall / 1e6
-        row["cpu_ms"] += cpu / 1e6
-        rq = runq or 0
-        row["runq_ms"] += rq / 1e6
-        row["blocked_ms"] += max(0, wall - cpu - rq) / 1e6
+        # cpu is None for spans reconstructed after the fact (see
+        # record_derived_span) -- nothing executed on a thread this process
+        # observed, so there is no cpu/blocked split to contribute; leave
+        # those totals as whatever the record's own live spans measured.
+        if cpu is not None:
+            row["cpu_ms"] += cpu / 1e6
+            rq = runq or 0
+            row["runq_ms"] += rq / 1e6
+            row["blocked_ms"] += max(0, wall - cpu - rq) / 1e6
     return out
 
 

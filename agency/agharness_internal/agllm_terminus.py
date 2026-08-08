@@ -39,7 +39,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..agconfig import GlobalConfigParam, _AgConfigViewBase
 from ..agllm_backends import BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS, API_ERROR_EXCS
-from ..profiler import agprof
+from ..profiler import agprof, agprof_derive
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
@@ -286,6 +286,7 @@ class agLLMTerminus:
         with self._lock:
             self._agents_by_token.pop(token, None)
             self._last_transcript_by_token.pop(token, None)
+        agprof_derive.forget(token)
 
     def _agent_for_token(self, token: "str | None"):
         if token is None:
@@ -371,6 +372,14 @@ class agLLMTerminus:
                 attempt_scope = agprof.span("llm:attempt[0]")
                 attempt_span = attempt_scope.__enter__()
                 attempt_t0 = time.perf_counter()
+                # M3 (docs/Design_profiler_harness_integration.md §5.2):
+                # separate clock captures for agprof_derive's turn/tool
+                # spans, taken at the same instant as attempt_t0 above but
+                # in agprof's own clock domain (perf_counter_ns for
+                # ordering/duration, time_ns for OTel's wall-clock span
+                # timestamps) -- see record_derived_span's docstring.
+                dispatch_start_perf_ns = time.perf_counter_ns()
+                dispatch_start_wall_ns = time.time_ns()
                 span_closed = False
 
                 def _finish_span(exc_info=(None, None, None)) -> None:
@@ -572,12 +581,31 @@ class agLLMTerminus:
                             generation_ms=round(max(0.0, elapsed_ms - ttft_ms), 3),
                             **_usage_metrics(usage),
                         )
+                        # M3: the last chunk's _accumulate_and_serialize()
+                        # call already recorded the final transcript above --
+                        # deriving here, once per dispatch on completion,
+                        # avoids the per-chunk _record_transcript() calls
+                        # manufacturing a turn per chunk (see module
+                        # docstring's compaction/chunking risk note).
+                        transcript = self.transcript_for_token(token)
+                        if transcript:
+                            agprof_derive.on_dispatch(
+                                token,
+                                transcript[:-1],
+                                transcript[-1],
+                                start_perf_ns=dispatch_start_perf_ns,
+                                start_wall_ns=dispatch_start_wall_ns,
+                                end_perf_ns=time.perf_counter_ns(),
+                                end_wall_ns=time.time_ns(),
+                            )
                         yield "data: [DONE]\n\n"
 
                 return _ProfiledStreamingResponse(
                     sse_gen(), media_type="text/event-stream", finish_span=_finish_span
                 )
 
+            dispatch_start_perf_ns = time.perf_counter_ns()
+            dispatch_start_wall_ns = time.time_ns()
             with agprof.span("llm:attempt[0]") as attempt_span:
                 _annotate_span(attempt_span, model=model, provider=provider)
                 try:
@@ -596,8 +624,16 @@ class agLLMTerminus:
                     attempt_span, outcome="success", **_usage_metrics(serialized["usage"])
                 )
                 if serialized["choices"]:
-                    self._record_transcript(
-                        token, kwargs.get("messages"), serialized["choices"][0]["message"]
+                    response_message = serialized["choices"][0]["message"]
+                    self._record_transcript(token, kwargs.get("messages"), response_message)
+                    agprof_derive.on_dispatch(
+                        token,
+                        kwargs.get("messages"),
+                        response_message,
+                        start_perf_ns=dispatch_start_perf_ns,
+                        start_wall_ns=dispatch_start_wall_ns,
+                        end_perf_ns=time.perf_counter_ns(),
+                        end_wall_ns=time.time_ns(),
                     )
                 return JSONResponse(serialized)
 

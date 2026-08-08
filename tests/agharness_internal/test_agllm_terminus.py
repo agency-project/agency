@@ -332,6 +332,135 @@ def test_streaming_dispatch_empty_stream_returns_clean_done_not_an_error():
     assert resp.text.strip() == "data: [DONE]"
 
 
+# ---------------------------------------------------------------------------
+# M3 (docs/Design_profiler_harness_integration.md §5.2): turn/tool spans
+# derived from two real, sequential dispatches on the same token -- the
+# shape every harness backend produces (it resends the full conversation,
+# including the previous turn's tool result, on each call).
+# ---------------------------------------------------------------------------
+
+
+def test_sequential_dispatches_derive_turn_and_tool_spans(monkeypatch, tmp_path):
+    from openai.types.chat.chat_completion_message_tool_call import (
+        ChatCompletionMessageToolCall,
+    )
+    from openai.types.chat.chat_completion_message_function_tool_call import Function
+
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    first_result = _completion(content=None, id="c1")
+    first_result.choices[0].message.tool_calls = [
+        ChatCompletionMessageToolCall(
+            id="call_1", type="function", function=Function(name="bash", arguments="{}")
+        )
+    ]
+    term, ag, fake_client = _make_terminus_with_agent(token="tok", single_result=first_result)
+    client = _client_for(term)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        first_messages = [{"role": "user", "content": "run ls"}]
+        resp1 = client.post(
+            "/internal/dispatch",
+            json={
+                "token": "tok",
+                "kwargs": {"model": "m", "messages": first_messages, "stream": False},
+            },
+        )
+        assert resp1.status_code == 200
+
+        fake_client.chat.completions.create.return_value = _completion(content="done", id="c2")
+        second_messages = first_messages + [
+            resp1.json()["choices"][0]["message"],
+            {"role": "tool", "tool_call_id": "call_1", "content": "file1\nfile2"},
+        ]
+        resp2 = client.post(
+            "/internal/dispatch",
+            json={
+                "token": "tok",
+                "kwargs": {"model": "m", "messages": second_messages, "stream": False},
+            },
+        )
+        assert resp2.status_code == 200
+
+    summary = agprof.summary_metrics()
+    span_labels = {row["label"] for row in summary["span_metrics"]}
+    assert "turn" in span_labels
+    assert "tool:bash" in span_labels
+    turn_row = next(row for row in summary["span_metrics"] if row["label"] == "turn")
+    assert turn_row["calls"] == 2
+    tool_row = next(row for row in summary["tool_metrics"]["by_tool"] if row["name"] == "bash")
+    assert tool_row["completed"] == 1
+
+
+def test_streaming_dispatches_derive_turn_and_tool_spans(monkeypatch, tmp_path):
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    first_chunks = [
+        _chunk(
+            content=None,
+            finish_reason="tool_calls",
+            id="c1",
+        )
+    ]
+    # Streaming tool_calls come through as deltas -- give the chunk a
+    # tool_calls delta the same way a real backend streams one.
+    from openai.types.chat.chat_completion_chunk import (
+        ChoiceDeltaToolCall,
+        ChoiceDeltaToolCallFunction,
+    )
+
+    first_chunks[0].choices[0].delta.tool_calls = [
+        ChoiceDeltaToolCall(
+            index=0,
+            id="call_1",
+            type="function",
+            function=ChoiceDeltaToolCallFunction(name="bash", arguments="{}"),
+        )
+    ]
+    term, ag, fake_client = _make_terminus_with_agent(token="tok", stream_result=first_chunks)
+    client = _client_for(term)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        first_messages = [{"role": "user", "content": "run ls"}]
+        resp1 = client.post(
+            "/internal/dispatch",
+            json={
+                "token": "tok",
+                "kwargs": {"model": "m", "messages": first_messages, "stream": True},
+            },
+        )
+        assert resp1.status_code == 200
+
+        fake_client.chat.completions.create.return_value = [_chunk(content="done")]
+        second_messages = first_messages + [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "file1\nfile2"},
+        ]
+        resp2 = client.post(
+            "/internal/dispatch",
+            json={
+                "token": "tok",
+                "kwargs": {"model": "m", "messages": second_messages, "stream": True},
+            },
+        )
+        assert resp2.status_code == 200
+
+    summary = agprof.summary_metrics()
+    span_labels = {row["label"] for row in summary["span_metrics"]}
+    assert "turn" in span_labels
+    assert "tool:bash" in span_labels
+
+
 def test_unregister_removes_token():
     term, _, _ = _make_terminus_with_agent(token="tok")
     term.unregister("tok")
