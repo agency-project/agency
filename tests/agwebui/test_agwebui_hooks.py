@@ -329,7 +329,9 @@ def test_dispatch_update_config_preserves_sandbox_mounts():
 
 
 def test_dispatch_update_config_all_preserves_sandbox_mounts():
-    from agency.agwebui import _dispatch_command
+    import copy
+
+    from agency.agwebui import _all_agteam_subclasses, _dispatch_command
     from agency.agent import agent
     from agency.agconfig import agConfig
     from agency.agsandbox import agSandboxConfig
@@ -347,20 +349,34 @@ def test_dispatch_update_config_all_preserves_sandbox_mounts():
         def run(self):
             pass
 
-    team = _MountPreserveTeam()
-    assert "hf_cache" in (team.ag.agconfig.get("agSandbox", "mounts") or {})
+    # update_config_all merges into every agteam subclass's class-level
+    # agconfig in place -- snapshot/restore so we don't leak base_url into
+    # unrelated suites (e.g. test_agteam's _EchoTeam).
+    saved_class_configs = {
+        team_cls: copy.deepcopy(team_cls.agconfig.data)
+        for team_cls in _all_agteam_subclasses(agteam)
+        if team_cls.agconfig is not None
+    }
+    try:
+        team = _MountPreserveTeam()
+        assert "hf_cache" in (team.ag.agconfig.get("agSandbox", "mounts") or {})
 
-    _dispatch_command(
-        {
-            "type": "update_config_all",
-            "config": {"agllm_backend": {"base_url": "http://new"}},
-        }
-    )
+        _dispatch_command(
+            {
+                "type": "update_config_all",
+                "config": {"agllm_backend": {"base_url": "http://new"}},
+            }
+        )
 
-    assert team.ag.agconfig.get("agllm_backend", "base_url") == "http://new"
-    assert "hf_cache" in (team.ag.agconfig.get("agSandbox", "mounts") or {})
-    assert "hf_cache" in (team.agconfig.get("agSandbox", "mounts") or {})
-    assert "hf_cache" in (_MountPreserveTeam.agconfig.get("agSandbox", "mounts") or {})
+        assert team.ag.agconfig.get("agllm_backend", "base_url") == "http://new"
+        assert "hf_cache" in (team.ag.agconfig.get("agSandbox", "mounts") or {})
+        assert "hf_cache" in (team.agconfig.get("agSandbox", "mounts") or {})
+        assert "hf_cache" in (_MountPreserveTeam.agconfig.get("agSandbox", "mounts") or {})
+    finally:
+        for team_cls, data in saved_class_configs.items():
+            team_cls.agconfig.data.clear()
+            for owner, fields in data.items():
+                team_cls.agconfig.data[owner] = copy.deepcopy(fields)
 
 
 def test_dispatch_update_config_all_mutates_default_agconfig():
