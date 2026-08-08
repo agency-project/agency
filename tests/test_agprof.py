@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import pytest
 
 from agency.profiler import agprof
+from agency.profiler import agprof_trace
 
 
 def test_complete_summary_includes_per_process_workload_and_gpu_metrics(monkeypatch):
@@ -123,10 +124,31 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_samples", [])
     monkeypatch.setattr(agprof, "_leases", [])
     monkeypatch.setattr(agprof, "_leases_open", {})
+    calls = []
+    build_observations = agprof._resource_observations
+    write_summaries = agprof._write_summary_files
+    write_trace = agprof_trace.write_trace
+
+    def observe_once(*args, **kwargs):
+        calls.append("observations")
+        return build_observations(*args, **kwargs)
+
+    def write_summaries_first(*args, **kwargs):
+        calls.append("summaries")
+        return write_summaries(*args, **kwargs)
+
+    def write_trace_last(*args, **kwargs):
+        calls.append("trace")
+        return write_trace(*args, **kwargs)
+
+    monkeypatch.setattr(agprof, "_resource_observations", observe_once)
+    monkeypatch.setattr(agprof, "_write_summary_files", write_summaries_first)
+    monkeypatch.setattr(agprof_trace, "write_trace", write_trace_last)
     agprof.stop()
 
     machine_summary = json.loads((tmp_path / "summary.json").read_text())
     human_summary = (tmp_path / "summary.md").read_text()
+    trace = json.loads((tmp_path / "agprof.trace.json").read_text())
     assert machine_summary["schema_version"] == 4
     assert "workload_metrics" in machine_summary
     assert machine_summary["process_metrics"] == []
@@ -134,7 +156,118 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     assert machine_summary["span_metrics"][0]["label"] == "stage:work"
     assert "# agprof summary" in human_summary
     assert "| stage:work |" in human_summary
+    span_event = next(event for event in trace["traceEvents"] if event.get("name") == "stage:work")
+    assert span_event["ph"] == "X"
+    assert span_event["args"]["blocked_ms"] == 0.4
+    assert calls == ["observations", "summaries", "trace"]
     assert agprof.summary_metrics() == machine_summary
+
+
+def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
+    second = 1_000_000_000
+    process_info = {
+        "101-10": {
+            "display_name": "python (PID 101)",
+            "trace_pid": 101,
+            "first_seen_ns": 0,
+            "cgroup": "/workload",
+            "cmdline": "python job.py",
+            "comm": "python",
+        }
+    }
+    records = [
+        (
+            7,
+            "run0:test:agent",
+            second,
+            500_000_000,
+            100_000_000,
+            25_000_000,
+            {"outcome": "success"},
+            0x123,
+            None,
+        ),
+        (
+            7,
+            "tool:read",
+            1_100_000_000,
+            100_000_000,
+            20_000_000,
+            None,
+            {},
+            0x456,
+            0x123,
+        ),
+    ]
+    samples = [
+        (second, "proc:101-10:cpu_s", 1.0),
+        (1_200_000_000, "proc:101-10:cpu_s", 1.04),
+    ]
+
+    trace = agprof_trace.build_trace(
+        records,
+        samples,
+        [(0, 1_250_000_000, 1_500_000_000, "agent")],
+        process_info=process_info,
+        started_ns=second,
+        pid=42,
+    )
+    events = trace["traceEvents"]
+    run = next(event for event in events if event.get("name") == "run0:test:agent")
+    tool = next(event for event in events if event.get("name") == "tool:read")
+    counter = next(event for event in events if event.get("ph") == "C")
+    lease = next(event for event in events if event.get("cat") == "gpu_lease")
+
+    assert run["ts"] == 0.0
+    assert run["dur"] == 500_000.0
+    assert run["args"]["cpu_ms"] == 100.0
+    assert run["args"]["blocked_ms"] == 375.0
+    assert run["args"]["span_id"] == "0000000000000123"
+    assert tool["args"]["parent_span_id"] == "0000000000000123"
+    assert tool["args"]["runqueue_ms"] == "n/a"
+    assert counter == {
+        "ph": "C",
+        "pid": 101,
+        "tid": 0,
+        "ts": 200_000.0,
+        "name": "cpu_percent",
+        "cat": "resource",
+        "args": {"value": 20.0},
+    }
+    assert lease["tid"] == "gpu0-lease"
+    assert lease["ts"] == 250_000.0
+    assert lease["dur"] == 250_000.0
+    assert any(
+        event.get("name") == "process_name"
+        and event.get("pid") == 101
+        and event["args"]["name"] == "python (PID 101)"
+        for event in events
+    )
+
+
+def test_perfetto_trace_keeps_interrupted_spans():
+    trace = agprof_trace.build_trace(
+        [],
+        [],
+        interrupted_spans=[
+            {
+                "thread_id": 9,
+                "label": "run0:test:agent",
+                "started_ns": 1_000_000,
+                "duration_ms": 2.5,
+                "reason": "session stopped",
+                "outcome": "interrupted",
+            }
+        ],
+        started_ns=1_000_000,
+        pid=42,
+        observations=[],
+    )
+
+    span = next(event for event in trace["traceEvents"] if event.get("ph") == "X")
+    assert span["ts"] == 0.0
+    assert span["dur"] == 2500.0
+    assert span["args"] == {"reason": "session stopped", "outcome": "interrupted"}
 
 
 def test_derived_rollups_include_outcomes_percentiles_tokens_energy_and_interruptions():

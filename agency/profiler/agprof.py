@@ -885,8 +885,9 @@ def start(
 ):
     """Start a profiling session. Prefer the ``session()`` context manager.
 
-    *out_dir* receives ``summary.json`` and ``summary.md``. *sample_hz* and
-    *sample_gpu* control the background gauge sampler (0 disables it).
+    *out_dir* receives ``agprof.trace.json``, ``summary.json``, and
+    ``summary.md``. *sample_hz* and *sample_gpu* control the background gauge
+    sampler (0 disables it).
     ``all_threads`` and ``worker_name`` remain accepted for API compatibility.
     """
     _require_linux()
@@ -966,13 +967,20 @@ def stop():
         _leases_open.clear()
     prof.stop()
     records = list(_records)
+    samples = list(_samples)
+    leases = list(_leases)
+    interrupted_spans = list(_interrupted_spans)
+    process_info = copy.deepcopy(_process_info)
     _last_summary = _build_summary(records)
+    observations = []
     try:
+        observations = _resource_observations(samples, process_info=process_info)
         _last_run_summary = _build_run_summary(
             records,
-            list(_samples),
-            list(_leases),
-            interrupted_spans=list(_interrupted_spans),
+            samples,
+            leases,
+            observations=observations,
+            interrupted_spans=interrupted_spans,
             started_ns=started_ns,
             ended_ns=t_end,
             sample_hz=_session_sample_hz,
@@ -988,6 +996,22 @@ def stop():
                 _write_summary_files(out_dir, _last_run_summary)
             except Exception as _e:  # never let reporting kill the run
                 print(f"[agprof] WARNING: summary output failed: {_e}")
+        try:
+            from .agprof_trace import write_trace
+
+            trace_path = write_trace(
+                out_dir,
+                records,
+                samples,
+                leases,
+                process_info=process_info,
+                interrupted_spans=interrupted_spans,
+                started_ns=started_ns,
+                observations=observations,
+            )
+            print(f"[agprof] Perfetto trace: {trace_path}")
+        except Exception as _e:  # never let reporting kill the run
+            print(f"[agprof] WARNING: trace output failed: {_e}")
     return prof
 
 
@@ -999,8 +1023,9 @@ _BYTE_KINDS = {
 }
 
 
-def _resource_observations(samples) -> list[dict]:
+def _resource_observations(samples, *, process_info=None) -> list[dict]:
     """Convert raw sampler series into gauges/rates with stable names and units."""
+    process_info = _process_info if process_info is None else process_info
     observations: list[dict] = []
     prev: "dict[str, tuple[int, float]]" = {}
     for t, series, value in samples:
@@ -1008,7 +1033,7 @@ def _resource_observations(samples) -> list[dict]:
         scope = parts[0]
         kind = parts[-1]
         identity = parts[1] if scope == "proc" and len(parts) == 3 else None
-        process = _process_info.get(identity) if identity is not None else None
+        process = process_info.get(identity) if identity is not None else None
         cumulative_scope = scope in ("cg", "workload", "proc")
         if kind in ("cpu_us", "cpu_s") or kind in _BYTE_KINDS:
             if not cumulative_scope:
@@ -1197,6 +1222,7 @@ def _build_run_summary(
     samples,
     leases,
     *,
+    observations=None,
     interrupted_spans=(),
     started_ns: "int | None",
     ended_ns: int,
@@ -1259,17 +1285,18 @@ def _build_run_summary(
         )
 
     grouped: "dict[str, list[dict]]" = {}
-    observations = _resource_observations(samples)
+    if observations is None:
+        observations = _resource_observations(samples)
     for observation in observations:
         grouped.setdefault(observation["name"], []).append(observation)
     resource_rows = []
-    for name, observations in sorted(grouped.items()):
-        values = [observation["value"] for observation in observations]
+    for name, grouped_observations in sorted(grouped.items()):
+        values = [observation["value"] for observation in grouped_observations]
         resource_rows.append(
             {
                 "name": name,
-                "display_name": observations[0]["display_name"],
-                "unit": observations[0]["unit"],
+                "display_name": grouped_observations[0]["display_name"],
+                "unit": grouped_observations[0]["unit"],
                 "samples": len(values),
                 "mean": round(sum(values) / len(values), 3),
                 "min": round(min(values), 3),
@@ -1279,12 +1306,12 @@ def _build_run_summary(
         )
         totals = [
             observation["interval_total"]
-            for observation in observations
+            for observation in grouped_observations
             if observation["interval_total"] is not None
         ]
         if totals:
             resource_rows[-1]["total"] = round(sum(totals), 6)
-            resource_rows[-1]["total_unit"] = observations[0]["total_unit"]
+            resource_rows[-1]["total_unit"] = grouped_observations[0]["total_unit"]
 
     raw_series: "dict[str, list[tuple[int, float]]]" = {}
     for timestamp, series, value in samples:
