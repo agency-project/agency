@@ -285,6 +285,7 @@ class agent:
         )
 
         self.agname: _agname = _agname.allocate_agname(agname)
+        self._parent_agent_id: "str | None" = None
 
         self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
         self.engine: str = engine if engine is not None else _AgAgentFields(self.agconfig).engine
@@ -613,6 +614,7 @@ class agent:
         """Return an independent agent forked from *src*."""
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname)
+        ag._parent_agent_id = str(src.agname)
         # Cloned so the fork's own agconfig is independent of src's -- see
         # the matching comment in __init__.
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
@@ -721,6 +723,7 @@ class agent:
 
         state = {
             "agname": self.agname,
+            "parent_agent_id": self._parent_agent_id,
             "engine": self.engine,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             "history": self.ctx.messages,
@@ -815,6 +818,7 @@ class agent:
 
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.claim_unique_agname(state["agname"])
+        ag._parent_agent_id = state.get("parent_agent_id")
         _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
         ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agConfig()
         _already_set = (

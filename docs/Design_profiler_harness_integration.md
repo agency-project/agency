@@ -204,7 +204,7 @@ This is the natural correlation key: it already maps 1:1 to (agent, skill run).
 | 12 | **`llm:retry_backoff`** | `agllm.py:539` | host retry loop deleted. Retries now live in 3 unrelated layers: `_dispatch_retry_backoff_s` ([entrypoint.py:791](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:791), native only), each harness CLI's internal retry (invisible — arrives as a fresh dispatch), and nowhere else. The terminus deliberately does **one** attempt, no loop ([agllm_terminus.py:47-70](../agency/agharness_internal/agllm_terminus.py:47)) | no single owner | **A** |
 | 13 | **`llm:sync`** (256-slot semaphore) | `agllm.py:164` | semaphore *deleted as a concept* ([agllm.py:88](../agency/agllm.py:88)) — there is no host LLM throttle to queue behind | none; metric is meaningless | **A** (retire) |
 | 14 | **`llm:compact`** | `agllm.py:870` | moved in-container, native only ([entrypoint.py:958](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:958)); external harnesses compact internally and invisibly | native only | **A** |
-| 15 | **`agmap:{fn}[{i}]` lane root** | `agmap.py:63-68` | `agency/agmap.py` deleted from HEAD; lives on branch `tony/agmap` | none | **A** (see §10) |
+| 15 | **`agmap:{fn}[{i}]` lane root** | `agmap.py:63-68` | `agency/agmap.py` deleted from HEAD; lives on branch `tony/agmap` — in a **different API revision** than the one `tony/profiler` instruments | none | **A** (see §5.8 and §10) |
 | 16 | Per-span `cpu_ms` / `runqueue_ms` / `blocked_ms` | `_TimedSpan.__exit__` | `time.thread_time_ns()` and `/proc/self/schedstat` are **host-thread-local**. Any span originating in a container has no host thread | unrecoverable host-side | **A** |
 
 **Summary:** 5 of 16 rows (≈60% of the 57 call sites) restore verbatim. Row 6 is
@@ -235,6 +235,16 @@ them precisely. The other four require per-harness adapters.
 `summary.json` gains a `coverage` block stating, per section and per engine,
 one of `complete` / `derived` / `unavailable(reason)`. An absent section must
 never be readable as zero.
+
+**Status: deferred to M10, pending a lab discussion.** The three-state
+vocabulary above is this document's proposal, not a settled contract. It is
+the artifact an external hardware comparison would be read against, so the
+tier names, the `derived` error bounds, and the publication rule ("may a
+report quote a number whose section is `derived`?") are decisions the lab
+owns, not implementation details. M8 ships the golden test without it; the
+tiering in this section stands as an internal description of what the
+profiler can and cannot see either way. See
+[Discussion_coverage_declaration.md](Discussion_coverage_declaration.md).
 
 ### 5.2 The turn/tool problem is mostly solvable from Tier 1
 
@@ -312,9 +322,11 @@ regresses:
    fresh context, so the implicit parent is lost. Every skill run is spawned as
    a bare daemon thread — [agskill.py:450](../agency/agskill.py:450),
    [agteam.py:208](../agency/agteam.py:208),
-   [agsandbox_backends/base.py:230](../agency/agsandbox_backends/base.py:230).
+   [agsandbox_backends/base.py:230](../agency/agsandbox_backends/base.py:230),
+   plus `agmap._spawn` once `agmap` returns (§5.8 — a fourth site, and the
+   highest-fan-out of the four).
    Without a fix, every run is a disconnected root and the `parent_agent_id`
-   hierarchy never forms. One helper, applied at all three sites:
+   hierarchy never forms. One helper, applied at all four sites:
 
    ```python
    def spawn_traced(fn, *a, **kw):
@@ -428,6 +440,136 @@ duplicated: `agsyscallevent.tool_name` / `.tool_args`
 and `_AgPtraceFields.profiler`
 ([agproxy_ptrace.py:135](../agency/agharness_internal/agproxy_ptrace.py:135),
 "reserved for a future profiler hook; unused so far").
+
+### 5.8 `agmap` fan-out: a fourth spawn site, and a lane-root contradiction
+
+Three problems, all currently latent because `agmap` is absent from HEAD, and
+all of which surface the moment it merges. Row 15 is not merely "re-apply two
+spans."
+
+**5.8.1 — A fourth bare-thread spawn site.** §5.3 item 3 lists three places
+that spawn a daemon thread without propagating context. `agmap._spawn()` is a
+fourth: it ends in `threading.Thread(target=_run, daemon=True).start()`
+(`tony/agmap:agency/agmap.py:92`, `tony/profiler:agency/agmap.py:76`). It is
+also the highest-fan-out of the four — one thread per mapped item, deliberately
+unbounded; the module docstring's throttling guarantee is about *containers*
+(via `agsandbox`'s semaphore), not threads.
+
+**The ordering question is already settled, unfavourably.** `spawn_traced()`
+has landed — [agprof.py:460](../agency/profiler/agprof.py:460), applied at
+[agskill.py:474](../agency/agskill.py:474),
+[agteam.py:208](../agency/agteam.py:208), and
+[agsandbox_backends/base.py:231](../agency/agsandbox_backends/base.py:231) —
+so `agmap` necessarily merges *after* the fix. It will arrive carrying an
+untouched raw `threading.Thread` call, and every mapped task becomes a
+disconnected trace root — **silently**, because a disconnected root is a valid
+trace, not an error. Nothing in `summary.json` reads as wrong; the hierarchy is
+just quietly flat.
+
+The merge checklist therefore has to carry the fix: `agmap._spawn` calls
+`agprof.spawn_traced(_run).start()` rather than constructing its own thread.
+
+Guarding that is less trivial than it first appears. A blanket "no bare
+`threading.Thread(` outside the helper" assertion is **not viable** — HEAD has
+~27 such call sites and nearly all are legitimate infrastructure (uvicorn
+server threads in the four bridged services, pipe drainers, the ptrace TCP↔UDS
+relays) which own no span and must *not* inherit one. The check has to separate
+**task** spawns from **plumbing** spawns; only the former belong to a trace.
+Two complementary guards:
+
+- **Primary, runtime:** M8's "exactly one root span per `team.run()`" assertion,
+  exercised under an `agmap` fan-out. This works *only* under §5.8.2's
+  resolution — if agmap tasks are trace roots by design, the root count carries
+  no information and there is no runtime signal left at all. That is a stronger
+  argument for §5.8.2 than mere consistency with §9.
+- **Secondary, static:** an allowlist test pinning the currently-legitimate bare
+  `threading.Thread(` sites by file, so a *new* one fails CI and must be
+  classified as task-or-plumbing deliberately. Cheap, and it catches what the
+  runtime check cannot — a task spawn added on a path `team.run()` never reaches.
+
+**5.8.2 — "Lane root" and "one root span per run" contradict each other.**
+The canonical instrumentation opens the `agmap:{fn}[{i}]` span *inside* `_run`,
+on the newly spawned thread, next to `agprof.thread_name(_prof_label)`
+(`tony/profiler:agency/agmap.py:64-69`). Under thread-local nesting that was
+deliberate and correct: a fresh thread has an empty `_tls.span_stack`, so the
+span became a top-level lane — exactly what the timeline view wanted.
+
+Under OTel the identical code yields the identical outcome for a *different*
+reason — a fresh thread has no `contextvars` parent, so the span is a genuine
+trace root. That now collides with §9's M8 assertion, "exactly one root span
+per `team.run()` under `agmap`-style fan-out." Both cannot hold: if agmap tasks
+are trace roots, an N-item map produces N+1 roots and the assertion fails on
+its own namesake case.
+
+**Resolution: "lane" is a presentation concept, not a trace concept.** Apply
+`spawn_traced()` at `agmap._spawn` so each task is a *child* of whatever ran
+the map — which is the truthful parentage, since the map call is what caused
+it. Recover the flat lane layout at render time in `agprof_trace.py` (M0b) by
+assigning each `agmap:{fn}[{i}]` span its own synthetic `tid`, the same
+mechanism `_inject_timelines()` already uses to lay out tracks.
+`agprof.thread_name()` stays, and stays a **naming** call only — it must not be
+load-bearing for hierarchy. §9's assertion then holds unchanged.
+
+One counter-case to name explicitly: an asynchronous map whose tasks outlive
+the enclosing span. Those children end *after* their parent ends — legal in
+OTel, and `agsync()` is the natural join point — so M8's "no child precedes its
+parent" check must not be strengthened into "no child outlives its parent."
+
+**5.8.3 — The two branches are not the same `agmap`.** M9 says "restore `agmap`
+instrumentation if `tony/agmap` merges," but the instrumentation lives on
+`tony/profiler`, against a materially different API:
+
+| | `tony/agmap` | `tony/profiler` |
+|---|---|---|
+| async kwarg | `asynchronous=` | `is_asynchronous=` |
+| return type | `agdata` | `agtask(agdata)` subclass |
+| in-flight registry | `_track` / `_untrack` / `drain_inflight()` | none |
+| `agsync` coupling | drains the global registry | joins by `agtask` type check |
+
+So "integrate `agmap`" is a three-way reconciliation (`tony/agmap` ∪
+`tony/profiler` ∪ HEAD), not a cherry-pick of two spans. The
+registry-vs-type-check row is the load-bearing one: it decides whether
+`agsync()` is a global barrier over all in-flight tasks or a per-target join,
+and `agsync.py:95`'s `agsync:join` span (row 5) measures a different quantity
+under each.
+
+**Resolution — reconcile per item, not per branch.**
+
+| Item | Take | Why |
+|---|---|---|
+| async kwarg | `asynchronous=` (`tony/agmap`) | `is_` prefixes read as predicates, not mode flags. Public API; cheaper to settle now than to deprecate |
+| return type | `agtask(agdata)` (`tony/profiler`) | Lets `agsync` accept agmap results *explicitly* while still rejecting plain `agdata`, preserving its strict type checking |
+| `agsync` join | per-target (`tony/profiler`) | See below — this is the decisive one |
+| in-flight registry | keep `_track`/`_untrack` (`tony/agmap`), **rewired** | Good mechanism, wrong caller. Drain at the run-teardown boundary, not inside `agsync()` |
+
+The decisive item is the `agsync` join, and `tony/agmap`'s global drain must
+**not** survive. Its `agsync()` calls `drain_inflight()` unconditionally, at the
+end of every invocation, regardless of what was passed — so `agsync(my_agent)`
+blocks on every in-flight `agmap` task in the process, including tasks belonging
+to unrelated agents. Two consequences, both disqualifying:
+
+1. **It contradicts its own documented interface.** That same `agsync()` raises
+   `TypeError` on anything that is not an `agent` or `agteam` — so an `agmap`
+   result cannot be passed as a target at all, while the implementation silently
+   waits for all of them anyway. The documented contract and the actual barrier
+   are disjoint.
+2. **It destroys `agsync:join` as a metric under exactly the workload this
+   profiler targets.** Under 32-agent fan-out the span would absorb wait time
+   for work the caller never referenced, so row 5's number stops meaning
+   "time this caller spent joining" and starts meaning "time until the process
+   happened to quiesce." A cross-agent coupling that is a latency hazard in its
+   own right, independent of profiling.
+
+The registry itself is still worth keeping — just drained at **skill-run
+teardown**, scoped to the run that spawned the tasks (the contextvar machinery
+`spawn_traced` already depends on is sufficient to attribute them). That keeps
+async tasks from leaking past their run without giving `agsync()` a hidden
+global side effect.
+
+Note what this does *not* buy, to avoid over-claiming: a child span outliving
+its parent is **legal** in OTel — the `parent_span_id` is a stored field, so the
+trace stays correct either way. Teardown draining buys a cleaner M8 assertion
+and no leaked work, not correctness of the trace.
 
 ---
 
@@ -573,12 +715,15 @@ Difficulty: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 - **Objective:** one connected trace per run instead of disjoint roots; remote
   and terminus spans parent to the right `run{N}`.
 - **Files:**
-  - `spawn_traced()` helper (§5.3, item 3) applied at
-    [agskill.py:450](../agency/agskill.py:450),
+  - ~~`spawn_traced()` helper (§5.3, item 3)~~ — **landed.**
+    [agprof.py:460](../agency/profiler/agprof.py:460), applied at
+    [agskill.py:474](../agency/agskill.py:474),
     [agteam.py:208](../agency/agteam.py:208),
-    [agsandbox_backends/base.py:230](../agency/agsandbox_backends/base.py:230)
-    — **without this, every skill run is a separate root and nothing else in
-    this milestone matters**;
+    [agsandbox_backends/base.py:231](../agency/agsandbox_backends/base.py:231).
+    It no-ops to a plain `Thread` while profiling is off, so the optional OTel
+    import stays off the disabled path. The remaining spawn site is
+    `agmap._spawn`, which does not exist on HEAD — it belongs to the `agmap`
+    merge checklist, not to this milestone (§5.8.1);
   - new `agharness_internal/agprof_ingest.py` holding token →
     `(agent, run span context)`, patterned on `agharness_messenger.py`;
   - register alongside `terminus.register()` at
@@ -655,17 +800,31 @@ milestone's correlation registry:
 - **Dependencies:** M4, M6.
 - **Outcome:** `claude_code` upgrades from `derived` to `complete`.
 
-### M8 — Coverage declaration + golden test — *required*
-- **Objective:** make partial coverage legible and regressions detectable.
-- **Files:** `coverage` block in `_build_run_summary()`; new
-  `tests/test_agprof_harness.py` running each engine against the mock endpoint
-  and diffing against a checked-in golden `summary.json`.
+### M8 — Golden test + thread allowlist — *required*
+- **Objective:** make regressions detectable.
+- **Files:** new `tests/test_agprof_harness.py` running each engine against the
+  mock endpoint and diffing against a checked-in golden `summary.json`; plus an
+  allowlist test pinning the known-legitimate bare `threading.Thread(` sites, so
+  a new one must be classified as task-or-plumbing deliberately (§5.8.1 — a
+  blanket ban is not viable; ~27 legitimate infrastructure threads exist).
 - **Difficulty:** M.
-- **Dependencies:** M3.
-- **Outcome:** a summary can no longer look complete while being empty.
+- **Dependencies:** M3, plus the mock/replay endpoint (§5.1 note; it does not
+  exist yet and is not owned by this roadmap). The root-count assertion
+  additionally needs §5.8.2 resolved — under the "agmap tasks are trace roots"
+  reading it contradicts row 15 *and* stops being the primary guard for §5.8.1.
+- **Outcome:** the shape of the artifact is pinned; a silent regression in span
+  parentage or turn counts fails CI.
+- **Note:** the `coverage` block was previously scoped here. It moved to M10 —
+  it needs a decision the lab owns, and blocking the golden test on that
+  decision would stall M8 for no engineering reason. The golden fixture will
+  need one regeneration when M10 lands; that is the accepted cost.
 
 ### M9 — Optional cleanup
-- Restore `agmap` instrumentation if `tony/agmap` merges (§10).
+- Restore `agmap` instrumentation if `agmap` merges — **not optional and not a
+  cherry-pick if it merges at all**; see §5.8 for the three-way API
+  reconciliation, the `spawn_traced` ordering hazard, and the lane-root
+  resolution. Only the span re-application is cleanup-grade; §5.8.1 belongs to
+  M4 and §5.8.2's synthetic-`tid` rendering to M0b.
 - Retire `llm:sync` from the span glossary and `summary.md` (row 13).
 - Adopt `gen_ai.*` semantic-convention attribute names on LLM spans
   (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, …) so Langfuse/Braintrust
@@ -675,6 +834,26 @@ milestone's correlation registry:
   exploration. Not on the critical path — M0 writes traces to a local file
   exporter, which is enough for `summary.json` and Perfetto.
 
+### M10 — Coverage declaration — *required, blocked on lab discussion*
+- **Objective:** make partial coverage legible in the artifact, so a reader
+  cannot mistake an unmeasured section for a measured zero (§5.1).
+- **Files:** `coverage` block in `_build_run_summary()`; regenerate M8's golden
+  `summary.json`; assert the block is populated for every engine the run
+  touched.
+- **Difficulty:** S–M once the semantics are agreed. The engineering is a
+  static per-engine table plus a serializer; essentially all of the cost is in
+  the decision, not the code.
+- **Dependencies:** M3 (which determines what `derived` can actually deliver),
+  M8 (fixture to regenerate), **and a lab decision on the four questions in
+  [Discussion_coverage_declaration.md](Discussion_coverage_declaration.md)**:
+  the state vocabulary, whether `derived` carries a quantified error bound,
+  the publication rule for externally-reported numbers, and who signs off that
+  a cross-engine comparison is admissible.
+- **Sequencing:** must land **before** any profiler-derived number leaves the
+  team — see §9's first architectural risk. It is late in the numbering, not
+  late in priority.
+- **Outcome:** a summary can no longer look complete while being empty.
+
 ---
 
 ## 9. Risks and mitigations
@@ -683,7 +862,7 @@ milestone's correlation registry:
 
 | Risk | Mitigation |
 |---|---|
-| Tier-3 coverage never lands for codex/opencode/grok, leaving benchmark comparisons subtly unequal across engines | M3 makes `derived` coverage uniform first; M8's `coverage` block makes any residual asymmetry explicit in the artifact, so a comparison can be rejected rather than silently believed |
+| Tier-3 coverage never lands for codex/opencode/grok, leaving benchmark comparisons subtly unequal across engines | M3 makes `derived` coverage uniform first; **M10**'s `coverage` block makes any residual asymmetry explicit in the artifact, so a comparison can be rejected rather than silently believed. Until M10 lands the artifact carries no such warning — treat every cross-engine number as provisional and internal |
 | Container-emitted spans are *claims*, not observations — a harness can under-report | Host stamps `provenance` at ingest (§5.4). Cross-check container-asserted turn counts against the terminus's own host-side `request_log` count; disagreement is a summary-level warning |
 | Per-span `cpu_ms`/`runq_ms` unrecoverable for remote spans (row 16) | Emit `None`, never `0`. Optionally have the in-container emitter read its own `/proc/self/schedstat` and include the delta as a distinct field |
 
@@ -704,15 +883,16 @@ milestone's correlation registry:
 | Compaction shrinks the messages array, so M3's diff sees a spurious rewind | Detect a shrink and restart the diff baseline; native already signals compaction directly (M5) |
 | Retries have no single owner (row 12): a harness CLI retry looks like a new turn | Report `llm.attempts_observed` (host truth, from the terminus) separately from `llm.retries_reported` (harness-asserted, usually absent). Benchmarks use the former |
 | **OTel default: unended spans are never exported.** A hung or OOM-killed run would produce no spans and read as *fast*, silently losing canonical `incomplete_spans` | Keep agprof's existing `_open_spans` registry; force-end with `outcome="interrupted"` at session stop (§5.3). Covered by M8's interruption test |
-| **OTel default: `contextvars` do not cross `threading.Thread`.** Every skill run spawns a bare daemon thread, so the implicit parent is lost and each run becomes a disjoint root | `spawn_traced()` at the three spawn sites, landed in M4. M8 asserts exactly one root span per `team.run()` under `agmap`-style fan-out |
+| **OTel default: `contextvars` do not cross `threading.Thread`.** Every skill run spawns a bare daemon thread, so the implicit parent is lost and each run becomes a disjoint root | `spawn_traced()` at all four spawn sites, landed in M4. M8 asserts exactly one root span per `team.run()` under `agmap`-style fan-out — which requires §5.8.2's resolution (agmap tasks parent to the map caller; flat lanes come from synthetic `tid`s at render time), or the assertion contradicts row 15's "lane root" |
+| The `agmap` merge reintroduces a raw `threading.Thread` after `spawn_traced` already fixed the other three sites, flattening the hierarchy with **no runtime error** — a disconnected root is a valid trace | `agmap._spawn` calls `spawn_traced` (merge-checklist item), guarded by M8's root-count assertion under fan-out plus a static allowlist of legitimate bare-`Thread` sites. A blanket grep ban is not viable — ~27 infrastructure threads legitimately own no span (§5.8.1) |
 | **OTel default: sampling.** If traces are sampled while resource metrics are always-on, one `summary.json`'s sections describe different populations | Pin `AlwaysOn` explicitly and record the sampler name in the `sampling health` section |
 | Percentiles silently degrade if someone later routes latency through OTel histogram metrics | `_SummaryProcessor` reads exact `start_time`/`end_time` (§5.3). Add a test asserting p99 matches a hand-computed value on a fixed span set |
 
 ### Backwards compatibility
 
-- `summary.json` keeps its existing keys; `coverage` and `provenance` are
-  additive. `_unpack_record()` is the single decode point, so the 2 new tuple
-  fields (`span_id`, `parent_id`) do not ripple.
+- `summary.json` keeps its existing keys; `provenance` (§5.4) and `coverage`
+  (M10) are additive. `_unpack_record()` is the single decode point, so the 2
+  new tuple fields (`span_id`, `parent_id`) do not ripple.
 - **`.pt.trace.json` / TensorBoard output is dropped** (confirmed not required,
   §10 Q7). M0b's Chrome-trace file replaces it for Perfetto;
   `torch-tb-profiler` no longer works. `agency/profiler/README.md`'s Usage and
@@ -749,10 +929,27 @@ milestone's correlation registry:
 
 ## 10. Open questions and assumptions
 
-1. **`agmap` is deleted from HEAD.** It exists on `tony/agmap`. Is it returning?
-   If yes, M0 should include its lane-root instrumentation; if no, the
-   `agmap:{fn}[{i}]` glossary entry should be removed from the canonical spec.
-   *Assumed: returning.*
+1. **`agmap` is deleted from HEAD.** It exists on `tony/agmap` — and, in a
+   different API revision, on `tony/profiler`. Is it returning, and *when*
+   relative to M4? The instrumentation is the small part; §5.8 covers what
+   actually has to be decided:
+   - **When it merges** determines whether M4 fixes four spawn sites in one
+     pass or needs a static guard against a later regression (§5.8.1).
+   - **Whether agmap tasks are trace roots or children** must be settled
+     before M8, because §9's "exactly one root per `team.run()`" and row 15's
+     "lane root" cannot both be true (§5.8.2). *Proposed: children; lanes
+     become a render-time concern.*
+   - ~~**Which `agmap` API wins**~~ — **resolved (§5.8.3):** reconcile per
+     item. `asynchronous=` kwarg, `agtask` return, per-target `agsync` join,
+     and keep the in-flight registry but drain it at run teardown rather than
+     inside `agsync()`. `tony/agmap`'s unconditional global drain is dropped —
+     it contradicts that function's own `TypeError` contract and would make
+     row 5's `agsync:join` unmeasurable under fan-out.
+
+   *Assumed: returning.* If it is **not** returning, delete the
+   `agmap:{fn}[{i}]` glossary entry from the canonical spec, drop row 15, and
+   strike "`agmap`-style fan-out" from §9's M8 assertion — leaving the phrase
+   in place while the module is absent makes the assertion untestable.
 2. **`benchmarks/` is not on this branch** — only `__pycache__`. Sources are on
    `eric/benchmark-tests` / `sunga/benchmark-integration`, and neither
    references `agprof`. Who owns wiring the profiler into the benchmark runner,
@@ -783,7 +980,15 @@ milestone's correlation registry:
    there is no host/container skew to manage. Worth confirming
    `opentelemetry-sdk` does not conflict with `fastapi`/`uvicorn` pins already
    in `pyproject.toml`.
-9. **Do we want OTel auto-instrumentation for `httpx`?** It would trace the
+9. **Coverage semantics are unowned (M10).** §5.1 proposes
+   `complete` / `derived` / `unavailable(reason)` and the rule that an absent
+   section is never zero. Neither the vocabulary nor the publication rule that
+   depends on it has been agreed with the lab. Four questions are open —
+   state vocabulary, whether `derived` carries a quantified error bound, the
+   rule for externally-reported numbers, and comparison sign-off — written up
+   in [Discussion_coverage_declaration.md](Discussion_coverage_declaration.md).
+   *Assumed until decided: profiler output is internal and provisional.*
+10. **Do we want OTel auto-instrumentation for `httpx`?** It would trace the
    UDS hops between `agproxy_llm` → terminus for free. Probably yes, but it
    adds a span per internal RPC and will dominate span counts under fan-out —
    default it **off** and make it a config flag.

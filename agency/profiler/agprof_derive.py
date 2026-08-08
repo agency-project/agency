@@ -71,6 +71,8 @@ def on_dispatch(
     start_wall_ns: int,
     end_perf_ns: int,
     end_wall_ns: int,
+    parent_context=None,
+    span_attributes: "dict | None" = None,
 ) -> None:
     """Record one successfully-completed dispatch as ``turn{n}``, deriving
     ``tool:{name}`` spans for whichever of the *previous* dispatch's tool
@@ -113,22 +115,29 @@ def on_dispatch(
             "end_wall_ns": end_wall_ns,
         }
 
+    correlated_attributes = dict(span_attributes or {})
     for name, sp_ns, ep_ns, sw_ns, ew_ns, call_id in tool_spans:
+        metadata = dict(correlated_attributes)
+        if call_id:
+            metadata["tool_call_id"] = call_id
         agprof.record_derived_span(
             f"tool:{name}",
             start_perf_ns=sp_ns,
             end_perf_ns=ep_ns,
             start_wall_ns=sw_ns,
             end_wall_ns=ew_ns,
-            metadata={"tool_call_id": call_id} if call_id else {},
+            metadata=metadata,
+            parent_context=parent_context,
         )
+    turn_metadata = {**correlated_attributes, "outcome": "success"}
     agprof.record_derived_span(
         f"turn{index}",
         start_perf_ns=start_perf_ns,
         end_perf_ns=end_perf_ns,
         start_wall_ns=start_wall_ns,
         end_wall_ns=end_wall_ns,
-        metadata={"outcome": "success"},
+        metadata=turn_metadata,
+        parent_context=parent_context,
     )
 
 

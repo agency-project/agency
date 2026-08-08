@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..agconfig import GlobalConfigParam, _AgConfigViewBase
 from ..agllm_backends import BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS, API_ERROR_EXCS
 from ..profiler import agprof, agprof_derive
+from .agprof_ingest import get_shared_profiler_ingest
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
@@ -205,9 +206,10 @@ class _ProfiledStreamingResponse(StreamingResponse):
     stream or changing when the caller receives chunks.
     """
 
-    def __init__(self, *args, finish_span, **kwargs) -> None:
+    def __init__(self, *args, finish_span, stream_finished, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._finish_span = finish_span
+        self._stream_finished = stream_finished
 
     async def __call__(self, scope, receive, send) -> None:
         exc_info = (None, None, None)
@@ -217,7 +219,10 @@ class _ProfiledStreamingResponse(StreamingResponse):
             exc_info = sys.exc_info()
             raise
         finally:
-            self._finish_span(exc_info)
+            try:
+                self._finish_span(exc_info)
+            finally:
+                self._stream_finished()
 
 
 def _annotate_span(span, **metadata) -> None:
@@ -272,6 +277,8 @@ class agLLMTerminus:
         # harness backend after its process exits, before `unregister()`
         # discards it (see `transcript_for_token`).
         self._last_transcript_by_token: "dict[str, list[dict]]" = {}
+        self._stream_condition = threading.Condition()
+        self._active_streams = 0
 
     # -- token <-> agent registry ---------------------------------------
     # Same shape as agProxyLLM's own registry -- see that module's
@@ -349,6 +356,14 @@ class agLLMTerminus:
             client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
             model = kwargs.get("model", "")
             provider = type(ag.llm.backend).__name__
+            profiler_ingest = get_shared_profiler_ingest()
+            run_context = profiler_ingest.context_for_token(token)
+            run_attributes = profiler_ingest.attributes_for_token(token)
+
+            def _attempt_span():
+                if run_context is None:
+                    return agprof.span("llm:attempt[0]")
+                return agprof.span("llm:attempt[0]", parent_context=run_context)
 
             if kwargs.get("stream"):
                 # OpenAI-compatible providers only include the final usage
@@ -369,8 +384,9 @@ class agLLMTerminus:
                 # generator can no longer be signaled to the caller as
                 # "retry me" -- see this module's retry-policy comment
                 # above for why that's a hard constraint, not an oversight.
-                attempt_scope = agprof.span("llm:attempt[0]")
+                attempt_scope = _attempt_span()
                 attempt_span = attempt_scope.__enter__()
+                _annotate_span(attempt_span, **run_attributes)
                 attempt_t0 = time.perf_counter()
                 # M3 (docs/Design_profiler_harness_integration.md §5.2):
                 # separate clock captures for agprof_derive's turn/tool
@@ -597,16 +613,27 @@ class agLLMTerminus:
                                 start_wall_ns=dispatch_start_wall_ns,
                                 end_perf_ns=time.perf_counter_ns(),
                                 end_wall_ns=time.time_ns(),
+                                parent_context=run_context,
+                                span_attributes=run_attributes,
                             )
                         yield "data: [DONE]\n\n"
 
-                return _ProfiledStreamingResponse(
-                    sse_gen(), media_type="text/event-stream", finish_span=_finish_span
-                )
+                self._stream_started()
+                try:
+                    return _ProfiledStreamingResponse(
+                        sse_gen(),
+                        media_type="text/event-stream",
+                        finish_span=_finish_span,
+                        stream_finished=self._stream_finished,
+                    )
+                except BaseException:
+                    self._stream_finished()
+                    raise
 
             dispatch_start_perf_ns = time.perf_counter_ns()
             dispatch_start_wall_ns = time.time_ns()
-            with agprof.span("llm:attempt[0]") as attempt_span:
+            with _attempt_span() as attempt_span:
+                _annotate_span(attempt_span, **run_attributes)
                 _annotate_span(attempt_span, model=model, provider=provider)
                 try:
                     result = client.chat.completions.create(**kwargs)
@@ -634,6 +661,8 @@ class agLLMTerminus:
                         start_wall_ns=dispatch_start_wall_ns,
                         end_perf_ns=time.perf_counter_ns(),
                         end_wall_ns=time.time_ns(),
+                        parent_context=run_context,
+                        span_attributes=run_attributes,
                     )
                 return JSONResponse(serialized)
 
@@ -704,6 +733,26 @@ class agLLMTerminus:
 
         return app
 
+    def _stream_started(self) -> None:
+        with self._stream_condition:
+            self._active_streams += 1
+
+    def _stream_finished(self) -> None:
+        with self._stream_condition:
+            self._active_streams -= 1
+            self._stream_condition.notify_all()
+
+    def drain(self, timeout_s: "float | None" = None) -> bool:
+        """Wait for streaming response finalizers without stopping the server."""
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        with self._stream_condition:
+            while self._active_streams:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._stream_condition.wait(timeout=remaining)
+        return True
+
     # -- lifecycle ----------------------------------------------------------
     # Identical shape to agProxyLLM's start()/ensure_uds_started()/stop() --
     # see that module for the reasoning (uvicorn on a daemon thread, poll
@@ -734,6 +783,7 @@ class agLLMTerminus:
         return self.base_url
 
     def stop(self) -> None:
+        self.drain(timeout_s=10)
         if self._server is not None:
             self._server.should_exit = True
         if self._thread is not None:
@@ -790,6 +840,9 @@ def get_shared_terminus(agconfig: "agConfig | None" = None) -> agLLMTerminus:
     with _shared_terminus_lock:
         if _shared_terminus is None:
             _shared_terminus = agLLMTerminus(agconfig)
+            from .shared_services import register_shared_service
+
+            register_shared_service(_shared_terminus)
         return _shared_terminus
 
 

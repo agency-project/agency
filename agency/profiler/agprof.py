@@ -41,6 +41,7 @@ import itertools
 import json
 import os
 import re
+import signal
 import sys
 import threading
 import time
@@ -56,6 +57,9 @@ _session = None  # None = profiling off (the fast path checks only this)
 _profiler = None  # the live _OTelSession object, if any
 _out_dir: "Path | None" = None
 _state_lock = threading.Lock()
+_process_shutdown_lock = threading.Lock()
+_process_shutdown_started = False
+_PROCESS_PROFILE_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 _counters: "dict[str, itertools.count]" = {}
 _counters_lock = threading.Lock()
@@ -104,6 +108,11 @@ _cg_lock = threading.Lock()
 # real `threading.get_native_id()` value, so it never collides with a real
 # thread lane in the summary or the Perfetto trace.
 _DERIVED_TID = -1
+
+
+def _agprof_print(message: str) -> None:
+    """Emit shutdown diagnostics promptly even when stdout is redirected."""
+    print(message, flush=True)
 
 
 def _require_linux() -> None:
@@ -282,6 +291,7 @@ class _TimedSpan:
     __slots__ = (
         "_name",
         "_tracer",
+        "_parent_context",
         "_span",
         "_scope",
         "_otel_t0",
@@ -294,9 +304,10 @@ class _TimedSpan:
         "_stack_token",
     )
 
-    def __init__(self, tracer, name: str) -> None:
+    def __init__(self, tracer, name: str, parent_context=None) -> None:
         self._name = name
         self._tracer = tracer
+        self._parent_context = parent_context
         self._span = None
         self._scope = None
         self._metadata: dict = {}
@@ -309,7 +320,11 @@ class _TimedSpan:
         self._rq0 = _read_schedstat()
         self._tid = threading.get_native_id()
         self._otel_t0 = time.time_ns()
-        self._span = self._tracer.start_span(self._name, start_time=self._otel_t0)
+        self._span = self._tracer.start_span(
+            self._name,
+            context=self._parent_context,
+            start_time=self._otel_t0,
+        )
         from opentelemetry.trace import use_span
 
         self._scope = use_span(self._span, end_on_exit=False)
@@ -401,8 +416,8 @@ class _OTelSession:
         self.provider = TracerProvider(sampler=ALWAYS_ON)
         self.tracer = self.provider.get_tracer("agency.profiler")
 
-    def span(self, name: str) -> _TimedSpan:
-        return _TimedSpan(self.tracer, name)
+    def span(self, name: str, parent_context=None) -> _TimedSpan:
+        return _TimedSpan(self.tracer, name, parent_context=parent_context)
 
     def stop(self) -> None:
         self.provider.force_flush()
@@ -414,7 +429,7 @@ def enabled() -> bool:
     return _session is not None
 
 
-def span(name: str):
+def span(name: str, *, parent_context=None):
     """A timed, named interval in the current execution context.
 
     No-op (a shared ``nullcontext``) unless a session is active. Nesting in the
@@ -425,7 +440,56 @@ def span(name: str):
     s = _session
     if s is None:
         return _NULL
-    return s.span(name)
+    return s.span(name, parent_context=parent_context)
+
+
+def current_span_context():
+    """Return a durable OTel context containing the active profiler span.
+
+    The returned context can be stored by a host-side correlation registry
+    and later supplied to :func:`span` from an unrelated request thread.  It
+    is ``None`` when profiling is off or the current execution context has no
+    active profiler span.
+    """
+    if _session is None or not _span_stack.get():
+        return None
+    from opentelemetry import trace
+
+    active_span = _span_stack.get()[-1]._span
+    return trace.set_span_in_context(active_span)
+
+
+def current_span_attributes() -> dict:
+    """Copy metadata attached to the active profiler span."""
+    if _session is None or not _span_stack.get():
+        return {}
+    return dict(_span_stack.get()[-1]._metadata)
+
+
+def spawn_traced(fn, *args, daemon: bool = True, **kwargs) -> threading.Thread:
+    """Create a thread that inherits the caller's active OTel context.
+
+    ``contextvars`` intentionally start empty in a new ``threading.Thread``.
+    Capturing only OTel's context here preserves trace parentage without
+    copying agprof's annotation stack into a thread that does not own those
+    span handles.  The optional OTel dependency is never imported while
+    profiling is disabled.
+    """
+    if _session is None:
+        return threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=daemon)
+
+    from opentelemetry import context as otel_context
+
+    context = otel_context.get_current()
+
+    def run() -> None:
+        token = otel_context.attach(context)
+        try:
+            fn(*args, **kwargs)
+        finally:
+            otel_context.detach(token)
+
+    return threading.Thread(target=run, daemon=daemon)
 
 
 def annotate(**metadata) -> None:
@@ -452,6 +516,7 @@ def record_derived_span(
     start_wall_ns: int,
     end_wall_ns: int,
     metadata: "dict | None" = None,
+    parent_context=None,
 ) -> None:
     """Append a span for an interval reconstructed after the fact — e.g.
     agprof_derive's terminus-transcript-diffed turn/tool boundaries — rather
@@ -460,11 +525,10 @@ def record_derived_span(
     No thread ever executed on the interval as far as this process can see,
     so there is nothing to attribute ``cpu_ns``/``runqueue_ms`` to; both stay
     absent rather than reported as zero (a busy interval and an unmeasured
-    one must not render identically). Explicitly parentless — it starts a
-    new trace rather than adopting whatever span happens to be ambient in
-    the calling context, since that context (usually none, for the
-    terminus's own request-handling thread) has no relationship to the
-    interval being described. No-op when profiling is off.
+    one must not render identically). It uses *parent_context* when the
+    correlation registry resolved one; otherwise it is explicitly parentless
+    rather than adopting whatever span happens to be ambient in the terminus
+    request thread. No-op when profiling is off.
 
     *start_perf_ns*/*end_perf_ns* must be ``time.perf_counter_ns()`` values
     (agprof's internal clock, see ``_records``' docstring); *start_wall_ns*/
@@ -474,11 +538,13 @@ def record_derived_span(
     s = _session
     if s is None:
         return
-    from opentelemetry.context import Context
-
     metadata = dict(metadata or {})
     metadata.setdefault("timing", "derived")
-    span = s.tracer.start_span(name, context=Context(), start_time=start_wall_ns)
+    if parent_context is None:
+        from opentelemetry.context import Context
+
+        parent_context = Context()
+    span = s.tracer.start_span(name, context=parent_context, start_time=start_wall_ns)
     for key, value in metadata.items():
         span.set_attribute(key, _otel_attribute(value))
     span.end(end_time=end_wall_ns)
@@ -1031,10 +1097,40 @@ def stop():
     leases = list(_leases)
     interrupted_spans = list(_interrupted_spans)
     process_info = copy.deepcopy(_process_info)
-    _last_summary = _build_summary(records)
     observations = []
+    observations_error = None
     try:
         observations = _resource_observations(samples, process_info=process_info)
+    except Exception as _e:
+        observations_error = _e
+
+    # The raw timestamps needed by the trace only live in this process. Write
+    # that irreplaceable artifact before spending shutdown time on summaries.
+    if out_dir is not None:
+        _agprof_print(f"[agprof] writing trace: {out_dir / 'agprof.trace.json'}")
+        try:
+            from .agprof_trace import write_trace
+
+            trace_path = write_trace(
+                out_dir,
+                records,
+                samples,
+                leases,
+                process_info=process_info,
+                interrupted_spans=interrupted_spans,
+                started_ns=started_ns,
+                observations=observations,
+            )
+            _agprof_print(f"[agprof] Perfetto trace: {trace_path}")
+        except BaseException as _e:  # signals/SystemExit must be visible too
+            _agprof_print(f"[agprof] WARNING: trace output failed: {_e}")
+            if not isinstance(_e, Exception):
+                raise
+
+    _last_summary = _build_summary(records)
+    try:
+        if observations_error is not None:
+            raise observations_error
         _last_run_summary = _build_run_summary(
             records,
             samples,
@@ -1049,29 +1145,12 @@ def stop():
         )
     except Exception as _e:  # never let reporting kill the run
         _last_run_summary = None
-        print(f"[agprof] WARNING: summary generation failed: {_e}")
-    if out_dir is not None:
-        if _last_run_summary is not None:
-            try:
-                _write_summary_files(out_dir, _last_run_summary)
-            except Exception as _e:  # never let reporting kill the run
-                print(f"[agprof] WARNING: summary output failed: {_e}")
+        _agprof_print(f"[agprof] WARNING: summary generation failed: {_e}")
+    if out_dir is not None and _last_run_summary is not None:
         try:
-            from .agprof_trace import write_trace
-
-            trace_path = write_trace(
-                out_dir,
-                records,
-                samples,
-                leases,
-                process_info=process_info,
-                interrupted_spans=interrupted_spans,
-                started_ns=started_ns,
-                observations=observations,
-            )
-            print(f"[agprof] Perfetto trace: {trace_path}")
+            _write_summary_files(out_dir, _last_run_summary)
         except Exception as _e:  # never let reporting kill the run
-            print(f"[agprof] WARNING: trace output failed: {_e}")
+            _agprof_print(f"[agprof] WARNING: summary output failed: {_e}")
     return prof
 
 
@@ -1944,7 +2023,7 @@ def _write_summary_files(out_dir: Path, summary: dict) -> "tuple[Path, Path]":
     markdown_tmp.write_text(_render_summary_markdown(summary))
     json_tmp.replace(json_path)
     markdown_tmp.replace(markdown_path)
-    print(f"[agprof] summaries: {json_path}, {markdown_path}")
+    _agprof_print(f"[agprof] summaries: {json_path}, {markdown_path}")
     return json_path, markdown_path
 
 
@@ -2029,8 +2108,46 @@ def _maybe_autostart() -> None:
     """Start process-lifetime profiling when explicitly requested."""
     if not _env_enabled() or profile_scope() != "process":
         return
+    global _process_shutdown_started
+    with _process_shutdown_lock:
+        _process_shutdown_started = False
     start(_env_out_dir())
-    atexit.register(stop)
+    _install_process_profile_signal_handlers()
+    atexit.register(_shutdown_process_profile)
+
+
+def _shutdown_process_profile() -> None:
+    """Drain shared harness work before finalizing process-scope traces."""
+    global _process_shutdown_started
+    with _process_shutdown_lock:
+        if _process_shutdown_started:
+            return
+        _process_shutdown_started = True
+    try:
+        from ..agharness_internal.shared_services import drain_shared_services
+
+        drain_shared_services()
+    finally:
+        stop()
+
+
+def _install_process_profile_signal_handlers() -> None:
+    """Make catchable termination signals follow the process shutdown path."""
+    for signum in _PROCESS_PROFILE_SIGNALS:
+        signal.signal(signum, _process_profile_signal_handler)
+
+
+def _process_profile_signal_handler(signum, _frame) -> None:
+    """Finalize once, then preserve the signal's normal exit semantics."""
+    # Prevent another SIGINT/SIGTERM from re-entering Python while the trace
+    # is being written. The original signal is re-raised below after shutdown.
+    for handled_signal in _PROCESS_PROFILE_SIGNALS:
+        signal.signal(handled_signal, signal.SIG_IGN)
+    try:
+        _shutdown_process_profile()
+    finally:
+        signal.signal(signum, signal.SIG_DFL)
+        signal.raise_signal(signum)
 
 
 def _initialize_environment_profiling() -> None:

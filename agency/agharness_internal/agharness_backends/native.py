@@ -272,9 +272,7 @@ def _wait_ready(sock_path: str, timeout_s: float) -> None:
         except Exception as e:
             last_exc = e
             time.sleep(0.1)
-    raise RuntimeError(
-        f"in-container entrypoint at {sock_path} never became reachable: {last_exc}"
-    )
+    raise RuntimeError(f"in-container entrypoint at {sock_path} never became reachable: {last_exc}")
 
 
 def _ensure_entrypoint(sandbox: "agSandbox") -> str:
@@ -289,7 +287,7 @@ def _ensure_entrypoint(sandbox: "agSandbox") -> str:
         try:
             ping(existing, timeout_s=2)
             return existing
-        except Exception:
+        except Exception:  # noqa: S110 - stale sockets are relaunched below
             pass  # stale -- fall through and relaunch
     sock_path = launch_in_container_entrypoint(sandbox)
     sandbox._native_entrypoint_sock = sock_path
@@ -344,7 +342,7 @@ class _LiveTranscriptPusher:
             from ... import agllm_pure
 
             ag.push_token_count_update_to_ui(agllm_pure.estimate_messages_tokens(transcript), 0)
-        except Exception:
+        except Exception:  # noqa: S110 - live UI updates are best-effort
             pass
 
     def run(self, stop_event: "threading.Event") -> None:
@@ -444,8 +442,12 @@ class _NativeBackend(agharness_backend):
         terminus = get_shared_terminus(ag.agconfig)
         mcp_server = get_shared_mcp_server(ag.agconfig)
         messenger = get_shared_messenger(ag.agconfig)
+        from ..agprof_ingest import get_shared_profiler_ingest
+
+        profiler_ingest = get_shared_profiler_ingest()
         token = uuid.uuid4().hex
         terminus.register(token, ag)
+        profiler_ingest.register(token, ag)
         mcp_server.register(token, ag, skill)
         messenger.register(token, ag)
 
@@ -514,6 +516,7 @@ class _NativeBackend(agharness_backend):
             poll_thread.join(timeout=2)
             pusher.poll_once()
             terminus.unregister(token)
+            profiler_ingest.unregister(token)
             mcp_server.unregister(token)
             messenger.unregister(token)
 
@@ -526,8 +529,7 @@ class _NativeBackend(agharness_backend):
                 result = agerror(
                     "structured output incomplete after "
                     f"{skill.max_output_schema_retries - output_schema_retries_left} "
-                    "retry/retries -- submit_output was never called for: "
-                    + ", ".join(missing)
+                    "retry/retries -- submit_output was never called for: " + ", ".join(missing)
                 )
             else:
                 result = agdata(**collected_output)

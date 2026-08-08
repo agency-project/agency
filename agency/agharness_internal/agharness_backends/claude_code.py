@@ -139,7 +139,6 @@ class _ClaudeCodeBackend(agharness_backend):
         skill: "agskill",
         extra_system: "str | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
-        import shlex
 
         from ... import agharness
         from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
@@ -162,9 +161,10 @@ class _ClaudeCodeBackend(agharness_backend):
         if resolved is None:
             where = (
                 "inside the sandbox container, in the harness binary cache "
-                f"(~/.cache/agency_harness_bin), or on this host's own PATH "
-                f"to seed that cache from"
-                if in_container else "on the host PATH"
+                "(~/.cache/agency_harness_bin), or on this host's own PATH "
+                "to seed that cache from"
+                if in_container
+                else "on the host PATH"
             )
             return agerror(f"claude binary {binary!r} not found {where}"), prev_ctx, [sys_msg]
 
@@ -198,6 +198,11 @@ class _ClaudeCodeBackend(agharness_backend):
             terminus = get_shared_terminus(ag.agconfig)
             token = uuid.uuid4().hex
             gateway.register(token, ag)
+
+        from ..agprof_ingest import get_shared_profiler_ingest
+
+        profiler_ingest = get_shared_profiler_ingest()
+        profiler_ingest.register(token, ag)
 
         # Shared MCP server (Phase 4): the same resource-control
         # (reserve_cpu/cpu_release/daemon_release) and output-submission
@@ -276,8 +281,10 @@ class _ClaudeCodeBackend(agharness_backend):
                 try:
                     blob = base64.b64decode(prior["blob_b64"])
                     _write_session_blob(
-                        ag.sandbox, in_container,
-                        _session_path(str(config_home), resume_session_id), blob,
+                        ag.sandbox,
+                        in_container,
+                        _session_path(str(config_home), resume_session_id),
+                        blob,
                     )
                 except Exception:
                     # Best-effort: a failure to restore the prior session
@@ -445,7 +452,11 @@ class _ClaudeCodeBackend(agharness_backend):
                 argv.append(prompt)
 
                 handle = px.launch(
-                    argv, envp, cwd=str(config_home), policy=policy, ag=ag,
+                    argv,
+                    envp,
+                    cwd=str(config_home),
+                    policy=policy,
+                    ag=ag,
                     sandbox=ag.sandbox if in_container else None,
                 )
                 if ag.sandbox is not None:
@@ -483,7 +494,7 @@ class _ClaudeCodeBackend(agharness_backend):
                                 "session_id": session_id,
                                 "blob_b64": base64.b64encode(blob).decode(),
                             }
-                    except Exception:
+                    except Exception:  # noqa: S110 - session persistence is best-effort
                         pass
 
                 # Snapshot whatever submit_output calls landed so far --
@@ -520,6 +531,7 @@ class _ClaudeCodeBackend(agharness_backend):
                 terminus.unregister(token)
             else:
                 gateway.unregister(token)
+            profiler_ingest.unregister(token)
             mcp_server.unregister(token)
             if mcp_relay_proc is not None:
                 # Per-launch relay subprocess -- torn down every time. Never

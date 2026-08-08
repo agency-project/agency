@@ -473,9 +473,17 @@ class agskill:
         ag._set_ui_state("skill", skill=self.name)
 
         def _traced_task() -> None:
-            label = f"run{agprof.next_index()}:{self.name}:{ag.agname}"
+            run_id = f"run{agprof.next_index()}"
+            label = f"{run_id}:{self.name}:{ag.agname}"
             agprof.thread_name(label)
             with agprof.span(label):
+                agprof.annotate(
+                    **{
+                        "agency.run_id": run_id,
+                        "agency.agent_id": str(ag.agname),
+                        "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None),
+                    }
+                )
                 _task()
                 profile_result = result_future.result()
                 profile_error = profile_result._data.get("error")
@@ -484,7 +492,7 @@ class agskill:
                     error_type="skill_error" if profile_error else None,
                 )
 
-        threading.Thread(target=_traced_task, daemon=True).start()
+        agprof.spawn_traced(_traced_task).start()
         ag.ctx = agcontext(_future=ctx_future)
         return agdata(_future=result_future)
 

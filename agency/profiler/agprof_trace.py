@@ -50,24 +50,17 @@ def _time_origin_ns(records, samples, leases, interrupted_spans, started_ns) -> 
     return min(candidates, default=0)
 
 
-def build_trace(
+def _prepare_trace(
     records,
     samples,
-    leases=(),
-    *,
-    process_info=None,
-    interrupted_spans=(),
-    started_ns: "int | None" = None,
-    pid: "int | None" = None,
-    observations=None,
-) -> dict:
-    """Build a Chrome-trace document consumable by ``ui.perfetto.dev``.
-
-    Completed spans are complete events (``ph: \"X\"``), resource observations
-    are counters (``ph: \"C\"``), and every GPU has a synthetic lease lane.
-    ``observations`` is injectable for tests; normally it is derived from the
-    raw sampler rows with agprof's canonical gauge/rate conversion.
-    """
+    leases,
+    process_info,
+    interrupted_spans,
+    started_ns,
+    pid,
+    observations,
+) -> tuple:
+    """Normalize trace inputs shared by in-memory and streaming output."""
     records = _reiterable(records)
     samples = _reiterable(samples)
     leases = _reiterable(leases)
@@ -79,21 +72,37 @@ def build_trace(
     process_info = dict(process_info)
     trace_pid = os.getpid() if pid is None else pid
     origin_ns = _time_origin_ns(records, samples, leases, interrupted_spans, started_ns)
+    if observations is None:
+        from .agprof import _resource_observations
+
+        observations = _resource_observations(samples, process_info=process_info)
+    else:
+        observations = _reiterable(observations)
+    return records, leases, process_info, interrupted_spans, observations, trace_pid, origin_ns
+
+
+def _iter_trace_events(
+    records,
+    leases,
+    process_info,
+    interrupted_spans,
+    observations,
+    trace_pid,
+    origin_ns,
+):
+    """Yield Chrome-trace events without retaining the full event array."""
 
     def to_us(timestamp_ns: int) -> float:
         return (timestamp_ns - origin_ns) / 1e3
 
-    events: list[dict] = [
-        {
-            "ph": "M",
-            "pid": trace_pid,
-            "tid": 0,
-            "name": "process_name",
-            "args": {"name": "agency profiler"},
-        }
-    ]
+    yield {
+        "ph": "M",
+        "pid": trace_pid,
+        "tid": 0,
+        "name": "process_name",
+        "args": {"name": "agency profiler"},
+    }
     thread_ids = set()
-
     for record in records:
         tid, name, t0, wall, cpu, runq, metadata, span_id, parent_span_id = _record_fields(record)
         thread_ids.add(tid)
@@ -112,21 +121,17 @@ def build_trace(
             args["span_id"] = _trace_id(span_id)
         if parent_span_id is not None:
             args["parent_span_id"] = _trace_id(parent_span_id)
-        events.append(
-            {
-                "ph": "X",
-                "pid": trace_pid,
-                "tid": tid,
-                "ts": to_us(t0),
-                "dur": max(1.0, wall / 1e3),
-                "name": name,
-                "cat": "agprof",
-                "args": args,
-            }
-        )
+        yield {
+            "ph": "X",
+            "pid": trace_pid,
+            "tid": tid,
+            "ts": to_us(t0),
+            "dur": max(1.0, wall / 1e3),
+            "name": name,
+            "cat": "agprof",
+            "args": args,
+        }
 
-    # Open spans do not enter _records. Preserve them on the timeline just as
-    # they are preserved in summary.json's incomplete_spans section.
     for interrupted in interrupted_spans:
         t0 = interrupted.get("started_ns")
         if t0 is None:
@@ -139,47 +144,32 @@ def build_trace(
             if key not in ("thread_id", "label", "started_ns", "duration_ms")
         }
         args["outcome"] = "interrupted"
-        events.append(
-            {
-                "ph": "X",
-                "pid": trace_pid,
-                "tid": tid,
-                "ts": to_us(t0),
-                "dur": max(1.0, float(interrupted.get("duration_ms", 0.0)) * 1e3),
-                "name": interrupted.get("label", "interrupted"),
-                "cat": "agprof",
-                "args": args,
-            }
-        )
+        yield {
+            "ph": "X",
+            "pid": trace_pid,
+            "tid": tid,
+            "ts": to_us(t0),
+            "dur": max(1.0, float(interrupted.get("duration_ms", 0.0)) * 1e3),
+            "name": interrupted.get("label", "interrupted"),
+            "cat": "agprof",
+            "args": args,
+        }
 
     for sort_index, tid in enumerate(sorted(thread_ids, key=str), start=1):
-        events.extend(
-            [
-                {
-                    "ph": "M",
-                    "pid": trace_pid,
-                    "tid": tid,
-                    "name": "thread_name",
-                    "args": {"name": f"thread {tid}"},
-                },
-                {
-                    "ph": "M",
-                    "pid": trace_pid,
-                    "tid": tid,
-                    "name": "thread_sort_index",
-                    "args": {"sort_index": sort_index},
-                },
-            ]
-        )
-
-    if observations is None:
-        # Local import avoids making the trace module part of agprof's startup
-        # dependency graph (important when profiling is disabled).
-        from .agprof import _resource_observations
-
-        observations = _resource_observations(samples, process_info=process_info)
-    else:
-        observations = _reiterable(observations)
+        yield {
+            "ph": "M",
+            "pid": trace_pid,
+            "tid": tid,
+            "name": "thread_name",
+            "args": {"name": f"thread {tid}"},
+        }
+        yield {
+            "ph": "M",
+            "pid": trace_pid,
+            "tid": tid,
+            "name": "thread_sort_index",
+            "args": {"sort_index": sort_index},
+        }
 
     process_identities = {
         observation["process_identity"]
@@ -197,78 +187,99 @@ def build_trace(
         if info is None:
             continue
         process_pid = info["trace_pid"]
-        events.extend(
-            [
-                {
-                    "ph": "M",
-                    "pid": process_pid,
-                    "tid": 0,
-                    "name": "process_name",
-                    "args": {"name": info["display_name"]},
-                },
-                {
-                    "ph": "M",
-                    "pid": process_pid,
-                    "tid": 0,
-                    "name": "process_sort_index",
-                    "args": {"sort_index": sort_index},
-                },
-                {
-                    "ph": "M",
-                    "pid": process_pid,
-                    "tid": 0,
-                    "name": "process_labels",
-                    "args": {
-                        "labels": f"cgroup={info['cgroup']}; "
-                        f"cmdline={info['cmdline'] or info['comm']}"
-                    },
-                },
-            ]
-        )
+        yield {
+            "ph": "M",
+            "pid": process_pid,
+            "tid": 0,
+            "name": "process_name",
+            "args": {"name": info["display_name"]},
+        }
+        yield {
+            "ph": "M",
+            "pid": process_pid,
+            "tid": 0,
+            "name": "process_sort_index",
+            "args": {"sort_index": sort_index},
+        }
+        yield {
+            "ph": "M",
+            "pid": process_pid,
+            "tid": 0,
+            "name": "process_labels",
+            "args": {
+                "labels": f"cgroup={info['cgroup']}; cmdline={info['cmdline'] or info['comm']}"
+            },
+        }
 
-    # Cumulative series have already become rates; direct series remain gauges.
     for observation in observations:
-        events.append(
-            {
-                "ph": "C",
-                "pid": observation.get("trace_pid", trace_pid),
-                "tid": 0,
-                "ts": to_us(observation["timestamp_ns"]),
-                "name": observation["trace_name"],
-                "cat": "resource",
-                "args": {"value": round(observation["value"], 2)},
-            }
-        )
+        yield {
+            "ph": "C",
+            "pid": observation.get("trace_pid", trace_pid),
+            "tid": 0,
+            "ts": to_us(observation["timestamp_ns"]),
+            "name": observation["trace_name"],
+            "cat": "resource",
+            "args": {"value": round(observation["value"], 2)},
+        }
 
-    # Lease lanes: one synthetic thread per device, spans labeled by acquirer.
     lease_tids = set()
     for gpu_id, t0, t1, label in leases:
         tid = f"gpu{gpu_id}-lease"
         lease_tids.add((gpu_id, tid))
-        events.append(
-            {
-                "ph": "X",
-                "pid": trace_pid,
-                "tid": tid,
-                "ts": to_us(t0),
-                "dur": max(1.0, (t1 - t0) / 1e3),
-                "name": f"lease:{label}",
-                "cat": "gpu_lease",
-            }
-        )
+        yield {
+            "ph": "X",
+            "pid": trace_pid,
+            "tid": tid,
+            "ts": to_us(t0),
+            "dur": max(1.0, (t1 - t0) / 1e3),
+            "name": f"lease:{label}",
+            "cat": "gpu_lease",
+        }
     for gpu_id, tid in sorted(lease_tids):
-        events.append(
-            {
-                "ph": "M",
-                "pid": trace_pid,
-                "tid": tid,
-                "name": "thread_name",
-                "args": {"name": f"GPU {gpu_id} lease"},
-            }
-        )
+        yield {
+            "ph": "M",
+            "pid": trace_pid,
+            "tid": tid,
+            "name": "thread_name",
+            "args": {"name": f"GPU {gpu_id} lease"},
+        }
 
+
+def build_trace(
+    records,
+    samples,
+    leases=(),
+    *,
+    process_info=None,
+    interrupted_spans=(),
+    started_ns: "int | None" = None,
+    pid: "int | None" = None,
+    observations=None,
+) -> dict:
+    """Build a Chrome-trace document consumable by ``ui.perfetto.dev``."""
+    prepared = _prepare_trace(
+        records,
+        samples,
+        leases,
+        process_info,
+        interrupted_spans,
+        started_ns,
+        pid,
+        observations,
+    )
+    records, leases, process_info, interrupted_spans, observations, trace_pid, origin_ns = prepared
     return {
-        "traceEvents": events,
+        "traceEvents": list(
+            _iter_trace_events(
+                records,
+                leases,
+                process_info,
+                interrupted_spans,
+                observations,
+                trace_pid,
+                origin_ns,
+            )
+        ),
         "displayTimeUnit": "ms",
         "otherData": {
             "agprof_clock": "perf_counter_ns",
@@ -294,16 +305,42 @@ def write_trace(
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / TRACE_FILENAME
     temporary = out_dir / f".{TRACE_FILENAME}.{os.getpid()}.tmp"
-    data = build_trace(
+    prepared = _prepare_trace(
         records,
         samples,
         leases,
-        process_info=process_info,
-        interrupted_spans=interrupted_spans,
-        started_ns=started_ns,
-        pid=pid,
-        observations=observations,
+        process_info,
+        interrupted_spans,
+        started_ns,
+        pid,
+        observations,
     )
-    temporary.write_text(json.dumps(data, separators=(",", ":"), default=str) + "\n")
+    records, leases, process_info, interrupted_spans, observations, trace_pid, origin_ns = prepared
+    events = _iter_trace_events(
+        records,
+        leases,
+        process_info,
+        interrupted_spans,
+        observations,
+        trace_pid,
+        origin_ns,
+    )
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write('{"traceEvents":[')
+        for index, event in enumerate(events):
+            if index:
+                stream.write(",")
+            json.dump(event, stream, separators=(",", ":"), default=str)
+        stream.write('],"displayTimeUnit":"ms","otherData":')
+        json.dump(
+            {
+                "agprof_clock": "perf_counter_ns",
+                "agprof_time_origin_ns": origin_ns,
+            },
+            stream,
+            separators=(",", ":"),
+            default=str,
+        )
+        stream.write("}\n")
     temporary.replace(path)
     return path

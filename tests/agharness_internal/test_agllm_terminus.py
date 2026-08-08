@@ -150,6 +150,8 @@ def test_valid_token_streaming_dispatch():
     assert json.loads(lines[0][len("data: ") :])["choices"][0]["delta"]["content"] == "a"
     assert json.loads(lines[1][len("data: ") :])["choices"][0]["delta"]["content"] == "b"
     assert lines[2] == "data: [DONE]"
+    assert term.drain(timeout_s=1)
+    assert term._active_streams == 0
 
 
 def test_streaming_dispatch_profiles_ttft_final_usage_and_backend(monkeypatch):

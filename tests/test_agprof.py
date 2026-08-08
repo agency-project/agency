@@ -127,24 +127,24 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_leases_open", {})
     calls = []
     build_observations = agprof._resource_observations
-    write_summaries = agprof._write_summary_files
-    write_trace = agprof_trace.write_trace
+    original_write_summaries = agprof._write_summary_files
+    original_write_trace = agprof_trace.write_trace
 
     def observe_once(*args, **kwargs):
         calls.append("observations")
         return build_observations(*args, **kwargs)
 
-    def write_summaries_first(*args, **kwargs):
+    def write_summaries(*args, **kwargs):
         calls.append("summaries")
-        return write_summaries(*args, **kwargs)
+        return original_write_summaries(*args, **kwargs)
 
-    def write_trace_last(*args, **kwargs):
+    def write_trace_first(*args, **kwargs):
         calls.append("trace")
-        return write_trace(*args, **kwargs)
+        return original_write_trace(*args, **kwargs)
 
     monkeypatch.setattr(agprof, "_resource_observations", observe_once)
-    monkeypatch.setattr(agprof, "_write_summary_files", write_summaries_first)
-    monkeypatch.setattr(agprof_trace, "write_trace", write_trace_last)
+    monkeypatch.setattr(agprof, "_write_summary_files", write_summaries)
+    monkeypatch.setattr(agprof_trace, "write_trace", write_trace_first)
     agprof.stop()
 
     machine_summary = json.loads((tmp_path / "summary.json").read_text())
@@ -160,8 +160,52 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     span_event = next(event for event in trace["traceEvents"] if event.get("name") == "stage:work")
     assert span_event["ph"] == "X"
     assert span_event["args"]["blocked_ms"] == 0.4
-    assert calls == ["observations", "summaries", "trace"]
+    assert calls == ["observations", "trace", "summaries"]
     assert agprof.summary_metrics() == machine_summary
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt("interrupt"), SystemExit("exit")])
+def test_stop_reports_and_reraises_fatal_trace_failure(monkeypatch, tmp_path, failure):
+    class FakeProfiler:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(agprof, "_session", object())
+    monkeypatch.setattr(agprof, "_profiler", FakeProfiler())
+    monkeypatch.setattr(agprof, "_out_dir", tmp_path)
+    monkeypatch.setattr(agprof, "_sampler", None)
+    monkeypatch.setattr(agprof, "_session_started_ns", time.perf_counter_ns())
+    monkeypatch.setattr(agprof, "_records", [])
+    monkeypatch.setattr(agprof, "_samples", [])
+    monkeypatch.setattr(agprof, "_leases", [])
+    monkeypatch.setattr(agprof, "_leases_open", {})
+    messages = []
+    monkeypatch.setattr(agprof, "_agprof_print", messages.append)
+    monkeypatch.setattr(
+        agprof_trace,
+        "write_trace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        agprof,
+        "_write_summary_files",
+        lambda *args, **kwargs: pytest.fail("trace must be attempted before summaries"),
+    )
+
+    with pytest.raises(type(failure)):
+        agprof.stop()
+
+    assert messages[0].startswith("[agprof] writing trace:")
+    assert messages[1] == f"[agprof] WARNING: trace output failed: {failure}"
+
+
+def test_agprof_print_flushes(monkeypatch):
+    calls = []
+    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    agprof._agprof_print("[agprof] message")
+
+    assert calls == [(("[agprof] message",), {"flush": True})]
 
 
 def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
@@ -269,6 +313,28 @@ def test_perfetto_trace_keeps_interrupted_spans():
     assert span["ts"] == 0.0
     assert span["dur"] == 2500.0
     assert span["args"] == {"reason": "session stopped", "outcome": "interrupted"}
+
+
+def test_write_trace_streams_json_without_building_one_giant_string(monkeypatch, tmp_path):
+    records = [(7, "stage:work", 10, 1_000, 500, 100, {"outcome": "success"})]
+    monkeypatch.setattr(
+        agprof_trace.json,
+        "dumps",
+        lambda *args, **kwargs: pytest.fail("write_trace must stream with json.dump"),
+    )
+
+    path = agprof_trace.write_trace(
+        tmp_path,
+        records,
+        [],
+        started_ns=10,
+        pid=42,
+        observations=[],
+    )
+
+    trace = json.loads(path.read_text())
+    assert trace["displayTimeUnit"] == "ms"
+    assert any(event.get("name") == "stage:work" for event in trace["traceEvents"])
 
 
 def test_derived_rollups_include_outcomes_percentiles_tokens_energy_and_interruptions():
@@ -800,11 +866,86 @@ def test_process_scope_is_the_only_environment_autostart(monkeypatch):
     monkeypatch.setenv("AGENCY_PROFILE_SCOPE", "process")
     monkeypatch.setenv("AGENCY_PROFILE_DIR", "process-trace")
     monkeypatch.setattr(agprof, "start", lambda out_dir: events.append(("start", out_dir)))
+    monkeypatch.setattr(
+        agprof,
+        "_install_process_profile_signal_handlers",
+        lambda: events.append(("signals", None)),
+    )
     monkeypatch.setattr(agprof.atexit, "register", lambda fn: events.append(("register", fn)))
 
     agprof._maybe_autostart()
 
-    assert events == [("start", "process-trace"), ("register", agprof.stop)]
+    assert events == [
+        ("start", "process-trace"),
+        ("signals", None),
+        ("register", agprof._shutdown_process_profile),
+    ]
+
+
+def test_process_shutdown_drains_shared_services_before_stopping_profiler(monkeypatch):
+    from agency.agharness_internal import shared_services
+
+    events = []
+    monkeypatch.setattr(agprof, "_process_shutdown_started", False)
+    monkeypatch.setattr(
+        shared_services,
+        "drain_shared_services",
+        lambda: events.append("drain"),
+    )
+    monkeypatch.setattr(agprof, "stop", lambda: events.append("stop"))
+
+    agprof._shutdown_process_profile()
+    agprof._shutdown_process_profile()
+
+    assert events == ["drain", "stop"]
+
+
+def test_process_signal_handler_shuts_down_then_restores_and_reraises(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        agprof,
+        "_shutdown_process_profile",
+        lambda: events.append(("shutdown", None)),
+    )
+    monkeypatch.setattr(
+        agprof.signal,
+        "signal",
+        lambda signum, handler: events.append(("signal", signum, handler)),
+    )
+    monkeypatch.setattr(
+        agprof.signal,
+        "raise_signal",
+        lambda signum: events.append(("raise", signum)),
+    )
+
+    agprof._process_profile_signal_handler(agprof.signal.SIGTERM, None)
+
+    assert events == [
+        ("signal", agprof.signal.SIGTERM, agprof.signal.SIG_IGN),
+        ("signal", agprof.signal.SIGINT, agprof.signal.SIG_IGN),
+        ("shutdown", None),
+        ("signal", agprof.signal.SIGTERM, agprof.signal.SIG_DFL),
+        ("raise", agprof.signal.SIGTERM),
+    ]
+
+
+def test_spawn_traced_preserves_parent_span_across_thread(monkeypatch, tmp_path):
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("parent"):
+            thread = agprof.spawn_traced(lambda: _record_child_span())
+            thread.start()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+
+    records = {record[1]: record for record in agprof._records}
+    assert records["child"][8] == records["parent"][7]
+
+
+def _record_child_span() -> None:
+    with agprof.span("child"):
+        pass
 
 
 @pytest.mark.parametrize("scope", [None, "workload", "invalid"])
