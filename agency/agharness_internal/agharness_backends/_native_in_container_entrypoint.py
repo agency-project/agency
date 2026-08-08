@@ -105,6 +105,7 @@ _AGENCY_PACKAGE_CONTAINER_MOUNT = os.environ.get(
 
 _DEFAULT_MAX_STEPS = 20
 _BASH_TIMEOUT_S = 120
+_MAX_PROFILER_ATTRIBUTE_CHARS = 16 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +213,20 @@ def _load_agllm_pure():
     return module
 
 
+def _load_agprof_emit():
+    """Load the stdlib-only remote emitter without importing ``agency``."""
+    import importlib.util
+
+    path = f"{_AGENCY_PACKAGE_CONTAINER_MOUNT}/agency/profiler/agprof_emit.py"
+    spec = importlib.util.spec_from_file_location("agprof_emit", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 _agtool_pure = _load_agtool_pure()
 _agllm_pure = _load_agllm_pure()
+_agprof_emit = _load_agprof_emit()
 
 _READ_DEFAULT_LIMIT = _agtool_pure.READ_DEFAULT_LIMIT
 
@@ -800,6 +813,7 @@ def _dispatch_via_terminus(
     kwargs: dict,
     timeout_s: float = 300,
     max_retries: int = _DISPATCH_MAX_RETRIES,
+    profiler=None,
 ) -> dict:
     """POST to the terminus with `stream=True` and reassemble the streamed
     chunks into `{"message": {"role": "assistant", "content", "tool_calls"},
@@ -836,6 +850,8 @@ def _dispatch_via_terminus(
     import httpx
     import time
 
+    if profiler is None:
+        profiler = _agprof_emit.RemoteProfilerEmitter(None, token)
     kwargs = dict(kwargs)
     kwargs["stream"] = True
     transport = httpx.HTTPTransport(uds=terminus_sock)
@@ -856,7 +872,12 @@ def _dispatch_via_terminus(
                         resp.read()
                         last_error = f"terminus dispatch failed: {resp.status_code} {resp.text}"
                         if attempt < max_retries - 1:
-                            time.sleep(_dispatch_retry_backoff_s(attempt))
+                            delay_s = _dispatch_retry_backoff_s(attempt)
+                            with profiler.span(
+                                "llm:retry_backoff",
+                                metadata={"attempt": attempt, "delay_ms": delay_s * 1000},
+                            ):
+                                time.sleep(delay_s)
                             continue
                         return {"error": last_error}
                     if resp.status_code != 200:
@@ -911,7 +932,12 @@ def _dispatch_via_terminus(
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             last_error = f"terminus unreachable: {e}"
             if attempt < max_retries - 1:
-                time.sleep(_dispatch_retry_backoff_s(attempt))
+                delay_s = _dispatch_retry_backoff_s(attempt)
+                with profiler.span(
+                    "llm:retry_backoff",
+                    metadata={"attempt": attempt, "delay_ms": delay_s * 1000},
+                ):
+                    time.sleep(delay_s)
                 continue
             return {"error": last_error}
 
@@ -962,6 +988,7 @@ def _maybe_compact(
     token: str,
     model: str,
     previous_summary: "str | None",
+    profiler,
 ) -> "tuple[list, str | None]":
     """Compact `messages` if they're near `context_limit`. Returns
     (messages, previous_summary) -- both unchanged if compaction doesn't
@@ -979,9 +1006,18 @@ def _maybe_compact(
         return messages, previous_summary
     head = _agllm_pure.prune_tool_outputs(head)
     summary_messages = _agllm_pure.build_summary_prompt_messages(task_input, head, previous_summary)
-    resp = _dispatch_via_terminus(
-        terminus_sock, token, {"model": model, "messages": summary_messages}
-    )
+    with profiler.span(
+        "llm:compact",
+        metadata={"messages_before": len(messages), "compacted_head_messages": len(head)},
+    ) as compact_span:
+        resp = _dispatch_via_terminus(
+            terminus_sock,
+            token,
+            {"model": model, "messages": summary_messages},
+            profiler=profiler,
+        )
+        if "error" in resp:
+            compact_span.annotate(outcome="failure", error=str(resp["error"]))
     if "error" in resp:
         return messages, previous_summary
     summary = (resp["message"].get("content") or "").strip()
@@ -1024,6 +1060,18 @@ def _check_in(messenger_sock: str, token: str) -> list:
 
 
 def _run_react_loop(req: dict) -> dict:
+    profiler = _agprof_emit.RemoteProfilerEmitter(req.get("profiler_sock"), req["token"])
+    try:
+        response = _run_react_loop_inner(req, profiler)
+    finally:
+        # The host unregisters this token immediately after receiving our
+        # response. Flush all span-end events before that response is sent.
+        profiler.close()
+    response["profiler_dropped_events"] = profiler.dropped_events
+    return response
+
+
+def _run_react_loop_inner(req: dict, profiler) -> dict:
     token = req["token"]
     terminus_sock = req["terminus_sock"]
     model = req.get("model", "")
@@ -1077,49 +1125,97 @@ def _run_react_loop(req: dict) -> dict:
         _have_tool.add(tool_name)
         dispatch[tool_name] = _make_custom_tool_handler(tool_name, ct["fn_b64"])
 
-    for _ in range(max_steps):
-        # Same order execute_react() uses in-process: check pause/drain
-        # inbox, THEN compact, THEN dispatch.
-        if messenger_sock:
-            messages.extend(_check_in(messenger_sock, token))
-        messages, previous_summary = _maybe_compact(
-            messages, context_limit, terminus_sock, token, model, previous_summary
-        )
-        kwargs = {"model": model, "messages": messages}
-        if tools:
-            kwargs["tools"] = tools
-        resp = _dispatch_via_terminus(terminus_sock, token, kwargs)
-        if "error" in resp:
-            return {"status": "error", "message": str(resp["error"])}
-
-        usage = resp.get("usage") or {}
-        total_input_tokens += usage.get("prompt_tokens", 0) or 0
-        total_output_tokens += usage.get("completion_tokens", 0) or 0
-
-        message = resp["message"]
-        messages.append(message)
-        tool_calls = message.get("tool_calls") or []
-        if not tool_calls:
-            return {
-                "status": "done",
-                "messages": messages,
-                "final_text": message.get("content") or "",
-                "usage": {"input_tokens": total_input_tokens, "output_tokens": total_output_tokens},
-            }
-
-        for tc in tool_calls:
-            fn_name = tc["function"]["name"]
-            fn_args = tc["function"]["arguments"]
-            handler = dispatch.get(fn_name)
-            result_content = (
-                handler(fn_args)
-                if handler is not None
-                else json.dumps({"error": f"unknown tool: {fn_name}"})
+    turn_offset = int(req.get("profiler_turn_offset") or 0)
+    for step in range(max_steps):
+        turn_index = turn_offset + step
+        with profiler.span(
+            f"turn{turn_index}",
+            span_id=f"turn:{turn_index}",
+            metadata={"turn_index": turn_index},
+        ) as turn_span:
+            # Same order execute_react() uses in-process: check pause/drain
+            # inbox, THEN compact, THEN dispatch.
+            if messenger_sock:
+                messages.extend(_check_in(messenger_sock, token))
+            messages, previous_summary = _maybe_compact(
+                messages,
+                context_limit,
+                terminus_sock,
+                token,
+                model,
+                previous_summary,
+                profiler,
             )
-            result_content = _offload_if_oversized(fn_name, tc["id"], result_content)
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_content})
+            kwargs = {"model": model, "messages": messages}
+            if tools:
+                kwargs["tools"] = tools
+            resp = _dispatch_via_terminus(terminus_sock, token, kwargs, profiler=profiler)
+            if "error" in resp:
+                turn_span.annotate(outcome="failure", error=str(resp["error"]))
+                return {
+                    "status": "error",
+                    "message": str(resp["error"]),
+                    "turn_count": step + 1,
+                }
 
-    return {"status": "error", "message": f"exceeded max_steps={max_steps} without a final answer"}
+            usage = resp.get("usage") or {}
+            total_input_tokens += usage.get("prompt_tokens", 0) or 0
+            total_output_tokens += usage.get("completion_tokens", 0) or 0
+
+            message = resp["message"]
+            messages.append(message)
+            tool_calls = message.get("tool_calls") or []
+            turn_span.annotate(tool_calls=len(tool_calls))
+            if not tool_calls:
+                return {
+                    "status": "done",
+                    "messages": messages,
+                    "final_text": message.get("content") or "",
+                    "usage": {
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                    },
+                    "turn_count": step + 1,
+                }
+
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                fn_args = tc["function"]["arguments"]
+                handler = dispatch.get(fn_name)
+                with profiler.span(
+                    f"tool:{fn_name}",
+                    span_id=f"tool:{tc['id']}",
+                    metadata={
+                        "tool_call_id": tc["id"],
+                        "arguments": fn_args[:_MAX_PROFILER_ATTRIBUTE_CHARS],
+                    },
+                ) as tool_span:
+                    result_content = (
+                        handler(fn_args)
+                        if handler is not None
+                        else json.dumps({"error": f"unknown tool: {fn_name}"})
+                    )
+                    result_content = _offload_if_oversized(fn_name, tc["id"], result_content)
+                    tool_ok = handler is not None
+                    try:
+                        parsed_result = json.loads(result_content)
+                        if isinstance(parsed_result, dict) and "error" in parsed_result:
+                            tool_ok = False
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    tool_span.annotate(
+                        outcome="success" if tool_ok else "failure",
+                        result=result_content[:_MAX_PROFILER_ATTRIBUTE_CHARS],
+                    )
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
+                )
+
+    return {
+        "status": "error",
+        "message": f"exceeded max_steps={max_steps} without a final answer",
+        "turn_count": max_steps,
+    }
 
 
 class _Handler(socketserver.BaseRequestHandler):

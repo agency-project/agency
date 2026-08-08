@@ -565,6 +565,38 @@ def record_derived_span(
     )
 
 
+def ingest_remote_span(
+    name: str,
+    *,
+    start_perf_ns: int,
+    end_perf_ns: int,
+    start_wall_ns: int,
+    end_wall_ns: int,
+    metadata: "dict | None" = None,
+    parent_context=None,
+    source: str = "container_asserted",
+) -> None:
+    """Mint a host-owned span from a timestamp pair asserted remotely.
+
+    Remote code reports neutral timing facts; it never constructs an OTel
+    span itself.  Stamping provenance here means a container cannot make an
+    asserted interval look like a host-observed one.  CPU and run-queue time
+    remain unmeasured, as with other reconstructed intervals.
+    """
+    attributes = dict(metadata or {})
+    attributes["timing"] = "exact"
+    attributes["provenance"] = source
+    record_derived_span(
+        name,
+        start_perf_ns=start_perf_ns,
+        end_perf_ns=end_perf_ns,
+        start_wall_ns=start_wall_ns,
+        end_wall_ns=end_wall_ns,
+        metadata=attributes,
+        parent_context=parent_context,
+    )
+
+
 def _unpack_record(record) -> tuple:
     """Return the six clock fields plus metadata from old/new record tuples."""
     metadata = record[6] if len(record) > 6 else {}

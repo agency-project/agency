@@ -604,7 +604,7 @@ class agLLMTerminus:
                         # manufacturing a turn per chunk (see module
                         # docstring's compaction/chunking risk note).
                         transcript = self.transcript_for_token(token)
-                        if transcript:
+                        if transcript and not profiler_ingest.has_exact_events(token):
                             agprof_derive.on_dispatch(
                                 token,
                                 transcript[:-1],
@@ -653,17 +653,18 @@ class agLLMTerminus:
                 if serialized["choices"]:
                     response_message = serialized["choices"][0]["message"]
                     self._record_transcript(token, kwargs.get("messages"), response_message)
-                    agprof_derive.on_dispatch(
-                        token,
-                        kwargs.get("messages"),
-                        response_message,
-                        start_perf_ns=dispatch_start_perf_ns,
-                        start_wall_ns=dispatch_start_wall_ns,
-                        end_perf_ns=time.perf_counter_ns(),
-                        end_wall_ns=time.time_ns(),
-                        parent_context=run_context,
-                        span_attributes=run_attributes,
-                    )
+                    if not profiler_ingest.has_exact_events(token):
+                        agprof_derive.on_dispatch(
+                            token,
+                            kwargs.get("messages"),
+                            response_message,
+                            start_perf_ns=dispatch_start_perf_ns,
+                            start_wall_ns=dispatch_start_wall_ns,
+                            end_perf_ns=time.perf_counter_ns(),
+                            end_wall_ns=time.time_ns(),
+                            parent_context=run_context,
+                            span_attributes=run_attributes,
+                        )
                 return JSONResponse(serialized)
 
         @app.post("/internal/resolve_model")

@@ -84,3 +84,91 @@ def test_terminus_drain_waits_for_active_stream_finalizer():
 
     assert drained.wait(timeout=1)
     waiter.join(timeout=1)
+
+
+def test_native_events_mint_exact_container_spans_under_registered_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    registry = agProfilerIngest()
+    ag = SimpleNamespace(agname="native-child", _parent_agent_id="parent")
+    token = "native-emitter-credential"
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("run3:native:child"):
+            agprof.annotate(
+                **{
+                    "agency.run_id": "run3",
+                    "agency.agent_id": "native-child",
+                    "agency.parent_agent_id": "parent",
+                }
+            )
+            registry.register(token, ag, exact_events=True)
+            start_wall = time.time_ns()
+            start_perf = time.perf_counter_ns()
+            assert registry._handle_event(
+                {
+                    "token": token,
+                    "ev": "span_start",
+                    "span_id": "turn:0",
+                    "name": "turn0",
+                    "wall_ns": start_wall,
+                    "perf_ns": start_perf,
+                    "metadata": {"turn_index": 0},
+                }
+            )["ok"]
+            assert registry._handle_event(
+                {
+                    "token": token,
+                    "ev": "span_end",
+                    "span_id": "turn:0",
+                    "wall_ns": start_wall + 2_000_000,
+                    "perf_ns": start_perf + 2_000_000,
+                    "metadata": {"outcome": "success"},
+                }
+            )["ok"]
+            assert registry._handle_event(
+                {
+                    "token": token,
+                    "ev": "span_start",
+                    "span_id": "tool:tc_1",
+                    "name": "tool:bash",
+                    "wall_ns": start_wall + 500_000,
+                    "perf_ns": start_perf + 500_000,
+                    "metadata": {
+                        "tool_call_id": "tc_1",
+                        "arguments": '{"command":"pwd"}',
+                    },
+                }
+            )["ok"]
+            assert registry._handle_event(
+                {
+                    "token": token,
+                    "ev": "span_end",
+                    "span_id": "tool:tc_1",
+                    "wall_ns": start_wall + 1_500_000,
+                    "perf_ns": start_perf + 1_500_000,
+                    "metadata": {"outcome": "success", "result": "/workspace"},
+                }
+            )["ok"]
+            registry.unregister(token)
+
+    records = {record[1]: record for record in agprof._records}
+    run_record = records["run3:native:child"]
+    for name in ("turn0", "tool:bash"):
+        record = records[name]
+        assert record[8] == run_record[7]
+        assert record[6]["timing"] == "exact"
+        assert record[6]["provenance"] == "container_asserted"
+        assert record[6]["agency.run_id"] == "run3"
+        assert token not in json.dumps(record)
+    assert records["tool:bash"][6]["result"] == "/workspace"
+
+
+def test_exact_event_registration_disables_transcript_fallback():
+    registry = agProfilerIngest()
+    ag = SimpleNamespace(agname="native", _parent_agent_id=None)
+    registry.register("exact", ag, exact_events=True)
+    registry.register("derived", ag)
+
+    assert registry.has_exact_events("exact") is True
+    assert registry.has_exact_events("derived") is False
+    assert registry.has_exact_events("missing") is False

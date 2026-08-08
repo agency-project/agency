@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shlex
 import socket
 import struct
@@ -443,16 +444,25 @@ class _NativeBackend(agharness_backend):
         mcp_server = get_shared_mcp_server(ag.agconfig)
         messenger = get_shared_messenger(ag.agconfig)
         from ..agprof_ingest import get_shared_profiler_ingest
+        from ...profiler import agprof
 
         profiler_ingest = get_shared_profiler_ingest()
         token = uuid.uuid4().hex
+        profile_native_events = agprof.enabled()
+        if not profile_native_events and os.environ.get("AGENCY_PROFILE"):
+            print(
+                "[native] WARNING: environment profiling is requested but no active "
+                "profiler session can receive in-container events"
+            )
+        profiler_host_sock = profiler_ingest.ensure_uds_started() if profile_native_events else None
         terminus.register(token, ag)
-        profiler_ingest.register(token, ag)
+        profiler_ingest.register(token, ag, exact_events=profile_native_events)
         mcp_server.register(token, ag, skill)
         messenger.register(token, ag)
 
         collected_output: dict = {}
         final_text = ""
+        profiler_turn_offset = 0
         pusher = _LiveTranscriptPusher(ag, terminus, token, skill.name)
         stop_poll = threading.Event()
         poll_thread = threading.Thread(target=pusher.run, args=(stop_poll,), daemon=True)
@@ -466,13 +476,27 @@ class _NativeBackend(agharness_backend):
                     "terminus_sock": _container_bridge_sock_path(terminus.ensure_uds_started()),
                     "mcp_server_sock": _container_bridge_sock_path(mcp_server.ensure_uds_started()),
                     "messenger_sock": _container_bridge_sock_path(messenger.ensure_uds_started()),
+                    "profiler_sock": (
+                        _container_bridge_sock_path(profiler_host_sock)
+                        if profiler_host_sock is not None
+                        else None
+                    ),
                     "model": ag.llm.backend.model or "",
                     "messages": messages,
                     "max_steps": max_steps or 20,
                     "custom_tools": custom_tools_payload,
                     "suppress_builtins": suppress_builtins,
+                    "profiler_turn_offset": profiler_turn_offset,
                 }
                 resp = run_react_loop(sock_path, request)
+                profiler_turn_offset += int(resp.get("turn_count") or 0)
+                profiler_dropped_events = int(resp.get("profiler_dropped_events") or 0)
+                if profiler_dropped_events:
+                    agprof.annotate(profiler_dropped_events=profiler_dropped_events)
+                    print(
+                        "[native] WARNING: in-container profiler dropped "
+                        f"{profiler_dropped_events} event(s)"
+                    )
                 if resp.get("status") != "done":
                     return (
                         agerror(resp.get("message", "native in-container run failed")),
