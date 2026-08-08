@@ -85,7 +85,9 @@ def _anthropic_system_to_text(system) -> "str | None":
     if isinstance(system, str):
         return system or None
     if isinstance(system, list):
-        parts = [b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"]
+        parts = [
+            b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"
+        ]
         joined = "".join(parts)
         return joined or None
     return None
@@ -178,7 +180,11 @@ def anthropic_messages_to_openai(body: dict) -> dict:
             openai_messages.append(msg)
         # unrecognized roles are dropped rather than sent to a backend that would reject them
 
-    combined_system = "\n\n".join([system_text] + extra_system_parts) if system_text else "\n\n".join(extra_system_parts)
+    combined_system = (
+        "\n\n".join([system_text] + extra_system_parts)
+        if system_text
+        else "\n\n".join(extra_system_parts)
+    )
     if combined_system:
         openai_messages.insert(0, {"role": "system", "content": combined_system})
 
@@ -188,7 +194,10 @@ def anthropic_messages_to_openai(body: dict) -> dict:
         "stream": bool(body.get("stream", False)),
     }
     if "max_tokens" in body:
-        kwargs["max_tokens"] = body["max_tokens"]
+        # Agency's canonical OpenAI-compatible request shape uses the
+        # current Chat Completions parameter. GPT-5-family models reject
+        # the legacy max_tokens spelling outright.
+        kwargs["max_completion_tokens"] = body["max_tokens"]
     if "temperature" in body:
         kwargs["temperature"] = body["temperature"]
     if "top_p" in body:
@@ -325,7 +334,8 @@ def openai_chunks_to_anthropic_sse(chunks, model: str, request_id: "str | None" 
                 if tc_index not in tool_blocks:
                     if text_index is not None:
                         yield _sse(
-                            "content_block_stop", {"type": "content_block_stop", "index": text_index}
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": text_index},
                         )
                         text_index = None
                     anthropic_index = next_index
@@ -472,7 +482,7 @@ def responses_request_to_openai(body: dict) -> dict:
         "stream": bool(body.get("stream", False)),
     }
     if "max_output_tokens" in body:
-        kwargs["max_tokens"] = body["max_output_tokens"]
+        kwargs["max_completion_tokens"] = body["max_output_tokens"]
     if "temperature" in body:
         kwargs["temperature"] = body["temperature"]
     if "top_p" in body:
@@ -548,7 +558,12 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
         "response.created",
         {
             "type": "response.created",
-            "response": {"id": request_id, "object": "response", "status": "in_progress", "model": model},
+            "response": {
+                "id": request_id,
+                "object": "response",
+                "status": "in_progress",
+                "model": model,
+            },
         },
     )
 
@@ -556,7 +571,6 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
     text_item_id = None
     text_parts: list[str] = []
     tool_blocks: dict = {}  # openai tool-call index -> {"output_index", "id", "call_id", "name", "args_parts"}
-    stop_reason = "stop"
     input_tokens = 0
     output_tokens = 0
 
@@ -567,10 +581,6 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
             output_tokens = getattr(usage, "completion_tokens", 0) or output_tokens
 
         for choice in getattr(chunk, "choices", None) or []:
-            finish_reason = getattr(choice, "finish_reason", None)
-            if finish_reason:
-                stop_reason = finish_reason
-
             delta = choice.delta
             content = getattr(delta, "content", None)
             if content:
@@ -671,7 +681,9 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                     "id": text_item_id,
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "".join(text_parts), "annotations": []}],
+                    "content": [
+                        {"type": "output_text", "text": "".join(text_parts), "annotations": []}
+                    ],
                 },
             },
         )

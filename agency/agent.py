@@ -32,6 +32,7 @@ from .agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname
+from .profiler import agprof
 
 
 # Exists only to register agent's config fields (via __set_name__ at import
@@ -239,6 +240,17 @@ class agent:
         agconfig: "agConfig | None" = None,
         engine: "str | None" = None,
     ):
+        with agprof.span("agent:create"):
+            self._initialize(agname, llm, sandbox, agconfig, engine)
+
+    def _initialize(
+        self,
+        agname: "str | None",
+        llm: "agllm | None",
+        sandbox: "agSandbox | None",
+        agconfig: "agConfig | None",
+        engine: "str | None",
+    ) -> None:
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
         if llm is None:
@@ -275,9 +287,7 @@ class agent:
         self.agname: _agname = _agname.allocate_agname(agname)
 
         self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
-        self.engine: str = (
-            engine if engine is not None else _AgAgentFields(self.agconfig).engine
-        )
+        self.engine: str = engine if engine is not None else _AgAgentFields(self.agconfig).engine
         self.ctx: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.

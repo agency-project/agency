@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 
+from .profiler import agprof
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
 
@@ -436,7 +437,7 @@ class agResourcePool(_AgResourcePoolFields):
         budget, not a fresh one per iteration.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._gpu_cond:
+        with agprof.span("sync:gpu_wait"), self._gpu_cond:
             while not self._free_gpus:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
@@ -445,6 +446,7 @@ class agResourcePool(_AgResourcePoolFields):
                     raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
             gpu_id = self._free_gpus.pop()
             self._gpus_acquired += 1
+        agprof.gpu_lease_begin(gpu_id)
         self._emit_resource()
         return gpu_id
 
@@ -484,6 +486,7 @@ class agResourcePool(_AgResourcePoolFields):
             self._free_gpus.add(gpu_id)
             self._gpus_acquired = max(0, self._gpus_acquired - 1)
             self._gpu_cond.notify()
+        agprof.gpu_lease_end(gpu_id)
         self._emit_resource()
 
     def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:

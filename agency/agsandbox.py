@@ -6,6 +6,7 @@ import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from .profiler import agprof
 from .agconfig import agConfig, StaticConfigParam, DynamicConfigParam, _AgConfigViewBase
 from .agname import agname as _agname
 from .agsandbox_backends import agsandbox_backend, backend_for_image_kind, _RUN_ID
@@ -122,6 +123,15 @@ class agSandbox(_AgSandboxFields):
         agname: str,
         checkpoint_image: str | None = None,
         agconfig: "agConfig | None" = None,
+    ) -> None:
+        with agprof.span("sandbox:create"):
+            self._initialize(agname, checkpoint_image, agconfig)
+
+    def _initialize(
+        self,
+        agname: str,
+        checkpoint_image: str | None,
+        agconfig: "agConfig | None",
     ) -> None:
         # Claimed from the SAME shared registry agent() uses (agname.py)
         # -- the "sandbox_" prefix guarantees this claim can never collide
@@ -329,34 +339,43 @@ class agSandbox(_AgSandboxFields):
         return self._backend._container_exec(*args, **kwargs)
 
     def exec(self, *args, **kwargs):
-        return self._backend.exec(*args, **kwargs)
+        with agprof.span("sandbox:exec"):
+            return self._backend.exec(*args, **kwargs)
 
     def exec_detached(self, *args, **kwargs) -> None:
         return self._backend.exec_detached(*args, **kwargs)
 
     def read_file(self, *args, **kwargs):
-        return self._backend.read_file(*args, **kwargs)
+        with agprof.span("sandbox:read_file"):
+            return self._backend.read_file(*args, **kwargs)
 
     def read_file_bytes(self, *args, **kwargs):
-        return self._backend.read_file_bytes(*args, **kwargs)
+        with agprof.span("sandbox:read_file_bytes"):
+            return self._backend.read_file_bytes(*args, **kwargs)
 
     def write_file(self, *args, **kwargs):
-        return self._backend.write_file(*args, **kwargs)
+        with agprof.span("sandbox:write_file"):
+            return self._backend.write_file(*args, **kwargs)
 
     def write_file_bytes(self, *args, **kwargs):
-        return self._backend.write_file_bytes(*args, **kwargs)
+        with agprof.span("sandbox:write_file_bytes"):
+            return self._backend.write_file_bytes(*args, **kwargs)
 
     def update_limits(self, *args, **kwargs) -> None:
-        self._backend.update_limits(*args, **kwargs)
+        with agprof.span("sandbox:update_limits"):
+            self._backend.update_limits(*args, **kwargs)
 
     def commit(self, *args, **kwargs) -> bool:
-        return self._backend.commit(*args, **kwargs)
+        with agprof.span("sandbox:commit"):
+            return self._backend.commit(*args, **kwargs)
 
     def stop(self, *args, **kwargs) -> None:
-        self._backend.stop(*args, **kwargs)
+        with agprof.span("sandbox:stop"):
+            self._backend.stop(*args, **kwargs)
 
     def rm_container(self, *args, **kwargs) -> None:
-        self._backend.rm_container(*args, **kwargs)
+        with agprof.span("sandbox:rm"):
+            self._backend.rm_container(*args, **kwargs)
 
     def restore(self, *args, **kwargs) -> None:
         self._backend.restore(*args, **kwargs)
@@ -391,8 +410,9 @@ class agSandbox(_AgSandboxFields):
         if self._destroyed:
             return
         self._destroyed = True
-        _live_sandboxes.discard(self)
-        self._backend.destroy()
+        with agprof.span("sandbox:destroy"):
+            _live_sandboxes.discard(self)
+            self._backend.destroy()
 
     def fork(self, new_agname: str, agconfig: "agConfig | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_agname* starting from this sandbox's
@@ -409,15 +429,16 @@ class agSandbox(_AgSandboxFields):
         The caller owns the returned sandbox and is responsible for calling
         destroy() on it when done.
         """
-        cfg = agconfig if agconfig is not None else self._agconfig
-        fork_sb = agSandbox(new_agname, agconfig=cfg)
-        checkpoint_image = self._backend._checkpoint_image
-        if checkpoint_image:
-            # type(self._backend), not the docker-only agSandbox.tag_image
-            # static forwarder -- a chroot-backed sandbox's checkpoint is a
-            # snapshot directory, not a docker/podman image tag, so it must
-            # be retagged by the same backend class that created it.
-            type(self._backend).tag_image(checkpoint_image, fork_sb._backend._lifecycle_tag())
+        with agprof.span("sandbox:fork"):
+            cfg = agconfig if agconfig is not None else self._agconfig
+            fork_sb = agSandbox(new_agname, agconfig=cfg)
+            checkpoint_image = self._backend._checkpoint_image
+            if checkpoint_image:
+                # type(self._backend), not the docker-only agSandbox.tag_image
+                # static forwarder -- a chroot-backed sandbox's checkpoint is a
+                # snapshot directory, not a docker/podman image tag, so it must
+                # be retagged by the same backend class that created it.
+                type(self._backend).tag_image(checkpoint_image, fork_sb._backend._lifecycle_tag())
             fork_sb._backend._checkpoint_image = fork_sb._backend._lifecycle_tag()
         return fork_sb
 

@@ -37,8 +37,10 @@ import tempfile
 import threading
 import time
 import uuid as _uuid
+from contextlib import contextmanager as _contextmanager
 from pathlib import Path
 
+from ..profiler import agprof
 from ..agconfig import agConfig
 from ..agresources import amd_render_node_paths_by_pci_bus, detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
@@ -92,6 +94,18 @@ def _get_docker_semaphore() -> threading.Semaphore:
     return _docker_semaphore
 
 
+@_contextmanager
+def _docker_semaphore_slot():
+    """Hold a docker/podman CLI slot; profile only the acquire wait."""
+    sem = _get_docker_semaphore()
+    with agprof.span("sync:container"):
+        sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
 def _runtime_works(runtime: str) -> bool:
     try:
         proc = subprocess.run(
@@ -110,10 +124,11 @@ def get_container_runtime() -> str:
     if _RUNTIME is not None:
         return _RUNTIME
 
-    has_docker = shutil.which("docker") is not None
-    has_podman = shutil.which("podman") is not None
-    docker_ok = has_docker and _runtime_works("docker")
-    podman_ok = has_podman and _runtime_works("podman")
+    with agprof.span("runtime:detect"):
+        has_docker = shutil.which("docker") is not None
+        has_podman = shutil.which("podman") is not None
+        docker_ok = has_docker and _runtime_works("docker")
+        podman_ok = has_podman and _runtime_works("podman")
 
     if podman_ok:
         _RUNTIME = "podman"
@@ -807,6 +822,10 @@ class _ContainerBackendBase(agsandbox_backend):
         return (running_str == "true", status)
 
     def _ensure_started(self) -> None:
+        with agprof.span("sandbox:start"):
+            self._ensure_started_profiled()
+
+    def _ensure_started_profiled(self) -> None:
         """Start the Docker/Podman container on first use.
 
         Called lazily by _container_exec() so containers are only created when
@@ -1076,7 +1095,8 @@ class _ContainerBackendBase(agsandbox_backend):
         rationale).
         """
         sem = _get_docker_semaphore()
-        sem.acquire()
+        with agprof.span("sync:container"):
+            sem.acquire()
         released = False
 
         def _release_once() -> None:
@@ -1180,7 +1200,17 @@ class _ContainerBackendBase(agsandbox_backend):
         offers no such feedback once the process is handed off.
         """
         self._ensure_started()
-        args = [self._runtime, "exec", "-d", "-w", workdir, self._container_name(), shell, "-c", sh_cmd]
+        args = [
+            self._runtime,
+            "exec",
+            "-d",
+            "-w",
+            workdir,
+            self._container_name(),
+            shell,
+            "-c",
+            sh_cmd,
+        ]
         self._run(args, check=True, timeout=self.exec_quick_timeout_s)
 
     def update_limits(
@@ -2003,7 +2033,7 @@ class _ContainerBackendBase(agsandbox_backend):
     def tag_image(source: str, dest: str) -> None:
         """Retag an image from *source* to *dest* (docker/podman tag)."""
         runtime = get_container_runtime()
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             subprocess.run(
                 [runtime, "tag", source, dest],
                 capture_output=True,
@@ -2018,7 +2048,7 @@ class _ContainerBackendBase(agsandbox_backend):
         if force:
             cmd.append("-f")
         cmd.append(tag)
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             subprocess.run(cmd, capture_output=True)
 
     @staticmethod
@@ -2030,7 +2060,7 @@ class _ContainerBackendBase(agsandbox_backend):
         Raises ``subprocess.CalledProcessError`` on failure.
         """
         runtime = get_container_runtime()
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             result = subprocess.run(
                 [runtime, "save", tag],
                 capture_output=True,
@@ -2046,7 +2076,7 @@ class _ContainerBackendBase(agsandbox_backend):
         Raises ``subprocess.CalledProcessError`` on failure.
         """
         runtime = get_container_runtime()
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             subprocess.run(
                 [runtime, "load"],
                 input=image_bytes,
@@ -2084,7 +2114,7 @@ class _ContainerBackendBase(agsandbox_backend):
         """
         runtime = get_container_runtime()
         value = "" if owner_pid is None else str(owner_pid)
-        with _get_docker_semaphore():
+        with _docker_semaphore_slot():
             created = subprocess.run(
                 [runtime, "create", tag],
                 capture_output=True,

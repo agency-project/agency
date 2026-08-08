@@ -45,7 +45,9 @@ def _completion(content=None, finish_reason="stop", usage=None, id="chatcmpl-tes
     )
 
 
-def _chunk(content=None, finish_reason=None, usage=None, id="chatcmpl-test", model="m", has_choice=True):
+def _chunk(
+    content=None, finish_reason=None, usage=None, id="chatcmpl-test", model="m", has_choice=True
+):
     """A real, valid `ChatCompletionChunk` -- same reconstruction reasoning
     as `_completion` above."""
     choices = []
@@ -112,9 +114,7 @@ def test_valid_token_non_streaming_passthrough():
     )
     client = _client_for(px)
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False}
-    resp = client.post(
-        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer tok"}
-    )
+    resp = client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer tok"})
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["id"] == "abc"
@@ -128,9 +128,7 @@ def test_valid_token_streaming_passthrough():
     px, ag, fake_client = _make_gateway_with_agent(token="tok", stream_result=chunks)
     client = _client_for(px)
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True}
-    resp = client.post(
-        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer tok"}
-    )
+    resp = client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer tok"})
     assert resp.status_code == 200
     lines = [l for l in resp.text.split("\n\n") if l.strip()]
     assert json.loads(lines[0][len("data: ") :])["choices"][0]["delta"]["content"] == "a"
@@ -205,7 +203,8 @@ def test_anthropic_messages_route_non_streaming_translates_request_and_response(
     call_kwargs = fake_client.chat.completions.create.call_args.kwargs
     assert call_kwargs["messages"][0] == {"role": "system", "content": "be helpful"}
     assert call_kwargs["messages"][1] == {"role": "user", "content": "hello"}
-    assert call_kwargs["max_tokens"] == 100
+    assert call_kwargs["max_completion_tokens"] == 100
+    assert "max_tokens" not in call_kwargs
     # The agent's OWN configured model is used, never the harness's own
     # request body model -- regression test for a real bug hit against the
     # live `claude` CLI: Claude Code's default model id has no reason to
@@ -379,7 +378,11 @@ def test_request_log_records_anthropic_messages_calls():
     client = _client_for(px)
     client.post(
         "/v1/messages",
-        json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+        json={
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
         headers={"Authorization": "Bearer tok"},
     )
     assert len(px.request_log) == 1
@@ -476,9 +479,7 @@ def test_dispatch_resolves_agent_via_the_terminus_not_agproxy_llms_own_registry(
 
     client = _client_for(px)
     body = {"model": "m", "messages": [], "stream": False}
-    resp = client.post(
-        "/v1/chat/completions", json=body, headers={"Authorization": "Bearer tok"}
-    )
+    resp = client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer tok"})
 
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"] == "replacement"
