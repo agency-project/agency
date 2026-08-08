@@ -22,7 +22,7 @@ diagnostics, never relied on for correctness.
 
 Exposes `InContainerRelay`, which duck-types the same surface
 `agProxyPtraceHandle` (agproxy_ptrace.py) already expects from a `TracerLoop`
-(`join`, `read_output`, `live_pids`, `on_spawn`, `on_exit`, `kill`) -- so
+(`join`, `read_output`, `live_pids`, `on_spawn`, `on_exec`, `on_exit`, `kill`) -- so
 `agProxyPtraceHandle(relay)` wraps it completely unchanged, and every
 existing caller (`wire_to_sandbox`, `agharness_backends/claude_code.py`)
 keeps using the exact same handle interface regardless of which launch path
@@ -100,10 +100,17 @@ class InContainerRelay:
     needs. Construct fresh per launch, matching `TracerLoop`'s own
     not-reusable convention."""
 
-    def __init__(self, sandbox, policy: "agpolicy", ag: "agent | None") -> None:
+    def __init__(
+        self,
+        sandbox,
+        policy: "agpolicy",
+        ag: "agent | None",
+        syscall_observer: "Callable[[object, object], None] | None" = None,
+    ) -> None:
         self._sandbox = sandbox
         self._policy = policy
         self._ag = ag
+        self._syscall_observer = syscall_observer
         self._proc: "subprocess.Popen | None" = None
 
         self._known_pids: "set[int]" = set()
@@ -113,10 +120,13 @@ class InContainerRelay:
         self._stderr = ""
         self._error: "str | None" = None
         self._finished = threading.Event()
+        self._root_pid: "int | None" = None
 
         self._spawn_callbacks: "list[Callable[[int], None]]" = []
+        self._exec_callbacks: "list[Callable[[int, str | None], None]]" = []
         self._exit_callbacks: "list[Callable[[int, int], None]]" = []
         self._spawn_log: "list[int]" = []
+        self._exec_log: "list[tuple[int, str | None]]" = []
         self._exit_log: "list[tuple[int, int]]" = []
 
         self._conn: "socket.socket | None" = None
@@ -134,6 +144,13 @@ class InContainerRelay:
         for pid in backlog:
             callback(pid)
 
+    def on_exec(self, callback: "Callable[[int, str | None], None]") -> None:
+        with self._options_lock:
+            backlog = list(self._exec_log)
+            self._exec_callbacks.append(callback)
+        for pid, executable_path in backlog:
+            callback(pid, executable_path)
+
     def on_exit(self, callback: "Callable[[int, int], None]") -> None:
         with self._options_lock:
             backlog = list(self._exit_log)
@@ -147,7 +164,9 @@ class InContainerRelay:
 
     # -- lifecycle -----------------------------------------------------------
 
-    def start(self, argv: "list[str]", envp: "dict[str, str]", cwd: str, syscalls: "list[str]") -> None:
+    def start(
+        self, argv: "list[str]", envp: "dict[str, str]", cwd: str, syscalls: "list[str]"
+    ) -> None:
         entrypoint_path = deploy_entrypoint(self._sandbox)
         runtime, container_name = self._runtime_and_container_name()
 
@@ -159,8 +178,11 @@ class InContainerRelay:
         exec_argv += [container_name, "python3", entrypoint_path, container_sock_path]
         self._proc = subprocess.Popen(
             exec_argv,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
         )
         # exec -i's own stdio is no longer the protocol channel (see module
         # docstring) -- drain it in the background purely so a startup
@@ -192,17 +214,27 @@ class InContainerRelay:
             self._conn_file.write(json.dumps(spec) + "\n")
             self._conn_file.flush()
 
-        # Block until the root process is confirmed spawned (or launch
-        # failed) -- same contract as TracerLoop.start(): the caller gets
-        # a live handle back, not one that might still silently fail to
-        # ever start.
+        # Block until the root process is spawned and its first executable
+        # image is confirmed (or it exits/fails). This mirrors
+        # TracerLoop.start() and ensures an immediately-stopped profiler can
+        # retain the kernel-confirmed process name.
         started = threading.Event()
+        root_image_ready = threading.Event()
 
         self._reader_thread = threading.Thread(
-            target=self._read_loop, args=(started,), name="agproxy_ptrace-in-container", daemon=True,
+            target=self._read_loop,
+            args=(started, root_image_ready),
+            name="agproxy_ptrace-in-container",
+            daemon=True,
         )
         self._reader_thread.start()
-        started.wait(timeout=30)
+        if not started.wait(timeout=30):
+            raise RuntimeError("in-container ptrace root did not spawn within 30s")
+        if self._error is not None:
+            raise RuntimeError(f"in-container ptrace entrypoint failed to launch: {self._error}")
+        if not root_image_ready.wait(timeout=30):
+            self.kill()
+            raise RuntimeError("in-container ptrace root did not exec or exit within 30s")
         if self._error is not None:
             raise RuntimeError(f"in-container ptrace entrypoint failed to launch: {self._error}")
 
@@ -211,7 +243,7 @@ class InContainerRelay:
             try:
                 for line in stream:
                     self._diag.append(line)
-            except Exception:
+            except Exception:  # noqa: S110 - diagnostic draining is best-effort
                 pass
 
         threading.Thread(target=_drain, args=(self._proc.stdout,), daemon=True).start()
@@ -224,7 +256,11 @@ class InContainerRelay:
         # public surface to agsandbox for a caller this internal.
         return _runtime_and_container_name(self._sandbox)
 
-    def _read_loop(self, started: threading.Event) -> None:
+    def _read_loop(
+        self,
+        started: threading.Event,
+        root_image_ready: threading.Event,
+    ) -> None:
         while True:
             line = self._conn_file.readline()
             if not line:
@@ -235,10 +271,18 @@ class InContainerRelay:
                 continue
             kind = msg.get("type")
             if kind == "spawn":
+                if self._root_pid is None:
+                    self._root_pid = msg["pid"]
                 self._remember_spawn(msg["pid"])
                 started.set()
+            elif kind == "exec":
+                self._remember_exec(msg["pid"], msg.get("path"))
+                if msg["pid"] == self._root_pid:
+                    root_image_ready.set()
             elif kind == "exit":
                 self._forget(msg["pid"], msg["code"])
+                if msg["pid"] == self._root_pid:
+                    root_image_ready.set()
             elif kind == "event":
                 self._handle_event(msg)
             elif kind == "result":
@@ -246,23 +290,31 @@ class InContainerRelay:
                 self._stderr = msg.get("stderr", "")
                 if self._returncode is None:
                     self._returncode = msg.get("returncode", -1)
+                root_image_ready.set()
                 break
             elif kind == "error":
                 self._error = msg.get("message", "unknown error")
                 started.set()
+                root_image_ready.set()
                 break
+        root_image_ready.set()
         self._finished.set()
 
     def _handle_event(self, msg: dict) -> None:
-        from ...agpolicy import agdecision  # local import: avoid import cycle at module load
         from ..agproxy_ptrace import agsyscallevent
 
         event = agsyscallevent(
-            syscall=msg["syscall"], pid=msg["pid"], tid=msg["pid"],
-            argv=msg.get("argv"), envp=msg.get("envp"), path=msg.get("path"),
+            syscall=msg["syscall"],
+            pid=msg["pid"],
+            tid=msg["pid"],
+            argv=msg.get("argv"),
+            envp=msg.get("envp"),
+            path=msg.get("path"),
             timestamp=msg.get("timestamp", 0.0),
         )
         decision = self._policy.check(self._ag, event)
+        if self._syscall_observer is not None:
+            self._syscall_observer(event, decision)
         reply = {"type": "decision", "kind": decision.kind, "new_args": decision.new_args}
         with self._send_lock:
             self._conn_file.write(json.dumps(reply) + "\n")
@@ -275,6 +327,13 @@ class InContainerRelay:
             callbacks = list(self._spawn_callbacks)
         for cb in callbacks:
             cb(pid)
+
+    def _remember_exec(self, pid: int, executable_path: "str | None") -> None:
+        with self._options_lock:
+            self._exec_log.append((pid, executable_path))
+            callbacks = list(self._exec_callbacks)
+        for callback in callbacks:
+            callback(pid, executable_path)
 
     def _forget(self, pid: int, exit_code: int) -> None:
         # Deliberately does NOT touch self._returncode here -- that must
@@ -317,14 +376,15 @@ class InContainerRelay:
             try:
                 subprocess.run(
                     [runtime, "exec", container_name, "kill", "-9", str(pid)],
-                    capture_output=True, timeout=5,
+                    capture_output=True,
+                    timeout=5,
                 )
-            except Exception:
+            except Exception:  # noqa: S110 - process cleanup is best-effort
                 pass
         if self._proc is not None:
             try:
                 self._proc.terminate()
-            except Exception:
+            except Exception:  # noqa: S110 - process cleanup is best-effort
                 pass
 
 
@@ -350,7 +410,7 @@ def start_tcp_relay(sandbox, uds_path: str) -> "tuple[subprocess.Popen, int]":
 
     port_out, port_rc = sandbox.exec(
         "python3 -c \"import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); "
-        "print(s.getsockname()[1]); s.close()\"",
+        'print(s.getsockname()[1]); s.close()"',
         workdir="/",
     )
     if port_rc != 0:
@@ -358,9 +418,19 @@ def start_tcp_relay(sandbox, uds_path: str) -> "tuple[subprocess.Popen, int]":
     port = int(port_out.strip())
 
     proc = subprocess.Popen(
-        [runtime, "exec", "-i", container_name, "python3", _RELAY_CONTAINER_PATH,
-         container_sock_path, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        [
+            runtime,
+            "exec",
+            "-i",
+            container_name,
+            "python3",
+            _RELAY_CONTAINER_PATH,
+            container_sock_path,
+            str(port),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     ready_line = proc.stdout.readline()
     if ready_line.strip() != "READY":

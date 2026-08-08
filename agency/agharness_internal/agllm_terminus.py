@@ -615,6 +615,10 @@ class agLLMTerminus:
                                 end_wall_ns=time.time_ns(),
                                 parent_context=run_context,
                                 span_attributes=run_attributes,
+                                skip_tool_call_ids=profiler_ingest.exact_tool_call_ids(token),
+                                before_derive_tools=lambda call_ids: (
+                                    profiler_ingest.reconcile_derived_tool_call_ids(token, call_ids)
+                                ),
                             )
                         yield "data: [DONE]\n\n"
 
@@ -664,6 +668,10 @@ class agLLMTerminus:
                             end_wall_ns=time.time_ns(),
                             parent_context=run_context,
                             span_attributes=run_attributes,
+                            skip_tool_call_ids=profiler_ingest.exact_tool_call_ids(token),
+                            before_derive_tools=lambda call_ids: (
+                                profiler_ingest.reconcile_derived_tool_call_ids(token, call_ids)
+                            ),
                         )
                 return JSONResponse(serialized)
 

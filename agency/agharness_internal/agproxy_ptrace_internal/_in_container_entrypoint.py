@@ -69,6 +69,7 @@ connection):
 
   entrypoint -> host:
     {"type": "spawn", "pid": N}
+    {"type": "exec", "pid": N, "path": "..." | null}
     {"type": "exit", "pid": N, "code": N}
     {"type": "event", "pid": N, "syscall": "...", "argv": [...] | null,
      "envp": {...} | null, "path": "..." | null, "timestamp": T}
@@ -102,8 +103,7 @@ import time
 
 if platform.machine() not in ("x86_64", "AMD64"):
     raise RuntimeError(
-        f"in-container ptrace entrypoint only supports x86_64 "
-        f"(running on {platform.machine()!r})"
+        f"in-container ptrace entrypoint only supports x86_64 (running on {platform.machine()!r})"
     )
 
 libc = ctypes.CDLL(None, use_errno=True)
@@ -128,8 +128,12 @@ PTRACE_O_TRACEEXEC = 0x00000010
 PTRACE_O_TRACEEXIT = 0x00000040
 PTRACE_O_TRACESECCOMP = 0x00000080
 ALL_TRACE_OPTIONS = (
-    PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE
-    | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT | PTRACE_O_TRACESECCOMP
+    PTRACE_O_TRACEFORK
+    | PTRACE_O_TRACEVFORK
+    | PTRACE_O_TRACECLONE
+    | PTRACE_O_TRACEEXEC
+    | PTRACE_O_TRACEEXIT
+    | PTRACE_O_TRACESECCOMP
 )
 
 PTRACE_EVENT_FORK = 1
@@ -143,8 +147,15 @@ PTRACE_EVENT_SECCOMP = 7
 # that module's comment: verify against
 # /usr/include/x86_64-linux-gnu/asm/unistd_64.h, never guess.
 SYSCALL_NUMBERS = {
-    "execve": 59, "execveat": 322, "open": 2, "openat": 257,
-    "connect": 42, "unlink": 87, "unlinkat": 263, "rename": 82, "renameat2": 316,
+    "execve": 59,
+    "execveat": 322,
+    "open": 2,
+    "openat": 257,
+    "connect": 42,
+    "unlink": 87,
+    "unlinkat": 263,
+    "rename": 82,
+    "renameat2": 316,
 }
 SYSCALL_NAMES_BY_NUMBER = {v: k for k, v in SYSCALL_NUMBERS.items()}
 
@@ -156,9 +167,33 @@ class UserRegsStruct(ctypes.Structure):
     _fields_ = [
         (name, ctypes.c_ulonglong)
         for name in (
-            "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10", "r9", "r8",
-            "rax", "rcx", "rdx", "rsi", "rdi", "orig_rax", "rip", "cs", "eflags",
-            "rsp", "ss", "fs_base", "gs_base", "ds", "es", "fs", "gs",
+            "r15",
+            "r14",
+            "r13",
+            "r12",
+            "rbp",
+            "rbx",
+            "r11",
+            "r10",
+            "r9",
+            "r8",
+            "rax",
+            "rcx",
+            "rdx",
+            "rsi",
+            "rdi",
+            "orig_rax",
+            "rip",
+            "cs",
+            "eflags",
+            "rsp",
+            "ss",
+            "fs_base",
+            "gs_base",
+            "ds",
+            "es",
+            "fs",
+            "gs",
         )
     ]
 
@@ -319,8 +354,12 @@ _SECCOMP_MODE_FILTER = 2
 
 
 class _SockFilter(ctypes.Structure):
-    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8),
-                ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+    _fields_ = [
+        ("code", ctypes.c_uint16),
+        ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8),
+        ("k", ctypes.c_uint32),
+    ]
 
 
 class _SockFprog(ctypes.Structure):
@@ -372,16 +411,42 @@ def _recv_decision() -> dict:
     return json.loads(line)
 
 
+def _is_thread_group_leader(pid: int) -> bool:
+    """Distinguish clone-created processes from CLONE_THREAD threads."""
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("Tgid:"):
+                    return int(line.split(":", 1)[1].strip()) == pid
+    except (OSError, ValueError):
+        # Losing a genuine subprocess is worse than one conservative false
+        # positive on a host with an unexpectedly hidden procfs.
+        return True
+    return True
+
+
+def _kernel_executable_path(pid: int) -> "str | None":
+    """Return the image installed by the kernel at PTRACE_EVENT_EXEC."""
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Tracer loop -- same shape as agproxy_ptrace_internal/_tracer_loop.py,
 # adapted to synchronous stdio instead of an in-process Python callback.
 # ---------------------------------------------------------------------------
+
 
 class _Tracer:
     def __init__(self, syscalls: "list[str]") -> None:
         self._syscalls = syscalls
         self.root_pid: "int | None" = None
         self._known_pids: "set[int]" = set()
+        self._process_pids: "set[int]" = set()
+        self._pending_clone_pids: "set[int]" = set()
+        self._pending_exec_paths: "dict[int, str | None]" = {}
         self._options_applied: "set[int]" = set()
         self._returncode = None
         self._stdout_buf = bytearray()
@@ -402,8 +467,12 @@ class _Tracer:
         self.root_pid = pid
         self._remember_spawn(pid)
 
-        threading.Thread(target=self._drain_pipe, args=(stdout_r, self._stdout_buf), daemon=True).start()
-        threading.Thread(target=self._drain_pipe, args=(stderr_r, self._stderr_buf), daemon=True).start()
+        threading.Thread(
+            target=self._drain_pipe, args=(stdout_r, self._stdout_buf), daemon=True
+        ).start()
+        threading.Thread(
+            target=self._drain_pipe, args=(stderr_r, self._stderr_buf), daemon=True
+        ).start()
 
         _, status = os.waitpid(pid, 0)
         assert os.WIFSTOPPED(status), f"expected initial stop, got status={status:#x}"
@@ -509,6 +578,7 @@ class _Tracer:
                 pass
 
         if pid not in self._options_applied:
+            self._classify_pending_clone(pid)
             ptrace(PTRACE_SETOPTIONS, pid, 0, ALL_TRACE_OPTIONS)
             self._options_applied.add(pid)
             ptrace(PTRACE_CONT, pid, 0, 0)
@@ -517,12 +587,23 @@ class _Tracer:
         if sig == signal.SIGTRAP and event == PTRACE_EVENT_SECCOMP:
             self._handle_seccomp_stop(pid)
             return
-        if sig == signal.SIGTRAP and event in (PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_CLONE):
+        if sig == signal.SIGTRAP and event in (
+            PTRACE_EVENT_FORK,
+            PTRACE_EVENT_VFORK,
+            PTRACE_EVENT_CLONE,
+        ):
             new_pid = get_eventmsg(pid)
-            self._remember_spawn(new_pid)
+            self._remember_spawn(
+                new_pid,
+                is_process=None if event == PTRACE_EVENT_CLONE else True,
+            )
             ptrace(PTRACE_CONT, pid, 0, 0)
             return
-        if sig == signal.SIGTRAP and event in (PTRACE_EVENT_EXEC, PTRACE_EVENT_EXIT):
+        if sig == signal.SIGTRAP and event == PTRACE_EVENT_EXEC:
+            self._commit_exec(pid)
+            ptrace(PTRACE_CONT, pid, 0, 0)
+            return
+        if sig == signal.SIGTRAP and event == PTRACE_EVENT_EXIT:
             ptrace(PTRACE_CONT, pid, 0, 0)
             return
         forward = 0 if sig == signal.SIGTRAP else sig
@@ -537,13 +618,22 @@ class _Tracer:
         if os.environ.get("AGENCY_DEBUG_PTRACE_EVENTS"):
             try:
                 with open("/tmp/.agency_ptrace_debug.log", "a") as _f:
-                    _f.write(f"SECCOMP pid={pid} syscall={name} argv={argv} path={path} -- sending event...\n")
+                    _f.write(
+                        f"SECCOMP pid={pid} syscall={name} argv={argv} path={path} -- sending event...\n"
+                    )
             except OSError:
                 pass
-        _send({
-            "type": "event", "pid": pid, "syscall": name,
-            "argv": argv, "envp": envp, "path": path, "timestamp": time.time(),
-        })
+        _send(
+            {
+                "type": "event",
+                "pid": pid,
+                "syscall": name,
+                "argv": argv,
+                "envp": envp,
+                "path": path,
+                "timestamp": time.time(),
+            }
+        )
         decision = _recv_decision()
         if os.environ.get("AGENCY_DEBUG_PTRACE_EVENTS"):
             try:
@@ -552,6 +642,7 @@ class _Tracer:
             except OSError:
                 pass
         kind = decision.get("kind", "allow")
+        is_exec = nr in (SYSCALL_NUMBERS["execve"], SYSCALL_NUMBERS["execveat"])
 
         if kind == "deny":
             regs.orig_rax = ctypes.c_ulonglong(-1).value
@@ -563,21 +654,58 @@ class _Tracer:
             if nr in (SYSCALL_NUMBERS["execve"], SYSCALL_NUMBERS["execveat"]):
                 new_args = decision["new_args"]
                 path_addr, argv_addr = inject_argv(pid, regs.rsp, new_args[0], new_args)
-                regs.rdi = path_addr
-                regs.rsi = argv_addr
+                if nr == SYSCALL_NUMBERS["execve"]:
+                    regs.rdi = path_addr
+                    regs.rsi = argv_addr
+                else:
+                    regs.rsi = path_addr
+                    regs.rdx = argv_addr
                 set_regs(pid, regs)
+        if is_exec:
+            # Stage the kernel pathname at syscall entry, but do not report it
+            # until PTRACE_EVENT_EXEC proves the image was installed.
+            if kind == "deny":
+                self._pending_exec_paths.pop(pid, None)
+            else:
+                new_args = decision.get("new_args")
+                self._pending_exec_paths[pid] = (
+                    new_args[0] if kind == "rewrite" and new_args else path
+                )
         ptrace(PTRACE_CONT, pid, 0, 0)
 
-    def _remember_spawn(self, pid: int) -> None:
+    def _remember_spawn(self, pid: int, *, is_process: "bool | None" = True) -> None:
         self._known_pids.add(pid)
-        _send({"type": "spawn", "pid": pid})
+        if is_process is None:
+            self._pending_clone_pids.add(pid)
+        elif is_process:
+            self._process_pids.add(pid)
+            _send({"type": "spawn", "pid": pid})
+
+    def _classify_pending_clone(self, pid: int) -> None:
+        if pid not in self._pending_clone_pids:
+            return
+        self._pending_clone_pids.discard(pid)
+        if _is_thread_group_leader(pid):
+            self._process_pids.add(pid)
+            _send({"type": "spawn", "pid": pid})
+
+    def _commit_exec(self, pid: int) -> None:
+        procfs_path = _kernel_executable_path(pid)
+        staged_path = self._pending_exec_paths.pop(pid, None)
+        executable_path = staged_path or procfs_path
+        if pid in self._process_pids:
+            _send({"type": "exec", "pid": pid, "path": executable_path})
 
     def _forget(self, pid: int, exit_code: int) -> None:
         self._known_pids.discard(pid)
+        self._pending_clone_pids.discard(pid)
+        self._pending_exec_paths.pop(pid, None)
         self._options_applied.discard(pid)
         if pid == self.root_pid:
             self._returncode = exit_code
-        _send({"type": "exit", "pid": pid, "code": exit_code})
+        if pid in self._process_pids:
+            self._process_pids.discard(pid)
+            _send({"type": "exit", "pid": pid, "code": exit_code})
 
 
 def main() -> None:
@@ -626,7 +754,14 @@ def main() -> None:
 
     stdout = bytes(tracer._stdout_buf).decode(errors="replace")
     stderr = bytes(tracer._stderr_buf).decode(errors="replace")
-    _send({"type": "result", "stdout": stdout, "stderr": stderr, "returncode": tracer._returncode or 0})
+    _send(
+        {
+            "type": "result",
+            "stdout": stdout,
+            "stderr": stderr,
+            "returncode": tracer._returncode or 0,
+        }
+    )
 
 
 if __name__ == "__main__":

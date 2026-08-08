@@ -73,7 +73,10 @@ def on_dispatch(
     end_wall_ns: int,
     parent_context=None,
     span_attributes: "dict | None" = None,
-) -> None:
+    derive_tools: bool = True,
+    skip_tool_call_ids: "set[str] | None" = None,
+    before_derive_tools=None,
+) -> "set[str]":
     """Record one successfully-completed dispatch as ``turn{n}``, deriving
     ``tool:{name}`` spans for whichever of the *previous* dispatch's tool
     calls resolved since it ended. Only call this for a dispatch that
@@ -81,19 +84,22 @@ def on_dispatch(
     a turn to otherwise.
     """
     if not agprof.enabled() or token is None:
-        return
+        return set()
     request_messages = list(request_messages or [])
+    skip_tool_call_ids = set(skip_tool_call_ids or ())
     tool_spans: "list[tuple]" = []
     with _lock:
         prev = _state.get(token)
         index = 0 if prev is None else prev["index"] + 1
-        if prev is not None and len(request_messages) >= prev["transcript_len"]:
+        if derive_tools and prev is not None and len(request_messages) >= prev["transcript_len"]:
             tool_names = _tool_names_by_call_id(prev["response_message"])
             gap_ns = max(0, start_perf_ns - prev["end_perf_ns"])
             for message in request_messages[prev["transcript_len"] :]:
                 if not isinstance(message, dict) or message.get("role") != "tool":
                     continue
                 call_id = message.get("tool_call_id")
+                if call_id in skip_tool_call_ids:
+                    continue
                 tool_spans.append(
                     (
                         tool_names.get(call_id, "unknown"),
@@ -116,6 +122,25 @@ def on_dispatch(
         }
 
     correlated_attributes = dict(span_attributes or {})
+    candidate_tool_call_ids = {
+        call_id
+        for _name, _sp, _ep, _sw, _ew, call_id in tool_spans
+        if isinstance(call_id, str) and call_id
+    }
+    if candidate_tool_call_ids and before_derive_tools is not None:
+        allowed_tool_call_ids = before_derive_tools(candidate_tool_call_ids)
+        if allowed_tool_call_ids is not None:
+            allowed_tool_call_ids = set(allowed_tool_call_ids)
+            tool_spans = [
+                span
+                for span in tool_spans
+                if not isinstance(span[-1], str) or span[-1] in allowed_tool_call_ids
+            ]
+    derived_tool_call_ids = {
+        call_id
+        for _name, _sp, _ep, _sw, _ew, call_id in tool_spans
+        if isinstance(call_id, str) and call_id
+    }
     for name, sp_ns, ep_ns, sw_ns, ew_ns, call_id in tool_spans:
         metadata = dict(correlated_attributes)
         if call_id:
@@ -139,6 +164,7 @@ def on_dispatch(
         metadata=turn_metadata,
         parent_context=parent_context,
     )
+    return derived_tool_call_ids
 
 
 __all__ = ["on_dispatch", "forget"]

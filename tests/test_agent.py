@@ -354,6 +354,18 @@ def test_fork_deep_copies_history():
     assert len(ag.history.messages) == 1  # parent unaffected
 
 
+def test_fork_deep_copies_harness_sessions():
+    ag = make_agent()
+    ag._harness_sessions = {"claude_code": {"session_id": "session-1", "blob_b64": "c3RhdGU="}}
+
+    forked = agent.fork(ag)
+    forked._harness_sessions["claude_code"]["session_id"] = "session-2"
+
+    assert ag._harness_sessions["claude_code"]["session_id"] == "session-1"
+    assert forked._harness_sessions is not ag._harness_sessions
+    assert forked._harness_sessions["claude_code"] is not ag._harness_sessions["claude_code"]
+
+
 def test_fork_copies_history_and_config():
     ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "prior"}])

@@ -40,6 +40,24 @@ def test_hook_payload_to_syscallevent_bash_command():
     assert event.pid == 123
     assert event.argv == ["rm", "-rf", "/tmp/x"]
     assert event.path is None
+    assert event.tool_name == "Bash"
+    assert event.tool_args == {"command": "rm -rf /tmp/x"}
+
+
+def test_hook_event_uses_shared_architecture_neutral_policy_type():
+    from agency.agharness_internal._syscall_event import agsyscallevent
+    from agency.agharness_internal.agharness_backends import _native_hooks
+
+    event = hook_payload_to_syscallevent({"tool_name": "Read", "tool_input": {}})
+    assert type(event) is agsyscallevent
+    assert _native_hooks.agsyscallevent is agsyscallevent
+    try:
+        from agency.agharness_internal import agproxy_ptrace
+    except RuntimeError:
+        # The ptrace implementation itself is x86_64-only, but both import
+        # sites still resolve their class from this neutral module.
+        return
+    assert agproxy_ptrace.agsyscallevent is agsyscallevent
 
 
 def test_hook_payload_to_syscallevent_file_path():

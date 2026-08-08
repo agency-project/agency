@@ -58,6 +58,38 @@ class StopDecision:
 _EPERM = 1
 
 
+def _is_thread_group_leader(pid: int) -> bool:
+    """Return whether *pid* names a process rather than a non-leader thread.
+
+    ``PTRACE_EVENT_CLONE`` covers both ``clone(CLONE_THREAD)`` and
+    clone-created processes.  At the clone child's mandatory initial ptrace
+    stop, ``/proc/<tid>/status`` is present and its ``Tgid`` distinguishes the
+    two exactly.  If procfs is unexpectedly unavailable, retain the tracee as
+    a process rather than silently losing a genuine subprocess.
+    """
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("Tgid:"):
+                    return int(line.split(":", 1)[1].strip()) == pid
+    except (OSError, ValueError):
+        return True
+    return True
+
+
+def _kernel_executable_path(pid: int) -> "str | None":
+    """Read the executable image the kernel installed for stopped *pid*.
+
+    This is called only at ``PTRACE_EVENT_EXEC``. Unlike ``argv[0]``, the
+    procfs link identifies the actual image and cannot be changed by
+    ``exec -a``.
+    """
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
 def _resolve_syscall_args(
     pid: int, regs: "pt.UserRegsStruct", syscall_nr: int
 ) -> "tuple[list[str] | None, dict[str, str] | None, str | None]":
@@ -111,9 +143,19 @@ class TracerLoop:
         self.stderr_r: "int | None" = None
 
         self._known_pids: "set[int]" = set()
+        self._process_pids: "set[int]" = set()
+        self._pending_clone_pids: "set[int]" = set()
+        self._pending_exec_paths: "dict[int, str | None]" = {}
         self._options_applied: "set[int]" = set()
         self._returncode: "int | None" = None
         self._finished = threading.Event()
+        # ``launch()`` must not return while the root process is still only
+        # the forked Python image.  In particular, an immediately-ending
+        # profiler session needs the kernel-confirmed executable name before
+        # it interrupts the live lifecycle span.  This event is set after
+        # the first root exec callback (or after the root exits without a
+        # successful exec).
+        self._root_image_ready = threading.Event()
         self._thread: "threading.Thread | None" = None
         self._lock = threading.Lock()
 
@@ -123,8 +165,10 @@ class TracerLoop:
         self._stderr_reader: "threading.Thread | None" = None
 
         self._spawn_callbacks: "list[Callable[[int], None]]" = []
+        self._exec_callbacks: "list[Callable[[int, str | None], None]]" = []
         self._exit_callbacks: "list[Callable[[int, int], None]]" = []
         self._spawn_log: "list[int]" = []
+        self._exec_log: "list[tuple[int, str | None]]" = []
         self._exit_log: "list[tuple[int, int]]" = []
 
     # -- registration: replay-safe, a callback registered after some events
@@ -136,6 +180,13 @@ class TracerLoop:
             self._spawn_callbacks.append(callback)
         for pid in backlog:
             callback(pid)
+
+    def on_exec(self, callback: "Callable[[int, str | None], None]") -> None:
+        with self._lock:
+            backlog = list(self._exec_log)
+            self._exec_callbacks.append(callback)
+        for pid, executable_path in backlog:
+            callback(pid, executable_path)
 
     def on_exit(self, callback: "Callable[[int, int], None]") -> None:
         with self._lock:
@@ -152,8 +203,8 @@ class TracerLoop:
 
     def start(self, argv: "list[str]", envp: "dict[str, str]", cwd: str) -> None:
         """Starts the fork + trace loop on ONE dedicated thread and blocks
-        until the child exists and its pid is known (or forking/the
-        initial stop failed). The fork itself MUST happen on the same
+        until the child exists and its first executable image is confirmed
+        (or forking/the initial stop/exec failed). The fork itself MUST happen on the same
         thread that subsequently calls waitpid()/ptrace() on the child --
         ptrace's tracer identity is per-thread (only the thread that
         attaches, here via the child's PTRACE_TRACEME, may later
@@ -174,13 +225,15 @@ class TracerLoop:
             started.set()
             self._run()
 
-        self._thread = threading.Thread(
-            target=run_with_fork, name="agproxy_ptrace", daemon=True
-        )
+        self._thread = threading.Thread(target=run_with_fork, name="agproxy_ptrace", daemon=True)
         self._thread.start()
-        started.wait()
+        if not started.wait(timeout=30):
+            raise RuntimeError("ptrace child did not reach its initial stop within 30s")
         if start_error:
             raise start_error[0]
+        if not self._root_image_ready.wait(timeout=30):
+            self.kill()
+            raise RuntimeError("ptrace child did not exec or exit within 30s")
 
     def _fork_and_exec(self, argv: "list[str]", envp: "dict[str, str]", cwd: str) -> None:
         """Runs on the dedicated tracer thread, before `_run()`. Forks,
@@ -209,12 +262,16 @@ class TracerLoop:
         self._remember_spawn(pid)
 
         self._stdout_reader = threading.Thread(
-            target=self._drain_pipe, args=(stdout_r, self._stdout_buf),
-            name=f"agproxy_ptrace-{pid}-stdout", daemon=True,
+            target=self._drain_pipe,
+            args=(stdout_r, self._stdout_buf),
+            name=f"agproxy_ptrace-{pid}-stdout",
+            daemon=True,
         )
         self._stderr_reader = threading.Thread(
-            target=self._drain_pipe, args=(stderr_r, self._stderr_buf),
-            name=f"agproxy_ptrace-{pid}-stderr", daemon=True,
+            target=self._drain_pipe,
+            args=(stderr_r, self._stderr_buf),
+            name=f"agproxy_ptrace-{pid}-stderr",
+            daemon=True,
         )
         self._stdout_reader.start()
         self._stderr_reader.start()
@@ -343,6 +400,7 @@ class TracerLoop:
             # the root, so in practice this branch only fires for a newly
             # auto-attached fork/vfork/clone child) or, defensively, any
             # other pid we somehow see before applying options to it.
+            self._classify_pending_clone(pid)
             pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
             with self._lock:
                 self._options_applied.add(pid)
@@ -358,13 +416,19 @@ class TracerLoop:
             pt.PTRACE_EVENT_CLONE,
         ):
             new_pid = pt.get_eventmsg(pid)
-            self._remember_spawn(new_pid)
+            self._remember_spawn(
+                new_pid,
+                is_process=None if event == pt.PTRACE_EVENT_CLONE else True,
+            )
             pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
             return
-        if sig == signal.SIGTRAP and event in (pt.PTRACE_EVENT_EXEC, pt.PTRACE_EVENT_EXIT):
-            # The automatic post-exec trap, and the pre-exit notification --
-            # process disappearance itself is handled via WIFEXITED/
-            # WIFSIGNALED above, so both of these just resume.
+        if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_EXEC:
+            self._commit_exec(pid)
+            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+            return
+        if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_EXIT:
+            # Process disappearance itself is handled via WIFEXITED or
+            # WIFSIGNALED above; the pre-exit notification just resumes.
             pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
             return
         # A real signal being delivered to the tracee -- forward it
@@ -389,6 +453,7 @@ class TracerLoop:
             timestamp=time.time(),
         )
         decision = self._syscall_hook(stop)
+        is_exec = nr in (pt.SYSCALL_NUMBERS["execve"], pt.SYSCALL_NUMBERS["execveat"])
         if decision.kind == "deny":
             # Skip the syscall (orig_rax=-1) and make it appear to have
             # returned -EPERM, in two separate GETREGS/SETREGS round-trips
@@ -402,8 +467,8 @@ class TracerLoop:
             pt.set_regs(pid, regs2)
         elif decision.kind == "rewrite" and decision.new_args:
             if nr not in (pt.SYSCALL_NUMBERS["execve"], pt.SYSCALL_NUMBERS["execveat"]):
-                # `rewrite` only injects a new path+argv into rdi/rsi, which
-                # is meaningful for execve-family syscalls only. Path
+                # `rewrite` only injects a new path+argv into the exec-family
+                # argument registers. Path
                 # redirection for openat/open is deliberately NOT done this
                 # way (see the design doc: raw pointer rewriting for file
                 # paths is fragile and agsandbox's mount mechanism already
@@ -415,29 +480,98 @@ class TracerLoop:
                 path_addr, argv_addr = pt.inject_argv(
                     pid, regs.rsp, decision.new_args[0], decision.new_args
                 )
-                regs.rdi = path_addr
-                regs.rsi = argv_addr
+                if nr == pt.SYSCALL_NUMBERS["execve"]:
+                    regs.rdi = path_addr
+                    regs.rsi = argv_addr
+                else:
+                    regs.rsi = path_addr
+                    regs.rdx = argv_addr
                 pt.set_regs(pid, regs)
+        if is_exec:
+            # The syscall entry is only a candidate: exec can still fail
+            # (ENOENT, EACCES, malformed image, ...). Commit it only if the
+            # kernel later reports PTRACE_EVENT_EXEC. A rewrite changes the
+            # kernel pathname but never makes argv[0] authoritative.
+            with self._lock:
+                if decision.kind == "deny":
+                    self._pending_exec_paths.pop(pid, None)
+                else:
+                    self._pending_exec_paths[pid] = (
+                        decision.new_args[0]
+                        if decision.kind == "rewrite" and decision.new_args
+                        else path
+                    )
         pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
 
-    def _remember_spawn(self, pid: int) -> None:
+    def _remember_spawn(self, pid: int, *, is_process: "bool | None" = True) -> None:
         with self._lock:
             self._known_pids.add(pid)
+            if is_process is None:
+                self._pending_clone_pids.add(pid)
+            elif is_process:
+                self._process_pids.add(pid)
+                self._spawn_log.append(pid)
+            callbacks = list(self._spawn_callbacks) if is_process else []
+        for cb in callbacks:
+            cb(pid)
+
+    def _classify_pending_clone(self, pid: int) -> None:
+        with self._lock:
+            if pid not in self._pending_clone_pids:
+                return
+            self._pending_clone_pids.discard(pid)
+        if not _is_thread_group_leader(pid):
+            return
+        with self._lock:
+            self._process_pids.add(pid)
             self._spawn_log.append(pid)
             callbacks = list(self._spawn_callbacks)
         for cb in callbacks:
             cb(pid)
 
+    def _commit_exec(self, pid: int) -> None:
+        # The staged syscall pathname is the user-facing command identity and
+        # PTRACE_EVENT_EXEC confirms that exact attempt succeeded. This keeps
+        # script launchers named for the requested script (for example
+        # ``claude``) instead of procfs' shebang interpreter (``node``).
+        # procfs remains the fallback when exec syscalls were not trapped or
+        # execveat used an empty pathname.
+        procfs_path = _kernel_executable_path(pid)
+        with self._lock:
+            staged_path = self._pending_exec_paths.pop(pid, None)
+            executable_path = staged_path or procfs_path
+            if pid not in self._process_pids:
+                return
+            self._exec_log.append((pid, executable_path))
+            callbacks = list(self._exec_callbacks)
+        for callback in callbacks:
+            callback(pid, executable_path)
+        if pid == self.root_pid:
+            # Callbacks are synchronous while the tracee is stopped. Publish
+            # readiness only after lifecycle consumers have applied the
+            # kernel-confirmed executable name.
+            self._root_image_ready.set()
+
     def _forget(self, pid: int, exit_code: int) -> None:
         with self._lock:
             self._known_pids.discard(pid)
+            self._pending_clone_pids.discard(pid)
+            self._pending_exec_paths.pop(pid, None)
             self._options_applied.discard(pid)
             if pid == self.root_pid:
                 self._returncode = exit_code
-            self._exit_log.append((pid, exit_code))
-            callbacks = list(self._exit_callbacks)
+            was_process = pid in self._process_pids
+            self._process_pids.discard(pid)
+            if was_process:
+                self._exit_log.append((pid, exit_code))
+            callbacks = list(self._exit_callbacks) if was_process else []
         for cb in callbacks:
             cb(pid, exit_code)
+        if pid == self.root_pid:
+            # Failed/denied execs never produce PTRACE_EVENT_EXEC. Unblock
+            # launch after their exit callbacks preserve the failed
+            # lifecycle under its honest ``<unknown>`` identity.
+            self._root_image_ready.set()
 
     def join(self, timeout: "float | None" = None) -> "int | None":
         """Block until the root process (and everything it spawned) has

@@ -164,7 +164,7 @@ class _ClaudeCodeBackend(agharness_backend):
                 "(~/.cache/agency_harness_bin), or on this host's own PATH "
                 "to seed that cache from"
                 if in_container
-                else "on the host PATH"
+                else "on PATH (the host PATH)"
             )
             return agerror(f"claude binary {binary!r} not found {where}"), prev_ctx, [sys_msg]
 
@@ -200,9 +200,15 @@ class _ClaudeCodeBackend(agharness_backend):
             gateway.register(token, ag)
 
         from ..agprof_ingest import get_shared_profiler_ingest
+        from ...profiler import agprof
 
         profiler_ingest = get_shared_profiler_ingest()
-        profiler_ingest.register(token, ag)
+        profile_hook_events = agprof.enabled()
+        profiler_ingest.register(
+            token,
+            ag,
+            exact_tool_events=profile_hook_events,
+        )
 
         # Shared MCP server (Phase 4): the same resource-control
         # (reserve_cpu/cpu_release/daemon_release) and output-submission
@@ -293,8 +299,8 @@ class _ClaudeCodeBackend(agharness_backend):
                     # session (still correct, just without native memory).
                     resume_session_id = None
 
-            # Bridge Claude Code's own PreToolUse permission check to
-            # agpolicy (docs/Design_harness_integration.md): write the
+            # Bridge Claude Code's PreToolUse permission check to agpolicy
+            # and its PreToolUse/PostToolUse boundaries to agprof: write the
             # self-contained hook script into this launch's own
             # config_home (visible to `claude` in both the host and
             # in-container case, unlike a path in this package's own
@@ -309,15 +315,15 @@ class _ClaudeCodeBackend(agharness_backend):
                 ag.sandbox.write_file_bytes(hook_path, hook_src)
             else:
                 Path(hook_path).write_bytes(hook_src)
-            hooks_settings = json.dumps(
-                {
-                    "hooks": {
-                        "PreToolUse": [
-                            {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
-                        ]
-                    }
-                }
-            )
+            hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
+            hooks = {"PreToolUse": [hook_command]}
+            if profile_hook_events:
+                # Post hooks exist solely for exact profiling. Do not make
+                # an unprofiled run spawn an extra Python process after
+                # every tool call just to discover AGPROF_* is unset.
+                hooks["PostToolUse"] = [hook_command]
+                hooks["PostToolUseFailure"] = [hook_command]
+            hooks_settings = json.dumps({"hooks": hooks})
 
             # --mcp-config -- point Claude Code's own native MCP client at
             # the shared agmcp_server bridge set up above (resource-control
@@ -394,6 +400,14 @@ class _ClaudeCodeBackend(agharness_backend):
                 # See docs/Design_harness_history.md.
                 "CLAUDE_CONFIG_DIR": str(config_home),
             }
+            if profile_hook_events:
+                # Off-path stays free when profiling is disabled: without
+                # these variables the shared hook skips its profiler POST.
+                # When enabled it uses the same container-local HTTP bridge
+                # as policy, authenticated by a header-only bearer token;
+                # agproxy forwards to agProfilerIngest's independent UDS.
+                envp["AGPROF_BASE_URL"] = base_url
+                envp["AGPROF_TOKEN"] = token
             if in_container:
                 # Deliberately does NOT forward the host's HOME: it points
                 # to a path that's meaningless (or, worse, coincidentally

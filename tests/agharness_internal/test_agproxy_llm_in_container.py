@@ -13,7 +13,7 @@ import json
 import shlex
 import subprocess
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -47,6 +47,100 @@ def _completion(content: str) -> ChatCompletion:
     message = ChatCompletionMessage(role="assistant", content=content)
     choice = Choice(index=0, finish_reason="stop", message=message)
     return ChatCompletion(id="x", object="chat.completion", created=0, model="m", choices=[choice])
+
+
+def test_launcher_uses_profiler_sentinel_when_profiling_is_off():
+    from agency.agharness_internal.agproxy_llm_in_container import (
+        ensure_agproxy_llm_in_container,
+    )
+
+    sandbox = MagicMock()
+    terminus = MagicMock()
+    terminus.ensure_uds_started.return_value = "/host/agllm-terminus.sock"
+    with (
+        patch(
+            "agency.agharness_internal.agproxy_llm_in_container._is_reachable",
+            side_effect=[False, True],
+        ),
+        patch("agency.agutil.ensure_python_packages_in_container"),
+        patch(
+            "agency.agharness_internal.agllm_terminus.get_shared_terminus",
+            return_value=terminus,
+        ),
+        patch("agency.profiler.agprof.enabled", return_value=False),
+        patch("agency.agharness_internal.agprof_ingest.get_shared_profiler_ingest") as ingest,
+    ):
+        ensure_agproxy_llm_in_container(sandbox, MagicMock())
+
+    ingest.assert_not_called()
+    command = sandbox.exec_detached.call_args.args[0]
+    assert "agllm-terminus.sock - 8765" in command
+
+
+def test_launcher_passes_bind_mounted_profiler_uds_when_profiling_is_on():
+    from agency.agharness_internal.agproxy_llm_in_container import (
+        ensure_agproxy_llm_in_container,
+    )
+
+    sandbox = MagicMock()
+    terminus = MagicMock()
+    terminus.ensure_uds_started.return_value = "/host/agllm-terminus.sock"
+    ingest = MagicMock()
+    ingest.ensure_uds_started.return_value = "/host/agprof-ingest-abc.sock"
+    with (
+        patch(
+            "agency.agharness_internal.agproxy_llm_in_container._is_reachable",
+            side_effect=[False, True],
+        ),
+        patch("agency.agutil.ensure_python_packages_in_container"),
+        patch(
+            "agency.agharness_internal.agllm_terminus.get_shared_terminus",
+            return_value=terminus,
+        ),
+        patch("agency.profiler.agprof.enabled", return_value=True),
+        patch(
+            "agency.agharness_internal.agprof_ingest.get_shared_profiler_ingest",
+            return_value=ingest,
+        ),
+    ):
+        ensure_agproxy_llm_in_container(sandbox, MagicMock())
+
+    command = sandbox.exec_detached.call_args.args[0]
+    assert "/var/run/agency_llm_gateway/agprof-ingest-abc.sock 8765" in command
+
+
+def test_entrypoint_maps_profiler_sentinel_to_none():
+    from agency.agharness_internal import _agproxy_llm_in_container_entrypoint as entrypoint
+
+    proxy = MagicMock()
+    with (
+        patch("agency.agharness_internal.agproxy_llm.agProxyLLM", return_value=proxy) as proxy_cls,
+        patch.object(entrypoint.threading.Event, "wait", return_value=None),
+    ):
+        entrypoint.main(["/bridge/terminus.sock", "-", "8765"])
+
+    assert proxy_cls.call_args.kwargs["terminus_uds_path"] == "/bridge/terminus.sock"
+    assert proxy_cls.call_args.kwargs["profiler_uds_path"] is None
+
+
+def test_profiled_run_rejects_already_running_unprofiled_proxy():
+    from agency.agharness_internal.agproxy_llm_in_container import (
+        ensure_agproxy_llm_in_container,
+    )
+
+    with (
+        patch(
+            "agency.agharness_internal.agproxy_llm_in_container._is_reachable",
+            return_value=True,
+        ),
+        patch(
+            "agency.agharness_internal.agproxy_llm_in_container._profiler_bridge_configured",
+            return_value=False,
+        ),
+        patch("agency.profiler.agprof.enabled", return_value=True),
+    ):
+        with pytest.raises(RuntimeError, match="started without a profiler UDS bridge"):
+            ensure_agproxy_llm_in_container(MagicMock(), MagicMock())
 
 
 def _curl_from_container(sandbox, base_url: str, token: str, body: dict) -> "tuple[dict, int]":
@@ -130,7 +224,9 @@ class TestEnsureAgproxyLlmInContainer:
         token = uuid.uuid4().hex
         terminus = get_shared_terminus(self.cfg)
         fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _completion("hello from in-container proxy")
+        fake_client.chat.completions.create.return_value = _completion(
+            "hello from in-container proxy"
+        )
         fake_ag = MagicMock()
         fake_ag.llm.backend.make_client.return_value = fake_client
         terminus.register(token, fake_ag)

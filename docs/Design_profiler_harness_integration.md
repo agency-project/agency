@@ -224,8 +224,8 @@ cgroup/process/GPU sampling, GPU leases, and **every real provider call**. One
 instrumentation site each; works for all five engines by construction.
 
 **Tier 2 — engine-independent, syscall-observed.** Process spawn/exit and
-`execve` argv via `agProxyPtrace`. Requires no harness cooperation.
-`agProxyPtraceHandle.on_spawn()` / `.on_exit()`
+kernel-confirmed executable identity via `agProxyPtrace`. Requires no harness cooperation.
+`agProxyPtraceHandle.on_spawn()` / `.on_exec()` / `.on_exit()`
 ([agproxy_ptrace.py:176-186](../agency/agharness_internal/agproxy_ptrace.py:176))
 are **existing callbacks** — no new plumbing.
 
@@ -434,12 +434,14 @@ Claude Code is the first Tier-3 adapter because the wiring already exists:
 ([_native_hooks.py:38](../agency/agharness_internal/agharness_backends/_native_hooks.py:38))
 which already parses the `PreToolUse`/`PostToolUse` payload shape.
 
-Two seams were reserved for this in advance and should be used rather than
-duplicated: `agsyscallevent.tool_name` / `.tool_args`
-([agproxy_ptrace.py:107-113](../agency/agharness_internal/agproxy_ptrace.py:107)),
-and `_AgPtraceFields.profiler`
-([agproxy_ptrace.py:135](../agency/agharness_internal/agproxy_ptrace.py:135),
-"reserved for a future profiler hook; unused so far").
+The semantic adapter should reuse the `agsyscallevent.tool_name` / `.tool_args`
+fields reserved for this shape of event
+([agproxy_ptrace.py:107-113](../agency/agharness_internal/agproxy_ptrace.py:107))
+rather than inventing a parallel policy-facing type. `_AgPtraceFields.profiler`
+remains a distinct selector for a future heavyweight per-process sampler such
+as `perf`; M6's low-cost
+spawn/exit records are baseline agprof telemetry and therefore activate with
+the agprof session rather than being gated by that optional selector.
 
 ### 5.8 `agmap` fan-out: a fourth spawn site, and a lane-root contradiction
 
@@ -782,9 +784,10 @@ milestone's correlation registry:
 
 ### M6 — ptrace process lifecycle — *recommended*
 - **Objective:** child-process spans for the four external engines.
-- **Files:** `agProxyPtraceHandle.on_spawn`/`on_exit`
+- **Files:** `agProxyPtraceHandle.on_spawn`/`on_exec`/`on_exit`
   ([agproxy_ptrace.py:176-186](../agency/agharness_internal/agharness_backends/../agproxy_ptrace.py:176))
-  → `agprof` records; resolve `execve` argv for span names.
+  → `agprof` records; stage the exec syscall path (never `argv[0]`) and
+  commit its sanitized basename only after `PTRACE_EVENT_EXEC` confirms success.
 - **Difficulty:** S — the callbacks already exist.
 - **Dependencies:** M4.
 - **Outcome:** "what did the harness actually run" becomes visible without
@@ -798,7 +801,9 @@ milestone's correlation registry:
   the ingest; reuse `_native_hooks.hook_payload_to_syscallevent()`.
 - **Difficulty:** M.
 - **Dependencies:** M4, M6.
-- **Outcome:** `claude_code` upgrades from `derived` to `complete`.
+- **Outcome:** `claude_code` records exact tool timing when Claude supplies
+  validated `duration_ms`; otherwise the observed Pre/Post interval is kept
+  with `metadata["timing"] = "hook_boundary"`, not claimed as complete.
 
 ### M8 — Golden test + thread allowlist — *required*
 - **Objective:** make regressions detectable.

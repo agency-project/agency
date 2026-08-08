@@ -25,7 +25,10 @@ from agency.agllm_backends import agBedrockBackendConfig
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
 from agency.agent import agent
-from agency.agharness_internal.agharness_backends.claude_code import _ClaudeCodeBackend, claude_code_available
+from agency.agharness_internal.agharness_backends.claude_code import (
+    _ClaudeCodeBackend,
+    claude_code_available,
+)
 from agency.agskill import agskill
 
 
@@ -116,8 +119,10 @@ def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
 
     handle = _make_handle(stdout='{"result": "ok"}')
     captured_envp = {}
+    captured_argv = []
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+        captured_argv.extend(argv)
         captured_envp.update(envp)
         return handle
 
@@ -135,6 +140,47 @@ def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
     # LLM traffic is routed through the gateway, not the host's own creds.
     assert captured_envp.get("ANTHROPIC_BASE_URL") == mock_gateway.base_url
     assert "ANTHROPIC_API_KEY" not in captured_envp
+    settings = json.loads(captured_argv[captured_argv.index("--settings") + 1])
+    assert set(settings["hooks"]) == {"PreToolUse"}
+    assert "AGPROF_BASE_URL" not in captured_envp
+
+
+def test_execute_enables_exact_claude_hooks_only_while_profiling(
+    _patch_which_finds_claude,
+):
+    backend = _ClaudeCodeBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    ag = _make_agent()
+    handle = _make_handle(stdout='{"result": "ok"}')
+    captured = {}
+
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+        captured["argv"] = argv
+        captured["envp"] = envp
+        return handle
+
+    profiler_ingest = MagicMock()
+    with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as gateway_getter,
+        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as ptrace_cls,
+        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
+        patch(
+            "agency.agharness_internal.agprof_ingest.get_shared_profiler_ingest",
+            return_value=profiler_ingest,
+        ),
+        patch("agency.profiler.agprof.enabled", return_value=True),
+    ):
+        gateway, _ = _patched_gateway_and_ptrace(handle)
+        gateway_getter.return_value = gateway
+        ptrace_cls.return_value.launch.side_effect = fake_launch
+        backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
+
+    settings = json.loads(captured["argv"][captured["argv"].index("--settings") + 1])
+    assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+    assert captured["envp"]["AGPROF_BASE_URL"] == gateway.base_url
+    assert captured["envp"]["AGPROF_TOKEN"]
+    profiler_ingest.register.assert_called_once()
+    assert profiler_ingest.register.call_args.kwargs == {"exact_tool_events": True}
 
 
 def test_execute_nonzero_exit_returns_agerror(_patch_which_finds_claude):
@@ -207,7 +253,9 @@ def test_execute_reports_missing_fields_when_submit_output_never_called(_patch_w
     silently return a partial/empty agdata."""
     backend = _ClaudeCodeBackend(agConfig())
     skill = agskill(
-        name="s", system_prompt="do the thing", output_schema=agdata(greeting=str, word_count=int),
+        name="s",
+        system_prompt="do the thing",
+        output_schema=agdata(greeting=str, word_count=int),
         max_output_schema_retries=2,
     )
     ag = _make_agent()
@@ -242,15 +290,15 @@ def test_execute_retries_and_recovers_when_submit_output_arrives_on_retry(
     proving this isn't just a give-up-immediately path."""
     backend = _ClaudeCodeBackend(agConfig())
     skill = agskill(
-        name="s", system_prompt="do the thing", output_schema=agdata(greeting=str, word_count=int),
+        name="s",
+        system_prompt="do the thing",
+        output_schema=agdata(greeting=str, word_count=int),
         max_output_schema_retries=3,
     )
     ag = _make_agent()
     prev_ctx = agcontext()
 
-    handle1 = _make_handle(
-        stdout=json.dumps({"result": "partial", "session_id": "sess-abc"})
-    )
+    handle1 = _make_handle(stdout=json.dumps({"result": "partial", "session_id": "sess-abc"}))
     handle2 = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
     mock_mcp_server = _patched_mcp_server()
     # First call: only "greeting" landed. Second call (after the reprompt
@@ -308,7 +356,9 @@ def test_execute_uses_terminus_transcript_for_history_when_available(_patch_whic
         {
             "role": "assistant",
             "content": None,
-            "tool_calls": [{"id": "1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}],
+            "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}
+            ],
         },
         {"role": "tool", "tool_call_id": "1", "content": "ok"},
         {"role": "assistant", "content": "the command printed ok"},
@@ -317,7 +367,9 @@ def test_execute_uses_terminus_transcript_for_history_when_available(_patch_whic
     mock_terminus.transcript_for_token.return_value = recorded_transcript
     with (
         patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.agharness_internal.agllm_terminus.get_shared_terminus") as mock_terminus_getter,
+        patch(
+            "agency.agharness_internal.agllm_terminus.get_shared_terminus"
+        ) as mock_terminus_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
         patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
     ):
@@ -336,16 +388,24 @@ def test_execute_uses_terminus_transcript_for_history_when_available(_patch_whic
 
 
 def test_parse_result_json_extracts_result_and_usage():
-    payload = json.dumps({"result": "abc", "usage": {"input_tokens": 1, "output_tokens": 2}})
-    text, usage = _ClaudeCodeBackend._parse_result_json(payload)
+    payload = json.dumps(
+        {
+            "result": "abc",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "session_id": "session-123",
+        }
+    )
+    text, usage, session_id = _ClaudeCodeBackend._parse_result_json(payload)
     assert text == "abc"
     assert usage == {"input_tokens": 1, "output_tokens": 2}
+    assert session_id == "session-123"
 
 
 def test_parse_result_json_falls_back_on_malformed_json():
-    text, usage = _ClaudeCodeBackend._parse_result_json("not json")
+    text, usage, session_id = _ClaudeCodeBackend._parse_result_json("not json")
     assert text == "not json"
     assert usage == {}
+    assert session_id is None
 
 
 # ---------------------------------------------------------------------------

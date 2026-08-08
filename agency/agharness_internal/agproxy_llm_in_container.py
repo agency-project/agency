@@ -36,9 +36,7 @@ if TYPE_CHECKING:
 # dynamically-assigned port back from.
 _AGPROXY_LLM_IN_CONTAINER_PORT = 8765
 
-_ENTRYPOINT_RELATIVE_PATH = (
-    "agency/agharness_internal/_agproxy_llm_in_container_entrypoint.py"
-)
+_ENTRYPOINT_RELATIVE_PATH = "agency/agharness_internal/_agproxy_llm_in_container_entrypoint.py"
 
 
 def _base_url() -> str:
@@ -71,6 +69,19 @@ def _is_reachable(sandbox: "agSandbox", timeout_s: float = 2) -> bool:
     return rc == 0
 
 
+def _profiler_bridge_configured(sandbox: "agSandbox", timeout_s: float = 2) -> bool:
+    script = (
+        "import urllib.request as u, json, sys\n"
+        "try:\n"
+        f"    r=u.urlopen({_base_url()!r} + '/agprof/status', timeout={timeout_s})\n"
+        "    sys.exit(0 if json.loads(r.read()).get('configured') else 1)\n"
+        "except Exception:\n"
+        "    sys.exit(1)\n"
+    )
+    _, rc = sandbox.exec(f"python3 -c {shlex.quote(script)}", timeout=int(timeout_s) + 10)
+    return rc == 0
+
+
 def ensure_agproxy_llm_in_container(
     sandbox: "agSandbox", agconfig: "agConfig | None", timeout_s: float = 60
 ) -> str:
@@ -86,8 +97,15 @@ def ensure_agproxy_llm_in_container(
     instance has no registry of its own; every request it handles resolves
     the agent purely via the terminus, over the bridge established here.
     """
+    from ..profiler import agprof
+
     base_url = _base_url()
     if _is_reachable(sandbox):
+        if agprof.enabled() and not _profiler_bridge_configured(sandbox):
+            raise RuntimeError(
+                "in-container agproxy_llm was started without a profiler UDS bridge; "
+                "restart the sandbox before beginning a profiled run"
+            )
         return base_url
 
     from ..agutil import (
@@ -101,6 +119,12 @@ def ensure_agproxy_llm_in_container(
     terminus = get_shared_terminus(agconfig)
     terminus_host_uds = terminus.ensure_uds_started()
     terminus_container_uds = f"/var/run/agency_llm_gateway/{Path(terminus_host_uds).name}"
+    profiler_container_uds = "-"
+    if agprof.enabled():
+        from .agprof_ingest import get_shared_profiler_ingest
+
+        profiler_host_uds = get_shared_profiler_ingest().ensure_uds_started()
+        profiler_container_uds = f"/var/run/agency_llm_gateway/{Path(profiler_host_uds).name}"
 
     entrypoint_path = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/{_ENTRYPOINT_RELATIVE_PATH}"
     # PYTHONPATH is required here (unlike native.py's entrypoint, which is
@@ -121,7 +145,8 @@ def ensure_agproxy_llm_in_container(
     cmd = (
         f"PYTHONPATH={shlex.quote(str(AGENCY_PACKAGE_CONTAINER_MOUNT))} "
         f"python3 {shlex.quote(entrypoint_path)} "
-        f"{shlex.quote(terminus_container_uds)} {_AGPROXY_LLM_IN_CONTAINER_PORT} "
+        f"{shlex.quote(terminus_container_uds)} "
+        f"{shlex.quote(profiler_container_uds)} {_AGPROXY_LLM_IN_CONTAINER_PORT} "
         f"> {shlex.quote(log_path)} 2>&1"
     )
     sandbox.exec_detached(cmd, workdir="/workspace")

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 import time
 from contextlib import contextmanager
 
@@ -512,6 +513,170 @@ def test_real_otel_session_records_nested_parent_ids(monkeypatch, tmp_path):
     assert sandbox[6]["agency.wall_ns"] > 0
     assert sandbox[6]["agency.cpu_ns"] >= 0
     assert json.loads((tmp_path / "summary.json").read_text())["llm_metrics"]["calls"] == 0
+
+
+def test_external_span_completion_can_retime_exact_interval(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("run0:test:agent"):
+            original_perf_ns = time.perf_counter_ns()
+            original_wall_ns = time.time_ns()
+            external = agprof.start_external_span(
+                "tool:bash",
+                start_perf_ns=original_perf_ns,
+                start_wall_ns=original_wall_ns,
+                metadata={"timing": "exact"},
+                parent_context=agprof.current_span_context(),
+            )
+            end_perf_ns = original_perf_ns + 10_000_000
+            end_wall_ns = original_wall_ns + 10_000_000
+            exact_start_perf_ns = end_perf_ns - 2_000_000
+            exact_start_wall_ns = end_wall_ns - 2_000_000
+            with pytest.raises(ValueError, match="overridden together"):
+                external.end(
+                    end_perf_ns=end_perf_ns,
+                    end_wall_ns=end_wall_ns,
+                    start_perf_ns=exact_start_perf_ns,
+                )
+            external.end(
+                end_perf_ns=end_perf_ns,
+                end_wall_ns=end_wall_ns,
+                start_perf_ns=exact_start_perf_ns,
+                start_wall_ns=exact_start_wall_ns,
+                metadata={"outcome": "success"},
+            )
+
+    records = {record[1]: record for record in agprof._records}
+    run = records["run0:test:agent"]
+    tool = records["tool:bash"]
+    assert tool[2] == exact_start_perf_ns
+    assert tool[3] == 2_000_000
+    assert tool[8] == run[7]
+    assert external._span.start_time == exact_start_wall_ns
+    assert external._span.end_time == end_wall_ns
+
+
+def test_open_external_span_is_interrupted_at_profiler_stop(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("run0:test:agent"):
+            external = agprof.start_external_span(
+                "process:sleep",
+                start_perf_ns=time.perf_counter_ns(),
+                start_wall_ns=time.time_ns(),
+                metadata={"pid": 42, "executable": "sleep", "timing": "exact"},
+                parent_context=agprof.current_span_context(),
+            )
+            external.update("process:sleep", executable="sleep")
+
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    incomplete = next(
+        span for span in summary["incomplete_spans"] if span["label"] == "process:sleep"
+    )
+    assert incomplete["outcome"] == "interrupted"
+    assert incomplete["pid"] == 42
+    assert external._interrupted
+    assert external._span.end_time is not None
+    external.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
+    assert not any(record[1] == "process:sleep" for record in agprof._records)
+
+
+def test_cancel_external_span_is_silent_and_idempotent(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        external = agprof.start_external_span(
+            "tool:duplicate",
+            start_perf_ns=time.perf_counter_ns(),
+            start_wall_ns=time.time_ns(),
+            metadata={"tool_call_id": "call-1"},
+        )
+        agprof.cancel_external_span(external)
+        agprof.cancel_external_span(external)
+
+    assert external._ended
+    assert external._cancelled
+    assert external._span is None
+    assert id(external) not in agprof._open_spans
+    assert not any(record[1] == "tool:duplicate" for record in agprof._records)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert not any(span["label"] == "tool:duplicate" for span in summary["incomplete_spans"])
+
+
+def test_external_span_registration_is_atomic_with_stop(monkeypatch, tmp_path):
+    """stop cannot drain between the session check and live-span registration."""
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    real_observed_span = agprof._ObservedSpan
+    constructor_entered = threading.Event()
+    allow_registration = threading.Event()
+    stop_attempted = threading.Event()
+    stop_finished = threading.Event()
+    result = {}
+    errors = []
+
+    def blocking_observed_span(*args, **kwargs):
+        constructor_entered.set()
+        if not allow_registration.wait(timeout=5):
+            raise AssertionError("test did not release external span registration")
+        return real_observed_span(*args, **kwargs)
+
+    def register_external() -> None:
+        try:
+            result["span"] = agprof.start_external_span(
+                "process:race",
+                start_perf_ns=time.perf_counter_ns(),
+                start_wall_ns=time.time_ns(),
+                metadata={"pid": 42},
+            )
+        except BaseException as exc:  # surfaced in the main test thread
+            errors.append(exc)
+
+    def stop_session() -> None:
+        stop_attempted.set()
+        try:
+            agprof.stop()
+        except BaseException as exc:  # surfaced in the main test thread
+            errors.append(exc)
+        finally:
+            stop_finished.set()
+
+    agprof.start(tmp_path, sample_hz=0, sample_gpu=False)
+    monkeypatch.setattr(agprof, "_ObservedSpan", blocking_observed_span)
+    register_thread = threading.Thread(target=register_external)
+    stop_thread = threading.Thread(target=stop_session)
+    try:
+        register_thread.start()
+        assert constructor_entered.wait(timeout=2)
+        state_lock_was_free = agprof._state_lock.acquire(blocking=False)
+        if state_lock_was_free:
+            agprof._state_lock.release()
+        assert not state_lock_was_free
+        stop_thread.start()
+        assert stop_attempted.wait(timeout=2)
+        # start_external_span owns _state_lock until registration completes,
+        # so stop must still be waiting rather than draining an empty map.
+        assert not stop_finished.wait(timeout=0.05)
+    finally:
+        allow_registration.set()
+        register_thread.join(timeout=5)
+        stop_thread.join(timeout=5)
+        if agprof.enabled():
+            agprof.stop()
+
+    assert not register_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert errors == []
+    assert result["span"]._interrupted
+    assert agprof._open_spans == {}
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert any(span["label"] == "process:race" for span in summary["incomplete_spans"])
 
 
 def test_concurrent_async_spans_keep_annotations_task_local(monkeypatch, tmp_path):

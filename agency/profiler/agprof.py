@@ -68,7 +68,7 @@ _counters_lock = threading.Lock()
 # (tid, name, t0_wall_ns, wall_ns, cpu_ns, runq_ns | None, metadata).
 # list.append is atomic under the GIL, so no lock on the hot path.
 _records: list[tuple] = []
-_open_spans: "dict[int, _TimedSpan]" = {}
+_open_spans: "dict[int, object]" = {}
 _open_spans_lock = threading.Lock()
 _interrupted_spans: "list[dict]" = []
 _last_summary: "dict[str, dict] | None" = None
@@ -404,6 +404,154 @@ class _TimedSpan:
         self._metadata.update(metadata)
 
 
+class _ObservedSpan:
+    """An exact host-observed interval with no executing host thread.
+
+    Unlike :class:`_TimedSpan`, this handle can be opened by one callback and
+    ended by a later callback without keeping an OTel context manager entered.
+    Registering it in ``_open_spans`` makes the existing profiler shutdown
+    path preserve a still-live external process as an interrupted span.
+    """
+
+    __slots__ = (
+        "_name",
+        "_tracer",
+        "_parent_context",
+        "_span",
+        "_t0",
+        "_wall0",
+        "_tid",
+        "_metadata",
+        "_interrupted",
+        "_ended",
+        "_cancelled",
+        "_lock",
+    )
+
+    def __init__(
+        self,
+        tracer,
+        name: str,
+        *,
+        start_perf_ns: int,
+        start_wall_ns: int,
+        metadata: "dict | None",
+        parent_context,
+    ) -> None:
+        if parent_context is None:
+            from opentelemetry.context import Context
+
+            parent_context = Context()
+        self._name = name
+        self._tracer = tracer
+        self._parent_context = parent_context
+        self._t0 = start_perf_ns
+        self._wall0 = start_wall_ns
+        self._tid = _DERIVED_TID
+        self._metadata = dict(metadata or {})
+        self._interrupted = False
+        self._ended = False
+        self._cancelled = False
+        self._lock = threading.Lock()
+        self._span = None
+        with _open_spans_lock:
+            _open_spans[id(self)] = self
+
+    def update(self, name: "str | None" = None, **metadata) -> None:
+        with self._lock:
+            if self._ended or self._interrupted or self._cancelled:
+                return
+            if name is not None and name != self._name:
+                self._name = name
+            self._metadata.update(metadata)
+
+    def end(
+        self,
+        *,
+        end_perf_ns: int,
+        end_wall_ns: int,
+        metadata: "dict | None" = None,
+        start_perf_ns: "int | None" = None,
+        start_wall_ns: "int | None" = None,
+    ) -> None:
+        if (start_perf_ns is None) != (start_wall_ns is None):
+            raise ValueError("start_perf_ns and start_wall_ns must be overridden together")
+        with _open_spans_lock:
+            if _open_spans.pop(id(self), None) is None:
+                return
+        with self._lock:
+            if self._ended or self._interrupted or self._cancelled:
+                return
+            self._ended = True
+            self._metadata.update(metadata or {})
+            completed_metadata = dict(self._metadata)
+            completed_metadata.setdefault("outcome", "success")
+            effective_start_perf_ns = min(
+                end_perf_ns,
+                self._t0 if start_perf_ns is None else start_perf_ns,
+            )
+            effective_start_wall_ns = min(
+                end_wall_ns,
+                self._wall0 if start_wall_ns is None else start_wall_ns,
+            )
+            self._t0 = effective_start_perf_ns
+            self._wall0 = effective_start_wall_ns
+            wall_ns = max(0, end_perf_ns - effective_start_perf_ns)
+            measurements = {
+                "agency.thread_id": self._tid,
+                "agency.perf_start_ns": effective_start_perf_ns,
+                "agency.wall_ns": wall_ns,
+            }
+            span = self._tracer.start_span(
+                self._name,
+                context=self._parent_context,
+                start_time=effective_start_wall_ns,
+            )
+            self._span = span
+            for key, value in {**completed_metadata, **measurements}.items():
+                span.set_attribute(key, _otel_attribute(value))
+            span_context = span.get_span_context()
+            parent = span.parent
+            _records.append(
+                (
+                    self._tid,
+                    self._name,
+                    effective_start_perf_ns,
+                    wall_ns,
+                    None,
+                    None,
+                    {**completed_metadata, **measurements},
+                    span_context.span_id if span_context is not None else None,
+                    parent.span_id if parent is not None else None,
+                )
+            )
+            span.end(end_time=end_wall_ns)
+
+    def interrupt(self, ended_perf_ns: int) -> None:
+        with self._lock:
+            if self._ended or self._interrupted or self._cancelled:
+                return
+            self._interrupted = True
+            wall_ns = max(0, ended_perf_ns - self._t0)
+            attributes = {
+                **self._metadata,
+                "outcome": "interrupted",
+                "agency.incomplete": True,
+                "agency.thread_id": self._tid,
+                "agency.perf_start_ns": self._t0,
+                "agency.wall_ns": wall_ns,
+            }
+            span = self._tracer.start_span(
+                self._name,
+                context=self._parent_context,
+                start_time=self._wall0,
+            )
+            self._span = span
+            for key, value in attributes.items():
+                span.set_attribute(key, _otel_attribute(value))
+            span.end(end_time=self._wall0 + wall_ns)
+
+
 class _OTelSession:
     """Own a private always-on OTel provider for one agprof session."""
 
@@ -506,6 +654,93 @@ def annotate(**metadata) -> None:
     stack = _span_stack.get()
     if stack:
         stack[-1].annotate(**metadata)
+
+
+def start_external_span(
+    name: str,
+    *,
+    start_perf_ns: int,
+    start_wall_ns: int,
+    metadata: "dict | None" = None,
+    parent_context=None,
+) -> "_ObservedSpan | None":
+    """Open a host-owned span whose interval is ended by a later callback.
+
+    This is the live counterpart to :func:`record_derived_span`: it is for
+    ptrace process lifecycles and remotely reported starts where shutdown may
+    happen before a matching end arrives.  Open handles participate in
+    agprof's normal interruption accounting.  The caller may safely call
+    ``handle.update(...)`` and ``handle.end(...)`` from unrelated threads.
+    """
+    # Registration and the session-state check are one transaction with
+    # stop(): either this handle reaches _open_spans before stop owns the
+    # state lock (and is drained as interrupted), or it observes the stopped
+    # session and returns None. Without this lock, stop could drain the map
+    # between the unsynchronised _session read and _ObservedSpan.__init__.
+    # Lock order is always state -> open; no open-span path acquires state.
+    with _state_lock:
+        s = _session
+        if s is None:
+            return None
+        return _ObservedSpan(
+            s.tracer,
+            name,
+            start_perf_ns=start_perf_ns,
+            start_wall_ns=start_wall_ns,
+            metadata=metadata,
+            parent_context=parent_context,
+        )
+
+
+def _append_interrupted_span(open_span, ended_perf_ns: int) -> None:
+    if getattr(open_span, "_interrupted", False) or getattr(open_span, "_ended", False):
+        return
+    open_span.interrupt(ended_perf_ns)
+    _interrupted_spans.append(
+        {
+            "thread_id": open_span._tid,
+            "label": open_span._name,
+            "started_ns": open_span._t0,
+            "duration_ms": round(max(0, ended_perf_ns - open_span._t0) / 1e6, 3),
+            **copy.deepcopy(open_span._metadata),
+            "outcome": "interrupted",
+        }
+    )
+
+
+def interrupt_external_span(
+    external_span: "_ObservedSpan | None", *, ended_perf_ns: "int | None" = None
+) -> None:
+    """Finalize an open external span as incomplete, once, if still live."""
+    if external_span is None:
+        return
+    with _open_spans_lock:
+        if _open_spans.pop(id(external_span), None) is None:
+            return
+    _append_interrupted_span(
+        external_span,
+        time.perf_counter_ns() if ended_perf_ns is None else ended_perf_ns,
+    )
+
+
+def cancel_external_span(external_span: "_ObservedSpan | None") -> None:
+    """Silently discard a live external interval without emitting a span.
+
+    This is for correlation reconcilers that learn the same interval will be
+    represented by an authoritative fallback and must avoid double counting.
+    Cancellation wins only while the handle is still registered; completion
+    or profiler shutdown remains authoritative if it removed the handle first.
+    """
+    if external_span is None:
+        return
+    with _open_spans_lock:
+        if _open_spans.pop(id(external_span), None) is None:
+            return
+        with external_span._lock:
+            if external_span._ended or external_span._interrupted:
+                return
+            external_span._ended = True
+            external_span._cancelled = True
 
 
 def record_derived_span(
@@ -1106,18 +1341,8 @@ def stop():
     with _open_spans_lock:
         open_spans = list(_open_spans.values())
         _open_spans.clear()
-        for open_span in open_spans:
-            open_span.interrupt(t_end)
-            _interrupted_spans.append(
-                {
-                    "thread_id": open_span._tid,
-                    "label": open_span._name,
-                    "started_ns": open_span._t0,
-                    "duration_ms": round(max(0, t_end - open_span._t0) / 1e6, 3),
-                    **copy.deepcopy(open_span._metadata),
-                    "outcome": "interrupted",
-                }
-            )
+    for open_span in open_spans:
+        _append_interrupted_span(open_span, t_end)
     # Close any lease still open at session end so it renders to the stop edge.
     with _leases_lock:
         for gpu_id, (t0, label) in _leases_open.items():

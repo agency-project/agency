@@ -13,7 +13,8 @@ verify this boundary directly, not just its externally-visible effect.
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+import time
+from unittest.mock import MagicMock, call, patch
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
@@ -21,6 +22,7 @@ from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice, Choic
 from openai.types.completion_usage import CompletionUsage
 
 from agency.agharness_internal.agproxy_llm import agProxyLLM, agProxyLLMConfig
+from agency.agharness_internal import agproxy_llm
 
 
 def _completion(content=None, finish_reason="stop", usage=None, id="chatcmpl-test", model="m"):
@@ -285,6 +287,143 @@ def test_agpolicy_check_tool_delegates_through_terminus_to_default_policy():
         assert resp.status_code == 200
         assert resp.json() == {"decision": "deny", "reason": "blocked for testing"}
         mock_policy.check_tool.assert_called_once_with(ag, "bash", {"command": "rm -rf /"})
+
+
+def test_agprof_hook_authenticates_then_delegates_to_profiler_bridge():
+    px, _, _ = _make_gateway_with_agent(token="profiler-secret")
+
+    def forward_to_ingest(token, _event):
+        if token != "profiler-secret":
+            return {"ok": False, "error": "unknown or missing token"}
+        return {"ok": True}
+
+    forward = MagicMock(side_effect=forward_to_ingest)
+    px._forward_profiler_hook = forward
+    client = _client_for(px)
+    event = {
+        "token": "body-token-must-not-authenticate",
+        "hook_event_name": "PreToolUse",
+        "perf_ns": time.perf_counter_ns(),
+        "wall_ns": time.time_ns(),
+        "payload": {"tool_use_id": "tool-bridge", "tool_name": "Read", "tool_input": {}},
+    }
+
+    assert client.post("/agprof/hook", json=event).status_code == 401
+    response = client.post(
+        "/agprof/hook",
+        json=event,
+        headers={"Authorization": "Bearer profiler-secret"},
+    )
+
+    assert response.json() == {"ok": True}
+    assert (
+        client.post(
+            "/agprof/hook",
+            json=event,
+            headers={"Authorization": "Bearer wrong-token"},
+        ).status_code
+        == 401
+    )
+    assert forward.call_args_list == [
+        call("profiler-secret", event),
+        call("wrong-token", event),
+    ]
+
+    oversized = client.post(
+        "/agprof/hook",
+        content=b"{" + b"x" * (256 * 1024),
+        headers={"Authorization": "Bearer profiler-secret"},
+    )
+    assert oversized.status_code == 413
+    assert oversized.json()["error"] == "profiler hook body too large"
+    assert forward.call_count == 2
+
+
+def test_agprof_hook_saturation_rejects_before_queuing_auth_or_forward():
+    px, _, _ = _make_gateway_with_agent(token="profiler-secret")
+    px._token_valid = MagicMock(return_value=True)
+    px._forward_profiler_hook = MagicMock(return_value={"ok": True})
+    px._profiler_forward_slots = MagicMock()
+    px._profiler_forward_slots.acquire.return_value = False
+    client = _client_for(px)
+
+    response = client.post(
+        "/agprof/hook",
+        json={"hook_event_name": "PreToolUse"},
+        headers={"Authorization": "Bearer profiler-secret"},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"] == "profiler hook bridge saturated"
+    px._token_valid.assert_not_called()
+    px._forward_profiler_hook.assert_not_called()
+    px._profiler_forward_slots.release.assert_not_called()
+
+
+def test_agprof_hook_rate_limit_rejects_valid_token_before_body_forward():
+    px, _, _ = _make_gateway_with_agent(token="profiler-secret")
+    px._token_valid = MagicMock(return_value=True)
+    px._profiler_hook_rate_allowed = MagicMock(return_value=False)
+    px._forward_profiler_hook = MagicMock(return_value={"ok": True})
+    client = _client_for(px)
+
+    response = client.post(
+        "/agprof/hook",
+        json={"hook_event_name": "PreToolUse"},
+        headers={"Authorization": "Bearer profiler-secret"},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"] == "profiler hook rate limit exceeded"
+    px._profiler_hook_rate_allowed.assert_called_once_with("profiler-secret")
+    px._forward_profiler_hook.assert_not_called()
+
+
+def test_profiler_hook_rate_window_and_token_state_are_bounded():
+    px = agProxyLLM(terminus=MagicMock())
+    with (
+        patch.object(agproxy_llm, "_MAX_PROFILER_HOOK_EVENTS_PER_TOKEN_PER_SECOND", 2),
+        patch.object(agproxy_llm, "_MAX_PROFILER_RATE_TOKENS", 2),
+    ):
+        assert px._profiler_hook_rate_allowed("a", now=10.0)
+        assert px._profiler_hook_rate_allowed("a", now=10.1)
+        assert not px._profiler_hook_rate_allowed("a", now=10.2)
+        assert px._profiler_hook_rate_allowed("a", now=11.0)
+        assert px._profiler_hook_rate_allowed("b", now=11.0)
+        assert px._profiler_hook_rate_allowed("c", now=11.0)
+
+    assert len(px._profiler_rate_windows) == 2
+    assert set(px._profiler_rate_windows) == {"b", "c"}
+
+
+def test_profiler_bridge_uses_separate_framed_uds_and_overrides_body_token():
+    px = agProxyLLM(terminus=MagicMock(), profiler_uds_path="/bridge/agprof-ingest.sock")
+    sock = MagicMock()
+    responses = [
+        {"ok": True, "host_wall_ns": time.time_ns(), "host_perf_ns": time.perf_counter_ns()},
+        {"ok": True},
+        {"ok": True},
+    ]
+    event = {
+        "token": "untrusted-body-token",
+        "hook_event_name": "PreToolUse",
+        "wall_ns": time.time_ns(),
+        "perf_ns": time.perf_counter_ns(),
+        "payload": {"tool_use_id": "tool-1", "tool_name": "Bash", "tool_input": {}},
+    }
+    with (
+        patch("agency.agharness_internal.agproxy_llm.socket.socket", return_value=sock),
+        patch("agency.profiler.agprof_emit._send_framed") as send,
+        patch("agency.profiler.agprof_emit._recv_framed", side_effect=responses),
+    ):
+        assert px._forward_profiler_hook("header-secret", event) == {"ok": True}
+
+    sock.connect.assert_called_once_with("/bridge/agprof-ingest.sock")
+    sock.settimeout.assert_called_once_with(agproxy_llm._PROFILER_FORWARD_TIMEOUT_S)
+    forwarded = send.call_args_list[-1].args[1]
+    assert forwarded["ev"] == "hook"
+    assert forwarded["token"] == "header-secret"
+    assert "untrusted-body-token" not in json.dumps(forwarded)
 
 
 def test_anthropic_count_tokens_route_returns_estimate():

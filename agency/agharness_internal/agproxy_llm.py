@@ -25,11 +25,14 @@ wire-format detail.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socket
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 import httpx
@@ -52,6 +55,12 @@ from .agproxy_llm_adapters import (
 if TYPE_CHECKING:
     from ..agconfig import agConfig
     from ..agent import agent
+
+_MAX_PROFILER_HOOK_BODY_BYTES = 256 * 1024
+_MAX_CONCURRENT_PROFILER_FORWARDS = 8
+_PROFILER_FORWARD_TIMEOUT_S = 0.25
+_MAX_PROFILER_HOOK_EVENTS_PER_TOKEN_PER_SECOND = 128
+_MAX_PROFILER_RATE_TOKENS = 1024
 
 # NOTE: FastAPI/Starlette resolve a route handler's parameter annotations
 # (e.g. `request: Request`) from the function's *module-level* globals at
@@ -82,7 +91,11 @@ class agProxyLLMConfig(_AgConfigViewBase):
     _OWNER = "agproxy_llm"
 
 
-_DEBUG_CAPTURE_MARKERS = ("Available agent types", "task tools haven't been used", "gentle reminder")
+_DEBUG_CAPTURE_MARKERS = (
+    "Available agent types",
+    "task tools haven't been used",
+    "gentle reminder",
+)
 
 
 def _debug_log_anthropic_messages_body(path: str, body: dict) -> None:
@@ -93,8 +106,10 @@ def _debug_log_anthropic_messages_body(path: str, body: dict) -> None:
     messages = body.get("messages", [])
     roles = [m.get("role") for m in messages]
     mid_array_system = "system" in roles[1:] if roles else False
-    lines = [f"\n=== num_messages={len(roles)} roles={roles} "
-             f"{'!!! MID-ARRAY SYSTEM !!!' if mid_array_system else ''}"]
+    lines = [
+        f"\n=== num_messages={len(roles)} roles={roles} "
+        f"{'!!! MID-ARRAY SYSTEM !!!' if mid_array_system else ''}"
+    ]
     sys_field = body.get("system")
     if sys_field:
         sys_text = sys_field if isinstance(sys_field, str) else json.dumps(sys_field)
@@ -108,7 +123,9 @@ def _debug_log_anthropic_messages_body(path: str, body: dict) -> None:
         if m.get("role") == "system":
             content = m.get("content")
             text = content if isinstance(content, str) else json.dumps(content)
-            lines.append(f"    >>> MID-ARRAY SYSTEM MESSAGE at index {i} ({len(text)} chars): {text[:300]!r}")
+            lines.append(
+                f"    >>> MID-ARRAY SYSTEM MESSAGE at index {i} ({len(text)} chars): {text[:300]!r}"
+            )
             for marker in _DEBUG_CAPTURE_MARKERS:
                 if marker in text:
                     lines.append(f"        >>> contains marker: {marker!r}")
@@ -180,6 +197,7 @@ class agProxyLLM:
         agconfig: "agConfig | None" = None,
         terminus: "agLLMTerminus | None" = None,
         terminus_uds_path: "str | None" = None,
+        profiler_uds_path: "str | None" = None,
     ) -> None:
         self._agconfig = agconfig
         self._lock = threading.Lock()
@@ -194,6 +212,31 @@ class agProxyLLM:
             self._terminus = terminus if terminus is not None else get_shared_terminus(agconfig)
         self._terminus_uds_path = terminus_uds_path
         self._terminus_client: "httpx.Client | None" = None
+        # Profiler traffic deliberately bypasses the LLM terminus.  The
+        # gateway is only a container-reachable HTTP bridge; it forwards
+        # each authenticated hook event to agProfilerIngest's independent
+        # framed-JSON UDS so telemetry cannot contend with dispatch/TTFT on
+        # the terminus event loop (Design_profiler_harness_integration §5.5).
+        if profiler_uds_path is not None and terminus_uds_path is not None:
+            profiler_path = Path(profiler_uds_path)
+            if (
+                profiler_path.parent != Path("/var/run/agency_llm_gateway")
+                or not profiler_path.name.startswith("agprof-ingest-")
+                or profiler_path.suffix != ".sock"
+            ):
+                raise ValueError("invalid in-container profiler UDS bridge path")
+        self._profiler_uds_path = profiler_uds_path
+        self._profiler_sync_lock = threading.Lock()
+        # asyncio.to_thread() bounds workers but not its pending-work queue.
+        # Admit profiler work before token validation and UDS forwarding so
+        # a valid-token request loop cannot enqueue unbounded blocking jobs.
+        self._profiler_forward_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_PROFILER_FORWARDS)
+        self._profiler_rate_lock = threading.Lock()
+        self._profiler_rate_windows: "dict[str, tuple[float, int]]" = {}
+        # In-container gateways are long-lived while launch tokens are
+        # unique, so keep this cache explicitly bounded. Re-syncing an
+        # evicted active token is harmless.
+        self._profiler_synced_tokens: dict[str, None] = {}
         self._app = self._build_app()
         self._server = None
         self._thread: "threading.Thread | None" = None
@@ -244,6 +287,10 @@ class agProxyLLM:
             self._terminus.register(token, ag)
 
     def unregister(self, token: str) -> None:
+        with self._profiler_sync_lock:
+            self._profiler_synced_tokens.pop(token, None)
+        with self._profiler_rate_lock:
+            self._profiler_rate_windows.pop(token, None)
         if self._terminus is not None:
             self._terminus.unregister(token)
 
@@ -332,10 +379,91 @@ class agProxyLLM:
             json={"token": token, "tool_name": tool_name, "tool_input": tool_input},
         )
         if resp.status_code != 200:
-            raise RuntimeError(
-                f"terminus check_tool_policy failed: {resp.status_code} {resp.text}"
-            )
+            raise RuntimeError(f"terminus check_tool_policy failed: {resp.status_code} {resp.text}")
         return resp.json()
+
+    def _profiler_socket_path(self) -> str:
+        if self._profiler_uds_path is not None:
+            return self._profiler_uds_path
+        if self._terminus_uds_path is not None:
+            raise RuntimeError("in-container proxy has no profiler UDS bridge")
+        # Host-resident gateways can resolve the host service lazily.
+        from .agprof_ingest import get_shared_profiler_ingest
+
+        self._profiler_uds_path = get_shared_profiler_ingest().ensure_uds_started()
+        return self._profiler_uds_path
+
+    def _forward_profiler_hook(self, token: str, event: dict) -> dict:
+        """Send one hook event to agProfilerIngest's separate UDS.
+
+        The HTTP bearer token is injected only into the private framed
+        envelope used for host correlation; it is never accepted from the
+        request body or copied into span metadata.
+        """
+        from ..profiler.agprof_emit import _recv_framed, _send_framed
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(_PROFILER_FORWARD_TIMEOUT_S)
+        try:
+            sock.connect(self._profiler_socket_path())
+            # The hook and this gateway share one container/host clock
+            # domain. Synchronize that domain once per launch token before
+            # forwarding the hook's captured timestamp.
+            with self._profiler_sync_lock:
+                if token not in self._profiler_synced_tokens:
+                    wall_0 = time.time_ns()
+                    perf_0 = time.perf_counter_ns()
+                    _send_framed(
+                        sock,
+                        {
+                            "token": token,
+                            "ev": "clock_sync",
+                            "wall_ns": wall_0,
+                            "perf_ns": perf_0,
+                        },
+                    )
+                    sync = _recv_framed(sock)
+                    wall_1 = time.time_ns()
+                    perf_1 = time.perf_counter_ns()
+                    if not sync.get("ok"):
+                        return sync
+                    _send_framed(
+                        sock,
+                        {
+                            "token": token,
+                            "ev": "clock_offset",
+                            "wall_offset_ns": int(sync["host_wall_ns"] - (wall_0 + wall_1) / 2),
+                            "perf_offset_ns": int(sync["host_perf_ns"] - (perf_0 + perf_1) / 2),
+                        },
+                    )
+                    offset = _recv_framed(sock)
+                    if not offset.get("ok"):
+                        return offset
+                    if len(self._profiler_synced_tokens) >= 1024:
+                        self._profiler_synced_tokens.pop(next(iter(self._profiler_synced_tokens)))
+                    self._profiler_synced_tokens[token] = None
+
+            _send_framed(sock, {**event, "token": token, "ev": "hook"})
+            return _recv_framed(sock)
+        finally:
+            sock.close()
+
+    def _profiler_hook_rate_allowed(self, token: str, *, now: "float | None" = None) -> bool:
+        """Apply a bounded, per-launch fixed-window profiler event limit."""
+        if now is None:
+            now = time.monotonic()
+        with self._profiler_rate_lock:
+            window_start, count = self._profiler_rate_windows.get(token, (now, 0))
+            if now - window_start >= 1.0 or now < window_start:
+                window_start, count = now, 0
+            if count >= _MAX_PROFILER_HOOK_EVENTS_PER_TOKEN_PER_SECOND:
+                return False
+            if token not in self._profiler_rate_windows and (
+                len(self._profiler_rate_windows) >= _MAX_PROFILER_RATE_TOKENS
+            ):
+                self._profiler_rate_windows.pop(next(iter(self._profiler_rate_windows)))
+            self._profiler_rate_windows[token] = (window_start, count + 1)
+            return True
 
     # -- app / routes -----------------------------------------------------
 
@@ -442,6 +570,68 @@ class agProxyLLM:
             tool_input = body.get("tool_input") or {}
             decision = self._check_tool_policy(token, tool_name, tool_input)
             return JSONResponse(decision)
+
+        @app.post("/agprof/hook")
+        async def agprof_hook(request: Request):
+            # Claude's hook subprocess can reach this gateway's local HTTP
+            # port from inside the sandbox, but not a host-only UDS by URL.
+            # Hop directly to agProfilerIngest's separate framed listener,
+            # which owns the authoritative token registration and rejects an
+            # unknown bearer.  Do not first round-trip through the LLM
+            # terminus merely to validate the same token: that redundant hop
+            # pushed concurrent PostToolUse hooks past their tight telemetry
+            # deadline.  Body/rate/slot bounds still apply before forwarding.
+            # The blocking UDS round trip runs in a worker so it cannot stall
+            # this gateway's async LLM routes.
+            slot_acquired = self._profiler_forward_slots.acquire(blocking=False)
+            try:
+                if not slot_acquired:
+                    return JSONResponse(
+                        {"ok": False, "error": "profiler hook bridge saturated"},
+                        status_code=429,
+                    )
+                token = _extract_bearer_token(request)
+                if not token:
+                    return JSONResponse({"ok": False, "error": "unknown or missing token"}, 401)
+                if not self._profiler_hook_rate_allowed(token):
+                    return JSONResponse(
+                        {"ok": False, "error": "profiler hook rate limit exceeded"},
+                        status_code=429,
+                    )
+                body = bytearray()
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > _MAX_PROFILER_HOOK_BODY_BYTES:
+                        return JSONResponse(
+                            {"ok": False, "error": "profiler hook body too large"},
+                            status_code=413,
+                        )
+                    body.extend(chunk)
+                try:
+                    event = json.loads(body)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return JSONResponse(
+                        {"ok": False, "error": "invalid profiler hook JSON"},
+                        status_code=400,
+                    )
+                if not isinstance(event, dict):
+                    return JSONResponse(
+                        {"ok": False, "error": "invalid profiler hook event"},
+                        status_code=400,
+                    )
+                try:
+                    result = await asyncio.to_thread(self._forward_profiler_hook, token, event)
+                except Exception as exc:
+                    return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+                if result.get("error") == "unknown or missing token":
+                    return JSONResponse(result, status_code=401)
+                return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+            finally:
+                if slot_acquired:
+                    self._profiler_forward_slots.release()
+
+        @app.get("/agprof/status")
+        async def agprof_status():
+            return JSONResponse({"configured": self._profiler_uds_path is not None})
 
         @app.post("/v1/messages/count_tokens")
         async def anthropic_count_tokens(request: Request):
@@ -570,9 +760,7 @@ class agProxyLLM:
         server = uvicorn.Server(config)
         self._uds_server = server
 
-        self._uds_thread = threading.Thread(
-            target=server.run, daemon=True, name="agproxy_llm-uds"
-        )
+        self._uds_thread = threading.Thread(target=server.run, daemon=True, name="agproxy_llm-uds")
         self._uds_thread.start()
 
         deadline = time.monotonic() + 10

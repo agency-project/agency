@@ -622,6 +622,11 @@ class agent:
         ag.engine = src.engine
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
+        # Native harness continuity is part of the agent's logical history,
+        # just like ``ctx``.  A fork must inherit the snapshot that existed at
+        # fork time while remaining free to advance its own external-engine
+        # session without mutating the parent (or a sibling fork).
+        ag._harness_sessions = copy.deepcopy(src._harness_sessions)
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
