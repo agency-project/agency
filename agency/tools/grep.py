@@ -24,7 +24,9 @@ def make_grep(sandbox: "agSandbox") -> agtool:
         path: str = str(getattr(arg, "path", "/workspace") or "/workspace")
         include: str | None = getattr(arg, "include", None)
 
-        output, _ = sandbox.exec(grep_command(pattern, path, include), timeout=GREP_EXEC_TIMEOUT_SECS)
+        output, _ = sandbox.exec(
+            grep_command(pattern, path, include), timeout=GREP_EXEC_TIMEOUT_SECS
+        )
         return agdata(**parse_grep_json_output(output))
 
     def _log(tool: agtool, arg: agdata, result: agdata, elapsed_ms: int) -> None:

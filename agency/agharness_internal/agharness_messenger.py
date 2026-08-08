@@ -164,7 +164,9 @@ class agHarnessMessenger:
 
         from ..agutil import agharness_llm_gateway_dir
 
-        sock_path = str(agharness_llm_gateway_dir() / f"agharness_messenger-{uuid.uuid4().hex}.sock")
+        sock_path = str(
+            agharness_llm_gateway_dir() / f"agharness_messenger-{uuid.uuid4().hex}.sock"
+        )
         config = uvicorn.Config(self._app, uds=sock_path, log_level="warning")
         server = uvicorn.Server(config)
         self._uds_server = server

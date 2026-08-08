@@ -2,9 +2,9 @@
 default gateway-socket mount) + the in-container TCP-to-UDS relay, all
 wired together for real. NOT a pytest file on purpose while hand-verifying.
 """
+
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, "agency")
@@ -40,9 +40,19 @@ def main():
         sandbox.write_file_bytes("/tmp/_tcp_to_uds_relay.py", RELAY_SOURCE)
 
         relay_proc = subprocess.Popen(
-            [runtime, "exec", "-i", container_name, "python3", "/tmp/_tcp_to_uds_relay.py",
-             container_sock_path, "58500"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            [
+                runtime,
+                "exec",
+                "-i",
+                container_name,
+                "python3",
+                "/tmp/_tcp_to_uds_relay.py",
+                container_sock_path,
+                "58500",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         ready_line = relay_proc.stdout.readline()
         print(f"relay startup line: {ready_line.strip()!r}")
@@ -62,9 +72,11 @@ def main():
             "except urllib.error.HTTPError as e:\n"
             "    print('HTTP', e.code, e.read().decode())\n"
         )
-        result, rc = sandbox._backend._container_exec(f"python3 -c \"{check_cmd}\"")
+        result, rc = sandbox._backend._container_exec(f'python3 -c "{check_cmd}"')
         print(f"in-container request via relay (rc={rc}): {result.strip()}")
-        assert "HTTP 401" in result, f"expected a 401 (reached the real app, no token), got: {result!r}"
+        assert "HTTP 401" in result, (
+            f"expected a 401 (reached the real app, no token), got: {result!r}"
+        )
 
         print("\nUDS RELAY PROBE: PASS")
     finally:

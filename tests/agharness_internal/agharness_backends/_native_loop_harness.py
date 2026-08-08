@@ -76,7 +76,11 @@ def content_chunks(text: str, finish_reason: str = "stop"):
     choice = ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)
     return [
         ChatCompletionChunk(
-            id="chatcmpl-test", object="chat.completion.chunk", created=0, model="m", choices=[choice]
+            id="chatcmpl-test",
+            object="chat.completion.chunk",
+            created=0,
+            model="m",
+            choices=[choice],
         )
     ]
 
@@ -102,7 +106,11 @@ def tool_call_chunks(
     choice = ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)
     return [
         ChatCompletionChunk(
-            id="chatcmpl-test", object="chat.completion.chunk", created=0, model="m", choices=[choice]
+            id="chatcmpl-test",
+            object="chat.completion.chunk",
+            created=0,
+            model="m",
+            choices=[choice],
         )
     ]
 
@@ -113,7 +121,9 @@ class NativeLoopHarness:
     every UDS server started -- call it in a `finally:`, mirroring
     test_native.py's own `sb.destroy()`/`terminus.stop_uds()` pattern."""
 
-    def __init__(self, *, with_mcp: bool = False, with_messenger: bool = False, mcp_skill=None) -> None:
+    def __init__(
+        self, *, with_mcp: bool = False, with_messenger: bool = False, mcp_skill=None
+    ) -> None:
         from agency.agharness_internal.agllm_terminus import agLLMTerminus
 
         self.module = load_entrypoint_module()

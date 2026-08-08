@@ -76,7 +76,11 @@ def test_execute_parses_json_result_and_routes_through_gateway():
     prev_ctx = agcontext()
 
     payload = json.dumps(
-        {"text": "Hi there!", "usage": {"input_tokens": 5, "output_tokens": 2}, "sessionId": "sess-1"}
+        {
+            "text": "Hi there!",
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "sessionId": "sess-1",
+        }
     )
     handle = _make_handle(stdout=payload)
     with (
@@ -207,9 +211,7 @@ def test_execute_nonzero_exit_returns_agerror():
 
 def test_execute_recovers_structured_output_schema():
     backend = _GrokBackend(agConfig())
-    skill = agskill(
-        name="s", system_prompt="do the thing", output_schema=agdata(answer=str)
-    )
+    skill = agskill(name="s", system_prompt="do the thing", output_schema=agdata(answer=str))
     ag = _make_agent()
     prev_ctx = agcontext()
 

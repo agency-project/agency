@@ -42,7 +42,11 @@ def test_unpicklable_closure_fails_fast_without_docker():
 
     backend = _NativeBackend(agConfig())
     result, ctx, delta = backend.execute(
-        MagicMock(), MagicMock(), agdata(), None, skill=skill,
+        MagicMock(),
+        MagicMock(),
+        agdata(),
+        None,
+        skill=skill,
     )
 
     assert isinstance(result, agerror)
@@ -80,4 +84,6 @@ def test_picklable_closure_is_not_rejected():
 
     with patch.object(native_mod, "_ensure_entrypoint", side_effect=_PastFailFastMarker()):
         with pytest.raises(_PastFailFastMarker):
-            _NativeBackend(agConfig()).execute(MagicMock(), MagicMock(), agdata(), None, skill=skill)
+            _NativeBackend(agConfig()).execute(
+                MagicMock(), MagicMock(), agdata(), None, skill=skill
+            )

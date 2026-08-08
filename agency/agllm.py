@@ -1,6 +1,4 @@
 from __future__ import annotations
-import re
-import time
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
 from . import agllm_pure
@@ -92,7 +90,6 @@ class agLLMConfig(_AgConfigViewBase):
 # _SUMMARY_SYSTEM lives in agllm_pure.py now (agllm_pure.SUMMARY_SYSTEM) --
 # shared, unmodified, with the in-container native entrypoint's own
 # compaction (see that module's docstring for why it's split out).
-
 
 
 # LLMCallResult was retired here along with agllm.call() itself, its only

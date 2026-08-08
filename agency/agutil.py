@@ -360,7 +360,9 @@ def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 1
     failure, not something to silently swallow."""
     import shlex
 
-    missing = [pkg for pkg in packages if sandbox.exec(f'python3 -c "import {pkg}"', timeout=30)[1] != 0]
+    missing = [
+        pkg for pkg in packages if sandbox.exec(f'python3 -c "import {pkg}"', timeout=30)[1] != 0
+    ]
     if not missing:
         return
 

@@ -16,7 +16,7 @@ import uuid
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agency.agdata import agdata, agerror
+from agency.agdata import agdata
 from agency.agresources import agResourcePool
 
 

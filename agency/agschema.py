@@ -96,8 +96,6 @@ def _lenient_json_object(raw_text: str) -> dict:
     raise original_exc
 
 
-
-
 class agschema:
     """Schema wrapper for agskill input/output schemas.
 

@@ -148,7 +148,9 @@ class agMCPServer:
         server = self._server
 
         @server.tool(structured_output=True)
-        def reserve_cpu(cpus: "float | None" = None, memory: "str | None" = None, *, ctx: Context) -> dict[str, Any]:
+        def reserve_cpu(
+            cpus: "float | None" = None, memory: "str | None" = None, *, ctx: Context
+        ) -> dict[str, Any]:
             """Boost CPU and/or memory limits for the current sandbox container
             before running compute-intensive work. Always call cpu_release when done."""
             token = _extract_bearer_token(ctx.headers)

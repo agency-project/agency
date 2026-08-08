@@ -17,7 +17,10 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
-from agency.agharness_internal.agharness_backends.opencode import _OpencodeBackend, opencode_available
+from agency.agharness_internal.agharness_backends.opencode import (
+    _OpencodeBackend,
+    opencode_available,
+)
 from agency.agskill import agskill
 
 
@@ -138,9 +141,7 @@ def test_execute_nonzero_exit_returns_agerror():
 
 def test_execute_recovers_structured_output_schema():
     backend = _OpencodeBackend(agConfig())
-    skill = agskill(
-        name="s", system_prompt="do the thing", output_schema=agdata(answer=str)
-    )
+    skill = agskill(name="s", system_prompt="do the thing", output_schema=agdata(answer=str))
     ag = _make_agent()
     prev_ctx = agcontext()
 

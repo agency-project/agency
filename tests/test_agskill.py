@@ -1,14 +1,14 @@
 """Tests for agskill as a self-contained ReAct skill."""
 
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
 from agency.agconfig import agConfig
-from agency.agschema import agschema, _AgSchemaFields
+from agency.agschema import agschema
 from agency.agskill import agskill
 from agency.agllm import _AgLLMFields, agllm
-from agency.agtool import agtool, _AgToolFields
+from agency.agtool import agtool
 from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
 
 LLM_MAX_RETRIES = _AgLLMFields.max_retries.default

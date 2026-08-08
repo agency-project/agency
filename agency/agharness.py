@@ -148,8 +148,9 @@ class _LoggingAllowAllPolicy:
                 {},
                 0,
             )
-        except Exception:
-            pass  # logging is best-effort; never let it block the traced process
+        except Exception as _e:
+            # logging is best-effort; never let it block the traced process
+            print(f"[agharness] WARNING: failed to log syscall {event.syscall!r}: {_e}")
         return agdecision.allow()
 
     def check_tool(self, ag, tool_name: str, tool_input: dict):
@@ -157,8 +158,9 @@ class _LoggingAllowAllPolicy:
 
         try:
             self._ag.log._tool_call(tool_name, tool_input, {}, 0)
-        except Exception:
-            pass  # logging is best-effort; never let it block the harness
+        except Exception as _e:
+            # logging is best-effort; never let it block the harness
+            print(f"[agharness] WARNING: failed to log tool call {tool_name!r}: {_e}")
         return agdecision.allow()
 
 
