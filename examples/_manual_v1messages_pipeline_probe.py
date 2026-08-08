@@ -15,7 +15,8 @@ Run:
     .venv/bin/python3 examples/_manual_v1messages_pipeline_probe.py
 
 With no LLM_BASE_URL, this falls back to Bedrock and requires AWS credentials.
-Set LLM_REGION to select the Bedrock region (default: us-east-1).
+Set LLM_REGION to select the Bedrock region (default: us-east-1), and
+LLM_CONTEXT_LIMIT when the backend's model metadata endpoint is unavailable.
 """
 
 import os
@@ -34,12 +35,13 @@ if os.environ.get("LLM_BASE_URL"):
         )
     )
 else:
-    cfg = agConfig(
-        agBedrockBackendConfig(
-            model=os.environ.get("LLM_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
-            region=os.environ.get("LLM_REGION", "us-east-1"),
-        )
-    )
+    bedrock_kwargs = {
+        "model": os.environ.get("LLM_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        "region": os.environ.get("LLM_REGION", "us-east-1"),
+    }
+    if os.environ.get("LLM_CONTEXT_LIMIT"):
+        bedrock_kwargs["context_limit"] = int(os.environ["LLM_CONTEXT_LIMIT"])
+    cfg = agConfig(agBedrockBackendConfig(**bedrock_kwargs))
 
 
 def _make_run_dir(name: str):
