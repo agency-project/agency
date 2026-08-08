@@ -824,6 +824,7 @@ class _ContainerBackendBase(agsandbox_backend):
     def _ensure_started(self) -> None:
         with agprof.span("sandbox:start"):
             self._ensure_started_profiled()
+        self._register_prof_container()
 
     def _ensure_started_profiled(self) -> None:
         """Start the Docker/Podman container on first use.
@@ -847,10 +848,11 @@ class _ContainerBackendBase(agsandbox_backend):
         someone else" case to force-remove here the way there used to be.
 
         Ground truth is always a real docker/podman inspect -- there is no
-        self._started cache. Every call pays that cost (just one inspect
-        call now, via _inspect_container_state(), not two), but that's the
-        price of never trusting a per-process flag that a different
-        worker-process copy of this backend could have made stale.
+        self._started cache. Every call pays one lifecycle-state inspect via
+        _inspect_container_state(); an active profiler adds an ID/PID inspect
+        on first registration to resolve and validate the kernel cgroup. That's the price of never
+        trusting a per-process flag that a different worker-process copy of
+        this backend could have made stale.
 
         _baseline_pids is captured exactly once (None means "not yet") and
         never refreshed after that, even though this method itself now runs
@@ -897,6 +899,10 @@ class _ContainerBackendBase(agsandbox_backend):
         if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
             self._gpu_id = self._gpu_acquire_fn()
         gpu_flags = _gpu_flags(self._runtime)
+        cgroup_flags = []
+        cgroup_parent = agprof.container_cgroup_parent()
+        if cgroup_parent is not None and self._runtime == "docker":
+            cgroup_flags = [f"--cgroup-parent={cgroup_parent}"]
         self._acquire_runtime_slot()
         try:
             if self._checkpoint_image is not None:
@@ -906,6 +912,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
+                    + cgroup_flags
                     + gpu_flags
                     + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
@@ -924,6 +931,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
                     + limit_flags
+                    + cgroup_flags
                     + gpu_flags
                     + self._vol_flags
                     + [image, "tail", "-f", "/dev/null"]
@@ -945,6 +953,113 @@ class _ContainerBackendBase(agsandbox_backend):
             raise
         if self._baseline_pids is None:
             self._baseline_pids = self._snapshot_pids_started()
+
+    def _prof_container_label(self) -> str:
+        """Return the plain agent name used for profiler resource series.
+
+        ``agSandbox`` allocates backend names as
+        ``sandbox_<agname>_<four-character-dedup>``. Unwrap that internal
+        envelope so cgroup, process, and GPU series line up with the agent's
+        span lanes.
+        """
+        name = str(self._agname)
+        if name.startswith("sandbox_"):
+            name = name[len("sandbox_") :]
+            base, _, suffix = name.rpartition("_")
+            if base and len(suffix) == 4:
+                name = base
+        return name
+
+    def _register_prof_container(self) -> None:
+        """Register this running container's kernel cgroup with agprof.
+
+        Resolve the cgroup from the runtime-reported host init PID rather
+        than assuming a Docker or Podman cgroup naming scheme. Profiling is
+        intentionally strict here: an active session on anything other than
+        cgroup v2 fails loudly instead of producing incomplete resource data.
+        """
+        if not agprof.enabled():
+            return
+        label = self._prof_container_label()
+        if agprof.container_registered(label):
+            return
+        result = self._run(
+            [
+                self._runtime,
+                "inspect",
+                "--format",
+                "{{.Id}}|{{.State.Pid}}",
+                self._name,
+            ],
+            check=False,
+            timeout=self.inspect_timeout_s,
+        )
+        raw_inspect = result.stdout.decode("utf-8", errors="replace").strip()
+        container_id, separator, pid_text = raw_inspect.partition("|")
+        try:
+            pid = int(pid_text)
+        except (TypeError, ValueError):
+            pid = 0
+        if (
+            result.returncode != 0
+            or not separator
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+            or pid <= 0
+        ):
+            raise RuntimeError(
+                f"agprof: cannot resolve ID and init PID for container {self._name!r} — "
+                "only docker/podman on cgroup v2 are supported"
+            )
+        try:
+            cg_text = Path(f"/proc/{pid}/cgroup").read_text()
+        except OSError as e:
+            raise RuntimeError(f"agprof: cannot read cgroup of container PID {pid}: {e}") from e
+        rel = next(
+            (
+                line.split("::", 1)[1].strip()
+                for line in cg_text.splitlines()
+                if line.startswith("0::")
+            ),
+            None,
+        )
+        if rel is None:
+            raise RuntimeError(
+                f"agprof: container PID {pid} has no cgroup v2 entry — "
+                "cgroup v1 hosts are not supported"
+            )
+        cgroup_dir = "/sys/fs/cgroup" + rel
+        leaf = os.path.basename(os.path.normpath(cgroup_dir))
+        expected_leaves = {
+            container_id,
+            f"docker-{container_id}.scope",
+            f"libpod-{container_id}.scope",
+        }
+        if leaf not in expected_leaves:
+            raise RuntimeError(
+                f"agprof: local cgroup for runtime PID {pid} does not match container "
+                f"{container_id[:12]} — the docker/podman daemon may be remote or VM-backed"
+            )
+
+        daemon_dir = None
+        daemon_kind = "conmon"
+        scope = cgroup_dir
+        while scope and not scope.endswith(".scope") and scope != "/sys/fs/cgroup":
+            scope = os.path.dirname(scope)
+        base = os.path.basename(scope)
+        if base.startswith("libpod-"):
+            candidate = os.path.join(
+                os.path.dirname(scope), f"libpod-conmon-{base[len('libpod-') :]}"
+            )
+            if os.path.isdir(candidate):
+                daemon_dir = candidate
+        elif base.startswith("docker-"):
+            daemon_kind = "dockerd"
+            for service in ("docker.service", "containerd.service"):
+                candidate = f"/sys/fs/cgroup/system.slice/{service}"
+                if os.path.isdir(candidate):
+                    agprof.container_started(label, cgroup_dir, candidate, daemon_kind)
+            daemon_dir = None
+        agprof.container_started(label, cgroup_dir, daemon_dir, daemon_kind)
 
     def _snapshot_pids_started(self) -> set[int]:
         """Same PID listing as base._snapshot_pids(), routed through
@@ -1602,6 +1717,7 @@ class _ContainerBackendBase(agsandbox_backend):
             self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
         )
         if not self._container_running():
+            agprof.container_stopped(self._prof_container_label())
             return
         # Clear PID tracking — stopping kills every process inside, same as rm.
         self._watched_pids = {}
@@ -1620,6 +1736,7 @@ class _ContainerBackendBase(agsandbox_backend):
         # Only release once actually confirmed not running -- a failed stop
         # may still leave the container (and the slot/GPU it holds) alive.
         if not self._container_running():
+            agprof.container_stopped(self._prof_container_label())
             self._release_runtime_slot()
             if gpu_id_to_release is not None and self._gpu_release_fn is not None:
                 self._gpu_release_fn(gpu_id_to_release)
@@ -1650,6 +1767,7 @@ class _ContainerBackendBase(agsandbox_backend):
             self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
         )
         if not self._container_status():
+            agprof.container_stopped(self._prof_container_label())
             if gpu_id_to_release is not None and self._gpu_release_fn is not None:
                 self._gpu_release_fn(gpu_id_to_release)
                 self._gpu_id = None
@@ -1693,6 +1811,12 @@ class _ContainerBackendBase(agsandbox_backend):
         ):
             self._gpu_release_fn(gpu_id_to_release)
             self._gpu_id = None
+        # A runtime client can raise even when the daemon completed removal;
+        # drop stale attribution whenever removal succeeded or the container
+        # is independently confirmed no longer running. Keep it registered if
+        # a failed rm left the workload alive.
+        if rm_exc is None or not self._container_running():
+            agprof.container_stopped(self._prof_container_label())
         if rm_exc is not None:
             raise rm_exc
 

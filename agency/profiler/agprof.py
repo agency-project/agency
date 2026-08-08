@@ -228,7 +228,7 @@ def container_started(
 
 
 def container_stopped(label: str) -> None:
-    """Drop a removed container from the sampling registry."""
+    """Drop a stopped or removed container from the sampling registry."""
     with _cg_lock:
         _cg_registry.pop(label, None)
 
