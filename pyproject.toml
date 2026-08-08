@@ -22,6 +22,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+profiler = [
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp",
+    "nvidia-ml-py",
+]
 dev = [
     "pytest",
     "pytest-mock",
