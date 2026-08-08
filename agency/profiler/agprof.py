@@ -46,6 +46,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,7 +70,8 @@ _interrupted_spans: "list[dict]" = []
 _last_summary: "dict[str, dict] | None" = None
 _last_run_summary: "dict | None" = None
 
-_tls = threading.local()
+_tls = threading.local()  # per-thread schedstat file cache only
+_span_stack: "ContextVar[tuple[_TimedSpan, ...]]" = ContextVar("agprof_span_stack", default=())
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
@@ -282,6 +284,7 @@ class _TimedSpan:
         "_tid",
         "_metadata",
         "_interrupted",
+        "_stack_token",
     )
 
     def __init__(self, tracer, name: str) -> None:
@@ -291,6 +294,7 @@ class _TimedSpan:
         self._scope = None
         self._metadata: dict = {}
         self._interrupted = False
+        self._stack_token = None
 
     def __enter__(self) -> "_TimedSpan":
         self._t0 = time.perf_counter_ns()
@@ -303,24 +307,15 @@ class _TimedSpan:
 
         self._scope = use_span(self._span, end_on_exit=False)
         self._scope.__enter__()
-        stack = getattr(_tls, "span_stack", None)
-        if stack is None:
-            stack = _tls.span_stack = []
-        stack.append(self)
+        self._stack_token = _span_stack.set((*_span_stack.get(), self))
         with _open_spans_lock:
             _open_spans[id(self)] = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        stack = getattr(_tls, "span_stack", None)
-        if stack:
-            if stack[-1] is self:
-                stack.pop()
-            else:
-                try:
-                    stack.remove(self)
-                except ValueError:
-                    pass
+        stack_token = getattr(self, "_stack_token", None)
+        if stack_token is not None:
+            _span_stack.reset(stack_token)
         with _open_spans_lock:
             _open_spans.pop(id(self), None)
         if self._interrupted:
@@ -413,11 +408,12 @@ def enabled() -> bool:
 
 
 def span(name: str):
-    """A timed, named interval on the current thread.
+    """A timed, named interval in the current execution context.
 
-    No-op (a shared ``nullcontext``) unless a session is active. Nesting on the
-    same thread produces parent/child spans in the trace. While active, each
-    span also records its thread's CPU and run-queue time (see module doc).
+    No-op (a shared ``nullcontext``) unless a session is active. Nesting in the
+    same synchronous or async context produces parent/child spans in the trace.
+    While active, each span also records its thread's CPU and run-queue time
+    (see module doc).
     """
     s = _session
     if s is None:
@@ -426,15 +422,17 @@ def span(name: str):
 
 
 def annotate(**metadata) -> None:
-    """Attach fields to the innermost active span on this thread.
+    """Attach fields to the innermost active span in this execution context.
 
-    This is a no-op when profiling is disabled or the current thread has no
-    open span. Framework call sites use it for outcomes, token counts, TTFT,
-    and other per-invocation metrics without adding work to the off path.
+    This is a no-op when profiling is disabled or the current context has no
+    open span. Context-local ownership prevents concurrent asyncio tasks on one
+    thread from cross-annotating. Framework call sites use it for outcomes,
+    token counts, TTFT, and other per-invocation metrics without adding work to
+    the off path.
     """
     if _session is None:
         return
-    stack = getattr(_tls, "span_stack", None)
+    stack = _span_stack.get()
     if stack:
         stack[-1].annotate(**metadata)
 

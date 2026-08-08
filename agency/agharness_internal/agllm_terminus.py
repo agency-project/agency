@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import ssl
+import sys
 import threading
 import time
 import uuid
@@ -38,6 +39,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..agconfig import GlobalConfigParam, _AgConfigViewBase
 from ..agllm_backends import BAD_REQUEST_EXCS, API_CONN_EXCS, RATE_LIMIT_EXCS, API_ERROR_EXCS
+from ..profiler import agprof
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
@@ -193,6 +195,46 @@ class agLLMTerminusConfig(_AgConfigViewBase):
     _OWNER = "agllm_terminus"
 
 
+class _ProfiledStreamingResponse(StreamingResponse):
+    """Close a provider-attempt span after Starlette drains its body.
+
+    The terminus has to pull the first provider chunk before constructing the
+    response so pre-stream failures can still become an HTTP 400/503.  Usage,
+    however, normally arrives in the final chunk.  Keeping the span scope on
+    the response bridges those two points without buffering the provider
+    stream or changing when the caller receives chunks.
+    """
+
+    def __init__(self, *args, finish_span, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._finish_span = finish_span
+
+    async def __call__(self, scope, receive, send) -> None:
+        exc_info = (None, None, None)
+        try:
+            await super().__call__(scope, receive, send)
+        except BaseException:
+            exc_info = sys.exc_info()
+            raise
+        finally:
+            self._finish_span(exc_info)
+
+
+def _annotate_span(span, **metadata) -> None:
+    """Annotate a concrete span handle, or do nothing when profiling is off."""
+    annotate = getattr(span, "annotate", None)
+    if annotate is not None:
+        annotate(**metadata)
+
+
+def _usage_metrics(usage: "dict | None") -> dict:
+    usage = usage or {}
+    return {
+        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("completion_tokens") or 0),
+    }
+
+
 class agLLMTerminus:
     """The one place a real per-agent LLM backend client is ever
     constructed. One process-wide instance, shared the same way
@@ -263,11 +305,15 @@ class agLLMTerminus:
             transcript = self._last_transcript_by_token.get(token)
             return list(transcript) if transcript is not None else None
 
-    def _record_transcript(self, token: "str | None", request_messages, response_message: dict) -> None:
+    def _record_transcript(
+        self, token: "str | None", request_messages, response_message: dict
+    ) -> None:
         if token is None:
             return
         with self._lock:
-            self._last_transcript_by_token[token] = list(request_messages or []) + [response_message]
+            self._last_transcript_by_token[token] = list(request_messages or []) + [
+                response_message
+            ]
 
     # -- app / route ------------------------------------------------------
 
@@ -300,8 +346,20 @@ class agLLMTerminus:
                 self.request_log.append({"token": token, "model": kwargs.get("model", "")})
             timeout_s = _AgLLMTerminusFields(self._agconfig).request_timeout_s
             client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
+            model = kwargs.get("model", "")
+            provider = type(ag.llm.backend).__name__
 
             if kwargs.get("stream"):
+                # OpenAI-compatible providers only include the final usage
+                # chunk when explicitly requested.  Anthropic/Bedrock's
+                # compatibility client accepts and discards this option while
+                # still producing its own final usage chunk.
+                kwargs = dict(kwargs)
+                stream_options = kwargs.get("stream_options")
+                stream_options = dict(stream_options) if isinstance(stream_options, dict) else {}
+                stream_options["include_usage"] = True
+                kwargs["stream_options"] = stream_options
+
                 # Force the FIRST chunk before returning any HTTP response
                 # at all -- this is what makes the 503-vs-400 classification
                 # below meaningful. A `StreamingResponse` commits its status
@@ -310,29 +368,110 @@ class agLLMTerminus:
                 # generator can no longer be signaled to the caller as
                 # "retry me" -- see this module's retry-policy comment
                 # above for why that's a hard constraint, not an oversight.
+                attempt_scope = agprof.span("llm:attempt[0]")
+                attempt_span = attempt_scope.__enter__()
+                attempt_t0 = time.perf_counter()
+                span_closed = False
+
+                def _finish_span(exc_info=(None, None, None)) -> None:
+                    nonlocal span_closed
+                    if not span_closed:
+                        span_closed = True
+                        attempt_scope.__exit__(*exc_info)
+
                 try:
                     stream_iter = iter(client.chat.completions.create(**kwargs))
                     first_chunk = next(stream_iter)
+                    ttft_ms = (time.perf_counter() - attempt_t0) * 1000
+                    _annotate_span(
+                        attempt_span,
+                        model=model,
+                        provider=provider,
+                        ttft_ms=round(ttft_ms, 3),
+                    )
                 except StopIteration:
                     # A genuinely empty stream -- not an error, just
                     # nothing to reassemble or forward.
-                    return StreamingResponse(iter(["data: [DONE]\n\n"]), media_type="text/event-stream")
+                    elapsed_ms = (time.perf_counter() - attempt_t0) * 1000
+                    _annotate_span(
+                        attempt_span,
+                        model=model,
+                        provider=provider,
+                        outcome="success",
+                        ttft_ms=None,
+                        generation_ms=round(elapsed_ms, 3),
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                    _finish_span()
+                    return StreamingResponse(
+                        iter(["data: [DONE]\n\n"]), media_type="text/event-stream"
+                    )
                 except BAD_REQUEST_EXCS as e:
+                    _annotate_span(
+                        attempt_span,
+                        model=model,
+                        provider=provider,
+                        outcome="failure",
+                        error_type=type(e).__name__,
+                        status_code=400,
+                        transient=False,
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                    _finish_span(sys.exc_info())
                     try:
                         client.close()
-                    except Exception:
-                        pass
+                    except Exception as close_error:
+                        print(
+                            "[agllm_terminus] WARNING: failed to close client after "
+                            f"bad request: {close_error}"
+                        )
                     return JSONResponse(
                         {"error": {"message": str(e), "transient": False}}, status_code=400
                     )
                 except TRANSIENT_DISPATCH_EXCS as e:
+                    _annotate_span(
+                        attempt_span,
+                        model=model,
+                        provider=provider,
+                        outcome="failure",
+                        error_type=type(e).__name__,
+                        status_code=503,
+                        transient=True,
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                    _finish_span(sys.exc_info())
                     try:
                         client.close()
-                    except Exception:
-                        pass
+                    except Exception as close_error:
+                        print(
+                            "[agllm_terminus] WARNING: failed to close client after "
+                            f"transient error: {close_error}"
+                        )
                     return JSONResponse(
                         {"error": {"message": str(e), "transient": True}}, status_code=503
                     )
+                except BaseException as e:
+                    _annotate_span(
+                        attempt_span,
+                        model=model,
+                        provider=provider,
+                        outcome="failure",
+                        error_type=type(e).__name__,
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                    _finish_span(sys.exc_info())
+                    try:
+                        client.close()
+                    except Exception as close_error:
+                        print(
+                            "[agllm_terminus] WARNING: failed to close client after "
+                            f"unexpected dispatch error: {close_error}"
+                        )
+                    raise
 
                 # Reassemble the streamed deltas into one final message for
                 # the transcript (Phase 5) -- mirrors the exact same
@@ -343,9 +482,31 @@ class agLLMTerminus:
                 # actual caller below are untouched.
                 content_parts: "list[str]" = []
                 tool_calls_raw: "dict[int, dict]" = {}
+                usage: "dict | None" = None
 
                 def _accumulate_and_serialize(chunk) -> dict:
+                    nonlocal usage
                     serialized = _serialize_chunk(chunk)
+                    chunk_usage = serialized.get("usage")
+                    if chunk_usage is not None:
+                        if usage is None:
+                            usage = chunk_usage
+                        else:
+                            # Some compatibility backends report prompt and
+                            # completion counts in different chunks.  Retain
+                            # the latest non-zero value for each side.
+                            prompt_tokens = chunk_usage.get("prompt_tokens") or usage.get(
+                                "prompt_tokens", 0
+                            )
+                            completion_tokens = chunk_usage.get("completion_tokens") or usage.get(
+                                "completion_tokens", 0
+                            )
+                            usage = {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": chunk_usage.get("total_tokens")
+                                or (prompt_tokens + completion_tokens),
+                            }
                     for choice in serialized["choices"]:
                         delta = choice["delta"]
                         if delta.get("content"):
@@ -354,7 +515,11 @@ class agLLMTerminus:
                             idx = tc.get("index", 0)
                             slot = tool_calls_raw.setdefault(
                                 idx,
-                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                                {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
                             )
                             if tc.get("id"):
                                 slot["id"] = tc["id"]
@@ -381,18 +546,60 @@ class agLLMTerminus:
                     return serialized
 
                 def sse_gen():
-                    yield f"data: {json.dumps(_accumulate_and_serialize(first_chunk))}\n\n"
-                    for chunk in stream_iter:
-                        yield f"data: {json.dumps(_accumulate_and_serialize(chunk))}\n\n"
-                    yield "data: [DONE]\n\n"
+                    try:
+                        yield f"data: {json.dumps(_accumulate_and_serialize(first_chunk))}\n\n"
+                        for chunk in stream_iter:
+                            yield f"data: {json.dumps(_accumulate_and_serialize(chunk))}\n\n"
+                    except BaseException as e:
+                        elapsed_ms = (time.perf_counter() - attempt_t0) * 1000
+                        _annotate_span(
+                            attempt_span,
+                            model=model,
+                            provider=provider,
+                            outcome="failure",
+                            error_type=type(e).__name__,
+                            generation_ms=round(max(0.0, elapsed_ms - ttft_ms), 3),
+                            **_usage_metrics(usage),
+                        )
+                        raise
+                    else:
+                        elapsed_ms = (time.perf_counter() - attempt_t0) * 1000
+                        _annotate_span(
+                            attempt_span,
+                            model=model,
+                            provider=provider,
+                            outcome="success",
+                            generation_ms=round(max(0.0, elapsed_ms - ttft_ms), 3),
+                            **_usage_metrics(usage),
+                        )
+                        yield "data: [DONE]\n\n"
 
-                return StreamingResponse(sse_gen(), media_type="text/event-stream")
+                return _ProfiledStreamingResponse(
+                    sse_gen(), media_type="text/event-stream", finish_span=_finish_span
+                )
 
-            result = client.chat.completions.create(**kwargs)
-            serialized = _serialize_result(result)
-            if serialized["choices"]:
-                self._record_transcript(token, kwargs.get("messages"), serialized["choices"][0]["message"])
-            return JSONResponse(serialized)
+            with agprof.span("llm:attempt[0]") as attempt_span:
+                _annotate_span(attempt_span, model=model, provider=provider)
+                try:
+                    result = client.chat.completions.create(**kwargs)
+                    serialized = _serialize_result(result)
+                except BaseException as e:
+                    _annotate_span(
+                        attempt_span,
+                        outcome="failure",
+                        error_type=type(e).__name__,
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                    raise
+                _annotate_span(
+                    attempt_span, outcome="success", **_usage_metrics(serialized["usage"])
+                )
+                if serialized["choices"]:
+                    self._record_transcript(
+                        token, kwargs.get("messages"), serialized["choices"][0]["message"]
+                    )
+                return JSONResponse(serialized)
 
         @app.post("/internal/resolve_model")
         async def resolve_model(request: Request):
@@ -454,7 +661,9 @@ class agLLMTerminus:
             from .. import agharness
 
             policy = agharness.default_policy(ag)
-            decision = policy.check_tool(ag, body.get("tool_name", ""), body.get("tool_input") or {})
+            decision = policy.check_tool(
+                ag, body.get("tool_name", ""), body.get("tool_input") or {}
+            )
             return JSONResponse({"decision": decision.kind, "reason": decision.reason})
 
         return app

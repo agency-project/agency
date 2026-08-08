@@ -17,9 +17,10 @@ from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice, Choic
 from openai.types.completion_usage import CompletionUsage
 
 from agency.agharness_internal.agllm_terminus import agLLMTerminus
+from agency.profiler import agprof
 
 
-def _completion(content=None, finish_reason="stop", id="chatcmpl-test", model="m"):
+def _completion(content=None, finish_reason="stop", id="chatcmpl-test", model="m", usage=None):
     """A real, valid ChatCompletion -- agllm_terminus's dispatch route
     serializes these via duck-typed attribute access
     (_serialize_result/_serialize_chunk), NOT `.model_dump()`/
@@ -31,16 +32,31 @@ def _completion(content=None, finish_reason="stop", id="chatcmpl-test", model="m
     message = ChatCompletionMessage(role="assistant", content=content)
     choice = Choice(index=0, finish_reason=finish_reason, message=message)
     return ChatCompletion(
-        id=id, object="chat.completion", created=0, model=model, choices=[choice]
+        id=id, object="chat.completion", created=0, model=model, choices=[choice], usage=usage
     )
 
 
-def _chunk(content=None, finish_reason=None, id="chatcmpl-test", model="m"):
+def _chunk(content=None, finish_reason=None, id="chatcmpl-test", model="m", usage=None):
     delta = ChoiceDelta(content=content)
     choice = ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)
     return ChatCompletionChunk(
-        id=id, object="chat.completion.chunk", created=0, model=model, choices=[choice]
+        id=id, object="chat.completion.chunk", created=0, model=model, choices=[choice], usage=usage
     )
+
+
+class _RecordingSpan:
+    def __init__(self):
+        self.metadata = {}
+        self.exit_info = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.exit_info = exc_info
+
+    def annotate(self, **metadata):
+        self.metadata.update(metadata)
 
 
 def _make_terminus_with_agent(token="tok", stream_result=None, single_result=None):
@@ -49,7 +65,9 @@ def _make_terminus_with_agent(token="tok", stream_result=None, single_result=Non
     if stream_result is not None:
         fake_client.chat.completions.create.return_value = stream_result
     else:
-        fake_client.chat.completions.create.return_value = single_result or _completion(content="hi")
+        fake_client.chat.completions.create.return_value = single_result or _completion(
+            content="hi"
+        )
     fake_ag = MagicMock()
     fake_ag.llm.backend.make_client.return_value = fake_client
     term.register(token, fake_ag)
@@ -134,6 +152,86 @@ def test_valid_token_streaming_dispatch():
     assert lines[2] == "data: [DONE]"
 
 
+def test_streaming_dispatch_profiles_ttft_final_usage_and_backend(monkeypatch):
+    usage = CompletionUsage(prompt_tokens=11, completion_tokens=4, total_tokens=15)
+    chunks = [_chunk(content="a"), _chunk(content=None, finish_reason="stop", usage=usage)]
+    term, ag, fake_client = _make_terminus_with_agent(token="tok", stream_result=chunks)
+    client = _client_for(term)
+    span = _RecordingSpan()
+    monkeypatch.setattr(
+        "agency.agharness_internal.agllm_terminus.agprof.span",
+        lambda name: span if name == "llm:attempt[0]" else None,
+    )
+
+    kwargs = {"model": "profiled-model", "messages": [], "stream": True}
+    resp = client.post("/internal/dispatch", json={"token": "tok", "kwargs": kwargs})
+
+    assert resp.status_code == 200
+    assert span.exit_info == (None, None, None)
+    assert span.metadata["outcome"] == "success"
+    assert span.metadata["model"] == "profiled-model"
+    assert span.metadata["provider"] == type(ag.llm.backend).__name__
+    assert span.metadata["input_tokens"] == 11
+    assert span.metadata["output_tokens"] == 4
+    assert span.metadata["ttft_ms"] >= 0
+    assert span.metadata["generation_ms"] >= 0
+    forwarded = fake_client.chat.completions.create.call_args.kwargs
+    assert forwarded["stream_options"] == {"include_usage": True}
+
+
+def test_streaming_dispatch_populates_llm_summary(monkeypatch, tmp_path):
+    usage = CompletionUsage(prompt_tokens=13, completion_tokens=5, total_tokens=18)
+    chunks = [_chunk(content="a"), _chunk(content=None, finish_reason="stop", usage=usage)]
+    term, _, _ = _make_terminus_with_agent(token="tok", stream_result=chunks)
+    client = _client_for(term)
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        resp = client.post(
+            "/internal/dispatch",
+            json={
+                "token": "tok",
+                "kwargs": {"model": "summary-model", "messages": [], "stream": True},
+            },
+        )
+        assert resp.status_code == 200
+
+    summary = agprof.summary_metrics()
+    assert summary["llm_metrics"]["calls"] == 1
+    assert summary["llm_metrics"]["successful_calls"] == 1
+    assert summary["llm_metrics"]["input_tokens"] == 13
+    assert summary["llm_metrics"]["output_tokens"] == 5
+    assert summary["llm_metrics"]["ttft"]["mean_ms"] is not None
+
+
+def test_non_streaming_dispatch_profiles_usage_and_backend(monkeypatch):
+    usage = CompletionUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10)
+    term, ag, _ = _make_terminus_with_agent(
+        token="tok", single_result=_completion(content="hi", usage=usage)
+    )
+    client = _client_for(term)
+    span = _RecordingSpan()
+    monkeypatch.setattr(
+        "agency.agharness_internal.agllm_terminus.agprof.span",
+        lambda name: span if name == "llm:attempt[0]" else None,
+    )
+
+    resp = client.post(
+        "/internal/dispatch",
+        json={"token": "tok", "kwargs": {"model": "m", "messages": [], "stream": False}},
+    )
+
+    assert resp.status_code == 200
+    assert span.exit_info == (None, None, None)
+    assert span.metadata == {
+        "model": "m",
+        "provider": type(ag.llm.backend).__name__,
+        "outcome": "success",
+        "input_tokens": 7,
+        "output_tokens": 3,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Retry-policy classification -- see agllm_terminus.py's own module-level
 # comment for why this terminus does exactly one attempt (no sleep, no
@@ -176,6 +274,39 @@ def test_streaming_dispatch_bad_request_before_first_chunk_returns_400():
     assert resp.status_code == 400
     payload = resp.json()
     assert payload["error"]["transient"] is False
+
+
+def test_streaming_dispatch_profiles_classified_failure(monkeypatch):
+    import openai
+
+    term, ag, fake_client = _make_terminus_with_agent(token="tok")
+    fake_client.chat.completions.create.side_effect = openai.BadRequestError(
+        message="invalid request", response=MagicMock(status_code=400), body=None
+    )
+    client = _client_for(term)
+    span = _RecordingSpan()
+    monkeypatch.setattr(
+        "agency.agharness_internal.agllm_terminus.agprof.span",
+        lambda name: span if name == "llm:attempt[0]" else None,
+    )
+
+    resp = client.post(
+        "/internal/dispatch",
+        json={"token": "tok", "kwargs": {"model": "m", "messages": [], "stream": True}},
+    )
+
+    assert resp.status_code == 400
+    assert span.exit_info[0] is openai.BadRequestError
+    assert span.metadata == {
+        "model": "m",
+        "provider": type(ag.llm.backend).__name__,
+        "outcome": "failure",
+        "error_type": "BadRequestError",
+        "status_code": 400,
+        "transient": False,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
 
 
 def test_streaming_dispatch_rate_limit_before_first_chunk_returns_503():

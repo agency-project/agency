@@ -1,5 +1,6 @@
 """Tests for environment-controlled profiler lifecycle scopes."""
 
+import asyncio
 import json
 import time
 from contextlib import contextmanager
@@ -445,6 +446,42 @@ def test_real_otel_session_records_nested_parent_ids(monkeypatch, tmp_path):
     assert sandbox[6]["agency.wall_ns"] > 0
     assert sandbox[6]["agency.cpu_ns"] >= 0
     assert json.loads((tmp_path / "summary.json").read_text())["llm_metrics"]["calls"] == 0
+
+
+def test_concurrent_async_spans_keep_annotations_task_local(monkeypatch, tmp_path):
+    """An open span in one coroutine must not own another task's annotate()."""
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    async def overlap_spans():
+        first_open = asyncio.Event()
+        second_open = asyncio.Event()
+        first_annotated = asyncio.Event()
+
+        async def first():
+            with agprof.span("async:first"):
+                first_open.set()
+                await second_open.wait()
+                agprof.annotate(owner="first")
+                first_annotated.set()
+
+        async def second():
+            await first_open.wait()
+            with agprof.span("async:second"):
+                second_open.set()
+                await first_annotated.wait()
+                agprof.annotate(owner="second")
+
+        await asyncio.gather(first(), second())
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        asyncio.run(overlap_spans())
+
+    records = {record[1]: record for record in agprof._records}
+    assert records["async:first"][6]["owner"] == "first"
+    assert records["async:second"][6]["owner"] == "second"
+    assert records["async:first"][8] is None
+    assert records["async:second"][8] is None
 
 
 @pytest.mark.parametrize(
