@@ -540,6 +540,13 @@ def test_poll_commands_applies_and_deletes_command_files(tmp_path):
         while time.time() < deadline and ag._state.run_allowed.is_set():
             time.sleep(0.02)
         assert not ag._state.run_allowed.is_set()
+        # Wait for the unlink on its own deadline rather than asserting it
+        # immediately: _poll_commands() dispatches first and unlinks after
+        # (in its `finally`), so the pause landing above says nothing about
+        # whether the file is gone yet -- on a loaded host the poll thread
+        # can be descheduled in exactly that window.
+        while time.time() < deadline and list(cmd_dir.glob("*.json")):
+            time.sleep(0.02)
         assert not list(cmd_dir.glob("*.json"))  # consumed
     finally:
         stop.set()

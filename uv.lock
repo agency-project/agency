@@ -32,6 +32,9 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "nvidia-ml-py" },
+    { name = "opentelemetry-exporter-otlp" },
+    { name = "opentelemetry-sdk" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-mock" },
@@ -46,6 +49,7 @@ profiler = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agency", extras = ["profiler"], marker = "extra == 'dev'" },
     { name = "anthropic" },
     { name = "aws-bedrock-token-generator" },
     { name = "boto3" },

@@ -1113,6 +1113,58 @@ def _record_child_span() -> None:
         pass
 
 
+def _double(x):
+    return x * 2
+
+
+def _boom(_x):
+    raise RuntimeError("mapped task blew up")
+
+
+def test_agmap_tasks_are_traced_children_of_the_enclosing_span(monkeypatch, tmp_path):
+    """agmap's fan-out is the framework's highest-fan-out spawn site: a bare
+    thread there would make every mapped task a disconnected trace root
+    (silently -- a disconnected root is a valid trace). Each task span must
+    instead parent to whatever ran the map, and must stay a *task* label so
+    run_metrics keeps counting only agent runs."""
+    from agency.agmap import agmap
+
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("parent"):
+            results = agmap(_double, [1, 2, 3])
+
+    assert [task.result for task in results] == [2, 4, 6]
+
+    records = {record[1]: record for record in agprof._records}
+    for index in range(3):
+        record = records[f"agmap:_double[{index}]"]
+        assert record[8] == records["parent"][7]  # parent_span_id -> the map's span
+        assert record[6]["outcome"] == "success"
+
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["run_metrics"]["started"] == 0
+
+
+def test_agmap_task_error_is_annotated_as_a_failure(monkeypatch, tmp_path):
+    """A mapped task's exception becomes an agerror rather than propagating,
+    so the span cannot see it as a raised exception -- the outcome has to be
+    annotated explicitly or a failed fan-out reads as all-success."""
+    from agency.agmap import agmap
+
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        result = agmap(_boom, 1)
+
+    assert "mapped task blew up" in result._data["error"]
+
+    record = {record[1]: record for record in agprof._records}["agmap:_boom[0]"]
+    assert record[6]["outcome"] == "failure"
+    assert record[6]["error_type"] == "agmap_task_error"
+
+
 @pytest.mark.parametrize("scope", [None, "workload", "invalid"])
 def test_default_and_invalid_scopes_do_not_autostart(monkeypatch, scope):
     monkeypatch.setenv("AGENCY_PROFILE", "1")

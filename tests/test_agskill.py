@@ -451,7 +451,7 @@ def test_tool_success_defers_hibernate_when_background_work_pending():
     sandbox = _make_sandbox_with_tracking()
     sandbox._has_pending_background_work.return_value = True
     s = make_skill()
-    s.execute_react = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
