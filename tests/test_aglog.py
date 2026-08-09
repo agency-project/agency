@@ -202,11 +202,36 @@ def test_forked_agent_has_own_agname():
 
 
 def test_destroyed_event_logged():
+    """Destruction is recorded on the agent's own log.
+
+    `del` only drops the last *reference*; it does not promise the object is
+    finalized on that line. It usually looks like it does -- refcounting
+    collects immediately when nothing else holds the agent -- but inside a
+    full suite something transiently can (a live thread, an interpreter
+    frame, a cycle awaiting the generational collector), and then `__del__`
+    runs later, at an unrelated moment. Asserting on the log immediately
+    after `del` was therefore reading a race, which is exactly how this
+    failed: a run showed CREATED and DESTROYED one millisecond apart while
+    this log still ended at "created" -- the DESTROYED belonged to a
+    *different* agent, an earlier test's, finalized in this test's window
+    under a recycled agname (conftest clears the name registry per test).
+    Collect explicitly and give finalization a bounded moment to land.
+    """
+    import gc
+    import time
+
     ag = make_agent()
     log = ag.log  # keep a reference to the log after the agent dies
     del ag
-    events = log.events
-    assert events[-1]["event"] == "destroyed"
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        gc.collect()
+        if any(e.get("event") == "destroyed" for e in log.events):
+            break
+        time.sleep(0.02)
+
+    assert [e.get("event") for e in log.events][-1] == "destroyed"
 
 
 def test_events_includes_skill_and_lifecycle():
