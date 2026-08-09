@@ -16,7 +16,7 @@ import uuid
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agency.agdata import agdata, agerror
+from agency.agdata import agdata
 from agency.agresources import agResourcePool
 
 
@@ -1453,10 +1453,34 @@ class TestAgSandboxExecDetached:
     def test_exec_detached_process_survives_after_call_returns(self):
         """A long-lived detached process (not a one-shot command) must
         still be alive well after exec_detached() itself returns -- the
-        actual property a persistent in-container entrypoint depends on."""
-        self.sb.exec_detached("sleep 5")
-        out, rc = self.sb.exec("pgrep -f 'sleep 5'")
-        assert rc == 0, f"detached 'sleep 5' process not found running: {out}"
+        actual property a persistent in-container entrypoint depends on.
+
+        Scans /proc with shell builtins rather than calling `pgrep`/`ps`:
+        procps is absent from the CPU image (python:3.12-slim + ripgrep,
+        what `GPU_TYPE=cpu ./images/build.sh` builds in CI) but present in
+        the CUDA/ROCm ones, whose full Ubuntu bases ship it -- so a
+        pgrep-based check passes on every GPU-built image and fails only on
+        CPU. Nothing in agency/ needs procps; this was the repo's only
+        caller. Matching the *start* of each cmdline is what keeps the
+        scanning shell (argv[0] "bash") and its own children from matching
+        the pattern they are searching for.
+
+        The sleep is 60s because its real job is to outlive two docker
+        round trips (the detached launch, then the scanning exec), not to
+        measure anything: a 5s window passed standalone in 8s and expired
+        inside a loaded 16-minute run, reporting "process not found" for
+        what was really exec latency. Nothing here waits for the process to
+        exit -- teardown destroys the container -- so a generous window
+        costs only clarity, exactly as with test_chroot.py's marked sleep.
+        """
+        self.sb.exec_detached("sleep 60")
+        out, rc = self.sb.exec(
+            "for d in /proc/[0-9]*; do "
+            'c=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null); '
+            'case "$c" in "sleep 60 "*) echo "$d"; exit 0 ;; esac; '
+            "done; exit 1"
+        )
+        assert rc == 0, f"detached 'sleep 60' process not found running: {out}"
 
     def test_exec_detached_workdir(self):
         self.sb.exec_detached("pwd > /tmp/detached_workdir.txt", workdir="/tmp")

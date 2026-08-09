@@ -336,14 +336,19 @@ class TestChrootBackendPIDTracking:
         marker = f"agencytest{uuid.uuid4().hex[:8]}"
         # Set argv[0] to a random, practically-unique marker via `exec -a` so
         # our own backgrounded process can be conclusively identified,
-        # rather than assuming the whole set is ours -- this host's own
-        # setup/mount overhead per exec() call (unshare + chroot + ~40 bind
-        # mounts, no persistent daemon to cache it across calls) can itself
-        # take upward of half a second. `sleep 3` gives comfortable margin
-        # over that per-call overhead so our own process is genuinely still
-        # running when tracked, without relying on an unrealistically short
-        # duration a busy host could race past entirely.
-        self.sb.exec(f"exec -a {marker} sleep 3 &")
+        # rather than assuming the whole set is ours.
+        #
+        # The 10s margin is sized for get_live_pids() itself, not for exec():
+        # _live_pgid_matched_pids() walks every /proc/[0-9]* entry in pure
+        # shell, so its cost scales with the whole host's process count, not
+        # with this jail's. Measured at ~0.5s on an idle host but ~7s on a
+        # busy shared one (26k processes / 43k threads) -- and a process that
+        # exits before the scan reads its /proc entry is skipped by the
+        # scan's own `[ -f "$d/status" ]` guard, so too short a sleep here
+        # reads as "not tracked" (an empty set) rather than as a slow scan.
+        marked_sleep_s = 10
+        spawned_at = time.monotonic()
+        self.sb.exec(f"exec -a {marker} sleep {marked_sleep_s} &")
 
         def _find_marked(pids):
             found = set()
@@ -358,7 +363,11 @@ class TestChrootBackendPIDTracking:
 
         marked = _find_marked(self.sb.get_live_pids())
         assert marked, f"expected the marked sleep to be tracked, got {self.sb.get_live_pids()}"
-        time.sleep(4.0)  # comfortable margin past sleep 3's own exit
+        # Anchor the exit wait to spawn time rather than sleeping a fixed
+        # amount after the scan above: that scan's duration is exactly the
+        # thing that varies with host load, so a fixed post-scan wait can
+        # land either side of the marked process's own exit.
+        time.sleep(max(0.0, spawned_at + marked_sleep_s + 1.0 - time.monotonic()))
         live = self.sb.get_live_pids()
         surviving = _find_marked(marked & live)
         assert not surviving, f"expected the marked sleep to have exited, still see {surviving}"

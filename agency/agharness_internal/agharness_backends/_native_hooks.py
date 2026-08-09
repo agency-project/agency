@@ -20,9 +20,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .._syscall_event import agsyscallevent
+
 if TYPE_CHECKING:
     from ...agpolicy import agdecision
-    from ..agproxy_ptrace import agsyscallevent
 
 
 def resolve_mediation_mode(mediation_mode: str) -> str:
@@ -41,8 +42,6 @@ def hook_payload_to_syscallevent(payload: dict):
     into the same `agsyscallevent` shape `agproxy_ptrace` delivers to
     `agpolicy.check()`, so one policy implementation can back both
     mediation paths without knowing which one is active."""
-    from ..agproxy_ptrace import agsyscallevent
-
     tool_input = payload.get("tool_input") or {}
     argv = None
     if "command" in tool_input:
@@ -58,6 +57,8 @@ def hook_payload_to_syscallevent(payload: dict):
         envp=None,
         path=tool_input.get("path") or tool_input.get("file_path"),
         timestamp=0.0,
+        tool_name=payload.get("tool_name") or "unknown",
+        tool_args=tool_input,
     )
 
 

@@ -78,9 +78,7 @@ class TestNativeInContainerEntrypoint:
             sock_path = launch_in_container_entrypoint(sb, timeout_s=30)
             resp = ping(sock_path)
             assert resp["agency_package_visible"] is True
-            assert resp["agency_package_marker_path"].startswith(
-                AGENCY_PACKAGE_CONTAINER_MOUNT
-            )
+            assert resp["agency_package_marker_path"].startswith(AGENCY_PACKAGE_CONTAINER_MOUNT)
         finally:
             sb.destroy()
 
@@ -128,7 +126,11 @@ def _content_chunks(text: str, finish_reason: str = "stop"):
     choice = ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)
     return [
         ChatCompletionChunk(
-            id="chatcmpl-test", object="chat.completion.chunk", created=0, model="m", choices=[choice]
+            id="chatcmpl-test",
+            object="chat.completion.chunk",
+            created=0,
+            model="m",
+            choices=[choice],
         )
     ]
 
@@ -152,18 +154,26 @@ def _tool_call_chunks(command: str, call_id: str = "call_1", finish_reason: str 
         index=0,
         id=call_id,
         type="function",
-        function=ChoiceDeltaToolCallFunction(name="bash", arguments=json.dumps({"command": command})),
+        function=ChoiceDeltaToolCallFunction(
+            name="bash", arguments=json.dumps({"command": command})
+        ),
     )
     delta = ChoiceDelta(tool_calls=[tc_delta])
     choice = ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)
     return [
         ChatCompletionChunk(
-            id="chatcmpl-test", object="chat.completion.chunk", created=0, model="m", choices=[choice]
+            id="chatcmpl-test",
+            object="chat.completion.chunk",
+            created=0,
+            model="m",
+            choices=[choice],
         )
     ]
 
 
-def _tool_call_named_chunks(tool_name: str, arguments: dict, call_id: str = "call_1", finish_reason: str = "tool_calls"):
+def _tool_call_named_chunks(
+    tool_name: str, arguments: dict, call_id: str = "call_1", finish_reason: str = "tool_calls"
+):
     """Like `_tool_call_chunks`, but for an arbitrary tool name/arguments --
     used to drive the react loop toward calling a dynamically-discovered
     MCP tool instead of the hardcoded `bash` one."""
@@ -185,7 +195,11 @@ def _tool_call_named_chunks(tool_name: str, arguments: dict, call_id: str = "cal
     choice = ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)
     return [
         ChatCompletionChunk(
-            id="chatcmpl-test", object="chat.completion.chunk", created=0, model="m", choices=[choice]
+            id="chatcmpl-test",
+            object="chat.completion.chunk",
+            created=0,
+            model="m",
+            choices=[choice],
         )
     ]
 
@@ -444,7 +458,9 @@ class TestNativeReactLoop:
             terminus_host_sock = terminus.ensure_uds_started()
             messenger_host_sock = messenger.ensure_uds_started()
             container_terminus_sock = f"/var/run/agency_llm_gateway/{Path(terminus_host_sock).name}"
-            container_messenger_sock = f"/var/run/agency_llm_gateway/{Path(messenger_host_sock).name}"
+            container_messenger_sock = (
+                f"/var/run/agency_llm_gateway/{Path(messenger_host_sock).name}"
+            )
 
             request = {
                 "token": token,
@@ -560,7 +576,9 @@ class TestNativeReactLoop:
                 call_id="call_write",
             ),
             _tool_call_named_chunks(
-                "read", {"file_path": "/workspace/native_tool_test.txt"}, call_id="call_read",
+                "read",
+                {"file_path": "/workspace/native_tool_test.txt"},
+                call_id="call_read",
             ),
             _content_chunks("done"),
         ]
@@ -674,7 +692,6 @@ class TestNativeBackendRealEndToEnd:
         from agency.agdata import agdata
         from agency.agent import agent
         from agency.agllm_backends import agBedrockBackendConfig
-        from agency.agsandbox import agSandbox
         from agency.agsandbox_backends import agSandboxBackendConfig
         from agency.agskill import agskill
         from agency.agharness_internal.agharness_backends.native import _NativeBackend
@@ -710,9 +727,9 @@ class TestNativeBackendRealEndToEnd:
             # hallucinating the output without calling anything.
             tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
             assert len(tool_msgs) >= 1, "model never actually called the bash tool"
-            assert any(
-                "agency-native-e2e-marker" in m["content"] for m in tool_msgs
-            ), "bash tool's real output never reached the model"
+            assert any("agency-native-e2e-marker" in m["content"] for m in tool_msgs), (
+                "bash tool's real output never reached the model"
+            )
         finally:
             sandbox.destroy()
 
@@ -781,9 +798,9 @@ class TestNativeBackendRealEndToEnd:
 
             tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
             assert len(tool_msgs) >= 1, "model never actually called the double tool"
-            assert any(
-                "42" in m["content"] for m in tool_msgs
-            ), "double tool's real (in-container) output never reached the model"
+            assert any("42" in m["content"] for m in tool_msgs), (
+                "double tool's real (in-container) output never reached the model"
+            )
         finally:
             sandbox.destroy()
 

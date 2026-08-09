@@ -4,6 +4,7 @@ engine="claude_code" -- exercises the actual new in-container code path in
 claude_code.py through the real public agent.run() API. NOT a pytest file
 on purpose while hand-verifying.
 """
+
 import subprocess
 import sys
 
@@ -20,13 +21,15 @@ CLAUDE_HOST_BINARY = "/home/eecs/js_park/.local/share/claude/versions/2.1.220"
 
 
 def main():
-    cfg = agConfig({
-        "agllm_backend": {
-            "provider": "bedrock",
-            "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            "region": "us-east-1",
-        },
-    })
+    cfg = agConfig(
+        {
+            "agllm_backend": {
+                "provider": "bedrock",
+                "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "region": "us-east-1",
+            },
+        }
+    )
     backend_cfg = agSandboxBackendConfig(backend="docker").agconfig
     cfg = cfg.clone()
     for owner, key in [("agsandbox_backend", "backend")]:
@@ -41,12 +44,18 @@ def main():
         print(f"container: {container_name}")
 
         print("copying real claude binary into the container (264MB)...")
-        subprocess.run([runtime, "cp", CLAUDE_HOST_BINARY, f"{container_name}:/usr/local/bin/claude"],
-                       capture_output=True)
-        subprocess.run([runtime, "exec", container_name, "chmod", "+x", "/usr/local/bin/claude"],
-                       check=True)
-        ver = subprocess.run([runtime, "exec", container_name, "/usr/local/bin/claude", "--version"],
-                              capture_output=True, text=True)
+        subprocess.run(
+            [runtime, "cp", CLAUDE_HOST_BINARY, f"{container_name}:/usr/local/bin/claude"],
+            capture_output=True,
+        )
+        subprocess.run(
+            [runtime, "exec", container_name, "chmod", "+x", "/usr/local/bin/claude"], check=True
+        )
+        ver = subprocess.run(
+            [runtime, "exec", container_name, "/usr/local/bin/claude", "--version"],
+            capture_output=True,
+            text=True,
+        )
         print(f"claude --version inside container: {ver.stdout.strip()}")
 
         skill = agskill(
@@ -54,12 +63,19 @@ def main():
             system_prompt="You are a test assistant running inside a sandboxed container.",
         )
 
-        print("\nrunning ag.run(skill, ...) -- this launches the real claude CLI "
-              "inside the real container via the new in-container ptrace + UDS-relay path...")
-        result = ag.run(skill, agdata(instruction=(
-            "Run the shell command `echo HELLO_FROM_CONTAINER && pwd && echo $$` "
-            "using your Bash tool, then tell me exactly what it printed."
-        )))
+        print(
+            "\nrunning ag.run(skill, ...) -- this launches the real claude CLI "
+            "inside the real container via the new in-container ptrace + UDS-relay path..."
+        )
+        result = ag.run(
+            skill,
+            agdata(
+                instruction=(
+                    "Run the shell command `echo HELLO_FROM_CONTAINER && pwd && echo $$` "
+                    "using your Bash tool, then tell me exactly what it printed."
+                )
+            ),
+        )
         result._resolve()
 
         print(f"\nresult pending: {result.is_pending()}")

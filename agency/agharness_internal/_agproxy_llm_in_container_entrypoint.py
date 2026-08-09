@@ -28,17 +28,24 @@ import threading
 
 def main(argv: "list[str] | None" = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
-    if len(argv) < 2:
+    if len(argv) < 3:
         raise SystemExit(
-            "usage: python3 _agproxy_llm_in_container_entrypoint.py <terminus-uds-path> <port>"
+            "usage: python3 _agproxy_llm_in_container_entrypoint.py "
+            "<terminus-uds-path> <profiler-uds-path> <port>"
         )
-    terminus_uds_path, port = argv[0], int(argv[1])
+    terminus_uds_path, profiler_uds_path, port = argv[0], argv[1], int(argv[2])
+    if profiler_uds_path == "-":
+        profiler_uds_path = None
 
     from agency.agconfig import agConfig
     from agency.agharness_internal.agproxy_llm import agProxyLLM, agProxyLLMConfig
 
     cfg = agConfig(agProxyLLMConfig(port=port))
-    px = agProxyLLM(cfg, terminus_uds_path=terminus_uds_path)
+    px = agProxyLLM(
+        cfg,
+        terminus_uds_path=terminus_uds_path,
+        profiler_uds_path=profiler_uds_path,
+    )
     px.start()
 
     # This process's only job is to keep that server alive -- start() itself

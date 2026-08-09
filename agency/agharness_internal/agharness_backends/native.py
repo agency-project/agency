@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shlex
 import socket
 import struct
@@ -201,8 +202,8 @@ def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) 
     the idempotent wrapper `_NativeBackend.execute()` actually uses."""
     from ...agutil import (
         AGENCY_PACKAGE_CONTAINER_MOUNT,
-        agharness_llm_gateway_dir,
         ensure_python_packages_in_container,
+        new_uds_path,
     )
 
     # `mcp` for the resource/output-submission MCP client, `html2text` for
@@ -216,9 +217,12 @@ def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) 
     # `_ensure_entrypoint`), and a later call on the same sandbox might.
     ensure_python_packages_in_container(sandbox, ["mcp", "html2text", "cloudpickle"], timeout_s=180)
 
-    sock_name = f"native-entrypoint-{uuid.uuid4().hex}.sock"
+    # Minted via new_uds_path so this socket shares the run-scoped gateway
+    # directory and the sun_path budget check; the container side keeps the
+    # long mount name, where no such budget applies.
+    host_sock_path = Path(new_uds_path("native-entrypoint"))
+    sock_name = host_sock_path.name
     container_sock_path = f"/var/run/agency_llm_gateway/{sock_name}"
-    host_sock_path = agharness_llm_gateway_dir() / sock_name
     entrypoint_path = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/{_ENTRYPOINT_RELATIVE_PATH}"
     pid_path = f"/tmp/{sock_name}.pid"
 
@@ -272,9 +276,7 @@ def _wait_ready(sock_path: str, timeout_s: float) -> None:
         except Exception as e:
             last_exc = e
             time.sleep(0.1)
-    raise RuntimeError(
-        f"in-container entrypoint at {sock_path} never became reachable: {last_exc}"
-    )
+    raise RuntimeError(f"in-container entrypoint at {sock_path} never became reachable: {last_exc}")
 
 
 def _ensure_entrypoint(sandbox: "agSandbox") -> str:
@@ -289,7 +291,7 @@ def _ensure_entrypoint(sandbox: "agSandbox") -> str:
         try:
             ping(existing, timeout_s=2)
             return existing
-        except Exception:
+        except Exception:  # noqa: S110 - stale sockets are relaunched below
             pass  # stale -- fall through and relaunch
     sock_path = launch_in_container_entrypoint(sandbox)
     sandbox._native_entrypoint_sock = sock_path
@@ -344,7 +346,7 @@ class _LiveTranscriptPusher:
             from ... import agllm_pure
 
             ag.push_token_count_update_to_ui(agllm_pure.estimate_messages_tokens(transcript), 0)
-        except Exception:
+        except Exception:  # noqa: S110 - live UI updates are best-effort
             pass
 
     def run(self, stop_event: "threading.Event") -> None:
@@ -444,13 +446,26 @@ class _NativeBackend(agharness_backend):
         terminus = get_shared_terminus(ag.agconfig)
         mcp_server = get_shared_mcp_server(ag.agconfig)
         messenger = get_shared_messenger(ag.agconfig)
+        from ..agprof_ingest import get_shared_profiler_ingest
+        from ...profiler import agprof
+
+        profiler_ingest = get_shared_profiler_ingest()
         token = uuid.uuid4().hex
+        profile_native_events = agprof.enabled()
+        if not profile_native_events and os.environ.get("AGENCY_PROFILE"):
+            print(
+                "[native] WARNING: environment profiling is requested but no active "
+                "profiler session can receive in-container events"
+            )
+        profiler_host_sock = profiler_ingest.ensure_uds_started() if profile_native_events else None
         terminus.register(token, ag)
+        profiler_ingest.register(token, ag, exact_events=profile_native_events)
         mcp_server.register(token, ag, skill)
         messenger.register(token, ag)
 
         collected_output: dict = {}
         final_text = ""
+        profiler_turn_offset = 0
         pusher = _LiveTranscriptPusher(ag, terminus, token, skill.name)
         stop_poll = threading.Event()
         poll_thread = threading.Thread(target=pusher.run, args=(stop_poll,), daemon=True)
@@ -464,13 +479,27 @@ class _NativeBackend(agharness_backend):
                     "terminus_sock": _container_bridge_sock_path(terminus.ensure_uds_started()),
                     "mcp_server_sock": _container_bridge_sock_path(mcp_server.ensure_uds_started()),
                     "messenger_sock": _container_bridge_sock_path(messenger.ensure_uds_started()),
+                    "profiler_sock": (
+                        _container_bridge_sock_path(profiler_host_sock)
+                        if profiler_host_sock is not None
+                        else None
+                    ),
                     "model": ag.llm.backend.model or "",
                     "messages": messages,
                     "max_steps": max_steps or 20,
                     "custom_tools": custom_tools_payload,
                     "suppress_builtins": suppress_builtins,
+                    "profiler_turn_offset": profiler_turn_offset,
                 }
                 resp = run_react_loop(sock_path, request)
+                profiler_turn_offset += int(resp.get("turn_count") or 0)
+                profiler_dropped_events = int(resp.get("profiler_dropped_events") or 0)
+                if profiler_dropped_events:
+                    agprof.annotate(profiler_dropped_events=profiler_dropped_events)
+                    print(
+                        "[native] WARNING: in-container profiler dropped "
+                        f"{profiler_dropped_events} event(s)"
+                    )
                 if resp.get("status") != "done":
                     return (
                         agerror(resp.get("message", "native in-container run failed")),
@@ -514,6 +543,7 @@ class _NativeBackend(agharness_backend):
             poll_thread.join(timeout=2)
             pusher.poll_once()
             terminus.unregister(token)
+            profiler_ingest.unregister(token)
             mcp_server.unregister(token)
             messenger.unregister(token)
 
@@ -526,8 +556,7 @@ class _NativeBackend(agharness_backend):
                 result = agerror(
                     "structured output incomplete after "
                     f"{skill.max_output_schema_retries - output_schema_retries_left} "
-                    "retry/retries -- submit_output was never called for: "
-                    + ", ".join(missing)
+                    "retry/retries -- submit_output was never called for: " + ", ".join(missing)
                 )
             else:
                 result = agdata(**collected_output)

@@ -8,21 +8,40 @@ incoming /v1/messages bodies (roles, mid-array system messages, reminder
 markers) before any adapter transformation.
 
 Run:
-    LLM_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0 \
+    LLM_BASE_URL=https://your-openai-compatible-endpoint/v1 \
+    LLM_API_KEY=your-api-key \
+    LLM_MODEL=your-tool-capable-model \
     AGENCY_DEBUG_CAPTURE_LOG=/tmp/agproxy_v1msgs_pipeline.log \
     .venv/bin/python3 examples/_manual_v1messages_pipeline_probe.py
+
+With no LLM_BASE_URL, this falls back to Bedrock and requires AWS credentials.
+Set LLM_REGION to select the Bedrock region (default: us-east-1), and
+LLM_CONTEXT_LIMIT when the backend's model metadata endpoint is unavailable.
 """
 
 import os
 from pathlib import Path
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
-from agency.agllm_backends import agBedrockBackendConfig
+from agency.agllm_backends import agBedrockBackendConfig, agVLLMBackendConfig
 from agency.agtype import agpath
 
-cfg = agConfig(
-    agBedrockBackendConfig(model=os.environ.get("LLM_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"))
-)
+if os.environ.get("LLM_BASE_URL"):
+    cfg = agConfig(
+        agVLLMBackendConfig(
+            base_url=os.environ["LLM_BASE_URL"],
+            model=os.environ.get("LLM_MODEL", ""),
+            api_key=os.environ.get("LLM_API_KEY", ""),
+        )
+    )
+else:
+    bedrock_kwargs = {
+        "model": os.environ.get("LLM_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        "region": os.environ.get("LLM_REGION", "us-east-1"),
+    }
+    if os.environ.get("LLM_CONTEXT_LIMIT"):
+        bedrock_kwargs["context_limit"] = int(os.environ["LLM_CONTEXT_LIMIT"])
+    cfg = agConfig(agBedrockBackendConfig(**bedrock_kwargs))
 
 
 def _make_run_dir(name: str):
@@ -76,9 +95,13 @@ def main():
         file_skill,
         agdata(task=TASK_PROMPT, file_path="/workspace/a.txt"),
     )
-    print(f"   status  : {r1.status!r}")
-    print(f"   path    : {r1.path!r}")
-    print(f"   content : {r1.content!r}")
+    result = r1.to_dict()
+    if "error" in result:
+        print(f"   error   : {result['error']}")
+        return
+    print(f"   status  : {result['status']!r}")
+    print(f"   path    : {result['path']!r}")
+    print(f"   content : {result['content']!r}")
     print()
     print(f"Shared history : {len(ag.history.messages)} messages total")
 

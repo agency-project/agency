@@ -883,6 +883,150 @@ class TestOwnHostPidsPodman:
 
 
 # ---------------------------------------------------------------------------
+# Profiler container registration -- cgroup discovery, stable series labels,
+# and lifecycle deregistration. All kernel/runtime surfaces are mocked so
+# these checks run on non-Linux hosts and without Docker/Podman.
+# ---------------------------------------------------------------------------
+
+
+class TestProfilerContainerRegistration:
+    _CONTAINER_ID = "d" * 64
+
+    def _sb(self, agname="sandbox_research_agent_a1b2"):
+        from agency.agsandbox_backends.podman import _PodmanBackend
+
+        return _PodmanBackend(
+            agname,
+            name="profiler-registration-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=None,
+        )
+
+    def test_profiler_label_unwraps_sandbox_name_and_dedup_suffix(self):
+        assert self._sb()._prof_container_label() == "research_agent"
+        assert self._sb("plain_agent")._prof_container_label() == "plain_agent"
+
+    def test_registration_is_a_noop_without_an_active_profiler(self):
+        sb = self._sb()
+        with patch.object(_container.agprof, "enabled", return_value=False):
+            with patch.object(sb, "_run") as run:
+                sb._register_prof_container()
+        run.assert_not_called()
+
+    def test_registration_discovers_cgroup_v2_and_podman_conmon_scope(self):
+        sb = self._sb()
+        inspect = MagicMock(returncode=0, stdout=f"{self._CONTAINER_ID}|4242\n".encode())
+        cgroup = f"0::/user.slice/libpod-{self._CONTAINER_ID}.scope\n"
+        conmon = f"/sys/fs/cgroup/user.slice/libpod-conmon-{self._CONTAINER_ID}.scope"
+
+        with patch.object(_container.agprof, "enabled", return_value=True):
+            with patch.object(_container.agprof, "container_registered", return_value=False):
+                with patch.object(sb, "_run", return_value=inspect) as run:
+                    with patch.object(_container.Path, "read_text", return_value=cgroup):
+                        with patch.object(
+                            _container.os.path, "isdir", side_effect=lambda p: p == conmon
+                        ):
+                            with patch.object(_container.agprof, "container_started") as started:
+                                sb._register_prof_container()
+
+        assert run.call_args.args[0] == [
+            "podman",
+            "inspect",
+            "--format",
+            "{{.Id}}|{{.State.Pid}}",
+            sb._name,
+        ]
+        started.assert_called_once_with(
+            "research_agent",
+            f"/sys/fs/cgroup/user.slice/libpod-{self._CONTAINER_ID}.scope",
+            conmon,
+            "conmon",
+        )
+
+    def test_registration_rejects_cgroup_v1(self):
+        sb = self._sb()
+        inspect = MagicMock(returncode=0, stdout=f"{self._CONTAINER_ID}|4242\n".encode())
+        with patch.object(_container.agprof, "enabled", return_value=True):
+            with patch.object(_container.agprof, "container_registered", return_value=False):
+                with patch.object(sb, "_run", return_value=inspect):
+                    with patch.object(_container.Path, "read_text", return_value="2:cpu:/legacy\n"):
+                        with pytest.raises(RuntimeError, match="cgroup v2"):
+                            sb._register_prof_container()
+
+    def test_registration_rejects_remote_daemon_pid_with_unrelated_local_cgroup(self):
+        sb = self._sb()
+        inspect = MagicMock(returncode=0, stdout=f"{self._CONTAINER_ID}|4242\n".encode())
+        unrelated = "0::/user.slice/user-501.slice/session-7.scope\n"
+        with patch.object(_container.agprof, "enabled", return_value=True):
+            with patch.object(_container.agprof, "container_registered", return_value=False):
+                with patch.object(sb, "_run", return_value=inspect):
+                    with patch.object(_container.Path, "read_text", return_value=unrelated):
+                        with patch.object(_container.agprof, "container_started") as started:
+                            with pytest.raises(RuntimeError, match="remote or VM-backed"):
+                                sb._register_prof_container()
+        started.assert_not_called()
+
+    def test_already_registered_container_skips_runtime_and_proc_probes(self):
+        sb = self._sb()
+        with patch.object(_container.agprof, "enabled", return_value=True):
+            with patch.object(_container.agprof, "container_registered", return_value=True):
+                with patch.object(sb, "_run") as run:
+                    with patch.object(_container.Path, "read_text") as read_text:
+                        sb._register_prof_container()
+        run.assert_not_called()
+        read_text.assert_not_called()
+
+    def test_ensure_started_registers_after_every_successful_start_path(self):
+        sb = self._sb()
+        with patch.object(sb, "_ensure_started_profiled") as ensure:
+            with patch.object(sb, "_register_prof_container") as register:
+                sb._ensure_started()
+        ensure.assert_called_once_with()
+        register.assert_called_once_with()
+
+    def test_stop_deregisters_after_container_is_confirmed_stopped(self):
+        sb = self._sb()
+        with patch.object(sb, "_container_running", side_effect=[True, False]):
+            with patch.object(sb, "_run"):
+                with patch.object(sb, "_release_runtime_slot"):
+                    with patch.object(_container.agprof, "container_stopped") as stopped:
+                        sb.stop()
+        stopped.assert_called_once_with("research_agent")
+
+    def test_failed_stop_keeps_running_container_registered(self):
+        sb = self._sb()
+        with patch.object(sb, "_container_running", side_effect=[True, True]):
+            with patch.object(sb, "_run", side_effect=RuntimeError("stop failed")):
+                with patch.object(_container.agprof, "container_stopped") as stopped:
+                    with pytest.raises(RuntimeError, match="stop failed"):
+                        sb.stop()
+        stopped.assert_not_called()
+
+    def test_rm_deregisters_only_after_successful_removal(self):
+        sb = self._sb()
+        with patch.object(sb, "_container_status", return_value="running"):
+            with patch.object(sb, "_container_running", side_effect=[True, False]):
+                with patch.object(sb, "_rm_container"):
+                    with patch.object(sb, "_release_runtime_slot"):
+                        with patch.object(_container.agprof, "container_stopped") as stopped:
+                            sb.rm_container()
+        stopped.assert_called_once_with("research_agent")
+
+    def test_failed_rm_keeps_a_still_running_container_registered(self):
+        sb = self._sb()
+        with patch.object(sb, "_container_status", return_value="running"):
+            with patch.object(sb, "_container_running", side_effect=[True, True, True]):
+                with patch.object(sb, "_rm_container", side_effect=RuntimeError("rm failed")):
+                    with patch.object(_container.time, "sleep"):
+                        with patch.object(_container.agprof, "container_stopped") as stopped:
+                            with pytest.raises(RuntimeError, match="rm failed"):
+                                sb.rm_container()
+        stopped.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _gpu_flags(runtime) -- regression coverage for:
 # (1) Docker's ``--gpus all`` was used unconditionally for Podman too. Podman
 #     accepts that flag without erroring but never mounts the NVIDIA
@@ -1092,6 +1236,35 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
             f"expected GPU flags in the run command even though reserve_gpu() was never "
             f"called before container creation: {run_cmd}"
         )
+
+    def test_docker_run_uses_profiler_cgroup_parent(self):
+        from agency.agsandbox_backends.docker import _DockerBackend
+
+        sb = _DockerBackend(
+            "agent",
+            name="docker-profiler-cgroup-parent-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=None,
+        )
+        with patch.object(
+            _container.agprof, "container_cgroup_parent", return_value="agprof-ab.slice"
+        ):
+            with patch.object(_container, "_gpu_flags", return_value=[]):
+                with patch.object(sb, "_inspect_container_state", return_value=(False, "")):
+                    with patch.object(sb, "_acquire_runtime_slot"):
+                        with patch.object(sb, "_resolve_image", return_value="img"):
+                            with patch.object(sb, "_cfs_supported", return_value=False):
+                                with patch.object(sb, "_run_with_conflict_retry") as run_retry:
+                                    with patch.object(sb, "_run"):
+                                        with patch.object(
+                                            sb, "_snapshot_pids_started", return_value=set()
+                                        ):
+                                            sb._ensure_started()
+
+        run_cmd = run_retry.call_args.args[0]
+        assert "--cgroup-parent=agprof-ab.slice" in run_cmd
 
 
 def _host_rocm_available() -> bool:

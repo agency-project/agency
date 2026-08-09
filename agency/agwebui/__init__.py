@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from ..agutil import sigterm_as_exit
+from ..profiler import agprof
 from .emitter import agwebui_emitter
 
 # Module-level singleton — set while agwebui.run() is active.
@@ -288,7 +289,8 @@ class agwebui:
 
         with sigterm_as_exit("agwebui") as sigterm_received:
             try:
-                fn(*args, **kwargs)
+                with agprof.workload():
+                    fn(*args, **kwargs)
             except Exception:
                 import traceback
 

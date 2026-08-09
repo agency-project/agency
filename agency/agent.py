@@ -12,10 +12,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
 
+from .agutil import agency_tmp_root as _agency_tmp_root
+
 # Single run-level ID for the default log directory.
 _RUN_ID = _uuid_mod.uuid4().hex[:12]
 _RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-_DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
+# Same root as the UDS gateway (see agutil.agency_tmp_root for why it is
+# hardcoded rather than following $TMPDIR) -- one location policy for every
+# host-side runtime path agency owns, instead of logs and sockets diverging.
+_DEFAULT_LOG_DIR = _agency_tmp_root() / f"{_RUN_TS}_{_RUN_ID}"
 
 # Global weak registry of all live agent instances.
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
@@ -32,6 +37,7 @@ from .agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname
+from .profiler import agprof
 
 
 # Exists only to register agent's config fields (via __set_name__ at import
@@ -239,6 +245,17 @@ class agent:
         agconfig: "agConfig | None" = None,
         engine: "str | None" = None,
     ):
+        with agprof.span("agent:create"):
+            self._initialize(agname, llm, sandbox, agconfig, engine)
+
+    def _initialize(
+        self,
+        agname: "str | None",
+        llm: "agllm | None",
+        sandbox: "agSandbox | None",
+        agconfig: "agConfig | None",
+        engine: "str | None",
+    ) -> None:
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
         if llm is None:
@@ -273,11 +290,10 @@ class agent:
         )
 
         self.agname: _agname = _agname.allocate_agname(agname)
+        self._parent_agent_id: "str | None" = None
 
         self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
-        self.engine: str = (
-            engine if engine is not None else _AgAgentFields(self.agconfig).engine
-        )
+        self.engine: str = engine if engine is not None else _AgAgentFields(self.agconfig).engine
         self.ctx: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -603,6 +619,7 @@ class agent:
         """Return an independent agent forked from *src*."""
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname)
+        ag._parent_agent_id = str(src.agname)
         # Cloned so the fork's own agconfig is independent of src's -- see
         # the matching comment in __init__.
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
@@ -610,6 +627,11 @@ class agent:
         ag.engine = src.engine
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
+        # Native harness continuity is part of the agent's logical history,
+        # just like ``ctx``.  A fork must inherit the snapshot that existed at
+        # fork time while remaining free to advance its own external-engine
+        # session without mutating the parent (or a sibling fork).
+        ag._harness_sessions = copy.deepcopy(src._harness_sessions)
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
@@ -711,6 +733,7 @@ class agent:
 
         state = {
             "agname": self.agname,
+            "parent_agent_id": self._parent_agent_id,
             "engine": self.engine,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             "history": self.ctx.messages,
@@ -805,6 +828,7 @@ class agent:
 
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.claim_unique_agname(state["agname"])
+        ag._parent_agent_id = state.get("parent_agent_id")
         _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
         ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agConfig()
         _already_set = (

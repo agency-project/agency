@@ -23,12 +23,16 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import threading
+import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from ..agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 from ..agpolicy import agdecision
+from ._syscall_event import agsyscallevent
 from .agproxy_ptrace_internal._tracer_loop import SeccompStop, StopDecision, TracerLoop
 
 if TYPE_CHECKING:
@@ -91,36 +95,236 @@ def _probe_ptrace_available() -> bool:
     try:
         pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
         os.waitpid(pid, 0)
-    except Exception:
+    except Exception:  # noqa: S110 - availability-probe cleanup is best-effort
         pass
     return True
 
 
 @dataclass
-class agsyscallevent:
-    """One intercepted syscall, resolved into agpolicy-friendly shape.
-    `argv`/`envp`/`path` are populated only for syscalls this module knows
-    how to resolve arguments for (execve/execveat: all three; open/openat:
-    `path` only) -- see agproxy_ptrace_internal/_tracer_loop.py's
-    `_resolve_syscall_args`.
+class _ProcessSpanStart:
+    """Host-clock timestamps retained until a traced process exits."""
 
-    `tool_name`/`tool_args` are unused here -- they exist only so
-    `agtool.dispatch_tools()`'s native-tool-call retrofit (see
-    docs/Design_harness_integration.md's later build phase) can hand
-    `agpolicy.check()` the same event type a syscall-level mediation gets,
-    with `syscall="tool_call"` and `argv`/`envp`/`path` left `None`, rather
-    than inventing a second event type policies would need to special-case.
+    perf_ns: int
+    wall_ns: int
+    executable: str
+    external_span: object | None
+
+
+_SAFE_EXECUTABLE_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-"
+)
+_CREDENTIAL_SHAPED_EXECUTABLE = re.compile(
+    r"(?:[0-9a-fA-F]{24,64}|"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|"
+    r"(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9._+-]{8,})"
+)
+_SENSITIVE_ENV_KEY_PARTS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "AUTH",
+    "CREDENTIAL",
+    "KEY",
+)
+
+
+def _executable_display_name(
+    executable_path: "str | None", *, sensitive_values: "frozenset[str]" = frozenset()
+) -> str:
+    """Return a bounded, argument-free executable name for a trace span.
+
+    Harness argv frequently contains both the full user prompt and bearer
+    credentials (for example in an inline MCP configuration), and ``argv[0]``
+    itself is attacker-controlled via facilities such as ``exec -a``. Process
+    identity therefore comes only from the kernel-confirmed executable path
+    delivered at ``PTRACE_EVENT_EXEC``. Only its basename is retained so a
+    credential-bearing parent directory cannot reach a profiler artifact.
+    """
+    if not isinstance(executable_path, str):
+        return "<unknown>"
+    # procfs marks an unlinked image as ``/path/name (deleted)``. The suffix is
+    # kernel metadata rather than part of the executable identity.
+    if executable_path.endswith(" (deleted)"):
+        executable_path = executable_path[: -len(" (deleted)")]
+    basename = os.path.basename(executable_path.rstrip("/"))
+    if not basename:
+        return "<unknown>"
+    # Span names are exported to JSON. Refuse rather than partially echo a
+    # pathological filename: control/bidi characters, URI punctuation, query
+    # strings, or overlong credential-shaped basenames must not be copied into
+    # an artifact. Normal Unix command names fit this conservative alphabet.
+    if len(basename) > 64 or any(
+        character not in _SAFE_EXECUTABLE_CHARACTERS for character in basename
+    ):
+        return "<redacted>"
+    if any(secret in basename for secret in sensitive_values) or (
+        _CREDENTIAL_SHAPED_EXECUTABLE.fullmatch(basename)
+    ):
+        return "<redacted>"
+    return basename
+
+
+def _sensitive_environment_values(envp: "dict[str, str]") -> "frozenset[str]":
+    """Extract exact launch credentials that must never become span names."""
+    return frozenset(
+        value
+        for key, value in envp.items()
+        if isinstance(value, str)
+        and value
+        and any(marker in key.upper() for marker in _SENSITIVE_ENV_KEY_PARTS)
+    )
+
+
+class _ProcessLifecycleProfiler:
+    """Translate ptrace spawn/exec/exit observations into agprof records.
+
+    A lifecycle is measured from the synchronous spawn callback through the
+    synchronous exit callback. A successful PTRACE_EVENT_EXEC supplies a safe
+    executable display name; raw argv/envp are intentionally never retained.
     """
 
-    syscall: str
-    pid: int
-    tid: int
-    argv: "list[str] | None"
-    envp: "dict[str, str] | None"
-    path: "str | None"
-    timestamp: float
-    tool_name: "str | None" = None
-    tool_args: "dict | None" = None
+    def __init__(
+        self,
+        *,
+        parent_context,
+        span_attributes: dict,
+        sensitive_values: "frozenset[str]" = frozenset(),
+        timing: str = "exact",
+    ) -> None:
+        self._parent_context = parent_context
+        self._span_attributes = dict(span_attributes)
+        self._sensitive_values = sensitive_values
+        self._timing = timing
+        self._processes: "dict[int, _ProcessSpanStart]" = {}
+        self._finalized = False
+        self._lock = threading.Lock()
+
+    @classmethod
+    def for_active_session(
+        cls, ag: "agent | None", envp: "dict[str, str]", *, timing: str = "exact"
+    ) -> "_ProcessLifecycleProfiler | None":
+        from ..profiler import agprof
+
+        if not agprof.enabled():
+            return None
+        attributes = agprof.current_span_attributes()
+        if ag is not None:
+            attributes.setdefault("agency.agent_id", str(ag.agname))
+            parent_agent_id = getattr(ag, "_parent_agent_id", None)
+            if parent_agent_id is not None:
+                attributes.setdefault("agency.parent_agent_id", str(parent_agent_id))
+        return cls(
+            parent_context=agprof.current_span_context(),
+            span_attributes=attributes,
+            sensitive_values=_sensitive_environment_values(envp),
+            timing=timing,
+        )
+
+    def on_spawn(self, pid: int) -> None:
+        from ..profiler import agprof
+
+        start_perf_ns = time.perf_counter_ns()
+        start_wall_ns = time.time_ns()
+        with self._lock:
+            if self._finalized:
+                return
+            if pid in self._processes:
+                return
+            # Never derive process identity from launch argv: argv[0] is
+            # attacker-controlled. PTRACE_EVENT_EXEC will update this only
+            # after the kernel has successfully installed the image.
+            executable = "<unknown>"
+            metadata = {
+                **self._span_attributes,
+                "timing": self._timing,
+                "provenance": "ptrace",
+                "pid": pid,
+                "executable": executable,
+            }
+            self._processes[pid] = _ProcessSpanStart(
+                start_perf_ns,
+                start_wall_ns,
+                executable,
+                agprof.start_external_span(
+                    f"process:{executable}",
+                    start_perf_ns=start_perf_ns,
+                    start_wall_ns=start_wall_ns,
+                    metadata=metadata,
+                    parent_context=self._parent_context,
+                ),
+            )
+
+    def on_exec(self, pid: int, executable_path: "str | None") -> None:
+        """Commit a kernel-confirmed executable identity for a live process."""
+        executable = _executable_display_name(
+            executable_path, sensitive_values=self._sensitive_values
+        )
+        with self._lock:
+            if self._finalized:
+                return
+            process = self._processes.get(pid)
+            if process is None:
+                return
+            process.executable = executable
+            if process.external_span is not None:
+                process.external_span.update(f"process:{executable}", executable=executable)
+
+    def on_exit(self, pid: int, exit_code: int) -> None:
+        end_perf_ns = time.perf_counter_ns()
+        end_wall_ns = time.time_ns()
+        with self._lock:
+            process = self._processes.pop(pid, None)
+        if process is None:
+            return
+
+        metadata = {
+            "executable": process.executable,
+            "exit_code": exit_code,
+            "outcome": "success" if exit_code == 0 else "failure",
+        }
+        if process.external_span is not None:
+            process.external_span.end(
+                end_perf_ns=max(process.perf_ns, end_perf_ns),
+                end_wall_ns=max(process.wall_ns, end_wall_ns),
+                metadata=metadata,
+            )
+
+    def finalize(self) -> None:
+        """Preserve every still-live process as an interrupted agprof span."""
+        from ..profiler import agprof
+
+        with self._lock:
+            if self._finalized:
+                return
+            self._finalized = True
+            processes = list(self._processes.values())
+            self._processes.clear()
+        ended_perf_ns = time.perf_counter_ns()
+        for process in processes:
+            # Profiling is observational. A broken exporter must not mask the
+            # launch failure whose cleanup called finalize().
+            with suppress(Exception):
+                agprof.interrupt_external_span(
+                    process.external_span,
+                    ended_perf_ns=max(process.perf_ns, ended_perf_ns),
+                )
+
+
+def _isolated_profiler_callback(callback: Callable) -> Callable:
+    """Keep automatic telemetry failures off the ptrace supervision thread."""
+
+    def invoke(*args) -> None:
+        try:
+            callback(*args)
+        except Exception:
+            # These callbacks run synchronously while a tracee is stopped. If
+            # optional agprof/OTel code escapes, the tracer thread dies and the
+            # child remains stopped forever. User callbacks are intentionally
+            # not wrapped; this isolation is only for built-in telemetry.
+            return
+
+    return invoke
 
 
 class _AgPtraceFields:
@@ -134,7 +338,10 @@ class _AgPtraceFields:
     # for the full set this module knows how to resolve arguments for.
     profiler = DynamicConfigParam(
         "agproxy_ptrace", default=None
-    )  # reserved for a future profiler hook (perf/strace-equivalent); unused so far.
+    )  # reserved for selecting a future heavyweight process profiler such as
+    # perf. This is deliberately separate from the automatic, low-cost agprof
+    # lifecycle records above: an active agprof session must see Tier-2
+    # spawn/exit coverage without requiring an unrelated config selector.
     disable_harness_native_sandbox = DynamicConfigParam(
         "agproxy_ptrace", default=True
     )  # advisory flag for agharness backends: prefer disabling a harness's own
@@ -157,8 +364,13 @@ class agProxyPtraceHandle:
     """A single launched, traced process tree. Returned by
     `agProxyPtrace.launch()`; not constructed directly."""
 
-    def __init__(self, loop: TracerLoop) -> None:
+    def __init__(
+        self,
+        loop: TracerLoop,
+        process_profiler: "_ProcessLifecycleProfiler | None" = None,
+    ) -> None:
         self._loop = loop
+        self._process_profiler = process_profiler
 
     def wait(self, timeout: "float | None" = None) -> "tuple[str, str, int]":
         """Block until the root process exits (or *timeout* elapses).
@@ -179,12 +391,34 @@ class agProxyPtraceHandle:
     def on_spawn(self, callback: "Callable[[int], None]") -> None:
         self._loop.on_spawn(callback)
 
-    def on_exit(self, callback: "Callable[[int], None]") -> None:
-        """*callback* receives `(pid, exit_code)` -- exit_code follows
-        `_tracer_loop._forget`'s convention: the process's real exit code if
-        it exited normally, or the negative signal number if it was
-        killed by a signal."""
-        self._loop.on_exit(lambda pid, code: callback(pid))
+    def on_exec(self, callback: "Callable[[int, str | None], None]") -> None:
+        """Register a replay-safe successful-exec callback.
+
+        The path is staged from the exec syscall's pathname and delivered only
+        after ``PTRACE_EVENT_EXEC`` confirms success; ``/proc/<pid>/exe`` is a
+        fallback when no pathname was trapped. It is never taken from argv[0].
+        """
+        self._loop.on_exec(callback)
+
+    def on_exit(
+        self,
+        callback: "Callable[[int], None] | Callable[[int, int], None]",
+        *,
+        include_exit_code: bool = False,
+    ) -> None:
+        """Register a replay-safe process-exit callback.
+
+        Existing one-argument callbacks continue to receive ``pid``.  Pass
+        ``include_exit_code=True`` for ``callback(pid, exit_code)``; the code
+        is the process's real exit status, or the negative signal number when
+        it was killed.  Keeping this opt-in preserves the original public
+        callback shape while making the ptrace-observed status available to
+        lifecycle consumers such as agprof.
+        """
+        if include_exit_code:
+            self._loop.on_exit(callback)
+        else:
+            self._loop.on_exit(lambda pid, _code: callback(pid))
 
     def kill(self) -> None:
         self._loop.kill()
@@ -218,13 +452,41 @@ class agProxyPtrace:
         host-level launch) uses the existing host-fork `TracerLoop` path,
         unchanged."""
         syscalls = _AgPtraceFields(self._agconfig).syscalls
+        container_launch = (
+            sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"
+        )
+        process_profiler = _ProcessLifecycleProfiler.for_active_session(
+            ag,
+            envp,
+            # In-container spawn/exit notifications cross a UDS before their
+            # host callbacks run, so their host-clock boundaries include
+            # unmeasured relay jitter and must not claim exact timing.
+            timing="host-observed" if container_launch else "exact",
+        )
 
-        if sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container":
+        if container_launch:
             from .agproxy_ptrace_internal._in_container_launcher import InContainerRelay
 
-            relay = InContainerRelay(sandbox=sandbox, policy=policy, ag=ag)
-            relay.start(argv, envp, cwd, syscalls)
-            return agProxyPtraceHandle(relay)
+            relay = InContainerRelay(
+                sandbox=sandbox,
+                policy=policy,
+                ag=ag,
+            )
+            handle = agProxyPtraceHandle(relay, process_profiler)
+            if process_profiler is not None:
+                handle.on_spawn(_isolated_profiler_callback(process_profiler.on_spawn))
+                handle.on_exec(_isolated_profiler_callback(process_profiler.on_exec))
+                handle.on_exit(
+                    _isolated_profiler_callback(process_profiler.on_exit),
+                    include_exit_code=True,
+                )
+            try:
+                relay.start(argv, envp, cwd, syscalls)
+            except BaseException:
+                if process_profiler is not None:
+                    process_profiler.finalize()
+                raise
+            return handle
 
         def syscall_hook(stop: SeccompStop) -> StopDecision:
             event = agsyscallevent(
@@ -244,8 +506,21 @@ class agProxyPtrace:
             return StopDecision(kind="allow")
 
         loop = TracerLoop(syscalls=syscalls, syscall_hook=syscall_hook)
-        loop.start(argv, envp, cwd)
-        return agProxyPtraceHandle(loop)
+        handle = agProxyPtraceHandle(loop, process_profiler)
+        if process_profiler is not None:
+            handle.on_spawn(_isolated_profiler_callback(process_profiler.on_spawn))
+            handle.on_exec(_isolated_profiler_callback(process_profiler.on_exec))
+            handle.on_exit(
+                _isolated_profiler_callback(process_profiler.on_exit),
+                include_exit_code=True,
+            )
+        try:
+            loop.start(argv, envp, cwd)
+        except BaseException:
+            if process_profiler is not None:
+                process_profiler.finalize()
+            raise
+        return handle
 
 
 def wire_to_sandbox(handle: agProxyPtraceHandle, sandbox) -> None:

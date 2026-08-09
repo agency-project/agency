@@ -68,8 +68,12 @@ class _CodexBackend(agharness_backend):
             return agerror(f"codex binary {binary!r} not found on PATH"), prev_ctx, [sys_msg]
 
         gateway = get_shared_gateway(ag.agconfig)
+        from ..agprof_ingest import get_shared_profiler_ingest
+
+        profiler_ingest = get_shared_profiler_ingest()
         token = uuid.uuid4().hex
         gateway.register(token, ag)
+        profiler_ingest.register(token, ag)
 
         config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
         try:
@@ -105,6 +109,7 @@ class _CodexBackend(agharness_backend):
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
         finally:
             gateway.unregister(token)
+            profiler_ingest.unregister(token)
             agharness.cleanup_config_home(config_home)
 
         if rc != 0:

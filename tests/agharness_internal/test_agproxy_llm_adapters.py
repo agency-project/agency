@@ -86,7 +86,8 @@ def test_anthropic_messages_to_openai_basic_text():
     }
     kwargs = anthropic_messages_to_openai(body)
     assert kwargs["model"] == "claude-x"
-    assert kwargs["max_tokens"] == 512
+    assert kwargs["max_completion_tokens"] == 512
+    assert "max_tokens" not in kwargs
     assert kwargs["messages"][0] == {"role": "system", "content": "be helpful"}
     assert kwargs["messages"][1] == {"role": "user", "content": "hello"}
     assert kwargs["stream"] is False
@@ -110,7 +111,12 @@ def test_anthropic_messages_to_openai_assistant_tool_use():
                 "role": "assistant",
                 "content": [
                     {"type": "text", "text": "let me check"},
-                    {"type": "tool_use", "id": "tu1", "name": "get_weather", "input": {"city": "SF"}},
+                    {
+                        "type": "tool_use",
+                        "id": "tu1",
+                        "name": "get_weather",
+                        "input": {"city": "SF"},
+                    },
                 ],
             }
         ],
@@ -206,7 +212,9 @@ def test_anthropic_tools_to_openai_empty():
 
 
 def test_openai_response_to_anthropic_message_text_only():
-    resp = _Response([_Choice(message=_Message(content="hi there"), finish_reason="stop")], usage=_Usage(5, 3))
+    resp = _Response(
+        [_Choice(message=_Message(content="hi there"), finish_reason="stop")], usage=_Usage(5, 3)
+    )
     out = openai_response_to_anthropic_message(resp, "claude-x", request_id="msg_1")
     assert out["id"] == "msg_1"
     assert out["type"] == "message"
@@ -230,7 +238,9 @@ def test_openai_response_to_anthropic_message_with_tool_call():
 
 
 def test_openai_response_to_anthropic_message_length_finish_reason():
-    resp = _Response([_Choice(message=_Message(content="cut off"), finish_reason="length")], usage=_Usage(1, 1))
+    resp = _Response(
+        [_Choice(message=_Message(content="cut off"), finish_reason="length")], usage=_Usage(1, 1)
+    )
     out = openai_response_to_anthropic_message(resp, "m")
     assert out["stop_reason"] == "max_tokens"
 
@@ -249,7 +259,7 @@ def _parse_sse(text):
         lines = frame.split("\n")
         event_line = next(l for l in lines if l.startswith("event: "))
         data_line = next(l for l in lines if l.startswith("data: "))
-        events.append((event_line[len("event: "):], json.loads(data_line[len("data: "):])))
+        events.append((event_line[len("event: ") :], json.loads(data_line[len("data: ") :])))
     return events
 
 
@@ -286,14 +296,19 @@ def test_openai_chunks_to_anthropic_sse_tool_call_stream():
             choices=[
                 _Choice(
                     delta=_Delta(
-                        tool_calls=[_ToolCall(id="call1", name="get_weather", arguments='{"ci', index=0)]
+                        tool_calls=[
+                            _ToolCall(id="call1", name="get_weather", arguments='{"ci', index=0)
+                        ]
                     )
                 )
             ]
         ),
         _Chunk(
             choices=[
-                _Choice(delta=_Delta(tool_calls=[_ToolCall(arguments='ty": "SF"}', index=0)]), finish_reason="tool_calls")
+                _Choice(
+                    delta=_Delta(tool_calls=[_ToolCall(arguments='ty": "SF"}', index=0)]),
+                    finish_reason="tool_calls",
+                )
             ]
         ),
     ]
@@ -307,7 +322,9 @@ def test_openai_chunks_to_anthropic_sse_tool_call_stream():
     assert text_stop_idx < tool_start_idx
 
     tool_start_event = next(
-        d for t, d in events if t == "content_block_start" and d["content_block"]["type"] == "tool_use"
+        d
+        for t, d in events
+        if t == "content_block_start" and d["content_block"]["type"] == "tool_use"
     )
     assert tool_start_event["content_block"]["id"] == "call1"
     assert tool_start_event["content_block"]["name"] == "get_weather"
@@ -342,7 +359,12 @@ def test_responses_request_to_openai_structured_input_with_function_call_roundtr
         "model": "m",
         "input": [
             {"role": "user", "content": [{"type": "input_text", "text": "what's the weather?"}]},
-            {"type": "function_call", "call_id": "call1", "name": "get_weather", "arguments": '{"city": "SF"}'},
+            {
+                "type": "function_call",
+                "call_id": "call1",
+                "name": "get_weather",
+                "arguments": '{"city": "SF"}',
+            },
             {"type": "function_call_output", "call_id": "call1", "output": "72F and sunny"},
         ],
     }
@@ -350,20 +372,39 @@ def test_responses_request_to_openai_structured_input_with_function_call_roundtr
     assert kwargs["messages"][0] == {"role": "user", "content": "what's the weather?"}
     assert kwargs["messages"][1]["role"] == "assistant"
     assert kwargs["messages"][1]["tool_calls"][0]["function"]["name"] == "get_weather"
-    assert kwargs["messages"][2] == {"role": "tool", "tool_call_id": "call1", "content": "72F and sunny"}
+    assert kwargs["messages"][2] == {
+        "role": "tool",
+        "tool_call_id": "call1",
+        "content": "72F and sunny",
+    }
 
 
-def test_responses_request_to_openai_max_output_tokens_maps_to_max_tokens():
+def test_responses_request_to_openai_max_output_tokens_maps_to_max_completion_tokens():
     body = {"model": "m", "input": "hi", "max_output_tokens": 256}
     kwargs = responses_request_to_openai(body)
-    assert kwargs["max_tokens"] == 256
+    assert kwargs["max_completion_tokens"] == 256
+    assert "max_tokens" not in kwargs
 
 
 def test_responses_tools_to_openai_flattens_to_nested():
-    tools = [{"type": "function", "name": "get_weather", "description": "d", "parameters": {"type": "object"}}]
+    tools = [
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "d",
+            "parameters": {"type": "object"},
+        }
+    ]
     converted = responses_tools_to_openai(tools)
     assert converted == [
-        {"type": "function", "function": {"name": "get_weather", "description": "d", "parameters": {"type": "object"}}}
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "d",
+                "parameters": {"type": "object"},
+            },
+        }
     ]
 
 
@@ -378,7 +419,9 @@ def test_openai_response_to_responses_api_text_only():
     assert out["id"] == "resp_1"
     assert out["status"] == "completed"
     assert out["output"][0]["type"] == "message"
-    assert out["output"][0]["content"] == [{"type": "output_text", "text": "the answer is 4", "annotations": []}]
+    assert out["output"][0]["content"] == [
+        {"type": "output_text", "text": "the answer is 4", "annotations": []}
+    ]
     assert out["usage"] == {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
 
 
@@ -422,13 +465,20 @@ def test_openai_chunks_to_responses_sse_function_call_stream():
         _Chunk(
             choices=[
                 _Choice(
-                    delta=_Delta(tool_calls=[_ToolCall(id="call1", name="get_weather", arguments='{"city"', index=0)])
+                    delta=_Delta(
+                        tool_calls=[
+                            _ToolCall(id="call1", name="get_weather", arguments='{"city"', index=0)
+                        ]
+                    )
                 )
             ]
         ),
         _Chunk(
             choices=[
-                _Choice(delta=_Delta(tool_calls=[_ToolCall(arguments=': "SF"}', index=0)]), finish_reason="tool_calls")
+                _Choice(
+                    delta=_Delta(tool_calls=[_ToolCall(arguments=': "SF"}', index=0)]),
+                    finish_reason="tool_calls",
+                )
             ]
         ),
     ]

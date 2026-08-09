@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
 
 from . import agpause
+from .profiler import agprof
 from .agtype import agtype
 from .agutil import _camel_to_snake
 
@@ -38,7 +39,11 @@ class agdata:
         if f is None:
             return
         with agpause.note_blocked_on(agpause.producer_of(f)):
-            resolved = f.result()
+            if f.done():
+                resolved = f.result()
+            else:
+                with agprof.span("sync:result_wait"):
+                    resolved = f.result()
         resolved._resolve()  # chain: future may resolve to another pending agdata
         object.__setattr__(self, "_data", object.__getattribute__(resolved, "_data"))
         object.__setattr__(self, "_future", None)

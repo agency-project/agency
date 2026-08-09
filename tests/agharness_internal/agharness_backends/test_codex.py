@@ -120,9 +120,7 @@ def test_execute_nonzero_exit_returns_agerror():
 
 def test_execute_recovers_structured_output_schema():
     backend = _CodexBackend(agConfig())
-    skill = agskill(
-        name="s", system_prompt="do the thing", output_schema=agdata(answer=str)
-    )
+    skill = agskill(name="s", system_prompt="do the thing", output_schema=agdata(answer=str))
     ag = _make_agent()
     prev_ctx = agcontext()
 
@@ -148,7 +146,9 @@ def test_execute_writes_model_providers_config_toml():
     skill = agskill(name="s", system_prompt="do the thing")
     ag = _make_agent()
 
-    handle = _make_handle(stdout='{"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}')
+    handle = _make_handle(
+        stdout='{"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}'
+    )
     written = {}
 
     def fake_launch(argv, envp, *, cwd, policy, ag):
@@ -183,8 +183,12 @@ def test_execute_writes_model_providers_config_toml():
 def test_parse_output_events_ignores_non_agent_message_items():
     stdout = "\n".join(
         [
-            json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "thinking"}}),
-            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "final"}}),
+            json.dumps(
+                {"type": "item.completed", "item": {"type": "reasoning", "text": "thinking"}}
+            ),
+            json.dumps(
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "final"}}
+            ),
         ]
     )
     assert _CodexBackend._parse_output_events(stdout) == "final"

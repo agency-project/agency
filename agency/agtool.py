@@ -8,10 +8,6 @@ from .agconfig import DynamicConfigParam, _AgConfigViewBase
 if TYPE_CHECKING:
     from .aglog import aglog
     from .agterm import agterm
-    from .agsandbox import agSandbox
-    from .agconfig import agConfig
-    from .agpolicy import agpolicy
-    from .agent import agent
 
 
 # Exists only to register agtool's config fields (via __set_name__ at import

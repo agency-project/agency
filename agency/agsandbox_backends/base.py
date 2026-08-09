@@ -26,7 +26,6 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
-import threading
 import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as _FutureTimeoutError
@@ -227,7 +226,9 @@ def run_with_unkillable_child_grace(
         except BaseException as e:  # noqa: BLE001 - relayed verbatim to the waiter below
             future.set_exception(e)
 
-    threading.Thread(target=_task, daemon=True).start()
+    from ..profiler import agprof
+
+    agprof.spawn_traced(_task).start()
     try:
         return future.result(timeout=timeout + grace_s)
     except _FutureTimeoutError:
@@ -770,11 +771,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         while changed:
             changed = False
             for pid, (ppid, _, _) in proc_info.items():
-                if (
-                    pid not in system_pids
-                    and pid not in baseline_pids
-                    and ppid in system_pids
-                ):
+                if pid not in system_pids and pid not in baseline_pids and ppid in system_pids:
                     system_pids.add(pid)
                     changed = True
 

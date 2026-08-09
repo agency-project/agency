@@ -35,12 +35,25 @@ stdout, stderr, returncode = handle.wait(timeout=300)
   `agProxyPtraceHandle` immediately (non-blocking; the traced process runs concurrently).
 - `agProxyPtraceHandle.wait(timeout=None)` — blocks until the root process exits; returns
   `(stdout, stderr, returncode)`, deliberately in the same family as `agSandbox.exec()`'s
-  `(str, int)` shape (see [agsandbox.md](../agsandbox.md)).
+  `(str, int)` shape (see [agsandbox.md](../agsandbox.md)). A timeout is a polling result
+  (`returncode == -1`), not termination: the handle may be waited on again and live agprof
+  process spans remain open.
 - `.pids()` — currently-live traced pids.
-- `.on_spawn(callback)` / `.on_exit(callback)` — fire for every process the traced tree
-  forks/exits, not just the root. Registering after some events have already happened still
-  replays them — see `TracerLoop`'s backlog lists. This is the seam Phase 2 wires into
-  `agsandbox_backend.ingest_ptrace_pids()`.
+- `.on_spawn(callback)` / `.on_exec(callback)` / `.on_exit(callback)` — fire for every process
+  the traced tree forks, successfully execs, or exits, not just the root. Exec callbacks receive
+  `(pid, executable_path)` only after `PTRACE_EVENT_EXEC`; the staged exec pathname is preferred
+  (so a shebang launcher is named for the requested script), with the stopped process's
+  `/proc/<pid>/exe` link as fallback. It is never taken from attacker-controlled `argv[0]`, and
+  credential-shaped basenames or names containing a registered launch credential are redacted
+  before agprof records them. An exec
+  candidate that fails produces no callback. `PTRACE_EVENT_CLONE` tracees are checked by thread-group ID;
+  non-leader threads remain traced internally but do not reach these process callbacks. Registering
+  after some events have already happened still replays them — see `TracerLoop`'s backlog lists.
+  Pass `include_exit_code=True` to `.on_exit()` for `(pid, exit_code)`. This is the seam Phase 2
+  wires into `agsandbox_backend.ingest_ptrace_pids()` and agprof lifecycle spans.
+- Host ptrace lifecycle spans carry `timing="exact"`. In-container lifecycle callbacks cross the
+  UDS relay before the host timestamps them, so those spans explicitly carry
+  `timing="host-observed"` rather than hiding unmeasured boundary jitter behind an exact label.
 - `.kill()` — SIGKILLs every currently-known traced pid.
 - `ptrace_available()` — process-lifetime-cached probe (mirrors
   `agsandbox_backends/chroot.py`'s `chroot_available()`): a live fork+`PTRACE_TRACEME` smoke test,
@@ -73,7 +86,7 @@ path resolution and process lifecycle event routing land in Phase 2.
 | Field | Tier | Default | Purpose |
 |---|---|---|---|
 | `syscalls` | dynamic | `("execve", "execveat")` | Which syscalls the seccomp filter traps. |
-| `profiler` | dynamic | `None` | Reserved for a future profiler hook; unused so far. |
+| `profiler` | dynamic | `None` | Reserved for a future heavyweight process profiler (for example `perf`). The low-cost agprof process-lifecycle spans are automatic whenever an agprof session is active and do not consume this selector. |
 | `disable_harness_native_sandbox` | dynamic | `True` | Advisory only — see the design doc's "Design Tensions" on seccomp filter stacking. |
 | `enabled_for_sandbox` | global | `False` | Whether agsandbox container backends add the `CAP_SYS_PTRACE` + custom seccomp profile a containerized traced process needs (Phase 2). |
 | `attach_timeout_s` | global | `30` | Ceiling on waiting for the traced process's initial post-`TRACEME` stop. |

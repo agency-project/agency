@@ -12,8 +12,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock
 
-import pytest
-
 
 def _make_session(sandbox=None, pool=None):
     """A minimal object exposing exactly the (sandbox, agresource_pool)
@@ -62,7 +60,6 @@ class TestAgMCPServerRealClient:
 
     def test_tool_discovery_lists_expected_tools(self):
         async def go():
-            import httpx2
             from mcp import ClientSession
             from mcp.client.streamable_http import streamable_http_client
 
@@ -73,7 +70,13 @@ class TestAgMCPServerRealClient:
 
         result = _run(go())
         names = {t.name for t in result.tools}
-        assert {"reserve_cpu", "cpu_release", "daemon_release", "submit_output", "ask_human"} <= names
+        assert {
+            "reserve_cpu",
+            "cpu_release",
+            "daemon_release",
+            "submit_output",
+            "ask_human",
+        } <= names
         # The known, documented gap -- see agmcp_server.py's module
         # docstring -- reserve_gpu is deliberately NOT exposed yet.
         assert "reserve_gpu" not in names
@@ -128,7 +131,9 @@ class TestAgMCPServerRealClient:
         try:
             result = _run(
                 _call_tool_over_http(
-                    self.base_url, token, "submit_output",
+                    self.base_url,
+                    token,
+                    "submit_output",
                     {"field": "greeting", "value": '"hello there"'},
                 )
             )
@@ -159,7 +164,9 @@ class TestAgMCPServerRealClient:
         try:
             result = _run(
                 _call_tool_over_http(
-                    self.base_url, token, "submit_output",
+                    self.base_url,
+                    token,
+                    "submit_output",
                     {"field": "word_count", "value": '"not a number"'},
                 )
             )
@@ -222,7 +229,13 @@ class TestAgMCPServerRealClient:
 
         result = _run(go())
         names = {t.name for t in result.tools}
-        assert {"reserve_cpu", "cpu_release", "daemon_release", "submit_output", "ask_human"} <= names
+        assert {
+            "reserve_cpu",
+            "cpu_release",
+            "daemon_release",
+            "submit_output",
+            "ask_human",
+        } <= names
 
     def test_submit_output_unknown_field_rejected(self):
         from agency.agdata import agdata
@@ -235,7 +248,9 @@ class TestAgMCPServerRealClient:
         try:
             result = _run(
                 _call_tool_over_http(
-                    self.base_url, token, "submit_output",
+                    self.base_url,
+                    token,
+                    "submit_output",
                     {"field": "not_a_real_field", "value": '"x"'},
                 )
             )

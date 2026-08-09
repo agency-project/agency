@@ -34,16 +34,20 @@ Joining: results resolve lazily like any agdata — access a field, call
 Container creation inside the mapped function is throttled by ``agsandbox``'s
 container semaphore, so mapping over a large list never starts unbounded
 containers even though each task gets its own thread.
+
+Profiling: each task runs on a traced thread under its own
+``agmap:{fn}[{index}]`` span (see ``_spawn``), so a fan-out appears as children
+of whatever ran the map instead of as N disconnected trace roots.
 """
 
 from __future__ import annotations
 
-import threading
 from concurrent.futures import Future
 from typing import Callable
 
 from .agdata import agdata, agerror
 from .agutil import format_exception
+from .profiler import agprof
 
 
 class agtask(agdata):
@@ -56,19 +60,49 @@ class agtask(agdata):
     """
 
 
-def _spawn(fn: "Callable[[object], object]", arg: object) -> agtask:
-    """Run ``fn(arg)`` on a daemon thread; return a pending agtask immediately."""
+def _spawn(fn: "Callable[[object], object]", arg: object, index: int = 0) -> agtask:
+    """Run ``fn(arg)`` on a traced daemon thread; return a pending agtask
+    immediately.
+
+    The thread comes from ``agprof.spawn_traced()`` rather than a bare
+    ``threading.Thread`` so each task is a *child* of whatever ran the map,
+    which is the truthful parentage: the map call is what caused it. A bare
+    thread starts with empty ``contextvars``, which would make every mapped
+    task a disconnected trace root — and silently, since a disconnected root
+    is a valid trace, not an error. This is the highest-fan-out spawn site in
+    the framework (one thread per mapped item, deliberately unbounded), so it
+    is also where flat parentage would cost the most.
+
+    ``agmap:{fn}[{index}]`` is deliberately a *task* label, not a
+    ``run{N}:`` one: run-shaped labels are what ``run_metrics`` counts, and a
+    mapped function is not an agent run. Laying these spans out as flat lanes
+    in a timeline view stays a rendering concern (a synthetic ``tid`` per
+    span), never a parentage one, so ``thread_name()`` here is naming only.
+
+    Tasks of an ``is_asynchronous=True`` map may outlive the span that
+    enclosed the ``agmap()`` call. That is legal — ``parent_span_id`` is a
+    stored field, so the trace stays correct — and ``agsync`` is the natural
+    join point.
+    """
     future: "Future[agdata]" = Future()
+    label = f"agmap:{getattr(fn, '__name__', type(fn).__name__)}[{index}]"
 
     def _run() -> None:
-        try:
-            out = fn(arg)
-            result = out if isinstance(out, agdata) else agdata(result=out)
-        except Exception as e:  # noqa: BLE001 — mirror skills: never propagate
-            result = agerror(format_exception(e))
-        future.set_result(result)
+        agprof.thread_name(label)
+        with agprof.span(label):
+            try:
+                out = fn(arg)
+                result = out if isinstance(out, agdata) else agdata(result=out)
+            except Exception as e:  # noqa: BLE001 — mirror skills: never propagate
+                result = agerror(format_exception(e))
+            error = result._data.get("error")
+            agprof.annotate(
+                outcome="failure" if error else "success",
+                error_type="agmap_task_error" if error else None,
+            )
+            future.set_result(result)
 
-    threading.Thread(target=_run, daemon=True).start()
+    agprof.spawn_traced(_run).start()
     return agtask(_future=future)
 
 
@@ -110,7 +144,7 @@ def agmap(
             "provide one function, one item, or equal-length lists"
         )
 
-    pending = [_spawn(f, it) for f, it in pairs]
+    pending = [_spawn(f, it, index) for index, (f, it) in enumerate(pairs)]
 
     if not is_asynchronous:
         agdata.wait_all(pending)

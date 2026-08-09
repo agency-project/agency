@@ -88,7 +88,6 @@ def test_build_mcp_output_format_instruction_present_for_structured_schema():
 
 
 def test_default_policy_check_returns_allow():
-    from agency.agpolicy import agdecision
 
     ag = _make_agent()
     ag.log = MagicMock()

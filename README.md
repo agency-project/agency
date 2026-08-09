@@ -25,7 +25,7 @@ uv venv --python 3.12 --seed --managed-python
 source .venv/bin/activate
 
 uv pip install -e .
-uv pip install -e ".[dev]"   # dev dependencies (pytest, ruff, pre-commit)
+uv pip install -e ".[dev]"   # dev dependencies (pytest, ruff, pre-commit) + the profiler extra the tests need
 
 pre-commit install   # one-time; runs ruff (lint + format) and hygiene checks on every commit
 ```

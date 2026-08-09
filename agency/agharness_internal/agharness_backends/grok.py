@@ -74,8 +74,12 @@ class _GrokBackend(agharness_backend):
             return agerror(f"grok binary {binary!r} not found on PATH"), prev_ctx, [sys_msg]
 
         gateway = get_shared_gateway(ag.agconfig)
+        from ..agprof_ingest import get_shared_profiler_ingest
+
+        profiler_ingest = get_shared_profiler_ingest()
         token = uuid.uuid4().hex
         gateway.register(token, ag)
+        profiler_ingest.register(token, ag)
 
         config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
         try:
@@ -110,6 +114,7 @@ class _GrokBackend(agharness_backend):
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
         finally:
             gateway.unregister(token)
+            profiler_ingest.unregister(token)
             agharness.cleanup_config_home(config_home)
 
         if rc != 0:
@@ -152,7 +157,7 @@ class _GrokBackend(agharness_backend):
             f"model = {_toml_string(self._MODEL_NAME)}\n\n"
             f"[model.{self._MODEL_NAME}]\n"
             f"model = {_toml_string(model)}\n"
-            f'base_url = {_toml_string(f"{base_url}/v1")}\n'
+            f"base_url = {_toml_string(f'{base_url}/v1')}\n"
             f"api_key = {_toml_string(token)}\n"
             f'api_backend = "chat_completions"\n'
         )

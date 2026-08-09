@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agtype import agtype
 from . import agpause
+from .profiler import agprof
 from .agschema import agschema
 from .agcontext import agcontext
 from .agtool import agtool
@@ -48,9 +49,6 @@ class agSkillConfig(_AgConfigViewBase):
 
 if TYPE_CHECKING:
     from .agent import agent
-    from .agterm import agterm
-    from .aglog import aglog
-    from .agresources import agResourcePool
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +265,9 @@ class agskill:
             try:
                 # ── 1. Unblock: wait for any in-flight predecessor to finish,
                 #    then resolve any lazy input futures passed by the caller.
-                prev_ctx.resolve_prev_dependencies()
-                skill_input.resolve_input_dependencies()
+                with agprof.span("resolve"):
+                    prev_ctx.resolve_prev_dependencies()
+                    skill_input.resolve_input_dependencies()
 
                 # Defensive shallow copy: prepare_inputs_in_sandbox() (called
                 # below, via execute_harness) mutates its skill_input argument
@@ -290,17 +289,18 @@ class agskill:
                 # ── 2. Provision sandbox — created once on first run and reused
                 #    across subsequent runs via its internal checkpoint image.
                 if ag.sandbox is None:
-                    _out_dir = (
-                        ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
-                        if ag.agconfig is not None
-                        else type(ag).output_dir
-                    )
-                    _out = Path(_out_dir) / ag.agname if _out_dir else None
-                    sb_cfg = ag.agconfig
-                    if _out is not None:
-                        sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-                        agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
-                    ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
+                    with agprof.span("sandbox:provision"):
+                        _out_dir = (
+                            ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
+                            if ag.agconfig is not None
+                            else type(ag).output_dir
+                        )
+                        _out = Path(_out_dir) / ag.agname if _out_dir else None
+                        sb_cfg = ag.agconfig
+                        if _out is not None:
+                            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
+                            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+                        ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
 
                 # Hold the sandbox's lock for the rest of the skill run so a
                 # sandbox shared across agents is never driven by more than
@@ -355,7 +355,8 @@ class agskill:
                         # no equivalent drain point today) surfaces it right
                         # as the agent resumes sandbox work, rather than
                         # never telling it at all.
-                        ag.sandbox.rm_container()
+                        with agprof.span("teardown:discard"):
+                            ag.sandbox.rm_container()
                         ag.inbox.put(
                             "Note: the previous skill call failed. Its sandbox "
                             "workspace changes have been discarded and the "
@@ -378,17 +379,18 @@ class agskill:
                         # /dev/null`. Same pending-work deferral as
                         # agtool.py -- wait_for_processes() should already
                         # have drained background jobs before we get here.
-                        try:
-                            ag.sandbox.commit()
-                        finally:
-                            if not ag.sandbox._has_pending_background_work():
-                                try:
-                                    ag.sandbox.stop()
-                                except Exception as _e:
-                                    print(
-                                        f"[agskill] WARNING: post-commit hibernate "
-                                        f"failed for {ag.agname}: {_e}"
-                                    )
+                        with agprof.span("teardown:commit"):
+                            try:
+                                ag.sandbox.commit()
+                            finally:
+                                if not ag.sandbox._has_pending_background_work():
+                                    try:
+                                        ag.sandbox.stop()
+                                    except Exception as _e:
+                                        print(
+                                            f"[agskill] WARNING: post-commit hibernate "
+                                            f"failed for {ag.agname}: {_e}"
+                                        )
                 if sandbox_lock is not None:
                     sandbox_lock.release()
                 agpause.set_current_worker_agent(None)
@@ -451,7 +453,8 @@ class agskill:
 
             # ── 7. Prune history, then resolve ctx future for the next chained call.
             try:
-                pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages)
+                with agprof.span("prune"):
+                    pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages)
                 if pruned_msgs is not updated_ctx.messages:
                     updated_ctx.messages = pruned_msgs
                     ag.terminal.log(
@@ -468,7 +471,28 @@ class agskill:
         # which would otherwise let wait_all_paused() race past a run that
         # hasn't had a chance to update its own state yet.
         ag._set_ui_state("skill", skill=self.name)
-        threading.Thread(target=_task, daemon=True).start()
+
+        def _traced_task() -> None:
+            run_id = f"run{agprof.next_index()}"
+            label = f"{run_id}:{self.name}:{ag.agname}"
+            agprof.thread_name(label)
+            with agprof.span(label):
+                agprof.annotate(
+                    **{
+                        "agency.run_id": run_id,
+                        "agency.agent_id": str(ag.agname),
+                        "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None),
+                    }
+                )
+                _task()
+                profile_result = result_future.result()
+                profile_error = profile_result._data.get("error")
+                agprof.annotate(
+                    outcome="failure" if profile_error else "success",
+                    error_type="skill_error" if profile_error else None,
+                )
+
+        agprof.spawn_traced(_traced_task).start()
         ag.ctx = agcontext(_future=ctx_future)
         return agdata(_future=result_future)
 
@@ -545,18 +569,19 @@ class agskill:
             return agerror(input_error), prev_ctx, [sys_msg]
 
         _input_suffix = f"_{int(time.time() * 1000)}"
-        _offloaded_paths, auto_fields = (
-            self.input_schema.prepare_inputs_in_sandbox(
-                skill_input,
-                ag.sandbox,
-                self.name,
-                suffix=_input_suffix,
-                context_limit=ag.llm.context_limit,
-                agconfig=ag.agconfig,
+        with agprof.span("input:prepare"):
+            _offloaded_paths, auto_fields = (
+                self.input_schema.prepare_inputs_in_sandbox(
+                    skill_input,
+                    ag.sandbox,
+                    self.name,
+                    suffix=_input_suffix,
+                    context_limit=ag.llm.context_limit,
+                    agconfig=ag.agconfig,
+                )
+                if self.input_schema is not None
+                else ([], [])
             )
-            if self.input_schema is not None
-            else ([], [])
-        )
         extra_system: "str | None" = None
         if auto_fields:
             field_list = ", ".join(f"`{f}`" for f in auto_fields)

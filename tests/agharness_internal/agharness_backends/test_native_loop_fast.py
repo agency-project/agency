@@ -16,6 +16,207 @@ from agency.agskill import agskill
 from ._native_loop_harness import NativeLoopHarness, content_chunks, tool_call_chunks
 
 
+class _CapturedSpan:
+    def __init__(self, owner, name, span_id, metadata):
+        self.owner = owner
+        self.name = name
+        self.span_id = span_id
+        self.metadata = dict(metadata or {})
+
+    def __enter__(self):
+        self.owner.spans.append(self)
+        return self
+
+    def annotate(self, **metadata):
+        self.metadata.update(metadata)
+
+    def __exit__(self, exc_type, _exc_value, _traceback):
+        self.metadata.setdefault("outcome", "failure" if exc_type else "success")
+
+
+class _CapturedProfiler:
+    def __init__(self):
+        self.spans = []
+
+    def span(self, name, *, span_id=None, metadata=None):
+        return _CapturedSpan(self, name, span_id, metadata)
+
+
+def test_react_loop_emits_exact_turn_and_tool_intervals(monkeypatch):
+    h = NativeLoopHarness()
+    module = h.module
+    profiler = _CapturedProfiler()
+    responses = iter(
+        [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "tc_7",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command":"printf m5-marker"}',
+                            },
+                        }
+                    ],
+                },
+                "usage": {},
+            },
+            {"message": {"role": "assistant", "content": "done"}, "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(module, "_fetch_context_limit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "_dispatch_via_terminus",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    response = module._run_react_loop_inner(
+        {
+            "token": "tok",
+            "terminus_sock": "/unused",
+            "model": "m",
+            "messages": [{"role": "user", "content": "run a tool"}],
+            "max_steps": 3,
+        },
+        profiler,
+    )
+
+    assert response["status"] == "done"
+    assert response["turn_count"] == 2
+    assert [span.name for span in profiler.spans] == ["turn0", "tool:bash", "turn1"]
+    tool_span = profiler.spans[1]
+    assert tool_span.span_id == "tool:tc_7"
+    assert tool_span.metadata["arguments"] == '{"command":"printf m5-marker"}'
+    assert "m5-marker" in tool_span.metadata["result"]
+
+
+def test_compaction_emits_exact_interval(monkeypatch):
+    h = NativeLoopHarness()
+    module = h.module
+    profiler = _CapturedProfiler()
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+
+    monkeypatch.setattr(module._agllm_pure, "should_compact", lambda *_args: True)
+    monkeypatch.setattr(
+        module._agllm_pure,
+        "split_for_compaction",
+        lambda *_args: (messages[0], messages[1], [{"role": "assistant", "content": "old"}], []),
+    )
+    monkeypatch.setattr(module._agllm_pure, "prune_tool_outputs", lambda head: head)
+    monkeypatch.setattr(
+        module._agllm_pure,
+        "build_summary_prompt_messages",
+        lambda *_args: [{"role": "user", "content": "summarize"}],
+    )
+    monkeypatch.setattr(
+        module._agllm_pure,
+        "assemble_compacted_messages",
+        lambda *_args: [{"role": "system", "content": "compacted"}],
+    )
+    monkeypatch.setattr(
+        module,
+        "_dispatch_via_terminus",
+        lambda *_args, **_kwargs: {
+            "message": {"role": "assistant", "content": "old turns summarized"},
+            "usage": {},
+        },
+    )
+
+    compacted, summary = module._maybe_compact(
+        messages,
+        100,
+        "/unused",
+        "tok",
+        "m",
+        None,
+        profiler,
+    )
+
+    assert summary == "old turns summarized"
+    assert compacted == [{"role": "system", "content": "compacted"}]
+    assert [span.name for span in profiler.spans] == ["llm:compact"]
+    assert profiler.spans[0].metadata["outcome"] == "success"
+
+
+def test_retry_sleep_emits_exact_backoff_interval(monkeypatch):
+    import httpx
+    import time
+
+    h = NativeLoopHarness()
+    module = h.module
+    profiler = _CapturedProfiler()
+
+    class FakeResponse:
+        def __init__(self, status_code, lines=()):
+            self.status_code = status_code
+            self._lines = lines
+            self.text = "temporarily unavailable"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return self.text.encode()
+
+        def iter_lines(self):
+            return iter(self._lines)
+
+    responses = iter(
+        [
+            FakeResponse(503),
+            FakeResponse(
+                200,
+                [
+                    'data: {"choices":[{"delta":{"content":"done"}}]}',
+                    "data: [DONE]",
+                ],
+            ),
+        ]
+    )
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return next(responses)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", lambda **_kwargs: object())
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    monkeypatch.setattr(module, "_dispatch_retry_backoff_s", lambda _attempt: 0.25)
+    monkeypatch.setattr(time, "sleep", lambda _delay: None)
+
+    response = module._dispatch_via_terminus(
+        "/unused",
+        "tok",
+        {"model": "m", "messages": []},
+        max_retries=2,
+        profiler=profiler,
+    )
+
+    assert response["message"]["content"] == "done"
+    assert [span.name for span in profiler.spans] == ["llm:retry_backoff"]
+    assert profiler.spans[0].metadata == {
+        "attempt": 0,
+        "delay_ms": 250.0,
+        "outcome": "success",
+    }
+
+
 def test_bash_tool_round_trip():
     h = NativeLoopHarness()
     try:
@@ -230,14 +431,13 @@ def test_submit_output_all_fields_collected():
     above this (native.py's own reprompt-until-complete loop, wrapping the
     result into `agdata`) is Docker-only coverage today -- see
     test_native.py's TestNativeBackendRealEndToEnd."""
-    skill = agskill(
-        name="s", system_prompt="", output_schema=agdata(summary=str, word_count=int)
-    )
+    skill = agskill(name="s", system_prompt="", output_schema=agdata(summary=str, word_count=int))
     h = NativeLoopHarness(with_mcp=True, mcp_skill=skill)
     try:
         h.fake_client.chat.completions.create.side_effect = [
             tool_call_chunks(
-                "submit_output", {"field": "summary", "value": json.dumps("great paper")},
+                "submit_output",
+                {"field": "summary", "value": json.dumps("great paper")},
                 call_id="call_1",
             ),
             tool_call_chunks(
@@ -269,7 +469,8 @@ def test_submit_output_type_error_returns_immediate_feedback():
     try:
         h.fake_client.chat.completions.create.side_effect = [
             tool_call_chunks(
-                "submit_output", {"field": "word_count", "value": json.dumps("not-a-number")},
+                "submit_output",
+                {"field": "word_count", "value": json.dumps("not-a-number")},
                 call_id="call_1",
             ),
             tool_call_chunks(
@@ -463,3 +664,25 @@ def test_custom_tool_load_failure_does_not_abort_the_run():
         assert "recovered" in resp["final_text"]
     finally:
         h.stop()
+
+
+def test_describe_exception_spells_out_exception_group_members():
+    """A `run` op that raises reports one string and nothing else -- so an
+    ExceptionGroup summarised as "(1 sub-exception)" erases the only part
+    naming what broke. The MCP client paths run under anyio task groups, so
+    that wrapper is the common shape for a real bridge failure, not an edge
+    case."""
+    from ._native_loop_harness import load_entrypoint_module
+
+    entrypoint = load_entrypoint_module()
+
+    plain = entrypoint._describe_exception(RuntimeError("boom"))
+    assert plain == "RuntimeError: boom"
+
+    group = ExceptionGroup("unhandled errors in a TaskGroup", [ConnectionRefusedError("no uds")])
+    described = entrypoint._describe_exception(group)
+    assert "ConnectionRefusedError: no uds" in described
+    assert "unhandled errors in a TaskGroup" in described
+
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner", [TimeoutError("read timeout")])])
+    assert "TimeoutError: read timeout" in entrypoint._describe_exception(nested)

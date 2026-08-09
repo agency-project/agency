@@ -121,9 +121,33 @@ class UserRegsStruct(ctypes.Structure):
     _fields_ = [
         (name, ctypes.c_ulonglong)
         for name in (
-            "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10", "r9", "r8",
-            "rax", "rcx", "rdx", "rsi", "rdi", "orig_rax", "rip", "cs", "eflags",
-            "rsp", "ss", "fs_base", "gs_base", "ds", "es", "fs", "gs",
+            "r15",
+            "r14",
+            "r13",
+            "r12",
+            "rbp",
+            "rbx",
+            "r11",
+            "r10",
+            "r9",
+            "r8",
+            "rax",
+            "rcx",
+            "rdx",
+            "rsi",
+            "rdi",
+            "orig_rax",
+            "rip",
+            "cs",
+            "eflags",
+            "rsp",
+            "ss",
+            "fs_base",
+            "gs_base",
+            "ds",
+            "es",
+            "fs",
+            "gs",
         )
     ]
 
@@ -141,7 +165,9 @@ def ptrace(request: int, pid: int, addr: int = 0, data: int = 0) -> int:
     result = libc.ptrace(request, pid, ctypes.c_void_p(addr), ctypes.c_void_p(data))
     if result == -1 and ctypes.get_errno() != 0:
         errno = ctypes.get_errno()
-        raise PtraceError(errno, f"ptrace(request={request}, pid={pid}) failed: {os_strerror(errno)}")
+        raise PtraceError(
+            errno, f"ptrace(request={request}, pid={pid}) failed: {os_strerror(errno)}"
+        )
     return result
 
 

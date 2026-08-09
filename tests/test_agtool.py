@@ -1,6 +1,5 @@
 """Tests for the agtool class."""
 
-import json
 import os
 from unittest.mock import MagicMock
 from agency.agdata import agdata

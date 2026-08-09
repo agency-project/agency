@@ -1,12 +1,12 @@
 from __future__ import annotations
 import functools
-import threading
 import weakref
 from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
 from ._context import _active_team
 from .agconfig import agConfig
+from .profiler import agprof
 
 if TYPE_CHECKING:
     from .agent import agent as _Agent
@@ -205,7 +205,7 @@ def _wrap_run(cls) -> None:
                 _active_team.reset(token)
 
         self._run_future = future
-        threading.Thread(target=_task, daemon=True).start()
+        agprof.spawn_traced(_task).start()
         return agdata(_future=future)
 
     cls.run = _async_run
