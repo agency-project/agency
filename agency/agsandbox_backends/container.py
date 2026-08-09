@@ -159,17 +159,15 @@ _AGENCY_OWNER_PID_LABEL = "agency.owner_pid"
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if *pid* refers to a currently-running process on this host."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Exists, just not signalable by us -- not expected for our own
-        # sandbox containers' owner PIDs (always this same user), but
-        # "exists" is the correct answer either way.
-        return True
-    return True
+    """Return True if *pid* refers to a currently-running process on this host.
+
+    Delegates to `agutil.pid_alive` so this reaper and the gateway-directory
+    reaper (`agutil._reap_orphaned_gateway_dirs`) share one definition of
+    "owner still alive" -- the test both rely on before deleting anything.
+    """
+    from ..agutil import pid_alive
+
+    return pid_alive(pid)
 
 
 _reap_lock = threading.Lock()

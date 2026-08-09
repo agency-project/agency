@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import queue
 import re
 import signal
@@ -259,6 +260,80 @@ def _b36_suffix(n: int, width: int = 4) -> str:
     return "".join(reversed(digits))
 
 
+# sizeof(struct sockaddr_un.sun_path) on Linux -- a kernel ABI constant,
+# NOT a filesystem limit (PATH_MAX is 4096), so a socket path can be a
+# perfectly legal *file* path and still be unbindable as a *socket*. The
+# usable length is one less: the path is NUL-terminated inside the array.
+UDS_SUN_PATH_MAX = 108
+
+# Records which process owns a gateway directory, so a later run can prove
+# the owner is dead before removing it -- the directory-level counterpart to
+# container.py's `agency.owner_pid` label.
+_GATEWAY_OWNER_FILE = "owner.pid"
+
+_AGENCY_RUN_ID: "str | None" = None
+_gateway_dir = None
+_gateway_lock = threading.Lock()
+_gateway_reap_done = False
+
+
+def pid_alive(pid: int) -> bool:
+    """Return True if *pid* refers to a currently-running process on this host.
+
+    The canonical copy: `agsandbox_backends/container.py` delegates here so
+    the "is this owner still alive?" test behind every reaper in the
+    framework has exactly one implementation to reason about.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists, just not signalable by us -- "exists" is the correct
+        # answer either way, and refusing to reap is the safe direction.
+        return True
+    return True
+
+
+def agency_run_id() -> str:
+    """Stable per-process id used to namespace this run's host-side runtime
+    state. A uuid rather than a pid, matching `container.py`'s `_RUN_ID`:
+    pids are recycled, so a successive run could otherwise inherit a dead
+    run's name and adopt its leftovers."""
+    global _AGENCY_RUN_ID
+    if _AGENCY_RUN_ID is None:
+        import uuid
+
+        _AGENCY_RUN_ID = f"r{uuid.uuid4().hex[:8]}"
+    return _AGENCY_RUN_ID
+
+
+def agency_tmp_root():
+    """Root of every host-side runtime path agency owns: run logs
+    (`agent._DEFAULT_LOG_DIR`) and the UDS gateway (`agharness_llm_gateway_dir`)
+    both live under here.
+
+    Deliberately hardcoded to `/tmp/agency` rather than derived from
+    `tempfile.gettempdir()`: `gettempdir()` honours `$TMPDIR`, which on a
+    shared host is routinely redirected to scratch space under an aggressive
+    cleanup policy. Files there are *supposed* to be deletable, which is
+    survivable for a scratch file and fatal for a live socket -- a reaped
+    socket leaves the server advertising a path that no longer exists, and
+    every request across the bridge then fails with a bare ENOENT (observed
+    in practice: a `$TMPDIR` on a full shared volume being swept every few
+    minutes, taking live sockets with it). Logs were already immune only
+    because `_DEFAULT_LOG_DIR` happened to hardcode `/tmp` while this
+    function honoured `$TMPDIR`; both now share one root, so one policy
+    covers both.
+
+    A short root matters for a second reason -- see `UDS_SUN_PATH_MAX` and
+    `new_uds_path`: every character here is spent from a 108-byte budget.
+    """
+    from pathlib import Path
+
+    return Path("/tmp/agency")
+
+
 def agharness_llm_gateway_dir():
     """Fixed, well-known host directory a docker/podman-backed harness
     launch's Unix-domain-socket LLM gateway lives in. Shared between
@@ -274,13 +349,201 @@ def agharness_llm_gateway_dir():
     neither should import from the other just for this constant. A bind
     mount is a live view of the host directory, not a snapshot, so it's
     safe for the socket file to not exist yet at container-creation time
-    and appear later once a harness actually launches."""
-    import tempfile
-    from pathlib import Path
+    and appear later once a harness actually launches.
 
-    d = Path(tempfile.gettempdir()) / "agency_llm_gateway"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    Named `gw` rather than `agency_llm_gateway` purely for path length: the
+    directory name is spent from every socket's 108-byte `sun_path` budget
+    (see `new_uds_path`), and the container side of the bind mount keeps the
+    long, self-describing name (`/var/run/agency_llm_gateway`) where no such
+    budget applies.
+
+    Scoped to one subdirectory per run, for the same three reasons container
+    names are (`agsandbox_backends/container.py`'s `_RUN_ID`):
+
+    * **Lifecycle.** This root is deliberately outside `$TMPDIR` and so is
+      never externally cleaned; a flat directory shared by every run would
+      accumulate sockets with no owner and no disposal point. A per-run
+      directory makes cleanup a single atomic removal -- see
+      `_register_gateway_cleanup`.
+    * **Isolation.** `agsandbox.py` bind-mounts this directory read-write
+      into *every* container, so a flat directory would let any container
+      read, connect to, and delete every concurrent run's sockets on the
+      host. Mounting only the current run's directory removes that entirely
+      while keeping the container-side path unchanged.
+    * **Attribution.** A socket's owning run is readable from its path
+      instead of having to be inferred from timestamps.
+
+    Safe to mount per-run because a container never outlives the run that
+    created it: container names embed their own per-process run id, and
+    reuse/resume only ever applies to containers this same process created
+    (see `_ContainerBackendBase._ensure_started`).
+    """
+    global _gateway_dir
+    if _gateway_dir is not None:
+        return _gateway_dir
+    with _gateway_lock:
+        if _gateway_dir is not None:
+            return _gateway_dir
+        d = agency_tmp_root() / "gw" / agency_run_id()
+        d.mkdir(parents=True, exist_ok=True)
+        # The directory-level equivalent of a container's `agency.owner_pid`
+        # label: ownership is recorded as a pid so a later run can *prove*
+        # this run is gone before deleting anything, while the directory NAME
+        # stays a uuid (a pid could be recycled by an unrelated process --
+        # the same split container.py's _RUN_ID comment describes).
+        (d / _GATEWAY_OWNER_FILE).write_text(f"{os.getpid()}\n", encoding="utf-8")
+        _gateway_dir = d
+        _register_gateway_cleanup(d)
+        _reap_orphaned_gateway_dirs()
+        return d
+
+
+def _register_gateway_cleanup(own_dir) -> None:
+    """Remove this run's socket directory on normal exit -- the counterpart
+    to `agsandbox.py`'s `_cleanup_all_sandboxes`, and best-effort in exactly
+    the same way (a failure here must never take down an exiting process)."""
+    import atexit
+    import shutil
+
+    def _cleanup() -> None:
+        try:
+            shutil.rmtree(own_dir, ignore_errors=True)
+        except Exception as _e:  # pragma: no cover -- interpreter teardown
+            print(f"[agutil] WARNING: gateway cleanup failed for {own_dir}: {_e}")
+
+    atexit.register(_cleanup)
+
+
+def _dir_has_live_listener(d) -> bool:
+    """True if any socket in *d* still has something accepting on it.
+
+    The safety check before a destructive sweep, mirroring the "no container
+    still uses this image as its ancestor" confirmation
+    `_reap_orphaned_lifecycle_images()` performs even after its label check
+    says the owner is dead: an owner file can be stale or hand-copied, and
+    the cost of being wrong is deleting a live run's bridge.
+    """
+    import socket as _socket
+
+    for sock in d.glob("*.sock"):
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            s.settimeout(0.5)
+            s.connect(str(sock))
+            return True  # someone is accepting -- this run is alive
+        except OSError:
+            continue  # refused/stale/unreachable -- no listener behind it
+        finally:
+            s.close()
+    return False
+
+
+def _reap_orphaned_gateway_dirs() -> None:
+    """Remove gateway directories left by SIGKILL'd runs, whose `atexit`
+    cleanup never got to run.
+
+    Deliberately keyed on proof the owner is gone (`pid_alive`) and never on
+    age: a Unix socket's mtime never updates, so every long-lived socket
+    looks arbitrarily stale to an age-based reaper -- which is exactly how an
+    external `$TMPDIR` cleaner silently deleted live sockets out from under
+    running servers, the failure this whole layout exists to prevent.
+
+    Runs once per process, best-effort throughout, mirroring
+    `container.py`'s `reap_orphaned_containers()`.
+    """
+    global _gateway_reap_done
+    if _gateway_reap_done:
+        return
+    _gateway_reap_done = True
+    import shutil
+
+    try:
+        root = agency_tmp_root() / "gw"
+        own_pid = os.getpid()
+        for d in root.iterdir():
+            if not d.is_dir() or d == _gateway_dir:
+                continue
+            owner = d / _GATEWAY_OWNER_FILE
+            try:
+                owner_pid = int(owner.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                continue  # no readable owner record -- never guess, leave it
+            if owner_pid == own_pid or pid_alive(owner_pid):
+                continue
+            if _dir_has_live_listener(d):
+                continue  # stale owner record over a live run -- leave it
+            print(
+                f"[agutil] Reaping gateway dir {d.name!r}, orphaned by dead "
+                f"process {owner_pid} (likely SIGKILL'd)",
+                flush=True,
+            )
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception as _e:
+        print(f"[agutil] WARNING: startup gateway reap failed: {_e}")
+
+
+def new_uds_path(prefix: str) -> str:
+    """A fresh socket path `<gateway dir>/<prefix>-<8 hex>.sock`, checked
+    against the `sun_path` budget before anything tries to bind it.
+
+    The id is 8 hex characters, not a full 32-character uuid4 hex: these
+    names only need to be unique within one directory on one host, and the
+    24 characters saved are the difference between fitting and not fitting
+    for any caller whose paths are deeper than the default (a `log_dir`
+    override, for instance). Validating here rather than at bind time turns
+    the kernel's bare `OSError: AF_UNIX path too long`, raised several
+    frames inside uvicorn with no mention of which path or what the limit
+    is, into an error naming both.
+    """
+    import uuid
+
+    path = str(agharness_llm_gateway_dir() / f"{prefix}-{uuid.uuid4().hex[:8]}.sock")
+    if len(path) >= UDS_SUN_PATH_MAX:
+        raise RuntimeError(
+            f"Unix-domain socket path is {len(path)} bytes, which exceeds the "
+            f"{UDS_SUN_PATH_MAX}-byte sockaddr_un.sun_path limit: {path!r}. "
+            "This is a kernel ABI limit on socket paths, unrelated to PATH_MAX -- "
+            "shorten the gateway directory (see agutil.agency_tmp_root)."
+        )
+    return path
+
+
+def reserve_uds_path(current: "str | None", prefix: str) -> str:
+    """The path a service should bind: its previously-reserved one if it has
+    one, otherwise a fresh path from `new_uds_path`.
+
+    Reusing the path across restarts is what makes recovery possible at all.
+    A container is told its bridge's socket name once, at launch, and neither
+    docker nor podman can change a running container's mounts -- so a
+    restarted server that minted a *new* random name would be invisible to
+    every container already pointed at the old one. Any stale file left at
+    the reserved path is removed first, since binding onto an existing socket
+    file fails outright.
+    """
+    if current:
+        from pathlib import Path
+
+        Path(current).unlink(missing_ok=True)
+        return current
+    return new_uds_path(prefix)
+
+
+def uds_listener_is_live(path: "str | None", thread) -> bool:
+    """True only if *path* still exists on disk AND *thread* is still
+    serving it -- the two ways a UDS listener silently stops working while
+    its owner still believes it is up.
+
+    Either half failing leaves the same unrecoverable state, since the
+    cached path keeps being handed out: an external cleanup can delete the
+    socket file from under a live server (a Unix socket's mtime never
+    updates, so every age-based reaper sees a long-lived one as stale), and
+    a server thread that exits for any reason takes the socket file with it,
+    because uvicorn unlinks it on shutdown."""
+    import os
+
+    if not path or not os.path.exists(path):
+        return False
+    return thread is not None and thread.is_alive()
 
 
 def agharness_binary_cache_dir():

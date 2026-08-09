@@ -165,11 +165,33 @@ def _curl_from_container(sandbox, base_url: str, token: str, body: dict) -> "tup
     )
     cmd = f"python3 -c {shlex.quote(script)}"
     out, rc = sandbox.exec(cmd, timeout=15)
-    assert rc == 0, f"in-container curl script failed: {out}"
+    assert rc == 0, f"in-container curl script failed: {out}{_proxy_log_tail(sandbox)}"
     lines = out.strip().split("\n")
     status = int(lines[0])
     payload = json.loads(lines[1])
     return payload, status
+
+
+def _proxy_log_tail(sandbox) -> str:
+    """The in-container proxy's own log, for failure messages.
+
+    `ensure_agproxy_llm_in_container()` already redirects the detached
+    process's stdout/stderr to this file precisely because a fire-and-forget
+    launch has nowhere else to report -- but only its own readiness-timeout
+    path ever reads it back. A request that fails *after* a successful launch
+    (any 5xx: the route raised, so uvicorn logged a traceback here and
+    returned a body with no detail in it) otherwise reports only the status
+    code, which names neither the failing step nor the reason. Since every
+    request begins with a token-validation POST across the bridge to the
+    host-side terminus, "500 on every token, valid or not" and "the bridge is
+    broken" look identical from outside -- this is what tells them apart.
+    """
+    log_path = "/tmp/.agproxy_llm_in_container.log"
+    try:
+        tail, _ = sandbox.exec(f"tail -c 4000 {shlex.quote(log_path)} 2>/dev/null", timeout=15)
+    except Exception as exc:  # the log is a diagnostic, never the assertion
+        return f"\n[could not read {log_path}: {type(exc).__name__}: {exc}]"
+    return f"\n--- in-container proxy log ({log_path}) ---\n{tail}"
 
 
 @docker
@@ -253,5 +275,5 @@ class TestEnsureAgproxyLlmInContainer:
         )
         cmd = f"python3 -c {shlex.quote(script)}"
         out, rc = self.sb.exec(cmd, timeout=15)
-        assert rc == 0, out
-        assert out.strip() == "401", out
+        assert rc == 0, f"{out}{_proxy_log_tail(self.sb)}"
+        assert out.strip() == "401", f"{out}{_proxy_log_tail(self.sb)}"

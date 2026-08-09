@@ -12,10 +12,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
 
+from .agutil import agency_tmp_root as _agency_tmp_root
+
 # Single run-level ID for the default log directory.
 _RUN_ID = _uuid_mod.uuid4().hex[:12]
 _RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-_DEFAULT_LOG_DIR = Path(f"/tmp/agency/{_RUN_TS}_{_RUN_ID}")
+# Same root as the UDS gateway (see agutil.agency_tmp_root for why it is
+# hardcoded rather than following $TMPDIR) -- one location policy for every
+# host-side runtime path agency owns, instead of logs and sockets diverging.
+_DEFAULT_LOG_DIR = _agency_tmp_root() / f"{_RUN_TS}_{_RUN_ID}"
 
 # Global weak registry of all live agent instances.
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()

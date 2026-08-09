@@ -115,6 +115,9 @@ class agMCPServer:
         self._uds_server = None
         self._uds_thread: "threading.Thread | None" = None
         self.uds_path: "str | None" = None
+        # Survives stop_uds() (which clears uds_path) so a restart rebinds the
+        # SAME path -- see agutil.reserve_uds_path.
+        self._uds_reserved_path: "str | None" = None
 
     # -- token <-> (agent, skill) registry ---------------------------------
 
@@ -311,16 +314,23 @@ class agMCPServer:
     def ensure_uds_started(self, timeout_s: float = 10) -> str:
         """Start (idempotently) a second listener for the same MCP server
         bound to a Unix domain socket instead of TCP -- see class docstring."""
-        if self.uds_path is not None:
-            return self.uds_path
+        from ..agutil import reserve_uds_path, uds_listener_is_live
 
-        import uuid
+        # "Idempotently" must mean *still working*, not merely *started once*:
+        # an external cleanup can delete a live socket file (a socket's mtime
+        # never updates, so age-based reapers see every long-lived one as
+        # stale) and a dead server thread takes its socket with it, since
+        # uvicorn unlinks on shutdown. Either leaves this method handing out a
+        # path nothing listens on. Rebuild at the same reserved path instead.
+        if self.uds_path is not None:
+            if uds_listener_is_live(self.uds_path, self._uds_thread):
+                return self.uds_path
+            self.stop_uds()
 
         import uvicorn
 
-        from ..agutil import agharness_llm_gateway_dir
-
-        sock_path = str(agharness_llm_gateway_dir() / f"agmcp_server-{uuid.uuid4().hex}.sock")
+        sock_path = reserve_uds_path(self._uds_reserved_path, "agmcp_server")
+        self._uds_reserved_path = sock_path
         # DNS-rebinding protection validates the Host header against an
         # allowed-hosts list built from the TCP `host=`/bound port (host
         # header including PORT, confirmed by trial against the real

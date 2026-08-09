@@ -21,7 +21,6 @@ import socketserver
 import struct
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -187,6 +186,9 @@ class agProfilerIngest:
         self._uds_server = None
         self._uds_thread: "threading.Thread | None" = None
         self.uds_path: "str | None" = None
+        # Survives stop_uds() (which clears uds_path) so a restart rebinds the
+        # SAME path -- see agutil.reserve_uds_path.
+        self._uds_reserved_path: "str | None" = None
 
     def register(
         self,
@@ -319,14 +321,21 @@ class agProfilerIngest:
             return self._registrations.get(token)
 
     def ensure_uds_started(self, timeout_s: float = 10) -> str:
-        if self.uds_path is not None:
+        from ..agutil import reserve_uds_path, uds_listener_is_live
+
+        # See agllm_terminus.ensure_uds_started: a cached path is not evidence
+        # the listener still exists. The double-check under the lifecycle lock
+        # is kept, with liveness as the condition instead of mere presence.
+        if uds_listener_is_live(self.uds_path, self._uds_thread):
             return self.uds_path
         with self._lifecycle_lock:
-            if self.uds_path is not None:
+            if uds_listener_is_live(self.uds_path, self._uds_thread):
                 return self.uds_path
-            from ..agutil import agharness_llm_gateway_dir
+            if self.uds_path is not None:
+                self.stop_uds()
 
-            sock_path = str(agharness_llm_gateway_dir() / f"agprof-ingest-{uuid.uuid4().hex}.sock")
+            sock_path = reserve_uds_path(self._uds_reserved_path, "agprof-ingest")
+            self._uds_reserved_path = sock_path
             server = _IngestServer(sock_path, _IngestHandler)
             server.ingest = self
             os.chmod(sock_path, 0o666)

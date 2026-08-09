@@ -1218,6 +1218,27 @@ def _run_react_loop_inner(req: dict, profiler) -> dict:
     }
 
 
+def _describe_exception(exc: BaseException) -> str:
+    """``Type: message``, but with an ExceptionGroup's sub-exceptions spelled
+    out instead of summarised away.
+
+    The MCP paths here (`_discover_mcp_tools`/`_call_mcp_tool`) run under
+    anyio task groups, so a failure anywhere inside one surfaces as
+    ``ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)`` --
+    a string that names the wrapper and discards the only part that says
+    what actually broke. That matters more here than in a normal except
+    block: this runs in the container, and this return value is the entire
+    record of the failure the host ever sees (native.py hands it straight to
+    `agerror`), so whatever is dropped here cannot be recovered afterward.
+    Nested groups recurse, since anyio can wrap a group in a group.
+    """
+    rendered = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, BaseExceptionGroup):
+        inner = "; ".join(_describe_exception(sub) for sub in exc.exceptions)
+        rendered = f"{rendered} [{inner}]"
+    return rendered
+
+
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         try:
@@ -1241,7 +1262,7 @@ class _Handler(socketserver.BaseRequestHandler):
             try:
                 resp = _run_react_loop(req)
             except Exception as e:
-                resp = {"status": "error", "message": f"{type(e).__name__}: {e}"}
+                resp = {"status": "error", "message": _describe_exception(e)}
         else:
             resp = {"status": "error", "message": f"unknown op {op!r}"}
 

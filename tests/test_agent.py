@@ -419,12 +419,22 @@ def test_fork_runs_do_not_update_parent_history():
 
 
 def test_fork_runs_in_parallel():
-    """Multiple forks reach the barrier together, proving concurrent execution."""
+    """Multiple forks reach the barrier together, proving concurrent execution.
+
+    The barrier itself -- not its timeout -- is what proves concurrency: a
+    serial implementation can never satisfy a 3-way barrier no matter how
+    long the timeout, since the first arrival blocks forever waiting on runs
+    that have not been started. So the timeout is purely a budget for how
+    long three real fork+provision paths may take before the test gives up,
+    and being generous with it costs nothing in rigor. The original 5s was
+    tight enough to expire on a loaded host, turning "not concurrent" into
+    the reported failure when the real cause was slow container forks.
+    """
     barrier = threading.Barrier(3)
     skill = agskill("s", "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=60)
         return agdata(n=inp.n), prev_ctx, []
 
     skill.execute_harness = fake_execute_react

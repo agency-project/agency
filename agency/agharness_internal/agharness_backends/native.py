@@ -202,8 +202,8 @@ def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) 
     the idempotent wrapper `_NativeBackend.execute()` actually uses."""
     from ...agutil import (
         AGENCY_PACKAGE_CONTAINER_MOUNT,
-        agharness_llm_gateway_dir,
         ensure_python_packages_in_container,
+        new_uds_path,
     )
 
     # `mcp` for the resource/output-submission MCP client, `html2text` for
@@ -217,9 +217,12 @@ def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) 
     # `_ensure_entrypoint`), and a later call on the same sandbox might.
     ensure_python_packages_in_container(sandbox, ["mcp", "html2text", "cloudpickle"], timeout_s=180)
 
-    sock_name = f"native-entrypoint-{uuid.uuid4().hex}.sock"
+    # Minted via new_uds_path so this socket shares the run-scoped gateway
+    # directory and the sun_path budget check; the container side keeps the
+    # long mount name, where no such budget applies.
+    host_sock_path = Path(new_uds_path("native-entrypoint"))
+    sock_name = host_sock_path.name
     container_sock_path = f"/var/run/agency_llm_gateway/{sock_name}"
-    host_sock_path = agharness_llm_gateway_dir() / sock_name
     entrypoint_path = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/{_ENTRYPOINT_RELATIVE_PATH}"
     pid_path = f"/tmp/{sock_name}.pid"
 

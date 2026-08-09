@@ -260,6 +260,9 @@ class agProxyLLM:
         self._uds_server = None
         self._uds_thread: "threading.Thread | None" = None
         self.uds_path: "str | None" = None
+        # Survives stop_uds() (which clears uds_path) so a restart rebinds the
+        # SAME path -- see agutil.reserve_uds_path.
+        self._uds_reserved_path: "str | None" = None
         # Every successfully-authenticated request across all three routes,
         # appended as {"route", "token", "model"} -- this is what lets a
         # test against a REAL harness binary prove its traffic actually
@@ -748,14 +751,21 @@ class agProxyLLM:
         harness launch uses this path via the in-container TCP-to-UDS
         relay; a bare host-level/chroot launch never calls this at all and
         never pays for it."""
+        from ..agutil import reserve_uds_path, uds_listener_is_live
+
+        # "Idempotently" must mean *still working*, not merely *started once*:
+        # an external cleanup can delete a live socket file (a socket's mtime
+        # never updates, so age-based reapers see every long-lived one as
+        # stale) and a dead server thread takes its socket with it, since
+        # uvicorn unlinks on shutdown. Either leaves this method handing out a
+        # path nothing listens on. Rebuild at the same reserved path instead.
         if self.uds_path is not None:
-            return self.uds_path
+            if uds_listener_is_live(self.uds_path, self._uds_thread):
+                return self.uds_path
+            self.stop_uds()
 
-        import uuid
-
-        from ..agutil import agharness_llm_gateway_dir
-
-        sock_path = str(agharness_llm_gateway_dir() / f"agproxy_llm-{uuid.uuid4().hex}.sock")
+        sock_path = reserve_uds_path(self._uds_reserved_path, "agproxy_llm")
+        self._uds_reserved_path = sock_path
         config = uvicorn.Config(self._app, uds=sock_path, log_level="warning")
         server = uvicorn.Server(config)
         self._uds_server = server

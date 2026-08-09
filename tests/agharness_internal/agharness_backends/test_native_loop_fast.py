@@ -664,3 +664,25 @@ def test_custom_tool_load_failure_does_not_abort_the_run():
         assert "recovered" in resp["final_text"]
     finally:
         h.stop()
+
+
+def test_describe_exception_spells_out_exception_group_members():
+    """A `run` op that raises reports one string and nothing else -- so an
+    ExceptionGroup summarised as "(1 sub-exception)" erases the only part
+    naming what broke. The MCP client paths run under anyio task groups, so
+    that wrapper is the common shape for a real bridge failure, not an edge
+    case."""
+    from ._native_loop_harness import load_entrypoint_module
+
+    entrypoint = load_entrypoint_module()
+
+    plain = entrypoint._describe_exception(RuntimeError("boom"))
+    assert plain == "RuntimeError: boom"
+
+    group = ExceptionGroup("unhandled errors in a TaskGroup", [ConnectionRefusedError("no uds")])
+    described = entrypoint._describe_exception(group)
+    assert "ConnectionRefusedError: no uds" in described
+    assert "unhandled errors in a TaskGroup" in described
+
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner", [TimeoutError("read timeout")])])
+    assert "TimeoutError: read timeout" in entrypoint._describe_exception(nested)

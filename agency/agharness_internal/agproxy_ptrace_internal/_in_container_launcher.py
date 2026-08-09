@@ -47,7 +47,6 @@ import os
 import socket
 import subprocess
 import threading
-import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -70,9 +69,12 @@ def _create_ptrace_uds_socket() -> "tuple[socket.socket, str, str]":
     matching one `InContainerRelay` per launch. Returns (listening_socket,
     host_path, container_path); the caller accepts exactly one connection
     (the entrypoint connecting back) then can close/unlink the listener."""
-    from ...agutil import agharness_llm_gateway_dir
+    from ...agutil import new_uds_path
 
-    host_path = str(agharness_llm_gateway_dir() / f"agproxy_ptrace-{uuid.uuid4().hex}.sock")
+    # new_uds_path (not a hand-built name) so this one-shot handshake socket
+    # is length-checked against sun_path like every other bridge -- a bind
+    # failure here would surface as an opaque OSError mid-launch.
+    host_path = new_uds_path("agproxy_ptrace")
     container_path = f"{_MOUNTED_GATEWAY_DIR}/{Path(host_path).name}"
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

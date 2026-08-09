@@ -29,7 +29,6 @@ import ssl
 import sys
 import threading
 import time
-import uuid
 from typing import TYPE_CHECKING
 
 import httpx
@@ -256,6 +255,10 @@ class agLLMTerminus:
         self._uds_server = None
         self._uds_thread: "threading.Thread | None" = None
         self.uds_path: "str | None" = None
+        # Survives stop_uds() (which clears uds_path) so a restart rebinds the
+        # SAME path -- see agutil.reserve_uds_path for why that matters to
+        # containers already launched against this bridge.
+        self._uds_reserved_path: "str | None" = None
         # Every successfully-authenticated dispatch, appended as
         # {"token", "model"} -- this is the one place a test (or anything
         # else) can prove a real credentialed call actually happened,
@@ -803,12 +806,29 @@ class agLLMTerminus:
         self.stop_uds()
 
     def ensure_uds_started(self) -> str:
+        """Start (idempotently) this terminus's UDS listener and return its path.
+
+        "Idempotently" has to mean *still working*, not merely *started once*:
+        the cached path alone is not evidence the bridge is up. A socket file
+        can be deleted out from under a live server by any external cleanup
+        (its mtime never updates, so age-based reapers treat every long-lived
+        socket as stale), and a server thread that dies takes the socket with
+        it, since uvicorn unlinks on shutdown. Both leave this method handing
+        out a path that nothing is listening on -- and because every request
+        across the bridge begins with a token-validation POST to this very
+        socket, the result is that *all* traffic fails with a bare ENOENT,
+        auth failures and real dispatches alike. Verifying and rebuilding at
+        the same reserved path turns that from unrecoverable into a reconnect.
+        """
+        from ..agutil import reserve_uds_path, uds_listener_is_live
+
         if self.uds_path is not None:
-            return self.uds_path
+            if uds_listener_is_live(self.uds_path, self._uds_thread):
+                return self.uds_path
+            self.stop_uds()  # half-dead: socket gone or thread dead -- rebuild
 
-        from ..agutil import agharness_llm_gateway_dir
-
-        sock_path = str(agharness_llm_gateway_dir() / f"agllm_terminus-{uuid.uuid4().hex}.sock")
+        sock_path = reserve_uds_path(self._uds_reserved_path, "agllm_terminus")
+        self._uds_reserved_path = sock_path
         config = uvicorn.Config(self._app, uds=sock_path, log_level="warning")
         server = uvicorn.Server(config)
         self._uds_server = server
