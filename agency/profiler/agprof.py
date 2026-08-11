@@ -43,6 +43,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -106,13 +107,17 @@ _DEFAULT_AUTO_MAX_DEPTH = 32
 _DEFAULT_AUTO_MAX_EVENTS = 250_000
 _DYNAMIC_THREAD_MIN_DURATION_NS = 10_000_000
 
-# Environment profiling is relaunched in a transient systemd slice before the
-# workload starts.  The slice is the aggregate accounting boundary; its child
-# scope contains the harness and Docker containers are placed alongside that
-# scope by the sandbox backend.
+# Environment profiling is relaunched into a transient systemd cgroup before
+# the workload starts. Prefer a system slice when passwordless sudo is
+# available: its child scope contains the harness and Docker containers can be
+# placed alongside that scope. Otherwise use an unprivileged user scope for the
+# harness; Docker containers remain in their daemon-managed cgroups and are
+# combined into the same trace through the container registry below.
 _CGROUP_DIR_ENV = "AGENCY_PROFILE_CGROUP"
 _CGROUP_PARENT_ENV = "AGENCY_PROFILE_CGROUP_PARENT"
+_CGROUP_USER_SCOPE_ENV = "AGENCY_PROFILE_USER_SCOPE"
 _CGROUP_SLICE_RE = re.compile(r"^agprof-[0-9a-f]+\.slice$")
+_CGROUP_SCOPE_RE = re.compile(r"^agprof-[0-9a-f]+\.scope$")
 
 # Container cgroup registry — filled by the sandbox backends at container
 # start (docker + podman)
@@ -168,6 +173,8 @@ def _process_cgroup_dir() -> Path:
 
 def container_cgroup_parent() -> "str | None":
     """Docker cgroup parent for containers created by the profiled workload."""
+    if os.environ.get(_CGROUP_USER_SCOPE_ENV):
+        return None
     value = os.environ.get(_CGROUP_PARENT_ENV, "")
     return value if _CGROUP_SLICE_RE.fullmatch(value) else None
 
@@ -212,6 +219,49 @@ def _cgroup_reexec_command(slice_name: str, cgroup_dir: str) -> list[str]:
     ]
 
 
+def _user_cgroup_reexec_command(scope_name: str) -> list[str]:
+    """Build an unprivileged user-systemd scope command for env profiling."""
+    original_argv = list(getattr(sys, "orig_argv", ())) or [sys.executable, *sys.argv]
+    return [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--same-dir",
+        f"--unit={scope_name}",
+        "env",
+        f"{_CGROUP_USER_SCOPE_ENV}={scope_name}",
+        *original_argv,
+    ]
+
+
+def _command_succeeds(command: list[str]) -> bool:
+    """Return whether a short, non-interactive cgroup capability probe succeeds."""
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _system_cgroup_available() -> bool:
+    """Whether system-slice creation can use sudo without prompting."""
+    return _command_succeeds(["sudo", "-n", "systemd-run", "--version"])
+
+
+def _user_cgroup_available() -> bool:
+    """Whether this login has a reachable per-user systemd manager."""
+    return _command_succeeds(["systemctl", "--user", "show-environment"])
+
+
 def _ensure_environment_cgroup() -> None:
     """Re-exec environment-enabled profiling inside a dedicated cgroup."""
     configured = os.environ.get(_CGROUP_DIR_ENV)
@@ -227,18 +277,49 @@ def _ensure_environment_cgroup() -> None:
             ) from e
         return
 
+    user_scope = os.environ.get(_CGROUP_USER_SCOPE_ENV, "")
+    if user_scope:
+        current = _current_cgroup_dir()
+        if not _CGROUP_SCOPE_RE.fullmatch(user_scope) or current.name != user_scope:
+            raise RuntimeError(
+                f"agprof: user-scope marker {user_scope!r} does not match "
+                f"process cgroup {current}"
+            )
+        os.environ[_CGROUP_DIR_ENV] = str(current)
+        os.environ.pop(_CGROUP_PARENT_ENV, None)
+        _process_cgroup_dir()
+        return
+
     run_id = f"{os.getpid():x}{uuid.uuid4().hex[:8]}"
     slice_name = f"agprof-{run_id}.slice"
     cgroup_dir = f"/sys/fs/cgroup/agprof.slice/{slice_name}"
-    command = _cgroup_reexec_command(slice_name, cgroup_dir)
-    try:
-        os.execvp(command[0], command)
-    except OSError as e:
-        raise RuntimeError(
-            "agprof: unable to create the dedicated workload cgroup with "
-            "sudo/systemd-run; profiling requires Linux cgroups v2 and "
-            "passwordless permission to create a transient systemd scope"
-        ) from e
+    if _system_cgroup_available():
+        command = _cgroup_reexec_command(slice_name, cgroup_dir)
+        try:
+            os.execvp(command[0], command)
+        except OSError:
+            # exec failed before replacing this process, so the unprivileged
+            # path is still safe to try. A successfully exec'd command never
+            # returns here.
+            pass
+        else:  # pragma: no cover - os.execvp never returns in production
+            return
+
+    if _user_cgroup_available():
+        scope_name = slice_name.removesuffix(".slice") + ".scope"
+        command = _user_cgroup_reexec_command(scope_name)
+        try:
+            os.execvp(command[0], command)
+        except OSError as e:
+            raise RuntimeError(
+                "agprof: unable to enter the unprivileged user systemd scope"
+            ) from e
+        return  # pragma: no cover - os.execvp never returns in production
+
+    raise RuntimeError(
+        "agprof: unable to create a dedicated workload cgroup: passwordless "
+        "sudo is unavailable and no user systemd manager is reachable"
+    )
 
 
 def container_started(

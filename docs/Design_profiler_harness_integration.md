@@ -926,9 +926,12 @@ milestone's correlation registry:
   environment here is darwin. M0–M4 and M8 are testable on macOS *except* the
   cgroup/NVML paths; M1's tests need a Linux host or CI runner. Plan for that
   rather than discovering it at M1.
-- `AGENCY_PROFILE_SCOPE=process` re-execs through `systemd-run` and needs
-  non-interactive sudo — unchanged, but worth re-confirming it still composes
-  with container-backed harness launches.
+- `AGENCY_PROFILE_SCOPE=process` re-execs through `systemd-run`. It prefers the
+  original system slice when a non-interactive sudo probe succeeds, keeping the
+  harness scope and Docker container cgroups under one aggregate parent. When
+  sudo is unavailable it transparently falls back to an unprivileged
+  `systemd-run --user` scope for the harness; registered Docker cgroups remain
+  daemon-managed and are combined into the same trace separately.
 
 ---
 

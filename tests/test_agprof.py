@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -827,9 +828,11 @@ def test_non_linux_environment_profiling_fails_before_cgroup_or_profiler(monkeyp
         agprof._initialize_environment_profiling()
 
 
-def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
+def test_environment_cgroup_prefers_system_slice(monkeypatch):
     captured = {}
     monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
+    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: True)
     monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py", "--quick"])
     monkeypatch.setattr(agprof.os, "getuid", lambda: 1234)
     monkeypatch.setattr(agprof.os, "getgid", lambda: 5678)
@@ -854,6 +857,97 @@ def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
         arg == f"AGENCY_PROFILE_CGROUP=/sys/fs/cgroup/agprof.slice/{slice_name}" for arg in command
     )
     assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
+
+
+def test_environment_cgroup_falls_back_to_user_scope(monkeypatch):
+    captured = {}
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
+    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: False)
+    monkeypatch.setattr(agprof, "_user_cgroup_available", lambda: True)
+    monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py", "--quick"])
+    monkeypatch.setattr(agprof.uuid, "uuid4", lambda: type("U", (), {"hex": "abcdef012345"})())
+    monkeypatch.setattr(
+        agprof.os,
+        "execvp",
+        lambda executable, argv: captured.update(executable=executable, argv=argv),
+    )
+
+    agprof._ensure_environment_cgroup()
+
+    assert captured["executable"] == "systemd-run"
+    command = captured["argv"]
+    assert command[:3] == ["systemd-run", "--user", "--scope"]
+    unit = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--unit="))
+    assert unit.startswith("agprof-") and unit.endswith(".scope")
+    assert f"AGENCY_PROFILE_USER_SCOPE={unit}" in command
+    assert not any(arg.startswith("AGENCY_PROFILE_CGROUP=") for arg in command)
+    assert not any(arg.startswith("AGENCY_PROFILE_CGROUP_PARENT=") for arg in command)
+    assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
+
+
+def test_environment_cgroup_falls_back_when_system_exec_fails(monkeypatch):
+    commands = []
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
+    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: True)
+    monkeypatch.setattr(agprof, "_user_cgroup_available", lambda: True)
+    monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py"])
+
+    def fake_execvp(executable, argv):
+        commands.append((executable, argv))
+        if executable == "sudo":
+            raise OSError("sudo disappeared after the capability probe")
+
+    monkeypatch.setattr(agprof.os, "execvp", fake_execvp)
+
+    agprof._ensure_environment_cgroup()
+
+    assert [executable for executable, _argv in commands] == ["sudo", "systemd-run"]
+
+
+def test_system_cgroup_probe_checks_systemd_run_permission(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        agprof,
+        "_command_succeeds",
+        lambda command: captured.append(command) or True,
+    )
+
+    assert agprof._system_cgroup_available() is True
+    assert captured == [["sudo", "-n", "systemd-run", "--version"]]
+
+
+def test_environment_cgroup_user_scope_child_discovers_current_cgroup(tmp_path, monkeypatch):
+    scope = tmp_path / "agprof-12ab.scope"
+    scope.mkdir()
+    for name in ("cpu.stat", "memory.current", "cgroup.procs"):
+        (scope / name).write_text("")
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "agprof-stale.slice")
+    monkeypatch.setenv("AGENCY_PROFILE_USER_SCOPE", scope.name)
+    monkeypatch.setattr(agprof, "_current_cgroup_dir", lambda: scope)
+    monkeypatch.setattr(
+        agprof.os,
+        "execvp",
+        lambda *_args: pytest.fail("user-scope child must not re-exec"),
+    )
+
+    agprof._ensure_environment_cgroup()
+
+    assert os.environ["AGENCY_PROFILE_CGROUP"] == str(scope)
+    assert "AGENCY_PROFILE_CGROUP_PARENT" not in os.environ
+    assert agprof.container_cgroup_parent() is None
+
+
+def test_environment_cgroup_fails_when_neither_systemd_path_is_available(monkeypatch):
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
+    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: False)
+    monkeypatch.setattr(agprof, "_user_cgroup_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="passwordless sudo is unavailable"):
+        agprof._ensure_environment_cgroup()
 
 
 def test_workload_cgroup_sampler_reads_aggregate_cpu_memory_and_io(tmp_path, monkeypatch):
@@ -1008,9 +1102,16 @@ def test_sampler_updates_container_label_when_registry_arrives_late(tmp_path, mo
 
 
 def test_container_cgroup_parent_accepts_only_profiler_slice(monkeypatch):
+    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
     monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "agprof-12ab.slice")
     assert agprof.container_cgroup_parent() == "agprof-12ab.slice"
     monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "../../system.slice")
+    assert agprof.container_cgroup_parent() is None
+
+
+def test_container_cgroup_parent_is_disabled_in_user_scope(monkeypatch):
+    monkeypatch.setenv("AGENCY_PROFILE_USER_SCOPE", "agprof-12ab.scope")
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "agprof-12ab.slice")
     assert agprof.container_cgroup_parent() is None
 
 
