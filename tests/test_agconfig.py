@@ -869,8 +869,9 @@ class TestProviderBackendConfigClasses:
         assert cfg.agllm_backend.provider == "vllm"
 
     def test_openai_config_fixes_provider(self):
-        cfg = agConfig(agOpenAIBackendConfig(model="m"))
+        cfg = agConfig(agOpenAIBackendConfig(model="m", reasoning_effort="none"))
         assert cfg.agllm_backend.provider == "openai"
+        assert cfg.agllm_backend.reasoning_effort == "none"
 
     def test_anthropic_config_fixes_provider(self):
         cfg = agConfig(agAnthropicBackendConfig(model="m"))

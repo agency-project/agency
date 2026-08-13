@@ -15,8 +15,6 @@ Run one or more models by display name or API ID::
         --model "5.6 luna" --model claude-sonnet-5
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import re
