@@ -1146,7 +1146,8 @@ def _run_react_loop_inner(req: dict, profiler) -> dict:
                 previous_summary,
                 profiler,
             )
-            kwargs = {"model": model, "messages": messages}
+            kwargs = dict(req.get("llm_kwargs") or {})
+            kwargs.update({"model": model, "messages": messages})
             if tools:
                 kwargs["tools"] = tools
             resp = _dispatch_via_terminus(terminus_sock, token, kwargs, profiler=profiler)

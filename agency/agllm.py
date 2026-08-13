@@ -158,6 +158,7 @@ class agllm(_AgLLMFields):
         )
         _OPENAI_GEN_PARAMS = {
             "temperature",
+            "reasoning_effort",
             "max_completion_tokens",
             "top_p",
             "frequency_penalty",

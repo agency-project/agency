@@ -92,6 +92,7 @@ class AgLLMBackendFields:
     region = DynamicConfigParam("agllm_backend", default=None)
     context_limit = DynamicConfigParam("agllm_backend", default=None)
     temperature = DynamicConfigParam("agllm_backend", default=None)
+    reasoning_effort = DynamicConfigParam("agllm_backend", default=None)
     max_completion_tokens = DynamicConfigParam("agllm_backend", default=None)
     max_tokens = DynamicConfigParam(
         "agllm_backend", default=None
@@ -125,6 +126,7 @@ class AgLLMBackendFields:
         "region",
         "context_limit",
         "temperature",
+        "reasoning_effort",
         "max_completion_tokens",
         "max_tokens",
         "top_p",
