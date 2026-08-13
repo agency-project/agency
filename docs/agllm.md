@@ -54,6 +54,7 @@ ag = agent(agconfig=cfg)
 | `api_key` | str | Bearer token. Pass `"EMPTY"` for vLLM without auth. |
 | `model` | str | Model identifier passed verbatim to the API. |
 | `temperature` | float | Sampling temperature. |
+| `reasoning_effort` | str | OpenAI reasoning effort (for example, `"none"` when Chat Completions tools require reasoning to be disabled). |
 | `max_tokens` | int | Maximum tokens in the completion. |
 | `top_p` | float | Nucleus sampling probability. |
 | `top_k` | int | Top-k sampling (sent via `extra_body`). |
