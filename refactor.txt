@@ -1,0 +1,63 @@
+File Structure
+1. Core: agent.py 
+2. Profiler: agprof.py
+3. Logging: aglog.py
+4. Config: agconfig.py
+5. Schema: agschema.py
+6. Context: agcontext.py
+7. Sandboxing: agsandbox.py
+
+Core Features
+1. Harness Side react loop
+2. Sandbox - Checkpointing, forking images, auto mount?
+3. llm backend routing
+4. tool calling inside sandboxes
+5. tool calling over to the host side
+6. Auto prompt building - System prompt, tools, input/output schema
+7. automatic conversion from python objects to prompt strings and vice versa (schema)
+8. Host-side execution: 1. Checkpoint - 2. Sandbox - 3. Logging - 4. Execute harness - 5. Teardown - 6.Log result - 7. Resolve future - 8. Prune History
+
+6. agent states and pausing - how does the state machine look like, and when/where does the state change happen? will it work with external agents?
+7. agent history management
+8. agent messages
+9. agent checkpointing
+10. agent forking
+
+11. agskill auto prompt building
+12. agskill auto long-input offloading to a file
+13. agskill input and output parsing
+14. agskill waiting for tracked processes to end
+
+15. sandbox bridging
+16. tool list controls
+
+Util Features (workflow controls?)
+
+1. agmap.py
+2. agname.py
+3. agsync.py
+4. agutil.py
+
+Data handling
+
+1. agtype.py
+2. agdata.py
+3. agschema.py
+
+What API should be exposed to the users?
+
+Refactor items
+
+1. Dedicated config dir/files?
+2. agent state + sagpause redesign
+3. agent object should be a host-side reflection dataclass of agents, for both live and idling agents. (state, history, sandbox image)
+4. Should agwebui state update be PULL vs PUSH? 
+5. Add separate files for sub-features of agent.py, e.g., webui logging and history management
+6. Why do we need a separate "pure" source files? Maybe rename and move them into the native agharness subdir?
+7. Rename prompt building in agskill?
+8. Refactor output path provisioning
+9. Remove automounted dirs
+10. Add workspace autosync
+11. Merge log and history?
+12. Why do we lazy import webui?
+13. List all host-harness bridging components, check their relationship and functions, and merge/inline if needed. - Refactor to driver model if needed.

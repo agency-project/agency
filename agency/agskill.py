@@ -26,6 +26,8 @@ from .aglog import _ts
 # agskill instances don't hold their own agconfig (a skill runs on behalf of
 # different agents with different agconfigs), so there's no self to hang a
 # descriptor on.
+
+# [REFACTOR] Maybe belongs in the harness code?
 class _AgSkillFields:
     react_max_steps = DynamicConfigParam("agskill", default=4096)
     agbinary_validate_exec_timeout = DynamicConfigParam("agskill", default=5)
@@ -57,7 +59,7 @@ if TYPE_CHECKING:
 
 
 class agskill:
-    """A named skill with its own system prompt and a self-contained ReAct loop.
+    """A named skill with its own system prompt and a self-contained ReAct loop. # [REFACTOR] Not anymore...
 
     input_schema / output_schema are agdata objects whose keys define required
     fields and whose values are Python types (``str``, ``int``, ``float``,
@@ -78,7 +80,7 @@ class agskill:
         replace_tools: list[agtool] | None = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
-        max_output_schema_retries: int = 10,
+        max_output_schema_retries: int = 10, # [REFACTOR] Why here?
         plan_mode: bool = False,
     ):
         self.name = name
@@ -94,20 +96,20 @@ class agskill:
     # ------------------------------------------------------------------
 
     def _build_system_prompt(self, extra: str | None = None) -> str:
-        parts = [self.system_prompt]
+        parts = [self.system_prompt] # [REFACTOR] Maybe rename into skill_prompt?
 
         # Each agtype subclass (agfile, agbinary, …) can inject extra prompt
         # lines describing how the LLM should handle that field (e.g. file paths,
         # binary encoding).  Collect these for both input and output schemas.
         extra_lines: list[str] = []
         for key, hint in self.input_schema._data.items() if self.input_schema else []:
-            cls = agtype.from_hint(hint)
+            cls = agtype.from_hint(hint) # [REFACTOR] We need better variable names here.
             if cls is not None:
                 line = cls.extra_input_prompt(key)
                 if line:
                     extra_lines.append(line)
         for key, hint in self.output_schema._data.items() if self.output_schema else []:
-            cls = agtype.from_hint(hint)
+            cls = agtype.from_hint(hint) # [REFACTOR] Better names needed.
             if cls is not None:
                 line = cls.extra_output_prompt(key, self.name)
                 if line:
@@ -120,14 +122,14 @@ class agskill:
                 "be automatically deleted after this task ends:\n" + "\n".join(extra_lines)
             )
 
-        # Caller-supplied extra prompt (e.g. compaction summary injection).
+        # Caller-supplied extra prompt (e.g. compaction summary injection). # [REFACTOR] Check which method uses extras
         if extra:
             parts.append(extra)
 
         # Describe the input shape so the LLM knows what JSON keys to expect.
         # Skipped for agrawstring inputs (the value arrives as plain text, not JSON).
         if self.input_schema is not None and self.input_schema.raw_key() is None:
-            parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}")
+            parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}") # [REFACTOR] Do we have to explain the input format?
 
         if self.output_schema is not None:
             if self.output_schema.raw_key() is not None:
@@ -141,7 +143,7 @@ class agskill:
                 field_lines = "\n".join(
                     f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
                 )
-                parts.append(
+                parts.append( # [REFACTOR] Better prompting
                     f"\nTo return your results, call the appropriate return_<field> tool "
                     f"once for each required output field ({field_tools}). "
                     f"Required fields:\n"
@@ -154,7 +156,7 @@ class agskill:
                 )
         return "\n".join(parts)
 
-    def _build_user_content(self, skill_input: agdata) -> "str | list":
+    def _build_user_content(self, skill_input: agdata) -> "str | list": # [REFACTOR] Are we only providing the per-turn inputs here?
         """Build the content value for the user message.
 
         Returns a plain string for simple inputs, or a multimodal content array
@@ -169,7 +171,7 @@ class agskill:
 
         schema = self.input_schema
         text_data = dict(skill_input._data)
-        extra_blocks: list[dict] = []
+        extra_blocks: list[dict] = [] # [REFACTOR] Better names - Why "extra"?
 
         # Ask each agtype field for its contribution to the user message.
         # Fields with no agtype (e.g. plain str, int) are left as-is.
@@ -183,7 +185,7 @@ class agskill:
                     text_data[key] = placeholder
                 extra_blocks.extend(blocks)
 
-        # No extra blocks — return a plain JSON string (fast path).
+        # No extra blocks — return a plain JSON string (fast path). # [REFACTOR] what is skill input and what is extra_blocks - Maybe because of offloading? If so, need better names
         if not extra_blocks:
             return f"[HARNESS SYSTEM] New Skill Input:\n{skill_input.to_json()}"
 
@@ -194,7 +196,7 @@ class agskill:
         content.extend(extra_blocks)
         return content
 
-    def _build_initial_messages(
+    def _build_initial_messages( # [REFACTOR] Unused?
         self,
         skill_input: agdata,
         agent_context: agcontext,
@@ -218,13 +220,13 @@ class agskill:
         # Push the conversation (minus system prompt) to the live UI view so the
         # user can see the running history before the first LLM response arrives.
         if live_messages_fn:
-            live_messages_fn(messages[1:])
+            live_messages_fn(messages[1:]) # [REFACTOR] Why 1:?
 
         # Log the system prompt and the new user message to the full-history sink
         # (e.g. aglog file writer) so they appear in debug transcripts.
         if full_history_fn:
             full_history_fn(messages[0])
-            full_history_fn(messages[-1])
+            full_history_fn(messages[-1]) # [REFACTOR] Why 0 and -1?
         return messages, n_before
 
     # ------------------------------------------------------------------
@@ -249,7 +251,7 @@ class agskill:
         agpause.tag_producer(ctx_future, ag)
         ts_start = _ts()
 
-        def _task() -> None:
+        def _task() -> None: # [REFACTOR] Why wrap in task?
             outer_result: agdata | None = None
             updated_ctx: agcontext = prev_ctx
             outer_delta: list[dict] = []
@@ -290,6 +292,7 @@ class agskill:
                 #    across subsequent runs via its internal checkpoint image.
                 if ag.sandbox is None:
                     with agprof.span("sandbox:provision"):
+                        # [REFACTOR] Do smth with out dir
                         _out_dir = (
                             ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
                             if ag.agconfig is not None
@@ -383,7 +386,7 @@ class agskill:
                             try:
                                 ag.sandbox.commit()
                             finally:
-                                if not ag.sandbox._has_pending_background_work():
+                                if not ag.sandbox._has_pending_background_work(): # [REFACTOR] What happens if this is true? Shouldn't we wait?
                                     try:
                                         ag.sandbox.stop()
                                     except Exception as _e:
@@ -393,7 +396,7 @@ class agskill:
                                         )
                 if sandbox_lock is not None:
                     sandbox_lock.release()
-                agpause.set_current_worker_agent(None)
+                agpause.set_current_worker_agent(None) # [REFACTOR] What does this do?
 
             # ── 5. Log result and commit token counts.
             ts_end = _ts()
@@ -401,7 +404,7 @@ class agskill:
             input_dict = local_skill_input.to_dict()
             result_dict = outer_result.to_dict()
             if result_dict.get("error"):
-                _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate
+                _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate # [REFACTOR] What is this? Why do we get it through ag.agconfig?
                 ag.terminal.log(
                     "SKILL ✗  ",
                     f"{self.name}  error={str(result_dict['error'])[:_error_log_truncate]}",
@@ -426,11 +429,11 @@ class agskill:
                     input_tokens=outer_input_tokens,
                     output_tokens=outer_output_tokens,
                 )
-                type(ag)._add_global_tokens(outer_input_tokens, outer_output_tokens)
-                _ag_usage = ag.log.token_usage
+                type(ag)._add_global_tokens(outer_input_tokens, outer_output_tokens) # [REFACTOR] Where is the add for local tokens??
+                _ag_usage = ag.log.token_usage # [REFACTOR] Is ag.log the right place to get token usage?
                 _gl_usage = type(ag).global_token_usage()
                 try:
-                    from . import agwebui as _agwebui
+                    from . import agwebui as _agwebui # [REFACTOR] Why lazy import?
 
                     if _agwebui._active is not None:
                         _agwebui._active.emitter.token_update(
@@ -451,10 +454,10 @@ class agskill:
             ag._snapshot_messages = list(updated_ctx.messages)
             result_future.set_result(outer_result)
 
-            # ── 7. Prune history, then resolve ctx future for the next chained call.
+            # ── 7. Prune history, then resolve ctx future for the next chained call. # [REFACTOR] What kind of pruning and auto context management do we have?
             try:
                 with agprof.span("prune"):
-                    pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages)
+                    pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages) # [REFACTOR] Why is this part of agllm?
                 if pruned_msgs is not updated_ctx.messages:
                     updated_ctx.messages = pruned_msgs
                     ag.terminal.log(
@@ -470,9 +473,9 @@ class agskill:
         # "inactive" -- is_settled() treats "inactive" as trivially settled,
         # which would otherwise let wait_all_paused() race past a run that
         # hasn't had a chance to update its own state yet.
-        ag._set_ui_state("skill", skill=self.name)
+        ag._set_ui_state("skill", skill=self.name) # [REFACTOR] Why not at the start of the run() function?
 
-        def _traced_task() -> None:
+        def _traced_task() -> None: # [REFACTOR] Maybe inline
             run_id = f"run{agprof.next_index()}"
             label = f"{run_id}:{self.name}:{ag.agname}"
             agprof.thread_name(label)
@@ -481,7 +484,7 @@ class agskill:
                     **{
                         "agency.run_id": run_id,
                         "agency.agent_id": str(ag.agname),
-                        "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None),
+                        "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None), # [REFACTOR] Why do we need to track this?
                     }
                 )
                 _task()
@@ -492,7 +495,7 @@ class agskill:
                     error_type="skill_error" if profile_error else None,
                 )
 
-        agprof.spawn_traced(_traced_task).start()
+        agprof.spawn_traced(_traced_task).start() # [REFACTOR] Why through "spawn_traced"?
         ag.ctx = agcontext(_future=ctx_future)
         return agdata(_future=result_future)
 
@@ -519,13 +522,14 @@ class agskill:
     # (agharness_backends/native.py), not in this host process.
     # ------------------------------------------------------------------
 
-    def execute_harness(
+    def execute_harness( # [REFACTOR]  Can be inlined into run()?
         self,
         ag: "agent",
         prev_ctx: agcontext,
         skill_input: agdata,
         max_steps: "int | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
+        # [REFACTOR] Too much text
         """Run this skill against *ag* via its configured `agharness_backend`
         -- called unconditionally by `agskill.run()`'s `_task()` for every
         engine, native included (native is just another backend whose
@@ -594,7 +598,7 @@ class agskill:
                 f"automatically deleted after this task ends."
             )
 
-        backend = agharness_backend.for_config(ag.engine, ag.agconfig)
+        backend = agharness_backend.for_config(ag.engine, ag.agconfig) # [REFACTOR] ag.engine should be part of ag.config
         try:
             result, updated_ctx, delta = backend.execute(
                 ag, prev_ctx, skill_input, max_steps, skill=self, extra_system=extra_system
@@ -625,8 +629,9 @@ class agskill:
             # (`agSandbox.release_daemon()`, see native.py's
             # `launch_in_container_entrypoint`), which is what makes this
             # safe for native specifically.
+            # [REFACTOR] Why do we wait on the host side? Check process tracking implementation
             if ag.engine == "native":
-                agSandbox.wait_for_processes(
+                agSandbox.wait_for_processes( # [REFACTOR] Returns a message, should be inside the container.
                     ag.sandbox,
                     self.name,
                     ag.terminal,

@@ -15,6 +15,7 @@ from typing import ClassVar
 from .agutil import agency_tmp_root as _agency_tmp_root
 
 # Single run-level ID for the default log directory.
+# [REFACTOR] combine with the RUN_ID in agcontainer
 _RUN_ID = _uuid_mod.uuid4().hex[:12]
 _RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 # Same root as the UDS gateway (see agutil.agency_tmp_root for why it is
@@ -36,7 +37,7 @@ from .agresources import agResourcePool
 from .agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
-from .agname import agname as _agname
+from .agname import agname as _agname # [REFACTOR] Why underscore?
 from .profiler import agprof
 
 
@@ -69,7 +70,7 @@ class agAgentConfig(_AgConfigViewBase):
 
     _OWNER = "agent"
 
-
+# [REFACTOR] Remove
 def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_default):
     """Resolve one of agent's own knobs (log_dir, output_dir, ...): the plain
     ClassVar default, optionally overridden by agconfig.
@@ -83,6 +84,7 @@ def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_defau
     return classvar_default if agconfig is None else agconfig.get("agent", name, classvar_default)
 
 
+# [REFACTOR] Check how it works
 # States that mean "this agent's worker thread will not make forward
 # progress until something external (a resume, or an upstream producer)
 # unblocks it". Used by agent.is_settled() -- the wait_all_* helpers in
@@ -91,6 +93,7 @@ _SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
 
 
 class agent_state:
+    # [REFACTOR] Comments too long, too much detail
     """Single owner of one agent's live status: the display fields a human or
     the webui sees (state/skill/tool), the synchronization primitives pause
     coordination needs (run_allowed/paused_ack/blocked_on), and the lock that
@@ -118,9 +121,9 @@ class agent_state:
 
     def __init__(self, agname: str) -> None:
         self.agname = agname
-        self.state: str = "inactive"
+        self.state: str = "inactive" # [REFACTOR] Should be an enum, not a string
         self.skill: "str | None" = None
-        self.tool: "str | None" = None
+        self.tool: "str | None" = None # [REFACTOR] Shouldn't the skill have the tools?
         # Set == allowed to run. Cleared by pause(), set by resume().
         self.run_allowed = threading.Event()
         self.run_allowed.set()
@@ -147,7 +150,7 @@ class agent_state:
         skill: "str | None" = None,
         tool: "str | None" = None,
         *,
-        unless_in: "tuple[str, ...]" = (),
+        unless_in: "tuple[str, ...]" = (), # [REFACTOR] Why do we need this?
     ) -> bool:
         """Atomically apply (new_state, skill, tool) unless the current state
         is one of *unless_in* (checked under the same lock as the write, so
@@ -157,10 +160,10 @@ class agent_state:
             if self.state in unless_in:
                 return False
             self.state, self.skill, self.tool = new_state, skill, tool
-        self._emit()
+        self._emit() 
         return True
 
-    def _emit(self) -> None:
+    def _emit(self) -> None: # [REFACTOR] "PUSH" to agwebui?
         try:
             from . import agwebui as _agwebui
 
@@ -203,7 +206,7 @@ class agent:
         agent.poll_interval_s = 5
         agent.max_outer_iters = 144
     """
-
+    # [REFACTOR] Move to agconfig
     log_dir: ClassVar[Path | None] = None
     output_dir: ClassVar[Path | None] = None
     agresource_pool: ClassVar[agResourcePool] = agResourcePool(mark_gpus=False)
@@ -215,7 +218,7 @@ class agent:
     # Same "set once before creating agents" convention as the ClassVars
     # above, so scripts that construct agents directly (agent(agname=...),
     # with no agconfig= kwarg) still pick up a run-wide agConfig.
-    default_agconfig: "ClassVar[agConfig | None]" = None
+    default_agconfig: "ClassVar[agConfig | None]" = None # [REFACTOR] Remove
 
     # Global token counter — accumulates across all agents and skill calls.
     _global_input_tokens: ClassVar[int] = 0
@@ -231,7 +234,7 @@ class agent:
     @classmethod
     def global_token_usage(cls) -> dict:
         """Framework-wide cumulative token usage across all agents and skill calls."""
-        with cls._global_token_lock:
+        with cls._global_token_lock: # [REFACTOR] Lock needed for read?
             inp = cls._global_input_tokens
             out = cls._global_output_tokens
         return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
@@ -247,7 +250,7 @@ class agent:
     ):
         with agprof.span("agent:create"):
             self._initialize(agname, llm, sandbox, agconfig, engine)
-
+    # [REFACTOR] Why separate?
     def _initialize(
         self,
         agname: "str | None",
@@ -258,7 +261,7 @@ class agent:
     ) -> None:
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
-        if llm is None:
+        if llm is None: # [REFACTOR] Why not next to set llm mem var
             if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
                 from ._context import _active_team as _at
 
@@ -267,7 +270,7 @@ class agent:
                     _t is not None
                     and _t.agconfig is not None
                     and _t.agconfig.data.get("agllm_backend")
-                ):
+                ): # [REFACTOR] Why do we have auto team-config inheritance only when agllm_backend exists?
                     # Adopt the team's agconfig outright (not just for the LLM
                     # fields) -- log_dir/output_dir/sandbox settings etc. should
                     # also come from it, matching "agents inherit the team's
@@ -287,13 +290,13 @@ class agent:
         # ag.change_config(new_cfg) to change it live -- see that method.
         self.agconfig: "agConfig | None" = (
             _src_agconfig.clone() if _src_agconfig is not None else None
-        )
+        ) # [REFACTOR] Should use a single setter method, also no default agconfig
 
         self.agname: _agname = _agname.allocate_agname(agname)
-        self._parent_agent_id: "str | None" = None
+        self._parent_agent_id: "str | None" = None # [REFACTOR]  Why do we need to keep reference of parent agent id?
 
         self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
-        self.engine: str = engine if engine is not None else _AgAgentFields(self.agconfig).engine
+        self.engine: str = engine if engine is not None else _AgAgentFields(self.agconfig).engine # [REFACTOR] Change to config only
         self.ctx: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -320,7 +323,7 @@ class agent:
         # sandbox handles the next call, never a replacement for it. Empty
         # until a harness backend that supports this (currently only
         # claude_code.py) actually populates it after a run.
-        self._harness_sessions: "dict[str, dict]" = {}
+        self._harness_sessions: "dict[str, dict]" = {} # [REFACTOR] Merge with full_history?
 
         _live_agents.add(self)
 
@@ -344,7 +347,7 @@ class agent:
             llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             context_limit=self.llm.context_limit,
         )
-        self._emit_config()
+        self._emit_config() # [REFACTOR] Maybe refactor into a separate agent_logging.py
 
     def change_config(self, agconfig: "agConfig") -> None:
         """Replace this agent's agconfig with a clone of the given one, and
@@ -366,7 +369,7 @@ class agent:
         return self.agconfig.clone() if self.agconfig is not None else None
 
     # ------------------------------------------------------------------
-    # Properties
+    # Properties # [REFACTOR] Why as properties?
     # ------------------------------------------------------------------
 
     @property
@@ -411,7 +414,7 @@ class agent:
     # UI / history helpers — called by agskill during execution
     # ------------------------------------------------------------------
 
-    def _append_full_history(self, msg: dict) -> None:
+    def _append_full_history(self, msg: dict) -> None: # [REFACTOR] File-write method? Maybe rename?
         """Append one message to the append-only full history (thread-safe write)."""
         self._full_history.append(msg)
         with self._full_history_path.open("a") as f:
@@ -422,7 +425,7 @@ class agent:
     def _set_ui_state(self, state: str, skill: str | None = None, tool: str | None = None) -> None:
         self._state.update_state(state, skill, tool)
 
-    def _emit_config(self) -> None:
+    def _emit_config(self) -> None: # [REFACTOR] Why not a single emission point to logger/webui?
         """Push this agent's current dynamic-config snapshot to the webui,
         so its config editor can show/edit it without a round trip into this
         (isolated) execution process. Called on construction and after every
@@ -510,7 +513,7 @@ class agent:
         display state string."""
         return self._state.paused_ack.is_set()
 
-    def is_settled(self, _seen: "set[str] | None" = None) -> bool:
+    def is_settled(self, _seen: "set[str] | None" = None) -> bool: # [REFACTOR] Why do we need this?
         """True if this agent is not making forward progress right now:
         either it's paused/inactive/finished/errored, or its worker thread is
         transitively blocked waiting on an upstream agent that is itself
@@ -537,7 +540,7 @@ class agent:
         """Checkpoint: block here while a pause is in effect. Called once
         before the ReAct loop starts and again at the top of every iteration
         — never mid-LLM-call or mid-tool-call, so an in-flight call always
-        finishes before a pause takes effect."""
+        finishes before a pause takes effect.""" # [REFACTOR]  How wil lthis work with the external harness redesign?
         if self._state.run_allowed.is_set():
             return
         prev_state, prev_skill, prev_tool = self._state.snapshot()
@@ -549,6 +552,7 @@ class agent:
             prev_state = "skill"
         self._state.update_state(prev_state, skill=prev_skill, tool=prev_tool)
 
+    # [REFACTOR] Single emition point?
     def push_token_count_update_to_ui(self, skill_inp: int, skill_out: int) -> None:
         """Push a live token update to the webui (called from agskill mid-loop)."""
         try:
@@ -600,6 +604,7 @@ class agent:
     # Destructor
     # ------------------------------------------------------------------
 
+    # [REFACTOR] No cleanup? No state checks?
     def __del__(self) -> None:
         """Best-effort: log destruction. The sandbox (if any) cleans itself up
         via agSandbox.__del__ once this agent's reference to it is gone."""
@@ -613,7 +618,7 @@ class agent:
     # ------------------------------------------------------------------
     # Fork
     # ------------------------------------------------------------------
-
+    # [REFACTOR] Why not call _init()_?
     @classmethod
     def fork(cls, src: "agent", agname: str | None = None) -> "agent":
         """Return an independent agent forked from *src*."""

@@ -190,7 +190,7 @@ def run_react_loop(sock_path: str, request: dict, timeout_s: float = 600) -> dic
 # ---------------------------------------------------------------------------
 
 
-def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) -> str:
+def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) -> str: # [REFACTOR] Why isn't this shared?
     """Start the in-container entrypoint as a persistent, detached process
     inside `sandbox`'s already-running container, and return the host-side
     path to its UDS socket once it's confirmed reachable (a real `ping`
@@ -223,7 +223,7 @@ def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) 
     host_sock_path = Path(new_uds_path("native-entrypoint"))
     sock_name = host_sock_path.name
     container_sock_path = f"/var/run/agency_llm_gateway/{sock_name}"
-    entrypoint_path = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/{_ENTRYPOINT_RELATIVE_PATH}"
+    entrypoint_path = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/{_ENTRYPOINT_RELATIVE_PATH}" # [REFACTOR] Update names/path
     pid_path = f"/tmp/{sock_name}.pid"
 
     # Run by raw file path, NOT `python3 -m package.module` -- see
@@ -259,7 +259,7 @@ def launch_in_container_entrypoint(sandbox: "agSandbox", timeout_s: float = 30) 
 
     try:
         entrypoint_pid = int(sandbox.read_file(pid_path).strip())
-        sandbox.release_daemon(entrypoint_pid)
+        sandbox.release_daemon(entrypoint_pid) # [REFACTOR] Harness is daemonized?
     except Exception as e:
         print(f"[native] WARNING: could not release entrypoint PID from monitoring: {e}")
 
@@ -369,7 +369,7 @@ def _container_bridge_sock_path(host_sock_path: str) -> str:
 
 
 class _NativeBackend(agharness_backend):
-    def execute(
+    def execute( # [REFACTOR] What is the execute "contract" exactly? Do we have a formal definition?
         self,
         ag: "agent",
         prev_ctx: "agcontext",
@@ -393,7 +393,7 @@ class _NativeBackend(agharness_backend):
         # merely *wrong* once relocated, which cloudpickle can't detect;
         # see this module's own docstring) fails right here, clearly, one
         # tool at a time.
-        custom_tools_payload = []
+        custom_tools_payload = [] # [REFACTOR] Why do we cloudpickle some objects and mount some objects?
         for tool in custom_tool_objs:
             try:
                 pickled = cloudpickle.dumps(tool.fn)
@@ -421,7 +421,7 @@ class _NativeBackend(agharness_backend):
         # sandbox's whole lifetime, so a retry is just one more `run_react_
         # loop()` request over the same socket, continuing the same
         # `messages` list with a reprompt appended. Cheaper than a harness
-        # relaunch, not a different mechanism.
+        # relaunch, not a different mechanism. # [REFACTOR] We should relaunch to keep consistency. Also, what is this structured output we are talking about? Aren't we using MCP output return tools?
         _use_structured_output = (
             skill.output_schema is not None and skill.output_schema.raw_key() is None
         )
@@ -432,16 +432,17 @@ class _NativeBackend(agharness_backend):
         if _use_structured_output:
             from ... import agharness
 
-            extra = agharness.build_mcp_output_format_instruction(skill)
+            extra = agharness.build_mcp_output_format_instruction(skill) # [REFACTOR] Isn't all output tools mcp now?
             if extra and isinstance(user_content, str):
                 user_content = user_content + extra
         user_msg = {"role": "user", "content": user_content}
 
         sock_path = _ensure_entrypoint(ag.sandbox)
 
+        # [REFACTOR] Bridges - Can we only have one?
         from ..agllm_terminus import get_shared_terminus
         from ..agmcp_server import get_shared_mcp_server
-        from ..agharness_messenger import get_shared_messenger
+        from ..agharness_messenger import get_shared_messenger # [REFACTOR] Why lazy?
 
         terminus = get_shared_terminus(ag.agconfig)
         mcp_server = get_shared_mcp_server(ag.agconfig)
