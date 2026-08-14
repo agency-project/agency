@@ -16,7 +16,8 @@ class agOpenAIBackendConfig(_AgProviderBackendConfig):
 
     _PROVIDER = "openai"
     _ALLOWED_FIELDS = (
-        frozenset({"model", "api_key", "base_url", "context_limit"}) | _OPENAI_GEN_FIELDS
+        frozenset({"model", "api_key", "base_url", "context_limit", "reasoning_effort"})
+        | _OPENAI_GEN_FIELDS
     )
 
 
