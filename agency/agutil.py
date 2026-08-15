@@ -313,7 +313,7 @@ def agency_tmp_root():
     (`agent._DEFAULT_LOG_DIR`) and the UDS gateway (`agharness_llm_gateway_dir`)
     both live under here.
 
-    Deliberately hardcoded to `/tmp/agency` rather than derived from
+    Deliberately hardcoded to `/tmp/agency-{uid}` rather than derived from
     `tempfile.gettempdir()`: `gettempdir()` honours `$TMPDIR`, which on a
     shared host is routinely redirected to scratch space under an aggressive
     cleanup policy. Files there are *supposed* to be deletable, which is
@@ -326,12 +326,22 @@ def agency_tmp_root():
     function honoured `$TMPDIR`; both now share one root, so one policy
     covers both.
 
+    Namespaced by uid (not username -- always short, and it's already the
+    actual permission boundary) so two OS users on the same shared host don't
+    collide: a bare `/tmp/agency` is created and owned by whichever user
+    happens to run agency first, `PermissionError`-ing every other user on
+    every later run. Overridable via `AGENCY_TMP_ROOT` for anyone who wants a
+    different location.
+
     A short root matters for a second reason -- see `UDS_SUN_PATH_MAX` and
     `new_uds_path`: every character here is spent from a 108-byte budget.
     """
     from pathlib import Path
 
-    return Path("/tmp/agency")
+    override = os.environ.get("AGENCY_TMP_ROOT")
+    if override:
+        return Path(override)
+    return Path(f"/tmp/agency-{os.getuid()}")
 
 
 def agharness_llm_gateway_dir():
