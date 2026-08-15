@@ -95,6 +95,35 @@ def test_react_loop_emits_exact_turn_and_tool_intervals(monkeypatch):
     assert "m5-marker" in tool_span.metadata["result"]
 
 
+def test_react_loop_forwards_llm_kwargs(monkeypatch):
+    h = NativeLoopHarness()
+    module = h.module
+    captured = {}
+
+    def dispatch(_sock, _token, kwargs, **_rest):
+        captured.update(kwargs)
+        return {"message": {"role": "assistant", "content": "done"}, "usage": {}}
+
+    monkeypatch.setattr(module, "_fetch_context_limit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "_dispatch_via_terminus", dispatch)
+
+    response = module._run_react_loop_inner(
+        {
+            "token": "tok",
+            "terminus_sock": "/unused",
+            "model": "gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hello"}],
+            "llm_kwargs": {"reasoning_effort": "none", "max_completion_tokens": 2048},
+            "max_steps": 1,
+        },
+        _CapturedProfiler(),
+    )
+
+    assert response["status"] == "done"
+    assert captured["reasoning_effort"] == "none"
+    assert captured["max_completion_tokens"] == 2048
+
+
 def test_compaction_emits_exact_interval(monkeypatch):
     h = NativeLoopHarness()
     module = h.module

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from agency.agllm import agllm
 from agency.agconfig import agConfig
 from agency.agllm import _AgLLMFields
+from agency.agllm_backends import agOpenAIBackendConfig
 
 
 def _cfg(**fields) -> agConfig:
@@ -28,6 +29,16 @@ fetch_context_limit = agllm.fetch_context_limit
 
 
 LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
+
+
+def test_build_llm_kwargs_includes_reasoning_effort():
+    cfg = agConfig(agOpenAIBackendConfig(model="gpt-5.6-luna", reasoning_effort="none"))
+
+    kwargs = agllm.build_llm_kwargs(cfg, [{"role": "user", "content": "hi"}], None)
+
+    assert kwargs["reasoning_effort"] == "none"
+
+
 BIG_CTX = 100_000
 LLM_COMPACT = agllm(_cfg(**LLM_COMPACT_CONFIG), context_limit=BIG_CTX)
 

@@ -474,6 +474,9 @@ class _NativeBackend(agharness_backend):
         try:
             request_messages = [sys_msg] + list(prev_ctx.messages) + [user_msg]
             messages = list(request_messages)
+            llm_kwargs = ag.llm.build_kwargs([], None)
+            llm_kwargs.pop("model", None)
+            llm_kwargs.pop("messages", None)
             while True:
                 request = {
                     "token": token,
@@ -486,6 +489,7 @@ class _NativeBackend(agharness_backend):
                         else None
                     ),
                     "model": ag.llm.backend.model or "",
+                    "llm_kwargs": llm_kwargs,
                     "messages": messages,
                     "max_steps": max_steps or 20,
                     "custom_tools": custom_tools_payload,
