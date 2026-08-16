@@ -20,7 +20,12 @@ from unittest.mock import MagicMock, call, patch
 from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_tool_call import Function
-from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice, ChoiceDelta
+from openai.types.chat.chat_completion_chunk import (
+    Choice as ChunkChoice,
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+)
 from openai.types.chat import ChatCompletionMessageToolCall
 from openai.types.completion_usage import CompletionUsage
 
@@ -58,13 +63,19 @@ def _completion(
 
 
 def _chunk(
-    content=None, finish_reason=None, usage=None, id="chatcmpl-test", model="m", has_choice=True
+    content=None,
+    finish_reason=None,
+    usage=None,
+    id="chatcmpl-test",
+    model="m",
+    has_choice=True,
+    tool_calls=None,
 ):
     """A real, valid `ChatCompletionChunk` -- same reconstruction reasoning
     as `_completion` above."""
     choices = []
     if has_choice:
-        delta = ChoiceDelta(content=content)
+        delta = ChoiceDelta(content=content, tool_calls=tool_calls)
         choices = [ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)]
     return ChatCompletionChunk(
         id=id,
@@ -592,6 +603,58 @@ def test_openai_responses_route_streaming_returns_responses_sse():
     assert "event: response.completed" in resp.text
 
 
+def test_openai_responses_route_streaming_preserves_namespace_reverse_map():
+    tool_delta = ChoiceDeltaToolCall(
+        index=0,
+        id="submit-1",
+        type="function",
+        function=ChoiceDeltaToolCallFunction(
+            name="mcp__agency__submit_output",
+            arguments='{"field":"status","value":"done"}',
+        ),
+    )
+    px, _, _ = _make_gateway_with_agent(
+        token="tok",
+        stream_result=[
+            _chunk(tool_calls=[tool_delta]),
+            _chunk(finish_reason="tool_calls"),
+        ],
+    )
+    client = _client_for(px)
+    body = {
+        "model": "m",
+        "input": "Submit the result.",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "mcp__agency",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "submit_output",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    response = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+
+    assert response.status_code == 200
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    tool_items = [payload["item"] for payload in payloads if "item" in payload]
+    assert [item["type"] for item in tool_items] == ["function_call", "function_call"]
+    assert {item["namespace"] for item in tool_items} == {"mcp__agency"}
+    assert {item["name"] for item in tool_items} == {"submit_output"}
+    assert "event: response.completed" in response.text
+
+
 def test_openai_responses_route_empty_stream_returns_failed_sse():
     px, _, _ = _make_gateway_with_agent(token="tok", stream_result=[])
     client = _client_for(px)
@@ -686,6 +749,29 @@ def test_openai_responses_route_rejects_unsupported_input_content_before_dispatc
     assert resp.json()["error"]["type"] == "invalid_request_error"
     assert resp.json()["error"]["code"] == "unsupported_responses_translation"
     assert "input_image" in resp.json()["error"]["message"]
+    fake_client.chat.completions.create.assert_not_called()
+
+
+def test_openai_responses_route_returns_400_for_malformed_tool_choice_namespace():
+    px, _, fake_client = _make_gateway_with_agent(token="tok")
+    client = _client_for(px)
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            }
+        ],
+        "tool_choice": {"type": "function", "namespace": 42, "name": "get_weather"},
+    }
+
+    response = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_responses_translation"
     fake_client.chat.completions.create.assert_not_called()
 
 

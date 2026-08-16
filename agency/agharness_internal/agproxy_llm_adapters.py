@@ -441,8 +441,15 @@ def _register_responses_tool(
     if existing is None:
         tool_name_map[chat_name] = entry
         return True
-    if existing == entry:
-        return False
+    existing_identity = {key: value for key, value in existing.items() if key != "_chat_function"}
+    if existing_identity == identity:
+        if existing.get("_chat_function") == chat_function:
+            return False
+        # A later tool_search_output may refresh one MCP tool's description or
+        # schema. The response identity is still unambiguous, so let the newest
+        # definition replace the historical one rather than failing the turn.
+        tool_name_map[chat_name] = entry
+        return True
     previous = (
         f"namespace={existing.get('namespace')!r}, name={existing.get('name')!r}, "
         f"type={existing.get('response_type')!r}"
@@ -618,7 +625,12 @@ def responses_tools_to_openai(
             "function tools on this turn",
             warning_handler,
         )
-    return converted or None
+    # A request can contain several historical tool_search outputs. Keep the
+    # latest schema for an unchanged identity while retaining first-seen order.
+    latest_by_name = {}
+    for tool in converted:
+        latest_by_name[tool["function"]["name"]] = tool
+    return list(latest_by_name.values()) or None
 
 
 def _responses_content_to_text(content, *, location: str) -> str:
@@ -658,7 +670,12 @@ def _responses_tool_choice_to_openai(tool_choice, tool_name_map: "dict | None" =
     if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         name = tool_choice.get("name")
         if isinstance(name, str) and name:
-            chat_name = _flatten_responses_tool_name(tool_choice.get("namespace"), name)
+            namespace = tool_choice.get("namespace")
+            if namespace is not None and not isinstance(namespace, str):
+                raise UnsupportedResponsesRequest(
+                    "Responses function tool_choice namespace must be a string or null"
+                )
+            chat_name = _flatten_responses_tool_name(namespace, name)
             if tool_name_map is not None and chat_name not in tool_name_map:
                 raise UnsupportedResponsesRequest(
                     f"Responses tool_choice names unavailable function tool {chat_name!r}"
@@ -833,6 +850,10 @@ def responses_request_to_openai(
             )
             or []
         )
+    latest_translated_tools = {}
+    for tool in translated_tools:
+        latest_translated_tools[tool["function"]["name"]] = tool
+    translated_tools = list(latest_translated_tools.values())
 
     instructions = body.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
@@ -1279,23 +1300,6 @@ def openai_chunks_to_responses_sse(
                         "name": getattr(tc.function, "name", "") or "",
                         "args_parts": [],
                     }
-                    added_item = _responses_item_for_chat_tool_call(
-                        chat_name=tool_blocks[tc_index]["name"],
-                        call_id=tool_blocks[tc_index]["call_id"],
-                        arguments="",
-                        item_id=fc_id,
-                        status="in_progress",
-                        tool_name_map=tool_name_map,
-                        partial=True,
-                    )
-                    yield _sse(
-                        "response.output_item.added",
-                        {
-                            "type": "response.output_item.added",
-                            "output_index": output_index,
-                            "item": added_item,
-                        },
-                    )
                     output_index += 1
                 fn = getattr(tc, "function", None)
                 call_id = getattr(tc, "id", None)
@@ -1340,6 +1344,15 @@ def openai_chunks_to_responses_sse(
 
     for block in tool_blocks.values():
         try:
+            added_item = _responses_item_for_chat_tool_call(
+                chat_name=block["name"],
+                call_id=block["call_id"],
+                arguments="",
+                item_id=block["id"],
+                status="in_progress",
+                tool_name_map=tool_name_map,
+                partial=True,
+            )
             done_item = _responses_item_for_chat_tool_call(
                 chat_name=block["name"],
                 call_id=block["call_id"],
@@ -1351,6 +1364,17 @@ def openai_chunks_to_responses_sse(
         except UnsupportedResponsesRequest as exc:
             yield _responses_stream_failure_sse(request_id, model, exc)
             return
+        # Chat providers may fragment function names across deltas. Delay the
+        # generic added event until the full name is known so one Responses
+        # item never changes type or namespace between `added` and `done`.
+        yield _sse(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": block["output_index"],
+                "item": added_item,
+            },
+        )
         yield _sse(
             "response.output_item.done",
             {

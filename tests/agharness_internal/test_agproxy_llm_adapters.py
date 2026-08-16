@@ -601,6 +601,70 @@ def test_responses_request_to_openai_loads_tool_search_namespace_results():
     assert tool_name_map["mcp__agency__submit_output"]["namespace"] == "mcp__agency"
 
 
+def test_responses_request_to_openai_uses_latest_refreshed_tool_search_definition():
+    def search_output(call_id, description, schema_type):
+        return {
+            "type": "tool_search_output",
+            "call_id": call_id,
+            "status": "completed",
+            "execution": "client",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__agency",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "submit_output",
+                            "description": description,
+                            "defer_loading": True,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": {"type": schema_type}},
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+    body = {
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "Submit output."},
+            {
+                "type": "tool_search_call",
+                "call_id": "search-old",
+                "execution": "client",
+                "arguments": {"query": "submit"},
+            },
+            search_output("search-old", "Old description", "string"),
+            {
+                "type": "tool_search_call",
+                "call_id": "search-new",
+                "execution": "client",
+                "arguments": {"query": "submit"},
+            },
+            search_output("search-new", "New description", "number"),
+        ],
+        "tools": [
+            {
+                "type": "tool_search",
+                "execution": "client",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+
+    kwargs = responses_request_to_openai(body)
+
+    names = [tool["function"]["name"] for tool in kwargs["tools"]]
+    assert names == ["tool_search", "mcp__agency__submit_output"]
+    refreshed = kwargs["tools"][1]["function"]
+    assert refreshed["description"] == "New description"
+    assert refreshed["parameters"]["properties"]["value"]["type"] == "number"
+
+
 @pytest.mark.parametrize("tool_type", ["custom", "web_search"])
 def test_responses_tools_to_openai_warns_and_omits_nonfunction_tools(tool_type):
     warnings = []
@@ -810,6 +874,24 @@ def test_responses_request_to_openai_maps_named_function_tool_choice():
         "type": "function",
         "function": {"name": "get_weather"},
     }
+
+
+def test_responses_request_to_openai_rejects_nonstring_tool_choice_namespace():
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            }
+        ],
+        "tool_choice": {"type": "function", "namespace": 42, "name": "get_weather"},
+    }
+
+    with pytest.raises(UnsupportedResponsesRequest, match="namespace must be a string or null"):
+        responses_request_to_openai(body)
 
 
 def test_responses_request_to_openai_rejects_required_choice_without_function_tools():
@@ -1163,6 +1245,96 @@ def test_openai_chunks_to_responses_sse_restores_tool_search_call():
     assert done["type"] == "tool_search_call"
     assert done["execution"] == "client"
     assert done["arguments"] == {"query": "submit_output", "limit": 1}
+
+
+def test_openai_chunks_to_responses_sse_keeps_fragmented_tool_search_identity_consistent():
+    chunks = [
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[_ToolCall(id="search-1", name="tool_", arguments="{", index=0)]
+                    )
+                )
+            ]
+        ),
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[
+                            _ToolCall(name="search", arguments='"query":"submit_output"}', index=0)
+                        ]
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ]
+        ),
+    ]
+    tool_name_map = {
+        "tool_search": {
+            "response_type": "tool_search_call",
+            "namespace": None,
+            "name": "tool_search",
+            "execution": "client",
+        }
+    }
+
+    events = _parse_sse(
+        "".join(openai_chunks_to_responses_sse(chunks, "m", tool_name_map=tool_name_map))
+    )
+    added = next(data["item"] for event, data in events if event == "response.output_item.added")
+    done = next(data["item"] for event, data in events if event == "response.output_item.done")
+
+    assert added["id"] == done["id"]
+    assert added["type"] == done["type"] == "tool_search_call"
+    assert added["execution"] == done["execution"] == "client"
+
+
+def test_openai_chunks_to_responses_sse_keeps_fragmented_namespace_identity_consistent():
+    chunks = [
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[
+                            _ToolCall(
+                                id="submit-1",
+                                name="mcp__agency__submit_",
+                                arguments="{",
+                                index=0,
+                            )
+                        ]
+                    )
+                )
+            ]
+        ),
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(tool_calls=[_ToolCall(name="output", arguments="}", index=0)]),
+                    finish_reason="tool_calls",
+                )
+            ]
+        ),
+    ]
+    tool_name_map = {
+        "mcp__agency__submit_output": {
+            "response_type": "function_call",
+            "namespace": "mcp__agency",
+            "name": "submit_output",
+        }
+    }
+
+    events = _parse_sse(
+        "".join(openai_chunks_to_responses_sse(chunks, "m", tool_name_map=tool_name_map))
+    )
+    added = next(data["item"] for event, data in events if event == "response.output_item.added")
+    done = next(data["item"] for event, data in events if event == "response.output_item.done")
+
+    assert added["id"] == done["id"]
+    assert added["namespace"] == done["namespace"] == "mcp__agency"
+    assert added["name"] == done["name"] == "submit_output"
 
 
 def test_openai_chunks_to_responses_sse_accepts_fragmented_tool_metadata():
