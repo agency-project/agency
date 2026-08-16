@@ -459,6 +459,17 @@ class _CodexBackend(agharness_backend):
                 [sys_msg],
             )
 
+        sandbox_kind = getattr(getattr(ag.sandbox, "_backend", None), "IMAGE_KIND", "")
+        if sandbox_kind == "chroot":
+            return (
+                agerror(
+                    "Codex does not yet support chroot-backed sandboxes safely; "
+                    "use a container-backed sandbox or run without an Agency sandbox"
+                ),
+                prev_ctx,
+                [sys_msg],
+            )
+
         binary = self.binary_path or self._DEFAULT_BINARY
         in_container = agharness.is_container_backed(ag.sandbox)
         if in_container:

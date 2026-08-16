@@ -293,7 +293,10 @@ cleanup stages above do not change. Its backend-specific edges are:
 Codex currently rejects attachments and `max_steps`. The Responses-to-chat boundary cannot retain
 opaque reasoning/native JSON-schema semantics, and reasoning effort is deliberately `none` because
 the validated chat backend rejects non-`none` reasoning together with function tools. Rollout blobs
-also grow with the conversation and remain version-coupled.
+also grow with the conversation and remain version-coupled. A chroot-backed Codex launch fails
+closed: until the shared supervisor implements the chroot entry path described above, launching the
+CLI as a host process would neither guarantee the jail workspace nor provide the intended
+containment. Container-backed and no-sandbox Codex launches are supported.
 
 ## What this document doesn't cover
 

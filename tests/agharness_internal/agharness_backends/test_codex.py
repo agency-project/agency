@@ -217,6 +217,26 @@ def test_execute_returns_agerror_when_binary_missing(monkeypatch):
     assert delta[0]["role"] == "system"
 
 
+def test_execute_fails_closed_for_chroot_before_starting_lifecycle():
+    backend = _CodexBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    ag = _make_agent()
+    ag.sandbox._backend.IMAGE_KIND = "chroot"
+
+    with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as gateway,
+        patch("agency.agharness.run_harness_cli") as run_cli,
+    ):
+        result, ctx, delta = backend.execute(ag, agcontext(), agdata(x=1), None, skill=skill)
+
+    assert isinstance(result, agerror)
+    assert "does not yet support chroot-backed sandboxes safely" in result.error
+    assert ctx.messages == []
+    assert delta[0]["role"] == "system"
+    gateway.assert_not_called()
+    run_cli.assert_not_called()
+
+
 def test_execute_uses_real_fresh_argv_final_file_and_usage():
     backend = _CodexBackend(agConfig())
     skill = agskill(name="s", system_prompt="developer policy")

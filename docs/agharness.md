@@ -87,8 +87,9 @@ capabilities. Generated config uses `shell_environment_policy.inherit = "none"` 
 verified this. Known limits are deliberate: attachments and `max_steps` are rejected, opaque
 Responses reasoning/native JSON-schema features do not cross the chat-completions boundary, and
 reasoning effort is currently `none` because the validated chat backend rejects non-`none`
-reasoning together with function tools. Rollout blobs are private, version-coupled, and grow with
-the conversation.
+reasoning together with function tools. Codex also fails closed for chroot-backed sandboxes until
+the shared process supervisor can enter that jail; container-backed and no-sandbox launches remain
+supported. Rollout blobs are private, version-coupled, and grow with the conversation.
 
 `grok.py` is the second backend (after opencode) that actually routes its LLM traffic through
 `agproxy_llm` rather than leaving the harness's own endpoint untouched — it writes a
