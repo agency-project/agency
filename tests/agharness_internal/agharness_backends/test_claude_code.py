@@ -1,20 +1,28 @@
 """Tests for the Claude Code agharness_backend.
 
-Tier 1 (mocked agProxyPtrace.launch and agproxy_llm.get_shared_gateway)
-covers the orchestration logic identically to test_opencode.py. Tier 2
-(marked `real_claude`) runs the actual installed `claude` CLI end-to-end
-against a REAL backend (Amazon Bedrock, via AWS_BEARER_TOKEN_BEDROCK) --
-verified working (v2.1.212) during development, both raw-text and
-structured-output-schema paths, with the request genuinely translated and
-routed through agproxy_llm's `/v1/messages` route rather than Claude Code
-using its own host credentials. Kept here as a regression check, skipped
-when the binary/auth isn't available so this suite doesn't require real API
-access to run.
+Tier 1 (mocked `agProxyPtrace.launch`) covers `_ClaudeCodeBackend.
+_run_attempt()` -- the one thing genuinely specific to this engine (binary
+resolution, argv/env construction, hook enabling, output parsing). The
+retry loop, structured-output collection, session capture, and transcript
+building it runs inside are all SHARED logic now (`agharness_backends/
+base.py`'s `execute()` template method) and are tested once, generically,
+in test_base.py's `TestSharedExecuteTemplate` instead of being re-tested
+per engine here.
+
+Tier 2 (marked `real_claude`) runs the actual installed `claude` CLI end-to-
+end against a REAL backend (Amazon Bedrock, via AWS_BEARER_TOKEN_BEDROCK)
+-- verified working (v2.1.212/v2.1.220) during development: raw-text,
+structured-output-schema, and cross-container session-continuity paths,
+with the request genuinely translated and routed through agmanager_harness
+rather than Claude Code using its own host credentials. Kept here as a
+regression check, skipped when the binary/auth isn't available so this
+suite doesn't require real API access to run.
 """
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,8 +30,7 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agsandbox_backends import agSandboxBackendConfig
 from agency.agllm_backends import agBedrockBackendConfig
-from agency.agdata import agdata, agerror
-from agency.agcontext import agcontext
+from agency.agdata import agdata
 from agency.agent import agent
 from agency.agharness_internal.agharness_backends.claude_code import (
     _ClaudeCodeBackend,
@@ -34,6 +41,7 @@ from agency.agskill import agskill
 
 def _make_agent(with_sandbox=True):
     ag = MagicMock()
+    ag.agname = "test-agent"
     ag.agconfig = agConfig()
     ag.llm.backend.model = "test-model"
     ag.sandbox = MagicMock() if with_sandbox else None
@@ -44,17 +52,6 @@ def _make_handle(stdout="", stderr="", rc=0):
     handle = MagicMock()
     handle.wait.return_value = (stdout, stderr, rc)
     return handle
-
-
-def _patched_gateway_and_ptrace(handle):
-    mock_gateway = MagicMock()
-    mock_gateway.base_url = "http://127.0.0.1:1"
-
-    def apply(mock_gateway_getter, mock_px_cls):
-        mock_gateway_getter.return_value = mock_gateway
-        mock_px_cls.return_value.launch.return_value = handle
-
-    return mock_gateway, apply
 
 
 @pytest.fixture
@@ -69,53 +66,66 @@ def _patch_which_finds_claude(monkeypatch):
     monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
 
 
-def test_execute_returns_agerror_when_binary_missing(monkeypatch):
+def _run_attempt(
+    backend,
+    ag,
+    *,
+    harness_base_url="http://harness.local",
+    token="tok-1",
+    prompt="go",
+    resume_session_id=None,
+    prior_session_blob=None,
+):
+    skill = agskill(name="s", system_prompt="do the thing")
+    return backend._run_attempt(
+        ag,
+        None,
+        harness_base_url,
+        SimpleNamespace(token=token),
+        skill,
+        prompt=prompt,
+        resume_session_id=resume_session_id,
+        prior_session_blob=prior_session_blob,
+        max_steps=None,
+    )
+
+
+def test_run_attempt_returns_error_when_binary_missing(monkeypatch):
     import shutil as _shutil
 
     monkeypatch.setattr(_shutil, "which", lambda name: None)
     backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent()
-    result, ctx, delta = backend.execute(ag, agcontext(), agdata(x=1), None, skill=skill)
-    assert isinstance(result, agerror)
-    assert "not found on PATH" in result.error
+    ag = _make_agent(with_sandbox=False)
+
+    attempt = _run_attempt(backend, ag)
+
+    assert not attempt.ok
+    assert "not found" in attempt.error_message
 
 
-def test_execute_parses_json_result_field(_patch_which_finds_claude):
+def test_run_attempt_parses_json_result_field(_patch_which_finds_claude):
     backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent()
-    prev_ctx = agcontext()
+    ag = _make_agent(with_sandbox=False)
 
     payload = json.dumps({"result": "Hi there!", "usage": {"input_tokens": 5, "output_tokens": 2}})
     handle = _make_handle(stdout=payload)
-    with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox") as mock_wire,
-    ):
-        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
-        apply(mock_gateway_getter, mock_px_cls)
-        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+    with patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+        mock_px_cls.return_value.launch.return_value = handle
+        attempt = _run_attempt(backend, ag)
 
-    assert not isinstance(result, agerror)
-    assert result.result == "Hi there!"
-    assert ctx is prev_ctx
-    assert ctx.total_input_tokens == 5
-    assert ctx.total_output_tokens == 2
-    mock_wire.assert_called_once_with(handle, ag.sandbox)
-    mock_gateway.register.assert_called_once()
-    mock_gateway.unregister.assert_called_once()
+    assert attempt.ok
+    assert attempt.final_text == "Hi there!"
+    assert attempt.input_tokens == 5
+    assert attempt.output_tokens == 2
 
 
-def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
+def test_run_attempt_does_not_override_home(monkeypatch, _patch_which_finds_claude):
     """Regression test for a real bug hit during development: overriding
     HOME cut Claude Code off from its own ~/.claude/.credentials.json,
     forcing "Not logged in" on every run."""
     monkeypatch.setenv("HOME", "/real/home")
     backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent()
+    ag = _make_agent(with_sandbox=False)
 
     handle = _make_handle(stdout='{"result": "ok"}')
     captured_envp = {}
@@ -126,31 +136,23 @@ def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
         captured_envp.update(envp)
         return handle
 
-    with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
-    ):
-        mock_gateway, _ = _patched_gateway_and_ptrace(handle)
-        mock_gateway_getter.return_value = mock_gateway
+    with patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
         mock_px_cls.return_value.launch.side_effect = fake_launch
-        backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
+        _run_attempt(backend, ag, harness_base_url="http://harness.local", token="tok-1")
 
     assert captured_envp.get("HOME") == "/real/home"
-    # LLM traffic is routed through the gateway, not the host's own creds.
-    assert captured_envp.get("ANTHROPIC_BASE_URL") == mock_gateway.base_url
+    # LLM traffic is routed through agmanager_harness, not the host's own creds.
+    assert captured_envp.get("ANTHROPIC_BASE_URL") == "http://harness.local"
+    assert captured_envp.get("ANTHROPIC_AUTH_TOKEN") == "tok-1"
     assert "ANTHROPIC_API_KEY" not in captured_envp
     settings = json.loads(captured_argv[captured_argv.index("--settings") + 1])
     assert set(settings["hooks"]) == {"PreToolUse"}
     assert "AGPROF_BASE_URL" not in captured_envp
 
 
-def test_execute_enables_exact_claude_hooks_only_while_profiling(
-    _patch_which_finds_claude,
-):
+def test_run_attempt_enables_exact_claude_hooks_only_while_profiling(_patch_which_finds_claude):
     backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent()
+    ag = _make_agent(with_sandbox=False)
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
 
@@ -159,232 +161,70 @@ def test_execute_enables_exact_claude_hooks_only_while_profiling(
         captured["envp"] = envp
         return handle
 
-    profiler_ingest = MagicMock()
     with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as gateway_getter,
         patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as ptrace_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
-        patch(
-            "agency.agharness_internal.agprof_ingest.get_shared_profiler_ingest",
-            return_value=profiler_ingest,
-        ),
         patch("agency.profiler.agprof.enabled", return_value=True),
     ):
-        gateway, _ = _patched_gateway_and_ptrace(handle)
-        gateway_getter.return_value = gateway
         ptrace_cls.return_value.launch.side_effect = fake_launch
-        backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
+        _run_attempt(backend, ag, harness_base_url="http://harness.local", token="tok-1")
 
     settings = json.loads(captured["argv"][captured["argv"].index("--settings") + 1])
     assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
-    assert captured["envp"]["AGPROF_BASE_URL"] == gateway.base_url
-    assert captured["envp"]["AGPROF_TOKEN"]
-    profiler_ingest.register.assert_called_once()
-    assert profiler_ingest.register.call_args.kwargs == {"exact_tool_events": True}
+    assert captured["envp"]["AGPROF_BASE_URL"] == "http://harness.local"
+    assert captured["envp"]["AGPROF_TOKEN"] == "tok-1"
 
 
-def test_execute_nonzero_exit_returns_agerror(_patch_which_finds_claude):
+def test_run_attempt_nonzero_exit_returns_error(_patch_which_finds_claude):
     backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent()
-    prev_ctx = agcontext()
+    ag = _make_agent(with_sandbox=False)
 
     handle = _make_handle(stdout="", stderr="auth error", rc=1)
-    with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
-    ):
-        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
-        apply(mock_gateway_getter, mock_px_cls)
-        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+    with patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+        mock_px_cls.return_value.launch.return_value = handle
+        attempt = _run_attempt(backend, ag)
 
-    assert isinstance(result, agerror)
-    assert "auth error" in result.error
+    assert not attempt.ok
+    assert "auth error" in attempt.error_message
 
 
-def _patched_mcp_server(collected=None):
-    """A fake agmcp_server -- structured output no longer comes from
-    parsing the harness's own final text (see agharness.py's
-    build_output_format_instruction and claude_code.py's execute()): it's
-    whatever `submit_output` calls landed against the real server during
-    the run, read back via `collected_output(token)`. Faking that return
-    value here is the mocked-tier equivalent of a real submit_output call
-    having happened -- test_real_claude_structured_output_end_to_end (Tier
-    2) is what proves the real MCP round trip itself works."""
-    mock_server = MagicMock()
-    mock_server.start.return_value = "http://127.0.0.1:1"
-    mock_server.ensure_uds_started.return_value = "/tmp/fake.sock"
-    mock_server.collected_output.return_value = collected or {}
-    return mock_server
-
-
-def test_execute_recovers_structured_output_schema(_patch_which_finds_claude):
+def test_run_attempt_threads_resume_session_id_into_argv(_patch_which_finds_claude):
+    """`resume_session_id` is decided by the SHARED retry loop in base.py
+    (see test_base.py's TestSharedExecuteTemplate) and simply threaded
+    through into `--resume <id>` here -- this only tests that threading,
+    not the retry loop itself."""
     backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(
-        name="s", system_prompt="do the thing", output_schema=agdata(greeting=str, word_count=int)
-    )
-    ag = _make_agent()
-    prev_ctx = agcontext()
-
-    handle = _make_handle(stdout=json.dumps({"result": "hi there friend"}))
-    mock_mcp_server = _patched_mcp_server({"greeting": "hi there friend", "word_count": 3})
-    with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.agharness_internal.agmcp_server.get_shared_mcp_server") as mock_mcp_getter,
-        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
-    ):
-        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
-        apply(mock_gateway_getter, mock_px_cls)
-        mock_mcp_getter.return_value = mock_mcp_server
-        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
-
-    assert not isinstance(result, agerror)
-    assert result.greeting == "hi there friend"
-    assert result.word_count == 3
-    mock_mcp_server.register.assert_called_once()
-    mock_mcp_server.unregister.assert_called_once()
-
-
-def test_execute_reports_missing_fields_when_submit_output_never_called(_patch_which_finds_claude):
-    """A harness that never calls submit_output (or misses a field), even
-    after exhausting its retries, must surface a clear agerror, not
-    silently return a partial/empty agdata."""
-    backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(
-        name="s",
-        system_prompt="do the thing",
-        output_schema=agdata(greeting=str, word_count=int),
-        max_output_schema_retries=2,
-    )
-    ag = _make_agent()
-    prev_ctx = agcontext()
-
-    handle = _make_handle(stdout=json.dumps({"result": "I forgot to submit"}))
-    mock_mcp_server = _patched_mcp_server({"greeting": "hi"})
-    with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.agharness_internal.agmcp_server.get_shared_mcp_server") as mock_mcp_getter,
-        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
-    ):
-        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
-        apply(mock_gateway_getter, mock_px_cls)
-        mock_mcp_getter.return_value = mock_mcp_server
-        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
-
-    assert isinstance(result, agerror)
-    assert "word_count" in result.error
-    # 1 initial attempt + 2 retries -- never gives up silently, never loops
-    # unbounded either.
-    assert mock_px_cls.return_value.launch.call_count == 3
-
-
-def test_execute_retries_and_recovers_when_submit_output_arrives_on_retry(
-    _patch_which_finds_claude,
-):
-    """The Phase 6 'outer' retry: a first attempt that's missing a field
-    must trigger a reprompted relaunch (via --resume, not a fresh session),
-    and a subsequent attempt that completes the fields must succeed --
-    proving this isn't just a give-up-immediately path."""
-    backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(
-        name="s",
-        system_prompt="do the thing",
-        output_schema=agdata(greeting=str, word_count=int),
-        max_output_schema_retries=3,
-    )
-    ag = _make_agent()
-    prev_ctx = agcontext()
-
-    handle1 = _make_handle(stdout=json.dumps({"result": "partial", "session_id": "sess-abc"}))
-    handle2 = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
-    mock_mcp_server = _patched_mcp_server()
-    # First call: only "greeting" landed. Second call (after the reprompt
-    # relaunch): both fields present -- simulates the model completing the
-    # missing field once reminded.
-    mock_mcp_server.collected_output.side_effect = [
-        {"greeting": "hi"},
-        {"greeting": "hi", "word_count": 2},
-    ]
-    captured_argvs = []
+    ag = _make_agent(with_sandbox=False)
+    handle = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
+    captured = {}
 
     def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
-        captured_argvs.append(argv)
-        return handle1 if len(captured_argvs) == 1 else handle2
+        captured["argv"] = argv
+        return handle
 
-    with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.agharness_internal.agmcp_server.get_shared_mcp_server") as mock_mcp_getter,
-        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
-    ):
-        mock_gateway, _ = _patched_gateway_and_ptrace(handle1)
-        mock_gateway_getter.return_value = mock_gateway
+    with patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
         mock_px_cls.return_value.launch.side_effect = fake_launch
-        mock_mcp_getter.return_value = mock_mcp_server
-        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+        attempt = _run_attempt(backend, ag, resume_session_id="sess-abc")
 
-    assert not isinstance(result, agerror), result
-    assert result.greeting == "hi"
-    assert result.word_count == 2
-    assert len(captured_argvs) == 2
-    # First attempt is a fresh session (no --resume yet).
-    assert "--resume" not in captured_argvs[0]
-    # Second attempt resumes the first's session and carries a reprompt,
-    # not the original task prompt again.
-    assert "--resume" in captured_argvs[1]
-    assert captured_argvs[1][captured_argvs[1].index("--resume") + 1] == "sess-abc"
-    assert "still missing" in captured_argvs[1][-1].lower()
+    assert attempt.ok
+    assert "--resume" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--resume") + 1] == "sess-abc"
 
 
-def test_execute_uses_terminus_transcript_for_history_when_available(_patch_which_finds_claude):
-    """Phase 5 (history unification): once agllm_terminus has recorded a
-    real transcript for this token, prev_ctx.messages/the returned delta
-    must come from THAT (tool calls/results included), not the old
-    flattened [user_msg, assistant_msg] collapse."""
+def test_run_attempt_omits_resume_flag_for_a_fresh_session(_patch_which_finds_claude):
     backend = _ClaudeCodeBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent()
-    prev_ctx = agcontext()
+    ag = _make_agent(with_sandbox=False)
+    handle = _make_handle(stdout='{"result": "ok"}')
+    captured = {}
 
-    handle = _make_handle(stdout=json.dumps({"result": "the command printed ok"}))
-    recorded_transcript = [
-        {"role": "system", "content": "claude code's own system prompt"},
-        {"role": "user", "content": "run echo ok"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}
-            ],
-        },
-        {"role": "tool", "tool_call_id": "1", "content": "ok"},
-        {"role": "assistant", "content": "the command printed ok"},
-    ]
-    mock_terminus = MagicMock()
-    mock_terminus.transcript_for_token.return_value = recorded_transcript
-    with (
-        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch(
-            "agency.agharness_internal.agllm_terminus.get_shared_terminus"
-        ) as mock_terminus_getter,
-        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
-    ):
-        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
-        apply(mock_gateway_getter, mock_px_cls)
-        mock_terminus_getter.return_value = mock_terminus
-        result, ctx, delta = backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+        captured["argv"] = argv
+        return handle
 
-    assert not isinstance(result, agerror)
-    # System message dropped from ctx.messages (matching agskill.py's own
-    # native-loop convention), but present in the returned delta.
-    assert ctx.messages == recorded_transcript[1:]
-    assert any(m.get("role") == "tool" for m in ctx.messages), "tool turn was flattened away"
-    assert delta[0]["role"] == "system"
-    assert delta[1:] == recorded_transcript[1:]
+    with patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+        mock_px_cls.return_value.launch.side_effect = fake_launch
+        _run_attempt(backend, ag, resume_session_id=None)
+
+    assert "--resume" not in captured["argv"]
 
 
 def test_parse_result_json_extracts_result_and_usage():
@@ -419,20 +259,16 @@ real_claude = pytest.mark.skipif(
 
 @real_claude
 def test_real_claude_raw_text_end_to_end():
-    # A genuinely-working backend, not a placeholder -- now that this
-    # backend routes claude's LLM traffic through an in-container
-    # agproxy_llm instance (Phase 2b-ii) to the host-side agllm_terminus,
-    # the real credentialed dispatch must actually happen, not just accept
-    # the connection. Uses the same Bedrock bearer-token credential
-    # (AWS_BEARER_TOKEN_BEDROCK) this dev environment already has.
-    from agency.agharness_internal.agllm_terminus import get_shared_terminus
-
+    # A genuinely-working backend, not a placeholder -- this backend routes
+    # claude's LLM traffic through agmanager_harness's `/v1/messages` route
+    # to this agent's own agmanager_host, so the real credentialed dispatch
+    # must actually happen, not just accept the connection. Uses the same
+    # Bedrock bearer-token credential (AWS_BEARER_TOKEN_BEDROCK) this dev
+    # environment already has.
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
-    terminus = get_shared_terminus(cfg)
-    log_before = len(terminus.request_log)
 
     ag = agent(agconfig=cfg, engine="claude_code")
     skill = agskill(
@@ -448,14 +284,12 @@ def test_real_claude_raw_text_end_to_end():
     # docstring), so a real OAuth-logged-in `claude` on this host could in
     # principle answer correctly via its OWN credentials if
     # ANTHROPIC_BASE_URL/AUTH_TOKEN were somehow ignored. Assert directly
-    # against the terminus's own request log -- the one place a real
-    # credentialed dispatch is ever recorded, regardless of which process
-    # (host-side gateway, or now an in-container agproxy_llm) routed the
-    # request here -- instead of inferring "it must have gone through" from
-    # the result looking right.
-    new_entries = terminus.request_log[log_before:]
-    assert len(new_entries) >= 1, "claude's request never reached agllm_terminus"
-    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in new_entries)
+    # against this agent's own agmanager_host request log -- the one place
+    # a real credentialed dispatch is ever recorded -- instead of inferring
+    # "it must have gone through" from the result looking right.
+    request_log = ag._host_agent_manager.request_log
+    assert len(request_log) >= 1, "claude's request never reached agmanager_host"
+    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in request_log)
     assert "error" not in raw, raw
     assert isinstance(raw.get("result"), str) and raw["result"]
 
@@ -498,16 +332,11 @@ def test_real_claude_tool_call_history_is_not_flattened():
 def test_real_claude_structured_output_end_to_end():
     # A genuinely-working backend, not a placeholder -- see
     # test_real_claude_raw_text_end_to_end's comment for why the request
-    # log check is against agllm_terminus, not agproxy_llm's own (no longer
-    # host-side-readable once its routing layer runs in-container).
-    from agency.agharness_internal.agllm_terminus import get_shared_terminus
-
+    # log check is against this agent's own agmanager_host.
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
-    terminus = get_shared_terminus(cfg)
-    log_before = len(terminus.request_log)
 
     ag = agent(agconfig=cfg, engine="claude_code")
     skill = agskill(
@@ -521,9 +350,65 @@ def test_real_claude_structured_output_end_to_end():
     result.wait()
     raw = result.to_dict()
 
-    new_entries = terminus.request_log[log_before:]
-    assert len(new_entries) >= 1, "claude's request never reached agllm_terminus"
-    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in new_entries)
+    request_log = ag._host_agent_manager.request_log
+    assert len(request_log) >= 1, "claude's request never reached agmanager_host"
+    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in request_log)
     assert "error" not in raw, raw
     assert isinstance(raw.get("greeting"), str)
     assert isinstance(raw.get("word_count"), int)
+
+
+@real_claude
+def test_real_claude_history_continues_across_a_fresh_sandbox():
+    """Session continuity (docs/Design_harness_history.md) travels with the
+    AGENT (`ag._harness_sessions`), not with any particular container: call 1
+    tells the agent a fact, then `ag.sandbox` is swapped for a brand-new
+    sandbox (a different container instance) before call 2 asks the agent to
+    recall that fact via `--resume` against the captured session blob."""
+    cfg = agConfig(
+        agSandboxBackendConfig(backend="docker"),
+        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
+    )
+    skill = agskill(name="continuity_test_skill", system_prompt="You are a test assistant.")
+
+    from agency.agsandbox import agSandbox
+    import uuid
+
+    ag = agent(
+        agconfig=cfg, sandbox=agSandbox(str(uuid.uuid4()), agconfig=cfg), engine="claude_code"
+    )
+    try:
+        r1 = ag.run(
+            skill,
+            agdata(
+                instruction="My project's deployment codename is PURPLE-42-NARWHAL. Just say OK."
+            ),
+        )
+        r1.wait()
+        raw1 = r1.to_dict()
+        assert "error" not in raw1, raw1
+
+        stored = ag._harness_sessions.get("claude_code")
+        assert stored and stored.get("session_id"), "no session captured after call 1"
+    finally:
+        ag.sandbox.rm_container()
+
+    # Fresh container for call 2 -- proves continuity doesn't depend on
+    # reusing the first container.
+    ag.sandbox = agSandbox(str(uuid.uuid4()), agconfig=cfg)
+    try:
+        r2 = ag.run(
+            skill,
+            agdata(
+                instruction="What's my project's deployment codename? Reply with just the codename."
+            ),
+        )
+        r2.wait()
+        raw2 = r2.to_dict()
+
+        assert "error" not in raw2, raw2
+        assert "PURPLE-42-NARWHAL" in raw2.get("result", ""), (
+            f"continuity failed -- agent didn't recall the code: {raw2!r}"
+        )
+    finally:
+        ag.sandbox.rm_container()

@@ -900,3 +900,49 @@ def test_wire_to_sandbox_reflects_traced_background_process():
         handle.wait(timeout=10)
     finally:
         sb.destroy()
+
+
+@ptrace
+@docker
+def test_launch_with_sandbox_traces_inside_container_and_enforces_policy():
+    """`agProxyPtrace.launch(..., sandbox=sandbox)` runs the traced command
+    INSIDE the given container (not on the host) and a deny-specific-path
+    policy still applies there -- the actual production shape (a harness
+    launched inside a real sandbox), as opposed to `test_launch_*`'s bare-
+    host coverage above or `test_wire_to_sandbox_reflects_traced_background_
+    process`'s host-launched-then-wired coverage."""
+    from agency.agsandbox import agSandbox
+    from agency.agsandbox_backends import agSandboxBackendConfig
+    import uuid
+
+    class _DenySpecificPathPolicy(agpolicy):
+        def __init__(self, deny_path):
+            self._deny_path = deny_path
+
+        def check(self, ag, event):
+            if event.path == self._deny_path:
+                return agdecision.deny(f"blocked {event.path}")
+            return agdecision.allow()
+
+    agconfig = agSandboxBackendConfig(backend="docker").agconfig
+    sandbox = agSandbox(str(uuid.uuid4()), agconfig=agconfig)
+    try:
+        px = agProxyPtrace(agconfig)
+        policy = _DenySpecificPathPolicy("/bin/true")
+
+        handle = px.launch(
+            ["/bin/sh", "-c", "echo REAL_API_PID=$$ && pwd && /bin/true; echo exit_was=$?"],
+            {"PATH": "/usr/bin:/bin"},
+            cwd="/workspace",
+            policy=policy,
+            ag=None,
+            sandbox=sandbox,
+        )
+        stdout, stderr, rc = handle.wait(timeout=30)
+
+        assert "REAL_API_PID=" in stdout, stdout
+        assert "/workspace" in stdout, stdout
+        assert "exit_was=126" in stdout, stdout  # denied exec -> shell reports 126
+        assert rc == 0, (rc, stdout, stderr)
+    finally:
+        sandbox.rm_container()

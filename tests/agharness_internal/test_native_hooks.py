@@ -8,7 +8,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from agency.agpolicy import agdecision
-from agency.agharness_internal.agharness_backends._native_hooks import (
+from agency.agharness_internal._native_hooks import (
     decision_to_hook_response,
     hook_payload_to_syscallevent,
     resolve_mediation_mode,
@@ -46,7 +46,7 @@ def test_hook_payload_to_syscallevent_bash_command():
 
 def test_hook_event_uses_shared_architecture_neutral_policy_type():
     from agency.agharness_internal._syscall_event import agsyscallevent
-    from agency.agharness_internal.agharness_backends import _native_hooks
+    from agency.agharness_internal import _native_hooks
 
     event = hook_payload_to_syscallevent({"tool_name": "Read", "tool_input": {}})
     assert type(event) is agsyscallevent

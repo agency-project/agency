@@ -14,16 +14,30 @@ launch should take. It is NOT wired into `claude_code.py`/`opencode.py`/
 that for all three, plus standing up each harness's own hook-registration
 config, is a real second implementation of Component 3 mediation, which is
 out of scope for what this phase calls a "reduced-coverage fallback."
+
+**Lives at the `agharness_internal` top level, not inside
+`agharness_backends/`** (moved from there -- see the conversation that
+caught this): `agprof_ingest.py`/`agmanager_host/profiler_ingest.py` (both
+top-level-ish "service" modules) need to import this for hook-payload
+parsing, while every concrete backend in `agharness_backends/` imports
+`agprof_ingest.py`. Nesting this module inside `agharness_backends/` made
+that a real circular dependency between the two layers (a service module
+reaching down into the backends package, while the backends package reaches
+back up into the service module) -- not a hard `ImportError` (every import
+site is function-local/lazy), but a real layering violation. This module
+has no backend-specific state or logic of its own (pure hook-JSON
+translation), so it belongs as a peer of `_syscall_event.py`, not nested
+under the backends it happens to currently only be used to support.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .._syscall_event import agsyscallevent
+from ._syscall_event import agsyscallevent
 
 if TYPE_CHECKING:
-    from ...agpolicy import agdecision
+    from ..agpolicy import agdecision
 
 
 def resolve_mediation_mode(mediation_mode: str) -> str:
@@ -31,7 +45,7 @@ def resolve_mediation_mode(mediation_mode: str) -> str:
     through unchanged (an explicit request is never silently overridden)."""
     if mediation_mode != "auto":
         return mediation_mode
-    from ..agproxy_ptrace import ptrace_available
+    from .agproxy_ptrace import ptrace_available
 
     return "ptrace" if ptrace_available() else "native_hooks"
 

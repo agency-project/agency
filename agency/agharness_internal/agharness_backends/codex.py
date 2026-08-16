@@ -55,6 +55,12 @@ class _CodexBackend(agharness_backend):
         *,
         skill: "agskill",
         extra_system: "str | None" = None,
+        # Not migrated yet -- see base.py's execute() docstring; this
+        # backend still constructs its own get_shared_gateway()/
+        # get_shared_profiler_ingest() bridges below, the old way.
+        host_manager=None,
+        harness_base_url: "str | None" = None,
+        launch=None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from ... import agharness
         from ..agproxy_llm import get_shared_gateway

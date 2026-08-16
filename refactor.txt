@@ -1,11 +1,13 @@
 File Structure
-1. Core: agent.py 
+1. Core: agent.py
 2. Profiler: agprof.py
 3. Logging: aglog.py
 4. Config: agconfig.py
 5. Schema: agschema.py
 6. Context: agcontext.py
 7. Sandboxing: agsandbox.py
+8. LLM: agllm.py
+9. Tools: agtool.py
 
 Core Features
 1. Harness Side react loop
@@ -51,7 +53,7 @@ Refactor items
 1. Dedicated config dir/files?
 2. agent state + sagpause redesign
 3. agent object should be a host-side reflection dataclass of agents, for both live and idling agents. (state, history, sandbox image)
-4. Should agwebui state update be PULL vs PUSH? 
+4. Should agwebui state update be PULL vs PUSH?
 5. Add separate files for sub-features of agent.py, e.g., webui logging and history management
 6. Why do we need a separate "pure" source files? Maybe rename and move them into the native agharness subdir?
 7. Rename prompt building in agskill?
@@ -61,3 +63,8 @@ Refactor items
 11. Merge log and history?
 12. Why do we lazy import webui?
 13. List all host-harness bridging components, check their relationship and functions, and merge/inline if needed. - Refactor to driver model if needed.
+14. What needs to be packeged into the container?
+15. package the native harness into a standalone package - Current abstraction between host and native harness is not well defined.
+16. Too many "base" files - agharness.py, arharness_internal/base.py, Why? What is the common base API for all backends?
+17. pause, inbox, resource control shared api?
+18. Per-turn UI pushed by agllm_terminus?

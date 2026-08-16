@@ -2374,18 +2374,13 @@ def _maybe_autostart() -> None:
 
 
 def _shutdown_process_profile() -> None:
-    """Drain shared harness work before finalizing process-scope traces."""
+    """Finalize process-scope traces exactly once."""
     global _process_shutdown_started
     with _process_shutdown_lock:
         if _process_shutdown_started:
             return
         _process_shutdown_started = True
-    try:
-        from ..agharness_internal.shared_services import drain_shared_services
-
-        drain_shared_services()
-    finally:
-        stop()
+    stop()
 
 
 def _install_process_profile_signal_handlers() -> None:

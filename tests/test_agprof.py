@@ -1047,22 +1047,15 @@ def test_process_scope_is_the_only_environment_autostart(monkeypatch):
     ]
 
 
-def test_process_shutdown_drains_shared_services_before_stopping_profiler(monkeypatch):
-    from agency.agharness_internal import shared_services
-
+def test_process_shutdown_stops_profiler_exactly_once(monkeypatch):
     events = []
     monkeypatch.setattr(agprof, "_process_shutdown_started", False)
-    monkeypatch.setattr(
-        shared_services,
-        "drain_shared_services",
-        lambda: events.append("drain"),
-    )
     monkeypatch.setattr(agprof, "stop", lambda: events.append("stop"))
 
     agprof._shutdown_process_profile()
     agprof._shutdown_process_profile()
 
-    assert events == ["drain", "stop"]
+    assert events == ["stop"]
 
 
 def test_process_signal_handler_shuts_down_then_restores_and_reraises(monkeypatch):
