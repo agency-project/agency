@@ -61,6 +61,11 @@ def test_build_harness_messages_keeps_every_canonical_input_part():
     assert "/workspace/input.txt" in rendered
     assert "data:image/png;base64,abc" in rendered
 
+    resumed = agharness.render_harness_messages(messages, include_previous_context=False)
+    assert "[PREVIOUS CONTEXT]" not in resumed
+    assert "prior answer" not in resumed
+    assert "[CURRENT USER INPUT]\ncurrent task" in resumed
+
 
 def test_run_harness_cli_uses_sandbox_stdin_workspace_and_pid_wiring():
     ag = _make_agent()

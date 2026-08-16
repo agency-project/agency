@@ -14,6 +14,7 @@ access to run.
 
 from __future__ import annotations
 
+import base64
 import json
 from unittest.mock import MagicMock, patch
 
@@ -205,6 +206,58 @@ def test_execute_nonzero_exit_returns_agerror(_patch_which_finds_claude):
 
     assert isinstance(result, agerror)
     assert "auth error" in result.error
+
+
+def test_synced_native_session_resumes_without_resending_history(
+    _patch_which_finds_claude,
+):
+    backend = _ClaudeCodeBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    ag = _make_agent(with_sandbox=False)
+    ag._harness_sessions = {
+        "claude_code": {
+            "session_id": "session-123",
+            "blob_b64": base64.b64encode(b'{"sessionId":"session-123"}\n').decode(),
+            "agcontext_revision": 3,
+        }
+    }
+    prev_ctx = agcontext(
+        messages=[{"role": "assistant", "content": "portable history"}],
+        revision=3,
+    )
+    handle = _make_handle(stdout='{"result": "ok"}')
+    captured = {}
+
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None, stdin=None):
+        captured["argv"] = argv
+        captured["stdin"] = stdin
+        return handle
+
+    mock_mcp = _patched_mcp_server()
+    mock_terminus = MagicMock()
+    mock_terminus.transcript_for_token.return_value = None
+    with (
+        patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as gateway_getter,
+        patch(
+            "agency.agharness_internal.agllm_terminus.get_shared_terminus",
+            return_value=mock_terminus,
+        ),
+        patch(
+            "agency.agharness_internal.agmcp_server.get_shared_mcp_server",
+            return_value=mock_mcp,
+        ),
+        patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as ptrace_cls,
+        patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
+    ):
+        gateway, _ = _patched_gateway_and_ptrace(handle)
+        gateway_getter.return_value = gateway
+        ptrace_cls.return_value.launch.side_effect = fake_launch
+        backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+
+    assert "--resume" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--resume") + 1] == "session-123"
+    assert "[PREVIOUS CONTEXT]" not in captured["stdin"]
+    assert "portable history" not in captured["stdin"]
 
 
 def _patched_mcp_server(collected=None):

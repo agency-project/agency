@@ -218,11 +218,6 @@ class _ClaudeCodeBackend(agharness_backend):
         )
         output_schema_retries_left = skill.max_output_schema_retries
 
-        first_prompt = agharness.render_harness_messages(
-            messages,
-            output_guidance=agharness.build_mcp_output_format_instruction(skill),
-        )
-
         total_input_tokens = 0
         total_output_tokens = 0
 
@@ -241,7 +236,11 @@ class _ClaudeCodeBackend(agharness_backend):
             # what the blob capture after each attempt is for.
             resume_session_id = None
             prior = ag._harness_sessions.get(_ENGINE_KEY)
-            if prior and prior.get("session_id"):
+            if (
+                prior
+                and prior.get("session_id")
+                and prior.get("agcontext_revision") == prev_ctx.revision
+            ):
                 resume_session_id = prior["session_id"]
                 try:
                     blob = base64.b64decode(prior["blob_b64"])
@@ -253,10 +252,19 @@ class _ClaudeCodeBackend(agharness_backend):
                     )
                 except Exception:
                     # Best-effort: a failure to restore the prior session
-                    # blob must never block the run -- --resume will just
-                    # fail its own lookup and this falls back to a fresh
-                    # session (still correct, just without native memory).
+                    # blob must never block the run. Clearing the id below
+                    # starts a fresh session with the portable Agency history.
                     resume_session_id = None
+
+            # A synchronized native session already contains the Agency
+            # history, so only the current task is sent on resume. If there
+            # is no matching/restorable session, this is a genuinely fresh
+            # launch and the portable Agency history initializes it.
+            first_prompt = agharness.render_harness_messages(
+                messages,
+                output_guidance=agharness.build_mcp_output_format_instruction(skill),
+                include_previous_context=resume_session_id is None,
+            )
 
             # Bridge Claude Code's PreToolUse permission check to agpolicy
             # and its PreToolUse/PostToolUse boundaries to agprof: write the
@@ -461,6 +469,7 @@ class _ClaudeCodeBackend(agharness_backend):
                             ag._harness_sessions[_ENGINE_KEY] = {
                                 "session_id": session_id,
                                 "blob_b64": base64.b64encode(blob).decode(),
+                                "agcontext_revision": prev_ctx.revision + 1,
                             }
                     except Exception:  # noqa: S110 - session persistence is best-effort
                         pass

@@ -16,6 +16,7 @@ def test_default_construction():
     assert ctx.total_input_tokens == 0
     assert ctx.total_output_tokens == 0
     assert ctx.compaction_summary is None
+    assert ctx.revision == 0
     assert ctx._future is None
 
 
@@ -85,6 +86,7 @@ def test_resolve_merges_future_state():
         total_input_tokens=42,
         total_output_tokens=17,
         compaction_summary="compact",
+        revision=4,
     )
     f.set_result(resolved)
     placeholder.resolve_prev_dependencies()
@@ -93,6 +95,7 @@ def test_resolve_merges_future_state():
     assert placeholder.total_input_tokens == 42
     assert placeholder.total_output_tokens == 17
     assert placeholder.compaction_summary == "compact"
+    assert placeholder.revision == 4
     assert placeholder._future is None
 
 
@@ -162,6 +165,13 @@ def test_copy_preserves_compaction_summary():
     ctx = agcontext(compaction_summary="the summary")
     c = ctx.copy()
     assert c.compaction_summary == "the summary"
+
+
+def test_revision_tracks_replacement_and_is_preserved_by_copy():
+    ctx = agcontext(revision=4)
+    ctx.set_messages([{"role": "user", "content": "replacement"}])
+    assert ctx.revision == 5
+    assert ctx.copy().revision == 5
 
 
 def test_copy_resolves_pending_future():

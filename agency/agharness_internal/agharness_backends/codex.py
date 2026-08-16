@@ -96,11 +96,18 @@ class _CodexBackend(agharness_backend):
                 config_home, base_url, model, sandbox=ag.sandbox if in_container else None
             )
 
-            prompt = agharness.render_harness_messages(messages)
-            argv = [resolved, "exec", "--json", "--strict-config", "--cd", "/workspace"]
             sessions = getattr(ag, "_harness_sessions", None)
             prior_session = sessions.get("codex", {}) if isinstance(sessions, dict) else {}
-            resume_session_id = prior_session.get("session_id") or self.session_resume_id
+            resume_session_id = (
+                prior_session.get("session_id")
+                if prior_session.get("agcontext_revision") == prev_ctx.revision
+                else None
+            )
+            prompt = agharness.render_harness_messages(
+                messages,
+                include_previous_context=resume_session_id is None,
+            )
+            argv = [resolved, "exec", "--json", "--strict-config", "--cd", "/workspace"]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
             argv.append("-")
@@ -148,7 +155,10 @@ class _CodexBackend(agharness_backend):
 
         if session_id:
             if isinstance(getattr(ag, "_harness_sessions", None), dict):
-                ag._harness_sessions["codex"] = {"session_id": session_id}
+                ag._harness_sessions["codex"] = {
+                    "session_id": session_id,
+                    "agcontext_revision": prev_ctx.revision + 1,
+                }
             self.session_resume_id = session_id
 
         prev_ctx.messages = [*messages.previous_context, user_msg, assistant_msg]

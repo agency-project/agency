@@ -20,6 +20,7 @@ class agcontext:
     total_input_tokens  : cumulative input tokens across all LLM calls so far
     total_output_tokens : cumulative output tokens across all LLM calls so far
     compaction_summary  : rolling summary produced by conversation compaction
+    revision            : lineage marker advanced when portable history changes
     """
 
     def __init__(
@@ -28,12 +29,14 @@ class agcontext:
         total_input_tokens: int = 0,
         total_output_tokens: int = 0,
         compaction_summary: "str | None" = None,
+        revision: int = 0,
         _future: "Future[agcontext] | None" = None,
     ) -> None:
         self.messages = messages if messages is not None else []
         self.total_input_tokens = total_input_tokens
         self.total_output_tokens = total_output_tokens
         self.compaction_summary = compaction_summary
+        self.revision = revision
         self._future = _future
 
     # ------------------------------------------------------------------
@@ -53,6 +56,7 @@ class agcontext:
         self.total_input_tokens = prev_ctx.total_input_tokens
         self.total_output_tokens = prev_ctx.total_output_tokens
         self.compaction_summary = prev_ctx.compaction_summary
+        self.revision = prev_ctx.revision
         self._future = None
 
     # ------------------------------------------------------------------
@@ -67,6 +71,7 @@ class agcontext:
     def set_messages(self, messages: "list[dict]") -> None:
         """Replace the message list directly."""
         self.messages = list(messages)
+        self.revision += 1
 
     def copy(self) -> "agcontext":
         """Return a deep copy of the resolved context (blocks if pending)."""
@@ -76,6 +81,7 @@ class agcontext:
             total_input_tokens=self.total_input_tokens,
             total_output_tokens=self.total_output_tokens,
             compaction_summary=self.compaction_summary,
+            revision=self.revision,
         )
 
     def __repr__(self) -> str:
@@ -85,5 +91,6 @@ class agcontext:
             f"  in={self.total_input_tokens}"
             f"  out={self.total_output_tokens}"
             f"  compact={'yes' if self.compaction_summary else 'no'}"
+            f"  rev={self.revision}"
             f"){pending}"
         )

@@ -74,11 +74,14 @@ def build_harness_messages(
 
 
 def render_harness_messages(
-    messages: HarnessMessages, *, output_guidance: "str | None" = None
+    messages: HarnessMessages,
+    *,
+    output_guidance: "str | None" = None,
+    include_previous_context: bool = True,
 ) -> str:
     """Render the canonical task as the CLI-independent full-task envelope."""
     sections = [("SYSTEM INSTRUCTIONS", messages.system_instructions)]
-    if messages.previous_context:
+    if include_previous_context and messages.previous_context:
         sections.append(
             (
                 "PREVIOUS CONTEXT",

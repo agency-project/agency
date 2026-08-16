@@ -258,6 +258,7 @@ class agskill:
             history_before: list[dict] = []
             _prev_input_tokens: int = 0
             _prev_output_tokens: int = 0
+            _prev_context_revision: int = 0
             sandbox_lock: "threading.RLock | None" = None
             # Fallback for the final logging step below if an exception hits
             # before the defensive copy further down is made.
@@ -313,6 +314,7 @@ class agskill:
                 history_before = list(prev_ctx.messages)
                 _prev_input_tokens = prev_ctx.total_input_tokens
                 _prev_output_tokens = prev_ctx.total_output_tokens
+                _prev_context_revision = prev_ctx.revision
 
                 ag.terminal.log(
                     "SKILL ▶  ", f"{self.name}  input={list(local_skill_input._data.keys())}"
@@ -332,6 +334,8 @@ class agskill:
                     local_skill_input,
                     max_steps,
                 )
+                if updated_ctx.messages != history_before:
+                    updated_ctx.revision = _prev_context_revision + 1
 
             except Exception as exc:
                 outer_result = agerror(format_exception(exc))

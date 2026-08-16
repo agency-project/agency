@@ -205,9 +205,11 @@ def test_history_updated_after_run():
 
     ag.run(skill, agdata(turn=1))
     assert len(ag.history.messages) == 2  # ag.history blocks until done
+    assert ag.ctx.revision == 1
 
     ag.run(skill, agdata(turn=2))
     assert len(ag.history.messages) == 4  # chain: step2 waited for step1
+    assert ag.ctx.revision == 2
 
 
 def test_sequential_calls_serialize_via_history_chain():
@@ -701,6 +703,7 @@ def test_save_and_load_restores_engine(tmp_path, monkeypatch):
         agconfig=_llm_agconfig({"api_key": "k", "model": "m"}),
         engine="claude_code",
     )
+    ag.ctx.revision = 7
 
     ckpt = tmp_path / "agent.ckpt"
     ag.save(ckpt)
@@ -710,6 +713,7 @@ def test_save_and_load_restores_engine(tmp_path, monkeypatch):
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     assert ag2.engine == "claude_code"
+    assert ag2.ctx.revision == 7
     del ag2
     _agname._allocated.discard(saved_agname)
 

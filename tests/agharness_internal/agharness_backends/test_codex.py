@@ -103,6 +103,56 @@ def test_execute_parses_ndjson_agent_message():
     mock_gateway.unregister.assert_called_once()
 
 
+def test_resume_omits_synced_history_and_stale_session_starts_fresh():
+    backend = _CodexBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "new-thread"}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}),
+        ]
+    )
+
+    def run(prior_revision):
+        ag = _make_agent()
+        ag._harness_sessions = {
+            "codex": {
+                "session_id": "old-thread",
+                "agcontext_revision": prior_revision,
+            }
+        }
+        prev_ctx = agcontext(
+            messages=[{"role": "assistant", "content": "portable history"}],
+            revision=3,
+        )
+        handle = _make_handle(stdout=stdout)
+        with (
+            patch("agency.agharness_internal.agproxy_llm.get_shared_gateway") as gateway_getter,
+            patch("agency.agharness_internal.agproxy_ptrace.agProxyPtrace") as ptrace_cls,
+            patch("agency.agharness_internal.agproxy_ptrace.wire_to_sandbox"),
+        ):
+            gateway, apply = _patched_gateway_and_ptrace(handle)
+            apply(gateway_getter, ptrace_cls)
+            backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
+            launch = ptrace_cls.return_value.launch.call_args
+        return ag, launch.args[0], launch.kwargs["stdin"]
+
+    resumed_ag, resumed_argv, resumed_stdin = run(prior_revision=3)
+    assert "--resume" in resumed_argv
+    assert "old-thread" in resumed_argv
+    assert "[PREVIOUS CONTEXT]" not in resumed_stdin
+    assert "portable history" not in resumed_stdin
+    assert resumed_ag._harness_sessions["codex"] == {
+        "session_id": "new-thread",
+        "agcontext_revision": 4,
+    }
+
+    _, fresh_argv, fresh_stdin = run(prior_revision=2)
+    assert "--resume" not in fresh_argv
+    assert "[PREVIOUS CONTEXT]" in fresh_stdin
+    assert "portable history" in fresh_stdin
+
+
 def test_execute_nonzero_exit_returns_agerror():
     backend = _CodexBackend(agConfig())
     skill = agskill(name="s", system_prompt="do the thing")

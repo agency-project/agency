@@ -102,7 +102,17 @@ class _GrokBackend(agharness_backend):
                 config_home, base_url, token, model, sandbox=ag.sandbox if in_container else None
             )
 
-            prompt = agharness.render_harness_messages(messages)
+            sessions = getattr(ag, "_harness_sessions", None)
+            prior_session = sessions.get("grok", {}) if isinstance(sessions, dict) else {}
+            resume_session_id = (
+                prior_session.get("session_id")
+                if prior_session.get("agcontext_revision") == prev_ctx.revision
+                else None
+            )
+            prompt = agharness.render_harness_messages(
+                messages,
+                include_previous_context=resume_session_id is None,
+            )
             prompt_path = f"{config_home}/task.txt"
             if in_container:
                 ag.sandbox.write_file(prompt_path, prompt)
@@ -121,9 +131,6 @@ class _GrokBackend(agharness_backend):
                 "--output-format",
                 "json",
             ]
-            sessions = getattr(ag, "_harness_sessions", None)
-            prior_session = sessions.get("grok", {}) if isinstance(sessions, dict) else {}
-            resume_session_id = prior_session.get("session_id") or self.session_resume_id
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
             envp = {
@@ -173,13 +180,12 @@ class _GrokBackend(agharness_backend):
             prev_ctx.total_input_tokens += usage.get("input_tokens", 0)
             prev_ctx.total_output_tokens += usage.get("output_tokens", 0)
         if session_id:
-            # Multi-turn resume (`grok -r <id>`) is future work -- not
-            # threaded through to a second execute() call yet, just
-            # recorded so that wiring is a config-read away rather than a
-            # new field.
             self.session_resume_id = session_id
             if isinstance(getattr(ag, "_harness_sessions", None), dict):
-                ag._harness_sessions["grok"] = {"session_id": session_id}
+                ag._harness_sessions["grok"] = {
+                    "session_id": session_id,
+                    "agcontext_revision": prev_ctx.revision + 1,
+                }
         prev_ctx.messages = [*messages.previous_context, user_msg, assistant_msg]
         return result, prev_ctx, [sys_msg, user_msg, assistant_msg]
 

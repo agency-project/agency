@@ -313,7 +313,8 @@ class agent:
         self._state = agent_state(str(self.agname))
         # Per-harness-engine native session continuity (see
         # docs/Design_harness_history.md) -- {"claude_code": {"session_id":
-        # ..., "blob_b64": ...}, ...}. Deliberately NOT part of `self.ctx`:
+        # ..., "blob_b64": ..., "agcontext_revision": ...}, ...}.
+        # Deliberately NOT part of `self.ctx`:
         # `agcontext` stays the portable, engine-agnostic history object
         # (attachable to any sandbox); this is a per-engine optimization
         # layered on top, extracted from and reinjected into whatever
@@ -737,6 +738,7 @@ class agent:
             "engine": self.engine,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             "history": self.ctx.messages,
+            "agcontext_revision": self.ctx.revision,
             "ts": _ts(),
         }
         if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
@@ -839,7 +841,10 @@ class agent:
                 ag.agconfig.set("agllm_backend", k, v)
         ag.llm = agllm(ag.agconfig)
         ag.engine = state.get("engine", "native")
-        ag.ctx = agcontext(messages=list(state.get("history", [])))
+        ag.ctx = agcontext(
+            messages=list(state.get("history", [])),
+            revision=state.get("agcontext_revision", 0),
+        )
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
