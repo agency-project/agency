@@ -93,6 +93,11 @@ def test_execute_parses_ndjson_agent_message():
     assert not isinstance(result, agerror)
     assert result.result == "hi"
     assert ctx is prev_ctx
+    launch = mock_px_cls.return_value.launch.call_args
+    assert launch.kwargs["cwd"] == "/workspace"
+    assert launch.kwargs["stdin"]
+    assert launch.args[0][-1] == "-"
+    assert "--ignore-user-config" not in launch.args[0]
     mock_wire.assert_called_once_with(handle, ag.sandbox)
     mock_gateway.register.assert_called_once()
     mock_gateway.unregister.assert_called_once()
@@ -151,11 +156,11 @@ def test_execute_writes_model_providers_config_toml():
     )
     written = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None, stdin=None):
         from pathlib import Path
 
         written["envp"] = envp
-        written["content"] = (Path(cwd) / "config.toml").read_text()
+        written["content"] = (Path(envp["CODEX_HOME"]) / "config.toml").read_text()
         return handle
 
     with (

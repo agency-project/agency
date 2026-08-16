@@ -55,15 +55,22 @@ class _CodexBackend(agharness_backend):
         *,
         skill: "agskill",
         extra_system: "str | None" = None,
+        canonical_input=None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from ... import agharness
         from ..agproxy_llm import get_shared_gateway
-        from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
 
-        sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
+        messages = canonical_input or agharness.build_harness_messages(
+            skill, prev_ctx, skill_input, file_notice=extra_system
+        )
+        sys_msg = {"role": "system", "content": messages.system_instructions}
 
         binary = self.binary_path or self._DEFAULT_BINARY
-        resolved = shutil.which(binary)
+        in_container = agharness.is_container_backed(ag.sandbox)
+        if in_container:
+            resolved = agharness.resolve_harness_binary_in_container(ag.sandbox, binary)
+        else:
+            resolved = shutil.which(binary)
         if resolved is None:
             return agerror(f"codex binary {binary!r} not found on PATH"), prev_ctx, [sys_msg]
 
@@ -75,22 +82,28 @@ class _CodexBackend(agharness_backend):
         gateway.register(token, ag)
         profiler_ingest.register(token, ag)
 
-        config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
+        if in_container:
+            from ..agproxy_llm_in_container import ensure_agproxy_llm_in_container
+
+            base_url = ensure_agproxy_llm_in_container(ag.sandbox, ag.agconfig)
+            config_home = agharness.materialize_config_home_in_container(ag, ag.sandbox, token)
+        else:
+            base_url = gateway.base_url
+            config_home = agharness.materialize_config_home(ag, token, base_url)
         try:
             model = getattr(ag.llm.backend, "model", "") or "default"
-            self._write_codex_config(config_home, gateway.base_url, model)
+            self._write_codex_config(
+                config_home, base_url, model, sandbox=ag.sandbox if in_container else None
+            )
 
-            prompt = agharness.build_user_turn_prompt(skill, skill_input)
-            if not isinstance(prompt, str):
-                prompt = json.dumps(prompt)
-            extra = agharness.build_output_format_instruction(skill)
-            if extra:
-                prompt = prompt + extra
-
-            # --ignore-user-config keeps this run from inheriting the
-            # caller's own ~/.codex/config.toml, matching the same
-            # isolated-config-home intent as the other two backends.
-            argv = [resolved, "exec", "--json", "--ignore-user-config", prompt]
+            prompt = agharness.render_harness_messages(messages)
+            argv = [resolved, "exec", "--json", "--strict-config", "--cd", "/workspace"]
+            sessions = getattr(ag, "_harness_sessions", None)
+            prior_session = sessions.get("codex", {}) if isinstance(sessions, dict) else {}
+            resume_session_id = prior_session.get("session_id") or self.session_resume_id
+            if resume_session_id:
+                argv += ["--resume", resume_session_id]
+            argv.append("-")
             envp = {
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
                 "CODEX_HOME": str(config_home),
@@ -100,17 +113,21 @@ class _CodexBackend(agharness_backend):
                 self._ENV_KEY_NAME: token,
             }
 
-            px = agProxyPtrace(ag.agconfig)
-            policy = agharness.default_policy(ag)
-            handle = px.launch(argv, envp, cwd=str(config_home), policy=policy, ag=ag)
-            if ag.sandbox is not None:
-                wire_to_sandbox(handle, ag.sandbox)
-
-            stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
+            stdout, stderr, rc = agharness.run_harness_cli(
+                ag,
+                argv,
+                envp,
+                stdin=prompt,
+                timeout_s=self._DEFAULT_TIMEOUT_S,
+                cwd="/workspace" if ag.sandbox is not None else str(config_home),
+            )
         finally:
             gateway.unregister(token)
             profiler_ingest.unregister(token)
-            agharness.cleanup_config_home(config_home)
+            if in_container:
+                agharness.cleanup_config_home_in_container(ag.sandbox, config_home)
+            else:
+                agharness.cleanup_config_home(config_home)
 
         if rc != 0:
             return (
@@ -119,8 +136,8 @@ class _CodexBackend(agharness_backend):
                 [sys_msg],
             )
 
-        final_text = self._parse_output_events(stdout)
-        user_msg = {"role": "user", "content": prompt}
+        final_text, session_id = self._parse_output(stdout)
+        user_msg = agharness.harness_user_message(messages)
         assistant_msg = {"role": "assistant", "content": final_text}
 
         if skill.output_schema is not None and skill.output_schema.raw_key() is None:
@@ -129,10 +146,15 @@ class _CodexBackend(agharness_backend):
             out_key = skill.output_schema.raw_key() if skill.output_schema is not None else "result"
             result = agdata(**{out_key: final_text})
 
-        prev_ctx.messages = [user_msg, assistant_msg]
+        if session_id:
+            if isinstance(getattr(ag, "_harness_sessions", None), dict):
+                ag._harness_sessions["codex"] = {"session_id": session_id}
+            self.session_resume_id = session_id
+
+        prev_ctx.messages = [*messages.previous_context, user_msg, assistant_msg]
         return result, prev_ctx, [sys_msg, user_msg, assistant_msg]
 
-    def _write_codex_config(self, config_home, base_url: str, model: str) -> None:
+    def _write_codex_config(self, config_home, base_url: str, model: str, *, sandbox=None) -> None:
         toml_text = (
             f'model = "{model}"\n'
             f'model_provider = "{self._PROVIDER_NAME}"\n'
@@ -143,7 +165,11 @@ class _CodexBackend(agharness_backend):
             f'env_key = "{self._ENV_KEY_NAME}"\n'
             f'wire_api = "responses"\n'
         )
-        (config_home / "config.toml").write_text(toml_text)
+        path = f"{config_home}/config.toml"
+        if sandbox is not None:
+            sandbox.write_file(path, toml_text)
+        else:
+            (config_home / "config.toml").write_text(toml_text)
 
     @staticmethod
     def _parse_output_events(stdout: str) -> str:
@@ -151,7 +177,12 @@ class _CodexBackend(agharness_backend):
         from `codex exec --json`'s NDJSON event stream -- unverified
         against a live run (no `codex` binary available), see this
         module's docstring."""
+        return _CodexBackend._parse_output(stdout)[0]
+
+    @staticmethod
+    def _parse_output(stdout: str) -> "tuple[str, str | None]":
         last_text = ""
+        session_id = None
         for line in stdout.splitlines():
             line = line.strip()
             if not line:
@@ -162,14 +193,16 @@ class _CodexBackend(agharness_backend):
                 continue
             if not isinstance(event, dict):
                 continue
+            if event.get("type") == "thread.started" and isinstance(event.get("thread_id"), str):
+                session_id = event["thread_id"]
             item = event.get("item") or {}
             if isinstance(item, dict) and item.get("type") == "agent_message":
                 text = item.get("text")
                 if isinstance(text, str) and text:
                     last_text = text
         if last_text:
-            return last_text
-        return stdout.strip()
+            return last_text, session_id
+        return stdout.strip(), session_id
 
 
 __all__ = ["_CodexBackend", "codex_available"]

@@ -147,13 +147,15 @@ Same responsibilities as before, with execution-capture logic removed (it now li
 1. Materializes an isolated, ephemeral config home per run, containing only the model/endpoint env
    from Component 1 — no hook registration, since mediation no longer depends on the harness's
    hook system.
-2. Delivers the skill's task as a plain **user-turn prompt** (`system_prompt` + input JSON +, if
-   `output_schema` is declared, a text instruction describing the required response shape) — never
-   as `--append-system-prompt`, never as a tool.
-3. **Launches the harness through `agproxy_ptrace` instead of a plain `sandbox.exec()`** — the one change
-   to how the backend starts the process. From the backend's point of view this is a drop-in
-   replacement for an exec call; it still gets the harness's stdout/stderr/exit code back.
-4. Parses the harness's own turn-level event stream (`stream-json` / `codex exec --json` / opencode
+2. `agskill.execute_harness()` calls `build_harness_messages()` before adapter dispatch. The
+   canonical value keeps system instructions, resolved history, current input, file notices,
+   attachments, and output guidance separate until the adapter renders the complete task.
+3. Each adapter chooses only its CLI transport: Claude Code, OpenCode, and Codex receive the task
+   on stdin; Grok receives a mode-`0600` private prompt file. Full task content is never an argv
+   element.
+4. `run_harness_cli()` owns the shared launch contract: the persisted `ag.sandbox`, `/workspace`
+   cwd, ptrace policy, PID wiring, stdin delivery and EOF, deadline handling, kill, and reap.
+5. Parses the harness's own turn-level event stream (`stream-json` / `codex exec --json` / opencode
    SSE) purely for **semantic, turn-level** information — which the OS-level view cannot
    reconstruct on its own: which model turn triggered a given execution, the model's assistant
    text/reasoning, token usage for cross-checking against `agproxy_llm`'s counts, and the final
@@ -161,9 +163,9 @@ Same responsibilities as before, with execution-capture logic removed (it now li
    and why"; `agproxy_ptrace` supplies the OS's-eye view of "what actually happened." Both feed `aglog`,
    correlated by timestamp/PID, so the webui can show "Bash tool call (turn 4)" *and* the exact
    `execve` argv `agproxy_ptrace` observed for it.
-5. Collects output by validating the harness's final response text against `output_schema` via the
+6. Collects output by validating the harness's final response text against `output_schema` via the
    existing `agschema` path, reprompting as an ordinary user turn on failure.
-6. Stores the harness's session id on `ag.ctx` for resume/fork.
+7. Stores the harness's session id in the agent's per-engine harness-session state for resume/fork.
 
 ---
 

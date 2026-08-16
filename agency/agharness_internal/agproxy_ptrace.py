@@ -33,16 +33,26 @@ from typing import TYPE_CHECKING, Callable
 from ..agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 from ..agpolicy import agdecision
 from ._syscall_event import agsyscallevent
-from .agproxy_ptrace_internal._tracer_loop import SeccompStop, StopDecision, TracerLoop
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
     from ..agent import agent
     from ..agpolicy import agpolicy
+    from .agproxy_ptrace_internal._tracer_loop import SeccompStop
 
 
 _ptrace_available_cache: "bool | None" = None
 _ptrace_available_lock = threading.Lock()
+# Loaded only when the host ptrace path is selected. Keeping patchable module
+# attributes preserves the supervisor's test seam without importing x86-only
+# ctypes definitions on ARM.
+TracerLoop = None
+
+
+@dataclass
+class StopDecision:
+    kind: str
+    new_args: "list[str] | None" = None
 
 
 def ptrace_available() -> bool:
@@ -442,6 +452,7 @@ class agProxyPtrace:
         policy: "agpolicy",
         ag: "agent | None" = None,
         sandbox=None,
+        stdin: "str | bytes | None" = None,
     ) -> agProxyPtraceHandle:
         """*sandbox*, when given, selects the launch path: a docker/podman-
         backed sandbox (`IMAGE_KIND == "container"`) forks the traced child
@@ -481,12 +492,24 @@ class agProxyPtrace:
                     include_exit_code=True,
                 )
             try:
-                relay.start(argv, envp, cwd, syscalls)
+                if stdin is None:
+                    relay.start(argv, envp, cwd, syscalls)
+                else:
+                    relay.start(argv, envp, cwd, syscalls, stdin=stdin)
             except BaseException:
                 if process_profiler is not None:
                     process_profiler.finalize()
                 raise
             return handle
+
+        # The host tracer is x86_64-specific. Keep this import off the
+        # container path and out of module import so ARM can still exercise
+        # adapters and the in-container supervisor.
+        global TracerLoop
+        if TracerLoop is None:
+            from .agproxy_ptrace_internal._tracer_loop import TracerLoop as _TracerLoop
+
+            TracerLoop = _TracerLoop
 
         def syscall_hook(stop: SeccompStop) -> StopDecision:
             event = agsyscallevent(
@@ -515,7 +538,10 @@ class agProxyPtrace:
                 include_exit_code=True,
             )
         try:
-            loop.start(argv, envp, cwd)
+            if stdin is None:
+                loop.start(argv, envp, cwd)
+            else:
+                loop.start(argv, envp, cwd, stdin=stdin)
         except BaseException:
             if process_profiler is not None:
                 process_profiler.finalize()

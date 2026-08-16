@@ -61,15 +61,22 @@ class _GrokBackend(agharness_backend):
         *,
         skill: "agskill",
         extra_system: "str | None" = None,
+        canonical_input=None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from ... import agharness
         from ..agproxy_llm import get_shared_gateway
-        from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
 
-        sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
+        messages = canonical_input or agharness.build_harness_messages(
+            skill, prev_ctx, skill_input, file_notice=extra_system
+        )
+        sys_msg = {"role": "system", "content": messages.system_instructions}
 
         binary = self.binary_path or self._DEFAULT_BINARY
-        resolved = shutil.which(binary)
+        in_container = agharness.is_container_backed(ag.sandbox)
+        if in_container:
+            resolved = agharness.resolve_harness_binary_in_container(ag.sandbox, binary)
+        else:
+            resolved = shutil.which(binary)
         if resolved is None:
             return agerror(f"grok binary {binary!r} not found on PATH"), prev_ctx, [sys_msg]
 
@@ -81,19 +88,44 @@ class _GrokBackend(agharness_backend):
         gateway.register(token, ag)
         profiler_ingest.register(token, ag)
 
-        config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
+        if in_container:
+            from ..agproxy_llm_in_container import ensure_agproxy_llm_in_container
+
+            base_url = ensure_agproxy_llm_in_container(ag.sandbox, ag.agconfig)
+            config_home = agharness.materialize_config_home_in_container(ag, ag.sandbox, token)
+        else:
+            base_url = gateway.base_url
+            config_home = agharness.materialize_config_home(ag, token, base_url)
         try:
             model = getattr(ag.llm.backend, "model", "") or "default"
-            self._write_grok_config(config_home, gateway.base_url, token, model)
+            self._write_grok_config(
+                config_home, base_url, token, model, sandbox=ag.sandbox if in_container else None
+            )
 
-            prompt = agharness.build_user_turn_prompt(skill, skill_input)
-            if not isinstance(prompt, str):
-                prompt = json.dumps(prompt)
-            extra = agharness.build_output_format_instruction(skill)
-            if extra:
-                prompt = prompt + extra
+            prompt = agharness.render_harness_messages(messages)
+            prompt_path = f"{config_home}/task.txt"
+            if in_container:
+                ag.sandbox.write_file(prompt_path, prompt)
+                import shlex
 
-            argv = [resolved, "-p", prompt, "--output-format", "json"]
+                ag.sandbox.exec(f"chmod 600 {shlex.quote(prompt_path)}", workdir="/")
+            else:
+                from pathlib import Path
+
+                Path(prompt_path).write_text(prompt)
+                Path(prompt_path).chmod(0o600)
+            argv = [
+                resolved,
+                "-p",
+                f"Read the complete task from {prompt_path} and follow it.",
+                "--output-format",
+                "json",
+            ]
+            sessions = getattr(ag, "_harness_sessions", None)
+            prior_session = sessions.get("grok", {}) if isinstance(sessions, dict) else {}
+            resume_session_id = prior_session.get("session_id") or self.session_resume_id
+            if resume_session_id:
+                argv += ["--resume", resume_session_id]
             envp = {
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
                 # GROK_HOME redirects the *entire* config directory (config.toml,
@@ -105,17 +137,20 @@ class _GrokBackend(agharness_backend):
                 "GROK_HOME": str(config_home),
             }
 
-            px = agProxyPtrace(ag.agconfig)
-            policy = agharness.default_policy(ag)
-            handle = px.launch(argv, envp, cwd=str(config_home), policy=policy, ag=ag)
-            if ag.sandbox is not None:
-                wire_to_sandbox(handle, ag.sandbox)
-
-            stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
+            stdout, stderr, rc = agharness.run_harness_cli(
+                ag,
+                argv,
+                envp,
+                timeout_s=self._DEFAULT_TIMEOUT_S,
+                cwd="/workspace" if ag.sandbox is not None else str(config_home),
+            )
         finally:
             gateway.unregister(token)
             profiler_ingest.unregister(token)
-            agharness.cleanup_config_home(config_home)
+            if in_container:
+                agharness.cleanup_config_home_in_container(ag.sandbox, config_home)
+            else:
+                agharness.cleanup_config_home(config_home)
 
         if rc != 0:
             return (
@@ -125,7 +160,7 @@ class _GrokBackend(agharness_backend):
             )
 
         final_text, usage, session_id = self._parse_result_json(stdout)
-        user_msg = {"role": "user", "content": prompt}
+        user_msg = agharness.harness_user_message(messages)
         assistant_msg = {"role": "assistant", "content": final_text}
 
         if skill.output_schema is not None and skill.output_schema.raw_key() is None:
@@ -143,10 +178,14 @@ class _GrokBackend(agharness_backend):
             # recorded so that wiring is a config-read away rather than a
             # new field.
             self.session_resume_id = session_id
-        prev_ctx.messages = [user_msg, assistant_msg]
+            if isinstance(getattr(ag, "_harness_sessions", None), dict):
+                ag._harness_sessions["grok"] = {"session_id": session_id}
+        prev_ctx.messages = [*messages.previous_context, user_msg, assistant_msg]
         return result, prev_ctx, [sys_msg, user_msg, assistant_msg]
 
-    def _write_grok_config(self, config_home, base_url: str, token: str, model: str) -> None:
+    def _write_grok_config(
+        self, config_home, base_url: str, token: str, model: str, *, sandbox=None
+    ) -> None:
         # config.toml, per docs.x.ai/build's configuration guide: a
         # [model.<name>] block with base_url/api_key/api_backend, and a
         # top-level `model` key selecting the active one -- api_backend =
@@ -161,7 +200,11 @@ class _GrokBackend(agharness_backend):
             f"api_key = {_toml_string(token)}\n"
             f'api_backend = "chat_completions"\n'
         )
-        (config_home / "config.toml").write_text(config_toml)
+        path = f"{config_home}/config.toml"
+        if sandbox is not None:
+            sandbox.write_file(path, config_toml)
+        else:
+            (config_home / "config.toml").write_text(config_toml)
 
     @staticmethod
     def _parse_result_json(stdout: str) -> "tuple[str, dict, str | None]":

@@ -378,6 +378,7 @@ class _NativeBackend(agharness_backend):
         *,
         skill: "agskill",
         extra_system: "str | None" = None,
+        canonical_input=None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         # Same precedence the deleted `_build_toolkit()` used: replace_tools
         # (including plan_mode's `replace_tools=[]`) replaces the whole tool

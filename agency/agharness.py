@@ -1,22 +1,18 @@
 """Thin, engine-agnostic glue shared by every `agharness_backends/*`
 concrete backend.
 
-Deliberately small -- per-harness config-file format and CLI argv
-construction stay in each concrete backend, not here. This module only
-holds what's genuinely shared: an isolated per-launch config-home
-directory (so concurrent harness-driven agents never see each other's
-token/base_url, and a run leaves no trace in the user's own `~/.claude`/
-`~/.codex`/`~/.config/opencode`), and prompt construction that reuses
-agskill's own existing code rather than re-implementing it -- the skill's
-task is delivered to the harness as a plain user-turn prompt, never
-injected as the harness's own system prompt or as a tool (see
-docs/Design_harness_integration.md).
+Concrete backends retain only config-file, argv, and output parsing details.
+This module owns the engine-neutral input envelope, isolated config homes,
+and the common supervised CLI lifecycle.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +20,133 @@ if TYPE_CHECKING:
     from .agent import agent
     from .agdata import agdata
     from .agskill import agskill
+    from .agcontext import agcontext
+
+
+@dataclass(frozen=True)
+class HarnessMessages:
+    """Engine-neutral input for one external harness invocation."""
+
+    system_instructions: str
+    previous_context: tuple[dict, ...]
+    current_user_input: str
+    file_notices: tuple[str, ...] = ()
+    attachments: tuple[dict, ...] = ()
+    output_guidance: "str | None" = None
+
+
+def build_harness_messages(
+    skill: "agskill",
+    previous_context: "agcontext",
+    skill_input: "agdata",
+    *,
+    file_notice: "str | None" = None,
+) -> HarnessMessages:
+    """Build the complete Agency task before any engine is selected.
+
+    Multimodal blocks stay typed in ``attachments`` instead of being flattened
+    into adapter-specific prompt syntax.  The adapters only choose how this
+    canonical value is transported to their CLI.
+    """
+    content = skill._build_user_content(skill_input)
+    attachments: list[dict] = []
+
+    # Seperate text instructions from multi modal attachment
+    if isinstance(content, str):
+        user_input = content
+    else:
+        text_parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(str(block.get("text", "")))
+            elif isinstance(block, dict):
+                attachments.append(block)
+        user_input = "\n".join(part for part in text_parts if part)
+
+    return HarnessMessages(
+        system_instructions=skill._build_system_prompt(include_output_guidance=False),
+        previous_context=tuple(previous_context.messages),
+        current_user_input=user_input,
+        file_notices=(file_notice.strip(),) if file_notice and file_notice.strip() else (),
+        attachments=tuple(attachments),
+        output_guidance=build_output_format_instruction(skill),
+    )
+
+
+def render_harness_messages(
+    messages: HarnessMessages, *, output_guidance: "str | None" = None
+) -> str:
+    """Render the canonical task as the CLI-independent full-task envelope."""
+    sections = [("SYSTEM INSTRUCTIONS", messages.system_instructions)]
+    if messages.previous_context:
+        sections.append(
+            (
+                "PREVIOUS CONTEXT",
+                json.dumps(list(messages.previous_context), ensure_ascii=False, default=str),
+            )
+        )
+    sections.append(("CURRENT USER INPUT", messages.current_user_input))
+    if messages.file_notices:
+        sections.append(("FILE NOTICES", "\n".join(messages.file_notices)))
+    if messages.attachments:
+        sections.append(
+            (
+                "ATTACHMENTS",
+                json.dumps(list(messages.attachments), ensure_ascii=False, default=str),
+            )
+        )
+    guidance = messages.output_guidance if output_guidance is None else output_guidance
+    if guidance:
+        sections.append(("OUTPUT GUIDANCE", guidance.strip()))
+    return "\n\n".join(f"[{title}]\n{body}" for title, body in sections)
+
+
+def harness_user_message(messages: HarnessMessages) -> dict:
+    """Return the canonical current turn in Agency's context format."""
+    content: "str | list[dict]" = messages.current_user_input
+    if messages.attachments:
+        content = [
+            {"type": "text", "text": messages.current_user_input},
+            *messages.attachments,
+        ]
+    return {"role": "user", "content": content}
+
+
+def run_harness_cli(
+    ag: "agent",
+    argv: list[str],
+    envp: dict[str, str],
+    *,
+    stdin: "str | bytes | None" = None,
+    timeout_s: float = 600,
+    cwd: str = "/workspace",
+    sandbox=None,
+) -> "tuple[str, str, int]":
+    """Launch, feed, supervise, and reap one external harness process."""
+    from .agharness_internal.agproxy_ptrace import agProxyPtrace, wire_to_sandbox
+
+    target_sandbox = ag.sandbox if sandbox is None else sandbox
+    handle = agProxyPtrace(ag.agconfig).launch(
+        argv,
+        envp,
+        cwd=cwd,
+        policy=default_policy(ag),
+        ag=ag,
+        sandbox=target_sandbox,
+        stdin=stdin,
+    )
+    if target_sandbox is not None:
+        wire_to_sandbox(handle, target_sandbox)
+
+    stdout, stderr, rc = handle.wait(timeout=timeout_s)
+    if rc != -1:
+        return stdout, stderr, rc
+
+    # ``wait`` uses -1 exclusively for deadline expiry. Own termination and
+    # reap here so no adapter can accidentally leave a process tree behind.
+    handle.kill()
+    final_stdout, final_stderr, _killed_rc = handle.wait()
+    return final_stdout or stdout, final_stderr or stderr, -1
 
 
 def materialize_config_home(ag: "agent", token: str, base_url: str) -> Path:
@@ -49,6 +172,23 @@ def is_container_backed(sandbox) -> bool:
     return sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"
 
 
+def resolve_harness_binary_in_container(sandbox, binary: str) -> "str | None":
+    """Resolve a target-compatible CLI without copying a host binary.
+
+    The image PATH wins, followed by the read-only harness binary cache mount.
+    Avoiding an automatic host copy is essential when host and sandbox ABIs
+    differ (for example an ARM macOS host and an x86_64 Linux container).
+    """
+    import shlex
+
+    out, rc = sandbox.exec(f"which {shlex.quote(binary)}", workdir="/")
+    if rc == 0 and out.strip():
+        return out.strip()
+    cached_path = f"/opt/agency_harness_bin/{binary}"
+    out, rc = sandbox.exec(f"test -x {shlex.quote(cached_path)}", workdir="/")
+    return cached_path if rc == 0 else None
+
+
 def materialize_config_home_in_container(ag: "agent", sandbox, token: str) -> str:
     """In-container counterpart to `materialize_config_home` -- creates a
     fresh, isolated directory INSIDE *sandbox*'s own container filesystem
@@ -61,8 +201,10 @@ def materialize_config_home_in_container(ag: "agent", sandbox, token: str) -> st
     `materialize_config_home`/`cleanup_config_home`'s own pairing."""
     import shlex
 
-    path = f"/tmp/agharness-{ag.agname}-{token}"
-    sandbox.exec(f"mkdir -p {shlex.quote(path)}", workdir="/")
+    # The gateway bearer token must never appear in a filesystem path (Grok
+    # references its private task file by path in argv).
+    path = f"/tmp/agharness-{ag.agname}-{uuid.uuid4().hex}"
+    sandbox.exec(f"mkdir -m 700 -p {shlex.quote(path)}", workdir="/")
     return path
 
 
@@ -70,14 +212,6 @@ def cleanup_config_home_in_container(sandbox, path: str) -> None:
     import shlex
 
     sandbox.exec(f"rm -rf {shlex.quote(path)}", workdir="/")
-
-
-def build_user_turn_prompt(skill: "agskill", skill_input: "agdata") -> "str | list":
-    """The skill's task, delivered as a plain user-turn prompt -- reuses
-    agskill's own prompt-construction code so a harness sees exactly the
-    same JSON-input convention the native ReAct loop's first user message
-    uses."""
-    return skill._build_user_content(skill_input)
 
 
 def build_output_format_instruction(skill: "agskill") -> "str | None":
@@ -172,9 +306,14 @@ __all__ = [
     "materialize_config_home",
     "cleanup_config_home",
     "is_container_backed",
+    "resolve_harness_binary_in_container",
     "materialize_config_home_in_container",
     "cleanup_config_home_in_container",
-    "build_user_turn_prompt",
+    "HarnessMessages",
+    "build_harness_messages",
+    "render_harness_messages",
+    "harness_user_message",
+    "run_harness_cli",
     "build_output_format_instruction",
     "build_mcp_output_format_instruction",
     "default_policy",

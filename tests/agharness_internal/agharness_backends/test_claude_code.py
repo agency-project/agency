@@ -120,10 +120,12 @@ def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
     handle = _make_handle(stdout='{"result": "ok"}')
     captured_envp = {}
     captured_argv = []
+    captured_stdin = []
 
-    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None, stdin=None):
         captured_argv.extend(argv)
         captured_envp.update(envp)
+        captured_stdin.append(stdin)
         return handle
 
     with (
@@ -140,6 +142,8 @@ def test_execute_does_not_override_home(monkeypatch, _patch_which_finds_claude):
     # LLM traffic is routed through the gateway, not the host's own creds.
     assert captured_envp.get("ANTHROPIC_BASE_URL") == mock_gateway.base_url
     assert "ANTHROPIC_API_KEY" not in captured_envp
+    assert captured_stdin and "[SYSTEM INSTRUCTIONS]\ndo the thing" in captured_stdin[0]
+    assert all("New Skill Input" not in arg for arg in captured_argv)
     settings = json.loads(captured_argv[captured_argv.index("--settings") + 1])
     assert set(settings["hooks"]) == {"PreToolUse"}
     assert "AGPROF_BASE_URL" not in captured_envp
@@ -154,7 +158,7 @@ def test_execute_enables_exact_claude_hooks_only_while_profiling(
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None, stdin=None):
         captured["argv"] = argv
         captured["envp"] = envp
         return handle
@@ -310,8 +314,11 @@ def test_execute_retries_and_recovers_when_submit_output_arrives_on_retry(
     ]
     captured_argvs = []
 
-    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+    captured_stdins = []
+
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None, stdin=None):
         captured_argvs.append(argv)
+        captured_stdins.append(stdin)
         return handle1 if len(captured_argvs) == 1 else handle2
 
     with (
@@ -336,7 +343,7 @@ def test_execute_retries_and_recovers_when_submit_output_arrives_on_retry(
     # not the original task prompt again.
     assert "--resume" in captured_argvs[1]
     assert captured_argvs[1][captured_argvs[1].index("--resume") + 1] == "sess-abc"
-    assert "still missing" in captured_argvs[1][-1].lower()
+    assert "still missing" in captured_stdins[1].lower()
 
 
 def test_execute_uses_terminus_transcript_for_history_when_available(_patch_which_finds_claude):

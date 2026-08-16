@@ -88,6 +88,11 @@ def test_execute_launches_via_agproxy_ptrace_and_returns_raw_text():
     assert result.result == "the final answer"
     assert ctx is prev_ctx  # SAME object, mutated in place -- not a new one
     assert len(delta) == 3  # [system, user, assistant]
+    launch = mock_px_cls.return_value.launch.call_args
+    assert launch.kwargs["cwd"] == "/workspace"
+    assert "[SYSTEM INSTRUCTIONS]\ndo the thing" in launch.kwargs["stdin"]
+    assert "go" in launch.kwargs["stdin"]
+    assert all("go" not in arg for arg in launch.args[0])
     mock_wire.assert_called_once_with(handle, ag.sandbox)
     mock_gateway.register.assert_called_once()
     mock_gateway.unregister.assert_called_once()

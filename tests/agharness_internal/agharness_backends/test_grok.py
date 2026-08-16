@@ -112,7 +112,7 @@ def test_execute_uses_grok_home_for_config_isolation():
     handle = _make_handle(stdout='{"text": "ok"}')
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None, stdin=None):
         captured["argv"] = argv
         captured["envp"] = envp
         captured["cwd"] = cwd
@@ -130,9 +130,10 @@ def test_execute_uses_grok_home_for_config_isolation():
         backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
 
     assert "GROK_HOME" in captured["envp"]
-    assert captured["envp"]["GROK_HOME"] == captured["cwd"]
+    assert captured["cwd"] == "/workspace"
     assert captured["argv"][0] == "/usr/bin/grok"
     assert "-p" in captured["argv"]
+    assert "task.txt" in captured["argv"][captured["argv"].index("-p") + 1]
     assert "--output-format" in captured["argv"] and "json" in captured["argv"]
 
 
@@ -144,11 +145,11 @@ def test_execute_writes_chat_completions_config_toml():
     handle = _make_handle(stdout='{"text": "ok"}')
     written_config = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None, stdin=None):
         written_config["toml"] = (cwd, envp)
         from pathlib import Path
 
-        written_config["content"] = (Path(cwd) / "config.toml").read_text()
+        written_config["content"] = (Path(envp["GROK_HOME"]) / "config.toml").read_text()
         return handle
 
     with (

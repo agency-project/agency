@@ -38,53 +38,11 @@ def claude_code_available() -> bool:
     return shutil.which("claude") is not None
 
 
-_BIN_CACHE_MOUNT = "/opt/agency_harness_bin"
-
-
-def _resolve_binary_in_container(sandbox, binary: str) -> "str | None":
-    """Find *binary* for a container-backed launch, in order: (1) already
-    on the container image's own PATH -- e.g. a purpose-built image that
-    bakes it in; (2) the host-side binary cache every container-backed
-    sandbox has bind-mounted read-only at `_BIN_CACHE_MOUNT` (see
-    `agutil.agharness_binary_cache_dir`); (3) seed that cache, on the HOST,
-    from the host's own `shutil.which(binary)` -- never fetched over the
-    network by Agency itself, so this never depends on knowing an install
-    URL, and never requires the container to have network egress. Returns
-    None only if none of the three has it."""
-    import shlex
-
-    out, rc = sandbox.exec(f"which {shlex.quote(binary)}", workdir="/")
-    if rc == 0 and out.strip():
-        return out.strip()
-
-    cached_path = f"{_BIN_CACHE_MOUNT}/{binary}"
-    out, rc = sandbox.exec(f"test -x {shlex.quote(cached_path)}", workdir="/")
-    if rc == 0:
-        return cached_path
-
-    from ...agutil import agharness_binary_cache_dir
-
-    cache_file = agharness_binary_cache_dir() / binary
-    if not cache_file.exists():
-        host_path = shutil.which(binary)
-        if host_path is None:
-            return None
-        shutil.copy2(host_path, cache_file)
-        cache_file.chmod(0o755)
-
-    # The bind mount is a live view of the host directory, so the file
-    # just written is already visible inside the container -- re-check
-    # rather than assume, since the copy above could still race a
-    # concurrent launch for a different agent seeding the same cache.
-    out, rc = sandbox.exec(f"test -x {shlex.quote(cached_path)}", workdir="/")
-    return cached_path if rc == 0 else None
-
-
 # -- Native session continuity (see docs/Design_harness_history.md) ---------
 #
 # Claude Code's own conversation transcript, stored as
 # `<config_home>/projects/<slug>/<session_id>.jsonl` where <slug> is the
-# launch's cwd (== config_home, same value passed to px.launch(cwd=...))
+# launch's working directory (`/workspace` for a persisted sandbox)
 # with every non-alphanumeric character replaced by '-'. Confirmed
 # empirically against the real CLI (v2.1.220): copying that file into a
 # fresh directory and resuming with --resume <session_id> from there
@@ -104,8 +62,8 @@ def _session_slug(cwd: str) -> str:
     return _SESSION_SLUG_RE.sub("-", str(cwd))
 
 
-def _session_path(config_home: str, session_id: str) -> str:
-    return f"{config_home}/projects/{_session_slug(config_home)}/{session_id}.jsonl"
+def _session_path(config_home: str, session_id: str, cwd: str = "/workspace") -> str:
+    return f"{config_home}/projects/{_session_slug(cwd)}/{session_id}.jsonl"
 
 
 def _read_session_blob(sandbox, in_container: bool, path: str) -> "bytes | None":
@@ -138,12 +96,15 @@ class _ClaudeCodeBackend(agharness_backend):
         *,
         skill: "agskill",
         extra_system: "str | None" = None,
+        canonical_input=None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
 
         from ... import agharness
-        from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
 
-        sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
+        messages = canonical_input or agharness.build_harness_messages(
+            skill, prev_ctx, skill_input, file_notice=extra_system
+        )
+        sys_msg = {"role": "system", "content": messages.system_instructions}
 
         binary = self.binary_path or self._DEFAULT_BINARY
         # See docs/Design_harness_integration.md's Prerequisites: a
@@ -155,7 +116,7 @@ class _ClaudeCodeBackend(agharness_backend):
         in_container = agharness.is_container_backed(ag.sandbox)
 
         if in_container:
-            resolved = _resolve_binary_in_container(ag.sandbox, binary)
+            resolved = agharness.resolve_harness_binary_in_container(ag.sandbox, binary)
         else:
             resolved = shutil.which(binary)
         if resolved is None:
@@ -257,12 +218,10 @@ class _ClaudeCodeBackend(agharness_backend):
         )
         output_schema_retries_left = skill.max_output_schema_retries
 
-        first_prompt = agharness.build_user_turn_prompt(skill, skill_input)
-        if not isinstance(first_prompt, str):
-            first_prompt = json.dumps(first_prompt)
-        extra = agharness.build_mcp_output_format_instruction(skill)
-        if extra:
-            first_prompt = first_prompt + extra
+        first_prompt = agharness.render_harness_messages(
+            messages,
+            output_guidance=agharness.build_mcp_output_format_instruction(skill),
+        )
 
         total_input_tokens = 0
         total_output_tokens = 0
@@ -434,9 +393,6 @@ class _ClaudeCodeBackend(agharness_backend):
                 if "HOME" in os.environ:
                     envp["HOME"] = os.environ["HOME"]
 
-            px = agProxyPtrace(ag.agconfig)
-            policy = agharness.default_policy(ag)
-
             # Bounded relaunch on incomplete structured output (Phase 6's
             # "Outer" layer, docs/Design_harness_integration.md): each
             # attempt is a fresh `claude -p` process (one-shot by design),
@@ -463,20 +419,18 @@ class _ClaudeCodeBackend(agharness_backend):
                 ]
                 if resume_session_id:
                     argv += ["--resume", resume_session_id]
-                argv.append(prompt)
+                argv.append(
+                    "Read the complete Agency task from standard input and follow it exactly."
+                )
 
-                handle = px.launch(
+                stdout, stderr, rc = agharness.run_harness_cli(
+                    ag,
                     argv,
                     envp,
-                    cwd=str(config_home),
-                    policy=policy,
-                    ag=ag,
-                    sandbox=ag.sandbox if in_container else None,
+                    stdin=prompt,
+                    timeout_s=self._DEFAULT_TIMEOUT_S,
+                    cwd="/workspace" if ag.sandbox is not None else str(config_home),
                 )
-                if ag.sandbox is not None:
-                    wire_to_sandbox(handle, ag.sandbox)
-
-                stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
                 _dbg = os.environ.get("AGENCY_DEBUG_RAW_STDOUT_DUMP")
                 if _dbg:
                     with open(_dbg, "a") as _f:
@@ -603,9 +557,9 @@ class _ClaudeCodeBackend(agharness_backend):
             # mocked test double, or a real launch that failed before any
             # LLM call happened) -- fall back to the coarse shape rather
             # than silently returning an empty history.
-            user_msg = {"role": "user", "content": first_prompt}
+            user_msg = agharness.harness_user_message(messages)
             assistant_msg = {"role": "assistant", "content": final_text}
-            prev_ctx.messages = [user_msg, assistant_msg]
+            prev_ctx.messages = [*messages.previous_context, user_msg, assistant_msg]
             delta = [sys_msg, user_msg, assistant_msg]
         return result, prev_ctx, delta
 

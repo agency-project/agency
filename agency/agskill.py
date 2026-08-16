@@ -93,7 +93,9 @@ class agskill:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self, extra: str | None = None) -> str:
+    def _build_system_prompt(
+        self, extra: str | None = None, *, include_output_guidance: bool = True
+    ) -> str:
         parts = [self.system_prompt]
 
         # Each agtype subclass (agfile, agbinary, …) can inject extra prompt
@@ -129,7 +131,7 @@ class agskill:
         if self.input_schema is not None and self.input_schema.raw_key() is None:
             parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}")
 
-        if self.output_schema is not None:
+        if include_output_guidance and self.output_schema is not None:
             if self.output_schema.raw_key() is not None:
                 # agrawstring output — model must reply with plain text, not a tool call.
                 parts.append(
@@ -540,11 +542,11 @@ class agskill:
         this method does not need to resolve futures itself.
 
         See docs/Design_harness_integration.md for the design this
-        implements: the skill's system prompt + input become a plain
-        user-turn prompt (never injected as the harness's own system
-        prompt or a tool), and the harness's own built-in tools/compaction
-        run untouched -- mediation happens at the syscall level via
-        agproxy_ptrace, not through this method.
+        implements: system instructions, resolved history, current input,
+        file notices, attachments, and output guidance become one canonical
+        task before the selected adapter translates it. The harness's own
+        built-in tools/compaction run untouched; mediation happens at the
+        syscall level via agproxy_ptrace.
 
         Also where every engine gets agtype/oversized-input offloading and
         agtype-output recovery -- the same `agschema.prepare_inputs_in_
@@ -594,10 +596,24 @@ class agskill:
                 f"automatically deleted after this task ends."
             )
 
+        from . import agharness
+
+        canonical_input = agharness.build_harness_messages(
+            self,
+            prev_ctx,
+            skill_input,
+            file_notice=extra_system,
+        )
         backend = agharness_backend.for_config(ag.engine, ag.agconfig)
         try:
             result, updated_ctx, delta = backend.execute(
-                ag, prev_ctx, skill_input, max_steps, skill=self, extra_system=extra_system
+                ag,
+                prev_ctx,
+                skill_input,
+                max_steps,
+                skill=self,
+                extra_system=extra_system,
+                canonical_input=canonical_input,
             )
         finally:
             ag.sandbox.remove_files(_offloaded_paths)

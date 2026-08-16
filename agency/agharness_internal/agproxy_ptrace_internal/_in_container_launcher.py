@@ -167,7 +167,12 @@ class InContainerRelay:
     # -- lifecycle -----------------------------------------------------------
 
     def start(
-        self, argv: "list[str]", envp: "dict[str, str]", cwd: str, syscalls: "list[str]"
+        self,
+        argv: "list[str]",
+        envp: "dict[str, str]",
+        cwd: str,
+        syscalls: "list[str]",
+        stdin: "str | bytes | None" = None,
     ) -> None:
         entrypoint_path = deploy_entrypoint(self._sandbox)
         runtime, container_name = self._runtime_and_container_name()
@@ -211,7 +216,15 @@ class InContainerRelay:
         self._conn = conn
         self._conn_file = conn.makefile("rw")
 
-        spec = {"argv": argv, "envp": envp, "cwd": cwd, "syscalls": list(syscalls)}
+        if isinstance(stdin, bytes):
+            stdin = stdin.decode(errors="replace")
+        spec = {
+            "argv": argv,
+            "envp": envp,
+            "cwd": cwd,
+            "syscalls": list(syscalls),
+            "stdin": stdin,
+        }
         with self._send_lock:
             self._conn_file.write(json.dumps(spec) + "\n")
             self._conn_file.flush()

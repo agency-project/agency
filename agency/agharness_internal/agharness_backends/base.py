@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from ...agconfig import DynamicConfigParam, _AgConfigViewBase
 
 if TYPE_CHECKING:
+    from ...agharness import HarnessMessages
     from ...agconfig import agConfig
     from ...agent import agent
     from ...agcontext import agcontext
@@ -93,6 +94,7 @@ class agharness_backend(AgHarnessFields):
         *,
         skill: "agskill",
         extra_system: "str | None" = None,
+        canonical_input: "HarnessMessages | None" = None,
     ) -> "tuple[agdata, agcontext, list[dict]]":
         """Same return contract as `agskill.execute_react()`/
         `execute_harness()`: `ctx` is the SAME `prev_ctx` object, mutated in
@@ -100,13 +102,10 @@ class agharness_backend(AgHarnessFields):
         `delta` is `[system_prompt_message] + every message appended since
         this call started`. Concrete backends implement this.
 
-        `extra_system`, if given, is appended to the skill's own system
-        prompt (`skill._build_system_prompt(extra_system)`) -- currently
-        used for the "these input fields were auto-offloaded to sandbox
-        files" notice `execute_harness()` computes via `agschema.
-        prepare_inputs_in_sandbox()` before calling this, uniformly for
-        every engine (shared with native's own `execute_react()`, which
-        computes and injects the equivalent notice itself in-process)."""
+        `canonical_input` is built once by `execute_harness()` and contains
+        system instructions, prior context, current input, file notices,
+        attachments, and output guidance. `extra_system` remains only as a
+        compatibility input for direct backend calls and the native backend."""
         raise NotImplementedError
 
     @staticmethod

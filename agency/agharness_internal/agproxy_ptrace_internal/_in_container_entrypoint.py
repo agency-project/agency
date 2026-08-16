@@ -60,7 +60,8 @@ Protocol (newline-delimited JSON, one object per line, over the UDS
 connection):
 
   host -> entrypoint:
-    first line:  {"argv": [...], "envp": {...}, "cwd": "...", "syscalls": [...]}
+    first line:  {"argv": [...], "envp": {...}, "cwd": "...", "syscalls": [...],
+                  "stdin": "..." | null}
     thereafter:  {"type": "decision", "kind": "allow"|"deny"|"rewrite",
                   "new_args": [...] | null}
                  -- exactly one decision line per "event" line this process
@@ -453,17 +454,36 @@ class _Tracer:
         self._stderr_buf = bytearray()
         self._buf_lock = threading.Lock()
 
-    def run(self, argv: "list[str]", envp: "dict[str, str]", cwd: str) -> None:
+    def run(
+        self,
+        argv: "list[str]",
+        envp: "dict[str, str]",
+        cwd: str,
+        stdin: "str | None" = None,
+    ) -> None:
         stdout_r, stdout_w = os.pipe()
         stderr_r, stderr_w = os.pipe()
+        stdin_r, stdin_w = os.pipe() if stdin is not None else (None, None)
 
         pid = os.fork()
         if pid == 0:
-            self._child_exec(argv, envp, cwd, stdout_r, stdout_w, stderr_r, stderr_w)
+            self._child_exec(
+                argv,
+                envp,
+                cwd,
+                stdin_r,
+                stdin_w,
+                stdout_r,
+                stdout_w,
+                stderr_r,
+                stderr_w,
+            )
             os._exit(127)  # unreachable
 
         os.close(stdout_w)
         os.close(stderr_w)
+        if stdin_r is not None:
+            os.close(stdin_r)
         self.root_pid = pid
         self._remember_spawn(pid)
 
@@ -480,25 +500,56 @@ class _Tracer:
         self._options_applied.add(pid)
         ptrace(PTRACE_CONT, pid, 0, 0)
 
+        if stdin_w is not None:
+            threading.Thread(
+                target=self._write_stdin,
+                args=(stdin_w, stdin.encode()),
+                daemon=True,
+            ).start()
+
         self._wait_loop()
 
-    def _child_exec(self, argv, envp, cwd, stdout_r, stdout_w, stderr_r, stderr_w) -> None:
+    @staticmethod
+    def _write_stdin(fd: int, payload: bytes) -> None:
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _child_exec(
+        self,
+        argv,
+        envp,
+        cwd,
+        stdin_r,
+        stdin_w,
+        stdout_r,
+        stdout_w,
+        stderr_r,
+        stderr_w,
+    ) -> None:
         os.close(stdout_r)
         os.close(stderr_r)
         os.dup2(stdout_w, 1)
         os.dup2(stderr_w, 2)
         os.close(stdout_w)
         os.close(stderr_w)
-        # The traced target always receives its prompt via argv, never
-        # stdin -- but without this, it inherits this entrypoint's own fd 0,
-        # which is `docker exec -i`'s pipe (no longer used for anything
-        # since the switch to the UDS control channel, but still open and
-        # unfed). Newer Claude Code CLI builds detect that non-tty stdin
-        # and stall for a few seconds waiting for data that will never
-        # arrive before giving up (confirmed against the real CLI).
-        devnull_fd = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(devnull_fd, 0)
-        os.close(devnull_fd)
+        if stdin_r is None:
+            devnull_fd = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(devnull_fd, 0)
+            os.close(devnull_fd)
+        else:
+            os.close(stdin_w)
+            os.dup2(stdin_r, 0)
+            os.close(stdin_r)
         if cwd:
             os.chdir(cwd)
         ptrace(PTRACE_TRACEME, 0, 0, 0)
@@ -747,7 +798,12 @@ def main() -> None:
 
     tracer = _Tracer(syscalls=spec.get("syscalls") or ["execve", "execveat"])
     try:
-        tracer.run(spec["argv"], spec.get("envp") or {}, spec.get("cwd") or "")
+        tracer.run(
+            spec["argv"],
+            spec.get("envp") or {},
+            spec.get("cwd") or "",
+            stdin=spec.get("stdin"),
+        )
     except BaseException as exc:  # noqa: BLE001 -- always report, never crash silently
         _send({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         return
