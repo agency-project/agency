@@ -1,14 +1,10 @@
 # Harness History & Continuity Design
 
-> **Status:** proposed, not yet implemented. Extends
-> [Design_harness_integration.md](Design_harness_integration.md) — read that first. This document
-> covers a gap the shipped design doesn't address at all: a harness-driven agent has no continuity
-> across separate invocations today. Every call to a harness backend (`claude_code.py`, `codex.py`,
-> ...) launches the harness binary as a fresh, one-shot process; whatever happened inside is
-> collapsed to exactly `prev_ctx.messages = [user_msg, assistant_msg]` (`claude_code.py:155`) before
-> being handed back. There is no session id, no `--resume`, no cross-call memory of any kind in the
-> shipped code — this document designs that in, and rejects one plausible-looking approach along
-> the way for a concrete, empirically demonstrated reason.
+> **Status:** implemented for Claude Code and Codex. Each invocation is still a fresh OS process,
+> but compatible native session state is extracted to the agent and restored before the next call.
+> Native state is an optimization: portable `agcontext.messages` remains the engine-neutral source
+> of truth and the fallback when native resume is missing, stale, incompatible, or rejected. This
+> document explains that design and the rejected request-splicing alternative.
 
 ## Constraint this design must satisfy
 
@@ -78,13 +74,10 @@ fighting the wire format instead of using it. See the adopted approach below ins
 
 ## Adopted: treat the harness's own native session storage as a portable blob
 
-Every harness already has its own internal multi-turn continuation mechanism (`--resume` for Claude
-Code, and presumably an equivalent for Codex/opencode/Grok — not yet verified, see "Scope" below).
-Rather than reconstructing continuity ourselves, extract that mechanism's on-disk state out to the
-*agent's* own portable checkpoint after each call, and re-inject it before the next one — regardless
-of which sandbox instance handles that next call. This reuses machinery the harness has already
-built and tested, at the cost of it being harness-specific rather than uniform across engines (the
-opposite tradeoff from Components 1–3, which are deliberately harness-agnostic).
+Where a harness exposes a verified continuation mechanism, extract its native on-disk state to the
+*agent's* portable checkpoint after each call and re-inject it before the next one — regardless of
+which sandbox instance handles that call. The blob format and resume command remain backend-local,
+unlike the engine-neutral task/result/process abstractions.
 
 ### What was verified against the real `claude` CLI (v2.1.220 installed, not assumed)
 
@@ -108,38 +101,43 @@ opposite tradeoff from Components 1–3, which are deliberately harness-agnostic
   directory with *no* copied session file failed immediately and cleanly: `No conversation found
   with session ID: b82d7947-6b6c-484c-b85a-f3772ee9722e` — not a silent fallback to something wrong.
 
-### Concrete mechanism
+### Concrete mechanism (Claude Code)
 
-1. `claude_code.py`'s `envp` gains `"CLAUDE_CONFIG_DIR": str(config_home)` — `config_home` is
+1. `claude_code.py` sets `"CLAUDE_CONFIG_DIR": str(config_home)` — `config_home` is
    already the isolated, disposable per-launch directory `materialize_config_home` creates
    (`agharness.py:29-35`) and already cleaned up unconditionally after every launch
    (`cleanup_config_home`, `agharness.py:38-39`), so this adds no new lifecycle to manage.
 2. Before launch, if the agent's own saved state carries a session blob + session id from a prior
    call in this lineage, write the blob to `config_home/projects/<slug(cwd)>/<session_id>.jsonl` and
    add `--resume <session_id>` to `argv`.
-3. After the run, in the existing `finally` block, read that same path back out (the run may have
-   appended to it) and store the bytes plus the session id as part of the agent's own portable
-   state — a new field in `agent.save()`/`load()`'s `state.json` (`agent.py:691-841`) alongside
-   `history`/`sandbox_image_kind`, not inside `container.tar`. This is what makes it portable: the
-   blob travels with the agent's checkpoint, not with any particular sandbox's committed image.
+3. After the run, read that path back out (the run may have appended to it) and store the bytes plus
+   session metadata in `ag._harness_sessions`. `agent.save()` serializes that map alongside history,
+   not inside `container.tar`, and `fork()` deep-copies it.
 4. `cleanup_config_home` runs exactly as it does today — full removal, zero host trace, so the
    "leaves no trace in the user's own `~/.claude`" isolation goal (`agharness.py:6-9`) is unaffected.
+
+### Codex rollout mechanism (verified with CLI 0.147.0)
+
+Codex writes timestamped rollout JSONL below isolated `CODEX_HOME/sessions/`. Agency captures the
+matching rollout after a completed turn and stores its bytes, relative path, thread id, context
+revision, and version evidence in `ag._harness_sessions["codex"]`; fork and checkpoint operations
+carry that record independently of the sandbox image.
+
+Restore requires a canonical UUID, safe `sessions/.../*.jsonl` path, valid base64 and `session_meta`,
+matching workspace/context revision, and the exact detected Codex/rollout version. Passing those
+guards selects `codex exec resume <thread-id>` and avoids duplicating portable history. A failed
+guard starts a fresh native thread with portable history. If Codex itself reports a recognized
+resume-state failure, Agency retries that way once; unrelated failures are not retried. The live
+container E2E verified capture, resume in a fresh container, and stale-version fallback.
 
 ### Interaction with running the harness inside the container
 
 The project decided to run the harness process inside the sandbox container rather than keeping it
 on the host behind a FUSE view (see [Design_harness_filesystem.md](Design_harness_filesystem.md),
 now superseded, and [Design_harness_integration.md](Design_harness_integration.md)'s "Prerequisites"
-for the adopted in-container supervisor bridge). That changes where `config_home` itself has to
-live: `materialize_config_home` (`agharness.py:29-35`) creates a host-side `tempfile.mkdtemp()`
-today, which the harness can no longer see once it's launched inside the container's own filesystem
-namespace via the `docker exec`-based entrypoint. For a docker/podman-backed launch, config-home
-materialization needs to create its directory *inside* the container instead — via the sandbox's
-existing `exec()`/file-write primitives (`agsandbox.py:274`, `write_file`/`write_file_bytes`,
-`agsandbox.py:283-286`), not a host `mkdtemp()`. `CLAUDE_CONFIG_DIR` then points at that in-container
-path, and `cwd` for the launched process is whatever real in-container directory the entrypoint
-uses (no FUSE mount, no virtual root — it's simply a real path in the container's own filesystem,
-the same way native tool execution already sees it via `_container_exec`).
+for the adopted in-container supervisor bridge). A host `mkdtemp()` is invisible there, so
+`materialize_config_home_in_container()` creates the config home inside docker/podman and each
+backend points `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or its equivalent at that path.
 
 This is a net simplification for the history mechanism specifically: reading the session blob back
 out after a run and writing it back in before the next one now goes through `agsandbox`'s existing
@@ -164,21 +162,18 @@ and shouldn't be attempted — when:
   workspace) where the old session's tool-call results reference files/state that no longer match —
   resuming natively there risks feeding the model stale, misleading context rather than helping it.
 
-For these cases, fall back to what already exists: build the new call's prompt by recapping the
-relevant prior `agcontext.messages` as text, through the same `build_user_turn_prompt`/
-`_build_user_content` path that already constructs every call's prompt (`agharness.py:42-47`). This
+For these cases, fall back to what already exists: `build_harness_messages()` carries the relevant
+prior `agcontext.messages`, and the selected backend renders them into the fresh task. This
 is lossier (no step-by-step tool-call fidelity, no native prompt-cache reuse) but always available
 and never depends on sandbox or environment compatibility — the correct degraded mode for a
 boundary the native mechanism structurally can't cross.
 
-## Scope: verified for Claude Code only
+## Verification scope
 
-Everything empirical in this document was checked against the real `claude` CLI. Codex, opencode,
-and Grok Build each need the same kind of direct verification against their own binaries — session
-storage location, on-disk format, and `--resume`-equivalent semantics may all differ, and shouldn't
-be assumed to generalize from this one case. Treat the native-session-blob mechanism as a per-engine
-capability, added one backend at a time as each is actually checked, with the `agcontext` recap
-fallback covering any engine that hasn't been verified yet (or never gains an equivalent at all).
+Claude Code and Codex have both been verified against real CLIs. OpenCode and Grok still need the
+same live verification; their session-id support is not proof that complete on-disk state is
+portable. Treat native resume as a per-engine capability, with portable history covering engines
+that lack it.
 
 ## Open items — not yet verified or resolved
 
@@ -186,13 +181,13 @@ fallback covering any engine that hasn't been verified yet (or never gains an eq
   verification was stamped `"version":"2.1.217"`; the CLI installed in the same environment is
   `2.1.220`. Resume failing loudly on a future incompatible format change (parse error, or the same
   `No conversation found`) is an acceptable failure mode, but there's currently no way to distinguish
-  "the format changed under us" from "the blob is simply missing" — worth adding before this ships.
-- **The exact `state.json` field(s)** for the session blob and session id aren't drafted — needs to
-  fit alongside the existing `history`/`sandbox_image_kind` keys `agent.save()` already writes.
+  "the format changed under us" from "the blob is simply missing" — worth guarding explicitly.
+- **Native blobs grow with the conversation.** Codex rollouts are base64-encoded in agent state;
+  long sessions still need a measured size/pruning policy.
 - **Mixed native/harness history within one agent's lifetime has no unified representation.** The
   native session file covers only that engine's span; whether/how `agcontext` should note "a harness
   session covers this range, unavailable in raw message form" for logging/webui purposes is
   undesigned.
-- **Schema-retry turns issued against an existing `--resume`d session** (the reprompt seam described
-  in Component 5 of the parent document) have only been verified for a single before/after copy —
-  not for whether multiple retry turns compound cleanly against the same resumed session.
+- **Schema retries require captured state.** Codex issues a bounded MCP-output correction only when
+  the just-completed rollout was captured; otherwise it fails explicitly rather than retrying
+  without context.

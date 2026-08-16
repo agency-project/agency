@@ -19,19 +19,18 @@
 > the container (a FUSE-backed filesystem around a host-resident harness process) — **superseded**;
 > the project decided to run the harness inside the container after all, which is this document's
 > original direction and makes that gap moot (see "Prerequisites" and "Design Tensions" below, which
-> briefly documented the FUSE direction before being corrected back). The active in-container
-> supervisor bridge described there is now being implemented directly.
+> briefly documented the FUSE direction before being corrected back). The in-container supervisor
+> bridge is implemented directly.
 > [Design_harness_history.md](Design_harness_history.md) — cross-invocation history/continuity for
 > harness-driven agents, decoupled from any specific sandbox instance, matching the portability
-> `agcontext` already gives native agents — unaffected by the filesystem-direction reversal, still
-> active.
+> `agcontext` already gives native agents — implemented for Claude Code and Codex.
 
 ## Core Principle
 
-The harness keeps its own operation intact: its own system prompt and scaffolding, its own
-built-in tools (Bash, Edit, Read, ...), its own compaction. Agency does not inject a system prompt,
-does not disable or replace the harness's default toolkit, and does not force its own tool
-definitions into the harness's tool list. Agency occupies exactly two seams:
+The harness keeps its own operation intact: its own scaffolding, built-in tools (Bash, Edit, Read,
+...), and compaction. Agency supplies skill instructions through the harness's supported
+instruction surface and adds shared MCP capabilities, but does not replace the harness's built-in
+prompt or toolkit. Its two hard mediation seams remain:
 
 1. **The LLM endpoint** — every one of these harnesses is explicitly designed to have this
    swapped (`ANTHROPIC_BASE_URL`, `model_providers.base_url`, a custom `provider` block).
@@ -65,12 +64,12 @@ they carry no execution-capture logic at all.
 
 ## Why This Is Possible
 
-| Capability | Claude Code | Codex CLI (0.144.x) | opencode | Grok Build (xAI) |
+| Capability | Claude Code | Codex CLI (validated on 0.147.0) | opencode | Grok Build (xAI) |
 |---|---|---|---|---|
 | Custom LLM endpoint | `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`; wire = Anthropic Messages API | `model_providers` in `config.toml`; wire = OpenAI Responses API only | `provider` block naming an ai-sdk package → any wire format | `[model.<name>]` in `config.toml`, `base_url`/`api_key`/`env_key`; `api_backend` selects `chat_completions` \| `responses` \| `messages` — any of the three wire formats |
 | Headless run + turn-level event stream | `claude -p --output-format stream-json` | `codex exec --json` | `opencode serve` (HTTP+SSE) / `opencode run --format json` | `grok -p "..." --output-format json` (single JSON result) / `streaming-json` (NDJSON) |
 | Execution-level mediation | **Not needed via the harness's own hooks** — superseded by syscall interception (Component 3), which requires no harness support at all | same | same | same |
-| Supplemental tools (opt-in, additive only) | MCP | MCP | MCP + native `.opencode/tools/*.ts` | MCP (stdio + HTTP/SSE), plus auto-imports Claude Code's/Cursor's MCP config |
+| Supplemental tools (additive only) | MCP | MCP, deferred through Responses `tool_search` | MCP + native `.opencode/tools/*.ts` | MCP (stdio + HTTP/SSE), plus auto-imports Claude Code's/Cursor's MCP config |
 
 The key shift from earlier drafts of this design: tool-call capture no longer depends on each
 harness's own `PreToolUse`/`tool.execute.before` hook system firing correctly, or on hook JSON
@@ -127,15 +126,17 @@ opencode and Grok Build. Translate mode (`/v1/messages` for Claude Code, `/v1/re
 Codex, conversion functions in `agharness_internal/agproxy_llm_adapters.py`) reshapes the request
 into the uniform `client.chat.completions.create()` call every `agllm_backend` exposes and reshapes
 the response back — implemented as unconditional translation for every request on those two
-routes, not a conditional "reuse the native format when it happens to match" optimization. This is
-a real fidelity cost, not a free lunch: extended-thinking blocks, prompt-cache breakpoints
-(`cache_control`), and image content blocks have no chat-completions equivalent and are silently
-dropped on translation rather than erroring. A future optimization could detect when the
-configured backend's *native* format already matches the harness's wire format (e.g. an
-`agAnthropicBackendConfig`-backed agent talking to Claude Code) and skip translation entirely to
-preserve that fidelity — not built, since the immediate goal was closing the "harness bypasses
-agency's backend choice entirely" gap, not maximizing streaming fidelity for an already-matched
-case.
+routes, not a conditional "reuse the native format when it happens to match" optimization.
+
+For current Codex, the Responses adapter also translates client-executed `tool_search`: it exposes
+the search as a chat function, loads namespaced functions from `tool_search_output`, flattens their
+names reversibly, and restores `namespace` + `name` so Codex invokes its real MCP client. Invalid or
+ambiguous function mappings fail explicitly. Other unsupported Responses semantics (opaque
+reasoning, native JSON-schema output, non-text input, and some hosted/custom tools) either fail or
+produce a bounded warning rather than disappearing silently. Real backend credentials stay in the
+host terminus; Codex receives only per-run proxy/MCP capabilities. Its shell policy inherits no
+parent environment and disables shell snapshots so those capabilities do not reach model-run shell
+children.
 
 ---
 
@@ -144,9 +145,9 @@ case.
 Same responsibilities as before, with execution-capture logic removed (it now lives entirely in
 `agproxy_ptrace`):
 
-1. Materializes an isolated, ephemeral config home per run, containing only the model/endpoint env
-   from Component 1 — no hook registration, since mediation no longer depends on the harness's
-   hook system.
+1. Materializes an isolated, ephemeral config home per run, containing endpoint, MCP, instruction,
+   and non-interactive policy settings — no hook registration, since mediation no longer depends on
+   the harness's hook system.
 2. `agskill.execute_harness()` calls `build_harness_messages()` before adapter dispatch. The
    canonical value keeps system instructions, resolved history, current input, file notices,
    attachments, and output guidance separate until the adapter renders the complete task.
@@ -163,9 +164,11 @@ Same responsibilities as before, with execution-capture logic removed (it now li
    and why"; `agproxy_ptrace` supplies the OS's-eye view of "what actually happened." Both feed `aglog`,
    correlated by timestamp/PID, so the webui can show "Bash tool call (turn 4)" *and* the exact
    `execve` argv `agproxy_ptrace` observed for it.
-6. Collects output by validating the harness's final response text against `output_schema` via the
-   existing `agschema` path, reprompting as an ordinary user turn on failure.
-7. Stores the harness's session id in the agent's per-engine harness-session state for resume/fork.
+6. Collects structured output through shared MCP `submit_output` for native, Claude Code, and Codex;
+   OpenCode/Grok retain final-text recovery until their MCP wiring lands.
+7. Stores backend-native session state in the agent for resume/fork/checkpoint. Codex captures its
+   rollout with workspace, context-revision, safe-path, UUID, metadata, and exact-version guards;
+   incompatible or recognized broken resume state falls back once to portable `agcontext` history.
 
 ---
 
@@ -356,16 +359,12 @@ is unaffected, exactly as in the prior draft.
 **Status: partially built.** Resource-control and output-submission are no longer proposed --
 `agharness_internal/agmcp_server.py`'s shared `agMCPServer` (Phase 4 of the container-unification
 plan; see the plan's own doc/PR for the full design) exposes `reserve_cpu`/`cpu_release`/
-`daemon_release`/`submit_output` as real MCP tools, reached by `claude_code.py` today via
-`--mcp-config`/`--strict-mcp-config` (bridged into the container over the same UDS mount as the
-in-container LLM gateway, via a revived generic TCP-to-UDS relay -- see
-`agproxy_ptrace_internal/_in_container_launcher.py`'s `start_tcp_relay`) and by `native.py`'s
-in-container react loop via a real `mcp` client. `submit_output` replaces the schema-reprompting
-approach described below FOR THOSE TWO ENGINES: structured output is now collected via tool calls
-and read back through `agmcp_server.collected_output(token)`, not parsed post-hoc from the harness's
-final text. `codex.py`/`opencode.py`/`grok.py` are NOT wired to this server yet (no container support
-at all currently -- a separate, larger task) and still use the free-text JSON + `validate_and_recover`
-path described below unchanged. **`reserve_gpu`/`gpu_release` remain unimplemented** -- see
+`daemon_release`/`submit_output`/`ask_human` as real MCP tools, reached by native, Claude Code, and Codex.
+Container-backed external harnesses use the generic TCP-to-UDS relay; Codex discovers the same
+server through translated Responses `tool_search`. Structured fields are collected by run token
+rather than parsed from final prose, and Codex can issue a bounded correction turn when its rollout
+was captured. OpenCode/Grok still use free-text recovery. **`reserve_gpu`/`gpu_release` remain
+unimplemented** -- see
 `agmcp_server.py`'s own module docstring for the specific gap (GPU env-var injection only reaches
 `agsandbox_backends/base.py`'s `exec()`, a path neither an in-container harness's own tool execution
 nor `native.py`'s bash tool goes through) -- the paragraph below describing the intended MCP-based
@@ -467,14 +466,14 @@ than resolving it in general.
 
 **Linux/POSIX-only.** No macOS/BSD backend exists in this design; see Platform scope.
 
-**MCP visibility stays opt-in and additive-only**, unchanged from the prior draft — reserved
-strictly for `skill.add_tools`, never for replacing the harness's default toolkit.
+**MCP visibility stays additive-only** — shared Agency/skill tools never replace the harness's
+default toolkit.
 
 ---
 
 ## Build Order (as executed)
 
-All six phases are implemented and tested; this section is kept as the historical build log.
+The original six phases and later backend passes are implemented; this section is the build log.
 
 1. **`agproxy_ptrace` core: launch-and-trace + `execve` interception, against trivial test binaries
    (not a real harness yet).** Built the fork/`PTRACE_TRACEME`/seccomp-install/exec sequence,
@@ -501,8 +500,8 @@ All six phases are implemented and tested; this section is kept as the historica
    `agproxy_ptrace` tracing of the real process. LLM routing through `agproxy_llm` was **not**
    implemented for this backend initially (Claude Code speaks the Anthropic Messages API, a
    different wire format from the chat-completions-only gateway that existed at the time) — closed
-   in a later pass, see item 8 below. **Codex backend** built structurally (same shape, mocked
-   tests only) — no `codex` binary was available to verify against, then or since.
+   in a later pass, see item 8 below. **Codex backend** was initially structural/mocked; item 9
+   records its later production validation.
 5. **Harness-native hook fallback** (`agharness_internal/agharness_backends/_native_hooks.py`) — built at the reduced
    scope this phase called for: the hook-JSON ↔ `agsyscallevent`/`agdecision` translation logic is
    real and tested, but it is not wired into any concrete backend's `execute()` as an actual
@@ -530,6 +529,11 @@ All six phases are implemented and tested; this section is kept as the historica
    end-to-end, with the request genuinely reaching a real configured backend (Amazon Bedrock)
    *through* the gateway's translation, not around it. `codex.py` writes a
    `[model_providers.agency-proxy]` block into its isolated `CODEX_HOME/config.toml` pointing at
-   the gateway with `wire_api = "responses"`; unverified against a live binary, same caveat as
-   before. Every backend now genuinely routes its LLM traffic through `agproxy_llm` — no harness is
-   left free to use its own host credentials/endpoint.
+   the gateway with `wire_api = "responses"`. Every backend now genuinely routes its LLM traffic
+   through `agproxy_llm` — no harness is left free to use its own host credentials/endpoint.
+9. **Productionized Codex and validated CLI 0.147.0 end-to-end.** Added strict JSONL/usage handling,
+   timeout reap, MCP structured output, Responses `tool_search`/namespace translation, protected
+   shell environment, rollout capture/resume with exact guards, and one-shot portable-history
+   fallback. The real Linux/x86_64 container probe verified fresh file work, resume in a fresh
+   container, stale-version fallback, proxy-only routing, cleanup, and no leaked shell capability
+   variables.

@@ -1,8 +1,9 @@
 # External Harness Execution Loop
 
 > **Status:** describes the implemented, empirically-verified execution path
-> for a harness-driven skill call (`engine != "native"`), as of the
-> `claude_code.py` in-container + UDS-relay + session-continuity work. This
+> for a harness-driven skill call (`engine != "native"`), using Claude Code
+> as the detailed walkthrough. Codex follows the same shared lifecycle with
+> the backend-specific differences summarized near the end. This
 > document is the "what actually happens, in order" companion to
 > [Design_harness_integration.md](Design_harness_integration.md) (the "why
 > it's shaped this way") and [Design_harness_history.md](Design_harness_history.md)
@@ -264,6 +265,36 @@ deliberate design, not an oversight.
 | Filesystem the harness's tools see | The real host filesystem at `config_home`/cwd | The container's own real filesystem — no interception layer needed |
 | Container/sandbox lifetime for this call | N/A (no sandbox teardown mid-call) | Coarsens to one full harness invocation — native's per-tool-call hibernation can't apply once the harness's own live process is what's inside the container |
 
+## Codex differences within the same lifecycle
+
+Codex 0.147.0 has passed this real container E2E path; the shared process, sandbox, policy, and
+cleanup stages above do not change. Its backend-specific edges are:
+
+- isolated `CODEX_HOME/config.toml` selects an `agency-proxy` Responses provider and the shared
+  Agency MCP server; the task is passed to `codex exec --json ... -` on stdin;
+- in a container, the local translation proxy reaches the credential-holding host terminus over a
+  bind-mounted UDS, while a per-run TCP-to-UDS relay reaches the host MCP server;
+- `/v1/responses` is translated to the configured chat-completions backend. Client-executed
+  `tool_search` becomes a chat function; functions returned in `tool_search_output` are flattened
+  with a reversible namespace map, then restored so Codex invokes the real MCP tool;
+- structured fields come from bearer-authenticated `submit_output` calls, with bounded correction
+  turns, rather than parsing the final message as JSON;
+- the native session blob is Codex's rollout JSONL. Restore is gated by safe path/UUID/metadata,
+  workspace, context revision, and exact CLI version; incompatible or recognized broken resume
+  state falls back to portable `agcontext` history once;
+- JSONL `turn.completed` is required and supplies usage; `--output-last-message` supplies preferred
+  final text. Malformed/incomplete streams fail even if the process exits zero; and
+- real provider credentials remain in the host terminus. Codex sees only per-run proxy/MCP
+  capabilities, while `shell_environment_policy.inherit = "none"` plus
+  `features.shell_snapshot = false` keeps them out of model-run shell children. Live E2E verified
+  the protected environment, resume/fallback, registry cleanup, relay reap, and config/container
+  cleanup.
+
+Codex currently rejects attachments and `max_steps`. The Responses-to-chat boundary cannot retain
+opaque reasoning/native JSON-schema semantics, and reasoning effort is deliberately `none` because
+the validated chat backend rejects non-`none` reasoning together with function tools. Rollout blobs
+also grow with the conversation and remain version-coupled.
+
 ## What this document doesn't cover
 
 - *Why* the harness runs inside the container at all (and why the FUSE
@@ -272,7 +303,5 @@ deliberate design, not an oversight.
 - The full session-continuity design, its rejected alternative (splicing
   `agcontext` into the LLM request — empirically shown to break), and its
   open items — `Design_harness_history.md`.
-- Backends other than Claude Code: Codex/opencode/Grok follow the same
-  shape in principle (per-harness `argv`/`envp` construction, same
-  `agProxyPtrace`/`agproxy_llm` seams) but none of the container/UDS-relay/
-  session-continuity work in this document has been extended to them.
+- OpenCode and Grok: they follow the same shared process/proxy shape, but still need Codex/Claude
+  parity for live E2E, shared MCP structured output, and portable native-session validation.

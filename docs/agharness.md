@@ -56,15 +56,39 @@ checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`
 |---|---|---|
 | `opencode.py` | `agproxy_llm` `/v1/chat/completions` passthrough (matches wire format) | Mocked only — no `opencode` binary installable without Node/Bun in the environment this was built in |
 | `claude_code.py` | `agproxy_llm` `/v1/messages` translate (Anthropic Messages API <-> chat-completions, see [agproxy_llm.md](agharness_internal/agproxy_llm.md)) — `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` point at the gateway; the host's own real credentials (API key, OAuth login, Bedrock env) are never forwarded | **Real CLI** (v2.1.212) — raw-text and structured-`output_schema` paths, both routed genuinely through the gateway to a real backend (Bedrock), verified end-to-end |
-| `codex.py` | `agproxy_llm` `/v1/responses` translate (OpenAI Responses API <-> chat-completions) — mandatory here since Codex dropped `wire_api="chat"` upstream; `CODEX_HOME/config.toml` gets a `[model_providers.agency-proxy]` block pointing `base_url` at the gateway | Mocked only — no `codex` binary available; the Responses-API adapter itself is unverified against a live run |
+| `codex.py` | `agproxy_llm` `/v1/responses` translate (OpenAI Responses API <-> chat-completions); isolated `CODEX_HOME/config.toml` points an `agency-proxy` provider at the gateway | **Real Codex CLI 0.147.0** — fresh workspace work, proxy routing, MCP structured output, native resume in a fresh container, portable-history fallback, token accounting, and cleanup verified end-to-end |
 | `grok.py` | `agproxy_llm` `/v1/chat/completions` passthrough — Grok Build's `[model.*]` config supports `api_backend = "chat_completions"` per xAI's published docs, matching `agproxy_llm`'s existing route with zero translation, same as opencode | Mocked only — no `grok` binary installed (installing it means running xAI's `curl \| bash` script, deliberately not done without being asked first) |
 
 Every backend now genuinely routes its LLM traffic through `agproxy_llm` rather than leaving any
 harness free to use its own host credentials/endpoint — two are exact wire-format matches
 (`gateway_mode="passthrough"`), two require reshaping (`gateway_mode="translate"`, implemented in
-`agharness_internal/agproxy_llm_adapters.py`). See that module's docstring for the translation
-fidelity cost (extended thinking, prompt-cache breakpoints, and image content blocks have no
-chat-completions equivalent and are dropped, not errored on).
+`agharness_internal/agproxy_llm_adapters.py`). The Responses adapter fails explicitly when semantic
+content cannot be represented safely and warns when an unsupported hosted/custom tool is omitted.
+
+### Codex-specific behavior behind the shared interface
+
+Codex remains a normal `agharness_backend`: shared code owns the canonical task/result, supervised
+process, proxy/terminus, MCP server, policy, and cleanup; `codex.py` owns only Codex config/argv,
+JSONL parsing, and rollout-file persistence. Current Codex defers MCP tools behind Responses
+`tool_search`, so the Responses adapter maps that search to a chat function, loads functions from
+`tool_search_output`, flattens namespaced functions reversibly, then restores `namespace` + `name`
+so Codex dispatches the real MCP call. Structured fields therefore use the same authenticated
+`submit_output` MCP tool as other wired engines.
+
+Successful turns copy Codex's rollout JSONL out of ephemeral `CODEX_HOME` into the agent's portable
+per-engine session state. Restore requires a canonical thread id, safe relative path, valid rollout
+metadata, matching workspace/context revision, and the exact Codex version. A failed guard uses
+portable `agcontext` history; a recognized runtime resume-state failure gets one bounded fresh
+retry. Arbitrary provider/process failures do not.
+
+Real model credentials stay in the host terminus. Codex receives only per-run proxy and MCP bearer
+capabilities. Generated config uses `shell_environment_policy.inherit = "none"` and disables
+`features.shell_snapshot`, so model-run shells cannot recover those variables; the live E2E probe
+verified this. Known limits are deliberate: attachments and `max_steps` are rejected, opaque
+Responses reasoning/native JSON-schema features do not cross the chat-completions boundary, and
+reasoning effort is currently `none` because the validated chat backend rejects non-`none`
+reasoning together with function tools. Rollout blobs are private, version-coupled, and grow with
+the conversation.
 
 `grok.py` is the second backend (after opencode) that actually routes its LLM traffic through
 `agproxy_llm` rather than leaving the harness's own endpoint untouched — it writes a

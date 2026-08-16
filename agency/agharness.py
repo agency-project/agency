@@ -25,7 +25,12 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class HarnessMessages:
-    """Engine-neutral input for one external harness invocation."""
+    """Engine-neutral input for one harness invocation.
+
+    Keep instruction, portable history, current input, attachments, and output
+    guidance typed until a concrete backend chooses its CLI transport. Native
+    and every external backend receive this same value.
+    """
 
     system_instructions: str
     previous_context: tuple[dict, ...]
@@ -37,7 +42,12 @@ class HarnessMessages:
 
 @dataclass(frozen=True)
 class HarnessResult:
-    """Engine-neutral output from one successful harness invocation."""
+    """Engine-neutral output from one successful harness invocation.
+
+    ``final_text`` serves raw-output and legacy text-recovery backends;
+    ``submitted_fields`` serves engines wired to shared MCP ``submit_output``.
+    Both paths converge in :func:`finalize_harness_result`.
+    """
 
     final_text: str = ""
     submitted_fields: "dict | None" = None
@@ -254,7 +264,7 @@ def build_output_format_instruction(skill: "agskill") -> "str | None":
     appended to the prompt for skills with a structured output_schema,
     parsed post-hoc by `agschema.validate_and_recover`. Used by every
     harness backend that hasn't been wired to the shared MCP server's
-    `submit_output` tool yet (codex/opencode/grok -- see
+    `submit_output` tool yet (currently OpenCode/Grok -- see
     build_mcp_output_format_instruction's docstring for the ones that
     have). Returns None for a raw-text/no-schema skill, which needs no such
     instruction."""
@@ -272,12 +282,14 @@ def build_mcp_output_format_instruction(skill: "agskill") -> "str | None":
     MCP server's `submit_output` tool (see agharness_internal/agmcp_server.py,
     Phase 4) once per required output field -- the harness-driven
     counterpart to the native loop's `return_<field>` tools, reusing the
-    same MCP server every engine already gets `reserve_cpu`/`cpu_release`/
-    `daemon_release` from rather than a second, harness-only mechanism.
-    Only for backends that actually register this skill's tokens against
-    that server and wire `--mcp-config` (today: claude_code.py only --
-    codex/opencode/grok still use `build_output_format_instruction` above
-    until they get the same wiring, task #11). Returns None for a
+    shared MCP server that wired engines use for `reserve_cpu`/`cpu_release`/
+    `daemon_release` rather than a second, harness-only mechanism.
+    Only for backends that register this skill's token against that server
+    and configure their native MCP client (today: native, Claude Code, and
+    Codex; OpenCode/Grok still use `build_output_format_instruction`).
+    Codex reaches the same tool through its Responses `tool_search`/namespace
+    protocol; that translation belongs to `agproxy_llm_adapters`, not here.
+    Returns None for a
     raw-text/no-schema skill, which needs no such instruction."""
     if skill.output_schema is None or skill.output_schema.raw_key() is not None:
         return None
