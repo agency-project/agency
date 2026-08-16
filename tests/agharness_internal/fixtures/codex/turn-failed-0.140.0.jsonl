@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"0198ab70-1234-7000-8000-000000000002"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"partial answer must not escape"}}
+{"type":"turn.failed","error":{"message":"provider stream disconnected"}}

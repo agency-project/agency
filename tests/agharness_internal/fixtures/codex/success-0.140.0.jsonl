@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"0198ab70-1234-7000-8000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"reasoning","text":""}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"workspace task complete"}}
+{"type":"turn.completed","usage":{"input_tokens":37,"cached_input_tokens":5,"output_tokens":11}}

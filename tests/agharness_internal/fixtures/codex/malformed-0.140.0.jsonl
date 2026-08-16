@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"0198ab70-1234-7000-8000-000000000003"}
+this is not JSON
+{"type":"item.completed","item":{"type":"agent_message","text":"looks complete but is not trusted"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
