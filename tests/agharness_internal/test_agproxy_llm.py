@@ -488,6 +488,72 @@ def test_openai_responses_route_streaming_returns_responses_sse():
     assert "event: response.completed" in resp.text
 
 
+def test_openai_responses_route_warns_and_omits_unsupported_tool_type():
+    px, ag, fake_client = _make_gateway_with_agent(token="tok")
+    client = _client_for(px)
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a command",
+                "parameters": {"type": "object"},
+                "strict": False,
+            },
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Unsupported Responses namespace tool",
+                "tools": [],
+            },
+        ],
+        "stream": False,
+    }
+
+    resp = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+
+    assert resp.status_code == 200
+    forwarded_tools = fake_client.chat.completions.create.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in forwarded_tools] == ["exec_command"]
+    ag.terminal.log.assert_called_once()
+    warning_prefix, warning_message = ag.terminal.log.call_args.args
+    assert warning_prefix == "WARNING  "
+    assert "namespace" in warning_message
+    assert "omitted" in warning_message
+
+
+def test_openai_responses_route_rejects_unsupported_input_content_before_dispatch():
+    px, _, fake_client = _make_gateway_with_agent(token="tok")
+    client = _client_for(px)
+    body = {
+        "model": "m",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AA==",
+                        "detail": "auto",
+                    }
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    resp = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "invalid_request_error"
+    assert resp.json()["error"]["code"] == "unsupported_responses_translation"
+    assert "input_image" in resp.json()["error"]["message"]
+    fake_client.chat.completions.create.assert_not_called()
+
+
 def test_request_log_records_authenticated_chat_completions_calls():
     px, _, _ = _make_gateway_with_agent(token="tok")
     client = _client_for(px)

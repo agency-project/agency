@@ -13,11 +13,12 @@ that request into OpenAI chat-completions kwargs, invokes the SAME uniform
 the (possibly streaming) response back into the harness's expected format.
 
 Fidelity is bounded on purpose: this is a format *translation*, not a proxy
-to the harness's real provider, so anything with no chat-completions
-equivalent is dropped rather than erroring -- extended thinking blocks,
-prompt-cache breakpoints (`cache_control`), and image content blocks are all
-silently stripped. See docs/Design_harness_integration.md's "Design
-Tensions" section: this is the documented cost of `gateway_mode="translate"`.
+to the harness's real provider. The Anthropic adapter retains its documented
+best-effort behavior for provider-only metadata. The Responses adapter is
+stricter because silently dropping a Codex tool or input block changes what
+the agent can do: unsupported semantic content raises an explicit translation
+error instead. See docs/Design_harness_integration.md's "Design Tensions"
+section for the limits of `gateway_mode="translate"`.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+import warnings
 
 
 # ---------------------------------------------------------------------------
@@ -388,51 +390,157 @@ def openai_chunks_to_anthropic_sse(chunks, model: str, request_id: "str | None" 
 # ---------------------------------------------------------------------------
 
 
-def responses_tools_to_openai(tools) -> "list[dict] | None":
+class UnsupportedResponsesRequest(ValueError):
+    """A Responses request cannot be represented by Chat Completions safely."""
+
+
+def responses_tools_to_openai(tools, *, warning_handler=None) -> "list[dict] | None":
     """Responses API tool defs are flat (`{"type":"function","name":...,
     "description":...,"parameters":...}`) -- chat-completions nests them
-    under a `function` key."""
+    under a `function` key.
+
+    Only function tools have a lossless Chat Completions representation.
+    Codex may also advertise custom or namespace tools depending on its model
+    metadata and enabled features. Chat Completions cannot represent those
+    tools. Keep the function-tool subset so Codex's shell remains usable, but
+    always surface each omission through the provided per-request warning
+    handler (or a Python warning for direct callers).
+    """
     if not tools:
         return None
     converted = []
-    for t in tools:
-        if t.get("type") != "function":
+    for index, t in enumerate(tools):
+        if not isinstance(t, dict):
+            raise UnsupportedResponsesRequest(f"Responses tool at index {index} must be an object")
+        tool_type = t.get("type")
+        if tool_type != "function":
+            message = (
+                f"Responses tool type {tool_type!r} at index {index} cannot be translated "
+                "to Chat Completions and was omitted; Codex may use only the remaining "
+                "function tools on this turn"
+            )
+            if warning_handler is None:
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+            else:
+                warning_handler(message)
             continue
+        if t.get("defer_loading"):
+            raise UnsupportedResponsesRequest(
+                f"Responses function tool {t.get('name', '')!r} uses defer_loading, which "
+                "Chat Completions cannot represent"
+            )
+
+        parameters = t.get("parameters")
+        if parameters is None:
+            parameters = {"type": "object", "properties": {}}
+        function = {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "parameters": parameters,
+        }
+        # `strict` exists in both APIs. Preserve even False/None rather than
+        # relying on a backend default that may differ from Codex's request.
+        if "strict" in t:
+            function["strict"] = t["strict"]
         converted.append(
             {
                 "type": "function",
-                "function": {
-                    "name": t.get("name", ""),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters") or {"type": "object", "properties": {}},
-                },
+                "function": function,
             }
         )
     return converted or None
 
 
-def _responses_content_to_text(content) -> str:
+def _responses_content_to_text(content, *, location: str) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
-        for block in content:
+        for index, block in enumerate(content):
             if not isinstance(block, dict):
-                continue
+                raise UnsupportedResponsesRequest(
+                    f"Responses content block {location}[{index}] must be an object"
+                )
             btype = block.get("type")
             if btype in ("input_text", "output_text", "text"):
-                parts.append(block.get("text", ""))
-            # input_image / other block types: no chat-completions text equivalent, dropped
+                text = block.get("text", "")
+                if not isinstance(text, str):
+                    raise UnsupportedResponsesRequest(
+                        f"Responses text block {location}[{index}] must contain string text"
+                    )
+                parts.append(text)
+                continue
+            raise UnsupportedResponsesRequest(
+                f"Responses content type {btype!r} at {location}[{index}] cannot be "
+                "translated safely to Agency's Chat Completions backends"
+            )
         return "".join(parts)
-    return "" if content is None else str(content)
+    raise UnsupportedResponsesRequest(
+        f"Responses content at {location} must be a string or a list of text blocks"
+    )
 
 
-def responses_request_to_openai(body: dict) -> dict:
+def _responses_tool_choice_to_openai(tool_choice):
+    if tool_choice is None:
+        return None
+    if tool_choice in ("auto", "none", "required"):
+        return tool_choice
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        name = tool_choice.get("name")
+        if isinstance(name, str) and name:
+            return {"type": "function", "function": {"name": name}}
+    raise UnsupportedResponsesRequest(
+        f"Responses tool_choice {tool_choice!r} cannot be translated to Chat Completions"
+    )
+
+
+def _apply_responses_reasoning_config(body: dict, kwargs: dict) -> None:
+    reasoning = body.get("reasoning")
+    if reasoning is None:
+        return
+    if not isinstance(reasoning, dict):
+        raise UnsupportedResponsesRequest("Responses reasoning must be an object or null")
+
+    unsupported = {key for key, value in reasoning.items() if key != "effort" and value is not None}
+    if unsupported:
+        fields = ", ".join(sorted(unsupported))
+        raise UnsupportedResponsesRequest(
+            f"Responses reasoning fields cannot be translated to Chat Completions: {fields}"
+        )
+    if reasoning.get("effort") is not None:
+        kwargs["reasoning_effort"] = reasoning["effort"]
+
+
+def _apply_responses_text_config(body: dict, kwargs: dict) -> None:
+    text_config = body.get("text")
+    if text_config is None:
+        return
+    if not isinstance(text_config, dict):
+        raise UnsupportedResponsesRequest("Responses text configuration must be an object")
+
+    response_format = text_config.get("format")
+    if response_format not in (None, {"type": "text"}):
+        raise UnsupportedResponsesRequest(
+            "Responses text.format is not supported by the Agency translation proxy; "
+            "use the shared Agency structured-output path instead"
+        )
+    if text_config.get("verbosity") is not None:
+        kwargs["verbosity"] = text_config["verbosity"]
+
+
+def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
     """OpenAI `POST /v1/responses` request body -> `client.chat.completions.
-    create(**kwargs)` kwargs."""
+    create(**kwargs)` kwargs.
+
+    This covers the function-tool subset emitted by Codex 0.140.0. Unsupported
+    tool definitions are warned and omitted while unsupported prompt content
+    fails explicitly instead of being removed from the model-visible request.
+    """
     openai_messages: list[dict] = []
 
     instructions = body.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        raise UnsupportedResponsesRequest("Responses instructions must be a string or null")
     if instructions:
         openai_messages.append({"role": "system", "content": instructions})
 
@@ -440,41 +548,68 @@ def responses_request_to_openai(body: dict) -> dict:
     if isinstance(raw_input, str):
         openai_messages.append({"role": "user", "content": raw_input})
     elif isinstance(raw_input, list):
-        for item in raw_input:
+        for index, item in enumerate(raw_input):
             if not isinstance(item, dict):
-                continue
+                raise UnsupportedResponsesRequest(
+                    f"Responses input item at index {index} must be an object"
+                )
             itype = item.get("type")
             if itype == "function_call":
-                openai_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": item.get("call_id", ""),
-                                "type": "function",
-                                "function": {
-                                    "name": item.get("name", ""),
-                                    "arguments": item.get("arguments", "{}"),
-                                },
-                            }
-                        ],
-                    }
-                )
+                tool_call = {
+                    "id": item.get("call_id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+                # A Responses turn can emit several parallel function_call
+                # output items. Chat Completions represents all of them on
+                # one assistant message; separate consecutive assistant
+                # messages also violate Anthropic/Bedrock role alternation.
+                if openai_messages and openai_messages[-1].get("role") == "assistant":
+                    openai_messages[-1].setdefault("tool_calls", []).append(tool_call)
+                else:
+                    openai_messages.append(
+                        {"role": "assistant", "content": None, "tool_calls": [tool_call]}
+                    )
             elif itype == "function_call_output":
                 openai_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": item.get("call_id", ""),
-                        "content": _responses_content_to_text(item.get("output")),
+                        "content": _responses_content_to_text(
+                            item.get("output"), location=f"input[{index}].output"
+                        ),
+                    }
+                )
+            elif itype in (None, "message"):
+                role = item.get("role")
+                if role not in ("user", "assistant", "system", "developer"):
+                    raise UnsupportedResponsesRequest(
+                        f"Responses message role {role!r} at input[{index}] is unsupported"
+                    )
+                # Agency's Anthropic-compatible backend understands `system`
+                # but not Chat Completions' newer `developer` role. Mapping it
+                # to system preserves its instruction priority across every
+                # configured Agency provider rather than silently losing it.
+                if role == "developer":
+                    role = "system"
+                openai_messages.append(
+                    {
+                        "role": role,
+                        "content": _responses_content_to_text(
+                            item.get("content"), location=f"input[{index}].content"
+                        ),
                     }
                 )
             else:
-                # a plain {"role": ..., "content": [...]} message item
-                role = item.get("role", "user")
-                openai_messages.append(
-                    {"role": role, "content": _responses_content_to_text(item.get("content"))}
+                raise UnsupportedResponsesRequest(
+                    f"Responses input item type {itype!r} at index {index} cannot be "
+                    "translated to Chat Completions"
                 )
+    else:
+        raise UnsupportedResponsesRequest("Responses input must be a string or a list")
 
     kwargs: dict = {
         "model": body.get("model", ""),
@@ -487,10 +622,53 @@ def responses_request_to_openai(body: dict) -> dict:
         kwargs["temperature"] = body["temperature"]
     if "top_p" in body:
         kwargs["top_p"] = body["top_p"]
-    tools = responses_tools_to_openai(body.get("tools"))
+    if "parallel_tool_calls" in body:
+        kwargs["parallel_tool_calls"] = body["parallel_tool_calls"]
+    if "store" in body:
+        kwargs["store"] = body["store"]
+    if body.get("prompt_cache_key") is not None:
+        kwargs["prompt_cache_key"] = body["prompt_cache_key"]
+    _apply_responses_reasoning_config(body, kwargs)
+    _apply_responses_text_config(body, kwargs)
+    tools = responses_tools_to_openai(body.get("tools"), warning_handler=warning_handler)
     if tools:
         kwargs["tools"] = tools
+    tool_choice = _responses_tool_choice_to_openai(body.get("tool_choice"))
+    if tools and tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+    elif not tools and tool_choice not in (None, "auto", "none"):
+        raise UnsupportedResponsesRequest(
+            "Responses tool_choice requires a function tool, but no translatable function "
+            "tools remain"
+        )
     return kwargs
+
+
+def _openai_usage_detail(usage, group: str, field: str) -> "int | None":
+    details = getattr(usage, group, None)
+    if details is None:
+        return None
+    if isinstance(details, dict):
+        return details.get(field)
+    return getattr(details, field, None)
+
+
+def _openai_usage_to_responses(usage) -> dict:
+    input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    output_tokens = getattr(usage, "completion_tokens", 0) or 0
+    result = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+    cached_tokens = _openai_usage_detail(usage, "prompt_tokens_details", "cached_tokens")
+    if cached_tokens is not None:
+        result["input_tokens_details"] = {"cached_tokens": cached_tokens}
+    reasoning_tokens = _openai_usage_detail(usage, "completion_tokens_details", "reasoning_tokens")
+    if reasoning_tokens is not None:
+        result["output_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+    return result
 
 
 def openai_response_to_responses_api(resp, model: str, request_id: "str | None" = None) -> dict:
@@ -524,9 +702,7 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
             }
         )
 
-    usage = getattr(resp, "usage", None)
-    input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    output_tokens = getattr(usage, "completion_tokens", 0) or 0
+    usage = _openai_usage_to_responses(getattr(resp, "usage", None))
 
     return {
         "id": request_id,
@@ -535,11 +711,7 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
         "status": "completed",
         "model": model,
         "output": output,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        },
+        "usage": usage,
     }
 
 
@@ -573,12 +745,22 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
     tool_blocks: dict = {}  # openai tool-call index -> {"output_index", "id", "call_id", "name", "args_parts"}
     input_tokens = 0
     output_tokens = 0
+    cached_input_tokens = None
+    reasoning_output_tokens = None
 
     for chunk in chunks:
         usage = getattr(chunk, "usage", None)
         if usage is not None:
             input_tokens = getattr(usage, "prompt_tokens", 0) or input_tokens
             output_tokens = getattr(usage, "completion_tokens", 0) or output_tokens
+            cached_tokens = _openai_usage_detail(usage, "prompt_tokens_details", "cached_tokens")
+            if cached_tokens is not None:
+                cached_input_tokens = cached_tokens
+            reasoning_tokens = _openai_usage_detail(
+                usage, "completion_tokens_details", "reasoning_tokens"
+            )
+            if reasoning_tokens is not None:
+                reasoning_output_tokens = reasoning_tokens
 
         for choice in getattr(chunk, "choices", None) or []:
             delta = choice.delta
@@ -705,6 +887,16 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
             },
         )
 
+    response_usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    if cached_input_tokens is not None:
+        response_usage["input_tokens_details"] = {"cached_tokens": cached_input_tokens}
+    if reasoning_output_tokens is not None:
+        response_usage["output_tokens_details"] = {"reasoning_tokens": reasoning_output_tokens}
+
     yield _sse(
         "response.completed",
         {
@@ -714,17 +906,14 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                 "object": "response",
                 "status": "completed",
                 "model": model,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
-                },
+                "usage": response_usage,
             },
         },
     )
 
 
 __all__ = [
+    "UnsupportedResponsesRequest",
     "anthropic_messages_to_openai",
     "anthropic_tools_to_openai",
     "openai_response_to_anthropic_message",

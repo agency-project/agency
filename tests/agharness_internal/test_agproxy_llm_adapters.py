@@ -8,8 +8,12 @@ what a real `client.chat.completions.create()` call returns.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
+import pytest
 
 from agency.agharness_internal.agproxy_llm_adapters import (
+    UnsupportedResponsesRequest,
     anthropic_messages_to_openai,
     anthropic_tools_to_openai,
     openai_response_to_anthropic_message,
@@ -19,6 +23,9 @@ from agency.agharness_internal.agproxy_llm_adapters import (
     openai_response_to_responses_api,
     openai_chunks_to_responses_sse,
 )
+
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "codex"
 
 
 class _Fn:
@@ -49,9 +56,15 @@ class _Choice:
 
 
 class _Usage:
-    def __init__(self, prompt_tokens=0, completion_tokens=0):
+    def __init__(
+        self, prompt_tokens=0, completion_tokens=0, cached_tokens=None, reasoning_tokens=None
+    ):
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        if cached_tokens is not None:
+            self.prompt_tokens_details = {"cached_tokens": cached_tokens}
+        if reasoning_tokens is not None:
+            self.completion_tokens_details = {"reasoning_tokens": reasoning_tokens}
 
 
 class _Response:
@@ -379,6 +392,53 @@ def test_responses_request_to_openai_structured_input_with_function_call_roundtr
     }
 
 
+def test_responses_request_to_openai_coalesces_parallel_function_calls():
+    body = {
+        "model": "m",
+        "input": [
+            {"role": "user", "content": "inspect both files"},
+            {
+                "type": "function_call",
+                "call_id": "call1",
+                "name": "read_file",
+                "arguments": '{"path":"a.py"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "call2",
+                "name": "read_file",
+                "arguments": '{"path":"b.py"}',
+            },
+            {"type": "function_call_output", "call_id": "call1", "output": "a contents"},
+            {"type": "function_call_output", "call_id": "call2", "output": "b contents"},
+        ],
+    }
+
+    kwargs = responses_request_to_openai(body)
+
+    assert kwargs["messages"] == [
+        {"role": "user", "content": "inspect both files"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+                },
+                {
+                    "id": "call2",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"b.py"}'},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call1", "content": "a contents"},
+        {"role": "tool", "tool_call_id": "call2", "content": "b contents"},
+    ]
+
+
 def test_responses_request_to_openai_max_output_tokens_maps_to_max_completion_tokens():
     body = {"model": "m", "input": "hi", "max_output_tokens": 256}
     kwargs = responses_request_to_openai(body)
@@ -408,6 +468,177 @@ def test_responses_tools_to_openai_flattens_to_nested():
     ]
 
 
+def test_responses_request_to_openai_matches_captured_codex_0_140_function_subset():
+    body = json.loads((_FIXTURES / "responses_request_function_tools_v0_140.json").read_text())
+
+    kwargs = responses_request_to_openai(body)
+
+    assert kwargs["messages"] == [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "system", "content": "Honor the workspace permissions."},
+        {"role": "user", "content": "Run pwd once, then reply done."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-redacted",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": '{"cmd":"pwd"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-redacted", "content": "/workspace\n"},
+    ]
+    assert kwargs["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "description": "Runs a command and returns its output.",
+                "parameters": body["tools"][0]["parameters"],
+                "strict": False,
+            },
+        }
+    ]
+    assert kwargs["tool_choice"] == "auto"
+    assert kwargs["parallel_tool_calls"] is True
+    assert kwargs["reasoning_effort"] == "medium"
+    assert kwargs["verbosity"] == "low"
+    assert kwargs["store"] is False
+    assert kwargs["prompt_cache_key"] == "thread-redacted"
+    assert kwargs["stream"] is True
+
+
+@pytest.mark.parametrize("tool_type", ["namespace", "custom", "web_search"])
+def test_responses_tools_to_openai_warns_and_omits_nonfunction_tools(tool_type):
+    warnings = []
+
+    converted = responses_tools_to_openai(
+        [{"type": tool_type, "name": "unsupported"}], warning_handler=warnings.append
+    )
+
+    assert converted is None
+    assert len(warnings) == 1
+    assert repr(tool_type) in warnings[0]
+
+
+def test_responses_tools_to_openai_keeps_functions_when_custom_tool_is_omitted():
+    warnings = []
+    tools = [
+        {
+            "type": "function",
+            "name": "exec_command",
+            "description": "Run a command",
+            "parameters": {"type": "object"},
+            "strict": False,
+        },
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+        },
+    ]
+
+    converted = responses_tools_to_openai(tools, warning_handler=warnings.append)
+
+    assert [tool["function"]["name"] for tool in converted] == ["exec_command"]
+    assert len(warnings) == 1
+    assert "custom" in warnings[0]
+
+
+def test_responses_tools_to_openai_rejects_deferred_function_tool():
+    with pytest.raises(UnsupportedResponsesRequest, match="defer_loading"):
+        responses_tools_to_openai(
+            [
+                {
+                    "type": "function",
+                    "name": "later",
+                    "parameters": {"type": "object"},
+                    "defer_loading": True,
+                }
+            ]
+        )
+
+
+@pytest.mark.parametrize("content_type", ["input_image", "input_file", "refusal"])
+def test_responses_request_to_openai_rejects_nontext_message_content(content_type):
+    body = {
+        "model": "m",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": content_type, "image_url": "data:image/png;base64,AA=="}],
+            }
+        ],
+    }
+
+    with pytest.raises(UnsupportedResponsesRequest, match=repr(content_type)):
+        responses_request_to_openai(body)
+
+
+def test_responses_request_to_openai_rejects_unsupported_input_item_type():
+    body = {"model": "m", "input": [{"type": "reasoning", "id": "reasoning-1"}]}
+
+    with pytest.raises(UnsupportedResponsesRequest, match="reasoning"):
+        responses_request_to_openai(body)
+
+
+def test_responses_request_to_openai_rejects_native_json_schema_format():
+    body = {
+        "model": "m",
+        "input": "hi",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {"type": "object"},
+                "strict": True,
+            }
+        },
+    }
+
+    with pytest.raises(UnsupportedResponsesRequest, match=r"text\.format"):
+        responses_request_to_openai(body)
+
+
+def test_responses_request_to_openai_maps_named_function_tool_choice():
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            }
+        ],
+        "tool_choice": {"type": "function", "name": "get_weather"},
+    }
+
+    kwargs = responses_request_to_openai(body)
+
+    assert kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "get_weather"},
+    }
+
+
+def test_responses_request_to_openai_rejects_required_choice_without_function_tools():
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "custom", "name": "apply_patch"}],
+        "tool_choice": "required",
+    }
+
+    with pytest.warns(RuntimeWarning, match="custom"):
+        with pytest.raises(UnsupportedResponsesRequest, match="no translatable function"):
+            responses_request_to_openai(body)
+
+
 # ---------------------------------------------------------------------------
 # OpenAI response -> Responses API response
 # ---------------------------------------------------------------------------
@@ -435,6 +666,21 @@ def test_openai_response_to_responses_api_function_call():
     assert out["output"][0]["arguments"] == '{"city": "SF"}'
 
 
+def test_openai_response_to_responses_api_preserves_cached_and_reasoning_usage():
+    usage = _Usage(11, 7, cached_tokens=4, reasoning_tokens=3)
+    resp = _Response([_Choice(message=_Message(content="done"))], usage=usage)
+
+    out = openai_response_to_responses_api(resp, "m")
+
+    assert out["usage"] == {
+        "input_tokens": 11,
+        "input_tokens_details": {"cached_tokens": 4},
+        "output_tokens": 7,
+        "output_tokens_details": {"reasoning_tokens": 3},
+        "total_tokens": 18,
+    }
+
+
 # ---------------------------------------------------------------------------
 # OpenAI streaming chunks -> Responses API SSE
 # ---------------------------------------------------------------------------
@@ -458,6 +704,31 @@ def test_openai_chunks_to_responses_sse_text_stream():
     assert completed["response"]["status"] == "completed"
     assert completed["response"]["usage"]["input_tokens"] == 2
     assert completed["response"]["usage"]["output_tokens"] == 1
+
+
+def test_openai_chunks_to_responses_sse_preserves_cached_and_reasoning_usage():
+    chunks = [
+        _Chunk(choices=[_Choice(delta=_Delta(content="done"))]),
+        _Chunk(
+            usage=_Usage(
+                prompt_tokens=11,
+                completion_tokens=7,
+                cached_tokens=4,
+                reasoning_tokens=3,
+            )
+        ),
+    ]
+
+    frames = "".join(openai_chunks_to_responses_sse(chunks, "m"))
+    completed = next(data for event, data in _parse_sse(frames) if event == "response.completed")
+
+    assert completed["response"]["usage"] == {
+        "input_tokens": 11,
+        "input_tokens_details": {"cached_tokens": 4},
+        "output_tokens": 7,
+        "output_tokens_details": {"reasoning_tokens": 3},
+        "total_tokens": 18,
+    }
 
 
 def test_openai_chunks_to_responses_sse_function_call_stream():

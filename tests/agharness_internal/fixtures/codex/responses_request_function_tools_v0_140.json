@@ -1,0 +1,76 @@
+{
+  "client_metadata": {
+    "session_id": "session-redacted",
+    "thread_id": "thread-redacted",
+    "turn_id": "turn-redacted"
+  },
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Honor the workspace permissions.",
+          "type": "input_text"
+        }
+      ],
+      "role": "developer",
+      "type": "message"
+    },
+    {
+      "content": [
+        {
+          "text": "Run pwd once, then reply done.",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "arguments": "{\"cmd\":\"pwd\"}",
+      "call_id": "call-redacted",
+      "name": "exec_command",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call-redacted",
+      "output": "/workspace\n",
+      "type": "function_call_output"
+    }
+  ],
+  "instructions": "You are a coding agent.",
+  "model": "gpt-5.3-codex",
+  "parallel_tool_calls": true,
+  "prompt_cache_key": "thread-redacted",
+  "reasoning": {
+    "effort": "medium"
+  },
+  "store": false,
+  "stream": true,
+  "text": {
+    "verbosity": "low"
+  },
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "description": "Runs a command and returns its output.",
+      "name": "exec_command",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "cmd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

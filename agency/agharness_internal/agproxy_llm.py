@@ -44,6 +44,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from ..agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 from .agllm_terminus import agLLMTerminus, get_shared_terminus
 from .agproxy_llm_adapters import (
+    UnsupportedResponsesRequest,
     anthropic_messages_to_openai,
     openai_response_to_anthropic_message,
     openai_chunks_to_anthropic_sse,
@@ -676,7 +677,21 @@ class agProxyLLM:
             model = self._resolve_model(token)
             request_id = f"resp_{uuid.uuid4().hex}"
             self._log_request("/v1/responses", token, model)
-            openai_kwargs = responses_request_to_openai(body)
+            try:
+                openai_kwargs = responses_request_to_openai(
+                    body, warning_handler=lambda message: self._log_warning(token, message)
+                )
+            except UnsupportedResponsesRequest as exc:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "invalid_request_error",
+                            "code": "unsupported_responses_translation",
+                        }
+                    },
+                    status_code=400,
+                )
             openai_kwargs["model"] = model
 
             if body.get("stream"):
