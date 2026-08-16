@@ -107,6 +107,7 @@ from typing import TYPE_CHECKING
 
 import cloudpickle
 
+from ... import agharness
 from ...agdata import agdata, agerror
 from .base import agharness_backend
 
@@ -431,8 +432,6 @@ class _NativeBackend(agharness_backend):
         sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
         user_content = skill._build_user_content(skill_input)
         if _use_structured_output:
-            from ... import agharness
-
             extra = agharness.build_mcp_output_format_instruction(skill)
             if extra and isinstance(user_content, str):
                 user_content = user_content + extra
@@ -564,10 +563,13 @@ class _NativeBackend(agharness_backend):
                     "retry/retries -- submit_output was never called for: " + ", ".join(missing)
                 )
             else:
-                result = agdata(**collected_output)
+                result = agharness.finalize_harness_result(
+                    agharness.HarnessResult(submitted_fields=collected_output), skill, ag.sandbox
+                )
         else:
-            out_key = skill.output_schema.raw_key() if skill.output_schema is not None else "result"
-            result = agdata(**{out_key: final_text})
+            result = agharness.finalize_harness_result(
+                agharness.HarnessResult(final_text=final_text), skill, ag.sandbox
+            )
 
         prev_ctx.messages = list(prev_ctx.messages) + [user_msg] + new_since_call_start
         return result, prev_ctx, [sys_msg, user_msg] + new_since_call_start

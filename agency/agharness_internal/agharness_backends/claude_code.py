@@ -541,10 +541,13 @@ class _ClaudeCodeBackend(agharness_backend):
                     "-- submit_output was never called for: " + ", ".join(missing)
                 )
             else:
-                result = agdata(**collected_output)
+                result = agharness.finalize_harness_result(
+                    agharness.HarnessResult(submitted_fields=collected_output), skill, ag.sandbox
+                )
         else:
-            out_key = skill.output_schema.raw_key() if skill.output_schema is not None else "result"
-            result = agdata(**{out_key: final_text})
+            result = agharness.finalize_harness_result(
+                agharness.HarnessResult(final_text=final_text), skill, ag.sandbox
+            )
 
         prev_ctx.total_input_tokens += total_input_tokens
         prev_ctx.total_output_tokens += total_output_tokens

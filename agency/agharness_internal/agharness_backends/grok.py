@@ -170,11 +170,9 @@ class _GrokBackend(agharness_backend):
         user_msg = agharness.harness_user_message(messages)
         assistant_msg = {"role": "assistant", "content": final_text}
 
-        if skill.output_schema is not None and skill.output_schema.raw_key() is None:
-            result, _paths = skill.output_schema.validate_and_recover(final_text, ag.sandbox)
-        else:
-            out_key = skill.output_schema.raw_key() if skill.output_schema is not None else "result"
-            result = agdata(**{out_key: final_text})
+        result = agharness.finalize_harness_result(
+            agharness.HarnessResult(final_text=final_text), skill, ag.sandbox
+        )
 
         if usage:
             prev_ctx.total_input_tokens += usage.get("input_tokens", 0)

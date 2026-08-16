@@ -67,6 +67,44 @@ def test_build_harness_messages_keeps_every_canonical_input_part():
     assert "[CURRENT USER INPUT]\ncurrent task" in resumed
 
 
+def test_finalize_harness_result_wraps_raw_text():
+    skill = agskill(name="s", system_prompt="do the thing")
+
+    result = agharness.finalize_harness_result(
+        agharness.HarnessResult(final_text="done"), skill, MagicMock()
+    )
+
+    assert result == agdata(result="done")
+
+
+def test_finalize_harness_result_validates_json_output():
+    skill = agskill(
+        name="s", system_prompt="do the thing", output_schema=agdata(answer=str, count=int)
+    )
+
+    result = agharness.finalize_harness_result(
+        agharness.HarnessResult(final_text='{"answer": "yes", "count": 2}'),
+        skill,
+        MagicMock(),
+    )
+
+    assert result == agdata(answer="yes", count=2)
+
+
+def test_finalize_harness_result_recovers_submitted_fields_once():
+    schema = MagicMock()
+    schema.check.return_value = []
+    skill = MagicMock(output_schema=schema)
+    sandbox = MagicMock()
+
+    result = agharness.finalize_harness_result(
+        agharness.HarnessResult(submitted_fields={"answer": "yes"}), skill, sandbox
+    )
+
+    assert result == agdata(answer="yes")
+    schema.recover_outputs.assert_called_once_with(result, sandbox)
+
+
 def test_run_harness_cli_uses_sandbox_stdin_workspace_and_pid_wiring():
     ag = _make_agent()
     ag.agconfig = MagicMock()

@@ -656,8 +656,6 @@ class agskill:
                     type(ag).poll_interval_s,
                     ag._set_ui_state,
                 )
-            if self.output_schema is not None:
-                self.output_schema.recover_outputs(result, ag.sandbox)
         return result, updated_ctx, delta
 
     def __repr__(self) -> str:

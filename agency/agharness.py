@@ -35,6 +35,38 @@ class HarnessMessages:
     output_guidance: "str | None" = None
 
 
+@dataclass(frozen=True)
+class HarnessResult:
+    """Engine-neutral output from one successful harness invocation."""
+
+    final_text: str = ""
+    submitted_fields: "dict | None" = None
+
+
+def finalize_harness_result(
+    result: HarnessResult,
+    skill: "agskill",
+    sandbox,
+) -> "agdata":
+    """Convert a harness result into the skill's public output contract."""
+    from .agdata import agdata, agerror
+
+    schema = skill.output_schema
+    if result.submitted_fields is not None:
+        data = agdata(**result.submitted_fields)
+        errors = schema.check(data) if schema is not None else []
+        if errors:
+            return agerror(f"output schema error: {errors}")
+        if schema is not None:
+            schema.recover_outputs(data, sandbox)
+        return data
+    if schema is not None and schema.raw_key() is None:
+        data, _paths = schema.validate_and_recover(result.final_text, sandbox)
+        return data
+    out_key = schema.raw_key() if schema is not None else "result"
+    return agdata(**{out_key: result.final_text})
+
+
 def build_harness_messages(
     skill: "agskill",
     previous_context: "agcontext",
@@ -313,7 +345,9 @@ __all__ = [
     "materialize_config_home_in_container",
     "cleanup_config_home_in_container",
     "HarnessMessages",
+    "HarnessResult",
     "build_harness_messages",
+    "finalize_harness_result",
     "render_harness_messages",
     "harness_user_message",
     "run_harness_cli",
