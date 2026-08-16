@@ -73,14 +73,20 @@ def _success_events(
     )
 
 
-def _rollout_blob(session_id: str, suffix: str = "") -> bytes:
+def _rollout_blob(
+    session_id: str,
+    suffix: str = "",
+    *,
+    cli_version: str = _VERSION,
+    cwd: str = "/workspace",
+) -> bytes:
     meta = {
         "timestamp": "2026-08-15T00:00:00Z",
         "type": "session_meta",
         "payload": {
             "id": session_id,
-            "cwd": "/workspace",
-            "cli_version": _VERSION,
+            "cwd": cwd,
+            "cli_version": cli_version,
         },
     }
     return (json.dumps(meta) + "\n" + suffix).encode()
@@ -358,6 +364,7 @@ def test_session_creation_captures_portable_rollout_before_cleanup():
     assert base64.b64decode(record["blob_b64"]) == _rollout_blob(session_id)
     assert record["agcontext_revision"] == 8
     assert record["codex_version"] == _VERSION
+    assert record["rollout_cli_version"] == _VERSION
     assert captured_home is not None and not Path(captured_home).exists()
 
 
@@ -373,6 +380,7 @@ def test_valid_rollout_is_restored_and_real_resume_subcommand_omits_history():
             "blob_b64": base64.b64encode(blob).decode(),
             "agcontext_revision": 3,
             "codex_version": _VERSION,
+            "rollout_cli_version": _VERSION,
         }
     }
     previous = agcontext(
@@ -417,6 +425,7 @@ def test_stale_revision_or_version_falls_back_to_portable_history(record_revisio
             "blob_b64": base64.b64encode(_rollout_blob(session_id)).decode(),
             "agcontext_revision": record_revision,
             "codex_version": record_version,
+            "rollout_cli_version": _VERSION,
         }
     }
     previous = agcontext(
@@ -434,6 +443,59 @@ def test_stale_revision_or_version_falls_back_to_portable_history(record_revisio
     assert "portable history" in launch["stdin"]
 
 
+@pytest.mark.parametrize(
+    ("stored_session_id", "blob"),
+    [
+        (
+            "--last",
+            _rollout_blob("0198ab70-1234-7000-8000-000000000020"),
+        ),
+        (
+            "0198ab70-1234-7000-8000-000000000021",
+            _rollout_blob(
+                "0198ab70-1234-7000-8000-000000000021",
+                cli_version="different-rollout-build",
+            ),
+        ),
+        (
+            "0198ab70-1234-7000-8000-000000000022",
+            _rollout_blob(
+                "0198ab70-1234-7000-8000-000000000022",
+                cwd="/different-workspace",
+            ),
+        ),
+        (
+            "0198ab70-1234-7000-8000-000000000023",
+            b'{"type":"event","message":"0198ab70-1234-7000-8000-000000000023"}\n',
+        ),
+    ],
+)
+def test_invalid_or_mismatched_rollout_metadata_falls_back_safely(stored_session_id, blob):
+    ag = _make_agent()
+    ag._harness_sessions = {
+        "codex": {
+            "session_id": stored_session_id,
+            "rollout_path": "sessions/2026/08/15/rollout.jsonl",
+            "blob_b64": base64.b64encode(blob).decode(),
+            "agcontext_revision": 3,
+            "codex_version": _VERSION,
+            "rollout_cli_version": _VERSION,
+        }
+    }
+    previous = agcontext(
+        messages=[{"role": "assistant", "content": "portable history"}], revision=3
+    )
+    backend = _CodexBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+
+    with _runtime(_make_handle(_success_events())) as runtime:
+        result, _, _ = backend.execute(ag, previous, agdata(task="go"), None, skill=skill)
+
+    assert not isinstance(result, agerror)
+    assert "resume" not in runtime["launches"][0]["argv"]
+    assert "portable history" in runtime["launches"][0]["stdin"]
+
+
 def test_codex_rejected_resume_retries_fresh_with_portable_history():
     session_id = "0198ab70-1234-7000-8000-000000000013"
     relative = f"sessions/2026/08/15/rollout-{session_id}.jsonl"
@@ -446,6 +508,7 @@ def test_codex_rejected_resume_retries_fresh_with_portable_history():
             "blob_b64": base64.b64encode(blob).decode(),
             "agcontext_revision": 3,
             "codex_version": _VERSION,
+            "rollout_cli_version": _VERSION,
         }
     }
     previous = agcontext(
@@ -518,9 +581,46 @@ def test_incomplete_structured_output_retries_same_native_thread():
     assert "Still missing: ['count']" in runtime["launches"][1]["stdin"]
 
 
+def test_failed_structured_output_retry_keeps_completed_attempt_usage():
+    session_id = "0198ab70-1234-7000-8000-000000000015"
+    backend = _CodexBackend(agConfig())
+    skill = agskill(
+        name="s",
+        system_prompt="do the thing",
+        output_schema=agdata(answer=str, count=int),
+        max_output_schema_retries=1,
+    )
+    previous = agcontext(total_input_tokens=10, total_output_tokens=20)
+
+    def on_launch(index, _argv, envp, _stdin):
+        if index == 0:
+            _install_rollout(envp["CODEX_HOME"], session_id)
+
+    handles = [
+        _make_handle(
+            _success_events(
+                "first",
+                session_id,
+                input_tokens=5,
+                output_tokens=6,
+            )
+        ),
+        _make_handle(stderr="provider unavailable", rc=1),
+    ]
+    with _runtime(handles, collected={"answer": "done"}, on_launch=on_launch):
+        result, ctx, _ = backend.execute(
+            _make_agent(), previous, agdata(task="go"), None, skill=skill
+        )
+
+    assert isinstance(result, agerror)
+    assert ctx.total_input_tokens == 15
+    assert ctx.total_output_tokens == 26
+
+
 def test_terminus_transcript_is_authoritative_history():
     transcript = [
-        {"role": "system", "content": "system"},
+        {"role": "system", "content": "Codex base instructions"},
+        {"role": "system", "content": "Agency developer instructions"},
         {"role": "user", "content": "wire user"},
         {"role": "assistant", "content": "wire assistant"},
         {"role": "tool", "content": "tool result"},
@@ -533,8 +633,8 @@ def test_terminus_transcript_is_authoritative_history():
             _make_agent(), previous, agdata(task="go"), None, skill=skill
         )
     assert not isinstance(result, agerror)
-    assert ctx.messages == transcript[1:]
-    assert delta[1:] == transcript[1:]
+    assert ctx.messages == transcript[2:]
+    assert delta[1:] == transcript[2:]
 
 
 def test_cleanup_after_partial_service_setup_failure():
@@ -551,6 +651,79 @@ def test_cleanup_after_partial_service_setup_failure():
     runtime["gateway"].unregister.assert_called_once()
     runtime["profiler"].unregister.assert_called_once()
     runtime["mcp"].unregister.assert_called_once()
+
+
+def test_config_cleanup_failure_does_not_replace_successful_result(capsys):
+    backend = _CodexBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+
+    from agency import agharness
+
+    real_cleanup = agharness.cleanup_config_home
+
+    def cleanup_then_fail(path):
+        real_cleanup(path)
+        raise RuntimeError("cleanup transport failed")
+
+    with (
+        _runtime(_make_handle(_success_events())),
+        patch("agency.agharness.cleanup_config_home", side_effect=cleanup_then_fail),
+    ):
+        result, _, _ = backend.execute(
+            _make_agent(), agcontext(), agdata(task="go"), None, skill=skill
+        )
+
+    assert not isinstance(result, agerror)
+    assert result.result == "ok"
+    assert "failed to clean up Codex config home" in capsys.readouterr().out
+
+
+def test_container_topology_cleans_services_and_relay_after_config_failure():
+    backend = _CodexBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    ag = _make_agent()
+    ag.sandbox._backend.IMAGE_KIND = "container"
+    ag.sandbox.exec.return_value = ("", 1)
+    ag.sandbox.write_file.side_effect = RuntimeError("container config write failed")
+    relay_process = MagicMock()
+
+    with (
+        _runtime(_make_handle(_success_events())) as runtime,
+        patch(
+            "agency.agharness.resolve_harness_binary_in_container",
+            return_value="/opt/agency_harness_bin/codex",
+        ),
+        patch(
+            "agency.agharness_internal.agproxy_llm_in_container.ensure_agproxy_llm_in_container",
+            return_value="http://127.0.0.1:18082",
+        ),
+        patch(
+            "agency.agharness_internal.agproxy_ptrace_internal._in_container_launcher."
+            "start_tcp_relay",
+            return_value=(relay_process, 18083),
+        ),
+        patch(
+            "agency.agharness_internal.agproxy_ptrace_internal._in_container_launcher."
+            "stop_tcp_relay"
+        ) as stop_relay,
+        patch(
+            "agency.agharness.materialize_config_home_in_container",
+            return_value="/tmp/agharness-codex-container",
+        ),
+        patch("agency.agharness.cleanup_config_home_in_container") as cleanup_home,
+    ):
+        result, _, _ = backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
+
+    assert isinstance(result, agerror)
+    assert "container config write failed" in result.error
+    runtime["gateway"].register.assert_not_called()
+    runtime["terminus"].register.assert_called_once()
+    runtime["terminus"].unregister.assert_called_once()
+    runtime["profiler"].unregister.assert_called_once()
+    runtime["mcp"].unregister.assert_called_once()
+    stop_relay.assert_called_once_with(relay_process)
+    cleanup_home.assert_called_once_with(ag.sandbox, "/tmp/agharness-codex-container")
+    assert runtime["launches"] == []
 
 
 def test_unsupported_contract_inputs_fail_clearly_before_launch():

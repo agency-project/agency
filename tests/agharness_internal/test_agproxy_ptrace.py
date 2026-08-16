@@ -11,8 +11,10 @@ smoke test, not just a config/capability check, is the authoritative signal.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -20,6 +22,37 @@ from agency.agpolicy import agAllowAllPolicy, agdecision, agpolicy
 from agency.agharness_internal.agproxy_ptrace import agProxyPtrace, ptrace_available
 
 ptrace = pytest.mark.skipif(not ptrace_available(), reason="ptrace not usable on this host")
+
+
+def test_stop_tcp_relay_terminates_and_reaps_process():
+    from agency.agharness_internal.agproxy_ptrace_internal._in_container_launcher import (
+        stop_tcp_relay,
+    )
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+
+    stop_tcp_relay(proc)
+
+    proc.terminate.assert_called_once()
+    proc.communicate.assert_called_once_with(timeout=5)
+
+
+def test_stop_tcp_relay_kills_after_graceful_timeout():
+    from agency.agharness_internal.agproxy_ptrace_internal._in_container_launcher import (
+        stop_tcp_relay,
+    )
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+    proc.communicate.side_effect = [subprocess.TimeoutExpired("relay", 5), ("", "")]
+
+    stop_tcp_relay(proc)
+
+    proc.terminate.assert_called_once()
+    proc.kill.assert_called_once()
+    assert proc.communicate.call_count == 2
+
 
 _SPAWN_CHILD_SCRIPT = str(
     # tests/fixtures/ stays a shared top-level directory (not moved into

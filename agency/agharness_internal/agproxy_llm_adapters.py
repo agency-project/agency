@@ -394,6 +394,13 @@ class UnsupportedResponsesRequest(ValueError):
     """A Responses request cannot be represented by Chat Completions safely."""
 
 
+def _responses_translation_warning(message: str, warning_handler=None) -> None:
+    if warning_handler is None:
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+    else:
+        warning_handler(message)
+
+
 def responses_tools_to_openai(tools, *, warning_handler=None) -> "list[dict] | None":
     """Responses API tool defs are flat (`{"type":"function","name":...,
     "description":...,"parameters":...}`) -- chat-completions nests them
@@ -419,10 +426,7 @@ def responses_tools_to_openai(tools, *, warning_handler=None) -> "list[dict] | N
                 "to Chat Completions and was omitted; Codex may use only the remaining "
                 "function tools on this turn"
             )
-            if warning_handler is None:
-                warnings.warn(message, RuntimeWarning, stacklevel=2)
-            else:
-                warning_handler(message)
+            _responses_translation_warning(message, warning_handler)
             continue
         if t.get("defer_loading"):
             raise UnsupportedResponsesRequest(
@@ -528,6 +532,26 @@ def _apply_responses_text_config(body: dict, kwargs: dict) -> None:
         kwargs["verbosity"] = text_config["verbosity"]
 
 
+def _check_responses_include(body: dict, warning_handler=None) -> None:
+    include = body.get("include")
+    if include is None:
+        return
+    if not isinstance(include, list) or any(not isinstance(value, str) for value in include):
+        raise UnsupportedResponsesRequest("Responses include must be a list of strings")
+    unsupported = [value for value in include if value != "reasoning.encrypted_content"]
+    if unsupported:
+        raise UnsupportedResponsesRequest(
+            "Responses include values cannot be synthesized by the Agency translation proxy: "
+            + ", ".join(sorted(unsupported))
+        )
+    if "reasoning.encrypted_content" in include:
+        _responses_translation_warning(
+            "Responses include 'reasoning.encrypted_content' cannot be synthesized from Chat "
+            "Completions and was omitted; Codex native opaque-reasoning continuity is unavailable",
+            warning_handler,
+        )
+
+
 def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
     """OpenAI `POST /v1/responses` request body -> `client.chat.completions.
     create(**kwargs)` kwargs.
@@ -537,6 +561,7 @@ def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
     fails explicitly instead of being removed from the model-visible request.
     """
     openai_messages: list[dict] = []
+    _check_responses_include(body, warning_handler)
 
     instructions = body.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
@@ -671,12 +696,32 @@ def _openai_usage_to_responses(usage) -> dict:
     return result
 
 
+def _responses_state_for_finish_reason(finish_reason) -> tuple[str, dict | None, dict | None]:
+    if finish_reason in (None, "stop", "tool_calls", "function_call"):
+        return "completed", None, None
+    if finish_reason in ("length", "content_filter"):
+        reason = "max_output_tokens" if finish_reason == "length" else "content_filter"
+        return "incomplete", {"reason": reason}, None
+    return (
+        "failed",
+        None,
+        {
+            "code": "upstream_finish_reason",
+            "message": f"Chat Completions ended with finish_reason={finish_reason!r}",
+        },
+    )
+
+
 def openai_response_to_responses_api(resp, model: str, request_id: "str | None" = None) -> dict:
     """Non-streaming OpenAI chat-completion response -> an OpenAI Responses
     API response object."""
     request_id = request_id or f"resp_{uuid.uuid4().hex}"
     choice = resp.choices[0]
     message = choice.message
+    status, incomplete_details, error = _responses_state_for_finish_reason(
+        getattr(choice, "finish_reason", None)
+    )
+    item_status = "completed" if status == "completed" else "incomplete"
     output = []
 
     text = getattr(message, "content", None)
@@ -685,7 +730,7 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
             {
                 "type": "message",
                 "id": f"msg_{uuid.uuid4().hex}",
-                "status": "completed",
+                "status": item_status,
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
@@ -698,21 +743,26 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
                 "call_id": tc.id,
                 "name": tc.function.name,
                 "arguments": tc.function.arguments,
-                "status": "completed",
+                "status": item_status,
             }
         )
 
     usage = _openai_usage_to_responses(getattr(resp, "usage", None))
 
-    return {
+    result = {
         "id": request_id,
         "object": "response",
         "created_at": time.time(),
-        "status": "completed",
+        "status": status,
         "model": model,
         "output": output,
         "usage": usage,
     }
+    if incomplete_details is not None:
+        result["incomplete_details"] = incomplete_details
+    if error is not None:
+        result["error"] = error
+    return result
 
 
 def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" = None):
@@ -747,6 +797,7 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
     output_tokens = 0
     cached_input_tokens = None
     reasoning_output_tokens = None
+    response_finish_reason = None
 
     for chunk in chunks:
         usage = getattr(chunk, "usage", None)
@@ -763,6 +814,9 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                 reasoning_output_tokens = reasoning_tokens
 
         for choice in getattr(chunk, "choices", None) or []:
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason is not None:
+                response_finish_reason = finish_reason
             delta = choice.delta
             content = getattr(delta, "content", None)
             if content:
@@ -845,9 +899,24 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                     )
                     output_index += 1
                 fn = getattr(tc, "function", None)
+                call_id = getattr(tc, "id", None)
+                if call_id:
+                    tool_blocks[tc_index]["call_id"] = call_id
+                name = getattr(fn, "name", None) if fn else None
+                if name:
+                    current_name = tool_blocks[tc_index]["name"]
+                    if not current_name or name.startswith(current_name):
+                        tool_blocks[tc_index]["name"] = name
+                    elif not current_name.endswith(name):
+                        tool_blocks[tc_index]["name"] += name
                 arguments = getattr(fn, "arguments", None) if fn else None
                 if arguments:
                     tool_blocks[tc_index]["args_parts"].append(arguments)
+
+    response_status, incomplete_details, response_error = _responses_state_for_finish_reason(
+        response_finish_reason
+    )
+    item_status = "completed" if response_status == "completed" else "incomplete"
 
     if text_item_id is not None:
         # No tool call ever followed this text item, so output_index was
@@ -861,7 +930,7 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                 "item": {
                     "type": "message",
                     "id": text_item_id,
-                    "status": "completed",
+                    "status": item_status,
                     "role": "assistant",
                     "content": [
                         {"type": "output_text", "text": "".join(text_parts), "annotations": []}
@@ -882,7 +951,7 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                     "call_id": block["call_id"],
                     "name": block["name"],
                     "arguments": "".join(block["args_parts"]),
-                    "status": "completed",
+                    "status": item_status,
                 },
             },
         )
@@ -897,19 +966,19 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
     if reasoning_output_tokens is not None:
         response_usage["output_tokens_details"] = {"reasoning_tokens": reasoning_output_tokens}
 
-    yield _sse(
-        "response.completed",
-        {
-            "type": "response.completed",
-            "response": {
-                "id": request_id,
-                "object": "response",
-                "status": "completed",
-                "model": model,
-                "usage": response_usage,
-            },
-        },
-    )
+    response = {
+        "id": request_id,
+        "object": "response",
+        "status": response_status,
+        "model": model,
+        "usage": response_usage,
+    }
+    if incomplete_details is not None:
+        response["incomplete_details"] = incomplete_details
+    if response_error is not None:
+        response["error"] = response_error
+    event_type = f"response.{response_status}"
+    yield _sse(event_type, {"type": event_type, "response": response})
 
 
 __all__ = [

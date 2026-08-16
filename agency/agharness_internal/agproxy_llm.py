@@ -26,6 +26,7 @@ wire-format detail.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import socket
@@ -275,7 +276,13 @@ class agProxyLLM:
 
     def _log_request(self, route: str, token: str, model: str) -> None:
         with self._lock:
-            self.request_log.append({"route": route, "token": token, "model": model})
+            self.request_log.append(
+                {
+                    "route": route,
+                    "token_fingerprint": hashlib.sha256(token.encode()).hexdigest()[:16],
+                    "model": model,
+                }
+            )
 
     # -- token <-> agent registry -- lives entirely on the terminus now ----
 

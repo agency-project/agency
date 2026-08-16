@@ -233,6 +233,7 @@ def _validated_session_record(ag: agent) -> dict:
         "blob_b64",
         "agcontext_revision",
         "codex_version",
+        "rollout_cli_version",
     }
     _require(required <= set(record), "the persisted Codex session record is incomplete")
     _require(
@@ -264,6 +265,10 @@ def _validated_session_record(ag: agent) -> dict:
     _require(
         isinstance(record["codex_version"], str) and bool(record["codex_version"]),
         "the Codex session record has no CLI version",
+    )
+    _require(
+        isinstance(record["rollout_cli_version"], str) and bool(record["rollout_cli_version"]),
+        "the Codex session record has no rollout format version",
     )
     return record
 

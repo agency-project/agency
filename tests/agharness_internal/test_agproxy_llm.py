@@ -565,7 +565,8 @@ def test_request_log_records_authenticated_chat_completions_calls():
     )
     assert len(px.request_log) == 1
     assert px.request_log[0]["route"] == "/v1/chat/completions"
-    assert px.request_log[0]["token"] == "tok"
+    assert px.request_log[0]["token_fingerprint"]
+    assert "tok" not in px.request_log[0].values()
 
 
 def test_request_log_does_not_record_unauthenticated_calls():

@@ -470,8 +470,9 @@ def test_responses_tools_to_openai_flattens_to_nested():
 
 def test_responses_request_to_openai_matches_captured_codex_0_140_function_subset():
     body = json.loads((_FIXTURES / "responses_request_function_tools_v0_140.json").read_text())
+    translation_warnings = []
 
-    kwargs = responses_request_to_openai(body)
+    kwargs = responses_request_to_openai(body, warning_handler=translation_warnings.append)
 
     assert kwargs["messages"] == [
         {"role": "system", "content": "You are a coding agent."},
@@ -507,6 +508,8 @@ def test_responses_request_to_openai_matches_captured_codex_0_140_function_subse
     assert kwargs["verbosity"] == "low"
     assert kwargs["store"] is False
     assert kwargs["prompt_cache_key"] == "thread-redacted"
+    assert len(translation_warnings) == 1
+    assert "opaque-reasoning continuity is unavailable" in translation_warnings[0]
     assert kwargs["stream"] is True
 
 
@@ -681,6 +684,25 @@ def test_openai_response_to_responses_api_preserves_cached_and_reasoning_usage()
     }
 
 
+@pytest.mark.parametrize(
+    ("finish_reason", "expected_reason"),
+    [("length", "max_output_tokens"), ("content_filter", "content_filter")],
+)
+def test_openai_response_to_responses_api_does_not_complete_truncated_output(
+    finish_reason, expected_reason
+):
+    resp = _Response(
+        [_Choice(message=_Message(content="partial"), finish_reason=finish_reason)],
+        usage=_Usage(3, 4),
+    )
+
+    out = openai_response_to_responses_api(resp, "m")
+
+    assert out["status"] == "incomplete"
+    assert out["incomplete_details"] == {"reason": expected_reason}
+    assert out["output"][0]["status"] == "incomplete"
+
+
 # ---------------------------------------------------------------------------
 # OpenAI streaming chunks -> Responses API SSE
 # ---------------------------------------------------------------------------
@@ -731,6 +753,22 @@ def test_openai_chunks_to_responses_sse_preserves_cached_and_reasoning_usage():
     }
 
 
+def test_openai_chunks_to_responses_sse_does_not_complete_length_truncation():
+    chunks = [
+        _Chunk(choices=[_Choice(delta=_Delta(content="partial"))]),
+        _Chunk(choices=[_Choice(delta=_Delta(), finish_reason="length")]),
+    ]
+
+    frames = "".join(openai_chunks_to_responses_sse(chunks, "m"))
+    events = _parse_sse(frames)
+
+    assert events[-1][0] == "response.incomplete"
+    assert events[-1][1]["response"]["status"] == "incomplete"
+    assert events[-1][1]["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+    done = next(data for event, data in events if event == "response.output_item.done")
+    assert done["item"]["status"] == "incomplete"
+
+
 def test_openai_chunks_to_responses_sse_function_call_stream():
     chunks = [
         _Chunk(
@@ -757,6 +795,46 @@ def test_openai_chunks_to_responses_sse_function_call_stream():
     events = _parse_sse(frames)
     done_items = [d["item"] for t, d in events if t == "response.output_item.done"]
     fc_item = next(i for i in done_items if i["type"] == "function_call")
+    assert fc_item["call_id"] == "call1"
     assert fc_item["name"] == "get_weather"
     assert fc_item["arguments"] == '{"city": "SF"}'
-    assert fc_item["call_id"] == "call1"
+
+
+def test_openai_chunks_to_responses_sse_accepts_fragmented_tool_metadata():
+    chunks = [
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[_ToolCall(id="", name="exec_", arguments="{", index=0)]
+                    )
+                )
+            ]
+        ),
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[
+                            _ToolCall(
+                                id="call-late",
+                                name="command",
+                                arguments='"cmd":"pwd"}',
+                                index=0,
+                            )
+                        ]
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ]
+        ),
+    ]
+
+    frames = "".join(openai_chunks_to_responses_sse(chunks, "m"))
+    events = _parse_sse(frames)
+    done_items = [data["item"] for event, data in events if event == "response.output_item.done"]
+    function_call = next(item for item in done_items if item["type"] == "function_call")
+
+    assert function_call["call_id"] == "call-late"
+    assert function_call["name"] == "exec_command"
+    assert function_call["arguments"] == '{"cmd":"pwd"}'

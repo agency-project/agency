@@ -24,6 +24,7 @@ shouldn't reach into a sibling object's in-process state to do its job.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import ssl
 import sys
@@ -98,11 +99,28 @@ def _serialize_usage(usage) -> "dict | None":
         return None
     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
     completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-    return {
+    result = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens),
     }
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    cached_tokens = (
+        prompt_details.get("cached_tokens")
+        if isinstance(prompt_details, dict)
+        else getattr(prompt_details, "cached_tokens", None)
+    )
+    if cached_tokens is not None:
+        result["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = (
+        completion_details.get("reasoning_tokens")
+        if isinstance(completion_details, dict)
+        else getattr(completion_details, "reasoning_tokens", None)
+    )
+    if reasoning_tokens is not None:
+        result["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+    return result
 
 
 def _serialize_tool_calls(tool_calls) -> "list | None":
@@ -354,7 +372,12 @@ class agLLMTerminus:
                 )
             kwargs = body.get("kwargs") or {}
             with self._lock:
-                self.request_log.append({"token": token, "model": kwargs.get("model", "")})
+                self.request_log.append(
+                    {
+                        "token_fingerprint": hashlib.sha256(token.encode()).hexdigest()[:16],
+                        "model": kwargs.get("model", ""),
+                    }
+                )
             timeout_s = _AgLLMTerminusFields(self._agconfig).request_timeout_s
             client = ag.llm.backend.make_client(httpx.Timeout(timeout_s))
             model = kwargs.get("model", "")

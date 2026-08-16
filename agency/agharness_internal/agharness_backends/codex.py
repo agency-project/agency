@@ -82,8 +82,18 @@ def _valid_rollout_relative_path(value: object) -> str | None:
     return path.as_posix()
 
 
-def _rollout_matches_session(blob: bytes, session_id: str) -> bool:
-    """Reject a valid-looking path containing another thread's rollout."""
+def _canonical_session_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        return None
+    return canonical if value.lower() == canonical else None
+
+
+def _rollout_session_metadata(blob: bytes) -> dict | None:
+    """Read the authoritative metadata emitted at the start of a rollout."""
     for raw_line in blob.splitlines()[:32]:
         try:
             event = json.loads(raw_line)
@@ -92,10 +102,27 @@ def _rollout_matches_session(blob: bytes, session_id: str) -> bool:
         if not isinstance(event, dict) or event.get("type") != "session_meta":
             continue
         payload = event.get("payload")
-        return isinstance(payload, dict) and payload.get("id") == session_id
-    # Older Codex rollouts did not always expose the same metadata envelope.
-    # Requiring the id to occur in the file still prevents accidental swaps.
-    return session_id.encode() in blob
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _rollout_matches_session(
+    blob: bytes,
+    session_id: str,
+    *,
+    workspace: str,
+    rollout_cli_version: str | None = None,
+) -> bool:
+    """Reject corrupt, swapped, or workspace-incompatible native state."""
+    metadata = _rollout_session_metadata(blob)
+    if metadata is None:
+        return False
+    if metadata.get("id") != session_id or metadata.get("cwd") != workspace:
+        return False
+    metadata_version = metadata.get("cli_version")
+    if not isinstance(metadata_version, str) or not metadata_version:
+        return False
+    return rollout_cli_version is None or metadata_version == rollout_cli_version
 
 
 def _rollout_paths(sandbox, in_container: bool, config_home: str) -> list[str]:
@@ -142,27 +169,36 @@ def _restore_native_session(
     *,
     context_revision: int,
     codex_version: str | None,
+    workspace: str,
 ) -> str | None:
     if not isinstance(prior, dict):
         return None
-    session_id = prior.get("session_id")
+    session_id = _canonical_session_id(prior.get("session_id"))
     relative_path = _valid_rollout_relative_path(prior.get("rollout_path"))
     encoded = prior.get("blob_b64")
+    rollout_cli_version = prior.get("rollout_cli_version")
     if (
-        not isinstance(session_id, str)
-        or not session_id
+        session_id is None
         or relative_path is None
         or not isinstance(encoded, str)
+        or not isinstance(rollout_cli_version, str)
+        or not rollout_cli_version
         or prior.get("agcontext_revision") != context_revision
         or codex_version is None
         or prior.get("codex_version") != codex_version
+        or rollout_cli_version != codex_version
     ):
         return None
     try:
         blob = base64.b64decode(encoded, validate=True)
     except (ValueError, TypeError):
         return None
-    if not _rollout_matches_session(blob, session_id):
+    if not _rollout_matches_session(
+        blob,
+        session_id,
+        workspace=workspace,
+        rollout_cli_version=rollout_cli_version,
+    ):
         return None
     try:
         _write_file(
@@ -184,15 +220,26 @@ def _capture_native_session(
     *,
     next_context_revision: int,
     codex_version: str | None,
+    workspace: str,
 ) -> dict | None:
-    if codex_version is None:
+    session_id = _canonical_session_id(session_id)
+    if codex_version is None or session_id is None:
         return None
     path = _find_rollout(sandbox, in_container, config_home, session_id)
     if path is None:
         return None
     relative_path = _relative_rollout_path(config_home, path)
     blob = _read_file(sandbox, in_container, path)
-    if relative_path is None or blob is None or not _rollout_matches_session(blob, session_id):
+    metadata = _rollout_session_metadata(blob) if blob is not None else None
+    rollout_cli_version = metadata.get("cli_version") if metadata is not None else None
+    if (
+        relative_path is None
+        or blob is None
+        or not isinstance(rollout_cli_version, str)
+        or not rollout_cli_version
+        or rollout_cli_version != codex_version
+        or not _rollout_matches_session(blob, session_id, workspace=workspace)
+    ):
         return None
     return {
         "session_id": session_id,
@@ -200,6 +247,7 @@ def _capture_native_session(
         "blob_b64": base64.b64encode(blob).decode("ascii"),
         "agcontext_revision": next_context_revision,
         "codex_version": codex_version,
+        "rollout_cli_version": rollout_cli_version,
     }
 
 
@@ -512,6 +560,7 @@ class _CodexBackend(agharness_backend):
                 prior,
                 context_revision=prev_ctx.revision,
                 codex_version=codex_version,
+                workspace=workspace,
             )
             if prior is not None and resume_session_id is None and isinstance(sessions, dict):
                 sessions.pop(_ENGINE_KEY, None)
@@ -581,6 +630,12 @@ class _CodexBackend(agharness_backend):
                     break
 
                 summary = _parse_codex_jsonl(stdout)
+                # A completed Codex turn is billable even when a later
+                # protocol problem or structured-output retry makes the
+                # overall skill call fail.  Account for each parsed attempt
+                # before taking any error/fallback branch.
+                total_input_tokens += summary.input_tokens
+                total_output_tokens += summary.output_tokens
                 if summary.error is not None:
                     if (
                         resume_session_id == restored_session_id
@@ -601,23 +656,23 @@ class _CodexBackend(agharness_backend):
                     protocol_error = summary.error
                     break
 
-                total_input_tokens += summary.input_tokens
-                total_output_tokens += summary.output_tokens
                 latest_file = _read_file(ag.sandbox, in_container, final_message_path)
                 if latest_file is not None and latest_file.strip():
                     final_text = latest_file.decode("utf-8", errors="replace").strip()
                 else:
                     final_text = summary.final_text
 
-                if summary.session_id:
-                    resume_session_id = summary.session_id
+                completed_session_id = _canonical_session_id(summary.session_id)
+                if completed_session_id:
+                    resume_session_id = completed_session_id
                     pending_session = _capture_native_session(
                         ag.sandbox,
                         in_container,
                         str(config_home),
-                        summary.session_id,
+                        completed_session_id,
                         next_context_revision=prev_ctx.revision + 1,
                         codex_version=codex_version,
+                        workspace=workspace,
                     )
 
                 collected_output = mcp_server.collected_output(token)
@@ -675,13 +730,22 @@ class _CodexBackend(agharness_backend):
                 except Exception as exc:
                     print(f"[agharness] WARNING: failed to stop Codex MCP relay: {exc}")
             if config_home is not None:
-                if in_container:
-                    agharness.cleanup_config_home_in_container(ag.sandbox, str(config_home))
-                else:
-                    agharness.cleanup_config_home(config_home)
+                try:
+                    if in_container:
+                        agharness.cleanup_config_home_in_container(ag.sandbox, str(config_home))
+                    else:
+                        agharness.cleanup_config_home(config_home)
+                except Exception as exc:
+                    # Teardown diagnostics must not replace the Codex result
+                    # (or the original setup/process failure) already in hand.
+                    print(f"[agharness] WARNING: failed to clean up Codex config home: {exc}")
 
         if setup_error is not None:
+            prev_ctx.total_input_tokens += total_input_tokens
+            prev_ctx.total_output_tokens += total_output_tokens
             return agerror(f"Codex setup/execution failed: {setup_error}"), prev_ctx, [sys_msg]
+        prev_ctx.total_input_tokens += total_input_tokens
+        prev_ctx.total_output_tokens += total_output_tokens
         if rc == -1:
             return (
                 agerror(
@@ -726,11 +790,13 @@ class _CodexBackend(agharness_backend):
                 sessions[_ENGINE_KEY] = pending_session
             self.session_resume_id = pending_session["session_id"]
 
-        prev_ctx.total_input_tokens += total_input_tokens
-        prev_ctx.total_output_tokens += total_output_tokens
-
         if isinstance(transcript, list) and transcript:
-            history = transcript[1:] if transcript[0].get("role") == "system" else transcript
+            # A Codex Responses request normally becomes two system messages
+            # at the Chat Completions boundary: top-level ``instructions``
+            # plus the developer message in ``input``.  Neither belongs in
+            # Agency's portable conversation history; the next invocation
+            # regenerates its own developer instructions from the skill.
+            history = [message for message in transcript if message.get("role") != "system"]
             prev_ctx.messages = history
             delta = [sys_msg, *history]
         else:

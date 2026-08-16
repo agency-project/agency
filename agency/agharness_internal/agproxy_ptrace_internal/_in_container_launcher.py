@@ -449,14 +449,26 @@ def start_tcp_relay(sandbox, uds_path: str) -> "tuple[subprocess.Popen, int]":
     )
     ready_line = proc.stdout.readline()
     if ready_line.strip() != "READY":
-        proc.terminate()
+        stop_tcp_relay(proc)
         raise RuntimeError(f"in-container TCP-to-UDS relay failed to start: {ready_line!r}")
     return proc, port
 
 
-def stop_tcp_relay(proc: "subprocess.Popen | None") -> None:
+def stop_tcp_relay(proc: "subprocess.Popen | None", timeout_s: float = 5) -> None:
+    """Terminate, drain, and reap a per-run container relay process."""
     if proc is not None:
-        proc.terminate()
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.communicate()
+            except (OSError, ValueError):
+                pass
+        except (OSError, ValueError):
+            pass
 
 
 def _runtime_and_container_name(sandbox) -> "tuple[str, str]":

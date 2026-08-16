@@ -116,6 +116,29 @@ def test_valid_token_non_streaming_dispatch():
     ag.llm.backend.make_client.assert_called_once()
 
 
+def test_dispatch_preserves_cached_and_reasoning_usage_details():
+    usage = CompletionUsage(
+        prompt_tokens=11,
+        completion_tokens=7,
+        total_tokens=18,
+        prompt_tokens_details={"cached_tokens": 4},
+        completion_tokens_details={"reasoning_tokens": 3},
+    )
+    term, _, _ = _make_terminus_with_agent(
+        token="tok", single_result=_completion(content="hi", usage=usage)
+    )
+    client = _client_for(term)
+
+    resp = client.post(
+        "/internal/dispatch",
+        json={"token": "tok", "kwargs": {"model": "m", "messages": [], "stream": False}},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["usage"]["prompt_tokens_details"] == {"cached_tokens": 4}
+    assert resp.json()["usage"]["completion_tokens_details"] == {"reasoning_tokens": 3}
+
+
 def test_dispatch_records_request_log_entry():
     """The one place a caller can prove a real credentialed dispatch
     happened, regardless of which process/engine routed the request here
@@ -127,7 +150,9 @@ def test_dispatch_records_request_log_entry():
     kwargs = {"model": "claude-x", "messages": [], "stream": False}
     client.post("/internal/dispatch", json={"token": "tok", "kwargs": kwargs})
     assert len(term.request_log) == 1
-    assert term.request_log[0] == {"token": "tok", "model": "claude-x"}
+    assert term.request_log[0]["model"] == "claude-x"
+    assert term.request_log[0]["token_fingerprint"]
+    assert "tok" not in term.request_log[0].values()
 
 
 def test_dispatch_does_not_record_unauthenticated_calls():
