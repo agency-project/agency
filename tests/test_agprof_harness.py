@@ -74,7 +74,7 @@ _BARE_THREAD_ALLOWLIST = {
     (
         "agency/agharness_internal/agproxy_ptrace_internal/_in_container_entrypoint.py",
         "_Tracer.run",
-    ): (2, "subprocess pipe drainers"),
+    ): (3, "stdin writer and subprocess pipe drainers"),
     (
         "agency/agharness_internal/agproxy_ptrace_internal/_in_container_launcher.py",
         "InContainerRelay.start",
@@ -98,7 +98,7 @@ _BARE_THREAD_ALLOWLIST = {
     (
         "agency/agharness_internal/agproxy_ptrace_internal/_tracer_loop.py",
         "TracerLoop._fork_and_exec",
-    ): (2, "subprocess pipe readers"),
+    ): (3, "stdin writer and subprocess pipe readers"),
     # General background I/O and UI maintenance.
     ("agency/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
     ("agency/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
