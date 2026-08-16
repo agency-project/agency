@@ -92,8 +92,8 @@ _session_started_ns: "int | None" = None
 _session_sample_hz = 0.0
 _session_sample_gpu = False
 
-# Filtered automatic Python call intervals, captured with Python 3.12+
-# sys.monitoring. These remain separate from semantic OTel spans so users can
+# Filtered automatic Python call intervals.
+# These remain separate from semantic OTel spans so users can
 # keep intentional agprof.span() overlays without losing unannotated work.
 _auto_records: list[tuple] = []
 _auto_stacks: "dict[tuple[int, int], list[tuple]]" = {}
@@ -282,8 +282,7 @@ def _ensure_environment_cgroup() -> None:
         current = _current_cgroup_dir()
         if not _CGROUP_SCOPE_RE.fullmatch(user_scope) or current.name != user_scope:
             raise RuntimeError(
-                f"agprof: user-scope marker {user_scope!r} does not match "
-                f"process cgroup {current}"
+                f"agprof: user-scope marker {user_scope!r} does not match process cgroup {current}"
             )
         os.environ[_CGROUP_DIR_ENV] = str(current)
         os.environ.pop(_CGROUP_PARENT_ENV, None)
@@ -311,9 +310,7 @@ def _ensure_environment_cgroup() -> None:
         try:
             os.execvp(command[0], command)
         except OSError as e:
-            raise RuntimeError(
-                "agprof: unable to enter the unprivileged user systemd scope"
-            ) from e
+            raise RuntimeError("agprof: unable to enter the unprivileged user systemd scope") from e
         return  # pragma: no cover - os.execvp never returns in production
 
     raise RuntimeError(
