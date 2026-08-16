@@ -513,7 +513,95 @@ def test_responses_request_to_openai_matches_captured_codex_0_140_function_subse
     assert kwargs["stream"] is True
 
 
-@pytest.mark.parametrize("tool_type", ["namespace", "custom", "web_search"])
+def test_responses_request_to_openai_loads_tool_search_namespace_results():
+    tool_name_map = {}
+    loaded_namespace = {
+        "type": "namespace",
+        "name": "mcp__agency",
+        "description": "Tools in the mcp__agency namespace.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "submit_output",
+                "description": "Submit one output field.",
+                "strict": False,
+                "defer_loading": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string"},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["field", "value"],
+                },
+            }
+        ],
+    }
+    body = {
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "Return structured output."},
+            {
+                "type": "tool_search_call",
+                "call_id": "search-1",
+                "execution": "client",
+                "arguments": {"query": "submit_output", "limit": 1},
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "search-1",
+                "status": "completed",
+                "execution": "client",
+                "tools": [loaded_namespace],
+            },
+            {
+                "type": "function_call",
+                "call_id": "submit-1",
+                "namespace": "mcp__agency",
+                "name": "submit_output",
+                "arguments": '{"field":"status","value":"done"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "submit-1",
+                "output": "accepted",
+            },
+        ],
+        "tools": [
+            {
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search available tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ],
+        "tool_choice": "auto",
+    }
+
+    kwargs = responses_request_to_openai(body, tool_name_map=tool_name_map)
+
+    assert [tool["function"]["name"] for tool in kwargs["tools"]] == [
+        "tool_search",
+        "mcp__agency__submit_output",
+    ]
+    assert kwargs["messages"][1]["tool_calls"][0]["function"] == {
+        "name": "tool_search",
+        "arguments": '{"query":"submit_output","limit":1}',
+    }
+    assert json.loads(kwargs["messages"][2]["content"])["tools"] == [loaded_namespace]
+    assert kwargs["messages"][3]["tool_calls"][0]["function"] == {
+        "name": "mcp__agency__submit_output",
+        "arguments": '{"field":"status","value":"done"}',
+    }
+    assert tool_name_map["tool_search"]["response_type"] == "tool_search_call"
+    assert tool_name_map["mcp__agency__submit_output"]["namespace"] == "mcp__agency"
+
+
+@pytest.mark.parametrize("tool_type", ["custom", "web_search"])
 def test_responses_tools_to_openai_warns_and_omits_nonfunction_tools(tool_type):
     warnings = []
 
@@ -524,6 +612,101 @@ def test_responses_tools_to_openai_warns_and_omits_nonfunction_tools(tool_type):
     assert converted is None
     assert len(warnings) == 1
     assert repr(tool_type) in warnings[0]
+
+
+def test_responses_tools_to_openai_flattens_namespace_functions_reversibly():
+    tool_name_map = {}
+    converted = responses_tools_to_openai(
+        [
+            {
+                "type": "namespace",
+                "name": "mcp__agency",
+                "description": "Agency harness tools.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "submit_output",
+                        "description": "Submit one output field.",
+                        "strict": False,
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        ],
+        tool_name_map=tool_name_map,
+    )
+
+    function = converted[0]["function"]
+    assert function["name"] == "mcp__agency__submit_output"
+    assert function["description"] == "Agency harness tools.\n\nSubmit one output field."
+    assert tool_name_map["mcp__agency__submit_output"]["namespace"] == "mcp__agency"
+    assert tool_name_map["mcp__agency__submit_output"]["name"] == "submit_output"
+
+
+def test_responses_tools_to_openai_warns_and_omits_namespace_custom_child():
+    translation_warnings = []
+
+    converted = responses_tools_to_openai(
+        [
+            {
+                "type": "namespace",
+                "name": "mcp__agency",
+                "tools": [{"type": "custom", "name": "freeform"}],
+            }
+        ],
+        warning_handler=translation_warnings.append,
+    )
+
+    assert converted is None
+    assert len(translation_warnings) == 1
+    assert "namespace 'mcp__agency' child tool type 'custom'" in translation_warnings[0]
+
+
+def test_responses_tools_to_openai_maps_client_tool_search():
+    tool_name_map = {}
+    converted = responses_tools_to_openai(
+        [
+            {
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search available tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ],
+        tool_name_map=tool_name_map,
+    )
+
+    assert converted[0]["function"]["name"] == "tool_search"
+    assert converted[0]["function"]["parameters"]["required"] == ["query"]
+    assert tool_name_map["tool_search"]["response_type"] == "tool_search_call"
+
+
+def test_responses_tools_to_openai_rejects_flattened_name_collision():
+    with pytest.raises(UnsupportedResponsesRequest, match="collide"):
+        responses_tools_to_openai(
+            [
+                {
+                    "type": "function",
+                    "name": "mcp__agency__submit_output",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "type": "namespace",
+                    "name": "mcp__agency",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "submit_output",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+            ]
+        )
 
 
 def test_responses_tools_to_openai_keeps_functions_when_custom_tool_is_omitted():
@@ -648,7 +831,10 @@ def test_responses_request_to_openai_rejects_required_choice_without_function_to
 
 
 def test_openai_response_to_responses_api_text_only():
-    resp = _Response([_Choice(message=_Message(content="the answer is 4"))], usage=_Usage(3, 4))
+    resp = _Response(
+        [_Choice(message=_Message(content="the answer is 4"), finish_reason="stop")],
+        usage=_Usage(3, 4),
+    )
     out = openai_response_to_responses_api(resp, "m", request_id="resp_1")
     assert out["id"] == "resp_1"
     assert out["status"] == "completed"
@@ -661,7 +847,10 @@ def test_openai_response_to_responses_api_text_only():
 
 def test_openai_response_to_responses_api_function_call():
     tc = _ToolCall(id="call1", name="get_weather", arguments='{"city": "SF"}')
-    resp = _Response([_Choice(message=_Message(content=None, tool_calls=[tc]))], usage=_Usage(1, 1))
+    resp = _Response(
+        [_Choice(message=_Message(content=None, tool_calls=[tc]), finish_reason="tool_calls")],
+        usage=_Usage(1, 1),
+    )
     out = openai_response_to_responses_api(resp, "m")
     assert out["output"][0]["type"] == "function_call"
     assert out["output"][0]["call_id"] == "call1"
@@ -669,9 +858,63 @@ def test_openai_response_to_responses_api_function_call():
     assert out["output"][0]["arguments"] == '{"city": "SF"}'
 
 
+def test_openai_response_to_responses_api_restores_namespace_function_call():
+    tc = _ToolCall(
+        id="call1",
+        name="mcp__agency__submit_output",
+        arguments='{"field":"status","value":"done"}',
+    )
+    resp = _Response(
+        [_Choice(message=_Message(content=None, tool_calls=[tc]), finish_reason="tool_calls")],
+        usage=_Usage(1, 1),
+    )
+    tool_name_map = {
+        "mcp__agency__submit_output": {
+            "response_type": "function_call",
+            "namespace": "mcp__agency",
+            "name": "submit_output",
+        }
+    }
+
+    out = openai_response_to_responses_api(resp, "m", tool_name_map=tool_name_map)
+
+    assert out["output"][0]["type"] == "function_call"
+    assert out["output"][0]["namespace"] == "mcp__agency"
+    assert out["output"][0]["name"] == "submit_output"
+
+
+def test_openai_response_to_responses_api_restores_tool_search_call():
+    tc = _ToolCall(
+        id="search-1", name="tool_search", arguments='{"query":"submit_output","limit":1}'
+    )
+    resp = _Response(
+        [_Choice(message=_Message(content=None, tool_calls=[tc]), finish_reason="tool_calls")],
+        usage=_Usage(1, 1),
+    )
+    tool_name_map = {
+        "tool_search": {
+            "response_type": "tool_search_call",
+            "namespace": None,
+            "name": "tool_search",
+            "execution": "client",
+        }
+    }
+
+    out = openai_response_to_responses_api(resp, "m", tool_name_map=tool_name_map)
+
+    assert out["output"][0] == {
+        "type": "tool_search_call",
+        "id": out["output"][0]["id"],
+        "call_id": "search-1",
+        "execution": "client",
+        "arguments": {"query": "submit_output", "limit": 1},
+        "status": "completed",
+    }
+
+
 def test_openai_response_to_responses_api_preserves_cached_and_reasoning_usage():
     usage = _Usage(11, 7, cached_tokens=4, reasoning_tokens=3)
-    resp = _Response([_Choice(message=_Message(content="done"))], usage=usage)
+    resp = _Response([_Choice(message=_Message(content="done"), finish_reason="stop")], usage=usage)
 
     out = openai_response_to_responses_api(resp, "m")
 
@@ -682,6 +925,16 @@ def test_openai_response_to_responses_api_preserves_cached_and_reasoning_usage()
         "output_tokens_details": {"reasoning_tokens": 3},
         "total_tokens": 18,
     }
+
+
+def test_openai_response_to_responses_api_rejects_missing_finish_reason():
+    resp = _Response([_Choice(message=_Message(content="partial"))], usage=_Usage(1, 1))
+
+    out = openai_response_to_responses_api(resp, "m")
+
+    assert out["status"] == "failed"
+    assert out["error"]["code"] == "missing_finish_reason"
+    assert out["output"][0]["status"] == "incomplete"
 
 
 @pytest.mark.parametrize(
@@ -731,6 +984,7 @@ def test_openai_chunks_to_responses_sse_text_stream():
 def test_openai_chunks_to_responses_sse_preserves_cached_and_reasoning_usage():
     chunks = [
         _Chunk(choices=[_Choice(delta=_Delta(content="done"))]),
+        _Chunk(choices=[_Choice(delta=_Delta(), finish_reason="stop")]),
         _Chunk(
             usage=_Usage(
                 prompt_tokens=11,
@@ -751,6 +1005,40 @@ def test_openai_chunks_to_responses_sse_preserves_cached_and_reasoning_usage():
         "output_tokens_details": {"reasoning_tokens": 3},
         "total_tokens": 18,
     }
+
+
+def test_openai_chunks_to_responses_sse_rejects_empty_stream():
+    events = _parse_sse("".join(openai_chunks_to_responses_sse([], "m")))
+
+    assert events[-1][0] == "response.failed"
+    assert events[-1][1]["response"]["status"] == "failed"
+    assert events[-1][1]["response"]["error"]["code"] == "missing_finish_reason"
+
+
+def test_openai_chunks_to_responses_sse_rejects_unterminated_partial_stream():
+    chunks = [_Chunk(choices=[_Choice(delta=_Delta(content="partial"))])]
+
+    events = _parse_sse("".join(openai_chunks_to_responses_sse(chunks, "m")))
+
+    assert events[-1][0] == "response.failed"
+    assert events[-1][1]["response"]["error"]["code"] == "missing_finish_reason"
+    done = next(data for event, data in events if event == "response.output_item.done")
+    assert done["item"]["status"] == "incomplete"
+
+
+def test_openai_chunks_to_responses_sse_emits_failure_after_provider_stream_error():
+    def broken_chunks():
+        yield _Chunk(choices=[_Choice(delta=_Delta(content="partial"))])
+        raise RuntimeError("provider stream disconnected")
+
+    events = _parse_sse("".join(openai_chunks_to_responses_sse(broken_chunks(), "m")))
+
+    assert events[-1][0] == "response.failed"
+    response = events[-1][1]["response"]
+    assert response["status"] == "failed"
+    assert response["error"]["code"] == "upstream_stream_error"
+    assert "provider stream disconnected" in response["error"]["message"]
+    assert not any(event == "response.completed" for event, _data in events)
 
 
 def test_openai_chunks_to_responses_sse_does_not_complete_length_truncation():
@@ -798,6 +1086,83 @@ def test_openai_chunks_to_responses_sse_function_call_stream():
     assert fc_item["call_id"] == "call1"
     assert fc_item["name"] == "get_weather"
     assert fc_item["arguments"] == '{"city": "SF"}'
+
+
+def test_openai_chunks_to_responses_sse_restores_namespace_function_call():
+    chunks = [
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[
+                            _ToolCall(
+                                id="submit-1",
+                                name="mcp__agency__submit_output",
+                                arguments='{"field":"status"}',
+                                index=0,
+                            )
+                        ]
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+    ]
+    tool_name_map = {
+        "mcp__agency__submit_output": {
+            "response_type": "function_call",
+            "namespace": "mcp__agency",
+            "name": "submit_output",
+        }
+    }
+
+    events = _parse_sse(
+        "".join(openai_chunks_to_responses_sse(chunks, "m", tool_name_map=tool_name_map))
+    )
+    done = next(data["item"] for event, data in events if event == "response.output_item.done")
+
+    assert done["type"] == "function_call"
+    assert done["namespace"] == "mcp__agency"
+    assert done["name"] == "submit_output"
+
+
+def test_openai_chunks_to_responses_sse_restores_tool_search_call():
+    chunks = [
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[
+                            _ToolCall(
+                                id="search-1",
+                                name="tool_search",
+                                arguments='{"query":"submit_output","limit":1}',
+                                index=0,
+                            )
+                        ]
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+    ]
+    tool_name_map = {
+        "tool_search": {
+            "response_type": "tool_search_call",
+            "namespace": None,
+            "name": "tool_search",
+            "execution": "client",
+        }
+    }
+
+    events = _parse_sse(
+        "".join(openai_chunks_to_responses_sse(chunks, "m", tool_name_map=tool_name_map))
+    )
+    done = next(data["item"] for event, data in events if event == "response.output_item.done")
+
+    assert done["type"] == "tool_search_call"
+    assert done["execution"] == "client"
+    assert done["arguments"] == {"query": "submit_output", "limit": 1}
 
 
 def test_openai_chunks_to_responses_sse_accepts_fragmented_tool_metadata():

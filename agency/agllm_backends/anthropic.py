@@ -188,10 +188,11 @@ class _FakeDelta:
 
 
 class _FakeChoice:
-    __slots__ = ("delta",)
+    __slots__ = ("delta", "finish_reason")
 
-    def __init__(self, delta: _FakeDelta) -> None:
+    def __init__(self, delta: _FakeDelta, finish_reason: "str | None" = None) -> None:
         self.delta = delta
+        self.finish_reason = finish_reason
 
 
 class _FakeUsage:
@@ -224,6 +225,7 @@ def _anthropic_stream_to_openai_chunks(stream):
     """
     input_tokens = 0
     output_tokens = 0
+    finish_reason = None
     tool_blocks: dict[int, dict] = {}  # index -> {"id", "name", "json_parts"}
 
     for event in stream:
@@ -272,6 +274,15 @@ def _anthropic_stream_to_openai_chunks(stream):
             usage = getattr(event, "usage", None)
             if usage is not None:
                 output_tokens = getattr(usage, "output_tokens", 0) or output_tokens
+            stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+            if stop_reason in ("end_turn", "stop_sequence"):
+                finish_reason = "stop"
+            elif stop_reason == "tool_use":
+                finish_reason = "tool_calls"
+            elif stop_reason in ("max_tokens", "model_context_window_exceeded"):
+                finish_reason = "length"
+            elif stop_reason == "refusal":
+                finish_reason = "content_filter"
 
     # If the stream ended (e.g. stop_reason="max_tokens") while a tool_use
     # block was still open, content_block_stop never fires for it and the
@@ -303,7 +314,8 @@ def _anthropic_stream_to_openai_chunks(stream):
             ]
         )
 
-    yield _FakeChunk(usage=_FakeUsage(input_tokens, output_tokens))
+    choices = [_FakeChoice(_FakeDelta(), finish_reason=finish_reason)] if finish_reason else []
+    yield _FakeChunk(choices=choices, usage=_FakeUsage(input_tokens, output_tokens))
 
 
 class _FakeMessage:

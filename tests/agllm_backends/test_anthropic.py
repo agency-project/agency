@@ -480,6 +480,31 @@ class TestAnthropicStreamToOpenAIChunks:
         assert final.usage.completion_tokens == 5
         assert final.choices == []
 
+    @pytest.mark.parametrize(
+        ("anthropic_reason", "openai_reason"),
+        [
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("tool_use", "tool_calls"),
+            ("max_tokens", "length"),
+            ("model_context_window_exceeded", "length"),
+            ("refusal", "content_filter"),
+        ],
+    )
+    def test_terminal_stop_reason_is_preserved(self, anthropic_reason, openai_reason):
+        stream = [
+            _ev(
+                type="message_delta",
+                delta=_ev(stop_reason=anthropic_reason),
+                usage=_ev(output_tokens=2),
+            )
+        ]
+
+        final = list(_anthropic_stream_to_openai_chunks(iter(stream)))[-1]
+
+        assert final.choices[0].finish_reason == openai_reason
+        assert final.usage.completion_tokens == 2
+
     def test_thinking_delta_emits_reasoning_content(self):
         stream = [
             _ev(type="message_start", message=_ev(usage=None)),

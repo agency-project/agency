@@ -271,6 +271,7 @@ def test_generated_config_is_isolated_authenticated_mcp_enabled_and_secret_safe(
     config = captured["config"]
     assert config["model"] == "test-model"
     assert config["model_provider"] == "agency-proxy"
+    assert config["model_reasoning_effort"] == "none"
     assert config["developer_instructions"] == 'policy with "quotes"\nand newlines'
     assert config["approval_policy"] == "never"
     assert config["sandbox_mode"] == "danger-full-access"
@@ -278,6 +279,10 @@ def test_generated_config_is_isolated_authenticated_mcp_enabled_and_secret_safe(
     assert config["features"]["apps"] is False
     assert config["features"]["plugins"] is False
     assert config["features"]["multi_agent"] is False
+    assert config["features"]["shell_snapshot"] is False, (
+        "Codex snapshots its parent environment before applying the shell policy; "
+        "enabling snapshots can resurrect the provider and MCP bearer variables"
+    )
     assert config["tools"]["web_search"] is False
     assert config["model_providers"]["agency-proxy"]["wire_api"] == "responses"
     assert config["mcp_servers"]["agency"]["required"] is True
@@ -338,6 +343,21 @@ def test_timeout_is_distinguished_from_normal_exit():
         )
     assert isinstance(result, agerror)
     assert "timed out" in result.error
+
+
+def test_process_failure_diagnostic_keeps_stderr_and_jsonl_error():
+    backend = _CodexBackend(agConfig())
+    skill = agskill(name="s", system_prompt="do the thing")
+    stdout = json.dumps(
+        {"type": "turn.failed", "error": {"message": "upstream rejected parameter"}}
+    )
+    with _runtime(_make_handle(stdout, "startup warning", 1)):
+        result, _, _ = backend.execute(
+            _make_agent(), agcontext(), agdata(task="go"), None, skill=skill
+        )
+    assert isinstance(result, agerror)
+    assert "startup warning" in result.error
+    assert "upstream rejected parameter" in result.error
 
 
 def test_session_creation_captures_portable_rollout_before_cleanup():
@@ -763,7 +783,7 @@ def test_parser_fixture_matches_captured_success_shape():
 
 @pytest.mark.skipif(_REAL_CODEX is None, reason="Codex CLI not installed")
 def test_real_codex_0140_accepts_generated_strict_config(tmp_path):
-    """Real CLI seam: config parsing is exercised; no model credentials are used."""
+    """Codex 0.140 accepts the hardened config, including disabled snapshots."""
     backend = _CodexBackend(agConfig())
     backend._write_codex_config(
         tmp_path,

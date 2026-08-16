@@ -12,26 +12,36 @@ verify this boundary directly, not just its externally-visible effect.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from unittest.mock import MagicMock, call, patch
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message_tool_call import Function
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice, ChoiceDelta
+from openai.types.chat import ChatCompletionMessageToolCall
 from openai.types.completion_usage import CompletionUsage
 
 from agency.agharness_internal.agproxy_llm import agProxyLLM, agProxyLLMConfig
 from agency.agharness_internal import agproxy_llm
 
 
-def _completion(content=None, finish_reason="stop", usage=None, id="chatcmpl-test", model="m"):
+def _completion(
+    content=None,
+    finish_reason="stop",
+    usage=None,
+    id="chatcmpl-test",
+    model="m",
+    tool_calls=None,
+):
     """A real, valid `ChatCompletion` -- these now cross a genuine HTTP
     boundary (agproxy_llm -> agllm_terminus and back) and are reconstructed
     via `ChatCompletion.model_validate()` on the way back, so a hand-rolled
     fake lacking real pydantic fields/methods no longer round-trips. See
     agproxy_llm.py's `_dispatch()`."""
-    message = ChatCompletionMessage(role="assistant", content=content)
+    message = ChatCompletionMessage(role="assistant", content=content, tool_calls=tool_calls)
     choice = Choice(index=0, finish_reason=finish_reason, message=message)
     return ChatCompletion(
         id=id,
@@ -474,6 +484,100 @@ def test_openai_responses_route_non_streaming_translates_request_and_response():
     assert call_kwargs["model"] == "configured-model"
 
 
+def test_openai_responses_route_restores_tool_search_call_identity():
+    search_call = ChatCompletionMessageToolCall(
+        id="search-1",
+        type="function",
+        function=Function(name="tool_search", arguments='{"query":"submit_output","limit":1}'),
+    )
+    px, _, fake_client = _make_gateway_with_agent(
+        token="tok",
+        single_result=_completion(
+            finish_reason="tool_calls", tool_calls=[search_call], usage=(3, 4)
+        ),
+    )
+    client = _client_for(px)
+    body = {
+        "model": "m",
+        "input": "Find the structured-output tool.",
+        "tools": [
+            {
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search available tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ],
+        "stream": False,
+    }
+
+    response = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+
+    assert response.status_code == 200
+    assert (
+        fake_client.chat.completions.create.call_args.kwargs["tools"][0]["function"]["name"]
+        == "tool_search"
+    )
+    output = response.json()["output"][0]
+    assert output["type"] == "tool_search_call"
+    assert output["execution"] == "client"
+    assert output["arguments"] == {"query": "submit_output", "limit": 1}
+
+
+def test_openai_responses_route_restores_namespace_function_identity():
+    submit_call = ChatCompletionMessageToolCall(
+        id="submit-1",
+        type="function",
+        function=Function(
+            name="mcp__agency__submit_output",
+            arguments='{"field":"status","value":"done"}',
+        ),
+    )
+    px, _, fake_client = _make_gateway_with_agent(
+        token="tok",
+        single_result=_completion(
+            finish_reason="tool_calls", tool_calls=[submit_call], usage=(3, 4)
+        ),
+    )
+    client = _client_for(px)
+    body = {
+        "model": "m",
+        "input": "Submit the result.",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "mcp__agency",
+                "description": "Agency harness tools.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "submit_output",
+                        "description": "Submit one output field.",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        ],
+        "stream": False,
+    }
+
+    response = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer tok"})
+
+    assert response.status_code == 200
+    assert (
+        fake_client.chat.completions.create.call_args.kwargs["tools"][0]["function"]["name"]
+        == "mcp__agency__submit_output"
+    )
+    output = response.json()["output"][0]
+    assert output["type"] == "function_call"
+    assert output["namespace"] == "mcp__agency"
+    assert output["name"] == "submit_output"
+
+
 def test_openai_responses_route_streaming_returns_responses_sse():
     px, ag, fake_client = _make_gateway_with_agent(token="tok")
     fake_client.chat.completions.create.return_value = [
@@ -488,7 +592,39 @@ def test_openai_responses_route_streaming_returns_responses_sse():
     assert "event: response.completed" in resp.text
 
 
-def test_openai_responses_route_warns_and_omits_unsupported_tool_type():
+def test_openai_responses_route_empty_stream_returns_failed_sse():
+    px, _, _ = _make_gateway_with_agent(token="tok", stream_result=[])
+    client = _client_for(px)
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "m", "input": "hi", "stream": True},
+        headers={"Authorization": "Bearer tok"},
+    )
+
+    assert response.status_code == 200
+    assert "event: response.failed" in response.text
+    assert "missing_finish_reason" in response.text
+    assert "event: response.completed" not in response.text
+
+
+def test_openai_responses_route_unterminated_stream_returns_failed_sse():
+    px, _, _ = _make_gateway_with_agent(token="tok", stream_result=[_chunk(content="partial")])
+    client = _client_for(px)
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "m", "input": "hi", "stream": True},
+        headers={"Authorization": "Bearer tok"},
+    )
+
+    assert response.status_code == 200
+    assert "event: response.failed" in response.text
+    assert "missing_finish_reason" in response.text
+    assert "event: response.completed" not in response.text
+
+
+def test_openai_responses_route_warns_and_omits_unsupported_custom_tool():
     px, ag, fake_client = _make_gateway_with_agent(token="tok")
     client = _client_for(px)
     body = {
@@ -503,10 +639,9 @@ def test_openai_responses_route_warns_and_omits_unsupported_tool_type():
                 "strict": False,
             },
             {
-                "type": "namespace",
-                "name": "multi_agent_v1",
-                "description": "Unsupported Responses namespace tool",
-                "tools": [],
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Unsupported Responses custom tool",
             },
         ],
         "stream": False,
@@ -520,7 +655,7 @@ def test_openai_responses_route_warns_and_omits_unsupported_tool_type():
     ag.terminal.log.assert_called_once()
     warning_prefix, warning_message = ag.terminal.log.call_args.args
     assert warning_prefix == "WARNING  "
-    assert "namespace" in warning_message
+    assert "custom" in warning_message
     assert "omitted" in warning_message
 
 
@@ -607,6 +742,74 @@ def test_request_log_records_responses_calls():
     )
     assert len(px.request_log) == 1
     assert px.request_log[0]["route"] == "/v1/responses"
+
+
+def test_responses_stream_preserves_pre_stream_provider_error_status():
+    import openai
+
+    px, _, fake_client = _make_gateway_with_agent(token="tok")
+    fake_client.chat.completions.create.side_effect = openai.BadRequestError(
+        message="unsupported parameter: verbosity",
+        response=MagicMock(status_code=400),
+        body=None,
+    )
+    client = _client_for(px)
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "m", "input": "hi", "stream": True},
+        headers={"Authorization": "Bearer tok"},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "terminus_dispatch_failed"
+    assert "unsupported parameter: verbosity" in response.json()["error"]["message"]
+
+
+def test_responses_stream_prefetch_uses_thread_bridge():
+    px, _, fake_client = _make_gateway_with_agent(
+        token="tok",
+        stream_result=[_chunk(content="hi"), _chunk(finish_reason="stop")],
+    )
+    client = _client_for(px)
+    real_to_thread = asyncio.to_thread
+    bridge_calls = []
+
+    async def observed_to_thread(func, *args):
+        bridge_calls.append(func)
+        return await real_to_thread(func, *args)
+
+    with patch.object(agproxy_llm.asyncio, "to_thread", side_effect=observed_to_thread):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "m", "input": "hi", "stream": True},
+            headers={"Authorization": "Bearer tok"},
+        )
+
+    assert response.status_code == 200
+    assert "event: response.completed" in response.text
+    assert len(bridge_calls) == 1
+
+
+def test_responses_stream_emits_failed_event_after_first_chunk_error():
+    def broken_stream():
+        yield _chunk(content="partial")
+        raise RuntimeError("provider stream disconnected")
+
+    px, _, _fake_client = _make_gateway_with_agent(token="tok", stream_result=broken_stream())
+    client = _client_for(px)
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "m", "input": "hi", "stream": True},
+        headers={"Authorization": "Bearer tok"},
+    )
+
+    assert response.status_code == 200
+    assert "event: response.failed" in response.text
+    assert "upstream_stream_error" in response.text
+    assert "event: response.completed" not in response.text
 
 
 def test_agproxy_llm_config_view():

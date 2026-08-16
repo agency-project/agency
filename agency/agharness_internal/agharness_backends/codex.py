@@ -409,7 +409,12 @@ def _looks_like_resume_state_failure(text: str) -> bool:
 
 
 def _diagnostic(stdout: str, stderr: str, limit: int = 8000) -> str:
-    text = (stderr or stdout or "no diagnostic output").strip()
+    parts = []
+    if stderr.strip():
+        parts.append(f"stderr:\n{stderr.strip()}")
+    if stdout.strip():
+        parts.append(f"stdout:\n{stdout.strip()}")
+    text = "\n".join(parts) or "no diagnostic output"
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -824,6 +829,13 @@ class _CodexBackend(agharness_backend):
             [
                 f"model = {_toml_string(model)}",
                 f"model_provider = {_toml_string(self._PROVIDER_NAME)}",
+                # Agency's provider boundary is currently Chat Completions.
+                # OpenAI rejects function tools plus non-none reasoning for
+                # models such as gpt-5.4-mini on that endpoint, while Codex
+                # always exposes shell/MCP functions.  Keep the request
+                # compatible here rather than silently weakening it in the
+                # shared Responses translator.
+                'model_reasoning_effort = "none"',
                 'approval_policy = "never"',
                 f"sandbox_mode = {_toml_string(sandbox_mode)}",
                 f"developer_instructions = {_toml_string(developer_instructions)}",
@@ -859,6 +871,11 @@ class _CodexBackend(agharness_backend):
                 'TMPDIR = "/tmp", LANG = "C.UTF-8" }',
                 "",
                 "[features]",
+                # Codex 0.140+ snapshots the parent process environment before
+                # shell_environment_policy is applied, then sources that snapshot
+                # for login-shell tool calls.  Disable it so the provider and MCP
+                # bearer variables cannot be resurrected after filtering.
+                "shell_snapshot = false",
                 "apps = false",
                 "plugins = false",
                 "multi_agent = false",

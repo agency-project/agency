@@ -24,6 +24,7 @@ section for the limits of `gateway_mode="translate"`.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 import warnings
@@ -401,26 +402,209 @@ def _responses_translation_warning(message: str, warning_handler=None) -> None:
         warning_handler(message)
 
 
-def responses_tools_to_openai(tools, *, warning_handler=None) -> "list[dict] | None":
-    """Responses API tool defs are flat (`{"type":"function","name":...,
-    "description":...,"parameters":...}`) -- chat-completions nests them
-    under a `function` key.
+_CHAT_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DEFAULT_RESPONSES_FUNCTION_NAMESPACE = "functions"
+_TOOL_SEARCH_CHAT_NAME = "tool_search"
 
-    Only function tools have a lossless Chat Completions representation.
-    Codex may also advertise custom or namespace tools depending on its model
-    metadata and enabled features. Chat Completions cannot represent those
-    tools. Keep the function-tool subset so Codex's shell remains usable, but
-    always surface each omission through the provided per-request warning
-    handler (or a Python warning for direct callers).
+
+def _flatten_responses_tool_name(namespace: "str | None", name: str) -> str:
+    """Encode a Responses namespace in one Chat Completions function name.
+
+    The Responses API carries ``namespace`` and ``name`` separately, while
+    Chat Completions has only one name.  Keep the default ``functions``
+    namespace flat, and use Codex's conventional ``__`` separator for every
+    other namespace.  The per-request tool map reverses this encoding on the
+    response path.
+    """
+    if not namespace or namespace == _DEFAULT_RESPONSES_FUNCTION_NAMESPACE:
+        flattened = name
+    else:
+        separator = "" if namespace.endswith("__") else "__"
+        flattened = f"{namespace}{separator}{name}"
+    if not _CHAT_FUNCTION_NAME_RE.fullmatch(flattened):
+        raise UnsupportedResponsesRequest(
+            f"Responses tool {flattened!r} cannot be represented as a Chat Completions "
+            "function name (expected 1-64 letters, digits, underscores, or hyphens)"
+        )
+    return flattened
+
+
+def _register_responses_tool(
+    tool_name_map: dict,
+    chat_name: str,
+    identity: dict,
+    chat_function: dict,
+) -> bool:
+    """Register a reversible name mapping; return False for an exact duplicate."""
+    entry = {**identity, "_chat_function": chat_function}
+    existing = tool_name_map.get(chat_name)
+    if existing is None:
+        tool_name_map[chat_name] = entry
+        return True
+    if existing == entry:
+        return False
+    previous = (
+        f"namespace={existing.get('namespace')!r}, name={existing.get('name')!r}, "
+        f"type={existing.get('response_type')!r}"
+    )
+    current = (
+        f"namespace={identity.get('namespace')!r}, name={identity.get('name')!r}, "
+        f"type={identity.get('response_type')!r}"
+    )
+    raise UnsupportedResponsesRequest(
+        f"Responses tools collide after Chat Completions name translation at "
+        f"{chat_name!r}: {previous} versus {current}"
+    )
+
+
+def _responses_function_to_openai(
+    tool: dict,
+    *,
+    namespace: "str | None",
+    namespace_description: str = "",
+    allow_deferred: bool,
+    tool_name_map: dict,
+) -> "dict | None":
+    name = tool.get("name")
+    if not isinstance(name, str) or not name:
+        raise UnsupportedResponsesRequest("Responses function tool name must be a nonempty string")
+    if tool.get("defer_loading") and not allow_deferred:
+        raise UnsupportedResponsesRequest(
+            f"Responses function tool {name!r} uses defer_loading outside a completed "
+            "tool_search_output"
+        )
+
+    parameters = tool.get("parameters")
+    if parameters is None:
+        parameters = {"type": "object", "properties": {}}
+    description = tool.get("description", "")
+    if not isinstance(description, str):
+        raise UnsupportedResponsesRequest(
+            f"Responses function tool {name!r} description must be a string"
+        )
+    if namespace_description:
+        description = (
+            f"{namespace_description}\n\n{description}" if description else namespace_description
+        )
+    chat_name = _flatten_responses_tool_name(namespace, name)
+    function = {"name": chat_name, "description": description, "parameters": parameters}
+    # `strict` exists in both APIs. Preserve even False/None rather than
+    # relying on a backend default that may differ from Codex's request.
+    if "strict" in tool:
+        function["strict"] = tool["strict"]
+    identity = {
+        "response_type": "function_call",
+        "name": name,
+        # The default Responses namespace is equivalent to no namespace.
+        "namespace": None if namespace == _DEFAULT_RESPONSES_FUNCTION_NAMESPACE else namespace,
+    }
+    if not _register_responses_tool(tool_name_map, chat_name, identity, function):
+        return None
+    return {"type": "function", "function": function}
+
+
+def responses_tools_to_openai(
+    tools,
+    *,
+    warning_handler=None,
+    tool_name_map: "dict | None" = None,
+    allow_deferred: bool = False,
+) -> "list[dict] | None":
+    """Translate Responses tools into reversible Chat Completions functions.
+
+    Plain functions map directly. Namespace function children are flattened
+    into unique Chat names and recorded in ``tool_name_map`` so responses can
+    restore the namespace. Codex's client-executed ``tool_search`` is modeled
+    as one Chat function; tools returned by ``tool_search_output`` call this
+    function with ``allow_deferred=True``. Custom/freeform and hosted tools
+    still have no safe Chat Completions equivalent and are warned and omitted.
     """
     if not tools:
         return None
+    if not isinstance(tools, list):
+        raise UnsupportedResponsesRequest("Responses tools must be a list")
+    if tool_name_map is None:
+        tool_name_map = {}
     converted = []
     for index, t in enumerate(tools):
         if not isinstance(t, dict):
             raise UnsupportedResponsesRequest(f"Responses tool at index {index} must be an object")
         tool_type = t.get("type")
-        if tool_type != "function":
+        if tool_type == "function":
+            openai_tool = _responses_function_to_openai(
+                t,
+                namespace=None,
+                allow_deferred=allow_deferred,
+                tool_name_map=tool_name_map,
+            )
+            if openai_tool is not None:
+                converted.append(openai_tool)
+            continue
+        if tool_type == "namespace":
+            namespace = t.get("name")
+            if not isinstance(namespace, str) or not namespace:
+                raise UnsupportedResponsesRequest(
+                    f"Responses namespace tool at index {index} needs a nonempty string name"
+                )
+            namespace_description = t.get("description", "")
+            if not isinstance(namespace_description, str):
+                raise UnsupportedResponsesRequest(
+                    f"Responses namespace {namespace!r} description must be a string"
+                )
+            children = t.get("tools")
+            if not isinstance(children, list):
+                raise UnsupportedResponsesRequest(
+                    f"Responses namespace {namespace!r} tools must be a list"
+                )
+            for child_index, child in enumerate(children):
+                if not isinstance(child, dict):
+                    raise UnsupportedResponsesRequest(
+                        f"Responses namespace {namespace!r} child at index {child_index} "
+                        "must be an object"
+                    )
+                if child.get("type") != "function":
+                    _responses_translation_warning(
+                        f"Responses namespace {namespace!r} child tool type "
+                        f"{child.get('type')!r} at index {child_index} cannot be translated "
+                        "to Chat Completions and was omitted",
+                        warning_handler,
+                    )
+                    continue
+                openai_tool = _responses_function_to_openai(
+                    child,
+                    namespace=namespace,
+                    namespace_description=namespace_description,
+                    allow_deferred=allow_deferred,
+                    tool_name_map=tool_name_map,
+                )
+                if openai_tool is not None:
+                    converted.append(openai_tool)
+            continue
+        if tool_type == "tool_search":
+            execution = t.get("execution", "client")
+            if execution != "client":
+                raise UnsupportedResponsesRequest(
+                    f"Responses tool_search execution {execution!r} cannot be emulated by "
+                    "Agency's client-side Chat Completions translation"
+                )
+            parameters = t.get("parameters") or {"type": "object", "properties": {}}
+            function = {
+                "name": _TOOL_SEARCH_CHAT_NAME,
+                "description": t.get("description", ""),
+                "parameters": parameters,
+            }
+            if "strict" in t:
+                function["strict"] = t["strict"]
+            identity = {
+                "response_type": "tool_search_call",
+                "name": _TOOL_SEARCH_CHAT_NAME,
+                "namespace": None,
+                "execution": execution,
+            }
+            if _register_responses_tool(tool_name_map, _TOOL_SEARCH_CHAT_NAME, identity, function):
+                converted.append({"type": "function", "function": function})
+            continue
+        if tool_type not in ("custom", "web_search"):
             message = (
                 f"Responses tool type {tool_type!r} at index {index} cannot be translated "
                 "to Chat Completions and was omitted; Codex may use only the remaining "
@@ -428,29 +612,11 @@ def responses_tools_to_openai(tools, *, warning_handler=None) -> "list[dict] | N
             )
             _responses_translation_warning(message, warning_handler)
             continue
-        if t.get("defer_loading"):
-            raise UnsupportedResponsesRequest(
-                f"Responses function tool {t.get('name', '')!r} uses defer_loading, which "
-                "Chat Completions cannot represent"
-            )
-
-        parameters = t.get("parameters")
-        if parameters is None:
-            parameters = {"type": "object", "properties": {}}
-        function = {
-            "name": t.get("name", ""),
-            "description": t.get("description", ""),
-            "parameters": parameters,
-        }
-        # `strict` exists in both APIs. Preserve even False/None rather than
-        # relying on a backend default that may differ from Codex's request.
-        if "strict" in t:
-            function["strict"] = t["strict"]
-        converted.append(
-            {
-                "type": "function",
-                "function": function,
-            }
+        _responses_translation_warning(
+            f"Responses tool type {tool_type!r} at index {index} cannot be translated "
+            "to Chat Completions and was omitted; Codex may use only the remaining "
+            "function tools on this turn",
+            warning_handler,
         )
     return converted or None
 
@@ -484,7 +650,7 @@ def _responses_content_to_text(content, *, location: str) -> str:
     )
 
 
-def _responses_tool_choice_to_openai(tool_choice):
+def _responses_tool_choice_to_openai(tool_choice, tool_name_map: "dict | None" = None):
     if tool_choice is None:
         return None
     if tool_choice in ("auto", "none", "required"):
@@ -492,7 +658,18 @@ def _responses_tool_choice_to_openai(tool_choice):
     if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         name = tool_choice.get("name")
         if isinstance(name, str) and name:
-            return {"type": "function", "function": {"name": name}}
+            chat_name = _flatten_responses_tool_name(tool_choice.get("namespace"), name)
+            if tool_name_map is not None and chat_name not in tool_name_map:
+                raise UnsupportedResponsesRequest(
+                    f"Responses tool_choice names unavailable function tool {chat_name!r}"
+                )
+            return {"type": "function", "function": {"name": chat_name}}
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "tool_search":
+        if tool_name_map is not None and _TOOL_SEARCH_CHAT_NAME not in tool_name_map:
+            raise UnsupportedResponsesRequest(
+                "Responses tool_choice selects tool_search, but no tool_search tool is available"
+            )
+        return {"type": "function", "function": {"name": _TOOL_SEARCH_CHAT_NAME}}
     raise UnsupportedResponsesRequest(
         f"Responses tool_choice {tool_choice!r} cannot be translated to Chat Completions"
     )
@@ -552,16 +729,110 @@ def _check_responses_include(body: dict, warning_handler=None) -> None:
         )
 
 
-def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
+def _responses_arguments_to_chat(arguments, *, location: str) -> str:
+    if isinstance(arguments, str):
+        return arguments
+    try:
+        return json.dumps(arguments, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedResponsesRequest(
+            f"Responses tool arguments at {location} are not JSON serializable"
+        ) from exc
+
+
+def _append_chat_tool_call(messages: list[dict], tool_call: dict) -> None:
+    # A Responses turn can emit several parallel call output items. Chat
+    # Completions represents all of them on one assistant message; separate
+    # consecutive assistant messages can also violate provider role ordering.
+    if messages and messages[-1].get("role") == "assistant":
+        messages[-1].setdefault("tool_calls", []).append(tool_call)
+    else:
+        messages.append({"role": "assistant", "content": None, "tool_calls": [tool_call]})
+
+
+def _responses_call_to_chat_name(item: dict, *, tool_name_map: dict, location: str) -> str:
+    name = item.get("name")
+    namespace = item.get("namespace")
+    if not isinstance(name, str) or not name:
+        raise UnsupportedResponsesRequest(f"Responses function call at {location} needs a name")
+    if namespace is not None and not isinstance(namespace, str):
+        raise UnsupportedResponsesRequest(
+            f"Responses function call namespace at {location} must be a string or null"
+        )
+    chat_name = _flatten_responses_tool_name(namespace, name)
+    mapped = tool_name_map.get(chat_name)
+    mapped_namespace = mapped.get("namespace") if mapped else None
+    if mapped and (
+        mapped.get("response_type") != "function_call"
+        or mapped.get("name") != name
+        or mapped_namespace
+        != (None if namespace == _DEFAULT_RESPONSES_FUNCTION_NAMESPACE else namespace)
+    ):
+        raise UnsupportedResponsesRequest(
+            f"Responses function call at {location} conflicts with tool mapping for {chat_name!r}"
+        )
+    return chat_name
+
+
+def responses_request_to_openai(
+    body: dict, *, warning_handler=None, tool_name_map: "dict | None" = None
+) -> dict:
     """OpenAI `POST /v1/responses` request body -> `client.chat.completions.
     create(**kwargs)` kwargs.
 
-    This covers the function-tool subset emitted by Codex 0.140.0. Unsupported
-    tool definitions are warned and omitted while unsupported prompt content
-    fails explicitly instead of being removed from the model-visible request.
+    In addition to normal function calls, this translates the client-executed
+    tool-search/namespace protocol used by current Codex releases. Unsupported
+    semantic content fails explicitly instead of disappearing from the
+    model-visible request.
     """
     openai_messages: list[dict] = []
     _check_responses_include(body, warning_handler)
+    if tool_name_map is None:
+        tool_name_map = {}
+
+    raw_input = body.get("input")
+    if not isinstance(raw_input, (str, list)):
+        raise UnsupportedResponsesRequest("Responses input must be a string or a list")
+
+    # Native Responses tool search puts newly loaded definitions in an input
+    # item, not in the request's top-level `tools`. Chat Completions has no
+    # corresponding state transition, so expose those definitions as ordinary
+    # functions on this request while retaining the output as tool history.
+    loaded_tool_sets: list[tuple[int, list]] = []
+    if isinstance(raw_input, list):
+        for index, item in enumerate(raw_input):
+            if not isinstance(item, dict):
+                raise UnsupportedResponsesRequest(
+                    f"Responses input item at index {index} must be an object"
+                )
+            if item.get("type") != "tool_search_output":
+                continue
+            loaded_tools = item.get("tools")
+            if not isinstance(loaded_tools, list):
+                raise UnsupportedResponsesRequest(
+                    f"Responses tool_search_output tools at input[{index}] must be a list"
+                )
+            if item.get("status") == "completed":
+                loaded_tool_sets.append((index, loaded_tools))
+
+    translated_tools = (
+        responses_tools_to_openai(
+            body.get("tools"),
+            warning_handler=warning_handler,
+            tool_name_map=tool_name_map,
+        )
+        or []
+    )
+    for _index, loaded_tools in loaded_tool_sets:
+        translated_tools.extend(
+            responses_tools_to_openai(
+                loaded_tools,
+                warning_handler=warning_handler,
+                tool_name_map=tool_name_map,
+                allow_deferred=True,
+            )
+            or []
+        )
 
     instructions = body.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
@@ -569,35 +840,47 @@ def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
     if instructions:
         openai_messages.append({"role": "system", "content": instructions})
 
-    raw_input = body.get("input")
     if isinstance(raw_input, str):
         openai_messages.append({"role": "user", "content": raw_input})
-    elif isinstance(raw_input, list):
+    else:
         for index, item in enumerate(raw_input):
-            if not isinstance(item, dict):
-                raise UnsupportedResponsesRequest(
-                    f"Responses input item at index {index} must be an object"
-                )
             itype = item.get("type")
             if itype == "function_call":
+                chat_name = _responses_call_to_chat_name(
+                    item, tool_name_map=tool_name_map, location=f"input[{index}]"
+                )
                 tool_call = {
                     "id": item.get("call_id", ""),
                     "type": "function",
                     "function": {
-                        "name": item.get("name", ""),
-                        "arguments": item.get("arguments", "{}"),
+                        "name": chat_name,
+                        "arguments": _responses_arguments_to_chat(
+                            item.get("arguments", "{}"), location=f"input[{index}].arguments"
+                        ),
                     },
                 }
-                # A Responses turn can emit several parallel function_call
-                # output items. Chat Completions represents all of them on
-                # one assistant message; separate consecutive assistant
-                # messages also violate Anthropic/Bedrock role alternation.
-                if openai_messages and openai_messages[-1].get("role") == "assistant":
-                    openai_messages[-1].setdefault("tool_calls", []).append(tool_call)
-                else:
-                    openai_messages.append(
-                        {"role": "assistant", "content": None, "tool_calls": [tool_call]}
+                _append_chat_tool_call(openai_messages, tool_call)
+            elif itype == "tool_search_call":
+                execution = item.get("execution")
+                if execution != "client":
+                    raise UnsupportedResponsesRequest(
+                        f"Responses tool_search_call execution {execution!r} at input[{index}] "
+                        "cannot be translated to a client Chat Completions tool call"
                     )
+                _append_chat_tool_call(
+                    openai_messages,
+                    {
+                        "id": item.get("call_id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": _TOOL_SEARCH_CHAT_NAME,
+                            "arguments": _responses_arguments_to_chat(
+                                item.get("arguments", {}),
+                                location=f"input[{index}].arguments",
+                            ),
+                        },
+                    },
+                )
             elif itype == "function_call_output":
                 openai_messages.append(
                     {
@@ -605,6 +888,26 @@ def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
                         "tool_call_id": item.get("call_id", ""),
                         "content": _responses_content_to_text(
                             item.get("output"), location=f"input[{index}].output"
+                        ),
+                    }
+                )
+            elif itype == "tool_search_output":
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise UnsupportedResponsesRequest(
+                        f"Responses client tool_search_output at input[{index}] needs a call_id"
+                    )
+                openai_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(
+                            {
+                                "status": item.get("status"),
+                                "execution": item.get("execution"),
+                                "tools": item.get("tools"),
+                            },
+                            separators=(",", ":"),
                         ),
                     }
                 )
@@ -633,9 +936,6 @@ def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
                     f"Responses input item type {itype!r} at index {index} cannot be "
                     "translated to Chat Completions"
                 )
-    else:
-        raise UnsupportedResponsesRequest("Responses input must be a string or a list")
-
     kwargs: dict = {
         "model": body.get("model", ""),
         "messages": openai_messages,
@@ -655,13 +955,12 @@ def responses_request_to_openai(body: dict, *, warning_handler=None) -> dict:
         kwargs["prompt_cache_key"] = body["prompt_cache_key"]
     _apply_responses_reasoning_config(body, kwargs)
     _apply_responses_text_config(body, kwargs)
-    tools = responses_tools_to_openai(body.get("tools"), warning_handler=warning_handler)
-    if tools:
-        kwargs["tools"] = tools
-    tool_choice = _responses_tool_choice_to_openai(body.get("tool_choice"))
-    if tools and tool_choice is not None:
+    if translated_tools:
+        kwargs["tools"] = translated_tools
+    tool_choice = _responses_tool_choice_to_openai(body.get("tool_choice"), tool_name_map)
+    if translated_tools and tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
-    elif not tools and tool_choice not in (None, "auto", "none"):
+    elif not translated_tools and tool_choice not in (None, "auto", "none"):
         raise UnsupportedResponsesRequest(
             "Responses tool_choice requires a function tool, but no translatable function "
             "tools remain"
@@ -697,8 +996,17 @@ def _openai_usage_to_responses(usage) -> dict:
 
 
 def _responses_state_for_finish_reason(finish_reason) -> tuple[str, dict | None, dict | None]:
-    if finish_reason in (None, "stop", "tool_calls", "function_call"):
+    if finish_reason in ("stop", "tool_calls", "function_call"):
         return "completed", None, None
+    if finish_reason is None:
+        return (
+            "failed",
+            None,
+            {
+                "code": "missing_finish_reason",
+                "message": "Chat Completions ended without a terminal finish_reason",
+            },
+        )
     if finish_reason in ("length", "content_filter"):
         reason = "max_output_tokens" if finish_reason == "length" else "content_filter"
         return "incomplete", {"reason": reason}, None
@@ -712,7 +1020,79 @@ def _responses_state_for_finish_reason(finish_reason) -> tuple[str, dict | None,
     )
 
 
-def openai_response_to_responses_api(resp, model: str, request_id: "str | None" = None) -> dict:
+def _responses_stream_failure_sse(request_id: str, model: str, exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    if len(message) > 2000:
+        message = message[:2000] + "…"
+    response = {
+        "id": request_id,
+        "object": "response",
+        "created_at": time.time(),
+        "status": "failed",
+        "error": {"code": "upstream_stream_error", "message": message},
+        "incomplete_details": None,
+        "model": model,
+        "output": [],
+        "usage": None,
+    }
+    return _sse("response.failed", {"type": "response.failed", "response": response})
+
+
+def _responses_item_for_chat_tool_call(
+    *,
+    chat_name: str,
+    call_id: str,
+    arguments: str,
+    item_id: str,
+    status: str,
+    tool_name_map: "dict | None",
+    partial: bool = False,
+) -> dict:
+    identity = (tool_name_map or {}).get(chat_name)
+    if identity and identity.get("response_type") == "tool_search_call":
+        if partial:
+            parsed_arguments = {}
+        else:
+            try:
+                parsed_arguments = json.loads(arguments or "{}")
+            except (TypeError, ValueError) as exc:
+                raise UnsupportedResponsesRequest(
+                    "Chat Completions returned invalid JSON arguments for tool_search"
+                ) from exc
+            if not isinstance(parsed_arguments, dict):
+                raise UnsupportedResponsesRequest(
+                    "Chat Completions returned non-object arguments for tool_search"
+                )
+        return {
+            "type": "tool_search_call",
+            "id": item_id,
+            "call_id": call_id,
+            "execution": identity.get("execution", "client"),
+            "arguments": parsed_arguments,
+            "status": status,
+        }
+
+    item = {
+        "type": "function_call",
+        "id": item_id,
+        "call_id": call_id,
+        "name": identity.get("name", chat_name) if identity else chat_name,
+        "arguments": arguments,
+        "status": status,
+    }
+    namespace = identity.get("namespace") if identity else None
+    if namespace:
+        item["namespace"] = namespace
+    return item
+
+
+def openai_response_to_responses_api(
+    resp,
+    model: str,
+    request_id: "str | None" = None,
+    *,
+    tool_name_map: "dict | None" = None,
+) -> dict:
     """Non-streaming OpenAI chat-completion response -> an OpenAI Responses
     API response object."""
     request_id = request_id or f"resp_{uuid.uuid4().hex}"
@@ -737,14 +1117,14 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
         )
     for tc in getattr(message, "tool_calls", None) or []:
         output.append(
-            {
-                "type": "function_call",
-                "id": f"fc_{uuid.uuid4().hex}",
-                "call_id": tc.id,
-                "name": tc.function.name,
-                "arguments": tc.function.arguments,
-                "status": item_status,
-            }
+            _responses_item_for_chat_tool_call(
+                chat_name=tc.function.name,
+                call_id=tc.id,
+                arguments=tc.function.arguments,
+                item_id=f"fc_{uuid.uuid4().hex}",
+                status=item_status,
+                tool_name_map=tool_name_map,
+            )
         )
 
     usage = _openai_usage_to_responses(getattr(resp, "usage", None))
@@ -765,14 +1145,18 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
     return result
 
 
-def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" = None):
+def openai_chunks_to_responses_sse(
+    chunks,
+    model: str,
+    request_id: "str | None" = None,
+    *,
+    tool_name_map: "dict | None" = None,
+):
     """OpenAI-style streaming chunks -> a Responses API SSE stream.
 
-    Not verified against a live `codex` binary (see codex.py's docstring) --
-    implemented from the documented Responses API streaming event shapes
-    (`response.created` / `response.output_item.added` / `response.output_text.
-    delta` / `response.output_item.done` / `response.completed`), covering the
-    text-message and function-call item cases only.
+    Covers text, function, namespaced function, and client tool-search items.
+    ``tool_name_map`` is the per-request reverse map populated while translating
+    the corresponding Responses request.
     """
     request_id = request_id or f"resp_{uuid.uuid4().hex}"
 
@@ -792,14 +1176,27 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
     output_index = 0
     text_item_id = None
     text_parts: list[str] = []
-    tool_blocks: dict = {}  # openai tool-call index -> {"output_index", "id", "call_id", "name", "args_parts"}
+    # OpenAI tool-call index -> output index/id/call id/name/argument fragments.
+    tool_blocks: dict = {}
     input_tokens = 0
     output_tokens = 0
     cached_input_tokens = None
     reasoning_output_tokens = None
     response_finish_reason = None
 
-    for chunk in chunks:
+    chunk_iterator = iter(chunks)
+    while True:
+        try:
+            chunk = next(chunk_iterator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            # HTTP status is already committed after the first SSE frame.
+            # Terminate with the Responses protocol's explicit failure event
+            # instead of exposing a truncated/broken event stream to Codex.
+            yield _responses_stream_failure_sse(request_id, model, exc)
+            return
+
         usage = getattr(chunk, "usage", None)
         if usage is not None:
             input_tokens = getattr(usage, "prompt_tokens", 0) or input_tokens
@@ -882,19 +1279,21 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                         "name": getattr(tc.function, "name", "") or "",
                         "args_parts": [],
                     }
+                    added_item = _responses_item_for_chat_tool_call(
+                        chat_name=tool_blocks[tc_index]["name"],
+                        call_id=tool_blocks[tc_index]["call_id"],
+                        arguments="",
+                        item_id=fc_id,
+                        status="in_progress",
+                        tool_name_map=tool_name_map,
+                        partial=True,
+                    )
                     yield _sse(
                         "response.output_item.added",
                         {
                             "type": "response.output_item.added",
                             "output_index": output_index,
-                            "item": {
-                                "type": "function_call",
-                                "id": fc_id,
-                                "call_id": tool_blocks[tc_index]["call_id"],
-                                "name": tool_blocks[tc_index]["name"],
-                                "arguments": "",
-                                "status": "in_progress",
-                            },
+                            "item": added_item,
                         },
                     )
                     output_index += 1
@@ -940,19 +1339,24 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
         )
 
     for block in tool_blocks.values():
+        try:
+            done_item = _responses_item_for_chat_tool_call(
+                chat_name=block["name"],
+                call_id=block["call_id"],
+                arguments="".join(block["args_parts"]),
+                item_id=block["id"],
+                status=item_status,
+                tool_name_map=tool_name_map,
+            )
+        except UnsupportedResponsesRequest as exc:
+            yield _responses_stream_failure_sse(request_id, model, exc)
+            return
         yield _sse(
             "response.output_item.done",
             {
                 "type": "response.output_item.done",
                 "output_index": block["output_index"],
-                "item": {
-                    "type": "function_call",
-                    "id": block["id"],
-                    "call_id": block["call_id"],
-                    "name": block["name"],
-                    "arguments": "".join(block["args_parts"]),
-                    "status": item_status,
-                },
+                "item": done_item,
             },
         )
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import os
 import socket
@@ -63,6 +64,29 @@ _MAX_CONCURRENT_PROFILER_FORWARDS = 8
 _PROFILER_FORWARD_TIMEOUT_S = 0.25
 _MAX_PROFILER_HOOK_EVENTS_PER_TOKEN_PER_SECOND = 128
 _MAX_PROFILER_RATE_TOKENS = 1024
+
+
+class _TerminusDispatchError(RuntimeError):
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"terminus dispatch failed: {status_code} {body}")
+
+
+_STREAM_EXHAUSTED = object()
+
+
+def _next_stream_chunk(chunks):
+    """Advance a blocking provider iterator without leaking StopIteration.
+
+    ``asyncio`` futures cannot carry ``StopIteration`` safely, so the
+    first-chunk thread bridge uses a private sentinel for an empty stream.
+    """
+    try:
+        return next(chunks)
+    except StopIteration:
+        return _STREAM_EXHAUSTED
+
 
 # NOTE: FastAPI/Starlette resolve a route handler's parameter annotations
 # (e.g. `request: Request`) from the function's *module-level* globals at
@@ -348,9 +372,7 @@ class agProxyLLM:
                 ) as resp:
                     if resp.status_code != 200:
                         resp.read()
-                        raise RuntimeError(
-                            f"terminus dispatch failed: {resp.status_code} {resp.text}"
-                        )
+                        raise _TerminusDispatchError(resp.status_code, resp.text)
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data: "):
                             continue
@@ -363,7 +385,7 @@ class agProxyLLM:
 
         resp = client.post("/internal/dispatch", json={"token": token, "kwargs": kwargs})
         if resp.status_code != 200:
-            raise RuntimeError(f"terminus dispatch failed: {resp.status_code} {resp.text}")
+            raise _TerminusDispatchError(resp.status_code, resp.text)
         return ChatCompletion.model_validate(resp.json())
 
     # -- everything else that needs the real `ag` object, routed through the
@@ -684,9 +706,12 @@ class agProxyLLM:
             model = self._resolve_model(token)
             request_id = f"resp_{uuid.uuid4().hex}"
             self._log_request("/v1/responses", token, model)
+            responses_tool_name_map: dict = {}
             try:
                 openai_kwargs = responses_request_to_openai(
-                    body, warning_handler=lambda message: self._log_warning(token, message)
+                    body,
+                    warning_handler=lambda message: self._log_warning(token, message),
+                    tool_name_map=responses_tool_name_map,
                 )
             except UnsupportedResponsesRequest as exc:
                 return JSONResponse(
@@ -702,16 +727,65 @@ class agProxyLLM:
             openai_kwargs["model"] = model
 
             if body.get("stream"):
+                chunks = iter(self._dispatch(token, openai_kwargs))
+                try:
+                    # This route is async, while the terminus/provider stream
+                    # is deliberately synchronous.  Waiting for provider TTFT
+                    # on FastAPI's event-loop thread would stall every other
+                    # request served by this proxy.
+                    first_chunk = await asyncio.to_thread(_next_stream_chunk, chunks)
+                except _TerminusDispatchError as exc:
+                    # Validate the terminus/provider response before
+                    # StreamingResponse commits HTTP 200.  A pre-stream
+                    # provider rejection must remain a real JSON error, not
+                    # a broken SSE body that Codex can only report as an
+                    # opaque decoding failure.
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "message": str(exc),
+                                "type": "upstream_error",
+                                "code": "terminus_dispatch_failed",
+                            }
+                        },
+                        status_code=exc.status_code,
+                    )
+                if first_chunk is _STREAM_EXHAUSTED:
+                    response_chunks = ()
+                else:
+                    response_chunks = itertools.chain((first_chunk,), chunks)
 
                 def sse_gen():
-                    chunks = self._dispatch(token, openai_kwargs)
-                    for frame in openai_chunks_to_responses_sse(chunks, model, request_id):
+                    for frame in openai_chunks_to_responses_sse(
+                        response_chunks,
+                        model,
+                        request_id,
+                        tool_name_map=responses_tool_name_map,
+                    ):
                         yield frame
 
                 return StreamingResponse(sse_gen(), media_type="text/event-stream")
 
             resp = self._dispatch(token, openai_kwargs)
-            return JSONResponse(openai_response_to_responses_api(resp, model, request_id))
+            try:
+                translated_response = openai_response_to_responses_api(
+                    resp,
+                    model,
+                    request_id,
+                    tool_name_map=responses_tool_name_map,
+                )
+            except UnsupportedResponsesRequest as exc:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "upstream_error",
+                            "code": "unsupported_responses_translation",
+                        }
+                    },
+                    status_code=502,
+                )
+            return JSONResponse(translated_response)
 
         return app
 
