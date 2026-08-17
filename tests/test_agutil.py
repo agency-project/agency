@@ -155,7 +155,7 @@ def test_gateway_dir_ignores_tmpdir(tmp_path, monkeypatch):
     gateway = agharness_llm_gateway_dir()
 
     assert str(tmp_path) not in str(gateway)
-    assert str(gateway).startswith("/tmp/agency/gw/")
+    assert str(gateway).startswith(f"{_agutil.agency_tmp_root()}/gw/")
 
 
 def test_gateway_dir_is_run_scoped_and_records_its_owner(_fresh_gateway):
