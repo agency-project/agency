@@ -1026,13 +1026,18 @@ class _ContainerBackendBase(agsandbox_backend):
                 "cgroup v1 hosts are not supported"
             )
         cgroup_dir = "/sys/fs/cgroup" + rel
-        leaf = os.path.basename(os.path.normpath(cgroup_dir))
-        expected_leaves = {
+        # The container's name has to appear somewhere on this path, but not
+        # necessarily as the leaf: podman's systemd cgroup manager parks the
+        # payload in a `container` child of `libpod-<id>.scope`, so matching the
+        # leaf alone rejects a perfectly local container. Testing every component
+        # still catches what this guards against -- a remote or VM-backed daemon,
+        # whose init PID resolves to a local cgroup with the id nowhere in it.
+        expected_names = {
             container_id,
             f"docker-{container_id}.scope",
             f"libpod-{container_id}.scope",
         }
-        if leaf not in expected_leaves:
+        if expected_names.isdisjoint(os.path.normpath(cgroup_dir).split(os.sep)):
             raise RuntimeError(
                 f"agprof: local cgroup for runtime PID {pid} does not match container "
                 f"{container_id[:12]} — the docker/podman daemon may be remote or VM-backed"
