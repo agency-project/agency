@@ -37,11 +37,13 @@ from __future__ import annotations
 
 import atexit
 import copy
+import importlib.util
 import itertools
 import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -79,6 +81,8 @@ _span_stack: "ContextVar[tuple[_TimedSpan, ...]]" = ContextVar("agprof_span_stac
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
 _process_info: "dict[str, dict]" = {}  # pid-start_ticks identity -> trace/display metadata
+_profile_root_pid: "int | None" = None
+_thread_labels: "dict[tuple[int, int], tuple[int, str]]" = {}
 _sampler: "_Sampler | None" = None
 _leases_open: "dict[int, tuple[int, str]]" = {}  # gpu_id -> (t0_ns, label)
 _leases: "list[tuple[int, int, int, str]]" = []  # (gpu_id, t0_ns, t1_ns, label)
@@ -87,13 +91,32 @@ _session_started_ns: "int | None" = None
 _session_sample_hz = 0.0
 _session_sample_gpu = False
 
-# Environment profiling is relaunched in a transient systemd slice before the
-# workload starts.  The slice is the aggregate accounting boundary; its child
-# scope contains the harness and Docker containers are placed alongside that
-# scope by the sandbox backend.
+# Filtered automatic Python call intervals.
+# These remain separate from semantic OTel spans so users can
+# keep intentional agprof.span() overlays without losing unannotated work.
+_auto_records: list[tuple] = []
+_auto_stacks: "dict[tuple[int, int], list[tuple]]" = {}
+_auto_code_labels: dict = {}
+_auto_settings: "dict | None" = None
+_auto_dropped = 0
+_auto_tool_in_use = False
+
+_DEFAULT_AUTO_MIN_DURATION_MS = 1.0
+_DEFAULT_AUTO_MAX_DEPTH = 32
+_DEFAULT_AUTO_MAX_EVENTS = 250_000
+_DYNAMIC_THREAD_MIN_DURATION_NS = 10_000_000
+
+# Environment profiling is relaunched into a transient systemd cgroup before
+# the workload starts. Prefer a system slice when passwordless sudo is
+# available: its child scope contains the harness and Docker containers can be
+# placed alongside that scope. Otherwise use an unprivileged user scope for the
+# harness; Docker containers remain in their daemon-managed cgroups and are
+# combined into the same trace through the container registry below.
 _CGROUP_DIR_ENV = "AGENCY_PROFILE_CGROUP"
 _CGROUP_PARENT_ENV = "AGENCY_PROFILE_CGROUP_PARENT"
+_CGROUP_USER_SCOPE_ENV = "AGENCY_PROFILE_USER_SCOPE"
 _CGROUP_SLICE_RE = re.compile(r"^agprof-[0-9a-f]+\.slice$")
+_CGROUP_SCOPE_RE = re.compile(r"^agprof-[0-9a-f]+\.scope$")
 
 # Marks a process already re-exec'd through the no-sudo systemd --user
 # scope path (see _user_cgroup_reexec_command); its cgroup path isn't
@@ -151,6 +174,8 @@ def _process_cgroup_dir() -> Path:
 
 def container_cgroup_parent() -> "str | None":
     """Docker cgroup parent for containers created by the profiled workload."""
+    if os.environ.get(_CGROUP_USER_SCOPE_ENV):
+        return None
     value = os.environ.get(_CGROUP_PARENT_ENV, "")
     return value if _CGROUP_SLICE_RE.fullmatch(value) else None
 
@@ -461,6 +486,9 @@ class _TimedSpan:
         self._cpu0 = time.thread_time_ns()
         self._rq0 = _read_schedstat()
         self._tid = threading.get_native_id()
+        semantic_thread = _span_thread_label(self._name)
+        if semantic_thread is not None:
+            _remember_thread_label(semantic_thread, priority=80, tid=self._tid)
         self._otel_t0 = time.time_ns()
         self._span = self._tracer.start_span(
             self._name,
@@ -893,6 +921,325 @@ def cancel_external_span(external_span: "_ObservedSpan | None") -> None:
             external_span._cancelled = True
 
 
+def _resolve_auto_roots(include) -> list[tuple[str, str]]:
+    """Resolve include specs to (absolute directory, import-prefix) pairs."""
+    if include is None:
+        specs = [str(Path.cwd()), "agency"]
+    elif isinstance(include, (str, os.PathLike)):
+        specs = [str(include)]
+    else:
+        specs = [str(item) for item in include]
+    roots: list[tuple[str, str]] = []
+    for spec in specs:
+        candidate = Path(spec).expanduser()
+        if candidate.exists() or os.sep in spec:
+            path = candidate.resolve()
+            roots.append((str(path.parent if path.is_file() else path), ""))
+            continue
+        try:
+            module_spec = importlib.util.find_spec(spec)
+        except (ImportError, AttributeError, ValueError):
+            module_spec = None
+        if module_spec is None:
+            continue
+        locations = list(module_spec.submodule_search_locations or ())
+        if locations:
+            roots.extend((str(Path(location).resolve()), spec) for location in locations)
+        elif module_spec.origin:
+            roots.append((str(Path(module_spec.origin).resolve().parent), spec.rpartition(".")[0]))
+    return sorted(set(roots), key=lambda item: len(item[0]), reverse=True)
+
+
+def _make_auto_settings(
+    *,
+    include=None,
+    exclude=None,
+    min_duration_ms: float = _DEFAULT_AUTO_MIN_DURATION_MS,
+    max_depth: int = _DEFAULT_AUTO_MAX_DEPTH,
+    max_events: int = _DEFAULT_AUTO_MAX_EVENTS,
+) -> dict:
+    if min_duration_ms < 0:
+        raise ValueError("agprof: auto_min_duration_ms must be >= 0")
+    if max_depth < 1:
+        raise ValueError("agprof: auto_max_depth must be >= 1")
+    if max_events < 1:
+        raise ValueError("agprof: auto_max_events must be >= 1")
+    excluded = [] if exclude is None else ([exclude] if isinstance(exclude, str) else list(exclude))
+    roots = _resolve_auto_roots(include)
+    if not roots:
+        raise ValueError("agprof: auto_include did not resolve to any Python source roots")
+    return {
+        "roots": roots,
+        "exclude": tuple(str(item) for item in excluded),
+        "min_duration_ns": int(min_duration_ms * 1e6),
+        "min_duration_ms": float(min_duration_ms),
+        "max_depth": int(max_depth),
+        "max_events": int(max_events),
+    }
+
+
+def _auto_label_for_code(code) -> "tuple[str, str, int] | None":
+    cached = _auto_code_labels.get(code, ...)
+    if cached is not ...:
+        return cached
+    settings = _auto_settings
+    if settings is None:
+        return None
+    filename = code.co_filename
+    if not filename or filename.startswith("<"):
+        _auto_code_labels[code] = None
+        return None
+    absolute = os.path.abspath(filename)
+    normalized = absolute.replace(os.sep, "/")
+    if (
+        any(
+            part in normalized
+            for part in ("/site-packages/", "/dist-packages/", "/.venv/", "/venv/")
+        )
+        or absolute.startswith(os.path.dirname(__file__) + os.sep)
+        or any(
+            pattern and (pattern in normalized or pattern.replace(".", "/") in normalized)
+            for pattern in settings["exclude"]
+        )
+    ):
+        _auto_code_labels[code] = None
+        return None
+    label = None
+    for root, prefix in settings["roots"]:
+        relative = os.path.relpath(absolute, root)
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            continue
+        module = os.path.splitext(relative)[0].replace(os.sep, ".")
+        if module.endswith(".__init__"):
+            module = module[: -len(".__init__")]
+        if prefix and not (module == prefix or module.startswith(prefix + ".")):
+            module = f"{prefix}.{module}" if module else prefix
+        label = f"{module}.{code.co_qualname}".strip(".")
+        break
+    if label and any(
+        label == pattern or label.startswith(pattern + ".")
+        for pattern in settings["exclude"]
+        if pattern
+    ):
+        label = None
+    result = (label, absolute, code.co_firstlineno) if label else None
+    if result is not None and _auto_tool_in_use:
+        monitoring = sys.monitoring
+        monitoring.set_local_events(
+            monitoring.PROFILER_ID, code, monitoring.events.PY_RETURN | monitoring.events.PY_YIELD
+        )
+    _auto_code_labels[code] = result
+    return result
+
+
+def _remember_thread_label(
+    name: str,
+    *,
+    priority: int = 20,
+    pid: "int | None" = None,
+    tid: "int | None" = None,
+) -> None:
+    label = " ".join(str(name).split()).strip()
+    if not label:
+        return
+    key = (os.getpid() if pid is None else pid, threading.get_native_id() if tid is None else tid)
+    previous = _thread_labels.get(key)
+    if previous is None or priority >= previous[0]:
+        _thread_labels[key] = (priority, label)
+
+
+def _runtime_thread_label() -> str:
+    current = threading.current_thread()
+    name = current.name
+    if current is threading.main_thread() or name == "MainThread":
+        return "Agency main thread" if os.getpid() == _profile_root_pid else "Main thread"
+    if name == "agprof-sampler":
+        return "agprof sampler"
+    match = re.fullmatch(r"ThreadPoolExecutor-(\d+)_(\d+)", name)
+    if match:
+        return f"Thread pool {match.group(1)} worker {match.group(2)}"
+    if re.fullmatch(r"Thread-\d+(?: \(.+\))?", name):
+        return "Python worker"
+    return name or "Python thread"
+
+
+def _span_thread_label(label: str) -> "str | None":
+    match = re.fullmatch(r"run\d+:([^:]+):(.+)", label)
+    if match:
+        return f"{match.group(1)} — {match.group(2)}"
+    return label if label.startswith("agmap:") else None
+
+
+def _infer_auto_thread_label(records: list[tuple]) -> "str | None":
+    if not records:
+        return None
+    labels = [record[2] for record in records]
+    for label in labels:
+        match = re.search(r"(?:^|\.)([A-Za-z_]\w*Team)\.(?:run|_run)(?:$|\.)", label)
+        if match:
+            return f"Agency team — {match.group(1)}"
+    rules = (
+        ("agsandbox_backends.base.run_with_unkillable_child_grace", "Sandbox subprocess waiter"),
+        ("agutil._iter_batched.<locals>._drain", "LLM stream drainer"),
+        ("agteam._wrap_run", "Agency team runner"),
+        ("agmap._spawn", "Agency map worker"),
+    )
+    for needle, name in rules:
+        if any(needle in label for label in labels):
+            return name
+    if any(label.startswith("agskill.") and "_traced_task" in label for label in labels):
+        return "Agency skill runner"
+    dominant = max(records, key=lambda record: record[6])
+    if dominant[6] < _DYNAMIC_THREAD_MIN_DURATION_NS:
+        return None
+    label, filename = dominant[2], dominant[3]
+    module = Path(filename).stem
+    marker_index = label.find(f"{module}.")
+    callable_name = label[marker_index:] if marker_index >= 0 else label
+    callable_name = callable_name.replace(".<locals>.", ".")
+    agency_dir = str(Path(__file__).resolve().parents[1]) + os.sep
+    prefix = "Agency" if os.path.abspath(filename).startswith(agency_dir) else "Python"
+    return f"{prefix} — {callable_name}"
+
+
+def _thread_label(pid: int, tid: int) -> str:
+    remembered = _thread_labels.get((pid, tid))
+    return remembered[1] if remembered is not None else "Python thread"
+
+
+def _record_auto_call(entry: tuple, ended_ns: int, outcome: str) -> None:
+    global _auto_dropped
+    _code, started_ns, label, filename, lineno = entry
+    if started_ns is None:
+        return
+    duration_ns = max(0, ended_ns - started_ns)
+    settings = _auto_settings
+    if settings is None or duration_ns < settings["min_duration_ns"]:
+        return
+    if len(_auto_records) >= settings["max_events"]:
+        _auto_dropped += 1
+        return
+    pid, tid = os.getpid(), threading.get_native_id()
+    _auto_records.append(
+        (
+            pid,
+            tid,
+            label,
+            filename,
+            lineno,
+            started_ns,
+            duration_ns,
+            outcome,
+            _thread_label(pid, tid),
+        )
+    )
+
+
+def _auto_py_start(code, _instruction_offset) -> None:
+    resolved = _auto_label_for_code(code)
+    if resolved is None:
+        return
+    _remember_thread_label(_runtime_thread_label())
+    key = (os.getpid(), threading.get_native_id())
+    stack = _auto_stacks.setdefault(key, [])
+    settings = _auto_settings
+    if settings is None:
+        return
+    started_ns = time.perf_counter_ns() if len(stack) < settings["max_depth"] else None
+    stack.append((code, started_ns, *resolved))
+
+
+def _auto_py_end(code, _instruction_offset, _value, *, outcome: str) -> None:
+    key = (os.getpid(), threading.get_native_id())
+    stack = _auto_stacks.get(key)
+    if not stack:
+        return
+    match = next((i for i in range(len(stack) - 1, -1, -1) if stack[i][0] is code), -1)
+    if match < 0:
+        return
+    ended_ns = time.perf_counter_ns()
+    entry, younger = stack[match], stack[match + 1 :]
+    del stack[match:]
+    for abandoned in younger:
+        _record_auto_call(abandoned, ended_ns, "interrupted")
+    _record_auto_call(entry, ended_ns, outcome)
+    if not stack:
+        _auto_stacks.pop(key, None)
+
+
+def _auto_py_return(code, offset, value) -> None:
+    _auto_py_end(code, offset, value, outcome="return")
+
+
+def _auto_py_unwind(code, offset, exception) -> None:
+    _auto_py_end(code, offset, exception, outcome="exception")
+
+
+def _auto_py_resume(code, offset) -> None:
+    _auto_py_start(code, offset)
+
+
+def _auto_py_yield(code, offset, value) -> None:
+    _auto_py_end(code, offset, value, outcome="yield")
+
+
+def _enable_auto_functions(settings: dict) -> None:
+    global _auto_settings, _auto_tool_in_use
+    monitoring = getattr(sys, "monitoring", None)
+    if monitoring is None:
+        raise RuntimeError("agprof: automatic function tracing requires Python 3.12 or newer")
+    tool_id = monitoring.PROFILER_ID
+    try:
+        monitoring.use_tool_id(tool_id, "agency.agprof")
+    except ValueError as e:
+        raise RuntimeError(
+            f"agprof: sys.monitoring profiler tool id is already in use by {monitoring.get_tool(tool_id)!r}"
+        ) from e
+    _auto_settings = copy.deepcopy(settings)
+    _auto_code_labels.clear()
+    _auto_stacks.clear()
+    monitoring.register_callback(tool_id, monitoring.events.PY_START, _auto_py_start)
+    monitoring.register_callback(tool_id, monitoring.events.PY_RESUME, _auto_py_resume)
+    monitoring.register_callback(tool_id, monitoring.events.PY_RETURN, _auto_py_return)
+    monitoring.register_callback(tool_id, monitoring.events.PY_YIELD, _auto_py_yield)
+    monitoring.register_callback(tool_id, monitoring.events.PY_UNWIND, _auto_py_unwind)
+    monitoring.set_events(
+        tool_id,
+        monitoring.events.PY_START | monitoring.events.PY_RESUME | monitoring.events.PY_UNWIND,
+    )
+    _auto_tool_in_use = True
+
+
+def _disable_auto_functions() -> list[tuple]:
+    global _auto_settings, _auto_tool_in_use
+    monitoring = getattr(sys, "monitoring", None)
+    if _auto_tool_in_use and monitoring is not None:
+        tool_id = monitoring.PROFILER_ID
+        monitoring.set_events(tool_id, 0)
+        for code, label in _auto_code_labels.items():
+            if label is not None:
+                monitoring.set_local_events(tool_id, code, 0)
+        for event in (
+            monitoring.events.PY_START,
+            monitoring.events.PY_RETURN,
+            monitoring.events.PY_RESUME,
+            monitoring.events.PY_UNWIND,
+            monitoring.events.PY_YIELD,
+        ):
+            monitoring.register_callback(tool_id, event, None)
+        monitoring.free_tool_id(tool_id)
+        _auto_tool_in_use = False
+    ended_ns = time.perf_counter_ns()
+    for stack in list(_auto_stacks.values()):
+        for entry in stack:
+            _record_auto_call(entry, ended_ns, "interrupted")
+    _auto_stacks.clear()
+    events = list(_auto_records)
+    _auto_settings = None
+    _auto_code_labels.clear()
+    return events
+
+
 def _unpack_record(record) -> tuple:
     """Return the six clock fields plus metadata from old/new record tuples."""
     metadata = record[6] if len(record) > 6 else {}
@@ -911,6 +1258,8 @@ def thread_name(name: str) -> None:
     """
     if _session is None:
         return
+    semantic_name = _span_thread_label(name)
+    _remember_thread_label(semantic_name or name, priority=100)
     global _libc
     with suppress(Exception):
         if _libc is None:
@@ -922,6 +1271,9 @@ def thread_name(name: str) -> None:
 
 def _os_thread_name() -> str:
     """This thread's OS-level name (what thread_name() set), or a tid tag."""
+    remembered = _thread_labels.get((os.getpid(), threading.get_native_id()))
+    if remembered is not None:
+        return remembered[1]
     try:
         with open(f"/proc/self/task/{threading.get_native_id()}/comm", "rb") as f:
             return f.read().decode().strip()
@@ -949,6 +1301,51 @@ def gpu_lease_end(gpu_id: int) -> None:
         entry = _leases_open.pop(gpu_id, None)
         if entry is not None:
             _leases.append((gpu_id, entry[0], time.perf_counter_ns(), entry[1]))
+
+
+def _is_python_executable(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?", Path(value).name))
+
+
+def _python_entrypoint(argv: list[str]) -> str:
+    args = argv[1:]
+    for index, arg in enumerate(args):
+        if arg == "-m" and index + 1 < len(args):
+            return f"python -m {args[index + 1]}"
+        if arg == "-c":
+            return "python -c"
+        if arg == "-":
+            return "python stdin"
+        if not arg.startswith("-"):
+            return Path(arg).name or "Python"
+    return "Python"
+
+
+def _command_role(comm: str, argv: list[str]) -> str:
+    if not argv:
+        return comm
+    if _is_python_executable(argv[0]) or _is_python_executable(comm):
+        return _python_entrypoint(argv)
+    program = Path(argv[0]).name or comm
+    if program in {"bash", "docker", "git", "podman", "sh", "sudo", "systemd-run"}:
+        subcommand = next((arg for arg in argv[1:] if arg and not arg.startswith("-")), None)
+        if subcommand is not None and len(subcommand) <= 40:
+            return f"{program} {Path(subcommand).name}"
+    return program
+
+
+def _process_display_name(pid: int, comm: str, argv: list[str], sandbox: "str | None") -> str:
+    """Semantic Perfetto process label with the PID retained for uniqueness."""
+    command = _command_role(comm, argv)
+    if sandbox is not None:
+        role = f"sandbox:{sandbox} — {command}"
+    elif pid == _profile_root_pid:
+        role = f"Agency harness — {command}"
+    elif argv and (_is_python_executable(argv[0]) or _is_python_executable(comm)):
+        role = command if command == "Python" else f"Python — {command}"
+    else:
+        role = command
+    return f"{role} (PID {pid})"
 
 
 class _Sampler(threading.Thread):
@@ -1034,18 +1431,12 @@ class _Sampler(threading.Thread):
         if info is None:
             sandbox = self._process_scope(cgroup_dir)
             try:
-                cmdline = (
-                    (process_dir / "cmdline")
-                    .read_bytes()
-                    .replace(b"\0", b" ")
-                    .decode(errors="replace")
-                    .strip()
-                )
+                raw_argv = (process_dir / "cmdline").read_bytes().split(b"\0")
+                argv = [arg.decode(errors="replace") for arg in raw_argv if arg]
             except OSError:
-                cmdline = ""
-            display_name = f"{comm} (PID {pid})"
-            if sandbox is not None:
-                display_name = f"{comm} [{sandbox}] (PID {pid})"
+                argv = []
+            cmdline = " ".join(argv)
+            display_name = _process_display_name(pid, comm, argv, sandbox)
             prior_pid_identity = next(
                 (key for key, prior in _process_info.items() if prior["pid"] == pid),
                 None,
@@ -1057,6 +1448,7 @@ class _Sampler(threading.Thread):
                 "start_ticks": start_ticks,
                 "comm": comm,
                 "cmdline": cmdline,
+                "argv": argv,
                 "sandbox": sandbox,
                 "cgroup": cgroup_dir,
                 "display_name": display_name,
@@ -1071,7 +1463,9 @@ class _Sampler(threading.Thread):
                 sandbox = self._process_scope(cgroup_dir)
                 if sandbox is not None:
                     info["sandbox"] = sandbox
-                    info["display_name"] = f"{comm} [{sandbox}] (PID {pid})"
+                    info["display_name"] = _process_display_name(
+                        pid, comm, info.get("argv", []), sandbox
+                    )
 
         prefix = f"proc:{identity}:"
         _samples.append((t, prefix + "cpu_s", cpu_s))
@@ -1309,6 +1703,7 @@ class _Sampler(threading.Thread):
         self._tick_cgroups(t)
 
     def run(self) -> None:
+        _remember_thread_label("agprof sampler", priority=90)
         while not self._stop_ev.wait(self._interval):
             self._tick()
         if self._nvml is not None:
@@ -1336,12 +1731,19 @@ def start(
     worker_name: "str | None" = None,
     sample_hz: float = 10.0,
     sample_gpu: bool = True,
+    auto_functions: bool = True,
+    auto_include=None,
+    auto_exclude=None,
+    auto_min_duration_ms: float = _DEFAULT_AUTO_MIN_DURATION_MS,
+    auto_max_depth: int = _DEFAULT_AUTO_MAX_DEPTH,
+    auto_max_events: int = _DEFAULT_AUTO_MAX_EVENTS,
 ):
     """Start a profiling session. Prefer the ``session()`` context manager.
 
     *out_dir* receives ``agprof.trace.json``, ``summary.json``, and
     ``summary.md``. *sample_hz* and *sample_gpu* control the background gauge
-    sampler (0 disables it).
+    sampler (0 disables it). Automatic Python function intervals are captured
+    with sys.monitoring and filtered before trace emission.
     ``all_threads`` and ``worker_name`` remain accepted for API compatibility.
     """
     _require_linux()
@@ -1349,6 +1751,18 @@ def start(
     global _sampler
     global _session_started_ns, _session_sample_hz, _session_sample_gpu
     global _profile_session_id, _profile_data_logger, _last_profile_records
+    global _profile_root_pid, _auto_dropped
+    auto_settings = (
+        _make_auto_settings(
+            include=auto_include,
+            exclude=auto_exclude,
+            min_duration_ms=auto_min_duration_ms,
+            max_depth=auto_max_depth,
+            max_events=auto_max_events,
+        )
+        if auto_functions
+        else None
+    )
     with _state_lock:
         if _session is not None:
             raise RuntimeError("agprof: a profiling session is already active")
@@ -1405,14 +1819,26 @@ def start(
             _open_spans.clear()
         _samples.clear()
         _process_info.clear()
+        _thread_labels.clear()
+        _profile_root_pid = os.getpid()
+        _remember_thread_label("Agency main thread", priority=90)
         _leases.clear()
         _leases_open.clear()
+        _auto_records.clear()
+        _auto_dropped = 0
         _last_summary = None
         _last_run_summary = None
+        started_ns = time.perf_counter_ns()
+        if auto_settings is not None:
+            try:
+                _enable_auto_functions(auto_settings)
+            except Exception:
+                otel_session.stop()
+                raise
         _out_dir = Path(out_dir) if out_dir is not None else None
         _profiler = otel_session
         _session = otel_session
-        _session_started_ns = time.perf_counter_ns()
+        _session_started_ns = started_ns
         _session_sample_hz = sample_hz
         _session_sample_gpu = sample_gpu
         if sample_hz > 0:
@@ -1442,6 +1868,8 @@ def stop():
         _session_started_ns = None
     if sampler is not None:
         sampler.halt()
+    auto_settings = copy.deepcopy(_auto_settings)
+    auto_events = _disable_auto_functions() if _auto_tool_in_use else list(_auto_records)
     t_end = time.perf_counter_ns()
     with _open_spans_lock:
         open_spans = list(_open_spans.values())
@@ -1490,6 +1918,9 @@ def stop():
                 interrupted_spans=interrupted_spans,
                 started_ns=started_ns,
                 observations=observations,
+                automatic_records=auto_events,
+                thread_labels=dict(_thread_labels),
+                profile_root_pid=_profile_root_pid,
             )
             _agprof_print(f"[agprof] Perfetto trace: {trace_path}")
         except BaseException as _e:  # signals/SystemExit must be visible too
@@ -1512,6 +1943,14 @@ def stop():
             sample_hz=_session_sample_hz,
             sample_gpu=_session_sample_gpu,
             gpu_sampling_available=sampler is not None and sampler._nvml is not None,
+            automatic_function_metrics={
+                "enabled": auto_settings is not None,
+                "captured": len(auto_events),
+                "dropped": _auto_dropped,
+                "min_duration_ms": auto_settings["min_duration_ms"] if auto_settings else None,
+                "max_depth": auto_settings["max_depth"] if auto_settings else None,
+                "max_events": auto_settings["max_events"] if auto_settings else None,
+            },
         )
     except Exception as _e:  # never let reporting kill the run
         _last_run_summary = None
@@ -1741,6 +2180,7 @@ def _build_run_summary(
     sample_hz: float,
     sample_gpu: bool,
     gpu_sampling_available: bool,
+    automatic_function_metrics: "dict | None" = None,
 ) -> dict:
     """Build the complete, JSON-safe summary for one profiler session."""
     completed_records = [_unpack_record(record) for record in records]
@@ -2081,7 +2521,7 @@ def _build_run_summary(
     tick_times = sorted({timestamp for timestamp, _series, _value in samples})
     sampled_duration_s = (tick_times[-1] - tick_times[0]) / 1e9 if len(tick_times) >= 2 else 0.0
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "data_source": "measured",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "duration_ms": round(duration_ms, 3),
@@ -2105,6 +2545,7 @@ def _build_run_summary(
         "span_metrics": span_rows,
         "resource_metrics": resource_rows,
         "gpu_lease_metrics": lease_rows,
+        "automatic_function_metrics": automatic_function_metrics or {"enabled": False},
         "incomplete_spans": interrupted,
     }
 
@@ -2129,6 +2570,7 @@ def _render_summary_markdown(summary: dict) -> str:
     runs = summary["run_metrics"]
     llm = summary["llm_metrics"]
     tools = summary["tool_metrics"]
+    automatic = summary.get("automatic_function_metrics", {"enabled": False})
 
     def number(value, digits=3):
         return "n/a" if value is None else f"{value:.{digits}f}"
@@ -2160,6 +2602,12 @@ def _render_summary_markdown(summary: dict) -> str:
             f"{llm['total_wait_ms'] / 1e3:.3f} s total wait",
             f"- Tools: **{tools['completed']}/{tools['started']} completed**, "
             f"{tools['failed']} failed, {tools['interrupted']} interrupted",
+            (
+                f"- Automatic Python calls: **{automatic.get('captured', 0)} captured**, "
+                f"{automatic.get('dropped', 0)} dropped"
+                if automatic.get("enabled")
+                else "- Automatic Python calls: **disabled**"
+            ),
             f"- Raw resource samples: **{sampling['raw_samples']}** "
             f"at {sampling['effective_hz']:g} Hz effective "
             f"({sampling['configured_hz']:g} Hz configured)",
@@ -2426,6 +2874,12 @@ def session(
     worker_name: "str | None" = None,
     sample_hz: float = 10.0,
     sample_gpu: bool = True,
+    auto_functions: bool = True,
+    auto_include=None,
+    auto_exclude=None,
+    auto_min_duration_ms: float = _DEFAULT_AUTO_MIN_DURATION_MS,
+    auto_max_depth: int = _DEFAULT_AUTO_MAX_DEPTH,
+    auto_max_events: int = _DEFAULT_AUTO_MAX_EVENTS,
 ):
     """Profile everything inside the block and write summaries on exit."""
     prof = start(
@@ -2434,6 +2888,12 @@ def session(
         worker_name=worker_name,
         sample_hz=sample_hz,
         sample_gpu=sample_gpu,
+        auto_functions=auto_functions,
+        auto_include=auto_include,
+        auto_exclude=auto_exclude,
+        auto_min_duration_ms=auto_min_duration_ms,
+        auto_max_depth=auto_max_depth,
+        auto_max_events=auto_max_events,
     )
     try:
         yield prof

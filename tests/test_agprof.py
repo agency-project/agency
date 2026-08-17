@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -265,7 +266,7 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     machine_summary = json.loads((tmp_path / "summary.json").read_text())
     human_summary = (tmp_path / "summary.md").read_text()
     trace = json.loads((tmp_path / "agprof.trace.json").read_text())
-    assert machine_summary["schema_version"] == 4
+    assert machine_summary["schema_version"] == 5
     assert "workload_metrics" in machine_summary
     assert machine_summary["process_metrics"] == []
     assert "host_metrics" not in machine_summary
@@ -609,6 +610,79 @@ def test_stop_snapshots_open_spans_as_interrupted(monkeypatch, tmp_path):
     assert active._span.attributes["outcome"] == "interrupted"
 
 
+def _automatic_probe(value):
+    time.sleep(0.002)
+    return value + 1
+
+
+def test_real_session_keeps_semantic_spans_and_automatic_calls(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    with agprof.session(
+        tmp_path,
+        sample_hz=0,
+        sample_gpu=False,
+        auto_include=[__file__],
+        auto_min_duration_ms=0,
+    ):
+        with agprof.span("run0:test:agent"):
+            assert _automatic_probe(41) == 42
+
+    trace = json.loads((tmp_path / "agprof.trace.json").read_text())
+    events = trace["traceEvents"]
+    assert any(
+        event.get("cat") == "agprof" and event.get("name") == "run0:test:agent" for event in events
+    )
+    automatic = [
+        event
+        for event in events
+        if event.get("cat") == "python.auto" and event.get("name", "").endswith("._automatic_probe")
+    ]
+    assert len(automatic) == 1
+    assert automatic[0]["ts"] >= 0
+    assert automatic[0]["args"]["automatic"] is True
+    assert agprof.summary_metrics()["automatic_function_metrics"]["captured"] > 0
+
+
+def test_trace_emits_semantic_thread_name_and_sampled_process_lifetime():
+    process_info = {
+        "101-10": {
+            "pid": 101,
+            "trace_pid": 101,
+            "display_name": "Python — worker.py (PID 101)",
+            "cgroup": "/workload",
+            "cmdline": "python worker.py",
+            "comm": "python",
+            "first_seen_ns": 1_000,
+            "last_seen_ns": 6_000,
+        }
+    }
+    trace = agprof_trace.build_trace(
+        [],
+        [],
+        process_info=process_info,
+        observations=[],
+        started_ns=0,
+        pid=101,
+        profile_root_pid=101,
+        automatic_records=[
+            (101, 7, "test.Worker.run", __file__, 1, 2_000, 2_000, "return", "Python worker")
+        ],
+        thread_labels={(101, 7): (90, "Agency tool dispatcher")},
+    )
+    events = trace["traceEvents"]
+    assert any(
+        event.get("name") == "thread_name"
+        and event.get("tid") == 7
+        and event["args"]["name"] == "Agency tool dispatcher"
+        for event in events
+    )
+    lifetime = next(event for event in events if event.get("name") == "alive (sampled)")
+    assert lifetime["pid"] == 101
+    assert lifetime["dur"] == 5.0
+
+
 def test_real_otel_session_records_nested_parent_ids(monkeypatch, tmp_path):
     pytest.importorskip("opentelemetry.sdk.trace")
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
@@ -923,6 +997,9 @@ def test_environment_cgroup_reexec_falls_back_to_sudo_without_user_scope(monkeyp
     monkeypatch.setattr(agprof, "_user_scope_available", lambda: False)
     monkeypatch.setattr(agprof.sys, "orig_argv", ["python", "bench.py", "--quick"])
     monkeypatch.setattr(agprof.sys, "executable", "/venv/bin/python")
+    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
+    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: True)
+
     monkeypatch.setattr(agprof.os, "getuid", lambda: 1234)
     monkeypatch.setattr(agprof.os, "getgid", lambda: 5678)
     monkeypatch.setenv("USER", "benchmark")
@@ -1042,8 +1119,10 @@ def test_sampler_discovers_recursive_cgroup_pids_and_samples_each_process(tmp_pa
     sampler._tick_processes(99)
 
     assert set(agprof._process_info) == {"101-10", "202-20"}
-    assert agprof._process_info["101-10"]["display_name"] == "python (PID 101)"
-    assert agprof._process_info["202-20"]["display_name"] == ("container-python [worker] (PID 202)")
+    assert agprof._process_info["101-10"]["display_name"] == "Python — worker.py (PID 101)"
+    assert agprof._process_info["202-20"]["display_name"] == (
+        "sandbox:worker — container-python (PID 202)"
+    )
     assert (99, "proc:101-10:cpu_s", 1.5) in agprof._samples
     assert (99, "proc:101-10:rss_mb", 1.0) in agprof._samples
     assert (99, "proc:101-10:vms_mb", 100.0) in agprof._samples
@@ -1113,13 +1192,22 @@ def test_sampler_updates_container_label_when_registry_arrives_late(tmp_path, mo
     sampler._tick_processes(2)
 
     assert agprof._process_info["505-50"]["sandbox"] == "worker"
-    assert agprof._process_info["505-50"]["display_name"] == "python [worker] (PID 505)"
+    assert agprof._process_info["505-50"]["display_name"] == (
+        "sandbox:worker — worker.py (PID 505)"
+    )
 
 
 def test_container_cgroup_parent_accepts_only_profiler_slice(monkeypatch):
+    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
     monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "agprof-12ab.slice")
     assert agprof.container_cgroup_parent() == "agprof-12ab.slice"
     monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "../../system.slice")
+    assert agprof.container_cgroup_parent() is None
+
+
+def test_container_cgroup_parent_is_disabled_in_user_scope(monkeypatch):
+    monkeypatch.setenv("AGENCY_PROFILE_USER_SCOPE", "agprof-12ab.scope")
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "agprof-12ab.slice")
     assert agprof.container_cgroup_parent() is None
 
 
