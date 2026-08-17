@@ -38,12 +38,15 @@ def _trace_id(value) -> "str | None":
     return str(value)
 
 
-def _time_origin_ns(records, samples, leases, interrupted_spans, started_ns) -> int:
+def _time_origin_ns(
+    records, samples, leases, interrupted_spans, automatic_records, started_ns
+) -> int:
     if started_ns is not None:
         return started_ns
     candidates = [record[2] for record in records]
     candidates.extend(sample[0] for sample in samples)
     candidates.extend(lease[1] for lease in leases)
+    candidates.extend(record[5] for record in automatic_records)
     candidates.extend(
         span["started_ns"] for span in interrupted_spans if span.get("started_ns") is not None
     )
@@ -59,26 +62,43 @@ def _prepare_trace(
     started_ns,
     pid,
     observations,
+    automatic_records,
+    thread_labels,
+    profile_root_pid,
 ) -> tuple:
     """Normalize trace inputs shared by in-memory and streaming output."""
     records = _reiterable(records)
     samples = _reiterable(samples)
     leases = _reiterable(leases)
     interrupted_spans = _reiterable(interrupted_spans)
+    automatic_records = _reiterable(automatic_records)
     if process_info is None:
         from .agprof import _process_info
 
         process_info = _process_info
     process_info = dict(process_info)
     trace_pid = os.getpid() if pid is None else pid
-    origin_ns = _time_origin_ns(records, samples, leases, interrupted_spans, started_ns)
+    origin_ns = _time_origin_ns(
+        records, samples, leases, interrupted_spans, automatic_records, started_ns
+    )
     if observations is None:
         from .agprof import _resource_observations
 
         observations = _resource_observations(samples, process_info=process_info)
     else:
         observations = _reiterable(observations)
-    return records, leases, process_info, interrupted_spans, observations, trace_pid, origin_ns
+    return (
+        records,
+        leases,
+        process_info,
+        interrupted_spans,
+        observations,
+        automatic_records,
+        dict(thread_labels or {}),
+        profile_root_pid,
+        trace_pid,
+        origin_ns,
+    )
 
 
 def _iter_trace_events(
@@ -87,6 +107,9 @@ def _iter_trace_events(
     process_info,
     interrupted_spans,
     observations,
+    automatic_records,
+    thread_labels,
+    profile_root_pid,
     trace_pid,
     origin_ns,
 ):
@@ -95,12 +118,23 @@ def _iter_trace_events(
     def to_us(timestamp_ns: int) -> float:
         return (timestamp_ns - origin_ns) / 1e3
 
+    root_name = "agency profiler"
+    root_pid = trace_pid if profile_root_pid is None else profile_root_pid
+    root_info = next((info for info in process_info.values() if info.get("pid") == root_pid), None)
+    if root_info is not None:
+        root_name = root_info["display_name"]
+    elif profile_root_pid is not None:
+        import sys
+        from .agprof import _process_display_name
+
+        argv = [str(arg) for arg in getattr(sys, "orig_argv", ())]
+        root_name = _process_display_name(profile_root_pid, "python", argv, None)
     yield {
         "ph": "M",
         "pid": trace_pid,
         "tid": 0,
         "name": "process_name",
-        "args": {"name": "agency profiler"},
+        "args": {"name": root_name},
     }
     thread_ids = set()
     for record in records:
@@ -155,27 +189,77 @@ def _iter_trace_events(
             "args": args,
         }
 
-    for sort_index, tid in enumerate(sorted(thread_ids, key=str), start=1):
+    def trace_pid_for(process_pid: int, at_ns=None) -> int:
+        candidates = [info for info in process_info.values() if info.get("pid") == process_pid]
+        if at_ns is not None:
+            candidates = [info for info in candidates if info.get("first_seen_ns", at_ns) <= at_ns]
+        if not candidates:
+            return trace_pid if process_pid == profile_root_pid else process_pid
+        return max(candidates, key=lambda info: info.get("first_seen_ns", 0))["trace_pid"]
+
+    desired_names = {}
+
+    def prefer(process_pid, tid, name, priority):
+        key = (process_pid, tid)
+        if key not in desired_names or priority >= desired_names[key][0]:
+            desired_names[key] = (priority, name)
+
+    for (process_pid, tid), (priority, name) in thread_labels.items():
+        prefer(trace_pid_for(process_pid), tid, name, priority)
+
+    from .agprof import _infer_auto_thread_label, _span_thread_label
+
+    for record in records:
+        semantic = _span_thread_label(record[1])
+        if semantic is not None:
+            prefer(trace_pid, record[0], semantic, 80)
+
+    automatic_by_thread = {}
+    for record in automatic_records:
+        process_pid, tid, _name, _file, _line, started_ns, _duration, _outcome = record[:8]
+        lane_pid = trace_pid_for(process_pid, started_ns)
+        automatic_by_thread.setdefault((lane_pid, tid), []).append(record)
+        runtime_name = record[8] if len(record) > 8 else "Python thread"
+        runtime_priority = 10 if runtime_name in {"Python thread", "Python worker"} else 70
+        prefer(lane_pid, tid, runtime_name, runtime_priority)
+        yield {
+            "ph": "X",
+            "pid": lane_pid,
+            "tid": tid,
+            "ts": to_us(started_ns),
+            "dur": max(1.0, record[6] / 1e3),
+            "name": record[2],
+            "cat": "python.auto",
+            "args": {
+                "file": record[3],
+                "line": record[4],
+                "outcome": record[7],
+                "automatic": True,
+            },
+        }
+    for key, lane_records in automatic_by_thread.items():
+        inferred = _infer_auto_thread_label(lane_records)
+        if inferred is not None:
+            prefer(*key, inferred, 60)
+
+    all_thread_keys = {(trace_pid, tid) for tid in thread_ids} | set(automatic_by_thread)
+    for sort_index, (lane_pid, tid) in enumerate(sorted(all_thread_keys, key=str), start=1):
         yield {
             "ph": "M",
-            "pid": trace_pid,
+            "pid": lane_pid,
             "tid": tid,
             "name": "thread_name",
-            "args": {"name": f"thread {tid}"},
+            "args": {"name": desired_names.get((lane_pid, tid), (0, f"thread {tid}"))[1]},
         }
         yield {
             "ph": "M",
-            "pid": trace_pid,
+            "pid": lane_pid,
             "tid": tid,
             "name": "thread_sort_index",
             "args": {"sort_index": sort_index},
         }
 
-    process_identities = {
-        observation["process_identity"]
-        for observation in observations
-        if observation.get("process_identity") is not None
-    }
+    process_identities = set(process_info)
     for sort_index, identity in enumerate(
         sorted(
             process_identities,
@@ -210,6 +294,26 @@ def _iter_trace_events(
                 "labels": f"cgroup={info['cgroup']}; cmdline={info['cmdline'] or info['comm']}"
             },
         }
+        first_seen = info.get("first_seen_ns")
+        last_seen = info.get("last_seen_ns", first_seen)
+        if first_seen is not None and last_seen is not None:
+            yield {
+                "ph": "M",
+                "pid": process_pid,
+                "tid": "process-lifetime",
+                "name": "thread_name",
+                "args": {"name": "process lifetime (sampled)"},
+            }
+            yield {
+                "ph": "X",
+                "pid": process_pid,
+                "tid": "process-lifetime",
+                "ts": to_us(first_seen),
+                "dur": max(1.0, (last_seen - first_seen) / 1e3),
+                "name": "alive (sampled)",
+                "cat": "process",
+                "args": {"timing": "bounded by sampler observations"},
+            }
 
     for observation in observations:
         yield {
@@ -255,6 +359,9 @@ def build_trace(
     started_ns: "int | None" = None,
     pid: "int | None" = None,
     observations=None,
+    automatic_records=(),
+    thread_labels=None,
+    profile_root_pid: "int | None" = None,
 ) -> dict:
     """Build a Chrome-trace document consumable by ``ui.perfetto.dev``."""
     prepared = _prepare_trace(
@@ -266,8 +373,22 @@ def build_trace(
         started_ns,
         pid,
         observations,
+        automatic_records,
+        thread_labels,
+        profile_root_pid,
     )
-    records, leases, process_info, interrupted_spans, observations, trace_pid, origin_ns = prepared
+    (
+        records,
+        leases,
+        process_info,
+        interrupted_spans,
+        observations,
+        automatic_records,
+        thread_labels,
+        profile_root_pid,
+        trace_pid,
+        origin_ns,
+    ) = prepared
     return {
         "traceEvents": list(
             _iter_trace_events(
@@ -276,6 +397,9 @@ def build_trace(
                 process_info,
                 interrupted_spans,
                 observations,
+                automatic_records,
+                thread_labels,
+                profile_root_pid,
                 trace_pid,
                 origin_ns,
             )
@@ -299,6 +423,9 @@ def write_trace(
     started_ns: "int | None" = None,
     pid: "int | None" = None,
     observations=None,
+    automatic_records=(),
+    thread_labels=None,
+    profile_root_pid: "int | None" = None,
 ) -> Path:
     """Atomically write ``agprof.trace.json`` under *out_dir*."""
     out_dir = Path(out_dir)
@@ -314,14 +441,31 @@ def write_trace(
         started_ns,
         pid,
         observations,
+        automatic_records,
+        thread_labels,
+        profile_root_pid,
     )
-    records, leases, process_info, interrupted_spans, observations, trace_pid, origin_ns = prepared
+    (
+        records,
+        leases,
+        process_info,
+        interrupted_spans,
+        observations,
+        automatic_records,
+        thread_labels,
+        profile_root_pid,
+        trace_pid,
+        origin_ns,
+    ) = prepared
     events = _iter_trace_events(
         records,
         leases,
         process_info,
         interrupted_spans,
         observations,
+        automatic_records,
+        thread_labels,
+        profile_root_pid,
         trace_pid,
         origin_ns,
     )
