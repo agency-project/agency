@@ -7,7 +7,7 @@ from agency.agcontext import agcontext
 from agency.agconfig import agConfig
 from agency.agschema import agschema
 from agency.agskill import agskill
-from agency.agllm import _AgLLMFields, agllm
+from agency.llm.agllm import _AgLLMFields, agllm
 from agency.agtool import agtool
 from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
 
@@ -146,7 +146,7 @@ def test_name_and_repr():
 # test_run_returns_agdata_and_history / test_run_no_schema_returns_raw_content /
 # test_run_plain_text_fallback were retired here along with execute_react()
 # itself -- basic "the loop returns the model's content correctly" coverage
-# now lives in tests/agharness_internal/agharness_backends/test_native_loop_fast.py
+# now lives in tests/harness/agharness_backends/test_native_loop_fast.py
 # (test_bash_tool_round_trip, test_final_text_preserves_raw_content_verbatim),
 # exercising the native loop that replaces execute_react() for every engine.
 
@@ -300,7 +300,7 @@ def test_input_schema_description_value_only_checks_presence():
 # per-field `return_<field>` tool mechanism. Native's structured output
 # uses a different mechanism entirely -- a single `submit_output` MCP tool
 # validated per-call (fast coverage:
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# tests/harness/agharness_backends/test_native_loop_fast.py's
 # test_submit_output_all_fields_collected /
 # test_submit_output_type_error_returns_immediate_feedback) plus a bounded
 # reprompt-across-turns loop one level up in native.py's
@@ -338,7 +338,7 @@ def test_no_schemas_system_prompt_unchanged():
 # _build_toolkit(). Native's structured output uses a single `submit_output`
 # MCP tool instead -- fast coverage for the all-fields-correct and
 # type-error-immediate-feedback cases now lives in
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py
+# tests/harness/agharness_backends/test_native_loop_fast.py
 # (test_submit_output_all_fields_collected /
 # test_submit_output_type_error_returns_immediate_feedback).
 # test_semaphore_* / test_timeout_* / test_ssl_error_* / test_oserror_*
@@ -361,7 +361,7 @@ def test_no_schemas_system_prompt_unchanged():
 # execute_react()) -- native has its own, simpler offload (a plain local
 # file write, no sandbox bridge, `read` always available so no lazy
 # tool-injection step exists), already covered fast by
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# tests/harness/agharness_backends/test_native_loop_fast.py's
 # test_oversized_tool_output_is_offloaded_to_a_file.
 
 # ---------------------------------------------------------------------------
@@ -664,7 +664,7 @@ def test_tool_exception_with_run_in_subprocess_false_still_stops():
 # build_llm_kwargs
 # ---------------------------------------------------------------------------
 
-from agency.agllm import agllm as _agllm_mod
+from agency.llm.agllm import agllm as _agllm_mod
 
 build_llm_kwargs = _agllm_mod.build_llm_kwargs
 
@@ -805,7 +805,7 @@ def test_drain_inbox_calls_full_history_fn():
 # wait_for_processes
 # ---------------------------------------------------------------------------
 
-from agency.agsandbox import agSandbox
+from agency.sandbox.agsandbox import agSandbox
 
 
 def _make_real_sandbox(watched_pids=None):
@@ -1013,7 +1013,7 @@ def test_build_initial_messages_fires_full_history_fn():
 # "Known gaps" docstring section rather than silently dropped.
 
 # test_run_returns_token_counts was retired here: covered fast, for native,
-# by tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# by tests/harness/agharness_backends/test_native_loop_fast.py's
 # test_token_usage_is_tracked (proving _run_react_loop()'s response usage
 # is real, accumulated per-dispatch data, not an execute_react()-only
 # concern anymore).
@@ -1041,9 +1041,9 @@ def test_run_does_not_mutate_callers_shared_input_object():
     caller passed in -- prepare_inputs_in_sandbox()'s offload rewrite must
     land on a private copy, not the caller's own object."""
     from agency.agschema import agSchemaConfig
-    from agency.agsandbox_backends import agSandboxBackendConfig
+    from agency.sandbox import agSandboxBackendConfig
 
-    # Force the docker sandbox backend: agsandbox_backends' "auto" selection
+    # Force the docker sandbox backend: sandbox' "auto" selection
     # prefers podman over docker when both are usable, but CI's
     # images/build.sh only builds/tags agency-sandbox:latest for docker, so
     # podman has no local image and would try (and fail) to pull one.
@@ -1082,9 +1082,9 @@ def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
     ClassificationTeam.run() pattern) must each read back their own
     offloaded file, not race on the shared object's mutation."""
     from agency.agschema import agSchemaConfig
-    from agency.agsandbox_backends import agSandboxBackendConfig
+    from agency.sandbox import agSandboxBackendConfig
 
-    # Force the docker sandbox backend: agsandbox_backends' "auto" selection
+    # Force the docker sandbox backend: sandbox' "auto" selection
     # prefers podman over docker when both are usable, but CI's
     # images/build.sh only builds/tags agency-sandbox:latest for docker, so
     # podman has no local image and would try (and fail) to pull one.

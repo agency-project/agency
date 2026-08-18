@@ -1,0 +1,28 @@
+# Docker backend (`sandbox/docker.py`)
+
+> `_DockerBackend` is a thin subclass of `_ContainerBackendBase` ([container.md](container.md)) — see there for the mechanics shared with Podman ([podman.md](podman.md)), including the keyring-quota handling described below and the fast incremental squash path this doc's "Fast squash internals" section covers the Docker-specific half of.
+
+Docker and rootless Podman (via `runc`) are **both** subject to the Linux kernel session-keyring quota: each running container holds one session keyring against the *real host UID* that started it — not the container's remapped in-namespace UID — and once `/proc/sys/kernel/keys/maxkeys` is reached, the next `run` (either runtime) fails with `"unable to create session key: disk quota exceeded"`. This was previously believed to be Docker-only (rootless Podman's per-container user namespaces were assumed to give it an independent keyring), but that's incorrect: `runc` joins/creates the session keyring before the container process finishes transitioning into its remapped identity, so the charge lands on the same `key_user` quota bucket regardless of which runtime issued the call. Confirmed both empirically (watching `/proc/keys` gain a `_ses.*` entry owned by the real host UID across a plain `podman run`/`rm` cycle) and upstream (containers/podman#13363, kubernetes-sigs/kind#3806). See [container.md](container.md) for the full mechanics — they're identical for both runtimes and live entirely on `_ContainerBackendBase`, so neither `docker.py` nor `podman.py` overrides any of it.
+
+## Dangling image cleanup
+
+`commit()`'s squash path captures the current image ID for the lifecycle tag *before* committing over it, then deletes that old image ID afterward (skipping deletion if another container is still running from it, e.g. a fork) — this is the shared `_ContainerBackendBase.commit()` logic (see [container.md](container.md)), not Docker-specific, but it's what keeps repeated commits to the same tag from silently piling up dangling (untagged) images on disk.
+
+## Fast squash internals
+
+See [container.md](container.md)'s "Fast incremental squashing" section for the full mechanism and rationale (why `docker diff`/`docker save` weren't viable, how the accumulator/digest-only-`docker load` trick works, fork safety). This section covers only the two hooks `_DockerBackend` actually implements — `_ContainerBackendBase` defines both with a safe generic default; `_PodmanBackend` has its own overrides against `containers/storage` (see [podman.md](podman.md)).
+
+**`_locate_layer_diff_dir(diff_id, *, diff_ids=None)`** — finds the raw layer diff directory on disk, bypassing `docker diff`/`docker save`. Dispatches on `docker info`'s `Driver`; every step degrades to `None` (fast path unavailable) rather than raising:
+
+1. `_docker_info()` / `_docker_data_root_and_driver()` — cached `(DockerRootDir, Driver)`.
+2. **`overlay2`** (classic moby graphdriver): `diff_id` → `<DockerRootDir>/image/overlay2/layerdb/sha256/<entry>/diff` → `cache-id` → `<DockerRootDir>/overlay2/<cache-id>/diff/`.
+3. **`overlayfs`** (containerd snapshotter): needs `diff_ids` (full RootFS.Layers prefix ending at `diff_id`) to compute the OCI ChainID, then `ctr -n moby snapshots view` + `mounts` → `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<id>/fs/`. Tries bare `ctr`, then passwordless `sudo -n ctr`. The `fs/` directory must be readable by this process for tar conversion.
+
+**`_host_to_container_id(uid, gid)`** — translates HOST-side file ownership (what a raw filesystem read of the overlay2 diff directory reports) into CONTAINER-visible ownership. Needed only under **rootless** Docker: the daemon runs inside its own user namespace, so `os.lstat()` on files under its data root reports ownership remapped to the host side rather than what the container itself sees (confirmed empirically: a root-owned file inside the container showed up owned by the invoking host user via the raw overlay2 path) — without translating this back, re-`docker load`ing the accumulated diff fails with `failed to Lchown ... invalid argument`. Non-rootless Docker needs no translation at all (the on-disk ownership already *is* the container-visible ownership), so this is identity unless rootless mode is positively confirmed:
+
+1. `_is_rootless()` — `docker info`'s documented `SecurityOptions` field contains `name=rootless`. The one officially-supported detection signal this module relies on; everything else here is internals.
+2. `_find_dockerd_pid()` — scans `/proc/*/comm` for a process literally named `dockerd` owned by the same host user running this Python process. Reliable specifically for rootless Docker, where the daemon and client necessarily run as the same host user by construction; returns `None` (→ identity) if no such process is found.
+3. `_rootless_id_maps()` — parses that PID's `/proc/<pid>/uid_map`/`gid_map` (each a list of `namespace_start host_start length` triples), cached per-backend-instance (a kernel-level property of the running daemon process, fixed for its whole lifetime).
+4. `_translate_id(host_id, id_map)` (module-level function) — reverse-looks-up a host id through the parsed map, returning it unchanged if it falls in no mapped range (an id we don't understand is safer left alone than guessed at).
+
+Covered by `tests/sandbox/test_docker.py`'s `TestLocateLayerDiffDir` and `TestHostToContainerId` (mocked filesystem/`/proc` structures plus real captured `uid_map`/`gid_map` content), and exercised end-to-end by `TestCheckpointAccumulator.test_real_end_to_end_fast_squash_against_large_base_image`.

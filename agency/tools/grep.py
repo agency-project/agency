@@ -6,7 +6,7 @@ from ..agtool import agtool
 from ..agtool_pure import grep_command, parse_grep_json_output, GREP_PARAMS as _GREP_PARAMS
 
 if TYPE_CHECKING:
-    from ..agsandbox import agSandbox
+    from ..sandbox.agsandbox import agSandbox
 
 # ---------------------------------------------------------------------------
 # Constants

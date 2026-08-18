@@ -43,7 +43,7 @@ translation code, and it breaks:**
 
 - The function that builds every real outbound Anthropic Messages API request (both the direct
   Anthropic API and Bedrock) is `_openai_messages_to_anthropic`
-  (`agllm_backends/anthropic.py:100-144`). It coalesces consecutive `tool`-role messages into a
+  (`llm/anthropic.py:100-144`). It coalesces consecutive `tool`-role messages into a
   single `user` turn (`:132-142`, the only case any existing caller has ever produced, tested at
   `test_anthropic.py:338-370`) — it has **no logic at all** for merging consecutive plain
   `user`/`user` or `assistant`/`assistant` entries (`:111-131`), because nothing in the current

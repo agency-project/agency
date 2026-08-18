@@ -29,7 +29,7 @@ around that boundary.
 | Actor | What it is | Where it runs |
 |---|---|---|
 | Caller | `agent.run(skill, skill_input)` → `agskill.run()` | Agency's own process |
-| `_ClaudeCodeBackend.execute()` | `agharness_internal/agharness_backends/claude_code.py` | Agency's own process |
+| `_ClaudeCodeBackend.execute()` | `harness/agharness_backends/claude_code.py` | Agency's own process |
 | `agProxyPtrace` / launch path | `agproxy_ptrace.py`, dispatching to either `TracerLoop` (host fork) or `InContainerRelay` (`_in_container_launcher.py`) | Agency's own process |
 | In-container entrypoint | `_in_container_entrypoint.py` — only exists for a docker/podman-backed sandbox | Inside the sandbox container, via `docker/podman exec` |
 | **Harness binary** (`claude`) | The unmodified, real CLI | Inside the sandbox container (docker/podman) or the bare host (chroot/none) |

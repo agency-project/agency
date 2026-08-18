@@ -1,6 +1,6 @@
 # Chroot Sandbox v2: Namespace-Isolated Jail Design
 
-> **Status:** proposed, not yet implemented. Extends `agsandbox_backends/chroot.py`'s existing
+> **Status:** proposed, not yet implemented. Extends `sandbox/chroot.py`'s existing
 > `_ChrootBackend` in place — same public contract (`agsandbox_backend`'s interface), same
 > `agSandboxConfig(backend="chroot")` selector, same checkpoint/restore-as-directory-copy model.
 > This document proposes closing the three gaps the current implementation's own module docstring

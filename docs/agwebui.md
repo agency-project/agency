@@ -83,7 +83,7 @@ agwebui.run(main, linger=False)   # exit immediately when done
 
 `SIGINT` (Ctrl+C) needs no special handling here — Python's default handler already raises `KeyboardInterrupt`, which the existing `try/except KeyboardInterrupt` around the linger loop (and the framework's own `finally`/`atexit` hooks elsewhere) handle normally.
 
-**`SIGKILL` cannot be caught by any process**, including this one — there is no handler that can run cleanup in response to it. Recovery from a `SIGKILL`'d run relies on the framework's own self-healing at the *next* run's startup, notably the orphaned-container reaper in `agsandbox_backends/container.py` (see [container.md](agsandbox_backends/container.md#orphaned-container-reaping)), not on anything `agwebui.run()` does.
+**`SIGKILL` cannot be caught by any process**, including this one — there is no handler that can run cleanup in response to it. Recovery from a `SIGKILL`'d run relies on the framework's own self-healing at the *next* run's startup, notably the orphaned-container reaper in `sandbox/container.py` (see [container.md](sandbox/container.md#orphaned-container-reaping)), not on anything `agwebui.run()` does.
 
 **The web server subprocess does not propagate signals to it.** Sending `kill <pid>` to the execution process's PID only affects that process; the server subprocess (started via `subprocess.Popen`) is a distinct PID with its own default signal handling (uvicorn's own SIGINT/SIGTERM handling) and is stopped only because the execution process's own cleanup code explicitly calls `proc.terminate()` on it — not through any signal relay from the OS.
 

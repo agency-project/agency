@@ -221,7 +221,7 @@ This guard prevents a single oversized tool result (e.g. a raw PDF fetched via `
 
 ### Tool call hibernation and skill-level revert
 
-There's no per-tool-call checkpoint or revert anymore — a single tool call's own success or failure has no bearing on whether the sandbox gets checkpointed or discarded. Instead, after every tool call the container is only *hibernated* (`sandbox.stop()`, a `docker/podman stop` that never removes the container — see [container.md](agsandbox_backends/container.md)'s "Container lifecycle"), regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred entirely for this call; a later call that finds nothing pending is what actually hibernates it).
+There's no per-tool-call checkpoint or revert anymore — a single tool call's own success or failure has no bearing on whether the sandbox gets checkpointed or discarded. Instead, after every tool call the container is only *hibernated* (`sandbox.stop()`, a `docker/podman stop` that never removes the container — see [container.md](sandbox/container.md)'s "Container lifecycle"), regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred entirely for this call; a later call that finds nothing pending is what actually hibernates it).
 
 Rollback happens once per *skill* call instead, at `_task()`'s teardown:
 

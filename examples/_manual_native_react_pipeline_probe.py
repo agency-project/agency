@@ -23,7 +23,7 @@ from pathlib import Path
 
 from agency import agent, agdata, agskill
 from agency.agconfig import agConfig
-from agency.agllm_backends import agBedrockBackendConfig, agVLLMBackendConfig
+from agency.llm import agBedrockBackendConfig, agVLLMBackendConfig
 from agency.agtype import agpath
 
 

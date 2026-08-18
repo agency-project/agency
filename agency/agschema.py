@@ -11,7 +11,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .agsandbox import agSandbox
+    from .sandbox.agsandbox import agSandbox
     from .agconfig import agConfig
 
 from .agdata import agdata, agerror

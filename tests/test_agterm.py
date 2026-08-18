@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 def _worker_get_run_id():
     """Top-level so ProcessPoolExecutor can pickle it."""
-    from agency.agsandbox import _RUN_ID
+    from agency.sandbox.agsandbox import _RUN_ID
 
     return _RUN_ID
 
@@ -391,13 +391,13 @@ class TestLogThreadSafety:
 
 class TestSandboxNaming:
     def test_container_name_includes_run_id(self):
-        from agency.agsandbox import agSandbox, _RUN_ID
+        from agency.sandbox.agsandbox import agSandbox, _RUN_ID
 
         sb = agSandbox("myagent")
         assert _RUN_ID in sb._name
 
     def test_container_name_includes_agname(self):
-        from agency.agsandbox import agSandbox
+        from agency.sandbox.agsandbox import agSandbox
 
         sb = agSandbox("myagent")
         assert "myagent" in sb._name
@@ -408,7 +408,7 @@ class TestSandboxNaming:
         shared agname registry, so the exact suffix isn't predictable
         (it depends on how many times this base has already been claimed
         elsewhere in this same test process), only the overall shape is."""
-        from agency.agsandbox import agSandbox, _RUN_ID
+        from agency.sandbox.agsandbox import agSandbox, _RUN_ID
 
         sb = agSandbox("myagent")
         assert re.fullmatch(rf"sandbox-{_RUN_ID}-sandbox_myagent_[0-9a-z]{{4}}", sb._name), sb._name
@@ -422,14 +422,14 @@ class TestSandboxNaming:
         name string (see test_agsandbox.py's
         test_ensure_started_reuses_running_container for the supported way
         to do that)."""
-        from agency.agsandbox import agSandbox
+        from agency.sandbox.agsandbox import agSandbox
 
         sb1 = agSandbox("shared-agent")
         sb2 = agSandbox("shared-agent")
         assert sb1._name != sb2._name
 
     def test_two_sandboxes_different_agnames_differ(self):
-        from agency.agsandbox import agSandbox
+        from agency.sandbox.agsandbox import agSandbox
 
         sb1 = agSandbox("agent-alpha")
         sb2 = agSandbox("agent-beta")
@@ -438,13 +438,13 @@ class TestSandboxNaming:
     def test_run_id_is_run_scoped_not_pid(self):
         """_RUN_ID must not be the current PID (we switched to UUID)."""
         import os
-        from agency.agsandbox import _RUN_ID
+        from agency.sandbox.agsandbox import _RUN_ID
 
         assert str(os.getpid()) not in _RUN_ID
 
     def test_run_id_format(self):
         """_RUN_ID must be 'r' followed by 8 hex chars."""
-        from agency.agsandbox import _RUN_ID
+        from agency.sandbox.agsandbox import _RUN_ID
 
         assert re.fullmatch(r"r[0-9a-f]{8}", _RUN_ID), f"unexpected _RUN_ID: {_RUN_ID!r}"
 
@@ -452,7 +452,7 @@ class TestSandboxNaming:
 class TestRunIsolation:
     def test_separate_imports_produce_different_run_ids(self):
         """Two separate process invocations must never share a _RUN_ID."""
-        script = "from agency.agsandbox import _RUN_ID; print(_RUN_ID)"
+        script = "from agency.sandbox.agsandbox import _RUN_ID; print(_RUN_ID)"
         r1 = subprocess.run(
             [sys.executable, "-c", script],
             capture_output=True,
@@ -474,7 +474,7 @@ class TestRunIsolation:
     def test_separate_imports_produce_different_container_names(self):
         """Container names from two separate runs must not collide."""
         script = (
-            "from agency.agsandbox import agSandbox; "
+            "from agency.sandbox.agsandbox import agSandbox; "
             "sb = agSandbox('DataGen_0000'); print(sb._name)"
         )
         r1 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
@@ -489,7 +489,7 @@ class TestRunIsolation:
     def test_checkpoint_image_tag_differs_across_runs(self):
         """Lifecycle image tags must be run-scoped to prevent cross-run clobber."""
         script = (
-            "from agency.agsandbox import agSandbox; "
+            "from agency.sandbox.agsandbox import agSandbox; "
             "sb = agSandbox('DataGen_0000'); "
             "print(sb._backend._lifecycle_tag())"
         )
@@ -506,7 +506,7 @@ class TestRunIsolation:
     def test_worker_process_inherits_run_id(self):
         """Worker processes (fork/spawn) must see the same _RUN_ID as the main process."""
         import concurrent.futures
-        from agency.agsandbox import _RUN_ID
+        from agency.sandbox.agsandbox import _RUN_ID
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as pool:
             worker_id = pool.submit(_worker_get_run_id).result(timeout=30)

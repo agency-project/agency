@@ -31,52 +31,52 @@ _AGENCY_ROOT = _REPO_ROOT / "agency"
 _BARE_THREAD_ALLOWLIST = {
     # Harness transcript/service plumbing.
     (
-        "agency/agharness_internal/agharness_backends/base.py",
+        "agency/harness/agharness_backends/base.py",
         "agharness_backend.execute",
     ): (1, "transcript polling"),
     (
-        "agency/agharness_internal/agmanager_harness/launcher.py",
+        "agency/manager/agmanager_harness/launcher.py",
         "ensure_launched_locally",
     ): (1, "bare-host in-process TCP server"),
     (
-        "agency/agharness_internal/agmanager_host/agmanager_host.py",
+        "agency/manager/agmanager_host/agmanager_host.py",
         "agHostAgentManager.start",
     ): (1, "TCP server"),
     (
-        "agency/agharness_internal/agmanager_host/agmanager_host.py",
+        "agency/manager/agmanager_host/agmanager_host.py",
         "agHostAgentManager.ensure_uds_started",
     ): (1, "UDS server"),
     (
-        "agency/agharness_internal/agmanager_host/profiler_ingest.py",
+        "agency/manager/agmanager_host/profiler_ingest.py",
         "ProfilerIngest.ensure_uds_started",
     ): (1, "UDS ingest server"),
     # ptrace transport and subprocess pipe plumbing.
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_in_container_entrypoint.py",
+        "agency/harness/agproxy_ptrace_internal/_in_container_entrypoint.py",
         "_Tracer.run",
     ): (2, "subprocess pipe drainers"),
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_in_container_launcher.py",
+        "agency/harness/agproxy_ptrace_internal/_in_container_launcher.py",
         "InContainerRelay.start",
     ): (2, "diagnostic and relay readers"),
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_in_container_launcher.py",
+        "agency/harness/agproxy_ptrace_internal/_in_container_launcher.py",
         "InContainerRelay._drain_diagnostics",
     ): (2, "subprocess pipe drainers"),
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
+        "agency/harness/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
         "_handle_connection",
     ): (2, "bidirectional relay pumps"),
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
+        "agency/harness/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
         "main",
     ): (1, "per-connection handler"),
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tracer_loop.py",
+        "agency/harness/agproxy_ptrace_internal/_tracer_loop.py",
         "TracerLoop.start",
     ): (1, "tracer loop"),
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tracer_loop.py",
+        "agency/harness/agproxy_ptrace_internal/_tracer_loop.py",
         "TracerLoop._fork_and_exec",
     ): (2, "subprocess pipe readers"),
     # General background I/O and UI maintenance.

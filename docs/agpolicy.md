@@ -1,6 +1,6 @@
 # Mediation interface (`agpolicy.py`)
 
-`agpolicy` is the decision point [`agproxy_ptrace`](agharness_internal/agproxy_ptrace.md) calls on every intercepted
+`agpolicy` is the decision point [`agproxy_ptrace`](harness/agproxy_ptrace.md) calls on every intercepted
 syscall for a harness-driven agent, and the point `agtool.dispatch_tools()` calls (when a caller
 opts in via its `policy=`/`ag=` parameters — `None` by default, so every existing native call site
 is unaffected) for native tool calls. Same interface, two different event sources — a syscall
@@ -47,7 +47,7 @@ class agdecision:
 ## `agpolicy`
 
 Base class; `check(self, ag, event) -> agdecision` raises `NotImplementedError` — subclass and
-override it. `event` is always an `agsyscallevent` ([agproxy_ptrace.md](agharness_internal/agproxy_ptrace.md)):
+override it. `event` is always an `agsyscallevent` ([agproxy_ptrace.md](harness/agproxy_ptrace.md)):
 for syscall-level mediation, `argv`/`envp`/`path` are populated and `tool_name`/`tool_args` are
 `None`; for `agtool.dispatch_tools()`'s native retrofit, `syscall="tool_call"`,
 `tool_name`/`tool_args` are populated, and `argv`/`envp`/`path` are `None` — one event type either

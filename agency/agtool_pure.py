@@ -8,7 +8,7 @@ filesystem directly since it already runs inside the container.
 Deliberately zero imports beyond stdlib (`re` only) and zero relative
 imports -- the whole reason this file exists separately from `tools/edit.py`/
 `tools/read.py` rather than being imported from there. Those modules import
-`agtool`/`agdata`, which transitively import `agent`/`agllm_backends`
+`agtool`/`agdata`, which transitively import `agent`/`llm`
 (`import openai` etc. at module level) -- fine for the host process, but
 exactly what the in-container entrypoint avoids needing installed just to
 reuse this pure logic. This module has no such chain, so the entrypoint

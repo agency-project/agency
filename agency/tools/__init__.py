@@ -11,7 +11,7 @@ agplan.py` still names the first three (itself currently unreachable --
 see that module's own callers, or lack thereof -- a pre-existing,
 unrelated vestige left as-is rather than pulled on here), and
 `make_ask_human`'s underlying blocking implementation (`ask_human_and_wait`,
-in `.human`) is still used directly by `agharness_internal/agmcp_server.py`.
+in `.human`) is still used directly by `harness/agmcp_server.py`.
 """
 
 from __future__ import annotations

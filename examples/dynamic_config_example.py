@@ -37,8 +37,8 @@ from pathlib import Path
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
 from agency.agtype import agpath
-from agency.agllm_backends import agVLLMBackendConfig
-from agency.agsandbox import agSandboxConfig
+from agency.llm import agVLLMBackendConfig
+from agency.sandbox.agsandbox import agSandboxConfig
 
 _NOTE_TEXT = (
     "The quick brown fox jumps over the lazy dog. "

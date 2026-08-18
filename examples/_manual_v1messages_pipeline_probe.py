@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 from agency import agent, agskill, agdata
 from agency.agconfig import agConfig
-from agency.agllm_backends import agBedrockBackendConfig, agVLLMBackendConfig
+from agency.llm import agBedrockBackendConfig, agVLLMBackendConfig
 from agency.agtype import agpath
 
 if os.environ.get("LLM_BASE_URL"):

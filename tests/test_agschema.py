@@ -270,7 +270,7 @@ def test_get_return_tool_description_prompt_agpath_warns_against_content():
 # whose only caller was agskill.py's (now-deleted) _build_toolkit(). Native's
 # structured output uses a different mechanism (`submit_output`, see
 # agmcp_server.py) -- fast coverage for that lives in
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py.
+# tests/harness/agharness_backends/test_native_loop_fast.py.
 
 
 # ---------------------------------------------------------------------------

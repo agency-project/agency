@@ -1,10 +1,10 @@
-# Harness engine glue (`agharness.py`, `agharness_internal/agharness_backends/`)
+# Harness engine glue (`harness/agharness.py`, `harness/agharness_backends/`)
 
 The `engine` seam on `agent` (see [agent.md](agent.md)) lets `agskill.run()` dispatch to an
-off-the-shelf coding-agent CLI instead of the native ReAct loop. `agharness.py` holds what's
-genuinely shared across every concrete backend; `agharness_internal/agharness_backends/` holds one file per harness,
+off-the-shelf coding-agent CLI instead of the native ReAct loop. `harness/agharness.py` holds what's
+genuinely shared across every concrete backend; `harness/agharness_backends/` holds one file per harness,
 selected via `agharness_backend.for_config(engine, agconfig)` — the exact same shape as
-`agllm_backends`/`agsandbox_backends` (see [agconfig.md](agconfig.md)).
+`llm`/`sandbox` (see [agconfig.md](agconfig.md)).
 
 ## The engine seam
 
@@ -34,7 +34,7 @@ checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`
 3. Materialize an isolated config home (`agharness.materialize_config_home`) so concurrent agents
    never share a harness's own config/credentials directory.
 4. Launch via `agProxyPtrace(ag.agconfig).launch(argv, envp, cwd=..., policy=agharness.default_policy(ag), ag=ag)`
-   — real syscall-level tracing (see [agproxy_ptrace.md](agharness_internal/agproxy_ptrace.md)), not a plain
+   — real syscall-level tracing (see [agproxy_ptrace.md](harness/agproxy_ptrace.md)), not a plain
    `subprocess.run`. `agharness.default_policy(ag)` allows everything but logs every intercepted
    syscall through `ag.log`, so a harness-driven agent's execution is observable in the
    webui/logs exactly like a native one's, even with no real security policy wired up yet
@@ -55,14 +55,14 @@ checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`
 | Backend | LLM routing | Tested against |
 |---|---|---|
 | `opencode.py` | `agproxy_llm` `/v1/chat/completions` passthrough (matches wire format) | Mocked only — no `opencode` binary installable without Node/Bun in the environment this was built in |
-| `claude_code.py` | `agproxy_llm` `/v1/messages` translate (Anthropic Messages API <-> chat-completions, see [agproxy_llm.md](agharness_internal/agproxy_llm.md)) — `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` point at the gateway; the host's own real credentials (API key, OAuth login, Bedrock env) are never forwarded | **Real CLI** (v2.1.212) — raw-text and structured-`output_schema` paths, both routed genuinely through the gateway to a real backend (Bedrock), verified end-to-end |
+| `claude_code.py` | `agproxy_llm` `/v1/messages` translate (Anthropic Messages API <-> chat-completions, see [agproxy_llm.md](harness/agproxy_llm.md)) — `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` point at the gateway; the host's own real credentials (API key, OAuth login, Bedrock env) are never forwarded | **Real CLI** (v2.1.212) — raw-text and structured-`output_schema` paths, both routed genuinely through the gateway to a real backend (Bedrock), verified end-to-end |
 | `codex.py` | `agproxy_llm` `/v1/responses` translate (OpenAI Responses API <-> chat-completions) — mandatory here since Codex dropped `wire_api="chat"` upstream; `CODEX_HOME/config.toml` gets a `[model_providers.agency-proxy]` block pointing `base_url` at the gateway | Mocked only — no `codex` binary available; the Responses-API adapter itself is unverified against a live run |
 | `grok.py` | `agproxy_llm` `/v1/chat/completions` passthrough — Grok Build's `[model.*]` config supports `api_backend = "chat_completions"` per xAI's published docs, matching `agproxy_llm`'s existing route with zero translation, same as opencode | Mocked only — no `grok` binary installed (installing it means running xAI's `curl \| bash` script, deliberately not done without being asked first) |
 
 Every backend now genuinely routes its LLM traffic through `agproxy_llm` rather than leaving any
 harness free to use its own host credentials/endpoint — two are exact wire-format matches
 (`gateway_mode="passthrough"`), two require reshaping (`gateway_mode="translate"`, implemented in
-`agharness_internal/agproxy_llm_adapters.py`). See that module's docstring for the translation
+`harness/agproxy_llm_adapters.py`). See that module's docstring for the translation
 fidelity cost (extended thinking, prompt-cache breakpoints, and image content blocks have no
 chat-completions equivalent and are dropped, not errored on).
 
@@ -85,5 +85,5 @@ own OAuth login (`~/.claude/.credentials.json` lives under the real `$HOME`), fo
 "Not logged in" on every run. Fixed by leaving `HOME` untouched and relying on
 `--setting-sources ""` for the actual "don't inherit the caller's CLAUDE.md/settings" isolation —
 see `claude_code.py`'s `execute()` for the exact reasoning, and
-`test_execute_does_not_override_home` in `tests/agharness_internal/agharness_backends/test_claude_code.py` for the
+`test_execute_does_not_override_home` in `tests/harness/agharness_backends/test_claude_code.py` for the
 regression test.

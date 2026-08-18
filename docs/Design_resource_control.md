@@ -32,7 +32,7 @@ The Docker/Podman daemon serializes most operations internally (GPU init via the
 ### `_container_semaphore` — simultaneously running container cap
 | | |
 |---|---|
-| **File** | `agency/agsandbox_backends/container.py` |
+| **File** | `agency/sandbox/container.py` |
 | **Type** | `multiprocessing.Semaphore(_keyring_container_limit())` |
 | **Resource** | Number of simultaneously running containers — **docker and podman share one cap**, not one each, since both are subject to the same kernel session-keyring quota (see below) |
 | **Acquisition** | `_acquire_runtime_slot()` → `_container_semaphore.acquire()` inside `_ensure_started()`, immediately before `docker`/`podman run` |

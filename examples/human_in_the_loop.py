@@ -33,7 +33,7 @@ from pathlib import Path
 
 from agency import agent, agskill, agdata, agfile
 from agency.agconfig import agConfig
-from agency.agllm_backends import agVLLMBackendConfig
+from agency.llm import agVLLMBackendConfig
 from agency.agwebui import agwebui
 from agency.tools.human import make_ask_human
 

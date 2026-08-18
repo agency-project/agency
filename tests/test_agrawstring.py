@@ -107,7 +107,7 @@ def test_build_user_content_normal_input_still_json():
 # the identical raw_key()-passthrough logic (`agdata(**{out_key: final_text})`)
 # one level above the entrypoint's own react loop -- fast, no-Docker
 # coverage of the entrypoint's own final_text plumbing (which this logic
-# wraps) lives in tests/agharness_internal/agharness_backends/
+# wraps) lives in tests/harness/agharness_backends/
 # test_native_loop_fast.py; the agdata-wrapping step itself is Docker-only
 # coverage today (test_native.py's TestNativeBackendRealEndToEnd), same
 # tier gap noted for the return_output-family tests elsewhere in this

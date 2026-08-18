@@ -208,7 +208,7 @@ Every subclass gets, for free:
 
 ### `_ALLOWED_FIELDS` — restricting a view to a subset of its owner's fields
 
-`_ALLOWED_FIELDS` exists so a subclass can expose only *some* of an owner's registered fields, instead of everything `FIELD_REGISTRY` has under that owner. The motivating case: `agllm_backend`'s single owner has ~30 registered fields (every parameter any backend might read — OpenAI-style generation params, vLLM sampling extensions, AWS credentials, ...), but any *one* concrete backend only reads a subset of them. `agllm_backends/base.py` defines the shared base (`_AgProviderBackendConfig`); `.openai`/`.vllm`/`.anthropic`/`.bedrock` each define one provider-specific subclass — see [agllm_backends/base.md](agllm_backends/base.md) for the full table:
+`_ALLOWED_FIELDS` exists so a subclass can expose only *some* of an owner's registered fields, instead of everything `FIELD_REGISTRY` has under that owner. The motivating case: `agllm_backend`'s single owner has ~30 registered fields (every parameter any backend might read — OpenAI-style generation params, vLLM sampling extensions, AWS credentials, ...), but any *one* concrete backend only reads a subset of them. `llm/base.py` defines the shared base (`_AgProviderBackendConfig`); `.openai`/`.vllm`/`.anthropic`/`.bedrock` each define one provider-specific subclass — see [llm/base.md](llm/base.md) for the full table:
 
 ```python
 class _AgProviderBackendConfig(agLLMBackendConfig):
@@ -325,4 +325,4 @@ Nothing else needs registering anywhere — `__set_name__` populates `FIELD_REGI
 | `agResourcePool` | `agResourcePoolConfig` | Global (detection timeouts/fallbacks), Dynamic (`idle_cpus`, `idle_memory` — also the sandbox's starting CPU/memory limits) |
 | `agSandbox` | `agSandboxConfig` (bespoke — adds `add_mount`/`remove_mount`/`mounts`, an unregistered structural field layered on top of `update()`) | Static (`base_image`), Global (everything else) |
 
-See each owning module (`agllm_backends/base.py`, `agsandbox.py`, ...) for the exact field list — this table is about which mechanics apply, not a field reference.
+See each owning module (`llm/base.py`, `sandbox/agsandbox.py`, ...) for the exact field list — this table is about which mechanics apply, not a field reference.

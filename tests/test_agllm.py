@@ -2,10 +2,10 @@
 
 from unittest.mock import MagicMock, patch
 
-from agency.agllm import agllm
+from agency.llm.agllm import agllm
 from agency.agconfig import agConfig
-from agency.agllm import _AgLLMFields
-from agency.agllm_backends import agOpenAIBackendConfig
+from agency.llm.agllm import _AgLLMFields
+from agency.llm import agOpenAIBackendConfig
 
 
 def _cfg(**fields) -> agConfig:
@@ -423,7 +423,7 @@ def test_fetch_context_limit_model_with_slash_in_name():
     mock_client = MagicMock()
     mock_client.models.list.return_value = [mock_info]
 
-    with patch("agency.agllm.openai.OpenAI", return_value=mock_client):
+    with patch("agency.llm.agllm.openai.OpenAI", return_value=mock_client):
         result = agllm.fetch_context_limit(cfg)
     assert result == 196000
     mock_client.models.retrieve.assert_not_called()
@@ -436,7 +436,7 @@ def test_fetch_context_limit_config_wins_over_vllm():
     mock_client = MagicMock()
     mock_client.models.list.return_value = [mock_info]
 
-    with patch("agency.agllm.openai.OpenAI", return_value=mock_client):
+    with patch("agency.llm.agllm.openai.OpenAI", return_value=mock_client):
         result = agllm.fetch_context_limit(cfg)
     assert result == 8192
 

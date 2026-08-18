@@ -308,7 +308,7 @@ def test_dispatch_update_config_preserves_sandbox_mounts():
     from agency.agwebui import _dispatch_command
     from agency.agent import agent
     from agency.agconfig import agConfig
-    from agency.agsandbox import agSandboxConfig
+    from agency.sandbox.agsandbox import agSandboxConfig
 
     cfg = agConfig({"agllm_backend": {"api_key": "k", "model": "", "base_url": "http://old"}})
     agSandboxConfig(cfg).add_mount("hf_cache", "/tmp/hf-cache", "/root/.cache/huggingface")
@@ -334,7 +334,7 @@ def test_dispatch_update_config_all_preserves_sandbox_mounts():
     from agency.agwebui import _all_agteam_subclasses, _dispatch_command
     from agency.agent import agent
     from agency.agconfig import agConfig
-    from agency.agsandbox import agSandboxConfig
+    from agency.sandbox.agsandbox import agSandboxConfig
     from agency.agteam import agteam
 
     cfg = agConfig({"agllm_backend": {"api_key": "k", "model": "", "base_url": "http://old"}})

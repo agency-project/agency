@@ -173,7 +173,7 @@ def test_detect_gpus_rocm_smi_cvd_filters_via_hip_visible_devices(monkeypatch):
 # `rocm-smi --showbus` (subprocess.run) and the /sys/class/drm/*/device
 # symlink resolution (os.path.realpath) so they run identically with or
 # without real ROCm hardware -- see TestAmdRenderNodeLiveHardware in
-# tests/agsandbox_backends/test_container.py for the check against real
+# tests/sandbox/test_container.py for the check against real
 # hardware.
 # ---------------------------------------------------------------------------
 
@@ -341,7 +341,7 @@ def test_pool_default_idle_values():
 
 
 def test_disconnected_fields_instance_idle_memory_defaults_to_none():
-    """agsandbox_backends/container.py's container-creation path reads
+    """sandbox/container.py's container-creation path reads
     idle_memory through a fresh _AgResourcePoolFields(sandbox_agconfig) bound
     to the SANDBOX's own agconfig, not agResourcePool's — a completely
     different, unrelated agConfig instance that never has idle_memory

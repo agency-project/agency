@@ -462,7 +462,7 @@ class agResourcePool(_AgResourcePoolFields):
         teardown already acted on, something the sequencing already
         guarantees. (A prior version of this threaded an `is_clear`
         predicate through here for exactly that re-check; removed as
-        redundant -- see agsandbox_backends.chroot's module docstring for
+        redundant -- see sandbox.chroot's module docstring for
         the reasoning that led here.)
 
         Explicitly guards against gpu_id not being one of this pool's GPUs,

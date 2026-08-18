@@ -90,7 +90,7 @@ def sigterm_as_exit(label: str = "agency") -> "Generator[threading.Event, None, 
 
     SIGKILL itself can never be caught by any process, so there's no
     equivalent possible for it -- resuming cleanly after a SIGKILL relies on
-    the framework's own self-healing (e.g. ``agsandbox_backends.container``'s
+    the framework's own self-healing (e.g. ``sandbox.container``'s
     startup orphan reaper reclaiming a dead run's containers), not on
     anything a context manager can do.
 
@@ -280,7 +280,7 @@ _gateway_reap_done = False
 def pid_alive(pid: int) -> bool:
     """Return True if *pid* refers to a currently-running process on this host.
 
-    The canonical copy: `agsandbox_backends/container.py` delegates here so
+    The canonical copy: `sandbox/container.py` delegates here so
     the "is this owner still alive?" test behind every reaper in the
     framework has exactly one implementation to reason about.
     """
@@ -341,7 +341,7 @@ def agharness_llm_gateway_dir():
     container-backed sandbox unconditionally -- cheap and harmless for a
     sandbox that never runs a harness, the same "attach unconditionally,
     gate on use" pattern already used for GPU passthrough flags) and
-    `agharness_internal/agproxy_llm.py` (which places its UDS socket file
+    `harness/agproxy_llm.py` (which places its UDS socket file
     inside it once a container-backed harness actually launches). Kept
     here, not in either of those two modules, specifically to avoid a
     layering dependency in either direction -- `agsandbox` sits below
@@ -358,7 +358,7 @@ def agharness_llm_gateway_dir():
     budget applies.
 
     Scoped to one subdirectory per run, for the same three reasons container
-    names are (`agsandbox_backends/container.py`'s `_RUN_ID`):
+    names are (`sandbox/container.py`'s `_RUN_ID`):
 
     * **Lifecycle.** This root is deliberately outside `$TMPDIR` and so is
       never externally cleaned; a flat directory shared by every run would

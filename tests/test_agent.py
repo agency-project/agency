@@ -69,12 +69,12 @@ def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
 
 def _llm_agconfig(d: dict) -> agConfig:
     # Force the docker sandbox backend for any test that ends up constructing
-    # a real sandbox -- agsandbox_backends' "auto" selection now prefers
+    # a real sandbox -- sandbox' "auto" selection now prefers
     # podman over docker when both are usable, but CI's images/build.sh only
     # builds/tags agency-sandbox:latest for docker, so podman has no local
     # image and would try (and fail) to pull one from a registry. This has
     # no effect on the many tests here that never touch ag.sandbox at all.
-    from agency.agsandbox_backends import agSandboxBackendConfig
+    from agency.sandbox import agSandboxBackendConfig
 
     return agConfig(agSandboxBackendConfig(backend="docker"), {"agllm_backend": dict(d)})
 
@@ -301,7 +301,7 @@ def test_end_to_end_direct_answer():
 # rejects it (a real, currently-open gap -- see that module's "Known gaps"
 # docstring; container-side support is deliberately scoped as separate
 # follow-up work, not done here). Basic tool-calling end-to-end coverage
-# now lives in tests/agharness_internal/agharness_backends/
+# now lives in tests/harness/agharness_backends/
 # test_native_loop_fast.py's test_bash_tool_round_trip.
 
 
@@ -794,7 +794,7 @@ def test_save_scrubs_and_load_restamps_owner_pid_label(tmp_path, monkeypatch):
     whether an image's owner is still alive, and a stale/foreign PID
     could make it act on wrong evidence."""
     import subprocess as _sp
-    from agency.agsandbox_backends.container import _ContainerBackendBase
+    from agency.sandbox.container import _ContainerBackendBase
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 

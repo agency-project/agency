@@ -61,7 +61,7 @@ def sigterm_as_exit(label: str = "agency") -> Generator[threading.Event, None, N
 
 **Why this exists:** Python installs no handler for `SIGTERM` by default, so a plain `kill <pid>` terminates the process immediately without ever unwinding the stack — every `finally` block and every `atexit` hook the framework relies on (live sandbox teardown in `agsandbox.py`, the tool worker pool in `agtool.py`, a webui/graphui server subprocess, ...) is skipped, exactly like `SIGKILL`. Installing this handler converts SIGTERM into `SystemExit`, so code inside the `with` block unwinds through its own `finally` blocks and reaches normal interpreter shutdown, where those hooks fire exactly as they would on any other clean exit.
 
-`SIGKILL` itself can never be caught by any process, so there is no equivalent possible for it — recovering from a `SIGKILL`'d run relies on the framework's own self-healing (e.g. the orphaned-container reaper described in [agsandbox_backends/container.md](agsandbox_backends/container.md#orphaned-container-reaping)), not on anything a context manager can do.
+`SIGKILL` itself can never be caught by any process, so there is no equivalent possible for it — recovering from a `SIGKILL`'d run relies on the framework's own self-healing (e.g. the orphaned-container reaper described in [sandbox/container.md](sandbox/container.md#orphaned-container-reaping)), not on anything a context manager can do.
 
 **Main-thread only:** `signal.signal()` only works when called from the main thread. From any other thread, `sigterm_as_exit` is a no-op — it yields an `Event` that is simply never set, since a background thread can't rely on `KeyboardInterrupt`/Ctrl+C working there either.
 

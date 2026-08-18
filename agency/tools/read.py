@@ -8,7 +8,7 @@ from ..agtool import agtool
 from ..agtool_pure import paginate_text as _paginate_text_dict, READ_PARAMS as _READ_PARAMS
 
 if TYPE_CHECKING:
-    from ..agsandbox import agSandbox
+    from ..sandbox.agsandbox import agSandbox
 
 _DEFAULT_LIMIT = 2000
 _MAX_BYTES = 50 * 1024

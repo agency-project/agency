@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, get_args, get_origin
 from .agutil import _looks_like_path
 
 if TYPE_CHECKING:
-    from .agsandbox import agSandbox
+    from .sandbox.agsandbox import agSandbox
 
 
 class agtype:

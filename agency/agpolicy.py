@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .agent import agent
-    from .agharness_internal.agproxy_ptrace import agsyscallevent
+    from .harness.agproxy_ptrace import agsyscallevent
 
 
 @dataclass

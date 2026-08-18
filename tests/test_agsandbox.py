@@ -61,11 +61,11 @@ def _make_sandbox(**kwargs):
     ``docker`` CLI directly (docker ps/images/rmi/...), so it needs every
     sandbox it builds to actually be a docker container regardless of the
     process-wide auto-detected default (which now prefers podman when both
-    are usable -- see agsandbox_backends.base.agsandbox_backend.for_config()).
+    are usable -- see sandbox.base.agsandbox_backend.for_config()).
     """
     from agency.agconfig import agConfig
-    from agency.agsandbox import agSandbox
-    from agency.agsandbox_backends import agSandboxBackendConfig
+    from agency.sandbox.agsandbox import agSandbox
+    from agency.sandbox import agSandboxBackendConfig
 
     uid = str(uuid.uuid4())
     agconfig = kwargs.pop("agconfig", None)
@@ -77,7 +77,7 @@ def _agconfig_with_output_dir(output_dir):
     """Build an agconfig mounting output_dir at /agent_output, replacing the
     old output_dir= constructor kwarg."""
     from agency.agconfig import agConfig
-    from agency.agsandbox import agSandboxConfig
+    from agency.sandbox.agsandbox import agSandboxConfig
 
     cfg = agConfig()
     agSandboxConfig(cfg).add_mount("agent_output", output_dir, "/agent_output")
@@ -595,7 +595,7 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
     def test_get_config_copy_none_when_no_agconfig(self):
         # Bypasses _make_sandbox()'s forced backend="docker" agconfig on purpose --
         # this test is specifically about the truly-no-agconfig-at-all pathway.
-        from agency.agsandbox import agSandbox
+        from agency.sandbox.agsandbox import agSandbox
 
         sb = agSandbox(str(uuid.uuid4()))
         try:
@@ -619,7 +619,7 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
 class TestAgSandboxLifecycle:
     def test_lifecycle_tag_is_lowercase(self):
         """_lifecycle_tag() must be fully lowercase — Docker rejects uppercase repository names."""
-        from agency.agsandbox_backends.docker import _DockerBackend
+        from agency.sandbox.docker import _DockerBackend
 
         backend = _DockerBackend.__new__(_DockerBackend)
         backend._name = "GenerationAgent_4816622_0000"
@@ -628,7 +628,7 @@ class TestAgSandboxLifecycle:
         assert "generationagent" in tag
 
     def test_lifecycle_tag_format(self):
-        from agency.agsandbox_backends.docker import _DockerBackend
+        from agency.sandbox.docker import _DockerBackend
 
         backend = _DockerBackend.__new__(_DockerBackend)
         backend._name = "myagent_0000"
@@ -690,8 +690,8 @@ class TestAgSandboxLifecycle:
         actually does across worker processes: it preserves the
         already-computed name rather than reallocating it)."""
         from agency.agconfig import agConfig
-        from agency.agsandbox import agSandbox
-        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
+        from agency.sandbox.agsandbox import agSandbox
+        from agency.sandbox import agSandboxBackendConfig, agsandbox_backend
 
         agname = str(uuid.uuid4())
         cfg = agConfig(agSandboxBackendConfig(backend="docker"))
@@ -742,7 +742,7 @@ class TestAgSandboxLifecycle:
         """_ensure_started() must reuse a container already running in Docker rather
         than destroying it and starting fresh — the cross-worker-process file-persistence fix."""
         from agency.agconfig import agConfig
-        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
+        from agency.sandbox import agSandboxBackendConfig, agsandbox_backend
 
         sb = _make_sandbox()
         # Start the container and write a sentinel file.
@@ -1089,7 +1089,7 @@ class TestAgSandboxLifecycle:
         release of _container_semaphore when both rm_container() and
         destroy() each independently believed they owed a release.
         """
-        from agency.agsandbox_backends.container import _container_semaphore
+        from agency.sandbox.container import _container_semaphore
 
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
@@ -1139,7 +1139,7 @@ class TestAgSandboxLifecycle:
         containers run concurrently than the kernel keyring quota actually
         supports -- the same class of bug the quota exists to prevent.
         """
-        from agency.agsandbox_backends.container import _container_semaphore
+        from agency.sandbox.container import _container_semaphore
 
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
@@ -1167,7 +1167,7 @@ class TestAgSandboxLifecycle:
     @docker
     def test_concurrent_docker_calls_gated_by_docker_semaphore(self):
         """All docker calls go through _run() which holds _docker_semaphore; peak concurrency <= 8."""
-        from agency.agsandbox_backends.container import _docker_semaphore
+        from agency.sandbox.container import _docker_semaphore
 
         sandboxes = [_make_sandbox() for _ in range(4)]
         lifecycle_tags = [sb._backend._lifecycle_tag() for sb in sandboxes]
@@ -1662,12 +1662,12 @@ class TestAgSandboxReadFileUnit:
     """Unit tests for read_file error cases — no Docker required.
 
     read_file()'s base64-decode/error-mapping logic lives on the shared
-    agsandbox_backends.container._ContainerBackendBase, so these unit tests
+    sandbox.container._ContainerBackendBase, so these unit tests
     exercise it directly rather than through the agSandbox facade.
     """
 
     def _make_sb(self):
-        from agency.agsandbox_backends.container import _ContainerBackendBase
+        from agency.sandbox.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
         return sb
@@ -1910,13 +1910,13 @@ class TestAgSandboxIngestPtracePids:
 class TestIngestPtracePidsUnit:
     """Pure-logic tests -- no real container/chroot needed, _container_exec
     mocked to return no processes at all, matching
-    tests/agsandbox_backends/test_base.py's convention."""
+    tests/sandbox/test_base.py's convention."""
 
     def _make_backend(self):
         from unittest.mock import patch
-        from agency.agsandbox_backends.docker import _DockerBackend
+        from agency.sandbox.docker import _DockerBackend
 
-        with patch("agency.agsandbox_backends.container._runtime_works", return_value=True):
+        with patch("agency.sandbox.container._runtime_works", return_value=True):
             backend = _DockerBackend(
                 "unit-test-agent",
                 name="unit-test-container",
@@ -2060,7 +2060,7 @@ class TestResourceTools:
     (execute_react()-only factories). The underlying agSandbox/
     agResourcePool mechanics these tools were thin wrappers over (physical
     GPU acquisition during exec(), CPU/memory limit application) remain
-    real and in active use (agharness_internal/agmcp_server.py's own
+    real and in active use (harness/agmcp_server.py's own
     reserve_cpu/cpu_release tools call sandbox.update_limits()/pool.notify_
     cpu_acquired() the same way) -- exercised below by setting sandbox/pool
     state directly instead of through the retired tool wrappers. Tests that

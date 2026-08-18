@@ -8,7 +8,7 @@
 
 ```python
 from agency.agllm import agllm
-from agency.agllm_backends import agLLMBackendConfig
+from agency.llm import agLLMBackendConfig
 from agency.agconfig import agConfig
 
 # 1. agConfig(agLLMBackendConfig(...)) -- set every field in one call, with
@@ -68,7 +68,7 @@ The second argument `context_limit` overrides the `context_limit` field and also
 
 ### How config values are stored internally
 
-`agllm_backend.for_config()` builds one concrete backend — see **[agllm_backends/base.md](agllm_backends/base.md)** for the full backend-selection logic and config-field reference, and [openai.md](agllm_backends/openai.md)/[vllm.md](agllm_backends/vllm.md)/[anthropic.md](agllm_backends/anthropic.md)/[bedrock.md](agllm_backends/bedrock.md) for how each concrete backend actually works. Every `agllm_backend` inherits `AgLLMBackendFields`, which declares each LLM parameter (`model`, `api_key`, `base_url`, `temperature`, `top_k`, `workspace_id`, `aws_access_key`, ...) as a `DynamicConfigParam` — the same descriptor machinery every other framework class uses for its tunables (see `agllm.py`'s `_AgLLMFields`).
+`agllm_backend.for_config()` builds one concrete backend — see **[llm/base.md](llm/base.md)** for the full backend-selection logic and config-field reference, and [openai.md](llm/openai.md)/[vllm.md](llm/vllm.md)/[anthropic.md](llm/anthropic.md)/[bedrock.md](llm/bedrock.md) for how each concrete backend actually works. Every `agllm_backend` inherits `AgLLMBackendFields`, which declares each LLM parameter (`model`, `api_key`, `base_url`, `temperature`, `top_k`, `workspace_id`, `aws_access_key`, ...) as a `DynamicConfigParam` — the same descriptor machinery every other framework class uses for its tunables (see `agllm.py`'s `_AgLLMFields`).
 
 - The backend clones the `agConfig` it's given (`self._agconfig`) rather than storing it as-is — so its config is independent of the caller's, and `ag.llm._agconfig` is independent of both `ag.agconfig` and `ag.llm.backend._agconfig` too (three separate clones). Mutating the caller's original `agConfig`, or `ag.agconfig`, or even `ag.llm._agconfig` after construction has no effect on the backend — none of them are the object `build_llm_kwargs` actually reads from. To change the backend's config live, call `ag.llm.change_config(new_cfg)`: it clones `new_cfg` into `ag.llm._agconfig` and pushes that same clone into `ag.llm.backend._agconfig`, so the next call sees it. `ag.llm.get_config_copy()` returns a clone of `ag.llm`'s current agconfig (handy as a starting point for `new_cfg`). See [Design_configuration.md](Design_configuration.md#changing-a-dynamic-field-live) for the full example.
 
@@ -235,7 +235,7 @@ n = agllm.count_messages_tokens(messages, llm_config)
 
 ## Amazon Bedrock
 
-Set `provider` to `"bedrock"` and provide a `region`. See **[agllm_backends/bedrock.md](agllm_backends/bedrock.md)** for the full authentication-resolution order, the two different Bedrock backends `for_config()` picks between depending on the model ID, and the separate "Claude Platform on AWS" backend (`provider="anthropicAWS"`).
+Set `provider` to `"bedrock"` and provide a `region`. See **[llm/bedrock.md](llm/bedrock.md)** for the full authentication-resolution order, the two different Bedrock backends `for_config()` picks between depending on the model ID, and the separate "Claude Platform on AWS" backend (`provider="anthropicAWS"`).
 
 ```python
 llm = agllm({

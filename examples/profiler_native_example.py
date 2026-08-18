@@ -114,7 +114,7 @@ from pathlib import Path
 
 from agency import AgError, agdata, agent, agprof, agskill, agsync
 from agency.agconfig import agConfig
-from agency.agllm_backends import agBedrockBackendConfig, agVLLMBackendConfig
+from agency.llm import agBedrockBackendConfig, agVLLMBackendConfig
 from agency.agtype import agpath
 
 # The only line that differs between this file and the Claude Code variant.

@@ -207,7 +207,7 @@ def test_return_value_description_mentions_path_not_content():
 
 class TestAgSandboxBinaryIO:
     def _make_sb(self):
-        from agency.agsandbox_backends.container import _ContainerBackendBase
+        from agency.sandbox.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
         return sb

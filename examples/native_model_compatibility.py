@@ -24,7 +24,7 @@ from pathlib import Path
 
 from agency import agent, agdata, agskill
 from agency.agconfig import agConfig
-from agency.agllm_backends import agAnthropicBackendConfig, agOpenAIBackendConfig
+from agency.llm import agAnthropicBackendConfig, agOpenAIBackendConfig
 
 
 @dataclass(frozen=True)

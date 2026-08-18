@@ -12,8 +12,8 @@ from .profiler import agprof
 from .agschema import agschema
 from .agcontext import agcontext
 from .agtool import agtool
-from .agllm import agllm
-from .agsandbox import agSandbox, agSandboxConfig
+from .llm.agllm import agllm
+from .sandbox.agsandbox import agSandbox, agSandboxConfig
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
 from .aglog import _ts
@@ -582,7 +582,7 @@ class agskill:
         host-side, sandbox-based operations with no dependency on which
         backend actually dispatched the call.
         """
-        from .agharness_internal.agharness_backends.base import agharness_backend
+        from .harness.agharness_backends.base import agharness_backend
 
         input_error = (
             self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
@@ -626,7 +626,7 @@ class agskill:
         # base.py's execute() docstring and agharness.py's own
         # get_or_create_host_manager()/ensure_harness_bridge() docstrings
         # for why this moved out of each backend's own execute().
-        from . import agharness
+        from .harness import agharness
 
         host_manager = agharness.get_or_create_host_manager(ag, ag.agconfig)
         # ensure_harness_bridge() itself picks container-backed vs

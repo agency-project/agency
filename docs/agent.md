@@ -9,7 +9,7 @@ The `agent` class is the top-level orchestrator. It manages a sandbox container 
 ```python
 from agency import agent, agskill
 from agency.agconfig import agConfig
-from agency.agllm_backends import agLLMBackendConfig
+from agency.llm import agLLMBackendConfig
 
 cfg = agConfig(agLLMBackendConfig(
     base_url="http://localhost:8000/v1",

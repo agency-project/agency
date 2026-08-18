@@ -96,7 +96,7 @@ handlers (`agproxy_llm.py:138-159`, `161-203`, `228-258`) gets a small addition:
 agent; when the *next* request from the harness carries the matching `tool_result`/
 `function_call_output`, close the window and log the result. This mirrors exactly the
 `tool_name`/`tool_args` fields already added to `agsyscallevent`
-(`agharness_internal/agproxy_ptrace.py:99-123`, added specifically so `agtool.dispatch_tools()`'s
+(`harness/agproxy_ptrace.py:99-123`, added specifically so `agtool.dispatch_tools()`'s
 native-tool retrofit and this could share one event type — see `agpolicy.py:45-49`, `agdecision`
 at `agpolicy.py:26-42`) rather than inventing a parallel policy interface.
 
@@ -110,7 +110,7 @@ as it does today — no change to `_ensure_started()`'s idempotent inspect-and-r
 
 The harness process still runs on the bare host, in its own **private mount namespace**
 (`unshare --user --map-root-user --mount`) — exactly the primitive `_ChrootBackend` already uses
-for every native tool call (`agsandbox_backends/chroot.py:812-821`,
+for every native tool call (`sandbox/chroot.py:812-821`,
 `_chroot_unshare_prefix()`/`_run_unshared()`, `chroot.py:276-283`/`786-861`). Inside that private
 namespace, a FUSE filesystem is mounted at the paths that should transparently resolve into the
 sandbox; every `open`/`read`/`write`/`readdir`/`stat` the harness (or any child process it spawns —
@@ -118,7 +118,7 @@ its own real Bash tool, `grep`, the dynamic linker) issues against those paths i
 kernel and handed to a userspace callback server, which dispatches into the **same
 `agsandbox_backend` primitives native tool dispatch already uses**:
 `read_file`/`write_file`/`write_file_bytes`/`remove_files`/`_container_exec` (signatures at
-`agsandbox_backends/base.py:532-613, 855-863` and `container.py:1119-1159`). No virtual
+`sandbox/base.py:532-613, 855-863` and `container.py:1119-1159`). No virtual
 fd table, no register forging — the kernel's real VFS layer does all the POSIX bookkeeping
 (offsets, partial reads, `stat` fields); your code only answers "what's the content" and "what's
 in this directory," the same two questions `read_file`/`_container_exec`-driven `ls` already

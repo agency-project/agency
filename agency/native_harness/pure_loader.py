@@ -3,7 +3,7 @@
 
 This package (`native_harness`) is meant to run with no dependency on
 agency's HOST-side runtime -- `agent.py`, `agconfig.py`, the five old
-per-process singletons, `agharness_internal`'s backends -- so it can be
+per-process singletons, `harness`'s backends -- so it can be
 launched by agency (as a real harness, bridged to `agmanager_harness`) or
 run completely standalone from a bash prompt against a real provider, with
 no agency process involved at all. Importing `agency` normally (`import

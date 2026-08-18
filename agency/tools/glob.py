@@ -6,7 +6,7 @@ from ..agtool import agtool
 from ..agtool_pure import glob_command, parse_glob_output, GLOB_PARAMS as _GLOB_PARAMS
 
 if TYPE_CHECKING:
-    from ..agsandbox import agSandbox
+    from ..sandbox.agsandbox import agSandbox
 
 
 def make_glob(sandbox: "agSandbox") -> agtool:

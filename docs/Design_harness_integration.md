@@ -1,9 +1,9 @@
 # Harness Integration Design
 
-> **Status:** implemented (all six build phases). `agharness`/`agharness_internal/agharness_backends/`,
-> `agproxy_llm`, `agproxy_ptrace`/`agharness_internal/agproxy_ptrace_internal/`, and `agpolicy` all exist in the
+> **Status:** implemented (all six build phases). `agharness`/`harness/agharness_backends/`,
+> `agproxy_llm`, `agproxy_ptrace`/`harness/agproxy_ptrace_internal/`, and `agpolicy` all exist in the
 > codebase, per this document's design — see [agharness.md](agharness.md),
-> [agproxy_llm.md](agharness_internal/agproxy_llm.md), [agproxy_ptrace.md](agharness_internal/agproxy_ptrace.md), and
+> [agproxy_llm.md](harness/agproxy_llm.md), [agproxy_ptrace.md](harness/agproxy_ptrace.md), and
 > [agpolicy.md](agpolicy.md) for the concrete implementation, and the plan referenced in that work
 > for the phase-by-phase build log. This document remains the source of truth for *why* things are
 > shaped this way; where implementation surfaced a correction to an assumption made here (e.g. the
@@ -99,7 +99,7 @@ agskill  ───────────────────────�
         ↓                           ↓
 agteam / agsync              agharness  (new)
                                      ↓
-                          agharness_internal/agharness_backends/  (new: claude_code.py, codex.py, opencode.py, grok.py)
+                          harness/agharness_backends/  (new: claude_code.py, codex.py, opencode.py, grok.py)
                                      ↓
                     ┌────────────────┴────────────────┐
                     ↓                                  ↓
@@ -124,7 +124,7 @@ chat-completions format, routed per-run by a bearer token minted into the harnes
 config/env at launch (`token → agent → agent.llm`). Passthrough mode (`/v1/chat/completions`, no
 reshaping) applies when the configured backend already speaks the harness's native format —
 opencode and Grok Build. Translate mode (`/v1/messages` for Claude Code, `/v1/responses` for
-Codex, conversion functions in `agharness_internal/agproxy_llm_adapters.py`) reshapes the request
+Codex, conversion functions in `harness/agproxy_llm_adapters.py`) reshapes the request
 into the uniform `client.chat.completions.create()` call every `agllm_backend` exposes and reshapes
 the response back — implemented as unconditional translation for every request on those two
 routes, not a conditional "reuse the native format when it happens to match" optimization. This is
@@ -139,7 +139,7 @@ case.
 
 ---
 
-## Component 2: `agharness` + `agharness_internal/agharness_backends/` — thin, turn-level glue only
+## Component 2: `agharness` + `harness/agharness_backends/` — thin, turn-level glue only
 
 Same responsibilities as before, with execution-capture logic removed (it now lives entirely in
 `agproxy_ptrace`):
@@ -171,7 +171,7 @@ Same responsibilities as before, with execution-capture logic removed (it now li
 
 ### What it is
 
-A single external process, launched by `agharness_internal/agharness_backends/*` in place of a direct `sandbox.exec`,
+A single external process, launched by `harness/agharness_backends/*` in place of a direct `sandbox.exec`,
 that starts the harness binary as its **own traced child** and observes/mediates its entire
 process tree at the syscall boundary — no changes to the harness binary, no dependence on its hook
 system, no per-harness code in the supervisor itself.
@@ -256,7 +256,7 @@ both the native `dispatch_tools` retrofit (future work, unchanged from before) a
 
 ### Prerequisites and required (small) changes elsewhere
 
-- **`agsandbox_backends/container.py` (docker/podman): NO extra capability or seccomp profile is
+- **`sandbox/container.py` (docker/podman): NO extra capability or seccomp profile is
   required** — corrected by direct empirical testing (a real docker container, default seccomp
   profile, no `--cap-add`), which is the opposite of what an earlier draft of this section assumed.
   `agproxy_ptrace` always traces its own forked descendants (it never `PTRACE_ATTACH`/`SEIZE`s an
@@ -297,7 +297,7 @@ both the native `dispatch_tools` retrofit (future work, unchanged from before) a
   no separate socket is required for a first implementation) and applies whatever
   allow/deny/rewrite decision comes back, exactly as the host-level tracer loop does today. Building
   and testing this bridge is now the active implementation task — see
-  `agharness_internal/agproxy_ptrace_internal/` for where the host-side tracer loop already lives
+  `harness/agproxy_ptrace_internal/` for where the host-side tracer loop already lives
   and what's being extended.
 - **Interaction with a harness's own internal OS-level sandboxing** (Codex's bwrap/seatbelt/landlock
   Bash sandbox, Claude Code's `sandbox.enabled`) has not been separately verified — those run as
@@ -352,7 +352,7 @@ is unaffected, exactly as in the prior draft.
 ## Component 5: Cross-cutting concerns for harness-driven agents (logging, webui, schema retry, GPU)
 
 **Status: partially built.** Resource-control and output-submission are no longer proposed --
-`agharness_internal/agmcp_server.py`'s shared `agMCPServer` (Phase 4 of the container-unification
+`harness/agmcp_server.py`'s shared `agMCPServer` (Phase 4 of the container-unification
 plan; see the plan's own doc/PR for the full design) exposes `reserve_cpu`/`cpu_release`/
 `daemon_release`/`submit_output` as real MCP tools, reached by `claude_code.py` today via
 `--mcp-config`/`--strict-mcp-config` (bridged into the container over the same UDS mount as the
@@ -365,7 +365,7 @@ final text. `codex.py`/`opencode.py`/`grok.py` are NOT wired to this server yet 
 at all currently -- a separate, larger task) and still use the free-text JSON + `validate_and_recover`
 path described below unchanged. **`reserve_gpu`/`gpu_release` remain unimplemented** -- see
 `agmcp_server.py`'s own module docstring for the specific gap (GPU env-var injection only reaches
-`agsandbox_backends/base.py`'s `exec()`, a path neither an in-container harness's own tool execution
+`sandbox/base.py`'s `exec()`, a path neither an in-container harness's own tool execution
 nor `native.py`'s bash tool goes through) -- the paragraph below describing the intended MCP-based
 GPU design is still accurate as a target, just not yet built.
 
@@ -501,7 +501,7 @@ All six phases are implemented and tested; this section is kept as the historica
    different wire format from the chat-completions-only gateway that existed at the time) — closed
    in a later pass, see item 8 below. **Codex backend** built structurally (same shape, mocked
    tests only) — no `codex` binary was available to verify against, then or since.
-5. **Harness-native hook fallback** (`agharness_internal/agharness_backends/_native_hooks.py`) — built at the reduced
+5. **Harness-native hook fallback** (`harness/agharness_backends/_native_hooks.py`) — built at the reduced
    scope this phase called for: the hook-JSON ↔ `agsyscallevent`/`agdecision` translation logic is
    real and tested, but it is not wired into any concrete backend's `execute()` as an actual
    alternate mediation path (that would be a second full implementation of Component 3's
@@ -521,7 +521,7 @@ All six phases are implemented and tested; this section is kept as the historica
    done without being asked first.
 8. **Closed the LLM-routing gap for Claude Code and Codex.** Built the two translate-mode routes
    Component 1 originally deferred: `/v1/messages` (Anthropic Messages API) and `/v1/responses`
-   (OpenAI Responses API), conversion logic in the new `agharness_internal/agproxy_llm_adapters.py`
+   (OpenAI Responses API), conversion logic in the new `harness/agproxy_llm_adapters.py`
    module. `claude_code.py` now mints a gateway token and points `ANTHROPIC_BASE_URL`/
    `ANTHROPIC_AUTH_TOKEN` at the gateway instead of carrying over the host's real Anthropic
    credentials (API key, OAuth login, Bedrock env) — verified against the real `claude` CLI

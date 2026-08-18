@@ -15,19 +15,19 @@ them without knowing which implementation is plugged in.
 |---|---|---|
 | Agent | `agency/agent.py` | owns `agname`, `agconfig`, `terminal`, `log`, `sandbox`, `engine` |
 | Skill run | `agskill.run()` → `_task()`, [agskill.py:450](../agency/agskill.py:450) | one daemon thread per run; the outer lifecycle boundary |
-| Engine (harness) | `agharness_backend.for_config()`, [base.py:112](../agency/agharness_internal/agharness_backends/base.py:112) | 5 backends: `native`, `claude_code`, `codex`, `opencode`, `grok` |
-| LLM | `agLLMTerminus`, [agllm_terminus.py:196](../agency/agharness_internal/agllm_terminus.py:196) | the **only** place a credentialed provider client is constructed |
-| Sandbox | `agSandbox` → `agsandbox_backends/{container,chroot}.py` | container lifecycle, cgroups, layer commits |
+| Engine (harness) | `agharness_backend.for_config()`, [base.py:112](../agency/harness/agharness_backends/base.py:112) | 5 backends: `native`, `claude_code`, `codex`, `opencode`, `grok` |
+| LLM | `agLLMTerminus`, [agllm_terminus.py:196](../agency/harness/agllm_terminus.py:196) | the **only** place a credentialed provider client is constructed |
+| Sandbox | `agSandbox` → `sandbox/{container,chroot}.py` | container lifecycle, cgroups, layer commits |
 
 Cross-cutting services, all following the same shape (host-side FastAPI class +
 own token→agent registry + TCP listener + UDS listener bind-mounted into the
 container):
 
-- `agLLMTerminus` — LLM dispatch, [agllm_terminus.py](../agency/agharness_internal/agllm_terminus.py)
-- `agProxyLLM` — wire-format routing, runs **in-container**, [agproxy_llm.py](../agency/agharness_internal/agproxy_llm.py)
-- `agMCPServer` — control-plane tools, [agmcp_server.py](../agency/agharness_internal/agmcp_server.py)
-- `agHarnessMessenger` — inbox/pause bridge, [agharness_messenger.py](../agency/agharness_internal/agharness_messenger.py)
-- `agProxyPtrace` — syscall mediation, [agproxy_ptrace.py](../agency/agharness_internal/agproxy_ptrace.py)
+- `agLLMTerminus` — LLM dispatch, [agllm_terminus.py](../agency/harness/agllm_terminus.py)
+- `agProxyLLM` — wire-format routing, runs **in-container**, [agproxy_llm.py](../agency/harness/agproxy_llm.py)
+- `agMCPServer` — control-plane tools, [agmcp_server.py](../agency/harness/agmcp_server.py)
+- `agHarnessMessenger` — inbox/pause bridge, [agharness_messenger.py](../agency/harness/agharness_messenger.py)
+- `agProxyPtrace` — syscall mediation, [agproxy_ptrace.py](../agency/harness/agproxy_ptrace.py)
 
 Logging/events are separate from profiling and stay that way: `aglog._record()`
 / `_tool_call()` / `_lifecycle()` ([aglog.py:89](../agency/aglog.py:89)) write
@@ -143,7 +143,7 @@ agharness_backend.for_config(engine, agconfig) -> _NativeBackend
 > below — native's own loop lives in a persistent in-container process.
 
 Native's loop is `_run_react_loop()`
-([_native_in_container_entrypoint.py:1026](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:1026)) —
+([_native_in_container_entrypoint.py:1026](../agency/harness/agharness_backends/_native_in_container_entrypoint.py:1026)) —
 `for _ in range(max_steps)` at line 1080 is the turn boundary,
 `handler(fn_args)` at line 1115 is the tool boundary. The other four engines run
 a third-party CLI whose loop is opaque.
@@ -160,7 +160,7 @@ Consequences visible in the tree:
 ### 3.3 One credentialed choke point, and a token that already identifies runs
 
 Every engine's LLM traffic reaches `agLLMTerminus./internal/dispatch`
-([agllm_terminus.py:289](../agency/agharness_internal/agllm_terminus.py:289)).
+([agllm_terminus.py:289](../agency/harness/agllm_terminus.py:289)).
 That is architecturally guaranteed — it is the whole reason the terminus
 exists. Two properties the profiler can exploit:
 
@@ -168,11 +168,11 @@ exists. Two properties the profiler can exploit:
    `next(stream_iter)` forced before the HTTP response commits — an **exact
    TTFT measurement point** for all five engines.
 2. `kwargs["messages"]` carries the *full* conversation each dispatch
-   ([agllm_terminus.py:221-232](../agency/agharness_internal/agllm_terminus.py:221)),
+   ([agllm_terminus.py:221-232](../agency/harness/agllm_terminus.py:221)),
    because every engine resends it whole.
 
 The per-run bearer token is minted and registered at, e.g.,
-[claude_code.py:184-185](../agency/agharness_internal/agharness_backends/claude_code.py:184):
+[claude_code.py:184-185](../agency/harness/agharness_backends/claude_code.py:184):
 
 ```python
 token = uuid.uuid4().hex
@@ -192,18 +192,18 @@ This is the natural correlation key: it already maps 1:1 to (agent, skill run).
 |---|---|---|---|---|---|
 | 1 | `run{N}` lane root, `resolve`, `sandbox:provision`, `teardown:*`, `prune` | `agskill.py:321-503` | nothing — `_task()` is structurally the same | [agskill.py:288-450](../agency/agskill.py:288) | I |
 | 2 | 11 `sandbox:*` spans | `agsandbox.py:148,279-366` | nothing — facade is byte-identical minus the `with` blocks | [agsandbox.py:328-364](../agency/agsandbox.py:328) | I |
-| 3 | `sync:container`, `runtime:detect`, `sandbox:start` | `container.py:103,131,882` | nothing | [container.py:85,107,809](../agency/agsandbox_backends/container.py:85) | I |
+| 3 | `sync:container`, `runtime:detect`, `sandbox:start` | `container.py:103,131,882` | nothing | [container.py:85,107,809](../agency/sandbox/container.py:85) | I |
 | 4 | GPU leases, `sync:gpu_wait` | `agresources.py:440-491` | nothing | [agresources.py:417,451](../agency/agresources.py:417) | I |
 | 5 | `agsync:join`, `sync:result_wait`, `agent:create`, `agprof.workload()` | `agsync.py:95`, `agdata.py:45`, `agent.py:235`, `agwebui/__init__.py:292` | nothing | same files | I |
-| 6 | **Container cgroup registration** | `container.py:990-1033`, `_register_prof_container()` | method deleted wholesale; no cgroup discovery survives on HEAD (`grep cgroup container.py` → 1 unrelated hit at line 1057) | must be re-added to [container.py](../agency/agsandbox_backends/container.py) | I (but blocks **all** container/process/GPU-attribution metrics) |
+| 6 | **Container cgroup registration** | `container.py:990-1033`, `_register_prof_container()` | method deleted wholesale; no cgroup discovery survives on HEAD (`grep cgroup container.py` → 1 unrelated hit at line 1057) | must be re-added to [container.py](../agency/sandbox/container.py) | I (but blocks **all** container/process/GPU-attribution metrics) |
 | 7 | `input:prepare` | `agskill.py:555` | operation hoisted from `execute_react` into `execute_harness` | [agskill.py:527](../agency/agskill.py:527) | I (relocate) |
 | 8 | `proc_wait` | `agskill.py:821,858` | now native-only; the other 4 engines skip it because ptrace PID exit events never arrive | [agskill.py:582-592](../agency/agskill.py:582) | A (narrowed scope) |
-| 9 | **`turn{i}`** | `agskill.py:606` | host loop deleted | native: [entrypoint.py:1080](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:1080); other 4: inside a third-party CLI | **A** |
-| 10 | **`tool:{name}`, `tool_dispatch:{skill}`** | `agtool.py:374`, `agskill.py:732` | `dispatch_tools()` deleted; host tool set reduced to glob/grep/read/todowrite/webfetch/human | native: [entrypoint.py:1110-1119](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:1110); other 4: harness-internal | **A** |
-| 11 | **`llm:attempt[n]` + TTFT/token annotations** | `agllm.py:315,350` | `agllm.call()` deleted | [agllm_terminus.py:314](../agency/agharness_internal/agllm_terminus.py:314) — *better placed than before* | **A** (favourable) |
-| 12 | **`llm:retry_backoff`** | `agllm.py:539` | host retry loop deleted. Retries now live in 3 unrelated layers: `_dispatch_retry_backoff_s` ([entrypoint.py:791](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:791), native only), each harness CLI's internal retry (invisible — arrives as a fresh dispatch), and nowhere else. The terminus deliberately does **one** attempt, no loop ([agllm_terminus.py:47-70](../agency/agharness_internal/agllm_terminus.py:47)) | no single owner | **A** |
+| 9 | **`turn{i}`** | `agskill.py:606` | host loop deleted | native: [entrypoint.py:1080](../agency/harness/agharness_backends/_native_in_container_entrypoint.py:1080); other 4: inside a third-party CLI | **A** |
+| 10 | **`tool:{name}`, `tool_dispatch:{skill}`** | `agtool.py:374`, `agskill.py:732` | `dispatch_tools()` deleted; host tool set reduced to glob/grep/read/todowrite/webfetch/human | native: [entrypoint.py:1110-1119](../agency/harness/agharness_backends/_native_in_container_entrypoint.py:1110); other 4: harness-internal | **A** |
+| 11 | **`llm:attempt[n]` + TTFT/token annotations** | `agllm.py:315,350` | `agllm.call()` deleted | [agllm_terminus.py:314](../agency/harness/agllm_terminus.py:314) — *better placed than before* | **A** (favourable) |
+| 12 | **`llm:retry_backoff`** | `agllm.py:539` | host retry loop deleted. Retries now live in 3 unrelated layers: `_dispatch_retry_backoff_s` ([entrypoint.py:791](../agency/harness/agharness_backends/_native_in_container_entrypoint.py:791), native only), each harness CLI's internal retry (invisible — arrives as a fresh dispatch), and nowhere else. The terminus deliberately does **one** attempt, no loop ([agllm_terminus.py:47-70](../agency/harness/agllm_terminus.py:47)) | no single owner | **A** |
 | 13 | **`llm:sync`** (256-slot semaphore) | `agllm.py:164` | semaphore *deleted as a concept* ([agllm.py:88](../agency/agllm.py:88)) — there is no host LLM throttle to queue behind | none; metric is meaningless | **A** (retire) |
-| 14 | **`llm:compact`** | `agllm.py:870` | moved in-container, native only ([entrypoint.py:958](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:958)); external harnesses compact internally and invisibly | native only | **A** |
+| 14 | **`llm:compact`** | `agllm.py:870` | moved in-container, native only ([entrypoint.py:958](../agency/harness/agharness_backends/_native_in_container_entrypoint.py:958)); external harnesses compact internally and invisibly | native only | **A** |
 | 15 | **`agmap:{fn}[{i}]` lane root** | `agmap.py:63-68` | `agency/agmap.py` deleted from HEAD; lives on branch `tony/agmap` — in a **different API revision** than the one `tony/profiler` instruments | none | **A** (see §5.8 and §10) |
 | 16 | Per-span `cpu_ms` / `runqueue_ms` / `blocked_ms` | `_TimedSpan.__exit__` | `time.thread_time_ns()` and `/proc/self/schedstat` are **host-thread-local**. Any span originating in a container has no host thread | unrecoverable host-side | **A** |
 
@@ -226,7 +226,7 @@ instrumentation site each; works for all five engines by construction.
 **Tier 2 — engine-independent, syscall-observed.** Process spawn/exit and
 kernel-confirmed executable identity via `agProxyPtrace`. Requires no harness cooperation.
 `agProxyPtraceHandle.on_spawn()` / `.on_exec()` / `.on_exit()`
-([agproxy_ptrace.py:176-186](../agency/agharness_internal/agproxy_ptrace.py:176))
+([agproxy_ptrace.py:176-186](../agency/harness/agproxy_ptrace.py:176))
 are **existing callbacks** — no new plumbing.
 
 **Tier 3 — engine-specific, semantic.** Turn and tool boundaries. Native emits
@@ -252,7 +252,7 @@ This is the key insight and it should drive the first increment.
 
 Every engine resends the whole conversation on every dispatch, and the terminus
 already records it
-([agllm_terminus.py:221-232, 380](../agency/agharness_internal/agllm_terminus.py:221)).
+([agllm_terminus.py:221-232, 380](../agency/harness/agllm_terminus.py:221)).
 Therefore, host-side and with **zero** container code:
 
 - Dispatch *n* for a token **is** turn *n*. Turn count, per-turn LLM latency,
@@ -322,7 +322,7 @@ regresses:
    fresh context, so the implicit parent is lost. Every skill run is spawned as
    a bare daemon thread — [agskill.py:450](../agency/agskill.py:450),
    [agteam.py:208](../agency/agteam.py:208),
-   [agsandbox_backends/base.py:230](../agency/agsandbox_backends/base.py:230),
+   [sandbox/base.py:230](../agency/sandbox/base.py:230),
    plus `agmap._spawn` once `agmap` returns (§5.8 — a fourth site, and the
    highest-fan-out of the four).
    Without a fix, every run is a disconnected root and the `parent_agent_id`
@@ -384,10 +384,10 @@ structurally rather than by discipline:
 - Nothing is lost to an OOM kill — there is no in-container buffer to die with
   the container.
 
-### 5.5 New host-side module: `agharness_internal/agprof_ingest.py`
+### 5.5 New host-side module: `harness/agprof_ingest.py`
 
 Follows the established pattern exactly — see
-[agharness_messenger.py:22-25](../agency/agharness_internal/agharness_messenger.py:22)
+[agharness_messenger.py:22-25](../agency/harness/agharness_messenger.py:22)
 ("each bridged service should own its own registry rather than reaching into a
 sibling's in-process state"). Own class, own token→(agent, run span id)
 registry, own UDS listener.
@@ -428,15 +428,15 @@ The token is a **credential** and must never appear in a span attribute or in
 
 Claude Code is the first Tier-3 adapter because the wiring already exists:
 `--settings` hook registration at
-[claude_code.py:291-295](../agency/agharness_internal/agharness_backends/claude_code.py:291),
+[claude_code.py:291-295](../agency/harness/agharness_backends/claude_code.py:291),
 `_harness_permission_hook.py`, and
 `_native_hooks.hook_payload_to_syscallevent()`
-([_native_hooks.py:38](../agency/agharness_internal/agharness_backends/_native_hooks.py:38))
+([_native_hooks.py:38](../agency/harness/agharness_backends/_native_hooks.py:38))
 which already parses the `PreToolUse`/`PostToolUse` payload shape.
 
 The semantic adapter should reuse the `agsyscallevent.tool_name` / `.tool_args`
 fields reserved for this shape of event
-([agproxy_ptrace.py:107-113](../agency/agharness_internal/agproxy_ptrace.py:107))
+([agproxy_ptrace.py:107-113](../agency/harness/agproxy_ptrace.py:107))
 rather than inventing a parallel policy-facing type. `_AgPtraceFields.profiler`
 remains a distinct selector for a future heavyweight per-process sampler such
 as `perf`; M6's low-cost
@@ -461,7 +461,7 @@ unbounded; the module docstring's throttling guarantee is about *containers*
 has landed — [agprof.py:460](../agency/profiler/agprof.py:460), applied at
 [agskill.py:474](../agency/agskill.py:474),
 [agteam.py:208](../agency/agteam.py:208), and
-[agsandbox_backends/base.py:231](../agency/agsandbox_backends/base.py:231) —
+[sandbox/base.py:231](../agency/sandbox/base.py:231) —
 so `agmap` necessarily merges *after* the fix. It will arrive carrying an
 untouched raw `threading.Thread` call, and every mapped task becomes a
 disconnected trace root — **silently**, because a disconnected root is a valid
@@ -676,18 +676,18 @@ Difficulty: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 - **Objective:** unblock every container, per-process, and GPU-attribution
   metric.
 - **Files:** re-add `_register_prof_container()` and `_prof_container_label()`
-  to `agsandbox_backends/container.py` (~50 lines from
+  to `sandbox/container.py` (~50 lines from
   `tony/profiler:container.py:985-1033`); call from `_ensure_started()`
-  ([container.py:809](../agency/agsandbox_backends/container.py:809)) and
+  ([container.py:809](../agency/sandbox/container.py:809)) and
   `container_stopped()` from `stop()`/`rm_container()`
-  ([container.py:1546,1600](../agency/agsandbox_backends/container.py:1546)).
+  ([container.py:1546,1600](../agency/sandbox/container.py:1546)).
 - **Difficulty:** S.
 - **Dependencies:** M0.
 - **Outcome:** `sandbox:*` resource tracks and per-process attribution return.
 
 ### M2 — Instrument the terminus — *required*
 - **Objective:** exact LLM metrics for **all five engines** from one site.
-- **Files:** [agllm_terminus.py:289-395](../agency/agharness_internal/agllm_terminus.py:289).
+- **Files:** [agllm_terminus.py:289-395](../agency/harness/agllm_terminus.py:289).
   Wrap `client.chat.completions.create()` in `llm:attempt[0]`; TTFT is the
   interval to `next(stream_iter)` at line 315 (already forced before the
   response commits); annotate `input_tokens`/`output_tokens` from
@@ -703,7 +703,7 @@ Difficulty: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 - **Objective:** non-empty `turns` and `tools` sections for every engine.
 - **Files:** new `agency/profiler/agprof_derive.py`; hook into
   `_record_transcript()`
-  ([agllm_terminus.py:266](../agency/agharness_internal/agllm_terminus.py:266)).
+  ([agllm_terminus.py:266](../agency/harness/agllm_terminus.py:266)).
   Diff consecutive `messages` arrays per token; emit `turn{i}` and
   `tool:{name}` records with `metadata["timing"] = "derived"`.
 - **Difficulty:** M — the message-diff needs care around compaction (the array
@@ -721,15 +721,15 @@ Difficulty: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
     [agprof.py:460](../agency/profiler/agprof.py:460), applied at
     [agskill.py:474](../agency/agskill.py:474),
     [agteam.py:208](../agency/agteam.py:208),
-    [agsandbox_backends/base.py:231](../agency/agsandbox_backends/base.py:231).
+    [sandbox/base.py:231](../agency/sandbox/base.py:231).
     It no-ops to a plain `Thread` while profiling is off, so the optional OTel
     import stays off the disabled path. The remaining spawn site is
     `agmap._spawn`, which does not exist on HEAD — it belongs to the `agmap`
     merge checklist, not to this milestone (§5.8.1);
-  - new `agharness_internal/agprof_ingest.py` holding token →
+  - new `harness/agprof_ingest.py` holding token →
     `(agent, run span context)`, patterned on `agharness_messenger.py`;
   - register alongside `terminus.register()` at
-    [claude_code.py:184](../agency/agharness_internal/agharness_backends/claude_code.py:184)
+    [claude_code.py:184](../agency/harness/agharness_backends/claude_code.py:184)
     and the equivalent in `native.py`, `codex.py`, `opencode.py`, `grok.py`;
   - `agency.run_id` / `agent_id` / `parent_agent_id` as span attributes; the
     bearer token is the ingest's auth header **only** and must never reach a
@@ -740,7 +740,7 @@ Difficulty: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
   existing UDS HTTP bridge for free.
 
 **Follow-up — ordered shutdown of shared services.** `agLLMTerminus` runs
-Uvicorn on a daemon thread ([agllm_terminus.py:723](../agency/agharness_internal/agllm_terminus.py:723)).
+Uvicorn on a daemon thread ([agllm_terminus.py:723](../agency/harness/agllm_terminus.py:723)).
 A caller can observe the SSE `[DONE]` chunk and return while
 `_ProfiledStreamingResponse.__call__`'s `finally` (which calls
 `_finish_span` to annotate usage and close the span) is still running on
@@ -774,7 +774,7 @@ milestone's correlation registry:
 - **Objective:** exact turn/tool timing for `native`.
 - **Files:** new `agency/profiler/agprof_emit.py` (**stdlib only** — see §5.4);
   bind-mount + emit at
-  [entrypoint.py:1080](../agency/agharness_internal/agharness_backends/_native_in_container_entrypoint.py:1080)
+  [entrypoint.py:1080](../agency/harness/agharness_backends/_native_in_container_entrypoint.py:1080)
   (turn), `:1110-1119` (tool), `:958` (compact), `:791` (retry backoff);
   ingest host-side in `agprof_ingest.py`.
 - **Difficulty:** M.
@@ -785,7 +785,7 @@ milestone's correlation registry:
 ### M6 — ptrace process lifecycle — *recommended*
 - **Objective:** child-process spans for the four external engines.
 - **Files:** `agProxyPtraceHandle.on_spawn`/`on_exec`/`on_exit`
-  ([agproxy_ptrace.py:176-186](../agency/agharness_internal/agharness_backends/../agproxy_ptrace.py:176))
+  ([agproxy_ptrace.py:176-186](../agency/harness/agharness_backends/../agproxy_ptrace.py:176))
   → `agprof` records; stage the exec syscall path (never `argv[0]`) and
   commit its sanitized basename only after `PTRACE_EVENT_EXEC` confirms success.
 - **Difficulty:** S — the callbacks already exist.
@@ -796,7 +796,7 @@ milestone's correlation registry:
 ### M7 — Claude Code semantic adapter — *recommended*
 - **Objective:** exact tool timing for the highest-traffic external engine.
 - **Files:** extend the hook script at
-  [claude_code.py:291-295](../agency/agharness_internal/agharness_backends/claude_code.py:291)
+  [claude_code.py:291-295](../agency/harness/agharness_backends/claude_code.py:291)
   and `_harness_permission_hook.py` to also POST `PreToolUse`/`PostToolUse` to
   the ingest; reuse `_native_hooks.hook_payload_to_syscallevent()`.
 - **Difficulty:** M.
@@ -884,7 +884,7 @@ milestone's correlation registry:
 | Risk | Mitigation |
 |---|---|
 | Host↔container clock skew (Docker Desktop on macOS drifts seconds) reorders spans | Measure offset via a UDS round-trip at container start; apply once at ingest (§5.4). Assert no child starts before its parent in M8's golden test |
-| `_record_transcript` fires on **every chunk** ([agllm_terminus.py:380](../agency/agharness_internal/agllm_terminus.py:380)); a naive M3 differ will emit a turn per chunk | Derive on dispatch completion, not on transcript write |
+| `_record_transcript` fires on **every chunk** ([agllm_terminus.py:380](../agency/harness/agllm_terminus.py:380)); a naive M3 differ will emit a turn per chunk | Derive on dispatch completion, not on transcript write |
 | Compaction shrinks the messages array, so M3's diff sees a spurious rewind | Detect a shrink and restart the diff baseline; native already signals compaction directly (M5) |
 | Retries have no single owner (row 12): a harness CLI retry looks like a new turn | Report `llm.attempts_observed` (host truth, from the terminus) separately from `llm.retries_reported` (harness-asserted, usually absent). Benchmarks use the former |
 | **OTel default: unended spans are never exported.** A hung or OOM-killed run would produce no spans and read as *fast*, silently losing canonical `incomplete_spans` | Keep agprof's existing `_open_spans` registry; force-end with `outcome="interrupted"` at session stop (§5.3). Covered by M8's interruption test |

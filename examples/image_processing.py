@@ -24,7 +24,7 @@ from pathlib import Path
 
 from agency import agent, agdata, agimage, agskill, agteam, agsync
 from agency.agconfig import agConfig
-from agency.agllm_backends import agVLLMBackendConfig
+from agency.llm import agVLLMBackendConfig
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agConfig(
