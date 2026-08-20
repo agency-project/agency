@@ -2,26 +2,25 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .host_server_manager.host_server_manager import HostServerManager
-from .policy_manager import AgentHarnessPolicyManager
+from .host_servers.host_server_manager import HostServerManager
 from .types import ExecutionResult
 
 if TYPE_CHECKING:
-    from ..agconfig import agConfig
     from ..agcontext import agcontext
     from ..agdata import agdata
+    from ..agent import agent
+    from ..agresources import agResourcePool
     from ..agskill import agskill
-    from ..sandbox.agsandbox import agSandbox
 
 
 class agentEngine:
     def __init__(
         self,
+        agent: "agent",
         context: "agcontext",
-        sandbox: "agSandbox",
-        agconfig: "agConfig",
         skill: "agskill",
         skill_input: "agdata",
+        resource_pool: "agResourcePool",
     ) -> None:
         raise NotImplementedError
 
@@ -36,8 +35,4 @@ class agentEngine:
 
     @property
     def host_server_manager(self) -> HostServerManager:
-        raise NotImplementedError
-
-    @property
-    def policy_manager(self) -> AgentHarnessPolicyManager:
         raise NotImplementedError

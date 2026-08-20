@@ -5,19 +5,19 @@ from typing import TYPE_CHECKING
 from .types import (
     ExecutionResult,
     HarnessAttemptResult,
-    HarnessManagerHandle,
     PromptPayload,
-    ProvisionedSandbox,
 )
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
     from ..agcontext import agcontext
     from ..agdata import agdata
+    from ..agent import agent
+    from ..agresources import agResourcePool
     from ..agskill import agskill
     from ..sandbox.agsandbox import agSandbox
     from .harness_bridge import HarnessManagerBridge
-    from .host_server_manager.host_server_manager import HostServerManager
+    from .host_servers.host_server_manager import HostServerManager
     from .sandbox_provisioner import SandboxProvisioner
 
 
@@ -31,23 +31,23 @@ class ExecutionBuilder:
 
     def build_and_run(
         self,
+        agent: "agent",
         context: "agcontext",
-        sandbox: "agSandbox",
-        agconfig: "agConfig",
         skill: "agskill",
         skill_input: "agdata",
+        resource_pool: "agResourcePool",
     ) -> ExecutionResult:
         raise NotImplementedError
 
-    def build_container_and_uds(self, sandbox: "agSandbox") -> ProvisionedSandbox:
+    def build_container_and_uds(self, sandbox: "agSandbox") -> "agSandbox":
         raise NotImplementedError
 
     def build_host_side_server(
         self,
-        context: "agcontext",
-        agconfig: "agConfig",
+        agent: "agent",
         skill: "agskill",
-        provisioned: ProvisionedSandbox,
+        sandbox: "agSandbox",
+        resource_pool: "agResourcePool",
     ) -> "HostServerManager":
         raise NotImplementedError
 
@@ -55,8 +55,8 @@ class ExecutionBuilder:
         raise NotImplementedError
 
     def launch_harness_manager(
-        self, provisioned: ProvisionedSandbox, host_server_manager: "HostServerManager"
-    ) -> HarnessManagerHandle:
+        self, sandbox: "agSandbox", host_server_manager: "HostServerManager"
+    ) -> "int | None":
         raise NotImplementedError
 
     def run_agent_harness(
@@ -64,11 +64,11 @@ class ExecutionBuilder:
         agconfig: "agConfig",
         skill: "agskill",
         prompt: PromptPayload,
-        harness: HarnessManagerHandle,
+        harness_manager_pid: "int | None",
     ) -> HarnessAttemptResult:
         raise NotImplementedError
 
     def wait_for_completion(
-        self, harness: HarnessManagerHandle, attempt: HarnessAttemptResult
+        self, harness_manager_pid: "int | None", attempt: HarnessAttemptResult
     ) -> ExecutionResult:
         raise NotImplementedError

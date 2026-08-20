@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
+from .agpolicy import agpolicy
 from .agtype import agtype
 from . import agpause
 from .profiler import agprof
@@ -83,6 +84,7 @@ class agskill:
         output_schema: agdata | None = None,
         max_output_schema_retries: int = 10,  # [REFACTOR] Why here?
         plan_mode: bool = False,
+        policy: "agpolicy | None" = None,
     ):
         self.name = name
         self.system_prompt = system_prompt
@@ -91,6 +93,7 @@ class agskill:
         self.input_schema = agschema(input_schema) if input_schema else None
         self.output_schema = agschema(output_schema) if output_schema else None
         self.max_output_schema_retries = max_output_schema_retries
+        self.policy = policy if policy is not None else agpolicy()
 
     # ------------------------------------------------------------------
     # Internal helpers

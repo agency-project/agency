@@ -6,13 +6,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..agcontext import agcontext
     from ..agdata import agdata
-    from ..sandbox.agsandbox import agSandbox
-
-
-@dataclass
-class ProvisionedSandbox:
-    sandbox: "agSandbox | None"
-    uds_path: "str | None"
 
 
 @dataclass
@@ -20,13 +13,6 @@ class PromptPayload:
     prompt: "str | list"
     output_format_instruction: "str | None"
     extra_system: "str | None"
-
-
-@dataclass
-class HarnessManagerHandle:
-    base_url: str
-    uds_path: "str | None"
-    pid: "int | None" = None
 
 
 @dataclass
