@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from ...harness._syscall_event import agsyscallevent
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
     from ...agconfig import agConfig
     from ...agent import agent
     from ...agskill import agskill
-    from ...harness._syscall_event import agsyscallevent
 
 
 class HarnessInteractionServer(HostServerBase):
@@ -38,7 +38,9 @@ class HarnessInteractionServer(HostServerBase):
         return result if isinstance(result, tuple) else (result, None)
 
     def check_inbox(self) -> "list[dict]":
-        raise NotImplementedError
+        messages: "list[dict]" = []
+        self._agent._drain_inbox(messages)
+        return messages
 
     def build_app(self) -> FastAPI:
         app = FastAPI()
@@ -51,5 +53,10 @@ class HarnessInteractionServer(HostServerBase):
         @app.post("/check_inbox")
         def _check_inbox() -> JSONResponse:
             return JSONResponse({"messages": self.check_inbox()})
+
+        @app.post("/check_syscall")
+        def _check_syscall(request: dict) -> JSONResponse:
+            allowed, reason = self.check_syscall(agsyscallevent(**request))
+            return JSONResponse({"allowed": allowed, "reason": reason})
 
         return app

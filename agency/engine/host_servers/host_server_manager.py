@@ -90,7 +90,3 @@ class HostServerManager(HostServerBase):
 
         for server_instance in self._server_instances:
             server_instance.stop()
-
-    @property
-    def harness_interaction_server(self) -> HarnessInteractionServer:
-        return self._harness_interaction_server

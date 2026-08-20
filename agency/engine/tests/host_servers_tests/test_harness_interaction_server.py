@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 from fastapi.testclient import TestClient
 
 from agency.agpolicy import agpolicy
@@ -17,18 +16,20 @@ from agency.harness._syscall_event import agsyscallevent
 # ---------------------------------------------------------------------------
 
 
-def _make_agent(agconfig=None):
-    return SimpleNamespace(
+def _make_agent(agconfig=None, drain_inbox=None):
+    agent = SimpleNamespace(
         agconfig=agconfig if agconfig is not None else SimpleNamespace(), inbox=object()
     )
+    agent._drain_inbox = drain_inbox if drain_inbox is not None else (lambda messages: False)
+    return agent
 
 
 def _make_skill(policy=None):
     return SimpleNamespace(policy=policy if policy is not None else agpolicy())
 
 
-def _make_server(policy=None, agconfig=None):
-    agent = _make_agent(agconfig)
+def _make_server(policy=None, agconfig=None, drain_inbox=None):
+    agent = _make_agent(agconfig, drain_inbox)
     skill = _make_skill(policy)
     return HarnessInteractionServer(agent, skill), agent
 
@@ -190,14 +191,42 @@ def test_check_syscall_falls_back_to_default_for_unregistered_syscall_name():
 
 
 # ---------------------------------------------------------------------------
-# check_inbox (unimplemented stub)
+# check_inbox
 # ---------------------------------------------------------------------------
 
 
-def test_check_inbox_raises_not_implemented():
+def test_check_inbox_returns_empty_list_when_nothing_pending():
     server, _ = _make_server()
-    with pytest.raises(NotImplementedError):
-        server.check_inbox()
+    assert server.check_inbox() == []
+
+
+def test_check_inbox_returns_messages_drained_from_the_agent():
+    def drain_inbox(messages):
+        messages.append({"role": "user", "content": "hello"})
+        messages.append({"role": "user", "content": "world"})
+        return True
+
+    server, _ = _make_server(drain_inbox=drain_inbox)
+    assert server.check_inbox() == [
+        {"role": "user", "content": "hello"},
+        {"role": "user", "content": "world"},
+    ]
+
+
+def test_check_inbox_passes_a_fresh_list_to_agent_drain_inbox_each_call():
+    seen_lists = []
+
+    def drain_inbox(messages):
+        seen_lists.append(messages)
+        messages.append({"role": "user", "content": "x"})
+        return True
+
+    server, _ = _make_server(drain_inbox=drain_inbox)
+    first = server.check_inbox()
+    second = server.check_inbox()
+    assert first == [{"role": "user", "content": "x"}]
+    assert second == [{"role": "user", "content": "x"}]
+    assert seen_lists[0] is not seen_lists[1]
 
 
 # ---------------------------------------------------------------------------
@@ -224,15 +253,62 @@ def test_build_app_check_tool_route_denies_with_reason():
     assert response.json() == {"allowed": False, "reason": "nope"}
 
 
-def test_build_app_check_inbox_route_surfaces_the_not_implemented_stub():
-    server, _ = _make_server()
-    client = TestClient(server.build_app(), raise_server_exceptions=False)
+def test_build_app_check_inbox_route_returns_drained_messages():
+    def drain_inbox(messages):
+        messages.append({"role": "user", "content": "hello"})
+        return True
+
+    server, _ = _make_server(drain_inbox=drain_inbox)
+    client = TestClient(server.build_app())
     response = client.post("/check_inbox")
-    assert response.status_code == 500
+    assert response.status_code == 200
+    assert response.json() == {"messages": [{"role": "user", "content": "hello"}]}
 
 
-def test_build_app_has_no_route_for_check_syscall():
+def test_build_app_check_inbox_route_returns_empty_list_when_nothing_pending():
     server, _ = _make_server()
-    app = server.build_app()
-    paths = {route.path for route in app.routes}
-    assert "/check_syscall" not in paths
+    client = TestClient(server.build_app())
+    response = client.post("/check_inbox")
+    assert response.status_code == 200
+    assert response.json() == {"messages": []}
+
+
+def test_build_app_check_syscall_route_allows():
+    server, _ = _make_server(policy=agpolicy())
+    client = TestClient(server.build_app())
+    response = client.post(
+        "/check_syscall",
+        json={
+            "syscall": "openat",
+            "pid": 1,
+            "tid": 1,
+            "argv": None,
+            "envp": None,
+            "path": "/tmp/x",
+            "timestamp": 0.0,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {"allowed": True, "reason": None}
+
+
+def test_build_app_check_syscall_route_denies_with_reason():
+    def hook(syscall):
+        return (False, "sensitive path")
+
+    server, _ = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}))
+    client = TestClient(server.build_app())
+    response = client.post(
+        "/check_syscall",
+        json={
+            "syscall": "openat",
+            "pid": 1,
+            "tid": 1,
+            "argv": None,
+            "envp": None,
+            "path": "/etc/passwd",
+            "timestamp": 0.0,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {"allowed": False, "reason": "sensitive path"}

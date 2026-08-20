@@ -8,12 +8,11 @@ if TYPE_CHECKING:
     from ..agconfig import agConfig
     from ..agskill import agskill
     from ..sandbox.agsandbox import agSandbox
-    from .host_servers.harness_interaction_server import HarnessInteractionServer
     from .host_servers.host_server_manager import HostServerManager
 
 
 class HarnessManagerBridge:
-    def __init__(self, harness_interaction_server: "HarnessInteractionServer") -> None:
+    def __init__(self) -> None:
         raise NotImplementedError
 
     def ensure_launched(
