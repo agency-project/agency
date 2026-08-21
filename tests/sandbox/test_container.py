@@ -1174,15 +1174,16 @@ class TestGpuFlagsPerRuntime:
 
 class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
     """Regression coverage for the bug this fixes: _gpu_flags() used to be
-    gated on `self._gpu_virtual` (whether reserve_gpu() had been called
-    *before* the container was created), so a container created via a first
-    bash/read_file/write_file call before reserve_gpu() ran was permanently
-    stuck without GPU device access -- reserve_gpu() could flip the
-    sandbox's own flag afterward, but neither docker nor podman can
-    hot-attach a device to an already-running container. `_gpu_flags()` is
-    now called unconditionally, so the `docker/podman run` invocation must
-    include GPU flags even when `_gpu_virtual` is still False at the moment
-    the container is actually created."""
+    gated on `self._gpu_count_requested` (whether reserve_resource(gpu=N)
+    had been called *before* the container was created), so a container
+    created via a first bash/read_file/write_file call before
+    reserve_resource() ran was permanently stuck without GPU device access
+    -- reserve_resource() could flip the sandbox's own state afterward, but
+    neither docker nor podman can hot-attach a device to an already-running
+    container. `_gpu_flags()` is now called unconditionally, so the
+    `docker/podman run` invocation must include GPU flags even when
+    `_gpu_count_requested` is still 0 at the moment the container is
+    actually created."""
 
     def _sb(self):
         from agency.sandbox.podman import _PodmanBackend
@@ -1198,7 +1199,7 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
 
     def test_run_cmd_includes_gpu_flags_when_container_created_before_reserve_gpu(self):
         sb = self._sb()
-        assert sb._gpu_virtual is False  # reserve_gpu() has NOT been called yet
+        assert sb._gpu_count_requested == 0  # reserve_resource() has NOT been called yet
 
         with patch.object(_container, "_gpu_flags", return_value=["--device", "sentinel"]) as gf:
             with patch.object(sb, "_inspect_container_state", return_value=(False, "")):
@@ -1687,11 +1688,11 @@ class TestCvdOverrideProtectionIntegration:
         pool = agResourcePool(mark_gpus=False)
         assert pool.gpus, "expected at least one real GPU to be detected on this host"
         try:
-            # Mirrors the retired make_gpu_reserve tool's own _run body: a
-            # virtual-only reservation, no physical GPU claimed until exec().
-            sb._gpu_virtual = True
-            sb._gpu_acquire_fn = pool.acquire_gpu
-            sb._gpu_release_fn = pool.release_gpu
+            # Mirrors agskill._reserve_resource's own body: a virtual-only
+            # reservation, no physical GPU claimed until exec().
+            sb._gpu_count_requested = 1
+            sb._gpu_acquire_fn = pool.acquire_gpus
+            sb._gpu_release_fn = pool.release_gpus
 
             leased_out, rc = sb.exec("echo $CUDA_VISIBLE_DEVICES")
             assert rc == 0

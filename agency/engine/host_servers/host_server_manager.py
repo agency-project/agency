@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,9 +64,23 @@ class HostServerManager(HostServerBase):
             server_instance.start()
 
         Path(self._configs.uds_path).parent.mkdir(parents=True, exist_ok=True)
-        app = FastAPI()
-        for server_instance in self._server_instances:
-            app.mount(f"/{type(server_instance).__name__}", server_instance.build_app())
+        sub_apps = [
+            (f"/{type(server_instance).__name__}", server_instance.build_app())
+            for server_instance in self._server_instances
+        ]
+
+        @asynccontextmanager
+        async def lifespan(_app: FastAPI):
+            async with AsyncExitStack() as stack:
+                for server_instance, (_, sub_app) in zip(self._server_instances, sub_apps):
+                    ctx = server_instance.lifespan_context(sub_app)
+                    if ctx is not None:
+                        await stack.enter_async_context(ctx)
+                yield
+
+        app = FastAPI(lifespan=lifespan)
+        for prefix, sub_app in sub_apps:
+            app.mount(prefix, sub_app)
         config = uvicorn.Config(app, uds=self._configs.uds_path, log_level="warning")
         server = uvicorn.Server(config)
         self._server = server

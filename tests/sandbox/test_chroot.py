@@ -514,17 +514,17 @@ class TestChrootDelayedChildSafety:
 
 
 class TestChrootGpuDevPaths:
-    def test_gpu_id_none_returns_empty_even_with_gpus_on_host(self):
+    def test_gpu_ids_empty_returns_empty_even_with_gpus_on_host(self):
         with patch.object(
             _chroot_mod,
             "_all_chroot_gpu_dev_paths",
             return_value=["/dev/nvidiactl", "/dev/nvidia0"],
         ):
-            assert _chroot_gpu_dev_paths(None) == []
+            assert _chroot_gpu_dev_paths([]) == []
 
     def test_no_gpu_devices_on_host_returns_empty(self):
         with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=[]):
-            assert _chroot_gpu_dev_paths(0) == []
+            assert _chroot_gpu_dev_paths([0]) == []
 
     def test_nvidia_control_devices_plus_single_indexed_device(self):
         all_paths = [
@@ -537,18 +537,25 @@ class TestChrootGpuDevPaths:
         ]
         with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
             with patch.object(_chroot_mod.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                paths = _chroot_gpu_dev_paths(1)
+                paths = _chroot_gpu_dev_paths([1])
         assert "/dev/nvidia1" in paths
         assert "/dev/nvidia0" not in paths
         assert "/dev/nvidia2" not in paths
         for control in ("/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"):
             assert control in paths
 
+    def test_nvidia_multiple_indexed_devices(self):
+        all_paths = ["/dev/nvidiactl", "/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2"]
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
+            with patch.object(_chroot_mod.shutil, "which", return_value="/usr/bin/nvidia-smi"):
+                paths = _chroot_gpu_dev_paths([0, 2])
+        assert paths == ["/dev/nvidiactl", "/dev/nvidia0", "/dev/nvidia2"]
+
     def test_nvidia_gpu_id_out_of_range_returns_only_control_devices(self):
         all_paths = ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia0"]
         with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
             with patch.object(_chroot_mod.shutil, "which", return_value="/usr/bin/nvidia-smi"):
-                paths = _chroot_gpu_dev_paths(5)
+                paths = _chroot_gpu_dev_paths([5])
         assert paths == ["/dev/nvidiactl", "/dev/nvidia-uvm"]
 
     def test_amd_control_device_plus_single_render_node(self):
@@ -565,7 +572,7 @@ class TestChrootGpuDevPaths:
                 with patch.object(
                     _chroot_mod, "amd_render_node_paths_by_pci_bus", return_value=None
                 ):
-                    paths = _chroot_gpu_dev_paths(1)
+                    paths = _chroot_gpu_dev_paths([1])
         assert paths == ["/dev/kfd", "/dev/dri/renderD129"]
 
     def test_amd_gpu_id_out_of_range_returns_only_control_device(self):
@@ -575,7 +582,7 @@ class TestChrootGpuDevPaths:
                 with patch.object(
                     _chroot_mod, "amd_render_node_paths_by_pci_bus", return_value=None
                 ):
-                    paths = _chroot_gpu_dev_paths(5)
+                    paths = _chroot_gpu_dev_paths([5])
         assert paths == ["/dev/kfd"]
 
     def test_amd_uses_pci_bus_ordering_when_available(self):
@@ -591,15 +598,26 @@ class TestChrootGpuDevPaths:
                 with patch.object(
                     _chroot_mod, "amd_render_node_paths_by_pci_bus", return_value=pci_ordered
                 ):
-                    paths_0 = _chroot_gpu_dev_paths(0)
-                    paths_1 = _chroot_gpu_dev_paths(1)
+                    paths_0 = _chroot_gpu_dev_paths([0])
+                    paths_1 = _chroot_gpu_dev_paths([1])
         assert paths_0 == ["/dev/kfd", "/dev/dri/renderD129"]
         assert paths_1 == ["/dev/kfd", "/dev/dri/renderD128"]
+
+    def test_amd_multiple_render_nodes_via_pci_bus_ordering(self):
+        all_paths = ["/dev/kfd", "/dev/dri/renderD128", "/dev/dri/renderD129"]
+        pci_ordered = ["/dev/dri/renderD129", "/dev/dri/renderD128"]  # reversed
+        with patch.object(_chroot_mod, "_all_chroot_gpu_dev_paths", return_value=all_paths):
+            with patch.object(_chroot_mod.shutil, "which", return_value=None):
+                with patch.object(
+                    _chroot_mod, "amd_render_node_paths_by_pci_bus", return_value=pci_ordered
+                ):
+                    paths = _chroot_gpu_dev_paths([0, 1])
+        assert paths == ["/dev/kfd", "/dev/dri/renderD129", "/dev/dri/renderD128"]
 
 
 class TestChrootSetupLinesGpuScoping:
     """Integration check that _setup_lines() actually wires
-    _chroot_gpu_dev_paths(self._gpu_id) into the jail's /dev bind mounts,
+    _chroot_gpu_dev_paths(self._gpu_ids) into the jail's /dev bind mounts,
     rather than every host GPU device -- no real chroot required, this only
     inspects the generated shell lines."""
 
@@ -607,20 +625,36 @@ class TestChrootSetupLinesGpuScoping:
         scoped_dev = tmp_path / "nvidia1"
         scoped_dev.touch()
         sb = _make_backend()
-        sb._gpu_id = 1
+        sb._gpu_ids = [1]
         monkeypatch.setattr(
             _chroot_mod,
             "_chroot_gpu_dev_paths",
-            lambda gpu_id: [str(scoped_dev)] if gpu_id == 1 else [],
+            lambda gpu_ids: [str(scoped_dev)] if gpu_ids == [1] else [],
         )
         joined = "\n".join(sb._setup_lines())
         assert str(scoped_dev) in joined
         assert "nvidia0" not in joined
 
+    def test_multiple_scoped_gpu_devices_are_bind_mounted(self, tmp_path, monkeypatch):
+        dev1 = tmp_path / "nvidia1"
+        dev1.touch()
+        dev3 = tmp_path / "nvidia3"
+        dev3.touch()
+        sb = _make_backend()
+        sb._gpu_ids = [1, 3]
+        monkeypatch.setattr(
+            _chroot_mod,
+            "_chroot_gpu_dev_paths",
+            lambda gpu_ids: [str(dev1), str(dev3)] if gpu_ids == [1, 3] else [],
+        )
+        joined = "\n".join(sb._setup_lines())
+        assert str(dev1) in joined
+        assert str(dev3) in joined
+
     def test_no_gpu_leased_bind_mounts_no_gpu_devices(self, monkeypatch):
         sb = _make_backend()
-        sb._gpu_id = None
-        monkeypatch.setattr(_chroot_mod, "_chroot_gpu_dev_paths", lambda gpu_id: [])
+        sb._gpu_ids = []
+        monkeypatch.setattr(_chroot_mod, "_chroot_gpu_dev_paths", lambda gpu_ids: [])
         joined = "\n".join(sb._setup_lines())
         assert "nvidia" not in joined
         assert "renderD" not in joined
@@ -1082,11 +1116,11 @@ class TestChrootBackendLifecycle:
 
 
 class TestChrootGpuReleaseGating:
-    def _lease_gpu(self, sb, gpu_id=3):
+    def _lease_gpu(self, sb, gpu_ids=(3,)):
         released = []
-        sb._gpu_virtual = True
-        sb._gpu_id = gpu_id
-        sb._gpu_release_fn = lambda gid: released.append(gid)
+        sb._gpu_count_requested = len(gpu_ids)
+        sb._gpu_ids = list(gpu_ids)
+        sb._gpu_release_fn = lambda ids: released.extend(ids)
         return released
 
     def test_stop_releases_gpu_after_kill_attempt(self, monkeypatch):
@@ -1097,19 +1131,19 @@ class TestChrootGpuReleaseGating:
         sb.stop()
 
         assert released == [3]
-        assert sb._gpu_id is None
+        assert sb._gpu_ids == []
 
     def test_kill_runs_before_release(self, monkeypatch):
         order = []
         sb = _make_backend()
-        sb._gpu_virtual = True
-        sb._gpu_id = 3
-        sb._gpu_release_fn = lambda gid: order.append(("release", gid))
+        sb._gpu_count_requested = 1
+        sb._gpu_ids = [3]
+        sb._gpu_release_fn = lambda ids: order.append(("release", ids))
         monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: order.append(("kill",)))
 
         sb.stop()
 
-        assert order == [("kill",), ("release", 3)]
+        assert order == [("kill",), ("release", [3])]
 
     def test_gpu_released_exactly_once_across_stop_then_destroy(self, monkeypatch):
         sb = _make_backend()
@@ -1132,6 +1166,16 @@ class TestChrootGpuReleaseGating:
         sb.destroy()
 
         assert released == [3]
+
+    def test_stop_releases_multiple_held_gpu_ids(self, monkeypatch):
+        sb = _make_backend()
+        released = self._lease_gpu(sb, gpu_ids=(2, 4))
+        monkeypatch.setattr(sb, "_kill_all_sandbox_processes", lambda: None)
+
+        sb.stop()
+
+        assert released == [2, 4]
+        assert sb._gpu_ids == []
 
 
 @chroot

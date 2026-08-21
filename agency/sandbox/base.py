@@ -472,19 +472,19 @@ class agsandbox_backend(AgSandboxBackendFields):
         timeout: int = AgSandboxBackendFields.DEFAULT_EXEC_TIMEOUT_S,
     ) -> tuple[str, int]:
         """Run a user command inside the container."""
-        # Lazily acquire a physical GPU now that we have a bash call to run.
-        # Blocks (polling every 0.25 s) until any GPU in the pool is free.
-        if self._gpu_virtual and self._gpu_id is None and self._gpu_acquire_fn is not None:
-            self._gpu_id = self._gpu_acquire_fn()
+        # Lazily acquire the requested physical GPU(s) now that we have a
+        # bash call to run. Blocks until enough GPUs in the pool are free.
+        if self._gpu_count_requested > 0 and not self._gpu_ids and self._gpu_acquire_fn is not None:
+            self._gpu_ids = self._gpu_acquire_fn(self._gpu_count_requested)
 
-        # Restrict GPU access to the acquired GPU ID. Set both CUDA_VISIBLE_DEVICES
+        # Restrict GPU access to the acquired GPU ID(s). Set both CUDA_VISIBLE_DEVICES
         # (NVIDIA/CUDA) and HIP_VISIBLE_DEVICES (AMD/ROCm) so only the leased
-        # device is accessible regardless of which runtime is present.
-        # "NoDevFiles" hides all GPUs when no GPU has been acquired.
+        # device(s) are accessible regardless of which runtime is present.
+        # "NoDevFiles" hides all GPUs when none have been acquired.
         # An empty string would leave CUDA_VISIBLE_DEVICES unset, making all GPUs visible.
         import os
 
-        gpu_id = str(self._gpu_id) if self._gpu_id is not None else "NoDevFiles"
+        gpu_id = ",".join(str(g) for g in self._gpu_ids) if self._gpu_ids else "NoDevFiles"
         hf_token = os.environ.get("HF_TOKEN", "")
         hf_export = f"export HF_TOKEN={hf_token}\n" if hf_token else ""
         # readonly (not just export) so a command that itself starts with
@@ -525,7 +525,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         # idle entrypoint still runs. There is no agent-facing release tool;
         # the real GPU semaphore's lifetime is tied to the sandbox's own
         # lifetime.
-        if self._watched_pids and self._gpu_virtual and self._gpu_id is not None:
+        if self._watched_pids and self._gpu_count_requested > 0 and self._gpu_ids:
             self.get_live_pids()
 
         return clean_output, rc
@@ -846,13 +846,13 @@ class agsandbox_backend(AgSandboxBackendFields):
         return ", ".join(parts)
 
     def release_resources(self, pool: "agResourcePool | None" = None) -> None:
-        self._gpu_virtual = False
-        if self._gpu_id is not None:
+        self._gpu_count_requested = 0
+        if self._gpu_ids:
             if pool is not None:
-                pool.release_gpu(self._gpu_id)
+                pool.release_gpus(self._gpu_ids)
             elif self._gpu_release_fn is not None:
-                self._gpu_release_fn(self._gpu_id)
-            self._gpu_id = None
+                self._gpu_release_fn(self._gpu_ids)
+            self._gpu_ids = []
         if pool is not None and (self._cpu_acquired or self._memory_acquired_mb):
             pool.notify_cpu_released(self._cpu_acquired, self._memory_acquired_mb)
             self._cpu_acquired = 0.0

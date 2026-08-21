@@ -56,6 +56,208 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Default host-side MCP tools
+# ---------------------------------------------------------------------------
+
+
+def _memory_mb_to_docker_str(memory_mb: "float | None") -> "str | None":
+    if memory_mb is None:
+        return None
+    return f"{int(memory_mb)}m"
+
+
+def _reserve_resource(arg: agdata, sandbox, resource_pool) -> agdata:
+    cpus = arg._data.get("cpus")
+    memory_mb = arg._data.get("memory_mb")
+    gpu = arg._data.get("gpu", 0)
+    messages = []
+    result: dict = {}
+
+    if cpus is not None and cpus > resource_pool.total_cpus:
+        return agerror(f"requested {cpus} cpus but pool only has {resource_pool.total_cpus}")
+    if memory_mb is not None and memory_mb > resource_pool.total_memory_mb:
+        return agerror(
+            f"requested {memory_mb} MB but pool only has {resource_pool.total_memory_mb} MB"
+        )
+    if gpu and gpu > len(resource_pool.gpus):
+        return agerror(f"requested {gpu} gpus but pool only has {len(resource_pool.gpus)}")
+
+    if cpus is not None or memory_mb is not None:
+        sandbox.update_limits(cpus=cpus, memory=_memory_mb_to_docker_str(memory_mb))
+        if cpus is not None:
+            sandbox._cpu_acquired += cpus
+        if memory_mb is not None:
+            sandbox._memory_acquired_mb += memory_mb
+        resource_pool.notify_cpu_acquired(cpus or 0.0, memory_mb or 0)
+        messages.append(f"cpus={cpus}, memory_mb={memory_mb}")
+
+    if gpu:
+        sandbox._gpu_count_requested = gpu
+        sandbox._gpu_acquire_fn = resource_pool.acquire_gpus
+        sandbox._gpu_release_fn = resource_pool.release_gpus
+        result["gpu_count_requested"] = gpu
+        messages.append(f"gpu reservation set to {gpu} (granted lazily on next exec)")
+
+    if not messages:
+        return agerror("reserve_resource called with nothing to reserve")
+    result["message"] = "Reserved: " + "; ".join(messages)
+    return agdata(**result)
+
+
+def _release_resource(arg: agdata, sandbox, resource_pool) -> agdata:
+    cpu = arg._data.get("cpu", False)
+    memory = arg._data.get("memory", False)
+    gpu = arg._data.get("gpu", False)
+    messages = []
+
+    if cpu or memory:
+        held_cpus = sandbox._cpu_acquired if cpu else 0.0
+        held_mb = sandbox._memory_acquired_mb if memory else 0
+        sandbox.update_limits(
+            cpus=resource_pool.idle_cpus if cpu else None,
+            memory=resource_pool.idle_memory if memory else None,
+        )
+        if cpu:
+            sandbox._cpu_acquired = 0.0
+        if memory:
+            sandbox._memory_acquired_mb = 0
+        resource_pool.notify_cpu_released(held_cpus, held_mb)
+        messages.append(f"cpu={cpu}, memory={memory} reset to idle")
+
+    if gpu:
+        if sandbox._gpu_count_requested > 0:
+            if sandbox._gpu_ids:
+                resource_pool.release_gpus(sandbox._gpu_ids)
+            messages.append(f"gpu reservation ({sandbox._gpu_count_requested}) released")
+            sandbox._gpu_ids = []
+            sandbox._gpu_count_requested = 0
+            sandbox._gpu_acquire_fn = None
+            sandbox._gpu_release_fn = None
+        else:
+            messages.append("no gpu was reserved")
+
+    if not messages:
+        return agerror("release_resource called with nothing to release")
+    return agdata(message="; ".join(messages))
+
+
+def _get_current_resources(arg: agdata, sandbox, resource_pool) -> agdata:
+    return agdata(
+        cpus_acquired=sandbox._cpu_acquired,
+        memory_mb_acquired=sandbox._memory_acquired_mb,
+        gpu_count_requested=sandbox._gpu_count_requested,
+        gpu_ids_held=list(sandbox._gpu_ids),
+        total_cpus=resource_pool.total_cpus,
+        total_memory_mb=resource_pool.total_memory_mb,
+        total_gpus=len(resource_pool.gpus),
+    )
+
+
+def _daemon_release(arg: agdata, sandbox) -> agdata:
+    pid = arg._data["pid"]
+    sandbox.release_daemon(pid)
+    return agdata(message=f"PID {pid} released as daemon -- will not block skill completion")
+
+
+def _submit_output(arg: agdata, output_schema, submitted_output_store: dict) -> agdata:
+    if output_schema is None:
+        return agerror("this skill declares no output_schema -- nothing to submit")
+    field = arg._data["field"]
+    value = arg._data["value"]
+    if field not in output_schema._data:
+        return agerror(f"unknown output field {field!r}")
+    err = output_schema.check_field(field, value)
+    if err is not None:
+        return agerror(err)
+    submitted_output_store[field] = value
+    required = set(output_schema._data.keys())
+    still_missing = sorted(required - set(submitted_output_store.keys()))
+    return agdata(result=f"field {field!r} recorded", still_missing=still_missing)
+
+
+def _submitted_output(arg: agdata, submitted_output_store: dict) -> agdata:
+    return agdata(**submitted_output_store)
+
+
+_DEFAULT_HOST_MCP_TOOLS: "list[agtool]" = [
+    agtool(
+        name="reserve_resource",
+        description=(
+            "Reserve additional CPU/memory/GPU capacity for this sandbox. "
+            "Any combination of cpus/memory_mb/gpu may be given in one call; "
+            "omitted resources are left untouched."
+        ),
+        fn=_reserve_resource,
+        params={
+            "type": "object",
+            "properties": {
+                "cpus": {"type": "number", "description": "CPUs to reserve"},
+                "memory_mb": {"type": "number", "description": "memory to reserve, in MB"},
+                "gpu": {"type": "integer", "description": "number of GPUs to reserve"},
+            },
+            "required": [],
+        },
+    ),
+    agtool(
+        name="release_resource",
+        description=(
+            "Release previously reserved CPU/memory/GPU capacity for this "
+            "sandbox. Any combination of cpu/memory/gpu may be given in one "
+            "call; omitted resources are left untouched."
+        ),
+        fn=_release_resource,
+        params={
+            "type": "object",
+            "properties": {
+                "cpu": {"type": "boolean", "description": "release held CPU"},
+                "memory": {"type": "boolean", "description": "release held memory"},
+                "gpu": {"type": "boolean", "description": "release held GPU(s)"},
+            },
+            "required": [],
+        },
+    ),
+    agtool(
+        name="get_current_resources",
+        description="Return this sandbox's current resource allocation and the pool's totals.",
+        fn=_get_current_resources,
+    ),
+    agtool(
+        name="daemon_release",
+        description=(
+            "Release a background process (by pid) from monitoring so the "
+            "skill can finish without waiting for it."
+        ),
+        fn=_daemon_release,
+        params={
+            "type": "object",
+            "properties": {"pid": {"type": "integer", "description": "pid to release"}},
+            "required": ["pid"],
+        },
+    ),
+    agtool(
+        name="submit_output",
+        description="Submit one required output field's value.",
+        fn=_submit_output,
+        params={
+            "type": "object",
+            "properties": {
+                "field": {"type": "string", "description": "output field name"},
+                "value": {"description": "the field's value"},
+            },
+            "required": ["field", "value"],
+        },
+        persistent_vars={"submitted_output_store": dict},
+    ),
+    agtool(
+        name="submitted_output",
+        description="Return the output fields submitted so far.",
+        fn=_submitted_output,
+        persistent_vars={"submitted_output_store": dict},
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # Skill class
 # ---------------------------------------------------------------------------
 
@@ -78,22 +280,21 @@ class agskill:
         self,
         name: str,
         system_prompt: str,
-        add_tools: list[agtool] | None = None,
-        replace_tools: list[agtool] | None = None,
+        add_host_mcp_tools: "list[agtool] | None" = None,
+        add_sandbox_mcp_tools: "list[agtool] | None" = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
         max_output_schema_retries: int = 10,  # [REFACTOR] Why here?
-        plan_mode: bool = False,
         policy: "agpolicy | None" = None,
     ):
         self.name = name
         self.system_prompt = system_prompt
-        self.add_tools = add_tools
-        self.replace_tools = [] if plan_mode else replace_tools
         self.input_schema = agschema(input_schema) if input_schema else None
         self.output_schema = agschema(output_schema) if output_schema else None
         self.max_output_schema_retries = max_output_schema_retries
         self.policy = policy if policy is not None else agpolicy()
+        self.host_mcp_tools = list(_DEFAULT_HOST_MCP_TOOLS) + (add_host_mcp_tools or [])
+        self.sandbox_mcp_tools = list(add_sandbox_mcp_tools or [])
 
     # ------------------------------------------------------------------
     # Internal helpers

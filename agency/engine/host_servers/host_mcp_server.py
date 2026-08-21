@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import inspect
+from contextlib import AbstractAsyncContextManager
+from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
+from mcp.server.transport_security import TransportSecuritySettings
 
+from ...agdata import agdata
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
-    from ...agconfig import agConfig
+    from starlette.applications import Starlette
+
     from ...agresources import agResourcePool
     from ...agskill import agskill
+    from ...agtool import agtool
     from ...sandbox.agsandbox import agSandbox
 
 
@@ -21,49 +27,50 @@ class HostMcpServer(HostServerBase):
         self._sandbox = sandbox
         self._skill = skill
         self._resource_pool = resource_pool
+        self._persistent_vars: "dict[str, object]" = {}
+        self._mcp_server: "MCPServer | None" = None
 
-    def set_config(self, agconfig: "agConfig") -> None:
-        self._agconfig = agconfig
+    def _register_tool(self, server: MCPServer, tool: "agtool") -> None:
+        properties = (tool.params or {}).get("properties", {})
+        required = set((tool.params or {}).get("required", list(properties.keys())))
 
-    def reserve_cpu(self, count: float) -> bool:
-        raise NotImplementedError
+        def call_tool(**kwargs: "object") -> dict:
+            persistent = {
+                var_name: self._persistent_vars.setdefault(var_name, factory())
+                for var_name, factory in tool.persistent_vars.items()
+            }
+            return tool(
+                agdata(**kwargs),
+                sandbox=self._sandbox,
+                resource_pool=self._resource_pool,
+                output_schema=self._skill.output_schema,
+                **persistent,
+            ).to_dict()
 
-    def cpu_release(self, count: float) -> None:
-        raise NotImplementedError
+        call_tool.__name__ = tool.name
+        call_tool.__signature__ = inspect.Signature(
+            [
+                inspect.Parameter(
+                    key,
+                    kind=inspect.Parameter.KEYWORD_ONLY,
+                    annotation=Annotated[Any, WithJsonSchema(schema)],
+                    default=inspect.Parameter.empty if key in required else None,
+                )
+                for key, schema in properties.items()
+            ]
+        )
+        server.add_tool(call_tool, name=tool.name, description=tool.description)
 
-    def daemon_release(self, pid: int) -> None:
-        raise NotImplementedError
+    def build_app(self) -> "Starlette":
+        server = MCPServer(name="agency-host-mcp-server")
 
-    def submit_output(self, field: str, value: "object") -> None:
-        raise NotImplementedError
+        for tool in self._skill.host_mcp_tools:
+            self._register_tool(server, tool)
 
-    def collected_output(self) -> dict:
-        raise NotImplementedError
+        self._mcp_server = server
+        return server.streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
 
-    def build_app(self) -> FastAPI:
-        app = FastAPI()
-
-        @app.post("/reserve_cpu")
-        def _reserve_cpu(request: dict) -> JSONResponse:
-            return JSONResponse({"ok": self.reserve_cpu(request["count"])})
-
-        @app.post("/cpu_release")
-        def _cpu_release(request: dict) -> JSONResponse:
-            self.cpu_release(request["count"])
-            return JSONResponse({"ok": True})
-
-        @app.post("/daemon_release")
-        def _daemon_release(request: dict) -> JSONResponse:
-            self.daemon_release(request["pid"])
-            return JSONResponse({"ok": True})
-
-        @app.post("/submit_output")
-        def _submit_output(request: dict) -> JSONResponse:
-            self.submit_output(request["field"], request["value"])
-            return JSONResponse({"ok": True})
-
-        @app.get("/collected_output")
-        def _collected_output() -> JSONResponse:
-            return JSONResponse(self.collected_output())
-
-        return app
+    def lifespan_context(self, app: "Starlette") -> "AbstractAsyncContextManager[None] | None":
+        return app.router.lifespan_context(app)

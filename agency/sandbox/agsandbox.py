@@ -234,24 +234,24 @@ class agSandbox(_AgSandboxFields):
     # the backend's own exec() reads/writes these live (to gate GPU env-var
     # injection and release), so they're properties over the backend's state
     # rather than independent facade state. tools/resource.py sets these
-    # directly on the sandbox instance (e.g. ``sandbox._gpu_virtual = True``).
+    # directly on the sandbox instance (e.g. ``sandbox._gpu_count_requested = 1``).
     # ------------------------------------------------------------------
 
     @property
-    def _gpu_id(self) -> "int | None":
-        return self._backend._gpu_id
+    def _gpu_ids(self) -> "list[int]":
+        return self._backend._gpu_ids
 
-    @_gpu_id.setter
-    def _gpu_id(self, value: "int | None") -> None:
-        self._backend._gpu_id = value
+    @_gpu_ids.setter
+    def _gpu_ids(self, value: "list[int]") -> None:
+        self._backend._gpu_ids = value
 
     @property
-    def _gpu_virtual(self) -> bool:
-        return self._backend._gpu_virtual
+    def _gpu_count_requested(self) -> int:
+        return self._backend._gpu_count_requested
 
-    @_gpu_virtual.setter
-    def _gpu_virtual(self, value: bool) -> None:
-        self._backend._gpu_virtual = value
+    @_gpu_count_requested.setter
+    def _gpu_count_requested(self, value: int) -> None:
+        self._backend._gpu_count_requested = value
 
     @property
     def _gpu_acquire_fn(self):

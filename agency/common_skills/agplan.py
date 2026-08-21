@@ -49,7 +49,6 @@ class agplan(agskill):
             name=name,
             system_prompt=_BASE_PROMPT + system_prompt,
             add_tools=add_tools,
-            replace_tools=None,  # _build_tools handles tool selection
             input_schema=input_schema,
             output_schema=output_schema,
             max_output_schema_retries=max_output_schema_retries,

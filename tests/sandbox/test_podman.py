@@ -199,7 +199,7 @@ class TestDanglingImageEagerCleanup:
         with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
-                    with patch.object(sb, "_gpu_virtual", False):
+                    with patch.object(sb, "_gpu_count_requested", 0):
                         sb.commit()
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
@@ -232,7 +232,7 @@ class TestDanglingImageEagerCleanup:
         with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
-                    with patch.object(sb, "_gpu_virtual", False):
+                    with patch.object(sb, "_gpu_count_requested", 0):
                         sb.commit()
 
         rmi_calls = [a for a in run_calls if "rmi" in a]
@@ -264,7 +264,7 @@ class TestDanglingImageEagerCleanup:
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
             with patch.object(sb, "_container_status", return_value="running"):
-                with patch.object(sb, "_gpu_virtual", False):
+                with patch.object(sb, "_gpu_count_requested", 0):
                     sb.commit()
 
         id_lookups = [c for c in calls if "--format={{.Id}}" in c]
@@ -306,7 +306,7 @@ class TestDanglingImageEagerCleanup:
             with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._PodmanBackend, "_run", fake_run):
                     with patch.object(sb, "_container_status", return_value="running"):
-                        with patch.object(sb, "_gpu_virtual", False):
+                        with patch.object(sb, "_gpu_count_requested", 0):
                             sb.commit()  # must not raise
         finally:
             sys.stderr = old_stderr
@@ -357,7 +357,7 @@ class TestDanglingImageEagerCleanup:
         with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
-                    with patch.object(sb, "_gpu_virtual", False):
+                    with patch.object(sb, "_gpu_count_requested", 0):
                         sb.commit()
 
         assert "rm" not in call_order, (
@@ -582,7 +582,7 @@ class TestCheckpointSquash:
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
             with patch.object(sb, "_container_status", return_value="running"):
-                with patch.object(sb, "_gpu_virtual", False):
+                with patch.object(sb, "_gpu_count_requested", 0):
                     sb.commit()
 
         assert any(c[:2] == [sb._runtime, "commit"] for c in calls), (
@@ -611,7 +611,7 @@ class TestCheckpointSquash:
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
             with patch.object(sb, "_container_status", return_value="running"):
-                with patch.object(sb, "_gpu_virtual", False):
+                with patch.object(sb, "_gpu_count_requested", 0):
                     sb.commit()
 
         assert any(c[:2] == [sb._runtime, "commit"] for c in calls), (
@@ -634,7 +634,7 @@ class TestCheckpointSquash:
 
         with patch.object(_mod._PodmanBackend, "_run", fake_run):
             with patch.object(sb, "_container_status", return_value="running"):
-                with patch.object(sb, "_gpu_virtual", False):
+                with patch.object(sb, "_gpu_count_requested", 0):
                     sb.commit()  # must not raise
 
         assert not any("export" in c for c in calls), f"must not squash: {calls}"
@@ -662,7 +662,7 @@ class TestCheckpointSquash:
         with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
-                    with patch.object(sb, "_gpu_virtual", False):
+                    with patch.object(sb, "_gpu_count_requested", 0):
                         sb.commit()
 
         assert captured["input"] == fake_tar_bytes
@@ -692,7 +692,7 @@ class TestCheckpointSquash:
             with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._PodmanBackend, "_run", fake_run):
                     with patch.object(sb, "_container_status", return_value="running"):
-                        with patch.object(sb, "_gpu_virtual", False):
+                        with patch.object(sb, "_gpu_count_requested", 0):
                             sb.commit()  # must not raise
         finally:
             sys.stderr = old_stderr
@@ -1408,9 +1408,9 @@ class TestPodmanGpuReleaseGating:
 
     def _lease_gpu(self, sb, gpu_id=3):
         released = []
-        sb._gpu_virtual = True
-        sb._gpu_id = gpu_id
-        sb._gpu_release_fn = lambda gid: released.append(gid)
+        sb._gpu_count_requested = 1
+        sb._gpu_ids = [gpu_id]
+        sb._gpu_release_fn = lambda ids: released.extend(ids)
         return released
 
     def test_rm_container_releases_gpu_when_already_confirmed_gone(self):
@@ -1428,7 +1428,7 @@ class TestPodmanGpuReleaseGating:
                 sb.rm_container()
 
         assert released == [3]
-        assert sb._gpu_id is None
+        assert sb._gpu_ids == []
 
     def test_rm_container_does_not_release_gpu_when_rm_fails_and_container_still_running(self):
         import agency.sandbox.container as _container_mod
@@ -1456,7 +1456,7 @@ class TestPodmanGpuReleaseGating:
         assert released == [], (
             "GPU must not be released while the container is confirmed still running"
         )
-        assert sb._gpu_id == 3
+        assert sb._gpu_ids == [3]
 
     def test_destroy_releases_gpu_when_container_confirmed_gone_despite_rm_error(self):
         import agency.sandbox.podman as _mod
@@ -1485,7 +1485,7 @@ class TestPodmanGpuReleaseGating:
                         sb.destroy()
 
         assert released == [3]
-        assert sb._gpu_id is None
+        assert sb._gpu_ids == []
 
     def test_destroy_does_not_release_gpu_when_container_still_running_after_rm_failure(self):
         import agency.sandbox.podman as _mod
@@ -1509,7 +1509,7 @@ class TestPodmanGpuReleaseGating:
                         sb.destroy()
 
         assert released == []
-        assert sb._gpu_id == 3
+        assert sb._gpu_ids == [3]
 
     def test_gpu_released_exactly_once_across_rm_container_then_destroy(self):
         """rm_container() tears the container down and releases the GPU; a

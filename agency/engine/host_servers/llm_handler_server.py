@@ -15,9 +15,6 @@ class LlmHandlerServer(HostServerBase):
     def __init__(self, agconfig: "agConfig") -> None:
         self.set_config(agconfig)
 
-    def set_config(self, agconfig: "agConfig") -> None:
-        self._agconfig = agconfig
-
     def dispatch(self, request: dict) -> dict:
         raise NotImplementedError
 

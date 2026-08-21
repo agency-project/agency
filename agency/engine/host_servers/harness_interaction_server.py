@@ -9,7 +9,6 @@ from ...harness._syscall_event import agsyscallevent
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
-    from ...agconfig import agConfig
     from ...agent import agent
     from ...agskill import agskill
 
@@ -20,21 +19,24 @@ class HarnessInteractionServer(HostServerBase):
         self._policy = skill.policy
         self.set_config(agent.agconfig)
 
-    def set_config(self, agconfig: "agConfig") -> None:
-        self._agconfig = agconfig
-
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
         hook = (self._policy.tool_hooks or {}).get(tool_name)
         if hook is None:
             return (not self._policy.default_to_deny, None)
-        result = hook(tool_input)
+        try:
+            result = hook(tool_input)
+        except Exception as exc:
+            return (False, f"hook raised: {exc}")
         return result if isinstance(result, tuple) else (result, None)
 
     def check_syscall(self, syscall: "agsyscallevent") -> "tuple[bool, str | None]":
         hook = (self._policy.syscall_hooks or {}).get(syscall.syscall)
         if hook is None:
             return (not self._policy.default_to_deny, None)
-        result = hook(syscall)
+        try:
+            result = hook(syscall)
+        except Exception as exc:
+            return (False, f"hook raised: {exc}")
         return result if isinstance(result, tuple) else (result, None)
 
     def check_inbox(self) -> "list[dict]":

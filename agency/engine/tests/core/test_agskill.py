@@ -123,12 +123,11 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
     return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
-def make_skill(name="summarise", add_tools=None, replace_tools=None) -> agskill:
+def make_skill(name="summarise", add_host_mcp_tools=None) -> agskill:
     return agskill(
         name=name,
         system_prompt="You are a summarisation assistant.",
-        add_tools=add_tools,
-        replace_tools=replace_tools,
+        add_host_mcp_tools=add_host_mcp_tools,
     )
 
 
@@ -1124,36 +1123,13 @@ def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
                 a.sandbox.destroy()
 
 
-# ---------------------------------------------------------------------------
-# plan_mode
-# ---------------------------------------------------------------------------
-
-
-def test_plan_mode_sets_replace_tools_empty():
-    """plan_mode=True sets replace_tools to [] regardless of default."""
-    s = agskill(name="s", system_prompt="", plan_mode=True)
-    assert s.replace_tools == []
-
-
-def test_plan_mode_overrides_replace_tools_kwarg():
-    """plan_mode=True takes precedence over an explicit replace_tools argument."""
-    t = agtool(name="mt", description="my tool", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", plan_mode=True, replace_tools=[t])
-    assert s.replace_tools == []
-
-
-def test_plan_mode_false_leaves_replace_tools_untouched():
-    """plan_mode=False (default) does not modify replace_tools."""
-    t = agtool(name="mt", description="my tool", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", plan_mode=False, replace_tools=[t])
-    assert s.replace_tools == [t]
-
-
-# test_plan_mode_no_tools_sent_to_llm was retired here along with
-# execute_react() itself: plan_mode sets replace_tools=[], which is now a
-# documented, currently-unsupported gap for every engine (see the
-# replace_tools/add_tools retirement note above) -- there is no loop left
-# to assert "no tools sent" against.
+# plan_mode / replace_tools were removed from agskill entirely in this
+# refactor (see agency/agskill.py) -- add_tools was renamed to
+# add_host_mcp_tools and now only extends the default host_mcp_tools set,
+# never replaces it, so there is no "replace"/"plan_mode suppresses tools"
+# concept left to test. See test_add_host_mcp_tools_extends_the_defaults
+# and test_host_mcp_tools_defaults_to_the_default_set below for the current
+# equivalent coverage.
 
 
 # ---------------------------------------------------------------------------
@@ -1391,3 +1367,53 @@ def test_random_schema_prompt_examples_parseable():
             )
 
     assert not failures, f"{len(failures)}/100 trials failed:\n" + "\n".join(failures[:20])
+
+
+# ---------------------------------------------------------------------------
+# host_mcp_tools / sandbox_mcp_tools / policy
+# ---------------------------------------------------------------------------
+
+
+def test_host_mcp_tools_defaults_to_the_default_set():
+    from agency.agskill import _DEFAULT_HOST_MCP_TOOLS
+
+    s = agskill(name="s", system_prompt="")
+    assert [t.name for t in s.host_mcp_tools] == [t.name for t in _DEFAULT_HOST_MCP_TOOLS]
+
+
+def test_add_host_mcp_tools_extends_the_defaults():
+    from agency.agskill import _DEFAULT_HOST_MCP_TOOLS
+
+    extra = agtool(name="extra", description="d", fn=_noop)
+    s = agskill(name="s", system_prompt="", add_host_mcp_tools=[extra])
+    assert [t.name for t in s.host_mcp_tools] == [t.name for t in _DEFAULT_HOST_MCP_TOOLS] + [
+        "extra"
+    ]
+
+
+def test_sandbox_mcp_tools_defaults_to_empty():
+    s = agskill(name="s", system_prompt="")
+    assert s.sandbox_mcp_tools == []
+
+
+def test_add_sandbox_mcp_tools_populates_sandbox_mcp_tools():
+    sbx_tool = agtool(name="sbx", description="d", fn=_noop)
+    s = agskill(name="s", system_prompt="", add_sandbox_mcp_tools=[sbx_tool])
+    assert [t.name for t in s.sandbox_mcp_tools] == ["sbx"]
+
+
+def test_policy_defaults_to_a_fresh_agpolicy():
+    from agency.agpolicy import agpolicy
+
+    s = agskill(name="s", system_prompt="")
+    assert isinstance(s.policy, agpolicy)
+    assert s.policy.tool_hooks is None
+    assert s.policy.default_to_deny is False
+
+
+def test_policy_stored_verbatim_when_supplied():
+    from agency.agpolicy import agpolicy
+
+    policy = agpolicy(default_to_deny=True)
+    s = agskill(name="s", system_prompt="", policy=policy)
+    assert s.policy is policy

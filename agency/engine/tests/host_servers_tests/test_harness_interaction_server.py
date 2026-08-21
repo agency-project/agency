@@ -120,6 +120,16 @@ def test_check_tool_passes_through_tool_input_unmodified():
     assert seen["tool_input"] is tool_input
 
 
+def test_check_tool_denies_with_reason_when_hook_raises():
+    def hook(tool_input):
+        raise ValueError("boom")
+
+    server, _ = _make_server(policy=agpolicy(tool_hooks={"bash": hook}))
+    allowed, reason = server.check_tool("bash", {"cmd": "ls"})
+    assert allowed is False
+    assert "boom" in reason
+
+
 def test_check_tool_falls_back_to_default_for_unregistered_tool_name():
     def hook(tool_input):
         return False
@@ -167,6 +177,16 @@ def test_check_syscall_uses_tuple_returning_hook():
     server, _ = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}))
     result = server.check_syscall(_make_syscall(syscall="openat", path="/etc/passwd"))
     assert result == (False, "sensitive path")
+
+
+def test_check_syscall_denies_with_reason_when_hook_raises():
+    def hook(syscall):
+        raise ValueError("boom")
+
+    server, _ = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}))
+    allowed, reason = server.check_syscall(_make_syscall(syscall="openat"))
+    assert allowed is False
+    assert "boom" in reason
 
 
 def test_check_syscall_passes_the_full_event_object_to_the_hook():
@@ -253,6 +273,19 @@ def test_build_app_check_tool_route_denies_with_reason():
     assert response.json() == {"allowed": False, "reason": "nope"}
 
 
+def test_build_app_check_tool_route_denies_when_hook_raises():
+    def hook(tool_input):
+        raise ValueError("boom")
+
+    server, _ = _make_server(policy=agpolicy(tool_hooks={"bash": hook}))
+    client = TestClient(server.build_app())
+    response = client.post("/check_tool", json={"tool_name": "bash", "tool_input": {"cmd": "ls"}})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["allowed"] is False
+    assert "boom" in body["reason"]
+
+
 def test_build_app_check_inbox_route_returns_drained_messages():
     def drain_inbox(messages):
         messages.append({"role": "user", "content": "hello"})
@@ -312,3 +345,27 @@ def test_build_app_check_syscall_route_denies_with_reason():
     )
     assert response.status_code == 200
     assert response.json() == {"allowed": False, "reason": "sensitive path"}
+
+
+def test_build_app_check_syscall_route_denies_when_hook_raises():
+    def hook(syscall):
+        raise ValueError("boom")
+
+    server, _ = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}))
+    client = TestClient(server.build_app())
+    response = client.post(
+        "/check_syscall",
+        json={
+            "syscall": "openat",
+            "pid": 1,
+            "tid": 1,
+            "argv": None,
+            "envp": None,
+            "path": "/tmp/x",
+            "timestamp": 0.0,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["allowed"] is False
+    assert "boom" in body["reason"]

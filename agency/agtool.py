@@ -1,4 +1,5 @@
 from __future__ import annotations
+import inspect
 import time
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
@@ -63,10 +64,11 @@ class agtool:
         self,
         name: str,
         description: str,
-        fn: Callable[[agdata], agdata],
+        fn: "Callable[..., agdata]",
         params: dict | None = None,
         log_fn: "Callable[[agtool, agdata, agdata, int], None] | None" = None,
         run_in_subprocess: bool = True,
+        persistent_vars: "dict[str, Callable[[], object]] | None" = None,
     ):
         self.name = name
         self.description = description
@@ -74,6 +76,7 @@ class agtool:
         self.params = params or {"type": "object", "properties": {}}
         self._log_fn = log_fn
         self.run_in_subprocess = run_in_subprocess
+        self.persistent_vars = persistent_vars or {}
         self._term: "agterm | None" = None
         self._aglog: "aglog  | None" = None
 
@@ -137,7 +140,7 @@ class agtool:
     # Invocation
     # ------------------------------------------------------------------
 
-    def __call__(self, arg: agdata, timeout: int | None = None) -> agdata:
+    def __call__(self, arg: agdata, timeout: int | None = None, **context: object) -> agdata:
         # Always runs directly in the calling thread/process -- no
         # subprocess isolation, no pickling `fn` across a process boundary
         # (a host-authored closure often captures host-only state, like a
@@ -149,11 +152,19 @@ class agtool:
         self.log_start(arg)
         t0 = time.monotonic()
         try:
-            result = self.fn(arg)
+            wanted = self._wanted_context(context)
+            result = self.fn(arg, **wanted)
         except Exception as e:
             result = agerror(format_exception(e))
         self.log(arg, result, int((time.monotonic() - t0) * 1000))
         return result
+
+    def _wanted_context(self, context: dict) -> dict:
+        if not context:
+            return {}
+        params = list(inspect.signature(self.fn).parameters.values())[1:]
+        names = {p.name for p in params}
+        return {k: v for k, v in context.items() if k in names}
 
     def to_openai_tool(self) -> dict:
         return {

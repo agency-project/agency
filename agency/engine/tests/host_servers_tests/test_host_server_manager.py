@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
+import httpx2
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
 from agency.agpolicy import agpolicy
+from agency.agskill import agskill
 from agency.engine.host_servers.harness_interaction_server import HarnessInteractionServer
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
@@ -33,3 +41,41 @@ def test_construction_wires_agent_and_skill_into_harness_interaction_server(tmp_
 def test_does_not_expose_a_public_harness_interaction_server_property(tmp_path):
     manager, _, _ = _make_manager(tmp_path)
     assert not hasattr(manager, "harness_interaction_server")
+
+
+def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
+    uds_path = f"/tmp/hsm_test_{uuid.uuid4().hex[:8]}.sock"
+    configs = HostServerManagerConfigs(uds_path=uds_path)
+    agconfig = SimpleNamespace(HostServerManagerConfigs=configs)
+    agent = SimpleNamespace(agconfig=agconfig, inbox=object())
+    sandbox = SimpleNamespace()
+    skill = agskill(name="s", system_prompt="p", policy=agpolicy())
+    resource_pool = SimpleNamespace()
+    manager = HostServerManager(agent, sandbox, skill, resource_pool)
+    try:
+        manager.start()
+
+        async def _list_tools():
+            client = httpx2.AsyncClient(
+                transport=httpx2.AsyncHTTPTransport(uds=uds_path), base_url="http://localhost"
+            )
+            async with streamable_http_client(
+                "http://localhost/HostMcpServer/mcp", http_client=client
+            ) as streams:
+                read, write = streams[0], streams[1]
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return await session.list_tools()
+
+        tools = asyncio.run(_list_tools())
+        assert {t.name for t in tools.tools} == {
+            "reserve_resource",
+            "release_resource",
+            "get_current_resources",
+            "daemon_release",
+            "submit_output",
+            "submitted_output",
+        }
+    finally:
+        manager.stop()
+        Path(uds_path).unlink(missing_ok=True)

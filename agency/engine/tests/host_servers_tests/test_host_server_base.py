@@ -12,10 +12,11 @@ from agency.engine.host_servers.host_server_base import HostServerBase
 # ---------------------------------------------------------------------------
 
 
-def test_set_config_raises_not_implemented():
+def test_set_config_stores_the_agconfig_by_default():
     server = HostServerBase()
-    with pytest.raises(NotImplementedError):
-        server.set_config(object())
+    agconfig = object()
+    server.set_config(agconfig)
+    assert server._agconfig is agconfig
 
 
 def test_build_app_raises_not_implemented():
@@ -32,6 +33,11 @@ def test_start_is_a_noop_by_default():
 def test_stop_is_a_noop_by_default():
     server = HostServerBase()
     assert server.stop() is None
+
+
+def test_lifespan_context_is_none_by_default():
+    server = HostServerBase()
+    assert server.lifespan_context(object()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -56,9 +62,20 @@ def test_subclass_can_override_every_method():
             calls.append(("build_app",))
             return "app"
 
+        def lifespan_context(self, app):
+            calls.append(("lifespan_context", app))
+            return "ctx"
+
     server = _FakeServer()
     server.set_config("cfg")
     server.start()
     server.stop()
     assert server.build_app() == "app"
-    assert calls == [("set_config", "cfg"), ("start",), ("stop",), ("build_app",)]
+    assert server.lifespan_context("myapp") == "ctx"
+    assert calls == [
+        ("set_config", "cfg"),
+        ("start",),
+        ("stop",),
+        ("build_app",),
+        ("lifespan_context", "myapp"),
+    ]

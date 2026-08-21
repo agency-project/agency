@@ -166,3 +166,42 @@ def test_call_timeout_not_enforced():
     t = agtool(name="slow_inproc", description="", fn=_slow)
     result = t(agdata(), timeout=1)
     assert result.done is True
+
+
+# ---------------------------------------------------------------------------
+# __call__ context injection -- a fn declares only the extra names (past its
+# first, agdata, parameter) it wants; __call__ forwards only those, sourced
+# from whatever **context a caller happens to pass in.
+# ---------------------------------------------------------------------------
+
+
+def test_plain_single_arg_fn_ignores_unrelated_context():
+    def _plain(arg: agdata) -> agdata:
+        return agdata(x=arg._data["x"])
+
+    t = agtool(name="plain", description="", fn=_plain)
+    result = t(agdata(x=1), sandbox="S", resource_pool="P")
+    assert result.x == 1
+
+
+def test_fn_declaring_extra_param_receives_only_the_matching_context():
+    seen = {}
+
+    def _needs_sandbox(arg: agdata, sandbox) -> agdata:
+        seen["sandbox"] = sandbox
+        return agdata(ok=True)
+
+    t = agtool(name="needs_sandbox", description="", fn=_needs_sandbox)
+    result = t(agdata(), sandbox="S", resource_pool="P")
+    assert result.ok is True
+    assert seen == {"sandbox": "S"}
+
+
+def test_fn_declaring_a_context_param_not_supplied_fails_gracefully():
+    def _needs_sandbox(arg: agdata, sandbox) -> agdata:
+        return agdata(sandbox=sandbox)
+
+    t = agtool(name="needs_sandbox", description="", fn=_needs_sandbox)
+    result = t(agdata())  # no context supplied at all
+    assert result.error is not None
+    assert "sandbox" in result.error

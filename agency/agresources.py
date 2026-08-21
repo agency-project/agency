@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import heapq
+import itertools
 import os
 import re
 import subprocess
@@ -333,6 +335,14 @@ def detect_memory_mb() -> int:
     return _AgResourcePoolFields().memory_detect_fallback_mb
 
 
+class _GpuRequest:
+    __slots__ = ("count", "granted_ids")
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.granted_ids: "list[int] | None" = None
+
+
 class agResourcePool(_AgResourcePoolFields):
     """Manages shared GPU tokens and CPU/memory limits for all sandboxes.
 
@@ -395,6 +405,8 @@ class agResourcePool(_AgResourcePoolFields):
         self._gpu_cond = threading.Condition()
         self._free_gpus: set[int] = set(self.gpus)
         self._gpus_acquired: int = 0
+        self._gpu_request_seq = itertools.count()
+        self._gpu_queue: "list[tuple[int, int, _GpuRequest]]" = []
         # Plain mutex for cpus_acquired/memory_acquired_mb -- a Condition
         # rather than a bare Lock only for consistency with _gpu_cond above;
         # nothing here ever calls wait()/notify().
@@ -415,43 +427,69 @@ class agResourcePool(_AgResourcePoolFields):
         """Return a clone of this pool's agconfig."""
         return self._agconfig.clone()
 
-    def acquire_gpu(self, timeout: float | None = None) -> int:
-        """Block until any GPU is free; return its id.
+    def acquire_gpus(self, count: int, timeout: "float | None" = None) -> "list[int]":
+        """Block until *count* GPUs are free; return their ids.
 
-        Waits on a single shared Condition rather than polling every GPU's
-        own lock in a loop -- release_gpu() notifies exactly one waiter the
-        moment a GPU frees up, instead of every waiter re-checking on a
-        fixed timer (which wasted CPU/context-switches under contention and
-        added up to one poll interval of latency before a freed GPU was
-        even noticed).
+        Queued (not just waited-on) so multiple concurrent requests for
+        different counts get served smallest-count-first rather than
+        strictly in arrival order: `_dispatch_gpu_queue_locked()` walks the
+        queue in ascending count order and grants whichever prefix of it
+        currently fits in `_free_gpus`, so a request for 1 GPU behind a
+        queued request for 5 doesn't wait on the 5 to be satisfiable first.
 
-        The `while not self._free_gpus` re-check after `wait()` returns is
-        required, not defensive style: `notify()` only guarantees the
-        woken thread gets a chance to recheck the condition, not that what
-        it was waiting for is still there by the time it reacquires the
-        lock -- another thread (a waiter woken earlier, or a fresh caller
-        that never waited at all) can win the race and take the last free
-        GPU first. `remaining` is recomputed from the original deadline on
-        each iteration (not reset to a fresh `timeout`) so a caller that
-        gets repeatedly out-raced still times out after its original
-        budget, not a fresh one per iteration.
+        Raises ValueError immediately if `count` exceeds the pool's total
+        size -- that's never satisfiable, so there's no reason to queue it.
         """
+        if count <= 0:
+            return []
+        if count > len(self.gpus):
+            raise ValueError(
+                f"requested {count} GPUs but pool only has {len(self.gpus)} (pool: {self.gpus})"
+            )
         deadline = None if timeout is None else time.monotonic() + timeout
+        request = _GpuRequest(count)
         with agprof.span("sync:gpu_wait"), self._gpu_cond:
-            while not self._free_gpus:
+            seq = next(self._gpu_request_seq)
+            heapq.heappush(self._gpu_queue, (count, seq, request))
+            self._dispatch_gpu_queue_locked()
+            while request.granted_ids is None:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
-                    raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
+                    self._dequeue_gpu_request_locked(request)
+                    raise TimeoutError(
+                        f"No {count} GPU(s) available within {timeout}s (pool: {self.gpus})"
+                    )
                 if not self._gpu_cond.wait(timeout=remaining):
-                    raise TimeoutError(f"No GPU available within {timeout}s (pool: {self.gpus})")
-            gpu_id = self._free_gpus.pop()
-            self._gpus_acquired += 1
-        agprof.gpu_lease_begin(gpu_id)
+                    self._dequeue_gpu_request_locked(request)
+                    raise TimeoutError(
+                        f"No {count} GPU(s) available within {timeout}s (pool: {self.gpus})"
+                    )
+        for gpu_id in request.granted_ids:
+            agprof.gpu_lease_begin(gpu_id)
         self._emit_resource()
-        return gpu_id
+        return request.granted_ids
 
-    def release_gpu(self, gpu_id: int) -> None:
-        """Release *gpu_id* back to the pool.
+    def _dequeue_gpu_request_locked(self, request: "_GpuRequest") -> None:
+        if request.granted_ids is not None:
+            return
+        self._gpu_queue = [entry for entry in self._gpu_queue if entry[2] is not request]
+        heapq.heapify(self._gpu_queue)
+
+    def _dispatch_gpu_queue_locked(self) -> None:
+        granted_any = False
+        while self._gpu_queue:
+            count, _seq, request = self._gpu_queue[0]
+            if len(self._free_gpus) < count:
+                break
+            heapq.heappop(self._gpu_queue)
+            request.granted_ids = [self._free_gpus.pop() for _ in range(count)]
+            self._gpus_acquired += count
+            granted_any = True
+        if granted_any:
+            self._gpu_cond.notify_all()
+
+    def release_gpus(self, gpu_ids: "list[int]") -> None:
+        """Release *gpu_ids* back to the pool.
 
         No separate "is this actually idle yet" wait: callers (backend
         `stop()`/`destroy()`) already run their own teardown -- kill
@@ -460,15 +498,11 @@ class agResourcePool(_AgResourcePoolFields):
         already the confirmation that the sandbox has exited; a poll here
         would just be re-checking, via the exact same tracked state the
         teardown already acted on, something the sequencing already
-        guarantees. (A prior version of this threaded an `is_clear`
-        predicate through here for exactly that re-check; removed as
-        redundant -- see sandbox.chroot's module docstring for
-        the reasoning that led here.)
+        guarantees.
 
-        Explicitly guards against gpu_id not being one of this pool's GPUs,
-        and against double-releasing a gpu_id already in `_free_gpus` --
-        neither is caught for free by a plain set the way a
-        BoundedSemaphore used to reject an over-release on its own. The
+        Explicitly guards against a gpu_id not being one of this pool's
+        GPUs, and against double-releasing a gpu_id already in
+        `_free_gpus` -- neither is caught for free by a plain set. The
         second check matters even though a set can't hold two copies of
         the same id: without it, a double-release (or releasing a gpu_id
         another sandbox still legitimately holds) would silently mark an
@@ -476,17 +510,23 @@ class agResourcePool(_AgResourcePoolFields):
         GPU at once -- the actual hazard, not just a cosmetic duplicate
         entry.
         """
+        if not gpu_ids:
+            return
         with self._gpu_cond:
-            if gpu_id not in self.gpus:
-                print(f"[agresources] WARNING: release_gpu called with unknown gpu_id={gpu_id}")
-                return
-            if gpu_id in self._free_gpus:
-                print(f"[agresources] WARNING: GPU double-release for gpu_id={gpu_id}")
-                return
-            self._free_gpus.add(gpu_id)
-            self._gpus_acquired = max(0, self._gpus_acquired - 1)
-            self._gpu_cond.notify()
-        agprof.gpu_lease_end(gpu_id)
+            for gpu_id in gpu_ids:
+                if gpu_id not in self.gpus:
+                    print(
+                        f"[agresources] WARNING: release_gpus called with unknown gpu_id={gpu_id}"
+                    )
+                    continue
+                if gpu_id in self._free_gpus:
+                    print(f"[agresources] WARNING: GPU double-release for gpu_id={gpu_id}")
+                    continue
+                self._free_gpus.add(gpu_id)
+                self._gpus_acquired = max(0, self._gpus_acquired - 1)
+            self._dispatch_gpu_queue_locked()
+        for gpu_id in gpu_ids:
+            agprof.gpu_lease_end(gpu_id)
         self._emit_resource()
 
     def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:

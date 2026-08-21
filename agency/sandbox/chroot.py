@@ -311,9 +311,9 @@ _gpu_dev_paths_lock = threading.Lock()
 _NVIDIA_INDEXED_DEV_RE = re.compile(r"^nvidia(\d+)$")
 
 
-def _chroot_gpu_dev_paths(gpu_id: "int | None") -> "list[str]":
+def _chroot_gpu_dev_paths(gpu_ids: "list[int]") -> "list[str]":
     """Return absolute host device paths to bind-mount into a jail for the
-    specific *gpu_id* leased to it (or [] if none is leased), cached for
+    specific *gpu_ids* leased to it (or [] if none are leased), cached for
     the process lifetime -- mirrors container.py's _gpu_flags()' nvidia-vs-amd
     detection (nvidia-smi on PATH => NVIDIA, else AMD/ROCm).
 
@@ -335,10 +335,10 @@ def _chroot_gpu_dev_paths(gpu_id: "int | None") -> "list[str]":
     /dev bind silently failed for every device file, GPU included, so this
     was ALREADY true before the /dev fix above, not something it changed.
 
-    Returns [] on a GPU-less host, and [] when gpu_id is None (no GPU
+    Returns [] on a GPU-less host, and [] when gpu_ids is empty (no GPU
     leased) -- CPU-only hosts and un-leased jails pay nothing extra here.
     """
-    if gpu_id is None:
+    if not gpu_ids:
         return []
     all_paths = _all_chroot_gpu_dev_paths()
     if not all_paths:
@@ -349,7 +349,7 @@ def _chroot_gpu_dev_paths(gpu_id: "int | None") -> "list[str]":
             (p for p in all_paths if _NVIDIA_INDEXED_DEV_RE.match(os.path.basename(p))),
             key=lambda p: int(_NVIDIA_INDEXED_DEV_RE.match(os.path.basename(p)).group(1)),
         )
-        return control if gpu_id >= len(indexed) else control + [indexed[gpu_id]]
+        return control + [indexed[g] for g in gpu_ids if g < len(indexed)]
     # AMD/ROCm: /dev/kfd is the one shared control device; each GPU's own
     # compute node is /dev/dri/renderD<128+N>, matched to gpu_id by PCI bus
     # (agresources.amd_render_node_paths_by_pci_bus()) rather than assumed
@@ -364,7 +364,7 @@ def _chroot_gpu_dev_paths(gpu_id: "int | None") -> "list[str]":
     )
     if render_nodes is None:
         render_nodes = naive_render_nodes
-    return control if gpu_id >= len(render_nodes) else control + [render_nodes[gpu_id]]
+    return control + [render_nodes[g] for g in gpu_ids if g < len(render_nodes)]
 
 
 def _all_chroot_gpu_dev_paths() -> "list[str]":
@@ -434,8 +434,8 @@ class _ChrootBackend(agsandbox_backend):
         agconfig: "agConfig | None",
     ) -> None:
         self._agname = agname
-        self._gpu_id: int | None = None
-        self._gpu_virtual: bool = False
+        self._gpu_ids: list[int] = []
+        self._gpu_count_requested: int = 0
         self._gpu_acquire_fn = None
         self._gpu_release_fn = None
         self._cpu_acquired: float = 0.0
@@ -745,7 +745,7 @@ class _ChrootBackend(agsandbox_backend):
         dev_jail_path = f"{root}/dev"
         lines.append(f"mkdir -p {shlex.quote(dev_jail_path)}")
         dev_host_paths = [f"/dev/{name}" for name in _CHROOT_DEV_FILES] + _chroot_gpu_dev_paths(
-            self._gpu_id
+            self._gpu_ids
         )
         for host_dev in dev_host_paths:
             if not os.path.exists(host_dev):
@@ -1008,22 +1008,20 @@ class _ChrootBackend(agsandbox_backend):
         stop() does; use rm_container() to discard it, and commit() to
         checkpoint it.
         """
-        gpu_id_to_release = (
-            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
-        )
+        gpu_ids_to_release = list(self._gpu_ids) if self._gpu_count_requested > 0 else []
         # Kill first: wait_for_processes() already gave background work its
         # fair chance to finish naturally before a skill's teardown ever
         # reaches stop() (see _kill_all_sandbox_processes()'s docstring for
         # why nothing does this implicitly here, unlike container removal).
         # Release happens right after -- this kill attempt IS the
         # confirmation the sandbox has exited; there is no separate
-        # "is it actually clear yet" wait (see release_gpu()'s docstring for
+        # "is it actually clear yet" wait (see release_gpus()'s docstring for
         # why re-checking the same tracked state the kill just acted on
         # would be redundant).
         self._kill_all_sandbox_processes()
-        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
-            self._gpu_release_fn(gpu_id_to_release)
-            self._gpu_id = None
+        if gpu_ids_to_release and self._gpu_release_fn is not None:
+            self._gpu_release_fn(gpu_ids_to_release)
+            self._gpu_ids = []
         self._watched_pids = {}
         self._invocation_pgids = set()
 
@@ -1038,13 +1036,11 @@ class _ChrootBackend(agsandbox_backend):
         primitive -- call it without a preceding commit() to throw away
         everything since the last checkpoint.
         """
-        gpu_id_to_release = (
-            self._gpu_id if (self._gpu_virtual and self._gpu_id is not None) else None
-        )
+        gpu_ids_to_release = list(self._gpu_ids) if self._gpu_count_requested > 0 else []
         self._kill_all_sandbox_processes()
-        if gpu_id_to_release is not None and self._gpu_release_fn is not None:
-            self._gpu_release_fn(gpu_id_to_release)
-            self._gpu_id = None
+        if gpu_ids_to_release and self._gpu_release_fn is not None:
+            self._gpu_release_fn(gpu_ids_to_release)
+            self._gpu_ids = []
         self._watched_pids = {}
         self._invocation_pgids = set()
         if self._workspace.exists():
