@@ -520,8 +520,9 @@ class agent:
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
-        Delegates all threading, sandboxing, and execution to skill.run(self, ...).
-        Calls on the same agent are serialized via the context future chain.
+        Delegates scheduling to ``skill.run(self, ...)``; the resulting
+        ``agentEngine`` owns sandboxing and execution. Calls on the same agent
+        are serialized via the context future chain.
         """
         if max_steps is None:
             return skill.run(self, skill_input)
