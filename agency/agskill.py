@@ -359,7 +359,7 @@ class agskill:
                 )
         return "\n".join(parts)
 
-    def _build_user_content(
+    def build_prompt_payload(
         self, skill_input: agdata
     ) -> "str | list":  # [REFACTOR] Are we only providing the per-turn inputs here?
         """Build the content value for the user message.
@@ -419,7 +419,7 @@ class agskill:
         messages: list[dict] = (
             [{"role": "system", "content": self._build_system_prompt(_extra_system)}]
             + list(agent_context.messages)
-            + [{"role": "user", "content": self._build_user_content(skill_input)}]
+            + [{"role": "user", "content": self.build_prompt_payload(skill_input)}]
         )
 
         # Push the conversation (minus system prompt) to the live UI view so the
