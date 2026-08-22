@@ -1,12 +1,12 @@
-"""Harness-native hook fallback -- lower priority per
-docs/Design_harness_integration.md's build order ("reduced-coverage
-fallback, don't over-invest here"): `agproxy_ptrace` is the default
+"""Harness-native hook fallback.
+
+`ptrace` is the default
 mediation path everywhere it's usable (Linux with a working ptrace), and
 this module exists only for the case it explicitly isn't (non-Linux, or a
 sandboxed environment where `ptrace_available()` genuinely returns False).
 
 Scope deliberately narrow: this provides the hook-JSON <-> `agsyscallevent`/
-`agdecision` translation (the part worth writing once, correctly, since
+`PtraceDecision` translation (the part worth writing once, correctly, since
 Claude Code's and Codex's PreToolUse/PostToolUse hook payload shapes are
 near-identical), and `resolve_mediation_mode()` to decide which path a
 launch should take. It is NOT wired into `claude_code.py`/`opencode.py`/
@@ -15,29 +15,19 @@ that for all three, plus standing up each harness's own hook-registration
 config, is a real second implementation of Component 3 mediation, which is
 out of scope for what this phase calls a "reduced-coverage fallback."
 
-**Lives at the `harness` top level, not inside
-`agharness_backends/`** (moved from there -- see the conversation that
-caught this): `agprof_ingest.py`/`agmanager_host/profiler_ingest.py` (both
-top-level-ish "service" modules) need to import this for hook-payload
-parsing, while every concrete backend in `agharness_backends/` imports
-`agprof_ingest.py`. Nesting this module inside `agharness_backends/` made
-that a real circular dependency between the two layers (a service module
-reaching down into the backends package, while the backends package reaches
-back up into the service module) -- not a hard `ImportError` (every import
-site is function-local/lazy), but a real layering violation. This module
-has no backend-specific state or logic of its own (pure hook-JSON
-translation), so it belongs as a peer of `_syscall_event.py`, not nested
-under the backends it happens to currently only be used to support.
+This module has no adapter-specific state. It lives in `agency.sandbox`
+beside the syscall event and ptrace implementations so the active harness
+boundary can depend on sandbox mediation without importing archived code.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ._syscall_event import agsyscallevent
+from .events import agsyscallevent
 
 if TYPE_CHECKING:
-    from ..agpolicy import agdecision
+    from .ptrace import PtraceDecision
 
 
 def resolve_mediation_mode(mediation_mode: str) -> str:
@@ -45,7 +35,7 @@ def resolve_mediation_mode(mediation_mode: str) -> str:
     through unchanged (an explicit request is never silently overridden)."""
     if mediation_mode != "auto":
         return mediation_mode
-    from .agproxy_ptrace import ptrace_available
+    from .ptrace import ptrace_available
 
     return "ptrace" if ptrace_available() else "native_hooks"
 
@@ -53,15 +43,15 @@ def resolve_mediation_mode(mediation_mode: str) -> str:
 def hook_payload_to_syscallevent(payload: dict):
     """Translate a `PreToolUse`/`PostToolUse`-shaped hook payload (Claude
     Code and Codex use near-identical JSON here: `tool_name`, `tool_input`)
-    into the same `agsyscallevent` shape `agproxy_ptrace` delivers to
-    `agpolicy.check()`, so one policy implementation can back both
+    into the same `agsyscallevent` shape `ptrace` delivers to
+    the policy service, so one policy implementation can back both
     mediation paths without knowing which one is active."""
     tool_input = payload.get("tool_input") or {}
     argv = None
     if "command" in tool_input:
         # Bash-family tools: the harness's own shell-parsing already
         # happened, so this is a best-effort split, not a real argv array
-        # the way agproxy_ptrace's execve resolution gives you.
+        # the way ptrace's execve resolution gives you.
         argv = str(tool_input["command"]).split()
     return agsyscallevent(
         syscall=payload.get("tool_name", "unknown"),
@@ -76,8 +66,8 @@ def hook_payload_to_syscallevent(payload: dict):
     )
 
 
-def decision_to_hook_response(decision: "agdecision") -> dict:
-    """Translate an `agdecision` back into the `PreToolUse` JSON response
+def decision_to_hook_response(decision: "PtraceDecision") -> dict:
+    """Translate a `PtraceDecision` back into the `PreToolUse` JSON response
     shape Claude Code/Codex hooks expect (`hookSpecificOutput` with
     `permissionDecision` + optional `updatedInput`)."""
     if decision.kind == "deny":

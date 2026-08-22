@@ -178,7 +178,7 @@ class agSandbox(_AgSandboxFields):
         # Unconditional, harmless-if-unused default mount for a
         # docker/podman-backed harness launch's Unix-domain-socket LLM
         # gateway bridge (see agutil.agharness_llm_gateway_dir's docstring
-        # and harness/agproxy_ptrace_internal/
+        # and sandbox/ptrace_internal/
         # _tcp_to_uds_relay.py). Added here rather than requiring each
         # harness backend to configure it per-agent, for the same reason
         # GPU passthrough flags are attached to every container

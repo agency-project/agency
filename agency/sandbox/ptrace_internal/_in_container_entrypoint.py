@@ -96,7 +96,7 @@ import time
 
 # ---------------------------------------------------------------------------
 # ptrace(2) ctypes bindings -- x86_64 only, mirrors
-# agproxy_ptrace_internal/_ctypes_defs.py's subset actually needed here.
+# ptrace_internal/_ctypes_defs.py's subset actually needed here.
 # Kept as a private copy (not imported) because this file must survive being
 # copied alone into an arbitrary container with no `agency` package present.
 # ---------------------------------------------------------------------------
@@ -434,7 +434,7 @@ def _kernel_executable_path(pid: int) -> "str | None":
 
 
 # ---------------------------------------------------------------------------
-# Tracer loop -- same shape as agproxy_ptrace_internal/_tracer_loop.py,
+# Tracer loop -- same shape as ptrace_internal/_tracer_loop.py,
 # adapted to synchronous stdio instead of an in-process Python callback.
 # ---------------------------------------------------------------------------
 

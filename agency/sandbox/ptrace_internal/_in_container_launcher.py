@@ -303,7 +303,7 @@ class InContainerRelay:
         self._finished.set()
 
     def _handle_event(self, msg: dict) -> None:
-        from ..agproxy_ptrace import agsyscallevent
+        from ..ptrace import agsyscallevent
 
         event = agsyscallevent(
             syscall=msg["syscall"],

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from ...harness._syscall_event import agsyscallevent
+from ...sandbox.events import agsyscallevent
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:

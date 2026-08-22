@@ -248,7 +248,7 @@ def test_existing_history_included_in_call():
 def test_input_schema_missing_field_returns_error():
     # input_schema validation is shared, engine-agnostic code
     # (self.input_schema.validate_input(), called directly by both
-    # execute_react() and execute_harness() before any engine/backend is
+    # execute_react() and execute_engine() before any engine/backend is
     # touched) -- testing it directly here needs no LLM/loop at all.
     s = agskill(
         name="s",
@@ -427,7 +427,7 @@ def test_tool_success_commits_and_stops():
     and must not rm_container() or push anything onto the inbox."""
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
@@ -449,7 +449,7 @@ def test_tool_success_defers_hibernate_when_background_work_pending():
     sandbox = _make_sandbox_with_tracking()
     sandbox._has_pending_background_work.return_value = True
     s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
@@ -467,7 +467,7 @@ def test_tool_failure_triggers_stop_without_commit():
     instead of sandbox.commit()."""
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("boom"),
         prev_ctx,
         [],
@@ -489,7 +489,7 @@ def test_tool_failure_adds_workspace_reverted_note():
     call via ag._drain_inbox()."""
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("disk full"),
         prev_ctx,
         [],
@@ -512,7 +512,7 @@ def test_tool_failure_reverts_even_without_subprocess():
     let alone in a subprocess; _task() only ever inspects outer_result."""
     sandbox = MagicMock()
     s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("nope"),
         prev_ctx,
         [],
@@ -532,13 +532,13 @@ def test_run_in_subprocess_false_still_stops():
     already committed successfully."""
     sandbox = _make_sandbox_with_tracking()
     ok_skill = make_skill(name="ok")
-    ok_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    ok_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
     )
     bad_skill = make_skill(name="bad")
-    bad_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    bad_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("second call failed"),
         prev_ctx,
         [],
@@ -567,7 +567,7 @@ def test_tool_exception_triggers_stop_without_commit():
     def _raise(ag, prev_ctx, skill_input, max_steps=None):
         raise RuntimeError("exploded")
 
-    s.execute_harness = _raise
+    s.execute_engine = _raise
 
     ag, pending = _run_skill_via_agent(s, sandbox)
 
@@ -583,13 +583,13 @@ def test_run_in_subprocess_false_success_still_commits():
     triggered a revert."""
     sandbox = _make_sandbox_with_tracking()
     bad_skill = make_skill(name="bad")
-    bad_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    bad_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agerror("first call failed"),
         prev_ctx,
         [],
     )
     ok_skill = make_skill(name="ok")
-    ok_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
+    ok_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
         agdata(result="ok"),
         prev_ctx,
         [],
@@ -611,7 +611,7 @@ def test_run_in_subprocess_false_success_still_commits():
 # `_has_pending_background_work()` is true -- the per-tool-call hibernate
 # model itself was already retired in Phase 1 (persistent containers), so
 # this check (and the "wait_for_processes() right after" ordering the
-# comment describes) no longer exists in the new execute_harness() path.
+# comment describes) no longer exists in the new execute_engine() path.
 
 # test_pending_background_work_omits_workspace_reverted_note_on_error was
 # retired here: same retired mechanism, errored-tool-call path.
@@ -630,7 +630,7 @@ def test_tool_exception_with_run_in_subprocess_false_still_stops():
     def _raise_early(ag, prev_ctx, skill_input, max_steps=None):
         raise ValueError("early failure")
 
-    s.execute_harness = _raise_early
+    s.execute_engine = _raise_early
 
     ag, pending = _run_skill_via_agent(s, sandbox)
 
@@ -977,7 +977,7 @@ def test_build_initial_messages_fires_full_history_fn():
 # reprompt the model" behavior when agSandbox.wait_for_processes()/
 # get_live_pids() finds pending background work after a final answer --
 # retired along with the per-tool-call hibernate model itself (Phase 1).
-# execute_harness() now calls wait_for_processes() once, non-looping, for
+# execute_engine() now calls wait_for_processes() once, non-looping, for
 # native only (see that method's own comment) -- there is no equivalent
 # "reprompt and continue in the same call" behavior to test for any engine
 # today.
@@ -1048,7 +1048,7 @@ def test_run_does_not_mutate_callers_shared_input_object():
         )
         return agdata(answer=skill_input.text), prev_ctx, []
 
-    s.execute_harness = fake_execute_react
+    s.execute_engine = fake_execute_react
 
     shared_input = agdata(text="x" * 100)
     ag = _agent_cls(agconfig=cfg)
@@ -1093,7 +1093,7 @@ def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
         r = make_read(ag.sandbox).fn(agdata(file_path=path))
         return agdata(answer=r.content), prev_ctx, []
 
-    s.execute_harness = fake_execute_react
+    s.execute_engine = fake_execute_react
 
     shared_input = agdata(text="x" * 100)
     agents = [_agent_cls(agconfig=cfg) for _ in range(2)]

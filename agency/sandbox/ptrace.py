@@ -14,7 +14,7 @@ harness's own hook system (Claude Code's `PreToolUse`, opencode's
 tool-dispatch code chooses to report. See docs/Design_harness_integration.md
 ("Component 3") for the full design rationale.
 
-x86_64 Linux only (see agproxy_ptrace_internal/_ctypes_defs.py's
+x86_64 Linux only (see ptrace_internal/_ctypes_defs.py's
 `_arch_guard()`) -- `seccomp`+`PTRACE_EVENT_SECCOMP` has no macOS/BSD
 equivalent.
 """
@@ -31,9 +31,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from ..agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
-from ..agpolicy import agdecision
-from ._syscall_event import agsyscallevent
-from .agproxy_ptrace_internal._tracer_loop import SeccompStop, StopDecision, TracerLoop
+from .events import agsyscallevent
+from .ptrace_internal._tracer_loop import SeccompStop, StopDecision, TracerLoop
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
@@ -65,7 +64,7 @@ def _probe_ptrace_available() -> bool:
     if platform.machine() not in ("x86_64", "AMD64"):
         return False
     try:
-        from .agproxy_ptrace_internal import _ctypes_defs as pt
+        from .ptrace_internal import _ctypes_defs as pt
     except Exception:
         return False
     try:
@@ -327,6 +326,27 @@ def _isolated_profiler_callback(callback: Callable) -> Callable:
     return invoke
 
 
+@dataclass(frozen=True)
+class PtraceDecision:
+    """Low-level action returned to the seccomp tracer for one syscall."""
+
+    kind: str
+    reason: str | None = None
+    new_args: list[str] | None = None
+
+    @classmethod
+    def allow(cls) -> "PtraceDecision":
+        return cls(kind="allow")
+
+    @classmethod
+    def deny(cls, reason: str | None = None) -> "PtraceDecision":
+        return cls(kind="deny", reason=reason)
+
+    @classmethod
+    def rewrite(cls, new_args: list[str]) -> "PtraceDecision":
+        return cls(kind="rewrite", new_args=new_args)
+
+
 class _AgPtraceFields:
     """Every agproxy_ptrace tunable, as config descriptors -- see
     docs/agconfig.md for the tier-1 (GlobalConfigParam) vs. tier-3
@@ -446,7 +466,7 @@ class agProxyPtrace:
         """*sandbox*, when given, selects the launch path: a docker/podman-
         backed sandbox (`IMAGE_KIND == "container"`) forks the traced child
         *inside the container* via a `docker/podman exec`-launched
-        entrypoint (see `agproxy_ptrace_internal/_in_container_launcher.py`
+        entrypoint (see `ptrace_internal/_in_container_launcher.py`
         for why a host-side `fork()` cannot land a child in a different PID
         namespace). Any other sandbox (chroot, or none at all -- a bare
         host-level launch) uses the existing host-fork `TracerLoop` path,
@@ -465,7 +485,7 @@ class agProxyPtrace:
         )
 
         if container_launch:
-            from .agproxy_ptrace_internal._in_container_launcher import InContainerRelay
+            from .ptrace_internal._in_container_launcher import InContainerRelay
 
             relay = InContainerRelay(
                 sandbox=sandbox,
@@ -539,8 +559,8 @@ def wire_to_sandbox(handle: agProxyPtraceHandle, sandbox) -> None:
 
 __all__ = [
     "agsyscallevent",
-    "agdecision",
     "agPtraceConfig",
+    "PtraceDecision",
     "agProxyPtrace",
     "wire_to_sandbox",
     "agProxyPtraceHandle",
