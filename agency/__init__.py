@@ -10,7 +10,6 @@ from .agent import agent
 from .agmap import agmap, agtask
 from .agteam import agteam
 from .agsync import agsync
-from .agpause import wait_all_paused, wait_all_resumed
 from .sandbox.agsandbox import agSandbox, get_container_runtime
 from .agresources import agResourcePool
 from .agutil import sigterm_as_exit
@@ -37,8 +36,6 @@ __all__ = [
     "agtask",
     "agteam",
     "agsync",
-    "wait_all_paused",
-    "wait_all_resumed",
     "agSandbox",
     "agResourcePool",
     "get_container_runtime",

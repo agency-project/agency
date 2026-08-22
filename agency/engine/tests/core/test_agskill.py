@@ -29,7 +29,6 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
         poll_interval_s = _poll
         agconfig = None
         _drain_inbox = _agent_cls._drain_inbox
-        _check_pause = _agent_cls._check_pause
 
     ag = _MockAgent()
     ag.llm = llm or LLM
@@ -767,37 +766,23 @@ def test_drain_inbox_empty_queue_returns_false():
 
 def test_drain_inbox_single_message_appended():
     ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["hello", None])
+    ag._next_inbox_msg = MagicMock(side_effect=[{"type": "message", "content": "hello"}, None])
     messages = [{"role": "system", "content": "sys"}]
     had = ag._drain_inbox(messages)
     assert had is True
-    assert messages[-1] == {"role": "user", "content": "hello"}
+    assert messages[-1] == {"type": "message", "content": "hello"}
 
 
 def test_drain_inbox_multiple_messages_all_appended():
     ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["msg1", "msg2", None])
+    ag._next_inbox_msg = MagicMock(
+        side_effect=[{"type": "message", "content": "msg1"}, {"type": "pause"}, None]
+    )
     messages = []
     ag._drain_inbox(messages)
     assert len(messages) == 2
-    assert messages[0]["content"] == "msg1"
-    assert messages[1]["content"] == "msg2"
-
-
-def test_drain_inbox_calls_live_fn():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["hi", None])
-    messages = [{"role": "system", "content": "sys"}]
-    ag._drain_inbox(messages)
-    ag._push_live_messages.assert_called_once()
-
-
-def test_drain_inbox_calls_full_history_fn():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["hi", None])
-    messages = []
-    ag._drain_inbox(messages)
-    ag._append_full_history.assert_called_once_with({"role": "user", "content": "hi"})
+    assert messages[0] == {"type": "message", "content": "msg1"}
+    assert messages[1] == {"type": "pause"}
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import uvicorn
 from fastapi import FastAPI
 
+from ..agDataCollector import agDataCollector
 from .harness_interaction_server import HarnessInteractionServer
 from .host_mcp_server import HostMcpServer
 from .host_server_base import HostServerBase
@@ -38,9 +39,12 @@ class HostServerManager(HostServerBase):
         skill: "agskill",
         resource_pool: "agResourcePool",
     ) -> None:
+        self._data_collector = agDataCollector(agent.agconfig)
         self._llm_handler_server = LlmHandlerServer(agent.agconfig)
         self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool)
-        self._harness_interaction_server = HarnessInteractionServer(agent, skill)
+        self._harness_interaction_server = HarnessInteractionServer(
+            agent, skill, self._data_collector
+        )
         self._server_instances: "list[HostServerBase]" = [
             self._llm_handler_server,
             self._host_mcp_server,
@@ -53,6 +57,7 @@ class HostServerManager(HostServerBase):
 
     def set_config(self, agconfig: "agConfig") -> None:
         self._configs = agconfig.HostServerManagerConfigs
+        self._data_collector.set_config(agconfig)
         for server_instance in self._server_instances:
             server_instance.set_config(agconfig)
 
@@ -60,6 +65,7 @@ class HostServerManager(HostServerBase):
         if self._server is not None:
             return self._configs.uds_path
 
+        self._data_collector.start()
         for server_instance in self._server_instances:
             server_instance.start()
 
@@ -105,3 +111,4 @@ class HostServerManager(HostServerBase):
 
         for server_instance in self._server_instances:
             server_instance.stop()
+        self._data_collector.stop()

@@ -94,30 +94,15 @@ _SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
 
 
 class agent_state:
-    # [REFACTOR] Comments too long, too much detail
     """Single owner of one agent's live status: the display fields a human or
-    the webui sees (state/skill/tool), the synchronization primitives pause
-    coordination needs (run_allowed/paused_ack/blocked_on), and the lock that
-    makes every transition atomic. One instance lives on agent._state.
+    the webui sees (state/skill/tool), blocked_on for is_settled()'s
+    dependency-chain recursion, and the lock that makes every transition
+    atomic. One instance lives on agent._state.
 
-    Lives here rather than in agpause.py because it's the general-purpose
-    status container set on every skill run (every LLM call, every tool
-    dispatch) — pausing is just one consumer of it, via run_allowed/
-    paused_ack/blocked_on. agpause.py's coordination code (_BlockCtx,
-    wait_all_paused, ...) only ever touches these fields through plain
-    attribute access on an agent it's given, so it never needs to import
-    this class at all.
-
-    update_state() is the *only* way to change the display fields — no
-    caller ever takes the lock itself. That matters because a plain "set
-    these fields" swap is atomic under the GIL, but a read-then-conditionally
-    -write sequence is not: pause()'s "relabel to 'pausing' unless already
-    paused/blocked" check used to run outside any lock, so it could read a
-    stale "skill" state right before the worker thread's checkpoint wrote
-    "paused", then overwrite that "paused" back to "pausing" moments later.
-    Folding the guard condition into update_state() itself means the whole
-    check-and-set is one atomic operation, and no future caller can
-    reintroduce that race by forgetting to lock around its own check.
+    update_state() is the only way to change the display fields — called by
+    HarnessInteractionServer.update_state() as the harness manager reports
+    its own execution state, or by agpause.py's _BlockCtx for the
+    blocked_on_dependency transition.
     """
 
     def __init__(self, agname: str) -> None:
@@ -125,13 +110,6 @@ class agent_state:
         self.state: str = "inactive"  # [REFACTOR] Should be an enum, not a string
         self.skill: "str | None" = None
         self.tool: "str | None" = None  # [REFACTOR] Shouldn't the skill have the tools?
-        # Set == allowed to run. Cleared by pause(), set by resume().
-        self.run_allowed = threading.Event()
-        self.run_allowed.set()
-        # Set the moment a worker thread actually blocks at a checkpoint —
-        # the real "pause took effect" acknowledgment. is_paused() reads
-        # this directly rather than the (cosmetic, racy) state string.
-        self.paused_ack = threading.Event()
         # While this agent's worker thread is blocked resolving another
         # agent's pending future, points at that upstream agent so
         # is_settled() can recurse through the dependency chain.
@@ -146,23 +124,13 @@ class agent_state:
             return self.state, self.skill, self.tool
 
     def update_state(
-        self,
-        new_state: str,
-        skill: "str | None" = None,
-        tool: "str | None" = None,
-        *,
-        unless_in: "tuple[str, ...]" = (),  # [REFACTOR] Why do we need this?
-    ) -> bool:
-        """Atomically apply (new_state, skill, tool) unless the current state
-        is one of *unless_in* (checked under the same lock as the write, so
-        the guard can never race a concurrent transition). Emits to the
-        webui outside the lock. Returns False if the guard blocked the write."""
+        self, new_state: str, skill: "str | None" = None, tool: "str | None" = None
+    ) -> None:
+        """Atomically apply (new_state, skill, tool). Emits to the webui
+        outside the lock."""
         with self._lock:
-            if self.state in unless_in:
-                return False
             self.state, self.skill, self.tool = new_state, skill, tool
         self._emit()
-        return True
 
     def _emit(self) -> None:  # [REFACTOR] "PUSH" to agwebui?
         try:
@@ -460,27 +428,22 @@ class agent:
         except Exception as _e:
             print(f"[agent] WARNING: push_messages failed for {self.agname}: {_e}")
 
-    def _next_inbox_msg(self) -> "str | None":
-        """Return the next message from the inbox, or None if empty."""
+    def _next_inbox_msg(self) -> "dict | None":
+        """Return the next typed inbox entry, or None if empty."""
         try:
             return self.inbox.get_nowait()
         except queue.Empty:
             return None
 
     def _drain_inbox(self, messages: list) -> bool:
-        """Drain pending inbox messages into the conversation. Returns True if any were appended."""
+        """Drain pending typed inbox entries. Returns True if any were appended."""
         had_inbox = False
         while True:
             msg = self._next_inbox_msg()
             if msg is None:
                 break
-            inbox_msg = {"role": "user", "content": msg}
-            messages.append(inbox_msg)
+            messages.append(msg)
             had_inbox = True
-            if self._push_live_messages:
-                self._push_live_messages(messages[1:])
-            if self._append_full_history:
-                self._append_full_history(inbox_msg)
         return had_inbox
 
     # ------------------------------------------------------------------
@@ -488,39 +451,22 @@ class agent:
     # ------------------------------------------------------------------
 
     def pause(self) -> None:
-        """Request that this agent stop at its next safe checkpoint (the top
-        of its ReAct loop, or before one starts). Non-blocking — the agent
-        may still be mid-LLM-call or mid-tool-call for a while after this
-        returns. Use agpause.wait_all_paused([...]) to confirm it actually
-        stopped."""
-        self._state.run_allowed.clear()
-        self._state.paused_ack.clear()
-        # Relabel to "pausing" unless already paused/blocked/terminal --
-        # update_state()'s unless_in guard makes this check-and-set atomic
-        # against the worker thread's own concurrent transitions (e.g. the
-        # checkpoint writing "paused"), so this can never clobber a state
-        # that already reflects a genuine stop.
-        self._state.update_state(
-            "pausing",
-            skill=self._state.skill,
-            tool=self._state.tool,
-            unless_in=("inactive", "finished", "error", "paused", "blocked_on_dependency"),
-        )
+        """Request that this agent's harness manager stop at its next safe
+        checkpoint. Non-blocking — delivered as an inbox entry the harness
+        manager drains via check_inbox()."""
+        self.inbox.put({"type": "pause"})
         self.terminal.log("PAUSE ▶  ", "requested")
 
     def resume(self) -> None:
-        """Clear a pause request. Non-blocking — use
-        agpause.wait_all_resumed([...]) to confirm execution actually
-        continued past the checkpoint."""
-        self._state.run_allowed.set()
+        """Clear a pause request. Non-blocking — delivered as an inbox entry
+        the harness manager drains via check_inbox()."""
+        self.inbox.put({"type": "resume"})
         self.terminal.log("PAUSE ✓  ", "resumed")
 
     def is_paused(self) -> bool:
-        """True once this agent has actually stopped at its checkpoint (not
-        merely requested — see pause()). Reads the real synchronization
-        primitive directly rather than the (cosmetic, independently-settable)
-        display state string."""
-        return self._state.paused_ack.is_set()
+        """True once the harness manager has reported this agent as actually
+        paused (see update_state(), called from HarnessInteractionServer)."""
+        return self._state.state == "paused"
 
     def is_settled(
         self, _seen: "set[str] | None" = None
@@ -528,10 +474,10 @@ class agent:
         """True if this agent is not making forward progress right now:
         either it's paused/inactive/finished/errored, or its worker thread is
         transitively blocked waiting on an upstream agent that is itself
-        settled. The recursive case is what lets wait_all_paused() confirm a
-        whole dependency chain has stopped instead of deadlocking on an agent
-        that will never reach its own checkpoint because an upstream
-        producer it's waiting on is paused first.
+        settled. The recursive case lets a caller confirm a whole dependency
+        chain has stopped instead of deadlocking on an agent that will never
+        reach its own checkpoint because an upstream producer it's waiting on
+        is paused first.
 
         Checks _state.blocked_on first, ahead of the display state string: a
         pause() request can legitimately relabel the display state (e.g. to
@@ -546,22 +492,6 @@ class agent:
             _seen.add(self.agname)
             return producer.is_settled(_seen)
         return self._state.state in _SETTLED_LEAF_STATES
-
-    def _check_pause(self, skill: "str | None" = None, tool: "str | None" = None) -> None:
-        """Checkpoint: block here while a pause is in effect. Called once
-        before the ReAct loop starts and again at the top of every iteration
-        — never mid-LLM-call or mid-tool-call, so an in-flight call always
-        finishes before a pause takes effect."""  # [REFACTOR]  How wil lthis work with the external harness redesign?
-        if self._state.run_allowed.is_set():
-            return
-        prev_state, prev_skill, prev_tool = self._state.snapshot()
-        self._state.update_state("paused", skill=skill, tool=tool)
-        self._state.paused_ack.set()
-        self._state.run_allowed.wait()
-        self._state.paused_ack.clear()
-        if prev_state in (None, "pausing", "paused", "blocked_on_dependency"):
-            prev_state = "skill"
-        self._state.update_state(prev_state, skill=prev_skill, tool=prev_tool)
 
     # [REFACTOR] Single emition point?
     def push_token_count_update_to_ui(self, skill_inp: int, skill_out: int) -> None:

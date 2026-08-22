@@ -13,6 +13,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
+from agency.engine.agDataCollector import agDataCollectorConfigs
 from agency.engine.host_servers.harness_interaction_server import HarnessInteractionServer
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
@@ -22,7 +23,10 @@ from agency.engine.host_servers.host_server_manager import (
 
 def _make_manager(tmp_path, policy=None):
     configs = HostServerManagerConfigs(uds_path=str(tmp_path / "host.sock"))
-    agconfig = SimpleNamespace(HostServerManagerConfigs=configs)
+    data_collector_configs = agDataCollectorConfigs(db_path=str(tmp_path / "agent.db"))
+    agconfig = SimpleNamespace(
+        HostServerManagerConfigs=configs, agDataCollectorConfigs=data_collector_configs
+    )
     agent = SimpleNamespace(agconfig=agconfig, inbox=object())
     sandbox = SimpleNamespace()
     skill = SimpleNamespace(policy=policy if policy is not None else agpolicy())
@@ -44,9 +48,14 @@ def test_does_not_expose_a_public_harness_interaction_server_property(tmp_path):
 
 
 def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
-    uds_path = f"/tmp/hsm_test_{uuid.uuid4().hex[:8]}.sock"
+    token = uuid.uuid4().hex[:8]
+    uds_path = f"/tmp/hsm_test_{token}.sock"
+    db_path = f"/tmp/hsm_test_{token}.db"
     configs = HostServerManagerConfigs(uds_path=uds_path)
-    agconfig = SimpleNamespace(HostServerManagerConfigs=configs)
+    data_collector_configs = agDataCollectorConfigs(db_path=db_path)
+    agconfig = SimpleNamespace(
+        HostServerManagerConfigs=configs, agDataCollectorConfigs=data_collector_configs
+    )
     agent = SimpleNamespace(agconfig=agconfig, inbox=object())
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())
@@ -79,3 +88,4 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     finally:
         manager.stop()
         Path(uds_path).unlink(missing_ok=True)
+        Path(db_path).unlink(missing_ok=True)

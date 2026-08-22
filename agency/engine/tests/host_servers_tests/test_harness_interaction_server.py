@@ -16,9 +16,46 @@ from agency.harness._syscall_event import agsyscallevent
 # ---------------------------------------------------------------------------
 
 
+class _FakeDataCollector:
+    def __init__(self):
+        self.events = []
+        self.spans = []
+
+    def record_event(self, type, payload, call_label=None, do_update=False):
+        self.events.append((type, payload, call_label, do_update))
+
+    def record_span(
+        self,
+        name,
+        start_ts,
+        end_ts,
+        attributes,
+        cpu_ms=None,
+        runqueue_ms=None,
+        blocked_ms=None,
+        parent=None,
+        call_label=None,
+    ):
+        self.spans.append(
+            (
+                name,
+                start_ts,
+                end_ts,
+                attributes,
+                cpu_ms,
+                runqueue_ms,
+                blocked_ms,
+                parent,
+                call_label,
+            )
+        )
+
+
 def _make_agent(agconfig=None, drain_inbox=None):
     agent = SimpleNamespace(
-        agconfig=agconfig if agconfig is not None else SimpleNamespace(), inbox=object()
+        agconfig=agconfig if agconfig is not None else SimpleNamespace(),
+        inbox=object(),
+        _state=SimpleNamespace(update_state=lambda *a, **kw: None),
     )
     agent._drain_inbox = drain_inbox if drain_inbox is not None else (lambda messages: False)
     return agent
@@ -28,10 +65,11 @@ def _make_skill(policy=None):
     return SimpleNamespace(policy=policy if policy is not None else agpolicy())
 
 
-def _make_server(policy=None, agconfig=None, drain_inbox=None):
+def _make_server(policy=None, agconfig=None, drain_inbox=None, data_collector=None):
     agent = _make_agent(agconfig, drain_inbox)
     skill = _make_skill(policy)
-    return HarnessInteractionServer(agent, skill), agent
+    data_collector = data_collector if data_collector is not None else _FakeDataCollector()
+    return HarnessInteractionServer(agent, skill, data_collector), agent
 
 
 def _make_syscall(
@@ -369,3 +407,75 @@ def test_build_app_check_syscall_route_denies_when_hook_raises():
     body = response.json()
     assert body["allowed"] is False
     assert "boom" in body["reason"]
+
+
+# ---------------------------------------------------------------------------
+# update_state
+# ---------------------------------------------------------------------------
+
+
+def test_update_state_calls_agent_state_update_state():
+    seen = []
+    server, agent = _make_server()
+    agent._state.update_state = lambda *a, **kw: seen.append((a, kw))
+    server.update_state("skill", skill="s", tool="bash")
+    assert seen == [(("skill", "s", "bash"), {})]
+
+
+def test_build_app_update_state_route_calls_agent_state():
+    seen = []
+    server, agent = _make_server()
+    agent._state.update_state = lambda *a, **kw: seen.append((a, kw))
+    client = TestClient(server.build_app())
+    response = client.post("/update_state", json={"state": "paused", "skill": "s", "tool": None})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert seen == [(("paused", "s", None), {})]
+
+
+# ---------------------------------------------------------------------------
+# record_event / record_span
+# ---------------------------------------------------------------------------
+
+
+def test_record_event_delegates_to_data_collector():
+    collector = _FakeDataCollector()
+    server, _ = _make_server(data_collector=collector)
+    server.record_event("warning", {"message": "bad shape"}, call_label="dispatch")
+    assert collector.events == [("warning", {"message": "bad shape"}, "dispatch", False)]
+
+
+def test_record_span_delegates_to_data_collector():
+    collector = _FakeDataCollector()
+    server, _ = _make_server(data_collector=collector)
+    server.record_span("llm:attempt", 0.0, 1.0, {"model": "x"}, cpu_ms=5.0)
+    assert collector.spans == [
+        ("llm:attempt", 0.0, 1.0, {"model": "x"}, 5.0, None, None, None, None)
+    ]
+
+
+def test_build_app_record_event_route_delegates_to_data_collector():
+    collector = _FakeDataCollector()
+    server, _ = _make_server(data_collector=collector)
+    client = TestClient(server.build_app())
+    response = client.post(
+        "/record_event", json={"type": "warning", "payload": {"message": "bad shape"}}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert collector.events == [("warning", {"message": "bad shape"}, None, False)]
+
+
+def test_build_app_record_span_route_delegates_to_data_collector():
+    collector = _FakeDataCollector()
+    server, _ = _make_server(data_collector=collector)
+    client = TestClient(server.build_app())
+    response = client.post(
+        "/record_span",
+        json={"name": "llm:attempt", "start_ts": 0.0, "end_ts": 1.0, "attributes": {"model": "x"}},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert collector.spans == [
+        ("llm:attempt", 0.0, 1.0, {"model": "x"}, None, None, None, None, None)
+    ]

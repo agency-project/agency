@@ -493,10 +493,6 @@ class agskill:
                 # value's own contents in place.
                 local_skill_input = agdata(**dict(skill_input._data))
 
-                # ── 1b. Checkpoint — honor a pause requested before this run
-                #    even started, before touching the sandbox.
-                ag._check_pause(self.name)
-
                 # ── 2. Provision sandbox — created once on first run and reused
                 #    across subsequent runs via its internal checkpoint image.
                 if ag.sandbox is None:
@@ -689,9 +685,7 @@ class agskill:
 
         # Set synchronously, before the thread even starts, so there is no
         # window where a run is genuinely in flight but ui_state still reads
-        # "inactive" -- is_settled() treats "inactive" as trivially settled,
-        # which would otherwise let wait_all_paused() race past a run that
-        # hasn't had a chance to update its own state yet.
+        # "inactive".
         ag._set_ui_state(
             "skill", skill=self.name
         )  # [REFACTOR] Why not at the start of the run() function?

@@ -218,7 +218,7 @@ def test_dispatch_pause_command_pauses_named_agent():
 
     ag = _make_agent()
     _dispatch_command({"type": "pause", "agname": ag.agname})
-    assert not ag._state.run_allowed.is_set()
+    assert ag.inbox.get_nowait() == {"type": "pause"}
 
 
 def test_dispatch_resume_command_resumes_named_agent():
@@ -226,8 +226,9 @@ def test_dispatch_resume_command_resumes_named_agent():
 
     ag = _make_agent()
     ag.pause()
+    ag.inbox.get_nowait()
     _dispatch_command({"type": "resume", "agname": ag.agname})
-    assert ag._state.run_allowed.is_set()
+    assert ag.inbox.get_nowait() == {"type": "resume"}
 
 
 def test_dispatch_pause_command_ignores_unknown_agname():
@@ -235,7 +236,7 @@ def test_dispatch_pause_command_ignores_unknown_agname():
 
     ag = _make_agent()
     _dispatch_command({"type": "pause", "agname": "__no_such_agent__"})
-    assert ag._state.run_allowed.is_set()  # untouched
+    assert ag.inbox.empty()  # untouched
 
 
 def test_dispatch_pause_all_pauses_every_live_agent():
@@ -243,8 +244,8 @@ def test_dispatch_pause_all_pauses_every_live_agent():
 
     a, b = _make_agent(), _make_agent()
     _dispatch_command({"type": "pause_all"})
-    assert not a._state.run_allowed.is_set()
-    assert not b._state.run_allowed.is_set()
+    assert a.inbox.get_nowait() == {"type": "pause"}
+    assert b.inbox.get_nowait() == {"type": "pause"}
 
 
 def test_dispatch_resume_all_resumes_every_live_agent():
@@ -253,9 +254,11 @@ def test_dispatch_resume_all_resumes_every_live_agent():
     a, b = _make_agent(), _make_agent()
     a.pause()
     b.pause()
+    a.inbox.get_nowait()
+    b.inbox.get_nowait()
     _dispatch_command({"type": "resume_all"})
-    assert a._state.run_allowed.is_set()
-    assert b._state.run_allowed.is_set()
+    assert a.inbox.get_nowait() == {"type": "resume"}
+    assert b.inbox.get_nowait() == {"type": "resume"}
 
 
 def test_dispatch_update_config_applies_to_named_agent():
@@ -537,9 +540,9 @@ def test_poll_commands_applies_and_deletes_command_files(tmp_path):
     t.start()
     try:
         deadline = time.time() + 2.0
-        while time.time() < deadline and ag._state.run_allowed.is_set():
+        while time.time() < deadline and ag.inbox.empty():
             time.sleep(0.02)
-        assert not ag._state.run_allowed.is_set()
+        assert not ag.inbox.empty()
         # Wait for the unlink on its own deadline rather than asserting it
         # immediately: _poll_commands() dispatches first and unlinks after
         # (in its `finally`), so the pause landing above says nothing about
