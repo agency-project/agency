@@ -1,6 +1,6 @@
 # Agent
 
-The `agent` class is a state container for configuration, conversation history, and an optional durable sandbox facade. Skills are passed directly to `run()` and always run asynchronously; the caller blocks only when it reads a result field. Sandbox transaction sequencing belongs to `ExecutionBuilder`, and lease/lifecycle ownership belongs to `SandboxProvisioner`.
+The `agent` class is the top-level orchestrator. It manages a sandbox container lifecycle and a shared conversation history. Skills are passed directly to `run()` and always run asynchronously; the caller blocks only when it reads a result field.
 
 ## Construction
 
@@ -22,11 +22,7 @@ ag = agent(agconfig=cfg)
 
 The `agconfig` is passed to every skill run. Any OpenAI-compatible endpoint works via `cfg.agllm_backend.base_url`. See [`agllm.md`](agllm.md) for the full field reference.
 
-No sandbox facade is created by `agent.__init__`. At execution time,
-`SandboxProvisioner.acquire()` reuses `ag.sandbox` or creates and attaches one,
-acquires its lock, and explicitly calls `sandbox.ensure_started()` before host
-services or the harness launch. Normal finalization commits or discards and may
-hibernate the backend; it does not destroy the durable facade/checkpoint.
+No sandbox is created at construction time. Within a task, a sandbox is started lazily — only when a tool with `run_in_subprocess=True` is first called. Tasks that use only host-side tools never create a sandbox at all. When a sandbox is started, it is committed to a checkpoint image (`agency/ckpt-<pid>-<agname>`) when the task completes and then destroyed.
 
 An optional `context_limit` field pins the model's context window size for auto-compaction. If omitted, the agent queries the endpoint at startup (vLLM exposes `max_model_len`). Compaction is silently disabled when the limit cannot be determined.
 
@@ -63,11 +59,7 @@ result = ag.run(skill, agdata(question="What is 2+2?"))
 print(result.answer)   # blocks here until the skill finishes
 ```
 
-`run()` is always non-blocking. It calls `skill.run(self, ...)`, which schedules
-a thread and returns a pending `agdata` immediately. That thread delegates the
-synchronous transaction to `agentEngine.execute()`; the selected sandbox-side
-harness is intended to own its execution loop. The result resolves only after
-the builder has waited for completion and run execution-scoped cleanup.
+`run()` is always non-blocking. It calls `skill.run(self, ...)`, which schedules a thread and returns a pending `agdata` immediately. The actual ReAct loop is driven by `agskill.execute_react()`, which runs synchronously inside that thread. The result resolves only when the full skill — including all background processes the agent may have launched — has finished and all resources have been released.
 
 ## Serialized history
 
@@ -84,7 +76,7 @@ r2 = ag.run(summarize_skill, agdata(text=r1.text))   # waits for r1 internally
 child = agent(ag)
 ```
 
-Forking blocks until the parent's in-flight task completes, then deep-copies the resolved ctx and copies the parent's checkpoint through the backend that produced it. The child's physical backend is not started at fork time; `SandboxProvisioner.acquire()` explicitly prepares it during the child's next execution, restoring from the copied checkpoint. All subsequent writes in either direction are isolated.
+Forking blocks until the parent's in-flight task completes, then deep-copies the resolved ctx and copies the parent's checkpoint image via `docker tag`. The child's sandbox is not started at fork time — it is created lazily when the child's first `run()` executes, restoring from the copied checkpoint. All subsequent writes in either direction are isolated.
 
 ## Class-level configuration
 
@@ -97,7 +89,7 @@ Set once before creating agents:
 | `agent.agresource_pool` | auto-detected | Shared GPU/CPU/memory pool |
 | `agent.ping_interval_s` | `300` | Max seconds `wait_for_processes` waits before injecting a status ping |
 | `agent.poll_interval_s` | `5` | `get_live_pids()` poll granularity inside each ping window |
-| `agent.max_outer_iters` | `144` | **Unused** — kept for backwards compatibility. |
+| `agent.max_outer_iters` | `144` | **Unused** — kept for backwards compatibility; process monitoring is now bounded by `AGSKILL_REACT_MAX_STEPS` inside `agskill.execute_react()` |
 
 ## Shared output directory
 
@@ -130,7 +122,7 @@ The name is always postfixed with `_XXXX` (a 4-character base-36 counter, digits
 
 ## Lifecycle and cleanup
 
-Each execution explicitly prepares its sandbox before host/harness work. `ExecutionBuilder` stops the harness manager and host server before asking `SandboxProvisioner` to finalize the lease. A validated success commits and may hibernate; a failure after the attempt mark discards dirty state and queues a revert notice; a setup failure before that mark unwinds without claiming a revert. Provisioner teardown runs before the sandbox lock is released last. The facade and last checkpoint survive normal finalization; `sandbox.destroy()` and the best-effort `atexit` handler are permanent lifetime cleanup.
+sandboxs are created lazily — only when a task first calls a tool that actually touches the sandbox (`run_in_subprocess` no longer gates this at all — see [agtools.md](agtools.md)). Tasks that use only host-side tools (web fetch, `ask_human`, paper search, …) complete without ever starting a sandbox. When a sandbox is started, stale sandboxs from a previous run (e.g. after a hard kill) are removed first. Between tool calls the sandbox is only hibernated (`ag.sandbox.stop()` — paused, never removed); it's checkpointed with `ag.sandbox.commit()` or discarded with `ag.sandbox.rm_container()` once per skill call at task end, depending on whether the skill succeeded (see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert)). An `atexit` handler removes any sandboxs still running at process exit.
 
 ## UI callbacks
 
@@ -156,9 +148,6 @@ wait_all_paused([ag])       # block until settled (see below), or until timeout=
 wait_all_resumed([ag])
 ```
 
-`pause()` is non-blocking. The replacement Harness Manager protocol must honor
-it at safe check-in points rather than interrupting an in-flight LLM or tool
-call. `is_paused()` reads `ag._state.paused_ack` directly (the real
-synchronization primitive), not the cosmetic state string.
+`pause()` is non-blocking and takes effect only at the next ReAct-loop checkpoint (`agent._check_pause()`, called at the top of every iteration in `agskill.execute_react()`, and once before the loop starts) — never mid-LLM-call or mid-tool-call, so an in-flight call always finishes first. `is_paused()` reads `ag._state.paused_ack` directly (the real synchronization primitive), not the cosmetic state string.
 
 `is_settled()` is what makes `wait_all_paused()` deadlock-safe across a dependency chain: an agent whose worker thread is blocked resolving another agent's still-pending result (e.g. via a nested `agdata` field, or `agent.fork()`) is tagged `blocked_on_dependency` with `ag._state.blocked_on` pointing at the upstream agent, and `is_settled()` recurses through that chain — an agent blocked on an already-*paused* upstream counts as settled, so waiting for a whole dependency graph to stop never hangs on an agent that can never reach its own checkpoint. This is unrelated to the future-chain registration-order deadlocks covered in `docs/Design_deadlock.md` — see `agency/agpause.py` for the pause-specific cross-agent coordination (thread-local worker tracking, `wait_all_paused`/`wait_all_resumed`).

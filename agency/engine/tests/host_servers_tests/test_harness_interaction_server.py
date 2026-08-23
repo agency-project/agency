@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
 from agency.agpolicy import agpolicy
 from agency.engine.host_servers.harness_interaction_server import HarnessInteractionServer
-from agency.sandbox.events import agsyscallevent
+from agency.engine.types import HarnessAttemptResult
+from agency.harness._syscall_event import agsyscallevent
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +467,65 @@ def test_build_app_record_event_route_delegates_to_data_collector():
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert collector.events == [("warning", {"message": "bad shape"}, None, False)]
+
+
+# ---------------------------------------------------------------------------
+# run_prompt / report_attempt_result
+# ---------------------------------------------------------------------------
+
+
+def test_report_attempt_result_with_no_pending_run_prompt_is_a_noop():
+    server, _ = _make_server()
+    server.report_attempt_result({"ok": True, "final_text": "x"})  # should not raise
+
+
+def test_run_prompt_puts_run_attempt_message_on_inbox_and_returns_reported_result():
+    server, agent = _make_server()
+    agent.inbox = queue.Queue()
+    seen_messages = []
+
+    def report_after_seeing_the_message():
+        seen_messages.append(agent.inbox.get(timeout=2.0))
+        server.report_attempt_result({"ok": True, "final_text": "done"})
+
+    t = threading.Thread(target=report_after_seeing_the_message)
+    t.start()
+    result = server.run_prompt("the-prompt", timeout=2.0)
+    t.join(timeout=2.0)
+
+    assert seen_messages == [{"type": "run_attempt", "prompt": "the-prompt"}]
+    assert result == HarnessAttemptResult(ok=True, final_text="done")
+
+
+def test_run_prompt_raises_queue_empty_on_timeout_with_no_report():
+    server, agent = _make_server()
+    agent.inbox = queue.Queue()
+    try:
+        server.run_prompt("the-prompt", timeout=0.05)
+        assert False, "expected queue.Empty"
+    except queue.Empty:
+        pass
+
+
+def test_build_app_report_attempt_result_route_delegates():
+    server, agent = _make_server()
+    agent.inbox = queue.Queue()
+    client = TestClient(server.build_app())
+    result_holder = {}
+
+    def call_run_prompt():
+        result_holder["result"] = server.run_prompt("the-prompt", timeout=2.0)
+
+    t = threading.Thread(target=call_run_prompt)
+    t.start()
+    agent.inbox.get(timeout=2.0)  # wait until run_prompt has registered its pending queue
+
+    response = client.post("/report_attempt_result", json={"ok": True, "final_text": "hi"})
+    t.join(timeout=2.0)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert result_holder["result"] == HarnessAttemptResult(ok=True, final_text="hi")
 
 
 def test_build_app_record_span_route_delegates_to_data_collector():

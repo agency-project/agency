@@ -43,12 +43,4 @@ Every concrete backend declares an `IMAGE_KIND` class attribute identifying the 
 
 ## Shared method implementations
 
-Physical readiness has one backend-neutral facade operation:
-`agSandbox.ensure_started()`. `SandboxProvisioner.acquire()` calls it after
-acquiring `sandbox._lock` and before host services start. The facade delegates
-to the selected backend: Docker and Podman share the container
-start/resume/create mechanics in `_ContainerBackendBase`, while chroot
-materializes or reuses its workspace. Backend operations may repeat the same
-check idempotently for defensive direct use.
-
 `exec()` (GPU env injection + background-PID tracking via the `__BGPIDS__` marker — see [../agsandbox.md](../agsandbox.md)'s "exec wrapper" section), `read_file()`/`read_file_bytes()`/`write_file()`/`write_file_bytes()`, `get_live_pids()`/`pid_status_summary()`/`release_daemon()`, and `release_resources()` are all implemented once, purely in terms of each concrete backend's own `_container_exec()` primitive — so every backend gets them for free rather than reimplementing the same base64/proc-diffing logic three times.

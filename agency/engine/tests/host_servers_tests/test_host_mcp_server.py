@@ -388,6 +388,26 @@ def test_submitted_output_starts_empty():
     assert result.content[0].text.strip() == "{}"
 
 
+def test_collected_output_starts_empty():
+    server, _, _ = _make_server(output_schema=agdata(summary=str))
+    assert server.collected_output() == {}
+
+
+def test_collected_output_reflects_submitted_fields():
+    server, _, _ = _make_server(output_schema=agdata(summary=str, count=int))
+    _call(server, "submit_output", {"field": "summary", "value": "hello"})
+    _call(server, "submit_output", {"field": "count", "value": 42})
+    assert server.collected_output() == {"summary": "hello", "count": 42}
+
+
+def test_collected_output_returns_a_copy_not_the_live_store():
+    server, _, _ = _make_server(output_schema=agdata(summary=str))
+    _call(server, "submit_output", {"field": "summary", "value": "hello"})
+    snapshot = server.collected_output()
+    snapshot["summary"] = "mutated"
+    assert server.collected_output() == {"summary": "hello"}
+
+
 def test_host_tool_receives_the_servers_sandbox_and_resource_pool_as_context():
     seen = {}
 

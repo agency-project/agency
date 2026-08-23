@@ -612,8 +612,8 @@ def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 1
     presence in `pip list` (a package can be listed but broken, or absent
     but shadowed by something else on the path) -- and only invokes pip for
     the ones genuinely missing, so a container whose checkpoint image
-    already has everything installed (reused across skill calls, see the
-    SandboxProvisioner commit boundary) pays this cost exactly once per fresh
+    already has everything installed (reused across skill calls, see
+    agskill.py's commit() boundary) pays this cost exactly once per fresh
     container, not on every launch. Requires the container to have
     outbound network access -- true today (see docs/Design_harness_
     integration.md's network lockdown discussion, deferred).

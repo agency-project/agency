@@ -62,7 +62,7 @@ class agtype:
         field_name.  Return an empty string to add nothing.  Default: ``""``.
 
     build_content_prompt(key, value) -> tuple[str | None, list[dict]]
-        Called by build_prompt_payload to let the type contribute to the user
+        Called by _build_user_content to let the type contribute to the user
         message content array.  Returns (placeholder, content_blocks).
         placeholder: if not None, replaces the field value in the JSON text
         portion so the LLM doesn't see the raw value (e.g. a base64 blob).

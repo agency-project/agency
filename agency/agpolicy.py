@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from .sandbox.events import agsyscallevent
+    from .harness._syscall_event import agsyscallevent
 
 
 @dataclass

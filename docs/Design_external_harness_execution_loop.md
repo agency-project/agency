@@ -1,12 +1,8 @@
 # External Harness Execution Loop
 
-> **Status: historical implementation reference.** The code described here
-> was relocated to `agency/old_harness/` and is not the current execution
-> path. Current scheduling reaches `agentEngine.execute()` and
-> `ExecutionBuilder.execute()`; the replacement sandbox-side Harness Manager
-> command protocol and `CompletedResult` recovery are not implemented yet. This
-> document records the earlier `claude_code.py` in-container + UDS-relay +
-> session-continuity work. It
+> **Status:** describes the implemented, empirically-verified execution path
+> for a harness-driven skill call (`engine != "native"`), as of the
+> `claude_code.py` in-container + UDS-relay + session-continuity work. This
 > document is the "what actually happens, in order" companion to
 > [Design_harness_integration.md](Design_harness_integration.md) (the "why
 > it's shaped this way") and [Design_harness_history.md](Design_harness_history.md)
@@ -266,7 +262,7 @@ deliberate design, not an oversight.
 | `agpolicy.check()` runs | In-process | Still on the host — relayed over the entrypoint's stdio |
 | LLM traffic reaches the gateway via | Direct TCP (`ANTHROPIC_BASE_URL` = gateway's own host:port) | Container-local relay → bind-mounted Unix socket → gateway |
 | Filesystem the harness's tools see | The real host filesystem at `config_home`/cwd | The container's own real filesystem — no interception layer needed |
-| Container/sandbox lifetime for this call | N/A (no sandbox teardown mid-call) | One full provisioner-owned execution transaction; the physical backend starts explicitly before launch and remains ready until harness and host cleanup complete |
+| Container/sandbox lifetime for this call | N/A (no sandbox teardown mid-call) | Coarsens to one full harness invocation — native's per-tool-call hibernation can't apply once the harness's own live process is what's inside the container |
 
 ## What this document doesn't cover
 

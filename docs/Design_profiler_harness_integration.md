@@ -4,12 +4,6 @@ Status: proposal, nothing implemented.
 Canonical profiler spec: branch `tony/profiler` @ `f46f00b`.
 Target branch: `eric/harness-profiler-integration` (HEAD, `6c87e92`).
 
-> **Repository note:** most harness paths and APIs cited in this proposal were
-> later relocated to `agency/old_harness/` and are not current runtime APIs.
-> Current execution uses the execute-only engine/builder/provisioner lifecycle;
-> the replacement Harness Manager protocol and result recovery are still
-> pending. Treat the old links below as historical design coordinates.
-
 ---
 
 ## 1. Repository architecture overview
@@ -20,9 +14,7 @@ them without knowing which implementation is plugged in.
 | Layer | Entry point | Notes |
 |---|---|---|
 | Agent | `agency/agent.py` | owns `agname`, `agconfig`, `terminal`, `log`, `sandbox`, `engine` |
-| Skill run | `agskill.run()` → `_task()`, [agskill.py](../agency/agskill.py) | scheduling/result boundary only; delegates synchronous execution to `agentEngine.execute()` |
-| Engine transaction | `agentEngine.execute()` → `ExecutionBuilder.execute()`, [engine.py](../agency/engine/engine.py) | execute-only facade plus orchestration of provisioning, host services, prompt, harness, and reverse cleanup |
-| Sandbox lease | `SandboxProvisioner.acquire()` / `.finalize()`, [sandbox_provisioner.py](../agency/engine/sandbox_provisioner.py) | owns physical startup, lock lifetime, commit/discard, optional hibernate, teardown, and lock release last |
+| Skill run | `agskill.run()` → `_task()`, [agskill.py:450](../agency/agskill.py:450) | one daemon thread per run; the outer lifecycle boundary |
 | Engine (harness) | `agharness_backend.for_config()`, [base.py:112](../agency/harness/agharness_backends/base.py:112) | 5 backends: `native`, `claude_code`, `codex`, `opencode`, `grok` |
 | LLM | `agLLMTerminus`, [agllm_terminus.py:196](../agency/harness/agllm_terminus.py:196) | the **only** place a credentialed provider client is constructed |
 | Sandbox | `agSandbox` → `sandbox/{container,chroot}.py` | container lifecycle, cgroups, layer commits |
@@ -198,7 +190,7 @@ This is the natural correlation key: it already maps 1:1 to (agent, skill run).
 
 | # | Profiler feature | Canonical site | What changed | HEAD target | Kind |
 |---|---|---|---|---|---|
-| 1 | `run{N}` lane root, `resolve`, `sandbox:provision`, `teardown:*`, `prune` | `agskill.py:321-503` | scheduling remains in `_task()`, but the execution transaction and sandbox lifecycle moved to `ExecutionBuilder` and `SandboxProvisioner`; lifecycle spans must move with their owners | [execution_builder.py](../agency/engine/execution_builder.py), [sandbox_provisioner.py](../agency/engine/sandbox_provisioner.py) | A |
+| 1 | `run{N}` lane root, `resolve`, `sandbox:provision`, `teardown:*`, `prune` | `agskill.py:321-503` | nothing — `_task()` is structurally the same | [agskill.py:288-450](../agency/agskill.py:288) | I |
 | 2 | 11 `sandbox:*` spans | `agsandbox.py:148,279-366` | nothing — facade is byte-identical minus the `with` blocks | [agsandbox.py:328-364](../agency/agsandbox.py:328) | I |
 | 3 | `sync:container`, `runtime:detect`, `sandbox:start` | `container.py:103,131,882` | nothing | [container.py:85,107,809](../agency/sandbox/container.py:85) | I |
 | 4 | GPU leases, `sync:gpu_wait` | `agresources.py:440-491` | nothing | [agresources.py:417,451](../agency/agresources.py:417) | I |
@@ -227,7 +219,7 @@ mechanical but gates the entire resource half. Rows 9–16 are architectural.
 The profiler cannot be uniformly complete across five engines, and pretending
 otherwise produces silently wrong benchmark numbers. Make the tiers explicit.
 
-**Tier 1 — engine-independent, host-observed.** Outer run, builder/provisioner transaction, sandbox lifecycle,
+**Tier 1 — engine-independent, host-observed.** Outer run, sandbox lifecycle,
 cgroup/process/GPU sampling, GPU leases, and **every real provider call**. One
 instrumentation site each; works for all five engines by construction.
 
@@ -661,12 +653,12 @@ Difficulty: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
   - `pyproject.toml`: `profiler` extra becomes
     `opentelemetry-sdk`, `opentelemetry-exporter-otlp`, `nvidia-ml-py` —
     **no torch**;
-  - re-apply spans at incompatibility rows 2–5 and 7, and relocate row 1's execution/lifecycle spans to `engine/execution_builder.py` and `engine/sandbox_provisioner.py` (`agskill.py`,
+  - re-apply spans at incompatibility rows 1–5 and 7 (`agskill.py`,
     `agsandbox.py`, `container.py`, `agresources.py`, `agsync.py`, `agdata.py`,
     `agent.py`, `agwebui/__init__.py`).
 - **Difficulty:** M — the span-backend swap is contained to ~120 lines of
-  `agprof.py`; the risk is preserving one connected run while scheduling stays in
-  `agskill.py` and transaction/finalization spans move to the builder and provisioner.
+  `agprof.py`; the risk is in `agskill.py`'s restructured `_task()`, where
+  `input:prepare` moves to `execute_harness` (row 7).
 - **Dependencies:** none.
 - **Outcome:** LLM/tool/turn sections present but empty. Expected; M3 fixes it.
 

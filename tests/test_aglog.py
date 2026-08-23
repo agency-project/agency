@@ -25,7 +25,7 @@ def make_skill(name: str = "s", out: dict | None = None):
         new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
         return agdata(**(out or {"ok": True})), agcontext(messages=new_msgs), []
 
-    sk.execute_engine = fake_execute_react
+    sk.execute_harness = fake_execute_react
     return sk
 
 

@@ -350,7 +350,7 @@ def test_recover_outputs_no_agtype_fields_returns_empty():
 
 # ---------------------------------------------------------------------------
 # validate_and_recover() -- whole-schema validation + recovery from a
-# harness's single raw final-answer text (agskill.execute_engine()'s path)
+# harness's single raw final-answer text (agskill.execute_harness()'s path)
 # ---------------------------------------------------------------------------
 
 

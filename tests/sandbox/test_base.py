@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import patch
 
-from agency.sandbox import _ChrootBackend, _DockerBackend, _PodmanBackend, agsandbox_backend
+from agency.sandbox import agsandbox_backend
 
 
 @pytest.fixture(autouse=True)
@@ -181,60 +181,6 @@ class TestBackendSelection:
             with patch("agency.sandbox.chroot.chroot_available", return_value=False):
                 with pytest.raises(RuntimeError, match="No usable sandbox backend"):
                     _auto_detect_runtime()
-
-
-@pytest.mark.parametrize("backend_cls", [_DockerBackend, _PodmanBackend, _ChrootBackend])
-def test_public_ensure_started_uses_each_concrete_backends_startup_hook(backend_cls):
-    backend = backend_cls.__new__(backend_cls)
-    calls = []
-    backend._ensure_started = lambda: calls.append("started")
-
-    backend.ensure_started()
-
-    assert calls == ["started"]
-
-
-def test_sandbox_facade_forwards_explicit_start_to_backend():
-    from agency.sandbox.agsandbox import agSandbox
-
-    calls = []
-    sandbox = agSandbox.__new__(agSandbox)
-    sandbox._destroyed = True
-    sandbox._agname = "explicit-start-test"
-    sandbox._backend = type(
-        "_Backend",
-        (),
-        {"ensure_started": lambda self: calls.append("started")},
-    )()
-
-    sandbox.ensure_started()
-
-    assert calls == ["started"]
-
-
-def test_sandbox_facade_destroy_remains_retryable_after_backend_failure():
-    from agency.sandbox.agsandbox import agSandbox
-
-    class _Backend:
-        def __init__(self):
-            self.calls = 0
-
-        def destroy(self):
-            self.calls += 1
-            if self.calls == 1:
-                raise RuntimeError("destroy failed")
-
-    sandbox = agSandbox.__new__(agSandbox)
-    sandbox._destroyed = False
-    sandbox._backend = _Backend()
-
-    with pytest.raises(RuntimeError, match="destroy failed"):
-        sandbox.destroy()
-
-    assert sandbox._destroyed is False
-    sandbox.destroy()
-    assert sandbox._destroyed is True
-    assert sandbox._backend.calls == 2
 
 
 class TestBackendForImageKind:

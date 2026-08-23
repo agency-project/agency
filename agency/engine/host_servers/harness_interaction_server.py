@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import queue
+import threading
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from ...sandbox.events import agsyscallevent
+from ...engine.types import HarnessAttemptResult
+from ...harness._syscall_event import agsyscallevent
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
     from ...agent import agent
     from ...agskill import agskill
     from ...engine.agDataCollector import agDataCollector
+    from ...engine.types import PromptPayload
 
 
 class HarnessInteractionServer(HostServerBase):
@@ -19,6 +23,8 @@ class HarnessInteractionServer(HostServerBase):
         self._agent = agent
         self._policy = skill.policy
         self._data_collector = data_collector
+        self._lock = threading.Lock()
+        self._pending_result_queue: "queue.Queue[HarnessAttemptResult] | None" = None
         self.set_config(agent.agconfig)
 
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
@@ -80,6 +86,26 @@ class HarnessInteractionServer(HostServerBase):
             call_label=call_label,
         )
 
+    def run_prompt(
+        self, prompt: "PromptPayload", timeout: "float | None" = None
+    ) -> HarnessAttemptResult:
+        """Deliver one prompt to the sandboxed harness manager via the inbox
+        and block until it reports completion. Not an HTTP route -- called
+        directly by agentEngine.run(), in-process, on the agent's own
+        worker thread. HostServerManager's uvicorn thread and anyio worker
+        pool stay free to serve every other route while this blocks."""
+        result_queue: "queue.Queue[HarnessAttemptResult]" = queue.Queue(maxsize=1)
+        with self._lock:
+            self._pending_result_queue = result_queue
+        self._agent.inbox.put({"type": "run_attempt", "prompt": prompt})
+        return result_queue.get(timeout=timeout)
+
+    def report_attempt_result(self, result: dict) -> None:
+        with self._lock:
+            q, self._pending_result_queue = self._pending_result_queue, None
+        if q is not None:
+            q.put(HarnessAttemptResult(**result))
+
     def build_app(self) -> FastAPI:
         app = FastAPI()
 
@@ -125,6 +151,11 @@ class HarnessInteractionServer(HostServerBase):
                 parent=request.get("parent"),
                 call_label=request.get("call_label"),
             )
+            return JSONResponse({"ok": True})
+
+        @app.post("/report_attempt_result")
+        def _report_attempt_result(request: dict) -> JSONResponse:
+            self.report_attempt_result(request)
             return JSONResponse({"ok": True})
 
         return app

@@ -2,10 +2,7 @@
 
 ## Core Principle
 
-`agent` is a **pure state container**. `agskill` defines and schedules work,
-`agentEngine` is the thin public execution facade, `ExecutionBuilder` sequences
-one complete execution, and `SandboxProvisioner` owns the sandbox lease and
-durability boundary.
+`agent` is a **pure state container**. `agskill` is the **execution engine**.
 
 This inversion from the original design eliminates the circular import between agent and agskill, removes the `agrun_hooks` indirection layer, and makes the execution logic entirely testable without constructing a real agent.
 
@@ -26,8 +23,6 @@ agent          ← pure state container; run() just calls skill.run(self, ...)
         ↓
 agskill        ← takes agent as an arg; owns scheduling wrapper + ReAct loop
         ↓
-engine         ← execute-only facade + builder/provisioner/host composition
-        ↓
 agteam / agsync
 ```
 
@@ -45,7 +40,7 @@ Holds all runtime state. No execution logic.
 |---|---|---|
 | `llm` | `agllm` | LLM endpoint config and call interface |
 | `ctx` | `agcontext` | Current/pending conversation context |
-| `sandbox` | `agSandbox \| None` | Durable sandbox facade; attached by `SandboxProvisioner` on the first execution when absent, or supplied directly by the caller. Plain attribute — no property, no ownership flag. |
+| `sandbox` | `agSandbox \| None` | Container sandbox; created lazily on first skill run, or supplied directly by the caller. Plain attribute — no property, no ownership flag. |
 | `terminal` | `agterm` | Structured terminal output for this agent |
 | `log` | `aglog` | Persistent event log |
 | `agname` | `agname` | Unique allocated agent name |
@@ -61,10 +56,9 @@ Methods on `agent` are limited to state manipulation and thin delegation:
 - `_set_ui_state(...)`, `_push_live_messages(...)`, `_append_full_history(...)` — UI/log callbacks called by agskill; `_set_ui_state` is a thin wrapper around `self._state.update_state(...)`
 - `pause()`, `resume()`, `is_paused()`, `is_settled()`, `_check_pause()` — pause/resume coordination; see `agent.md` and `agency/agpause.py` (cross-agent wait/dependency tracking lives in `agpause.py`, not here)
 
-### `agskill` — skill definition and scheduler
+### `agskill` — execution engine
 
-Owns the non-blocking scheduling wrapper and delegates each synchronous
-transaction to `agentEngine`.
+Owns both the non-blocking scheduling wrapper and the synchronous ReAct loop.
 
 #### `agskill.run(ag, skill_input, max_steps)` — scheduling wrapper
 
@@ -84,18 +78,15 @@ Runs in the background thread spawned by `run()`. Sequence:
 
 1. `prev_ctx.resolve_prev_dependencies()` — block until the previous skill's context future resolves
 2. `skill_input.resolve_input_dependencies()` — block until any pending agdata inputs resolve
-3. Call `self.execute_engine(ag, prev_ctx, skill_input, max_steps)`
-4. Log result, update token counts, prune history
-5. `result_future.set_result(result)` — unblock any caller awaiting the return value
-6. `ctx_future.set_result(updated_ctx)` — unblock the next skill's `resolve_prev_dependencies()`
+3. Provision sandbox if needed
+4. Call `self.execute_react(ag, prev_ctx, skill_input, max_steps)`
+5. Log result, update token counts, prune history
+6. `result_future.set_result(result)` — unblock any caller awaiting the return value
+7. `ctx_future.set_result(updated_ctx)` — unblock the next skill's `resolve_prev_dependencies()`
 
-#### Legacy in-process ReAct loop — historical reference
+#### `agskill.execute_react(ag, prev_ctx, skill_input, max_steps)` — synchronous ReAct loop
 
-`agskill.execute_react()` is no longer a live method. The loop sketch below
-records the retired host-side implementation; in the target architecture the
-selected sandbox-side harness owns its loop. The replacement Harness Manager
-protocol and host-only `CompletedResult` recovery are still pending, so this is
-not a description of a currently runnable default bridge.
+The actual execution. Receives `prev_ctx` explicitly because `ag.ctx` has already been replaced with the new pending placeholder by the time the thread runs.
 
 Loop structure:
 ```
@@ -119,62 +110,6 @@ for _ in range(max_steps):
     if _use_return_output: check for missing fields, reprompt or error
     else: return raw text as agdata(result=content)
 ```
-
-### `agentEngine` — public facade and composition root
-
-`agentEngine` exposes one execution operation, `execute() -> CompletedResult`.
-It constructs or receives `ExecutionBuilder` and its dependencies and delegates
-the complete execution to `ExecutionBuilder.execute()`. It does not construct
-`agSandbox`, acquire its lock, start or stop a physical backend, commit or
-discard state, or manage host/harness cleanup in detail. Execution state lives
-with the builder and the provisioner lease rather than being duplicated on the
-facade.
-
-### `ExecutionBuilder` — transaction sequencing
-
-`ExecutionBuilder.execute()` expresses the cross-component sequence:
-
-1. `SandboxProvisioner.acquire(agent)` resolves or creates the facade, acquires
-   its lock, and explicitly prepares the physical backend.
-2. `HostServerManager.start()` starts execution-scoped host services and returns
-   the actual host UDS path.
-3. The builder creates the prompt payload.
-4. Immediately before harness launch, the builder calls
-   `SandboxProvisioner.mark_execution_attempted(lease)`.
-5. It passes the prepared sandbox and host UDS to harness launch, runs the
-   selected harness, and waits for a validated `CompletedResult`.
-6. It stops the harness manager and then the host services.
-7. It calls `SandboxProvisioner.finalize(lease, succeeded=...)` on every path.
-
-The builder owns sequencing, not sandbox mechanics. In particular, the
-diagram's “Build Container & UDS” phase is composition: the provisioner prepares
-the sandbox and its transport mounts/prerequisites, while `HostServerManager`
-owns the host service and the UDS path it returns.
-
-### `SandboxProvisioner` — sandbox transaction owner
-
-The provisioner owns facade resolution/creation, an output-mount config clone,
-`sandbox._lock`, the explicit `sandbox.ensure_started()` call, and a lease that
-records whether physical preparation and an execution attempt occurred. It
-also owns final commit/discard, optional post-commit hibernation,
-provisioner-specific teardown, the failed-execution inbox notice, and releasing
-the lock last.
-
-After an attempted execution fails, finalization discards dirty live state and
-queues the revert notice while preserving the last successful checkpoint. A
-preparation failure before `mark_execution_attempted()` unwinds partial state
-and may hibernate the backend, but it does not claim that user execution was
-reverted. Cleanup errors are retained as notes/context without replacing the
-primary execution error. Permanent `sandbox.destroy()` is not part of normal
-per-execution finalization.
-
-### `agSandbox` and backends — isolation mechanics
-
-`agSandbox` is the backend-neutral facade. `ensure_started()`, `commit()`,
-`stop()`, `rm_container()`, and `destroy()` delegate to Docker, Podman, or
-chroot mechanics. Operations may still defensively ensure readiness, but the
-intended engine path explicitly calls `ensure_started()` while the provisioner
-holds the lease, before host services or harness launch.
 
 ### `agcontext` — conversation state
 
@@ -221,7 +156,7 @@ Also owns compaction logic:
 
 A named callable with a JSON Schema parameter spec. `run_in_subprocess=True` means the tool's function runs in a cloudpickle-serialized worker process (safe isolation). `run_in_subprocess=False` means it runs in the calling thread — used by all sandbox-backed tools, which close over the sandbox object directly and cannot be pickled.
 
-`dispatch_tools(toolkit, tool_calls_raw, sandbox, ...)` — execute all tool calls from one LLM turn and handle output offloading. It does not start, stop, commit, or restore the sandbox; those operations belong to the provisioner-owned execution transaction.
+`dispatch_tools(toolkit, tool_calls_raw, sandbox, ...)` — execute all tool calls from one LLM turn, handle output offloading, sandbox commit/restore.
 
 ---
 
@@ -231,14 +166,9 @@ A named callable with a JSON Schema parameter spec. `run_in_subprocess=True` mea
 
 `agent.run(skill, input)` calls `skill.run(self, input)` via duck typing. Any object with a `.run(agent, agdata)` method works. This keeps `agent.py` free of upward dependencies and makes it trivially testable without loading the full execution stack.
 
-### Why the captured context is passed into the engine
+### Why prev_ctx is a separate argument to execute_react
 
-By the time the background thread calls `execute_engine`, `ag.ctx` has already
-been replaced with the new pending placeholder for this skill run. The actual
-previous context was captured before the swap and must be passed to
-`agentEngine`/`ExecutionBuilder` explicitly. The pending harness protocol must
-use that input to recover the updated `CompletedResult.context` and `delta`;
-reading `ag.ctx` inside the transaction would observe the current placeholder.
+By the time the background thread calls `execute_react`, `ag.ctx` has already been replaced with the new pending placeholder for this skill run. The actual previous context was captured before the swap and must be passed explicitly. Reading `ag.ctx` inside `execute_react` would return the placeholder for the current call — which would deadlock if `resolve_prev_dependencies()` were called on it.
 
 ### Future-based serialization without locks
 
@@ -271,36 +201,22 @@ When a skill has no `output_schema`, the model's raw text response is returned a
 
 ### Sandbox lifecycle
 
-When an execution begins, `SandboxProvisioner.acquire()` returns an existing
-`agent.sandbox` or creates and attaches a new facade. It then acquires that
-facade's lock and explicitly calls `sandbox.ensure_started()` before the host
-server or harness starts. Sandbox operations retain idempotent readiness checks
-as a defensive backend invariant, but an incidental command is not the normal
-startup mechanism.
-
-After the harness manager and host server have stopped, the builder reports the
-outcome to `SandboxProvisioner.finalize()`. A successful validated result commits
-and may hibernate; a failure after `mark_execution_attempted()` discards dirty
-live state and queues a revert notice; a preparation failure before that mark
-unwinds without a revert claim. Provisioner teardown follows and the sandbox
-lock is released last. `_lifecycle_tag()` always lowercases a container
-checkpoint image name because Docker and Podman require lowercase repository
-names.
+The sandbox is created lazily on the first skill run that needs one. After each tool call — success or failure, regardless of `run_in_subprocess` — the sandbox is only *hibernated* (`sandbox.stop()`: `docker/podman stop`, container kept, never committed or removed), **unless** the tool call left background work still running (`sandbox._has_pending_background_work()`), in which case `stop()` is deferred to a later call rather than killing that work. The next tool call's `_ensure_started()` resumes the same hibernating container in place (`docker/podman start`) with no image or `run` involved at all. Checkpointing/reverting happens once per *skill* call instead, in `agskill`'s teardown: `sandbox.commit()` on success (checkpoints in place, container untouched) or `sandbox.rm_container()` on failure (discards everything since the last successful skill, with a revert notice delivered via the agent's `inbox` at the start of the *next* skill call) — see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert). `_lifecycle_tag()` always lowercases the Docker image name (Docker requires lowercase repository names).
 
 **Sandbox ownership — no flag, plain attribute**
 
 `agent.sandbox` is a plain instance attribute — no property, no getter/setter, no ownership flag:
 
-- `SandboxProvisioner` resolves `ag.sandbox` and attaches a new facade when it is `None`. It applies the same transaction policy whether the facade was created there or supplied through `agent(sandbox=...)` / direct assignment (`ag.sandbox = sb`). Neither `commit()` nor `rm_container()` destroys the facade: `commit()` advances its checkpoint, and `rm_container()` discards dirty live state so the next explicit `ensure_started()` restores from the last checkpoint.
+- `agskill` always provisions a sandbox when `ag.sandbox is None`, and always calls `sandbox.commit()`/`sandbox.rm_container()` in its teardown (success/failure respectively) — regardless of whether the sandbox was created by agskill or handed in via `agent(sandbox=...)` / direct assignment (`ag.sandbox = sb`). Neither call is destructive to the Python object itself: `commit()` doesn't touch the container's existence at all, and even `rm_container()` just means the next access transparently restarts it from the last checkpoint.
 - `agent.__del__` has no sandbox-specific logic at all. Once nothing references an `agSandbox` instance (the agent that held it is gone, and no one else kept a reference), Python's refcounting collects it and `agSandbox.__del__` (which calls `destroy()`) runs — see `agsandbox.md`. Sharing a sandbox across agents (e.g. a harness handing the same `agSandbox` to two agents in turn) works by simply assigning `ag.sandbox = sb` on each; whoever drops the last reference triggers the real cleanup.
 
 **Per-sandbox mutex — serializing concurrent skill runs on a shared sandbox**
 
-Because the provisioner applies the same lease policy to supplied and newly created facades, a single `agSandbox` object can legitimately be driven by more than one agent's skill run (e.g. a harness pattern like `examples/sandbox_handoff.py`, or two agents constructed with the same `sandbox=` object). Without serialization, two skill runs racing on the same container could interleave lifecycle calls and corrupt container state.
+Because agskill no longer special-cases "externally owned" sandboxes, a single `agSandbox` object can legitimately be driven by more than one agent's skill run (e.g. a harness pattern like `examples/sandbox_handoff.py`, or two agents constructed with the same `sandbox=` object). Without serialization, two skill runs racing on the same container could interleave `exec()`/`stop()`/`_ensure_started()` calls and corrupt container state (e.g. one run committing+removing the container while another is mid-`exec`).
 
-`agSandbox.__init__` allocates `self._lock = threading.RLock()` for this purpose. `SandboxProvisioner.acquire()` resolves the facade first, acquires its lock, and only then calls `sandbox.ensure_started()`. `SandboxProvisioner.finalize()` releases it after harness/host cleanup, commit or discard, optional hibernation, and provisioner teardown. The lock is therefore held for the complete physical execution transaction and released last.
+`agSandbox.__init__` allocates `self._lock = threading.RLock()` for this purpose. `agskill.py`'s `_task()` acquires it right after provisioning (`sandbox_lock = ag.sandbox._lock; sandbox_lock.acquire()`) and releases it only after the final teardown (`commit()`/`rm_container()`) — the lock is held for the *entire* skill run, not just for individual tool calls. Everything the skill run does to the sandbox in between (each tool call's own `stop()`/`_ensure_started()` from `agtool.py`, `wait_for_processes()` polling) runs on that same thread and reentrantly re-acquires the same `RLock` for free.
 
-This lock is **not** self-enforcing on `agSandbox` — calling `sandbox.exec()` (or any other method) directly does not itself acquire the lock. The provisioner lease establishes the "one execution owns this sandbox at a time" invariant; code that drives a shared sandbox outside an engine transaction is responsible for its own coordination. See `Design_sandbox_lifecycle.md`'s "Concurrency controls" section and `agsandbox.md` for details.
+This lock is **not** self-enforcing on `agSandbox` — calling `sandbox.exec()` (or any other method) directly does not itself acquire the lock. It's `agskill` that establishes the "one skill run owns this sandbox at a time" invariant by holding the lock around the whole run; code that drives a shared sandbox outside of an agskill run (harness scripts, `subgraph_owner.py`-style direct access) is responsible for its own coordination if it needs the same guarantee. See `Design_sandbox_lifecycle.md`'s "Concurrency controls" section and `agsandbox.md` for details.
 
 The lock is intentionally excluded from `agSandbox.__getstate__`/`__setstate__` — `threading.RLock` isn't picklable, and custom tools with `run_in_subprocess=True` (the default) get `cloudpickle`d to a worker process. A fresh lock is created on unpickling; it has no relationship to the original process's lock (locks are process-local by nature, so there was never real cross-process mutual exclusion to preserve).
 
@@ -312,29 +228,38 @@ The lock is intentionally excluded from `agSandbox.__getstate__`/`__setstate__` 
 
 ```
 agent.run(skill, input)
-  └─ skill.run(ag, input)                              # scheduling wrapper
-       ├─ prev_ctx = ag.ctx
-       ├─ ag.ctx = agcontext(_future=ctx_future)
+  └─ skill.run(ag, input)                         # agskill.run()
+       ├─ prev_ctx = ag.ctx                        # capture before swap
+       ├─ ag.ctx = agcontext(_future=ctx_future)   # install placeholder
        ├─ thread: _task()
-       │    ├─ resolve context and input dependencies
-       │    └─ agentEngine(...).execute()              # thin facade
-       │         └─ ExecutionBuilder.execute(...)
-       │              ├─ lease = SandboxProvisioner.acquire(ag)
-       │              │    ├─ resolve/create + attach agSandbox
-       │              │    ├─ sandbox._lock.acquire()
-       │              │    └─ sandbox.ensure_started()
-       │              ├─ host_uds = HostServerManager.start()
-       │              ├─ prompt = build_prompt_payload(...)
-       │              ├─ provisioner.mark_execution_attempted(lease)
-       │              ├─ launch harness manager(sandbox, host_uds)
-       │              ├─ run agent harness; wait for CompletedResult
-       │              ├─ stop harness manager
-       │              ├─ HostServerManager.stop()
-       │              └─ SandboxProvisioner.finalize(lease, succeeded=...)
-       │                   ├─ success: commit; optionally hibernate
-       │                   ├─ attempted failure: discard + inbox notice
-       │                   ├─ provisioner teardown
-       │                   └─ sandbox._lock.release()       # always last
-       ├─ resolve result/context futures
-       └─ return agdata(_future=result_future)          # non-blocking return
+       │    ├─ prev_ctx.resolve_prev_dependencies()
+       │    ├─ skill_input.resolve_input_dependencies()
+       │    ├─ agSandbox(...) if needed
+       │    ├─ skill.execute_react(ag, prev_ctx, skill_input)
+       │    │    ├─ agschema.prepare_inputs_in_sandbox(...)
+       │    │    ├─ agskill._build_toolkit(ag, ...)
+       │    │    ├─ agskill._build_initial_messages(...)
+       │    │    └─ for each step:
+       │    │         ├─ ag._drain_inbox(messages)
+       │    │         ├─ agllm.maybe_compact(prev_ctx, messages, ...)
+       │    │         ├─ ag.llm.call(kwargs, messages, ...)  → LLMCallResult
+       │    │         │    ├─ kwargs["stream"] = True
+       │    │         │    ├─ openai.OpenAI(base_url, api_key).chat.completions.create(**kwargs)
+       │    │         │    ├─ _iter_batched(stream, idle_timeout, stream_timeout)
+       │    │         │    │    └─ yields chunks; raises _LLMIdleTimeout if silent too long
+       │    │         │    ├─ per chunk: accumulate content_parts, reasoning_parts, tool_calls_raw
+       │    │         │    │    └─ push partial_msg to live UI via live_messages_fn
+       │    │         │    ├─ on BadRequestError (context_length_exceeded): return context_exceeded=True
+       │    │         │    ├─ on connection error: retry up to LLM_MAX_RETRIES, then return conn_error
+       │    │         │    ├─ call update_ui_token_count_fn(total_in, total_out)
+       │    │         │    └─ return LLMCallResult(content_parts, reasoning_parts, tool_calls_raw,
+       │    │         │                            prompt_tokens, total_input_tokens,
+       │    │         │                            total_output_tokens, elapsed_ms)
+       │    │         ├─ (compact if context_exceeded)
+       │    │         ├─ agllm.build_assistant_msg(...)
+       │    │         ├─ dispatch_tools(toolkit, tool_calls, sandbox, ...)
+       │    │         └─ (return if output complete)
+       │    ├─ ctx_future.set_result(updated_ctx)
+       │    └─ result_future.set_result(result)
+       └─ return agdata(_future=result_future)     # non-blocking return
 ```

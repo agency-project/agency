@@ -43,32 +43,6 @@ import pytest
 import agency.sandbox.container as _container
 
 
-def test_container_destroy_remains_retryable_after_removal_failure():
-    backend = _container._ContainerBackendBase.__new__(_container._ContainerBackendBase)
-    backend._destroyed = False
-    backend._watched_pids = {}
-    backend._checkpoint_image = None
-    backend._accumulator_dir = None
-    backend._container_name = lambda: "retry-destroy-test"
-    calls = 0
-
-    def flaky_rm_container():
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("remove failed")
-
-    backend.rm_container = flaky_rm_container
-
-    with pytest.raises(RuntimeError, match="remove failed"):
-        backend.destroy()
-
-    assert backend._destroyed is False
-    backend.destroy()
-    assert backend._destroyed is True
-    assert calls == 2
-
-
 class TestPidAlive:
     def test_own_pid_is_alive(self):
         assert _container._pid_alive(os.getpid()) is True

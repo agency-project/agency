@@ -114,18 +114,9 @@ The hint shown to the LLM in the system prompt is:
 
 The framework validates every element against the template: each item must be a `dict` containing the declared keys with the declared Python types. A type mismatch is caught immediately when the model calls the field's tool, which lets it correct only that field without restarting. Use this form instead of bare `list` whenever item structure matters.
 
-## Execution loop boundary
+## ReAct loop
 
-`agskill.run()` is a non-blocking scheduling wrapper: it captures `prev_ctx`,
-spawns a daemon thread that calls `execute_engine()`, and immediately returns a
-pending `agdata` backed by a `Future`. `execute_engine()` constructs the
-execute-only `agentEngine`; the selected sandbox-side harness is intended to
-own the synchronous loop.
-
-The replacement Harness Manager protocol and `CompletedResult` recovery are
-still incomplete. The `execute_react()` details below document the retired
-host-side loop and are retained only as historical behavior, not as the current
-call path.
+`agskill.run()` is a non-blocking scheduling wrapper: it captures `prev_ctx`, spawns a daemon thread that calls `execute_react()`, and immediately returns a pending `agdata` (backed by a `Future`). The synchronous ReAct loop itself lives in `agskill.execute_react()`.
 
 Each call to `agskill.execute_react()` runs the following steps:
 
@@ -228,23 +219,20 @@ Files are written to `/workspace/long_tool_call_outputs/<tool_name>_<call_id>.tx
 
 This guard prevents a single oversized tool result (e.g. a raw PDF fetched via `webfetch`) from filling the entire context window. If no sandbox is available the result is kept inline unchanged.
 
-### Execution-level sandbox finalization
+### Tool call hibernation and skill-level revert
 
-There is no per-tool-call sandbox lifecycle. A tool call's own success or failure does not start, stop, checkpoint, or revert the sandbox. `SandboxProvisioner.acquire()` explicitly prepares it once before the harness starts, and it remains physically ready for the complete engine transaction, including background-process monitoring.
+There's no per-tool-call checkpoint or revert anymore — a single tool call's own success or failure has no bearing on whether the sandbox gets checkpointed or discarded. Instead, after every tool call the container is only *hibernated* (`sandbox.stop()`, a `docker/podman stop` that never removes the container — see [container.md](sandbox/container.md)'s "Container lifecycle"), regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred entirely for this call; a later call that finds nothing pending is what actually hibernates it).
 
-Rollback happens once per *skill* call instead, in
-`SandboxProvisioner.finalize()` after the builder has stopped the harness
-manager and host services:
+Rollback happens once per *skill* call instead, at `_task()`'s teardown:
 
-- On success: `sandbox.commit()` checkpoints the backend's current state to `agency/lifecycle-<name>` without destroying the facade. The provisioner may then hibernate it when appropriate; the next execution explicitly calls `sandbox.ensure_started()` while holding the same facade's lease.
-- On failure after `mark_execution_attempted()`: `sandbox.rm_container()` discards dirty live state since the last successful commit. The next execution's explicit `ensure_started()` restores from that checkpoint, which is what makes this a revert: nothing is rolled back explicitly, the bad state is simply never checkpointed forward.
-- On preparation failure before the attempt mark: partial services and provisioner state unwind, but no execution revert is claimed and no revert notice is queued.
+- On success: `sandbox.commit()` checkpoints the container's current state to `agency/lifecycle-<name>` **without removing or stopping it** — the very next skill call resumes directly from the same container, no `run` needed.
+- On failure (the skill's own result contains `"error"`, or an exception escaped): `sandbox.rm_container()` force-removes the container, discarding everything since the last successful skill's `commit()`. The next tool call's `_ensure_started()` recreates fresh from that previous `agency/lifecycle-<name>` — i.e. the last successfully committed state — which is what makes this a revert: nothing is rolled back explicitly, the bad state is simply never checkpointed forward.
 
-Because the failing skill's own result is already final by the time the transaction closes, the revert notice can't be attached to it. Instead `SandboxProvisioner` pushes it onto the agent's `inbox` (`ag.inbox.put(...)`, a plain `queue.Queue[str]`) after a successful discard, and the next execution drains it before resuming sandbox work.
+Because the failing skill's own result is already final by the time teardown runs, the revert notice can't be attached to it. Instead it's pushed onto the agent's `inbox` (`ag.inbox.put(...)`, a plain `queue.Queue[str]`), which the react loop drains every iteration — including the first, before that skill's first LLM call — via `_drain_inbox()` (step 3 above). So the agent learns about the revert as a `{"role": "user", ...}` turn right as the *next* skill call begins, rather than inside the failed skill's own output.
 
 **When revert does NOT happen:**
 
-- Facade resolution, lock acquisition, physical preparation, or other setup failed before `mark_execution_attempted()`.
+- `sandbox` is `None` — no container exists.
 - The skill succeeded — `commit()` runs instead, checkpointing forward rather than discarding.
 
 The lifecycle image is named `agency/lifecycle-<container_name>`, scoped to a single sandbox lifetime, and deleted when `sandbox.destroy()` is called.
@@ -435,11 +423,7 @@ See [execution_process_control.md](execution_process_control.md) for per-scenari
 
 ## Context (`agcontext`)
 
-The `prev_ctx` (an `agcontext`) captured by `agskill.run()` is the agent's
-shared conversation context. It is passed through `execute_engine()` into the
-builder. The pending Harness Manager/result-recovery migration must return the
-updated context and delta in `CompletedResult`; the system prompt is not meant
-to be persisted in stored context.
+The `prev_ctx` (an `agcontext`) passed to `agskill.run()` is the agent's shared conversation context. `agskill.run()` captures it before spawning the thread; `execute_react()` appends the full message exchange and returns the updated `ctx`. The system prompt is re-injected fresh on every call and is not persisted in the stored context.
 
 ## Skill tools
 

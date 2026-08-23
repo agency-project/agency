@@ -323,7 +323,7 @@ class agschema:
         The native ReAct loop collects structured output incrementally,
         one field at a time, through per-field `return_<field>` tool calls
         (`make_return_output_agtool`/`make_field_handler` above) --
-        `agskill.execute_engine()`'s harness path instead gets one raw
+        `agskill.execute_harness()`'s harness path instead gets one raw
         text blob back and needs the whole-schema equivalent of that
         validation + recovery in a single step, which didn't exist as a
         single entry point before this method: this is pure composition of

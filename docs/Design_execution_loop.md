@@ -60,62 +60,96 @@ r2 = ag.run(summarize_skill, agdata(text=r1))    # r1 resolved here inside _task
 
 Immediately after — before touching the sandbox — `ag._check_pause(self.name)` runs once. This honors a `pause()` requested before this run even started, so an agent paused while idle never provisions a sandbox or makes an LLM call. See `agent.md`'s "Pause and resume" section for the other checkpoint (once per ReAct-loop iteration, 4d below).
 
-### 3b. Execute-only engine facade and builder transaction
+### 3b. Sandbox provisioning and locking
 
 ```python
-result = agentEngine(
-    agent=ag,
-    context=prev_ctx,
-    skill=self,
-    skill_input=local_skill_input,
-    resource_pool=ag.agresource_pool,
-).execute()
+if ag.sandbox is None:
+    _out_dir = (
+        ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
+        if ag.agconfig is not None else type(ag).output_dir
+    )
+    _out = Path(_out_dir) / ag.agname if _out_dir else None
+    sb_cfg = ag.agconfig
+    if _out is not None:
+        sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
+        agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+    ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
+
+# Hold the sandbox's lock for the rest of the skill run so a sandbox
+# shared across agents is never driven by more than one skill run
+# at a time — released in the teardown below.
+sandbox_lock = ag.sandbox._lock
+sandbox_lock.acquire()
 ```
 
-`agskill` does not create, lock, start, commit, discard, or stop a sandbox.
-`agentEngine.execute()` is a thin composition facade and delegates the whole
-operation to `ExecutionBuilder.execute()`:
+Sandbox creation is lazy — only on the first skill run that needs tools, and only if `ag.sandbox` isn't already set (either from a prior run on this agent, or a caller-provided sandbox passed to `agent(sandbox=...)`). There's no "external sandbox" special case anymore — whoever created the `agSandbox`, this skill run provisions it if missing and manages its lifecycle identically.
 
-1. `SandboxProvisioner.acquire(ag)` returns a lease. It resolves an existing
-   `ag.sandbox` or creates and attaches a facade, acquires `sandbox._lock`, and
-   explicitly calls the backend-neutral `sandbox.ensure_started()`.
-2. The builder constructs `HostServerManager`, calls `start()`, and records the
-   actual host UDS path it returns.
-3. The builder constructs the prompt payload.
-4. Immediately before harness launch, it calls
-   `SandboxProvisioner.mark_execution_attempted(lease)`.
-5. The builder launches the sandbox-side harness manager with the prepared
-   sandbox and host UDS, runs the selected harness, and waits for a validated
-   `CompletedResult`.
-6. It stops the harness manager and then the host-side services.
-7. It calls `SandboxProvisioner.finalize(lease, succeeded=...)`. Success commits
-   and may hibernate; an attempted failure discards dirty state and queues the
-   revert notice; preparation failure before the attempt mark unwinds without
-   claiming a revert. Provisioner teardown runs and the lock is released last.
+Immediately after provisioning, `_task()` acquires `ag.sandbox._lock` (a `threading.RLock`, one per `agSandbox` instance) and holds it until the teardown in 3d releases it. This matters because a single `agSandbox` object can now be shared across more than one agent (e.g. handed from one agent to another, as in `examples/sandbox_handoff.py`); the lock ensures two skill runs never interleave `exec()`/`stop()`/`_ensure_started()`/`commit()`/`rm_container()` calls against the same container. Everything the ReAct loop does to the sandbox — each tool call's own `stop()`/`_ensure_started()` (hibernate/resume only — see `Design_sandbox_lifecycle.md`), `wait_for_processes()` polling, and the single `commit()`/`rm_container()` call at teardown (3d below) — happens on this same thread, so those calls reentrantly reuse the lock this thread already holds at no cost.
 
-Holding the provisioner-owned lease across physical preparation, execution,
-service cleanup, durability finalization, and teardown serializes agents that
-share one `agSandbox` without making individual sandbox methods self-locking.
+### 3c. Skill execution
 
-### 3c. Skill-level exception handling
+```python
+outer_result, updated_ctx, outer_delta = self.execute_react(
+    ag, prev_ctx, skill_input, max_steps,
+)
+```
 
-The scheduling thread still converts exceptions from `engine.execute()` into
-an `agerror`, records UI/logging state, and resolves the result and context
-futures. Sandbox recovery has already happened through builder cleanup and
-provisioner finalization before the exception returns to `agskill`.
+`execute_react()` returns a 3-tuple: `(result: agdata, updated_ctx: agcontext, ctx_delta: list[dict])`. Token counts accumulate inside `prev_ctx` during the run and are committed back via `prev_ctx.total_input_tokens` / `prev_ctx.total_output_tokens`.
+
+### 3d. Exception handling
+
+The entire body of `_task` is wrapped in `try / except / finally`:
+
+```python
+try:
+    prev_ctx.resolve_prev_dependencies()
+    skill_input.resolve_input_dependencies()
+    ...
+    outer_result, updated_ctx, outer_delta = self.execute_react(...)
+
+except Exception as exc:
+    outer_result  = agerror(format_exception(exc))
+    updated_ctx   = prev_ctx
+    outer_delta   = []
+
+finally:
+    # Teardown — commit or discard the sandbox; this is now the only
+    # rollback boundary (per-tool-call rollback no longer exists — see
+    # agtool.py's dispatch_tools() / Design_sandbox_lifecycle.md).
+    _had_error = outer_result is not None and bool(outer_result._data.get("error"))
+    ag._set_ui_state("error" if _had_error else "finished")
+    if ag.sandbox is not None:
+        if _had_error:
+            # Discard everything since the last successful skill's
+            # commit(). The notice can't go into this skill's own result
+            # (already final by this point) -- it goes on the inbox
+            # instead, so the NEXT skill call's execute_react loop (via
+            # ag._drain_inbox(), run before its first LLM call) surfaces
+            # it right as the agent resumes sandbox work.
+            ag.sandbox.rm_container()
+            ag.inbox.put(
+                "Note: the previous skill call failed. Its sandbox "
+                "workspace changes have been discarded and the "
+                "workspace has been reverted to the last "
+                "successful checkpoint."
+            )
+        else:
+            # commit() squashes automatically once the layer chain's
+            # actual depth crosses checkpoint_squash_max_depth -- see
+            # its docstring for why that's a depth-triggered check, not
+            # a fixed commit count.
+            ag.sandbox.commit()
+    if sandbox_lock is not None:
+        sandbox_lock.release()
+```
+
+The `finally` block always runs, and is where the sandbox lifecycle decision that used to happen after *every tool call* now happens exactly *once*, at the end of the whole skill. On success, `commit()` checkpoints the container's current filesystem into its lifecycle image **without removing or even stopping the container** — the next skill run, on this agent or whichever one next holds this `agSandbox`, resumes directly from the very same container object. On failure, `rm_container()` force-removes the container outright, discarding everything since the last successful skill's `commit()`, and a revert notice is queued onto `ag.inbox` (see "Sandbox rollback and the inbox notice" below) since the failing result is already final by this point. Neither branch calls `stop()` — a container that's still running or hibernating from the ReAct loop's own per-tool-call `stop()` calls is left exactly as it was; only `commit()`/`rm_container()` change anything durable. There is no separate GPU-release step in this `finally` block: `commit()` never touches the GPU (the container isn't stopped or removed, so there's nothing to release), and `rm_container()` releases it as part of removal, same as `destroy()` does. The GPU's actual release cadence is set one level up, in the per-tool-call `stop()` calls this `finally` block doesn't touch at all: every hibernate between tool calls now releases the GPU too (re-acquired, possibly a *different* physical GPU, on the next `exec()`) — see `sandbox/container.md`'s "GPU device access" for why attaching every GPU up front to a GPU-reserving container makes that safe. Finally, the per-sandbox lock acquired in 3b is released last, so nothing else can touch this sandbox until this skill run's own teardown has fully finished.
 
 ### Sandbox rollback and the inbox notice
 
-Rollback happens once per engine transaction. A single tool failure does not
-independently revert the filesystem; only the final `CompletedResult` or an
-exception from execution determines whether the transaction commits or
-discards.
+Rollback now happens at exactly one point in the whole system: this `finally` block, once per skill call — replacing an older design where every individual tool call inside `dispatch_tools()` decided for itself whether to checkpoint or discard the sandbox. A single tool call failing partway through an otherwise-successful skill no longer discards anything by itself; only the skill's own final outcome (an `"error"` key in `outer_result`, or an exception that escaped `execute_react()`) decides, and it decides for the *entire* skill run's worth of tool calls at once.
 
-After an attempted execution is successfully discarded, `SandboxProvisioner`
-queues a plain-text notice on `ag.inbox`. The next execution surfaces that
-notice when it resumes sandbox work. A failure before
-`mark_execution_attempted()` does not queue one, and the failed skill's own
-output remains unchanged.
+Because `rm_container()` runs from inside `finally` — after `outer_result` is already computed and about to be returned to the caller — there is no way to attach a note to that same result the way an inline `workspace_reverted` key once could. Instead, the notice is pushed onto `ag.inbox` (a plain `queue.Queue[str]`), and surfaces at the very start of the *next* skill call: step 4d below shows `ag._drain_inbox(messages)` running every ReAct-loop iteration, including the first — before that skill's first LLM call — turning any queued string into a `{"role": "user", ...}` conversation turn. The agent therefore learns about the revert as it resumes sandbox work on the next skill, not inside the failed skill's own output.
 
 `"finished"`/`"error"` are both leaf states `agent.is_settled()` treats as trivially settled (alongside `"inactive"` and `"paused"`) — a `wait_all_paused()` call covering this agent won't block once `_task()` reaches this line, regardless of whether `pause()` was ever called.
 
@@ -142,13 +176,9 @@ ctx_future.set_result(updated_ctx)        # unblocks next run() on same agent
 
 ---
 
-## 4. Legacy in-process ReAct loop (historical)
+## 4. ReAct loop — `agskill.execute_react()`
 
-`agskill.execute_react()` is no longer a live method. This section preserves
-the retired host-side algorithm as historical context. Current scheduling
-routes through `agentEngine` and `ExecutionBuilder`; the selected sandbox-side
-harness is intended to own the loop once the replacement Harness Manager
-protocol and `CompletedResult` recovery are implemented.
+**File:** `agency/agskill.py` · `agskill.execute_react(ag, prev_ctx, skill_input, max_steps)`
 
 Receives `prev_ctx` explicitly because `ag.ctx` has already been replaced with the new pending placeholder by the time the thread runs.
 
@@ -184,7 +214,7 @@ _use_return_output = bool(_required_fields)
 messages = (
     [{"role": "system", "content": self._build_system_prompt(_extra_system)}]
     + list(prev_ctx.messages)
-    + [{"role": "user", "content": self.build_prompt_payload(skill_input)}]
+    + [{"role": "user", "content": self._build_user_content(skill_input)}]
 )
 n_before = len(prev_ctx.messages)
 ```
@@ -263,9 +293,9 @@ if msg_dict.get("tool_calls"):
 For each tool call in `dispatch_tools`:
 
 1. Unknown tool → `{"error": "unknown tool: <name>"}` injected; LLM recovers.
-2. Tool executes — in a `ProcessPoolExecutor` worker with configurable timeout if `run_in_subprocess=True` (the default for custom tools), or synchronously in the calling thread if `run_in_subprocess=False` (every built-in sandboxed tool — bash, read, write, edit, …). This flag has no sandbox-lifecycle effect: there is no per-tool-call start, stop, commit, or restore, regardless of which path a tool takes (see step 4 below and `Design_sandbox_lifecycle.md`'s "Execution-transaction container lifecycle").
+2. Tool executes — in a `ProcessPoolExecutor` worker with configurable timeout if `run_in_subprocess=True` (the default for custom tools), or synchronously in the calling thread if `run_in_subprocess=False` (every built-in sandboxed tool — bash, read, write, edit, …). This flag no longer has any checkpointing effect: there is no per-tool-call commit or restore anymore, regardless of which path a tool takes (see step 4 below and `Design_sandbox_lifecycle.md`'s "Per-tool-call container lifecycle").
 3. **Large output offloading.** If the result exceeds `TOOL_OUTPUT_OFFLOAD_CHARS` characters, the content is written to `/workspace/long_tool_call_outputs/<tool>_<id>.txt` inside the sandbox and the tool result is replaced with a short note telling the LLM to use `read` to access it. `read` is injected into the toolkit if not already present.
-4. **Sandbox stays active.** Tool dispatch does not call lifecycle methods. The provisioner started the sandbox before the harness launched, and it remains physically ready for the complete engine transaction so the harness and background work are not killed between tool calls. After harness and host cleanup, `SandboxProvisioner.finalize()` alone decides whether to commit, discard, and optionally hibernate (3d above).
+4. **Sandbox hibernation.** Whether the tool succeeded or raised, `dispatch_tools()` calls `sandbox.stop()` — a `docker/podman stop` that hibernates the container without removing it — unless `sandbox._has_pending_background_work()` is true, in which case `stop()` is skipped entirely for this call so a still-running background job isn't killed prematurely. A tool call's own success or failure has no bearing on this decision anymore, and no bearing on whether anything gets checkpointed or discarded — that decision moves to skill-exit (3d above).
 5. **`return_<field>` tools** (structured output): write into `_collected_outputs`. When `_required_fields ⊆ _collected_outputs`, all output fields are collected.
 
 After dispatch, check if output is complete:
@@ -329,28 +359,54 @@ agent.run(skill, input)
        └─ return agdata(              │
                _future=result_future) │  prev_ctx.resolve_prev_dependencies()
                                       │  skill_input.resolve_input_dependencies()
-caller.field ───── blocks ────────────┐  agentEngine(...).execute()
-                                      │  └─ ExecutionBuilder.execute(...)
-                                      │     ├─ provisioner.acquire(ag)
-                                      │     │  ├─ resolve/create facade
-                                      │     │  ├─ sandbox._lock.acquire()
-                                      │     │  └─ sandbox.ensure_started()
-                                      │     ├─ host_uds = host_manager.start()
-                                      │     ├─ build_prompt_payload()
-                                      │     ├─ provisioner.mark_execution_attempted(lease)
-                                      │     ├─ launch harness manager(sandbox, host_uds)
-                                      │     ├─ run selected harness / wait for completion
-                                      │     │  └─ selected harness loop
-                                      │     │     ├─ validate inputs and build toolkit/messages
-                                      │     │     ├─ stream LLM calls and compact context
-                                      │     │     ├─ dispatch tool calls and collect outputs
-                                      │     │     └─ wait for a validated CompletedResult
-                                      │     └─ finally:
-                                      │        ├─ stop harness manager, then host manager
-                                      │        └─ provisioner.finalize(lease, succeeded=...)
-                                      │           ├─ success → commit; optional hibernate
-                                      │           ├─ attempted error → discard + inbox notice
-                                      │           └─ teardown; sandbox._lock.release() last
+caller.field ───── blocks ────────────┐  agSandbox(...) if needed
+                                      │  │
+                                      │  agskill.execute_react(ag, prev_ctx, skill_input)
+                                      │  ├─ input_schema.validate_input()
+                                      │  ├─ input_schema.prepare_inputs_in_sandbox()
+                                      │  ├─ _build_toolkit()
+                                      │  │   → (toolkit, _collected_outputs, _required_fields)
+                                      │  ├─ _build_initial_messages()
+                                      │  └─ for _ in range(max_steps):
+                                      │       ag._drain_inbox(messages)
+                                      │       ag.llm.maybe_compact() [pre-call]
+                                      │       ag.push_token_count_update_to_ui()
+                                      │       ag.llm.call(kwargs, messages, ...)
+                                      │       │  openai streaming call
+                                      │       │  retry on SSL/OS/connection error
+                                      │       │  return LLMCallResult
+                                      │       if context_exceeded → compact, continue
+                                      │       if not ok → return agerror
+                                      │       prev_ctx.total_*_tokens updated
+                                      │       ag.llm.maybe_compact() [post-call]
+                                      │       build_assistant_msg() → append
+                                      │       ag._drain_inbox(messages)
+                                      │       ├─ tool calls?
+                                      │       │   dispatch_tools(toolkit, ...)
+                                      │       │   ├─ unknown tool → error msg
+                                      │       │   ├─ tool.fn(agdata) — worker process (run_in_subprocess=True)
+                                      │       │   │   or calling thread (run_in_subprocess=False)
+                                      │       │   │   → sandbox.exec() inside container
+                                      │       │   ├─ large output? → offload to file, inject read
+                                      │       │   ├─ pending background work? → stop() deferred
+                                      │       │   ├─ otherwise → sandbox.stop() (hibernate only,
+                                      │       │   │     success or failure alike — no commit/restore here)
+                                      │       │   └─ return_<field>? → collect into _collected_outputs
+                                      │       │   all fields collected?
+                                      │       │   → wait_for_processes, return result
+                                      │       │   missing fields? → reprompt or error
+                                      │       │   loop back
+                                      │       └─ text output (no tool calls)?
+                                      │           had_inbox? → continue
+                                      │           _use_return_output? → reprompt or error
+                                      │           agrawstring / no schema → agdata(result=content)
+                                      │           wait_for_processes
+                                      │           processes running? → inject msg, continue
+                                      │           sandbox clean → return
+                                      │  │
+                                      │  finally:
+                                      │    success → ag.sandbox.commit()  (checkpoint; container untouched)
+                                      │    error   → ag.sandbox.rm_container()  (discard) + ag.inbox.put(notice)
                                       │  log / token accounting
                                       │  _prune_tool_outputs(updated_ctx.messages)
                                       │  result_future.set_result(outer_result)
@@ -367,14 +423,14 @@ next run()   ◀──── unblocks ─────────────┘
 | Where it occurs | How it surfaces |
 |---|---|
 | Input schema failure | `execute_react()` returns `agerror(...)` before any LLM call |
-| Exception in the engine transaction | Builder cleanup and provisioner finalization run first; `_task` then converts the preserved primary error to `agerror(format_exception(exc))` |
+| Exception in `_task` | Caught by outer `except`; `outer_result = agerror(format_exception(exc))`; `finally` still runs |
 | Unknown tool name | `{"error": "unknown tool: <name>"}` injected as tool result; LLM recovers |
-| Tool `fn` raises | Per-tool catch; `{"error": str(e)}` injected; LLM recovers. No per-tool sandbox rollback or hibernation occurs; the completed execution outcome controls provisioner finalization (see 4h above) |
+| Tool `fn` raises | Per-tool catch; `{"error": str(e)}` injected; LLM recovers. No per-tool sandbox rollback anymore — the sandbox is only hibernated (`stop()`), same as on success (see 4h above) |
 | Tool timeout | Same as tool `fn` raises |
 | LLM connection error | `ag.llm.call()` retries up to `LLM_MAX_RETRIES`; on exhaustion returns `conn_error` in `LLMCallResult` → skill returns `agerror(...)` |
 | Context length exceeded | `ag.llm.call()` returns `context_exceeded=True` → forced compaction, loop continues |
 | Output schema failure after retries | `execute_react()` returns `agerror("output schema error: missing fields after retries: ...")` |
 | `max_steps` exceeded | `execute_react()` returns `agerror("max_steps exceeded")` |
-| **Attempted execution fails** (the completed result is not committable, or an exception escapes) | After builder service cleanup, `SandboxProvisioner.finalize()` discards dirty live state and queues the revert notice. A preparation failure before `mark_execution_attempted()` instead unwinds without that notice. |
+| **Skill itself fails** (any of the above surfaces as `outer_result._data["error"]`, or an exception escapes `execute_react()`) | 3d's `finally` block calls `ag.sandbox.rm_container()` — discarding every tool call's state since the last successful skill's `commit()` — and queues a revert notice onto `ag.inbox`, surfaced as a `{"role": "user", ...}` turn at the start of the *next* skill call (see "Sandbox rollback and the inbox notice" under 3d) |
 
 Accessing any field on an error `agdata` via `__getattr__` raises `AgError`. `.error` and `.is_error()` are safe accessors.

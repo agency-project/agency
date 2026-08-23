@@ -1,1 +1,0 @@
-"""Built-in harness adapters."""
