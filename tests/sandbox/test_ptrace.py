@@ -1,7 +1,7 @@
 """Tests for agproxy_ptrace -- the ptrace/seccomp syscall-level supervisor.
 
 Tier 1 (pure logic, no real process) tests seccomp filter construction and
-the agsyscallevent/agdecision shapes. Tier 2 tests (marked `ptrace`) launch
+the agsyscallevent/PtraceDecision shapes. Tier 2 tests (marked `ptrace`) launch
 real traced processes and are skipped when `ptrace_available()` returns
 False -- mirroring `tests/test_agsandbox.py`'s `docker`/`nvidia_smi` markers
 and `sandbox/chroot.py`'s `chroot_available()` convention: a live
@@ -16,8 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from agency.agpolicy import agAllowAllPolicy, agdecision, agpolicy
-from agency.harness.agproxy_ptrace import agProxyPtrace, ptrace_available
+from agency.sandbox.ptrace import PtraceDecision, agProxyPtrace, ptrace_available
 
 ptrace = pytest.mark.skipif(not ptrace_available(), reason="ptrace not usable on this host")
 
@@ -29,34 +28,39 @@ _SPAWN_CHILD_SCRIPT = str(
 )
 
 
-class _RecordingPolicy(agpolicy):
+class _AllowAllPolicy:
+    def check(self, ag, event):
+        return PtraceDecision.allow()
+
+
+class _RecordingPolicy:
     def __init__(self):
         self.events = []
 
     def check(self, ag, event):
         self.events.append(event)
-        return agdecision.allow()
+        return PtraceDecision.allow()
 
 
-class _DenyPolicy(agpolicy):
+class _DenyPolicy:
     def __init__(self, deny_path):
         self._deny_path = deny_path
 
     def check(self, ag, event):
         if event.argv and event.argv[0] == self._deny_path:
-            return agdecision.deny(f"{self._deny_path} is denied by test policy")
-        return agdecision.allow()
+            return PtraceDecision.deny(f"{self._deny_path} is denied by test policy")
+        return PtraceDecision.allow()
 
 
-class _RewritePolicy(agpolicy):
+class _RewritePolicy:
     def __init__(self, target_path, new_args):
         self._target_path = target_path
         self._new_args = new_args
 
     def check(self, ag, event):
         if event.argv and event.argv[0] == self._target_path:
-            return agdecision.rewrite(self._new_args)
-        return agdecision.allow()
+            return PtraceDecision.rewrite(self._new_args)
+        return PtraceDecision.allow()
 
 
 # ---------------------------------------------------------------------------
@@ -64,21 +68,21 @@ class _RewritePolicy(agpolicy):
 # ---------------------------------------------------------------------------
 
 
-def test_agdecision_allow():
-    d = agdecision.allow()
+def test_ptrace_decision_allow():
+    d = PtraceDecision.allow()
     assert d.kind == "allow"
     assert d.reason is None
     assert d.new_args is None
 
 
-def test_agdecision_deny():
-    d = agdecision.deny("no thanks")
+def test_ptrace_decision_deny():
+    d = PtraceDecision.deny("no thanks")
     assert d.kind == "deny"
     assert d.reason == "no thanks"
 
 
-def test_agdecision_rewrite():
-    d = agdecision.rewrite(["/bin/echo", "x"])
+def test_ptrace_decision_rewrite():
+    d = PtraceDecision.rewrite(["/bin/echo", "x"])
     assert d.kind == "rewrite"
     assert d.new_args == ["/bin/echo", "x"]
 
@@ -103,8 +107,8 @@ def test_ptrace_available_is_cached():
 
 def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypatch):
     """Only the kernel-confirmed path, never attacker-controlled argv, is named."""
-    from agency.harness import agproxy_ptrace as ptrace_module
-    from agency.harness.agproxy_ptrace_internal._tracer_loop import (
+    from agency.sandbox import ptrace as ptrace_module
+    from agency.sandbox.ptrace_internal._tracer_loop import (
         SeccompStop,
     )
     from agency.profiler import agprof
@@ -194,7 +198,7 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
     handle = ptrace_module.agProxyPtrace().launch(
         [secret, "initial prompt containing " + secret],
         {"AGPROF_TOKEN": secret},
-        policy=agAllowAllPolicy(),
+        policy=_AllowAllPolicy(),
     )
     assert handle.wait() == ("", "", 17)
 
@@ -231,7 +235,7 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
 
 @pytest.mark.parametrize("failure_phase", ["start", "update", "end"])
 def test_profiler_callback_failure_cannot_abort_ptrace_lifecycle(monkeypatch, failure_phase):
-    from agency.harness import agproxy_ptrace as ptrace_module
+    from agency.sandbox import ptrace as ptrace_module
     from agency.profiler import agprof
 
     reached = []
@@ -295,7 +299,7 @@ def test_profiler_callback_failure_cannot_abort_ptrace_lifecycle(monkeypatch, fa
 
     monkeypatch.setattr(ptrace_module, "TracerLoop", FakeLoop)
 
-    handle = ptrace_module.agProxyPtrace().launch(["/usr/bin/true"], {}, policy=agAllowAllPolicy())
+    handle = ptrace_module.agProxyPtrace().launch(["/usr/bin/true"], {}, policy=_AllowAllPolicy())
 
     assert reached == ["spawn", "exec", "exit"]
     assert handle.wait() == ("", "", 0)
@@ -315,13 +319,13 @@ def test_profiler_callback_failure_cannot_abort_ptrace_lifecycle(monkeypatch, fa
     ],
 )
 def test_executable_display_name_sanitizes_confirmed_exec_path(exec_path, display_name):
-    from agency.harness.agproxy_ptrace import _executable_display_name
+    from agency.sandbox.ptrace import _executable_display_name
 
     assert _executable_display_name(exec_path) == display_name
 
 
 def test_executable_display_name_redacts_sensitive_substrings():
-    from agency.harness.agproxy_ptrace import _executable_display_name
+    from agency.sandbox.ptrace import _executable_display_name
 
     secret = "opaqueSafeAlphabetToken"
     assert (
@@ -331,7 +335,7 @@ def test_executable_display_name_redacts_sensitive_substrings():
 
 
 def test_process_lifecycle_finalize_interrupts_live_children(monkeypatch):
-    from agency.harness import agproxy_ptrace as ptrace_module
+    from agency.sandbox import ptrace as ptrace_module
     from agency.profiler import agprof
 
     external_span = object()
@@ -360,8 +364,8 @@ def test_process_lifecycle_finalize_interrupts_live_children(monkeypatch):
 def test_container_lifecycle_timing_discloses_relay_boundary_jitter(monkeypatch):
     from types import SimpleNamespace
 
-    from agency.harness import agproxy_ptrace as ptrace_module
-    from agency.harness.agproxy_ptrace_internal import _in_container_launcher
+    from agency.sandbox import ptrace as ptrace_module
+    from agency.sandbox.ptrace_internal import _in_container_launcher
     from agency.profiler import agprof
 
     captured = []
@@ -413,7 +417,7 @@ def test_container_lifecycle_timing_discloses_relay_boundary_jitter(monkeypatch)
     handle = ptrace_module.agProxyPtrace().launch(
         ["/usr/bin/true"],
         {},
-        policy=agAllowAllPolicy(),
+        policy=_AllowAllPolicy(),
         sandbox=sandbox,
     )
 
@@ -422,7 +426,7 @@ def test_container_lifecycle_timing_discloses_relay_boundary_jitter(monkeypatch)
 
 
 def test_handle_on_exit_can_include_ptrace_exit_status():
-    from agency.harness.agproxy_ptrace import agProxyPtraceHandle
+    from agency.sandbox.ptrace import agProxyPtraceHandle
 
     class FakeLoop:
         def on_exec(self, callback):
@@ -445,7 +449,7 @@ def test_handle_on_exit_can_include_ptrace_exit_status():
 
 
 def test_handle_timeout_is_polling_and_later_wait_can_succeed():
-    from agency.harness.agproxy_ptrace import agProxyPtraceHandle
+    from agency.sandbox.ptrace import agProxyPtraceHandle
 
     class FakeLoop:
         def __init__(self):
@@ -473,7 +477,7 @@ def test_handle_timeout_is_polling_and_later_wait_can_succeed():
 
 
 def test_clone_threads_do_not_reach_process_lifecycle_callbacks(monkeypatch):
-    from agency.harness.agproxy_ptrace_internal import _tracer_loop
+    from agency.sandbox.ptrace_internal import _tracer_loop
 
     loop = _tracer_loop.TracerLoop(
         syscalls=("execve",),
@@ -503,7 +507,7 @@ def test_clone_threads_do_not_reach_process_lifecycle_callbacks(monkeypatch):
 def test_exec_callback_is_success_only_kernel_named_and_replay_safe(monkeypatch):
     from types import SimpleNamespace
 
-    from agency.harness.agproxy_ptrace_internal import _tracer_loop
+    from agency.sandbox.ptrace_internal import _tracer_loop
 
     loop = _tracer_loop.TracerLoop(
         syscalls=("execve",),
@@ -562,7 +566,7 @@ def test_exec_callback_is_success_only_kernel_named_and_replay_safe(monkeypatch)
 
 
 def test_in_container_clone_threads_do_not_reach_lifecycle_protocol(monkeypatch):
-    from agency.harness.agproxy_ptrace_internal import _in_container_entrypoint
+    from agency.sandbox.ptrace_internal import _in_container_entrypoint
 
     messages = []
     tracer = _in_container_entrypoint._Tracer(["execve"])
@@ -587,7 +591,7 @@ def test_in_container_clone_threads_do_not_reach_lifecycle_protocol(monkeypatch)
 
 
 def test_in_container_exec_protocol_is_committed_only_after_success(monkeypatch):
-    from agency.harness.agproxy_ptrace_internal import _in_container_entrypoint
+    from agency.sandbox.ptrace_internal import _in_container_entrypoint
 
     messages = []
     tracer = _in_container_entrypoint._Tracer(["execve"])
@@ -610,11 +614,11 @@ def test_in_container_exec_protocol_is_committed_only_after_success(monkeypatch)
 
 
 def test_in_container_relay_replays_exec_messages():
-    from agency.harness.agproxy_ptrace_internal._in_container_launcher import (
+    from agency.sandbox.ptrace_internal._in_container_launcher import (
         InContainerRelay,
     )
 
-    relay = InContainerRelay(object(), agAllowAllPolicy(), None)
+    relay = InContainerRelay(object(), _AllowAllPolicy(), None)
     relay._remember_exec(9401, "/usr/bin/python3")
     seen = []
     relay.on_exec(lambda pid, path: seen.append((pid, path)))
@@ -630,7 +634,7 @@ def test_in_container_relay_replays_exec_messages():
 @ptrace
 def test_launch_basic_echo():
     px = agProxyPtrace()
-    handle = px.launch(["/bin/echo", "hello"], {}, cwd="/tmp", policy=agAllowAllPolicy())
+    handle = px.launch(["/bin/echo", "hello"], {}, cwd="/tmp", policy=_AllowAllPolicy())
     stdout, stderr, rc = handle.wait(timeout=10)
     assert stdout == "hello\n"
     assert stderr == ""
@@ -664,7 +668,7 @@ def test_launch_records_process_lifecycles_under_current_span(tmp_path):
                 [sys.executable, _SPAWN_CHILD_SCRIPT],
                 {},
                 cwd="/tmp",
-                policy=agAllowAllPolicy(),
+                policy=_AllowAllPolicy(),
             )
             _stdout, _stderr, rc = handle.wait(timeout=10)
             assert rc == 0
@@ -694,7 +698,7 @@ def test_traced_thread_does_not_create_process_span(tmp_path):
             [sys.executable, "-c", script],
             {},
             cwd="/tmp",
-            policy=agAllowAllPolicy(),
+            policy=_AllowAllPolicy(),
         )
         _stdout, _stderr, rc = handle.wait(timeout=10)
         assert rc == 0
@@ -715,7 +719,7 @@ def test_live_traced_process_is_incomplete_when_profiler_stops(tmp_path):
                 ["/bin/sleep", "30"],
                 {},
                 cwd="/tmp",
-                policy=agAllowAllPolicy(),
+                policy=_AllowAllPolicy(),
             )
         summary = json.loads((tmp_path / "summary.json").read_text())
         incomplete = next(
@@ -762,7 +766,7 @@ def test_launch_uses_peekdata_fallback_when_vm_readv_unavailable(monkeypatch):
     PTRACE_PEEKDATA -- both paths must resolve argv identically."""
     import ctypes
 
-    from agency.harness.agproxy_ptrace_internal import _ctypes_defs as pt
+    from agency.sandbox.ptrace_internal import _ctypes_defs as pt
 
     def failing_vm_readv(*args, **kwargs):
         ctypes.set_errno(1)  # EPERM
@@ -782,7 +786,7 @@ def test_launch_uses_peekdata_fallback_when_vm_readv_unavailable(monkeypatch):
 @ptrace
 def test_handle_pids_reflects_live_process():
     px = agProxyPtrace()
-    handle = px.launch(["/bin/echo", "x"], {}, cwd="/tmp", policy=agAllowAllPolicy())
+    handle = px.launch(["/bin/echo", "x"], {}, cwd="/tmp", policy=_AllowAllPolicy())
     handle.wait(timeout=10)
     # Process has exited -- no pids should remain tracked.
     assert handle.pids() == set()
@@ -792,7 +796,7 @@ def test_handle_pids_reflects_live_process():
 def test_on_exit_callback_fires():
     px = agProxyPtrace()
     seen = []
-    handle = px.launch(["/bin/echo", "x"], {}, cwd="/tmp", policy=agAllowAllPolicy())
+    handle = px.launch(["/bin/echo", "x"], {}, cwd="/tmp", policy=_AllowAllPolicy())
     handle.on_exit(lambda pid: seen.append(pid))
     handle.wait(timeout=10)
     assert len(seen) == 1
@@ -806,14 +810,14 @@ def test_on_exit_callback_fires():
 @ptrace
 def test_launch_resolves_openat_path():
     from agency.agconfig import agConfig
-    from agency.harness.agproxy_ptrace import agPtraceConfig
+    from agency.sandbox.ptrace import agPtraceConfig
 
     events = []
 
-    class RecordingPolicy(agpolicy):
+    class RecordingPolicy:
         def check(self, ag, event):
             events.append(event)
-            return agdecision.allow()
+            return PtraceDecision.allow()
 
     cfg = agConfig(agPtraceConfig(syscalls=("execve", "execveat", "openat", "open")))
     px = agProxyPtrace(cfg)
@@ -829,14 +833,14 @@ def test_launch_resolves_openat_path():
 
 @ptrace
 def test_deny_openat_blocks_file_read():
-    class DenyHostnamePolicy(agpolicy):
+    class DenyHostnamePolicy:
         def check(self, ag, event):
             if event.syscall in ("openat", "open") and event.path and "hostname" in event.path:
-                return agdecision.deny("no reading /etc/hostname")
-            return agdecision.allow()
+                return PtraceDecision.deny("no reading /etc/hostname")
+            return PtraceDecision.allow()
 
     from agency.agconfig import agConfig
-    from agency.harness.agproxy_ptrace import agPtraceConfig
+    from agency.sandbox.ptrace import agPtraceConfig
 
     cfg = agConfig(agPtraceConfig(syscalls=("execve", "execveat", "openat", "open")))
     px = agProxyPtrace(cfg)
@@ -867,7 +871,7 @@ docker = pytest.mark.skipif(not _docker_available(), reason="Docker daemon not r
 @docker
 def test_wire_to_sandbox_reflects_traced_background_process():
     from agency.agconfig import agConfig
-    from agency.harness.agproxy_ptrace import wire_to_sandbox
+    from agency.sandbox.ptrace import wire_to_sandbox
     from agency.sandbox.agsandbox import agSandbox
     from agency.sandbox import agSandboxBackendConfig
     import time
@@ -886,7 +890,7 @@ def test_wire_to_sandbox_reflects_traced_background_process():
             [sys.executable, "-c", "import time; time.sleep(30)"],
             {},
             cwd="/tmp",
-            policy=agAllowAllPolicy(),
+            policy=_AllowAllPolicy(),
         )
         wire_to_sandbox(handle, sb)
         # wire_to_sandbox's on_spawn callback fires for the root pid too
@@ -915,14 +919,14 @@ def test_launch_with_sandbox_traces_inside_container_and_enforces_policy():
     from agency.sandbox import agSandboxBackendConfig
     import uuid
 
-    class _DenySpecificPathPolicy(agpolicy):
+    class _DenySpecificPathPolicy:
         def __init__(self, deny_path):
             self._deny_path = deny_path
 
         def check(self, ag, event):
             if event.path == self._deny_path:
-                return agdecision.deny(f"blocked {event.path}")
-            return agdecision.allow()
+                return PtraceDecision.deny(f"blocked {event.path}")
+            return PtraceDecision.allow()
 
     agconfig = agSandboxBackendConfig(backend="docker").agconfig
     sandbox = agSandbox(str(uuid.uuid4()), agconfig=agconfig)

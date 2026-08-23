@@ -1,6 +1,12 @@
 # Harness Integration Design
 
-> **Status:** implemented (all six build phases). `agharness`/`harness/agharness_backends/`,
+> **Current status:** historical design; its implementation was relocated to
+> `agency/old_harness/` and is not the current runtime path. Current scheduling
+> reaches `agentEngine.execute()` and `ExecutionBuilder.execute()`, while the
+> replacement `HarnessManagerBridge` command protocol and `CompletedResult`
+> recovery remain unfinished. Paths and APIs below describe the former system.
+>
+> **Historical status:** implemented (all six build phases). `agharness`/`harness/agharness_backends/`,
 > `agproxy_llm`, `agproxy_ptrace`/`harness/agproxy_ptrace_internal/`, and `agpolicy` all exist in the
 > codebase, per this document's design — see [agharness.md](agharness.md),
 > [agproxy_llm.md](harness/agproxy_llm.md), [agproxy_ptrace.md](harness/agproxy_ptrace.md), and
@@ -377,24 +383,17 @@ an in-process loop -- see that module's own docstring).** Originally, the native
 (`agskill.py:execute_react`, now retired) drove
 five things inline as it ran: `aglog` tool-call/turn logging, webui push (`_push_live_messages`/
 `_set_ui_state`/`token_update`), input/output schema validation with reprompt-on-failure, sandbox
-lifecycle (lazy-start/hibernate), and GPU/resource acquisition. A harness-driven run needs all five
+lifecycle (explicit transaction preparation/finalization and safe hibernation), and GPU/resource acquisition. A harness-driven run needs all five
 too, but can't hook into a loop it doesn't control. Each one maps onto a different existing seam:
 
-- **Sandbox lifecycle has no gap at the skill-run boundary.** Container create/`commit()`/
-  `rm_container()` already wraps *either* engine identically, at the `agskill.py:run()` boundary
-  outside both `execute_react` and `execute_harness` — nothing harness-specific to add here. The
-  finer-grained per-call lazy-start/hibernate (`_ensure_started()`/`stop()`) is a different
-  question, and running the harness inside the container genuinely coarsens it: native's per-tool-
-  call hibernation (`agtool.py:455-470`, `container.py:1521-1573`, explicitly to release "the
-  runtime slot ... AND the GPU") works because nothing lives inside the container between tool
-  calls — only the tool's own transient exec needs it up. Once the harness's own reasoning process
-  is what's alive inside the container, there's no safe point to fully stop it without killing that
-  process, so container liveness for a harness-driven call coarsens from per-tool-call to
-  per-skill-call — up for the duration of one harness invocation, torn down after, same boundary
-  `agskill.py:400-422` already uses. `docker pause`/`unpause` doesn't recover this: a frozen cgroup
-  still holds the GPU context/memory, so it only reclaims CPU scheduling, not the resource native's
-  `stop()` actually releases. Accept this as the real cost of this design rather than building
-  speculative pause-point detection.
+- **Sandbox lifecycle is explicit at the skill-run boundary.** `ExecutionBuilder.execute()` asks
+  `SandboxProvisioner.acquire()` to resolve the facade, acquire its lock, and call the public
+  `sandbox.ensure_started()` before the host server or harness launches. After harness and host
+  cleanup, `SandboxProvisioner.finalize()` commits or discards, tears down provisioner state, and
+  releases the lock last. The physical backend remains ready for the complete harness invocation;
+  tool dispatch does not hibernate it because that would kill the in-sandbox harness. Optional
+  hibernation is therefore an execution-finalization decision owned by the provisioner, after the
+  harness and host services have stopped.
 - **Logging and webui should be driven by tool-call boundaries parsed at the LLM proxy, not a
   separate stream-json parser.** `agproxy_llm_adapters.py` already parses `tool_use`/`tool_result`
   (Claude Code) and `function_call`/`function_call_output` (Codex) content blocks out of every
@@ -406,7 +405,7 @@ too, but can't hook into a loop it doesn't control. Each one maps onto a differe
   native gets. Keep `agproxy_ptrace`'s syscall stream as a second, parallel ground-truth feed into
   `aglog` — it answers "what actually happened at the OS level," the proxy-level window answers
   "what tool, semantically" — neither replaces the other. Note this window is a logging/webui signal
-  only now, not a sandbox lazy-start/hibernate trigger — the sandbox is already up for the whole
+  only now, not a sandbox physical-start/hibernate trigger — the sandbox is already up for the whole
   invocation per the bullet above, so there's nothing left for it to trigger on that axis.
 - **Output schema reprompting** can't inject a mid-loop correction message the way native does,
   since the harness's internal loop is opaque. Coarsen the retry unit instead: on validation

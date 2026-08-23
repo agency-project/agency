@@ -222,6 +222,13 @@ class TestChrootInvocationPgidTracking:
         with patch("os.killpg", side_effect=_raise_killpg):
             sb._kill_all_sandbox_processes()  # must not raise
 
+    def test_kill_all_sandbox_processes_reports_non_race_failures(self):
+        sb = self._sb()
+
+        with patch("os.killpg", side_effect=PermissionError("denied")):
+            with pytest.raises(RuntimeError, match="failed to kill sandbox process group 4242"):
+                sb._kill_all_sandbox_processes()
+
 
 # ---------------------------------------------------------------------------
 # Live background-process tracking -- the chroot analogue of
@@ -858,6 +865,40 @@ class TestChrootBackendFileIO:
                 sb.read_file("/workspace/does-not-exist.txt")
         finally:
             sb.destroy()
+
+
+class TestChrootCleanupFailures:
+    def test_rm_container_reports_when_workspace_deletion_did_not_finish(self):
+        sb = _make_backend()
+        try:
+            sb._ensure_started()
+            with patch("agency.sandbox.chroot.shutil.rmtree", return_value=None):
+                with pytest.raises(RuntimeError, match="failed to discard chroot workspace"):
+                    sb.rm_container()
+        finally:
+            sb.destroy()
+
+    def test_destroy_remains_retryable_after_cleanup_failure(self, monkeypatch):
+        sb = _make_backend()
+        original_rm_container = sb.rm_container
+        calls = 0
+
+        def flaky_rm_container():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("cleanup failed")
+            original_rm_container()
+
+        monkeypatch.setattr(sb, "rm_container", flaky_rm_container)
+
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            sb.destroy()
+
+        assert sb._destroyed is False
+        sb.destroy()
+        assert sb._destroyed is True
+        assert calls == 2
 
 
 @chroot

@@ -259,9 +259,9 @@ class agsandbox_backend(AgSandboxBackendFields):
     subclass; don't instantiate a subclass directly.
 
     Concrete backends implement every method `agSandbox` (the facade in
-    agsandbox.py) delegates to: exec/_container_exec, file I/O,
-    commit/stop/restore/destroy, update_limits, remove_files, PID tracking,
-    fork, and the static image-level helpers.
+    agsandbox.py) delegates to: ensure_started, exec/_container_exec, file
+    I/O, commit/stop/restore/destroy, update_limits, remove_files, PID
+    tracking, fork, and the static image-level helpers.
     """
 
     # Identifies the image/snapshot format a concrete backend's
@@ -272,6 +272,17 @@ class agsandbox_backend(AgSandboxBackendFields):
     # backend_for_image_kind() to route to the matching backend class rather
     # than assuming the container backend unconditionally.
     IMAGE_KIND: "str" = ""
+
+    def ensure_started(self) -> None:
+        """Make this backend ready for sandbox operations.
+
+        Concrete backends already own the mechanics in ``_ensure_started()``:
+        container backends inspect/create/resume their container, while the
+        chroot backend materializes its workspace.  This public entry point
+        lets lifecycle owners prepare either kind explicitly without using an
+        incidental command or file operation as a startup trigger.
+        """
+        self._ensure_started()
 
     def _own_host_pids(self) -> "set[int]":
         """Return the host PIDs of every process this sandbox currently has

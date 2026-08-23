@@ -617,8 +617,11 @@ class _ChrootBackend(agsandbox_backend):
     def _kill_all_sandbox_processes(self) -> None:
         """SIGKILL every process group in `_invocation_pgids` (see
         `_live_pgid_matched_pids()`'s docstring for why this is safe to act
-        on destructively). Best-effort: called from `stop()`/`destroy()`/
-        `restore()` before tearing down or overwriting the workspace.
+        on destructively). Every tracked group is attempted; a non-race
+        failure is raised after those attempts so callers never treat a
+        still-running process as successful teardown. Called from
+        `stop()`/`destroy()`/`restore()` before tearing down or overwriting
+        the workspace.
 
         `os.killpg()` on a tracked invocation group is a verified, kernel
         -checked operation -- not a guess the way the old baseline scan's
@@ -656,19 +659,30 @@ class _ChrootBackend(agsandbox_backend):
         """
         import signal
 
+        first_error: "BaseException | None" = None
         for pgid in list(self._invocation_pgids):
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            except Exception as _e:
-                print(
-                    f"[agsandbox_backend] WARNING: failed to kill process group {pgid} in {self._name}: {_e}"
+            except BaseException as exc:
+                error = RuntimeError(
+                    f"failed to kill sandbox process group {pgid} in {self._name}: {exc}"
                 )
+                if first_error is None:
+                    first_error = error
+                else:
+                    first_error.add_note(str(error))
+        if first_error is not None:
+            raise first_error
 
     def _ensure_started(self) -> None:
-        """Create the jail's workspace directory on first use, restoring it
-        from ``_checkpoint_image`` if one was given at construction time.
+        """Idempotently prepare the jail and restore its checkpoint.
+
+        ``SandboxProvisioner.acquire()`` reaches this through the public
+        ``agSandbox.ensure_started()`` operation before execution-scoped host
+        services start. Sandbox operations retain the same check defensively
+        for callers outside an engine transaction.
 
         Ground truth is always the workspace directory's existence on disk
         -- there is no ``self._started`` cache. Tool calls with
@@ -1045,6 +1059,8 @@ class _ChrootBackend(agsandbox_backend):
         self._invocation_pgids = set()
         if self._workspace.exists():
             shutil.rmtree(self._workspace, ignore_errors=True)
+        if self._workspace.exists():
+            raise RuntimeError(f"failed to discard chroot workspace {self._workspace}")
 
     def restore(self, tag: str) -> None:
         """Restore the jail's workspace from a previously committed snapshot."""
@@ -1064,7 +1080,6 @@ class _ChrootBackend(agsandbox_backend):
     def destroy(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
         # rm_container() kills tracked processes, releases the GPU, and
         # deletes the workspace (all idempotent -- a no-op if a prior
         # stop()/rm_container() already did them) before the root rmtree
@@ -1073,9 +1088,15 @@ class _ChrootBackend(agsandbox_backend):
         self.rm_container()
         if self._root.exists():
             shutil.rmtree(self._root, ignore_errors=True)
+        if self._root.exists():
+            raise RuntimeError(f"failed to remove chroot root {self._root}")
         if self._checkpoint_image:
             self.delete_image(self._checkpoint_image, force=True)
+            snapshot_dir = _CHROOT_SNAPSHOTS_DIR / _sanitize_tag(self._checkpoint_image)
+            if snapshot_dir.exists():
+                raise RuntimeError(f"failed to remove chroot snapshot {snapshot_dir}")
             self._checkpoint_image = None
+        self._destroyed = True
 
     # ------------------------------------------------------------------
     # Static helpers — snapshot-directory-level operations, the chroot

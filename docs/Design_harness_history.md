@@ -166,7 +166,7 @@ and shouldn't be attempted — when:
 
 For these cases, fall back to what already exists: build the new call's prompt by recapping the
 relevant prior `agcontext.messages` as text, through the same `build_user_turn_prompt`/
-`_build_user_content` path that already constructs every call's prompt (`agharness.py:42-47`). This
+`build_prompt_payload` path that already constructs every call's prompt (`agharness.py:42-47`). This
 is lossier (no step-by-step tool-call fidelity, no native prompt-cache reuse) but always available
 and never depends on sandbox or environment compatibility — the correct degraded mode for a
 boundary the native mechanism structurally can't cross.

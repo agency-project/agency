@@ -4,19 +4,17 @@ from dataclasses import asdict
 
 from agency.engine.types import (
     CapabilityToken,
-    ContextId,
-    ContextRef,
     ExecutionId,
     HarnessError,
     HarnessErrorKind,
-    HarnessRunRequest,
-    HarnessRunResult,
-    HarnessRunStatus,
+    SkillExecutionRequest,
+    SkillExecutionResponse,
+    SkillExecutionStatus,
 )
 
 
 def test_run_request_has_the_minimal_wire_shape():
-    request = HarnessRunRequest(
+    request = SkillExecutionRequest(
         execution_id=ExecutionId("exec-1"),
         capability_token=CapabilityToken("cap-1"),
         config={
@@ -28,7 +26,6 @@ def test_run_request_has_the_minimal_wire_shape():
             },
             "execution": {"max_steps": 20, "timeout_s": 60},
         },
-        context=ContextRef(id=ContextId("ctx-1"), version=3),
         prompt="compiled skill prompt",
     )
 
@@ -44,7 +41,6 @@ def test_run_request_has_the_minimal_wire_shape():
             },
             "execution": {"max_steps": 20, "timeout_s": 60},
         },
-        "context": {"id": "ctx-1", "version": 3},
         "prompt": "compiled skill prompt",
     }
 
@@ -54,11 +50,10 @@ def test_run_request_preserves_multimodal_prompt_blocks():
         {"type": "text", "text": "inspect this image"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
     ]
-    request = HarnessRunRequest(
+    request = SkillExecutionRequest(
         execution_id=ExecutionId("exec-1"),
         capability_token=CapabilityToken("cap-1"),
         config={"agent": {"engine": "codex"}},
-        context=ContextRef(),
         prompt=prompt,
     )
 
@@ -66,10 +61,9 @@ def test_run_request_preserves_multimodal_prompt_blocks():
 
 
 def test_run_result_success_is_derived_from_status():
-    result = HarnessRunResult(
+    result = SkillExecutionResponse(
         execution_id=ExecutionId("exec-1"),
-        status=HarnessRunStatus.SUCCEEDED,
-        context=ContextRef(id=ContextId("ctx-1"), version=1),
+        status=SkillExecutionStatus.SUCCEEDED,
         final_text="done",
     )
 
@@ -77,10 +71,9 @@ def test_run_result_success_is_derived_from_status():
 
 
 def test_run_result_carries_structured_failure():
-    result = HarnessRunResult(
+    result = SkillExecutionResponse(
         execution_id=ExecutionId("exec-1"),
-        status=HarnessRunStatus.FAILED,
-        context=ContextRef(),
+        status=SkillExecutionStatus.FAILED,
         exit_code=1,
         error=HarnessError(
             kind=HarnessErrorKind.HARNESS_EXITED,

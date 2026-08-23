@@ -8,16 +8,16 @@ if TYPE_CHECKING:
     from ..agconfig import agConfig
     from ..agskill import agskill
     from ..sandbox.agsandbox import agSandbox
-    from .host_servers.host_server_manager import HostServerManager
 
 
 class HarnessManagerBridge:
     def __init__(self) -> None:
-        raise NotImplementedError
+        # The bridge is a host-side lifecycle/client object.  Constructing it
+        # must not launch the sandbox-side harness manager; that remains a
+        # lazy operation behind ensure_launched().
+        pass
 
-    def ensure_launched(
-        self, sandbox: "agSandbox", host_server_manager: "HostServerManager"
-    ) -> "int | None":
+    def ensure_launched(self, sandbox: "agSandbox", host_uds_path: str) -> "int | None":
         raise NotImplementedError
 
     def run_attempt(

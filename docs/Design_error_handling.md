@@ -2,6 +2,14 @@
 
 This document covers every try/except/finally block, retry loop, and error emission in the framework, along with how errors propagate from their origin up to the caller.
 
+> **Migration note:** sections below that name `agskill.execute_react()`
+> describe the retired host-side loop. Current execution enters through
+> `agentEngine.execute()`: `ExecutionBuilder` preserves the primary exception
+> while stopping harness/host services, and `SandboxProvisioner` commits or
+> discards the leased sandbox, performs teardown, and releases its lock last.
+> The replacement Harness Manager protocol still needs to re-home the
+> loop-internal retry and schema-recovery details documented historically here.
+
 ---
 
 ## Error Propagation Overview
@@ -84,36 +92,51 @@ Errors almost never propagate as Python exceptions between threads. The canonica
 
 ---
 
-## `agency/agskill.py` — `_task()` closure (skill execution wrapper)
+## Engine transaction and `agskill._task()` error conversion
 
-### Main skill try/except/finally
+### Builder cleanup and provisioner finalization
 
-**Location:** `_task()` closure inside `agskill.run()` (line ~601–718)
+**Location:** `ExecutionBuilder.execute()`, `SandboxProvisioner`, and the
+`_task()` closure inside `agskill.run()`.
 
 **Structure:**
 ```python
 try:
-    # resolve input, create sandbox, run agskill
-    outer_result = af.execute_react(...)
+    completed = agentEngine(...).execute()  # delegates to ExecutionBuilder.execute()
 except Exception as exc:
-    # swallow — convert to agerror
+    # scheduling boundary: convert the already-cleaned-up transaction error
     outer_result = agerror(format_exception(exc))
-    outer_ctx = prev_ctx
+
+# Inside ExecutionBuilder.execute():
+lease = provisioner.acquire(ag)       # resolve, lock, explicit ensure_started
+try:
+    host_uds = host_manager.start()
+    prompt = build_prompt_payload(...)
+    provisioner.mark_execution_attempted(lease)
+    completed = launch_run_and_wait(...)
 finally:
-    # always runs, even on exception:
-    _remove_offloaded_fields(...)
-    pool.release_gpu(...)     # GPU released even if skill crashed
-    if _had_error:
-        ag.sandbox.rm_container()  # discard dirty state; releases GPU + runtime slot too
-        ag.inbox.put(...)          # revert notice, delivered at the NEXT skill's start
-    else:
-        ag.sandbox.commit()       # checkpoint in place -- container is never torn down
-    sandbox = None
+    stop_harness_manager_if_started()
+    host_manager.stop_if_started()
+    provisioner.finalize(lease, succeeded=validated_success)
+    # success: commit + optional hibernate
+    # attempted failure: discard + inbox notice
+    # preparation failure: unwind without a revert claim
+    # provisioner teardown, then sandbox lock release last
 ```
 
-**What is caught:** Any unhandled exception from the skill (note: `agskill.execute_react()` returning an error agdata is NOT an exception — only genuine throws reach here).
+**What is caught:** Failures from facade creation, lock acquisition, physical
+preparation, host startup, harness launch/run/wait, service cleanup, commit,
+discard, provisioner teardown, and lock release. A result is committable only
+when `CompletedResult.ok` is true, its output is not an error, and required
+execution-scoped cleanup succeeded.
 
-**Handler:** Formats the exception with full traceback via `format_exception(exc)`, stores it in `outer_result` as an `agerror`, logs `SKILL ✗` to the terminal, then emits `{"type": "skill_error", "skill": ..., "error": ...}` via `_append_full_history()` after the finally block (line 728).
+**Handler:** Builder cleanup runs in reverse dependency order (harness manager,
+then host server). The provisioner finalizes dirty sandbox state and releases
+its lock last. If commit fails it attempts discard. Cleanup failures are added
+as notes/context to an existing execution failure rather than replacing it.
+Once that cleanup completes, `_task()` formats the primary exception with full
+traceback via `format_exception(exc)`, stores it in `outer_result` as an
+`agerror`, logs `SKILL ✗`, and emits the skill-error history event.
 
 **Propagation:** `result_future.set_result(outer_result)` — the error is carried in an `agerror`; the future resolves successfully (no exception crossing thread boundary). Callers check `isinstance(result, agerror)`.
 

@@ -1,22 +1,32 @@
 # Sandboxing
 
-> **Lifecycle warning:** `agSandbox` wraps a live sandbox backend (a Docker/Podman container, or a chroot jail — see "Backend selection" below). Cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. There's no ownership flag to manage — sharing a sandbox between agents is just `ag.sandbox = sb` (or `agent(sandbox=sb)`) on each; `agskill` provisions/stops any sandbox it finds on `ag.sandbox` the same way regardless of where it came from, and the object itself is cleaned up once nothing references it anymore (see "Concurrent access" below).
+> **Lifecycle warning:** `agSandbox` wraps a live sandbox backend (a Docker/Podman container, or a chroot jail — see "Backend selection" below). Normal execution finalization commits or discards live state and may hibernate the backend; it does not permanently delete the durable facade/checkpoint. Permanent cleanup relies on `agSandbox.__del__` and an `atexit` handler. Neither runs on SIGKILL, and `__del__` may silently fail during interpreter shutdown (`sys.meta_path` is None by then). In long-running processes or when spawning many sandboxes, call `sandbox.destroy()` explicitly. There's no ownership flag to manage — sharing a sandbox between agents is just `ag.sandbox = sb` (or `agent(sandbox=sb)`) on each; `SandboxProvisioner` acquires and finalizes any facade it finds on `ag.sandbox` the same way regardless of where it came from (see "Concurrent access" below).
+
+`destroy()` marks the facade/backend destroyed only after permanent cleanup
+succeeds. If container removal or chroot cleanup raises, the object stays
+registered and a later explicit call or the `atexit` pass can retry it.
 
 All filesystem operations — bash commands, file reads, file writes, glob searches, grep searches — execute inside a sandbox, never directly on the host. `agSandbox` (in `sandbox/agsandbox.py`) is a thin facade: it resolves the image/mounts vocabulary that's meaningful regardless of backend, then builds and delegates every operation to an `agsandbox_backend` chosen by `agSandboxBackendConfig.backend`. Three backends exist today, each a real subclass in its own module under `sandbox/` — see **[sandbox/base.md](sandbox/base.md)** for backend selection, and [container.md](sandbox/container.md)/[docker.md](sandbox/docker.md)/[podman.md](sandbox/podman.md)/[chroot.md](sandbox/chroot.md) for how each one actually works. Everything below describes the facade — construction, the `agSandbox` API, concurrent access, GPU accounting at the facade level, the exec wrapper, file I/O, and config — regardless of which backend is behind it.
 
 ## GPU device access
 
-`--gpus all` (docker) / CDI `=all` (podman) / per-file device binds scoped to the currently-leased GPU (chroot, re-derived fresh on every `exec()`) make the host's GPU devices reachable, **once the sandbox has actually called `reserve_gpu()`** — a sandbox that never reserves a GPU gets nothing GPU-related passed/mounted at all, same as a CPU-only host. See [sandbox/container.md](sandbox/container.md)/[chroot.md](sandbox/chroot.md) for the backend-specific mechanics, including why the container backends attach *every* GPU rather than just the one currently leased (it's what lets `stop()` release the physical GPU between tool calls without ever needing to recreate the container).
+`--gpus all` (docker) / CDI `=all` (podman) / per-file device binds scoped to the currently-leased GPU (chroot, re-derived fresh on every `exec()`) make the host's GPU devices reachable, **once the sandbox has actually called `reserve_gpu()`** — a sandbox that never reserves a GPU gets nothing GPU-related passed/mounted at all, same as a CPU-only host. See [sandbox/container.md](sandbox/container.md)/[chroot.md](sandbox/chroot.md) for the backend-specific mechanics, including why the container backends attach *every* GPU rather than just the one currently leased (it permits a later provisioner-controlled hibernate/resume cycle to acquire a different physical GPU without recreating the container).
 
 Even so, GPUs are **not accessible by default** — every `exec()` call unconditionally exports `CUDA_VISIBLE_DEVICES="NoDevFiles"` when no GPU is currently leased, making all GPUs invisible to CUDA (`readonly`-exported, so a command can't hijack a different GPU by reassigning the variable inline). Calling `reserve_gpu` sets only a virtual flag; no physical GPU is taken yet. When `exec()` runs a bash command and the virtual flag is set but no GPU is currently held, a physical GPU is claimed from the pool at that moment (blocking until one is free) and `CUDA_VISIBLE_DEVICES=<id>` is injected — held across every subsequent `exec()` call, not reacquired each time.
 
-**GPU release now happens on every hibernate, not just at teardown.** There is no `gpu_release` tool and no `is_clear`/polling mechanism — `pool.release_gpu()` releases the semaphore immediately, unconditionally, with no wait. Safety comes purely from ordering: `stop()`/`rm_container()`/`destroy()` always stop or tear down whatever the sandbox was running *before* releasing the GPU, so by the time release happens, nothing this backend could see is still using it. A GPU, once actually acquired, is released every time the sandbox hibernates between tool calls (`sandbox.stop()`) and re-acquired (possibly a *different* physical GPU) on the next `exec()` — there's still no way for the agent to free it back to the pool explicitly mid-tool-call, but it's no longer held for the sandbox's whole lifetime either.
+**GPU release follows backend teardown.** There is no `gpu_release` tool and no `is_clear`/polling mechanism — `pool.release_gpu()` releases the semaphore immediately, with no wait. Safety comes from ordering: `stop()`/`rm_container()`/`destroy()` stop or tear down the associated work *before* releasing the GPU. On the normal engine path, `SandboxProvisioner.finalize()` chooses `stop()` after a successful commit when appropriate or `rm_container()` after an attempted failure; tools do not release or reacquire the GPU between calls.
 
 ## Concurrent access
 
 Each `agSandbox` allocates `self._lock = threading.RLock()` in `__init__`. It exists because a single `agSandbox` instance can be handed to more than one agent (there's no ownership flag preventing this — see the lifecycle warning above), and two skill runs interleaving `exec()` / `stop()` / `_ensure_started()` calls against the same container would corrupt its state.
 
-The lock is **not self-enforcing** — `agSandbox`'s own methods don't acquire it. Instead, `agskill.py`'s `_task()` acquires `ag.sandbox._lock` right after provisioning and holds it for the *entire* skill run, releasing it only after the final teardown (`commit()` on success, `rm_container()` on failure). This makes "one skill run owns this sandbox at a time" an invariant enforced by the caller (agskill), not by `agSandbox` itself. Code that drives a shared `agSandbox` outside of an agskill run (harness scripts, custom orchestration) must coordinate its own access if it needs the same guarantee — see `Design_architecture.md`'s "Per-sandbox mutex" section for the full rationale.
+The lock is **not self-enforcing** — `agSandbox`'s own methods don't acquire it. `SandboxProvisioner.acquire()` resolves the facade, acquires `ag.sandbox._lock`, and only then calls `ag.sandbox.ensure_started()`. The matching `SandboxProvisioner.finalize()` releases it after execution-scoped service cleanup, commit or discard, optional hibernation, and provisioner teardown. The component that acquires the lease therefore releases it, and the release is last on every path. Code that drives a shared `agSandbox` outside an engine transaction must coordinate its own access if it needs the same guarantee — see `Design_architecture.md`'s "Per-sandbox mutex" section for the full rationale.
+
+Provisioner recovery state also lives on the durable facade. If discard or
+hibernation fails, the next provisioner lease must retry physical removal under
+this lock before it may call `ensure_started()`. This prevents a shared facade
+from resuming an earlier execution's dirty or otherwise ambiguous writable
+layer.
 
 Because `threading.RLock` isn't picklable, `agSandbox` defines `__getstate__`/`__setstate__` to drop `_lock` before pickling and allocate a fresh one on unpickling. This matters because custom tools with `run_in_subprocess=True` (the default) get `cloudpickle`d to a worker process — without this, capturing a sandbox in such a tool's closure would raise `TypeError: cannot pickle '_thread.RLock' object`. All built-in tools (bash, read, write, grep, glob, …) use `run_in_subprocess=False` and never hit this path.
 
@@ -38,7 +48,7 @@ parent.sandbox._checkpoint_image ──tag_image──▶ agency/lifecycle-<fork
                                      (consumed by fork's first _task())
 ```
 
-Forking copies the parent's checkpoint image tag to a new tag for the fork via `type(parent.sandbox._backend).tag_image(...)` — dispatched to whichever backend class actually produced the checkpoint (`docker tag`/`podman tag` for the container backends, a directory copy for chroot — see [sandbox/chroot.md](sandbox/chroot.md)), not a bare docker-only call, since a chroot snapshot directory and a docker/podman image tag are unrelated formats. No container/jail is created at fork time — that happens lazily when the fork's first `_task()` runs, restoring from the copied tag.
+Forking copies the parent's checkpoint image tag to a new tag for the fork via `type(parent.sandbox._backend).tag_image(...)` — dispatched to whichever backend class actually produced the checkpoint (`docker tag`/`podman tag` for the container backends, a directory copy for chroot — see [sandbox/chroot.md](sandbox/chroot.md)), not a bare docker-only call, since a chroot snapshot directory and a docker/podman image tag are unrelated formats. No physical container/jail is created at fork time; `SandboxProvisioner.acquire()` explicitly prepares it during the fork's next execution, restoring from the copied checkpoint.
 
 Because forks wait for `src.ctx.resolve_prev_dependencies()` before construction, the parent's task is always complete before the fork is built, so the checkpoint image is already the committed post-task state.
 
@@ -114,11 +124,10 @@ sb = agSandbox(agname)
 sb = agSandbox(agname, agconfig=agConfig(agSandboxConfig().add_mount("out", Path("runs/agent_output"), "/agent_output")))
 sb = agSandbox(agname, checkpoint_image="agency/lifecycle-myagent")
 
-# Construction is cheap — the backend does no real work until _ensure_started() runs
-# (a docker/podman run, or just an mkdir for chroot).
-sb._ensure_started()    # called automatically on first exec(); idempotent
+# Construction is cheap; physical preparation is explicit and backend-neutral.
+sb.ensure_started()     # idempotent docker/podman start-or-run, or chroot materialization
 
-sb._lock  # threading.RLock; held by agskill for the whole skill run — see "Concurrent access" above
+sb._lock  # threading.RLock; owned by SandboxProvisioner's transaction lease
 
 sb.exec(cmd, workdir="/workspace", timeout=120) -> (str, int)
 sb.read_file(path) -> str           # UTF-8 text; raises UnicodeDecodeError for binary
@@ -140,7 +149,7 @@ sb.destroy()            # tear down the backend + delete its checkpoint image/sn
 sb.image_kind -> str    # "container" or "chroot" -- which backend produced sb._checkpoint_image
 ```
 
-Every method above is a one-line delegate from the `agSandbox` facade to `sb._backend` (an `agsandbox_backend` subclass — see [sandbox/base.md](sandbox/base.md)). `sb._backend` is the thing that actually knows how to talk to Docker/Podman or run `unshare`+`chroot`; the facade only owns what's backend-agnostic (config resolution, the `_lock`, GPU/CPU pool bookkeeping). See [sandbox/chroot.md](sandbox/chroot.md) for the chroot backend's own mechanics (mount namespace, directory layout, checkpointing, and what it deliberately doesn't isolate).
+Every method above is a one-line delegate from the `agSandbox` facade to `sb._backend` (an `agsandbox_backend` subclass — see [sandbox/base.md](sandbox/base.md)). `ensure_started()` is the public backend-neutral preparation operation used by `SandboxProvisioner`; individual operations may still invoke the backend's idempotent readiness check defensively, including after an intentional hibernate or when the facade is driven outside the engine. `sb._backend` is the thing that actually knows how to talk to Docker/Podman or run `unshare`+`chroot`; the facade only owns what's backend-agnostic (config resolution, the `_lock`, GPU/CPU pool bookkeeping). See [sandbox/chroot.md](sandbox/chroot.md) for the chroot backend's own mechanics (mount namespace, directory layout, checkpointing, and what it deliberately doesn't isolate).
 
 ## Custom base image and mounts
 

@@ -2,14 +2,14 @@
 
 The harness wire types contain JSON-compatible data only. They may cross
 the host/sandbox process boundary and must not contain Agency objects,
-callbacks, credentials, or tool implementations. ``ExecutionResult`` is an
+callbacks, credentials, or tool implementations. ``CompletedResult`` is an
 in-process result and is deliberately allowed to contain Agency objects.
 
 ExecutionBuilder compiles an ``agskill`` and its prepared input/output
 contract into ``PromptPayload``. The manager receives only that compiled
 prompt, a JSON-safe projection of the existing unified ``agConfig``, a
-context reference, and a short-lived capability token. Tools and policies
-stay host-side and are resolved from the capability token.
+short-lived capability token. Tools and policies stay host-side and are
+resolved from the capability token.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ ConfigPayload: TypeAlias = JsonObject
 
 ExecutionId = NewType("ExecutionId", str)
 CapabilityToken = NewType("CapabilityToken", str)
-ContextId = NewType("ContextId", str)
 ManagerId = NewType("ManagerId", str)
 
 
@@ -165,7 +164,7 @@ HarnessAttemptResult = SkillExecutionResponse
 
 
 @dataclass
-class ExecutionResult:
+class CompletedResult:
     """In-process Agency result; never serialized to the harness manager."""
 
     output: "agdata"
@@ -177,10 +176,9 @@ class ExecutionResult:
 
 __all__ = [
     "CapabilityToken",
+    "CompletedResult",
     "ConfigPayload",
-    "ContextId",
     "ExecutionId",
-    "ExecutionResult",
     "HarnessAttemptResult",
     "HarnessError",
     "HarnessErrorKind",

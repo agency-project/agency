@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from agency.agpolicy import agdecision
-from agency.harness._native_hooks import (
+from agency.sandbox.ptrace import PtraceDecision
+from agency.sandbox.mediation import (
     decision_to_hook_response,
     hook_payload_to_syscallevent,
     resolve_mediation_mode,
@@ -24,12 +24,12 @@ def test_resolve_mediation_mode_passes_through_explicit_native_hooks():
 
 
 def test_resolve_mediation_mode_auto_resolves_to_ptrace_when_available():
-    with patch("agency.harness.agproxy_ptrace.ptrace_available", return_value=True):
+    with patch("agency.sandbox.ptrace.ptrace_available", return_value=True):
         assert resolve_mediation_mode("auto") == "ptrace"
 
 
 def test_resolve_mediation_mode_auto_resolves_to_native_hooks_when_unavailable():
-    with patch("agency.harness.agproxy_ptrace.ptrace_available", return_value=False):
+    with patch("agency.sandbox.ptrace.ptrace_available", return_value=False):
         assert resolve_mediation_mode("auto") == "native_hooks"
 
 
@@ -45,19 +45,19 @@ def test_hook_payload_to_syscallevent_bash_command():
 
 
 def test_hook_event_uses_shared_architecture_neutral_policy_type():
-    from agency.harness._syscall_event import agsyscallevent
-    from agency.harness import _native_hooks
+    from agency.sandbox.events import agsyscallevent
+    from agency.sandbox import mediation
 
     event = hook_payload_to_syscallevent({"tool_name": "Read", "tool_input": {}})
     assert type(event) is agsyscallevent
-    assert _native_hooks.agsyscallevent is agsyscallevent
+    assert mediation.agsyscallevent is agsyscallevent
     try:
-        from agency.harness import agproxy_ptrace
+        from agency.sandbox import ptrace
     except RuntimeError:
         # The ptrace implementation itself is x86_64-only, but both import
         # sites still resolve their class from this neutral module.
         return
-    assert agproxy_ptrace.agsyscallevent is agsyscallevent
+    assert ptrace.agsyscallevent is agsyscallevent
 
 
 def test_hook_payload_to_syscallevent_file_path():
@@ -69,18 +69,18 @@ def test_hook_payload_to_syscallevent_file_path():
 
 
 def test_decision_to_hook_response_allow():
-    resp = decision_to_hook_response(agdecision.allow())
+    resp = decision_to_hook_response(PtraceDecision.allow())
     assert resp["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert "updatedInput" not in resp["hookSpecificOutput"]
 
 
 def test_decision_to_hook_response_deny():
-    resp = decision_to_hook_response(agdecision.deny("nope"))
+    resp = decision_to_hook_response(PtraceDecision.deny("nope"))
     assert resp["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert resp["hookSpecificOutput"]["permissionDecisionReason"] == "nope"
 
 
 def test_decision_to_hook_response_rewrite():
-    resp = decision_to_hook_response(agdecision.rewrite(["echo", "safe"]))
+    resp = decision_to_hook_response(PtraceDecision.rewrite(["echo", "safe"]))
     assert resp["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert resp["hookSpecificOutput"]["updatedInput"]["command"] == "echo safe"

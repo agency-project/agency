@@ -63,7 +63,7 @@ agdata(theme="AI",          agschema.prepare_inputs_in_sandbox()  system prompt:
                                background.txt               - File-backed field hints
                                replaces value with path
                                                             user message:
-                            _build_user_content()           {"theme":"AI",
+                            build_prompt_payload()          {"theme":"AI",
                             ↳ injects images (agimage)       "background":
                             ↳ sends JSON for text fields      "/workspace/inputs/background.txt"}
 
@@ -303,7 +303,7 @@ agimage.prepare():
   - http/https/data URL → pass through unchanged
   - local path → base64-encode → "data:image/jpeg;base64,..."
 
-_build_user_content():
+build_prompt_payload():
   - collects all agimage field values (prepared data URLs)
   - replaces image field in the text JSON with "[image attached]" placeholder
   - builds a multimodal content array:
@@ -348,7 +348,7 @@ parsing, no retry loop.
 ```
 Caller passes: agdata(prompt="Write a haiku about autumn.")
 
-_build_user_content() → returns the string directly, no JSON wrapper.
+build_prompt_payload() → returns the string directly, no JSON wrapper.
 
 System prompt does NOT include the "Input JSON format:" section.
 ```

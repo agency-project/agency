@@ -825,12 +825,13 @@ class _ContainerBackendBase(agsandbox_backend):
         self._register_prof_container()
 
     def _ensure_started_profiled(self) -> None:
-        """Start the Docker/Podman container on first use.
+        """Start or resume the Docker/Podman container idempotently.
 
-        Called lazily by _container_exec() so containers are only created when
-        an agent actually needs sandboxed execution (bash, file I/O, etc.).
-        Tasks that complete using only host-side tools (webfetch, todowrite,
-        find_papers, …) never start a container at all.
+        ``SandboxProvisioner.acquire()`` reaches this through the public
+        ``agSandbox.ensure_started()`` operation before execution-scoped host
+        services start. ``_container_exec()`` also retains the same check as a
+        defensive guarantee for callers that use a sandbox outside the engine
+        transaction.
 
         Invariant: after rm_container() the container does not exist; after
         stop() (hibernate) it still does, just not running -- see that
@@ -2079,7 +2080,6 @@ class _ContainerBackendBase(agsandbox_backend):
     def destroy(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
         container_name = self._container_name()
 
         # Best-effort courtesy signal before rm_container() forces the issue
@@ -2137,6 +2137,7 @@ class _ContainerBackendBase(agsandbox_backend):
 
         if rm_exc is not None:
             raise rm_exc
+        self._destroyed = True
 
     def _lifecycle_tag(self) -> str:
         return f"agency/lifecycle-{self._name}".lower()

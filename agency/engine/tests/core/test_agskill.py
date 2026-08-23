@@ -1,8 +1,9 @@
 """Tests for agskill as a self-contained ReAct skill."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
-from agency.agdata import agdata, agerror
+from agency.agdata import agdata
 from agency.agcontext import agcontext
 from agency.agconfig import agConfig
 from agency.agschema import agschema
@@ -363,68 +364,32 @@ def test_no_schemas_system_prompt_unchanged():
 # test_oversized_tool_output_is_offloaded_to_a_file.
 
 # ---------------------------------------------------------------------------
-# Skill-exit sandbox teardown (agskill.py's own run()/_task() finally block)
+# Sandbox lifecycle ownership
 #
-# Per-tool commit/rollback is gone (agtool.py's dispatch_tools() now just
-# calls sandbox.stop() unconditionally after each call -- a separate,
-# already-updated concern, not tested here). The remaining rollback boundary
-# lives one level up, in agskill.py's _task(): on a *skill's own* result
-# being an error, it calls ag.sandbox.rm_container() (discarding everything
-# since the last successful skill's commit()) and pushes a plain string onto
-# ag.inbox describing the revert -- surfaced at the START of the next skill
-# call via ag._drain_inbox() (see execute_react()'s loop), since the failed
-# skill's own result is already final by the time _task() reaches teardown.
-# On success, it calls ag.sandbox.commit() (no args -- squashing is now
-# fully automatic, the old force_squash parameter is gone) and then
-# ag.sandbox.stop() to hibernate again (releasing the session keyring);
-# execute_react()'s output path may have re-woken the container after the
-# last tool-call hibernate, and commit() itself does not stop it.
-#
-# These tests exercise that finally block directly by running skills through
-# the real agent.run()/_task() path (not execute_react() in isolation, which
-# never reaches this teardown) against a real agent and a mocked sandbox,
-# with execute_react() itself replaced by a fake so the scenario -- success,
-# an agerror result, or an uncaught exception -- is fully controlled. Any
-# per-tool run_in_subprocess distinction is irrelevant at this layer (kept
-# only in a few names/docstrings for traceability from the pre-refactor
-# suite these evolved from).
+# Provisioning, locking, checkpointing, rollback, and hibernation are tested
+# in engine/tests/test_engine.py.  A mocked execute_engine() intentionally
+# bypasses that owner, so agskill must not perform any fallback sandbox work.
 # ---------------------------------------------------------------------------
 
 
 def _make_sandbox_with_tracking():
-    """Return a sandbox mock that records stop()/commit()/rm_container() calls."""
     sandbox = MagicMock()
-    sandbox._name = "testbox"
-    sandbox.stop.return_value = None
+    sandbox._lock = MagicMock()
     sandbox._has_pending_background_work.return_value = False
-    # A bare MagicMock's auto-attribute for `.persistent` is a truthy Mock,
-    # not the real agSandbox default (False) -- since dispatch_tools() now
-    # short-circuits on `not sandbox.persistent` before ever consulting
-    # `_has_pending_background_work()` (see agtool.py), leaving this unset
-    # would silently skip that check (and any side_effect list queued on
-    # it) in every test using this helper. Match the real default here.
     sandbox.persistent = False
     return sandbox
 
 
-def _run_skill_via_agent(s, sandbox, skill_input=None):
-    """Run *s* to completion through a real agent.run() -- the only code
-    path that reaches agskill.py's _task() finally block -- against a real
-    agent and *sandbox* (typically a MagicMock so commit()/rm_container()/
-    inbox.put() calls can be asserted on). Returns (ag, resolved pending
-    agdata)."""
+def _run_skill_via_agent(skill, sandbox, skill_input=None):
     cfg = agConfig({"agllm_backend": LLM_CONFIG})
     ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
     ag.inbox = MagicMock()
-    pending = ag.run(s, skill_input if skill_input is not None else agdata(x=1))
+    pending = ag.run(skill, skill_input if skill_input is not None else agdata(x=1))
     pending.wait()
     return ag, pending
 
 
-def test_tool_success_commits_and_stops():
-    """A skill run that completes successfully must call sandbox.commit()
-    (no args) then sandbox.stop() in agskill.py's _task() finally block,
-    and must not rm_container() or push anything onto the inbox."""
+def test_run_delegation_does_not_manage_the_sandbox():
     sandbox = _make_sandbox_with_tracking()
     s = make_skill()
     s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
@@ -433,229 +398,96 @@ def test_tool_success_commits_and_stops():
         [],
     )
 
-    ag, _ = _run_skill_via_agent(s, sandbox)
+    ag, pending = _run_skill_via_agent(s, sandbox)
 
-    sandbox.commit.assert_called_once_with()
-    sandbox.stop.assert_called_once_with()
-    method_names = [c[0] for c in sandbox.method_calls]
-    assert method_names.index("commit") < method_names.index("stop")
+    assert pending.result == "ok"
+    sandbox._lock.acquire.assert_not_called()
+    sandbox._lock.release.assert_not_called()
+    sandbox.commit.assert_not_called()
     sandbox.rm_container.assert_not_called()
+    sandbox.stop.assert_not_called()
     ag.inbox.put.assert_not_called()
 
 
-def test_tool_success_defers_hibernate_when_background_work_pending():
-    """Same deferral as per-tool stop(): do not hibernate over live
-    background work at skill teardown."""
+def test_failed_delegation_does_not_add_fallback_sandbox_teardown():
     sandbox = _make_sandbox_with_tracking()
-    sandbox._has_pending_background_work.return_value = True
-    s = make_skill()
-    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agdata(result="ok"),
+    skill = make_skill()
+    skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
+        agdata(error="boom"),
         prev_ctx,
         [],
     )
 
-    _run_skill_via_agent(s, sandbox)
+    ag, pending = _run_skill_via_agent(skill, sandbox)
 
-    sandbox.commit.assert_called_once_with()
+    assert pending.error == "boom"
+    sandbox._lock.acquire.assert_not_called()
+    sandbox.commit.assert_not_called()
+    sandbox.rm_container.assert_not_called()
     sandbox.stop.assert_not_called()
+    ag.inbox.put.assert_not_called()
 
 
-def test_tool_failure_triggers_stop_without_commit():
-    """When the skill's own result is an error, the finally block must call
-    sandbox.rm_container() (discard since the last successful commit)
-    instead of sandbox.commit()."""
+def test_delegation_exception_does_not_add_fallback_sandbox_teardown():
     sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("boom"),
-        prev_ctx,
-        [],
-    )
+    skill = make_skill()
 
-    ag, pending = _run_skill_via_agent(s, sandbox)
+    def raise_from_engine(ag, prev_ctx, skill_input, max_steps=None):
+        raise RuntimeError("engine exploded")
 
-    sandbox.rm_container.assert_called_once_with()
+    skill.execute_engine = raise_from_engine
+    ag, pending = _run_skill_via_agent(skill, sandbox)
+
+    assert "engine exploded" in pending.error
+    sandbox._lock.acquire.assert_not_called()
     sandbox.commit.assert_not_called()
-    assert pending._data.get("error") == "boom"
+    sandbox.rm_container.assert_not_called()
+    sandbox.stop.assert_not_called()
+    ag.inbox.put.assert_not_called()
 
 
-def test_tool_failure_adds_workspace_reverted_note():
-    """The old "workspace_reverted key injected into the tool result JSON"
-    behavior is gone entirely -- the revert notice now goes on ag.inbox as a
-    plain string (queue.Queue[str]), not in the failed skill's own result,
-    since that result is already final by the time _task() reaches
-    teardown. The note is meant to surface at the START of the next skill
-    call via ag._drain_inbox()."""
-    sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("disk full"),
-        prev_ctx,
-        [],
-    )
+def test_mocked_engine_seam_does_not_preflight_a_sandbox():
+    skill = make_skill()
 
-    ag, pending = _run_skill_via_agent(s, sandbox)
+    def assert_no_sandbox(ag, prev_ctx, skill_input, max_steps=None):
+        assert ag.sandbox is None
+        return agdata(result="ok"), prev_ctx, []
 
-    ag.inbox.put.assert_called_once()
-    (note,), _kwargs = ag.inbox.put.call_args
-    assert isinstance(note, str)
-    assert "revert" in note.lower() or "discard" in note.lower()
-    # The failed skill's own result carries only its own error -- no
-    # revert-related key was added to it at this layer.
-    assert pending._data == {"error": "disk full"}
-
-
-def test_tool_failure_reverts_even_without_subprocess():
-    """The revert-and-notify teardown is triggered purely by the skill's own
-    result being an error -- it doesn't matter whether any tool ran at all,
-    let alone in a subprocess; _task() only ever inspects outer_result."""
-    sandbox = MagicMock()
-    s = make_skill()
-    s.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("nope"),
-        prev_ctx,
-        [],
-    )
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    sandbox.rm_container.assert_called_once_with()
-    ag.inbox.put.assert_called_once()
-    assert pending._data.get("error") == "nope"
-
-
-def test_run_in_subprocess_false_still_stops():
-    """The commit()/rm_container() decision is made fresh for every skill
-    call on the same agent -- a later call's failure must still trigger
-    rm_container() (and a fresh inbox note) even though an earlier call
-    already committed successfully."""
-    sandbox = _make_sandbox_with_tracking()
-    ok_skill = make_skill(name="ok")
-    ok_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agdata(result="ok"),
-        prev_ctx,
-        [],
-    )
-    bad_skill = make_skill(name="bad")
-    bad_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("second call failed"),
-        prev_ctx,
-        [],
-    )
-
+    skill.execute_engine = assert_no_sandbox
     cfg = agConfig({"agllm_backend": LLM_CONFIG})
-    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
-    ag.inbox = MagicMock()
-    ag.run(ok_skill, agdata(x=1)).wait()
-    ag.run(bad_skill, agdata(x=1)).wait()
+    ag = _agent_cls(agconfig=cfg, llm=LLM)
 
-    assert sandbox.commit.call_count == 1
-    assert sandbox.stop.call_count == 1  # success path hibernates after commit
-    assert sandbox.rm_container.call_count == 1
-    ag.inbox.put.assert_called_once()
+    assert ag.run(skill, agdata(x=1)).result == "ok"
+    assert ag.sandbox is None
 
 
-def test_tool_exception_triggers_stop_without_commit():
-    """An uncaught exception raised out of execute_react() is caught by
-    _task()'s own outer try/except and turned into an agerror -- which must
-    then trigger the same rm_container()-without-commit teardown as an
-    ordinary agerror result."""
-    sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-
-    def _raise(ag, prev_ctx, skill_input, max_steps=None):
-        raise RuntimeError("exploded")
-
-    s.execute_engine = _raise
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    sandbox.rm_container.assert_called_once_with()
-    sandbox.commit.assert_not_called()
-    assert "exploded" in pending._data.get("error", "")
-
-
-def test_run_in_subprocess_false_success_still_commits():
-    """A skill call's own commit()/rm_container() decision doesn't carry
-    over from an earlier call on the same agent -- a successful call must
-    still commit() even immediately after a prior call's failure already
-    triggered a revert."""
-    sandbox = _make_sandbox_with_tracking()
-    bad_skill = make_skill(name="bad")
-    bad_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("first call failed"),
-        prev_ctx,
-        [],
+def test_execute_engine_uses_the_engine_transaction_entrypoint(monkeypatch):
+    completed = SimpleNamespace(
+        output=agdata(result="ok"),
+        context=agcontext(),
+        delta=[{"role": "assistant", "content": "ok"}],
     )
-    ok_skill = make_skill(name="ok")
-    ok_skill.execute_engine = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agdata(result="ok"),
-        prev_ctx,
-        [],
-    )
+    calls = []
 
-    cfg = agConfig({"agllm_backend": LLM_CONFIG})
-    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
-    ag.inbox = MagicMock()
-    ag.run(bad_skill, agdata(x=1)).wait()
-    ag.run(ok_skill, agdata(x=1)).wait()
+    class _Engine:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
 
-    assert sandbox.rm_container.call_count == 1
-    assert sandbox.commit.call_count == 1
-    assert sandbox.stop.call_count == 1  # success path hibernates after commit
+        def execute(self):
+            calls.append(("execute", None))
+            return completed
 
-
-# test_pending_background_work_defers_stop_entirely was retired here: it
-# tested agtool.py's dispatch_tools() deferring sandbox.stop() while
-# `_has_pending_background_work()` is true -- the per-tool-call hibernate
-# model itself was already retired in Phase 1 (persistent containers), so
-# this check (and the "wait_for_processes() right after" ordering the
-# comment describes) no longer exists in the new execute_engine() path.
-
-# test_pending_background_work_omits_workspace_reverted_note_on_error was
-# retired here: same retired mechanism, errored-tool-call path.
-
-
-def test_tool_exception_with_run_in_subprocess_false_still_stops():
-    """Same exception-triggers-revert teardown as
-    test_tool_exception_triggers_stop_without_commit, confirmed here via a
-    plain ValueError (rather than RuntimeError) raised very early -- before
-    execute_react() ever reaches a tool call -- to show the finally block's
-    rm_container()+inbox path doesn't depend on how far execute_react() got
-    before failing."""
-    sandbox = _make_sandbox_with_tracking()
+    monkeypatch.setattr("agency.engine.engine.agentEngine", _Engine)
     s = make_skill()
+    ag = SimpleNamespace(agresource_pool="pool")
 
-    def _raise_early(ag, prev_ctx, skill_input, max_steps=None):
-        raise ValueError("early failure")
+    actual = s.execute_engine(ag, agcontext(), agdata(x=1))
 
-    s.execute_engine = _raise_early
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    sandbox.rm_container.assert_called_once_with()
-    sandbox.commit.assert_not_called()
-    assert "early failure" in pending._data.get("error", "")
-    ag.inbox.put.assert_called_once()
-    (note,), _kwargs = ag.inbox.put.call_args
-    assert "revert" in note.lower() or "discard" in note.lower()
-
-
-# test_tool_exception_with_pending_background_work_defers_stop was
-# retired here: same retired dispatch_tools() pending-background-work
-# stop-deferral mechanism, exception-handler path.
-
-
-# test_dispatch_tools_accepts_camel_case_llm_arguments /
-# test_tool_timeout_uses_agent_provided_value / test_tool_timeout_ignored_if_not_int
-# were retired here: all three tested agtool.py's dispatch_tools()-specific
-# mechanics (camelCase argument-key coercion via agdata.from_json(), and
-# per-call `timeout` override from LLM tool-call args) -- only ever
-# exercised via execute_react(). Native's built-in tools have fixed
-# timeouts and no camelCase-coercion step of their own (they parse JSON
-# arguments directly, see _native_in_container_entrypoint.py's
-# _parse_tool_args), so neither mechanism carries over.
+    assert actual == (completed.output, completed.context, completed.delta)
+    assert calls[0][0] == "init"
+    assert calls[0][1]["agent"] is ag
+    assert calls[0][1]["skill"] is s
+    assert calls[1] == ("execute", None)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,15 +857,9 @@ def test_run_does_not_mutate_callers_shared_input_object():
     caller passed in -- prepare_inputs_in_sandbox()'s offload rewrite must
     land on a private copy, not the caller's own object."""
     from agency.agschema import agSchemaConfig
-    from agency.sandbox import agSandboxBackendConfig
 
-    # Force the docker sandbox backend: sandbox' "auto" selection
-    # prefers podman over docker when both are usable, but CI's
-    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
-    # podman has no local image and would try (and fail) to pull one.
     cfg = agConfig(
         agSchemaConfig(input_offload_chars=10),
-        agSandboxBackendConfig(backend="docker"),
         {"agllm_backend": LLM_CONFIG},
     )
     s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
@@ -1051,14 +877,14 @@ def test_run_does_not_mutate_callers_shared_input_object():
     s.execute_engine = fake_execute_react
 
     shared_input = agdata(text="x" * 100)
-    ag = _agent_cls(agconfig=cfg)
-    try:
-        result = ag.run(s, shared_input)
-        assert "saved to" in result.answer  # this run's own copy WAS offloaded
-        assert shared_input.text == "x" * 100  # the caller's object was not
-    finally:
-        if ag.sandbox is not None:
-            ag.sandbox.destroy()
+    sandbox = SimpleNamespace(files={})
+    sandbox.write_file = lambda path, content: sandbox.files.__setitem__(path, content)
+    ag = _agent_cls(agconfig=cfg, sandbox=sandbox)
+
+    result = ag.run(s, shared_input)
+
+    assert "saved to" in result.answer  # this run's own copy WAS offloaded
+    assert shared_input.text == "x" * 100  # the caller's object was not
 
 
 def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
@@ -1066,15 +892,9 @@ def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
     ClassificationTeam.run() pattern) must each read back their own
     offloaded file, not race on the shared object's mutation."""
     from agency.agschema import agSchemaConfig
-    from agency.sandbox import agSandboxBackendConfig
 
-    # Force the docker sandbox backend: sandbox' "auto" selection
-    # prefers podman over docker when both are usable, but CI's
-    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
-    # podman has no local image and would try (and fail) to pull one.
     cfg = agConfig(
         agSchemaConfig(input_offload_chars=10),
-        agSandboxBackendConfig(backend="docker"),
         {"agllm_backend": LLM_CONFIG},
     )
     s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
@@ -1087,25 +907,24 @@ def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
             context_limit=ag.llm.context_limit,
             agconfig=ag.agconfig,
         )
-        from agency.tools.read import make_read
-
         path = skill_input.text.split("saved to ")[1].split(" —")[0]
-        r = make_read(ag.sandbox).fn(agdata(file_path=path))
-        return agdata(answer=r.content), prev_ctx, []
+        return agdata(answer=ag.sandbox.files[path]), prev_ctx, []
 
     s.execute_engine = fake_execute_react
 
     shared_input = agdata(text="x" * 100)
-    agents = [_agent_cls(agconfig=cfg) for _ in range(2)]
-    try:
-        pending = [a.run(s, shared_input) for a in agents]
-        for p in pending:
-            assert "x" * 100 in p.answer
-        assert shared_input.text == "x" * 100
-    finally:
-        for a in agents:
-            if a.sandbox is not None:
-                a.sandbox.destroy()
+    sandboxes = [SimpleNamespace(files={}) for _ in range(2)]
+    for sandbox in sandboxes:
+        sandbox.write_file = lambda path, content, store=sandbox.files: store.__setitem__(
+            path, content
+        )
+    agents = [_agent_cls(agconfig=cfg, sandbox=sandbox) for sandbox in sandboxes]
+
+    pending = [a.run(s, shared_input) for a in agents]
+
+    for result in pending:
+        assert "x" * 100 in result.answer
+    assert shared_input.text == "x" * 100
 
 
 # plan_mode / replace_tools were removed from agskill entirely in this

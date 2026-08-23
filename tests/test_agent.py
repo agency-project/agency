@@ -95,7 +95,7 @@ def test_run_returns_pending_agdata():
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(done=True), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
     result = ag.run(skill, agdata())
@@ -111,7 +111,7 @@ def test_run_calls_named_agskill():
         return agdata(done=True), prev_ctx, []
 
     skill = agskill(name="dowork", system_prompt="")
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
     result = ag.run(skill, agdata(task="go"))
@@ -150,39 +150,36 @@ def test_engine_from_agconfig():
     assert ag.engine == "opencode"
 
 
-def test_run_dispatches_to_execute_harness_when_native():
-    """Every engine, "native" included, now goes through execute_harness()
-    -- agharness_backend.for_config() resolves "native" to _NativeBackend,
-    a genuine drop-in like every other engine's backend, so _task() no
-    longer branches on ag.engine at all (Phase 0)."""
+def test_run_dispatches_to_execute_engine_when_native():
+    """Every configured harness is reached through the agent driver engine."""
     calls = []
 
-    def fake_execute_harness(ag, prev_ctx, inp, max_steps=None, **_):
-        calls.append("harness")
+    def fake_execute_engine(ag, prev_ctx, inp, max_steps=None, **_):
+        calls.append("engine")
         return agdata(done=True), prev_ctx, []
 
     skill = agskill(name="s", system_prompt="")
-    skill.execute_harness = fake_execute_harness
+    skill.execute_engine = fake_execute_engine
 
     ag = make_agent()
     assert ag.engine == "native"
     ag.run(skill, agdata()).done
-    assert calls == ["harness"]
+    assert calls == ["engine"]
 
 
-def test_run_dispatches_to_execute_harness_when_engine_not_native():
+def test_run_dispatches_to_execute_engine_when_engine_not_native():
     calls = []
 
-    def fake_execute_harness(ag, prev_ctx, inp, max_steps=None, **_):
-        calls.append("harness")
+    def fake_execute_engine(ag, prev_ctx, inp, max_steps=None, **_):
+        calls.append("engine")
         return agdata(done=True), prev_ctx, []
 
     skill = agskill(name="s", system_prompt="")
-    skill.execute_harness = fake_execute_harness
+    skill.execute_engine = fake_execute_engine
 
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), engine="claude_code")
     ag.run(skill, agdata()).done
-    assert calls == ["harness"]
+    assert calls == ["engine"]
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +197,7 @@ def test_history_updated_after_run():
         ]
         return agdata(ok=True), agcontext(messages=new_msgs), []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
     ag = make_agent()
 
     ag.run(skill, agdata(turn=1))
@@ -224,7 +221,7 @@ def test_sequential_calls_serialize_via_history_chain():
             new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
             return agdata(name=name), agcontext(messages=new_msgs), []
 
-        sk.execute_harness = fake_execute_react
+        sk.execute_engine = fake_execute_react
         return sk
 
     skill_first = make_skill("first")
@@ -248,7 +245,7 @@ def test_history_passed_to_agskill():
         received["hist"] = prev_ctx
         return agdata(), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag.run(skill, agdata(x=1))
     _ = ag.history  # sync
@@ -270,7 +267,7 @@ def test_skill_replace_tools_used_in_run():
         captured["replace_tools"] = skill.replace_tools
         return agdata(), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
     ag.run(skill, agdata())
@@ -315,8 +312,8 @@ def test_multiple_agskills_coexist():
     def fake_b(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(from_skill="b"), prev_ctx, []
 
-    skill_a.execute_harness = fake_a
-    skill_b.execute_harness = fake_b
+    skill_a.execute_engine = fake_a
+    skill_b.execute_engine = fake_b
 
     ag = make_agent()
     results = {}
@@ -384,7 +381,7 @@ def test_fork_waits_for_inflight_task():
         new_ctx = agcontext(messages=[{"role": "user", "content": str(inp.v)}])
         return agdata(v=inp.v), new_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
     ag.run(skill, agdata(v=42))  # non-blocking, in-flight
@@ -406,7 +403,7 @@ def test_fork_runs_do_not_update_parent_history():
         new_ctx = agcontext(messages=[{"role": "user", "content": "fork_msg"}])
         return agdata(ok=True), new_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "original"}])
@@ -437,7 +434,7 @@ def test_fork_runs_in_parallel():
         barrier.wait(timeout=60)
         return agdata(n=inp.n), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
     results = [agent.fork(ag).run(skill, agdata(n=i)) for i in range(3)]
@@ -452,7 +449,7 @@ def test_fork_sees_parent_history_at_fork_time():
         seen["hist"] = list(prev_ctx.messages)
         return agdata(), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
     ag.history = agdata(messages=[{"role": "user", "content": "seed"}])
@@ -478,7 +475,7 @@ def test_run_accepts_pending_agdata_as_input():
         received["inp"] = inp.to_dict()
         return agdata(ok=True), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
 
@@ -502,7 +499,7 @@ def test_run_resolves_list_of_pending_in_input():
         received["items"] = inp.items
         return agdata(ok=True), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = make_agent()
 
@@ -526,7 +523,7 @@ def test_chained_run_output_as_next_input():
         received_inputs.append(dict(inp._data))
         return agdata(done=True), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag1 = make_agent()
     ag2 = make_agent()
@@ -669,7 +666,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
         new_ctx = agcontext(messages=[{"role": "assistant", "content": "42"}])
         return agdata(answer="42"), new_ctx, []
 
-    skill_write.execute_harness = fake_write
+    skill_write.execute_engine = fake_write
 
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     ag.run(skill_write, agdata(q="test")).answer
@@ -804,7 +801,7 @@ def test_save_scrubs_and_load_restamps_owner_pid_label(tmp_path, monkeypatch):
         ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
         return agdata(ok=True), prev_ctx, []
 
-    skill_write.execute_harness = fake_write
+    skill_write.execute_engine = fake_write
 
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     ag.run(skill_write, agdata(agname=ag.agname)).ok
@@ -849,7 +846,7 @@ def test_save_all_and_load_all(tmp_path, monkeypatch):
         ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
         return agdata(ok=True), prev_ctx, []
 
-    skill_write.execute_harness = fake_write
+    skill_write.execute_engine = fake_write
 
     def _create_and_save():
         ag1 = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
@@ -891,7 +888,7 @@ def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(ok=True), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag1 = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     ag1.run(skill, agdata()).ok  # needs a checkpoint for save
@@ -936,7 +933,7 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(done=True), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
 
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     ag.run(skill, agdata()).done  # must run a skill to get a checkpoint
@@ -960,7 +957,7 @@ def test_ui_state_error_when_skill_returns_error():
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agerror("something went wrong"), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.error  # resolve
@@ -974,7 +971,7 @@ def test_ui_state_finished_on_success():
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(answer="ok"), prev_ctx, []
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.answer  # resolve
@@ -988,7 +985,7 @@ def test_ui_state_error_on_skill_exception():
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         raise RuntimeError("unexpected crash")
 
-    skill.execute_harness = fake_execute_react
+    skill.execute_engine = fake_execute_react
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.error  # resolve (will contain the formatted exception)

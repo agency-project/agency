@@ -31,17 +31,10 @@ class _AgSandboxFields:
     base_image = StaticConfigParam("agSandbox", default="agency-sandbox:latest")
     persistent = DynamicConfigParam(
         "agSandbox", default=False
-    )  # If True, agtool.py:dispatch_tools() never hibernates (sandbox.stop())
-    # this sandbox between tool calls within a skill run -- it only
-    # stops/commits at the skill-run boundary (agskill.py). This trades away
-    # GPU/keyring-slot release during the LLM "think" turn between tool
-    # calls (today's whole reason dispatch_tools() hibernates) for a
-    # container that stays warm for the entire skill call -- required once
-    # an agent's LLM calls or harness process themselves run inside the
-    # container rather than hopping in only for each tool call, since there
-    # is then no safe point to stop the container without killing whatever
-    # is making that call. Default False preserves today's per-tool-call
-    # hibernate behavior unchanged.
+    )  # Legacy compatibility field. Tool dispatch no longer owns sandbox
+    # hibernation, so this flag has no per-tool lifecycle effect; the
+    # provisioner keeps the backend ready for the complete execution and
+    # decides commit/discard/optional hibernate during finalization.
 
 
 class agSandboxConfig(_AgConfigViewBase):
@@ -146,10 +139,16 @@ class agSandbox(_AgSandboxFields):
         # construct multiple sandboxes -- each gets its own auto-suffixed
         # claim instead.
         self._agname = _agname.allocate_agname(f"sandbox_{agname}")
-        # Held by agskill for the full duration of a skill run so a sandbox
-        # shared across agents is never driven by more than one skill run
-        # at a time. See agskill.py's _task().
+        # Held by SandboxProvisioner for the full execution transaction so a
+        # sandbox shared across agents is never driven by more than one run at
+        # a time. See engine/sandbox_provisioner.py.
         self._lock = threading.RLock()
+        # Recovery markers are written only by SandboxProvisioner while that
+        # lock is held. They survive provisioner instances so a failed
+        # physical discard can never let a later transaction resume the
+        # sandbox's dirty writable layer.
+        self._provisioner_discard_required = False
+        self._provisioner_revert_notice_agent = None
         self._destroyed = False
         # Cloned so this sandbox's own agconfig is independent of the
         # caller's -- mutating the caller's original agConfig afterward does
@@ -336,6 +335,10 @@ class agSandbox(_AgSandboxFields):
     # Sandboxing operations -- all forwarded straight to the backend.
     # ------------------------------------------------------------------
 
+    def ensure_started(self) -> None:
+        """Explicitly prepare the selected physical sandbox backend."""
+        self._backend.ensure_started()
+
     def _container_exec(self, *args, **kwargs):
         return self._backend._container_exec(*args, **kwargs)
 
@@ -410,10 +413,18 @@ class agSandbox(_AgSandboxFields):
     def destroy(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
+        backend = getattr(self, "_backend", None)
+        if backend is None:
+            # Construction failed before a backend was attached. There is no
+            # physical state to destroy and the facade was never registered.
+            self._destroyed = True
+            return
         with agprof.span("sandbox:destroy"):
-            _live_sandboxes.discard(self)
-            self._backend.destroy()
+            backend.destroy()
+        # Mark and unregister only after backend cleanup succeeds. A failed
+        # permanent cleanup remains retryable by an explicit call or atexit.
+        self._destroyed = True
+        _live_sandboxes.discard(self)
 
     def fork(self, new_agname: str, agconfig: "agConfig | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_agname* starting from this sandbox's

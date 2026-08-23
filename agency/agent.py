@@ -50,11 +50,9 @@ class _AgAgentFields:
     checkpoint_load_timeout_s = DynamicConfigParam("agent", default=600)
     engine = DynamicConfigParam(
         "agent", default="native"
-    )  # Looked up via agharness_backend.for_config() and run through
-    # agskill.execute_engine() -- see agskill.py's _task(). "native" runs
-    # agency's own react loop as a persistent in-container process
-    # (agharness_backends/native.py); any other value names an external
-    # harness engine (claude_code/codex/opencode/grok).
+    )  # Harness selector retained in the unified config. The replacement
+    # HarnessManagerBridge protocol still needs to project and consume it;
+    # the retired agharness_backend lookup lives only under old_harness/.
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
@@ -273,8 +271,9 @@ class agent:
             engine if engine is not None else _AgAgentFields(self.agconfig).engine
         )  # [REFACTOR] Change to config only
         self.ctx: agcontext = agcontext()
-        # Sandbox is created lazily on first skill run; container provisioning
-        # is expensive and agents may be constructed without ever running a skill.
+        # SandboxProvisioner attaches a facade on the first execution when one
+        # was not supplied, then explicitly prepares its physical backend while
+        # holding the facade lock. Agents may still be constructed and never run.
         self.sandbox: "agSandbox | None" = sandbox
 
         _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
@@ -520,9 +519,10 @@ class agent:
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
-        Delegates scheduling to ``skill.run(self, ...)``; the resulting
-        ``agentEngine`` owns sandboxing and execution. Calls on the same agent
-        are serialized via the context future chain.
+        Delegates scheduling to ``skill.run(self, ...)``; its ``agentEngine``
+        facade routes the transaction through ``ExecutionBuilder`` and
+        ``SandboxProvisioner``. Calls on the same agent are serialized via the
+        context future chain.
         """
         if max_steps is None:
             return skill.run(self, skill_input)

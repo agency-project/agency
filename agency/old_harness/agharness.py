@@ -149,7 +149,7 @@ def build_user_turn_prompt(skill: "agskill", skill_input: "agdata") -> "str | li
     agskill's own prompt-construction code so a harness sees exactly the
     same JSON-input convention the native ReAct loop's first user message
     uses."""
-    return skill._build_user_content(skill_input)
+    return skill.build_prompt_payload(skill_input)
 
 
 def build_output_format_instruction(skill: "agskill") -> "str | None":

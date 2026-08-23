@@ -36,9 +36,9 @@ that ruled out simpler-looking alternatives):
    the harness's built-ins) would give clean per-tool-call visibility "for free," but breaks this
    constraint outright, and isn't uniformly supported for *denying* built-ins across all four
    harnesses. Rejected.
-3. **Individual tool calls (and their start/end boundaries) must be detectable**, so that sandbox
-   lazy-start/hibernate can key off the same event granularity the native ReAct loop already uses
-   — not "eagerly start the sandbox before every harness launch just in case."
+3. **Individual tool calls (and their start/end boundaries) must be detectable** for policy,
+   logging, and any safe intra-execution hibernation decision. Initial physical preparation is not
+   keyed from this signal: the provisioner explicitly starts the sandbox before harness launch.
 4. **All actual file/process execution must go through the existing `agsandbox_backend`
    abstraction** (`read_file`/`write_file`/`_container_exec`/etc.) — the same code native tool
    dispatch already uses — not a parallel redirection mechanism.
@@ -100,11 +100,12 @@ agent; when the *next* request from the harness carries the matching `tool_resul
 native-tool retrofit and this could share one event type — see `agpolicy.py:45-49`, `agdecision`
 at `agpolicy.py:26-42`) rather than inventing a parallel policy interface.
 
-**This window is the lazy-start/hibernate trigger**: `ag.sandbox._backend._ensure_started()` fires
-when a tool-call window opens (a real "the model is about to use a tool" signal, arriving
-*before* the harness's own local execution happens), and hibernate/commit fires at task end exactly
-as it does today — no change to `_ensure_started()`'s idempotent inspect-and-reuse logic
-(`container.py:809-928`) or to task-boundary teardown.
+**This window is not the transaction-start trigger**: the provisioner has already
+acquired the sandbox lock and called the public, backend-neutral
+`ag.sandbox.ensure_started()` before host services or harness launch. The window
+remains useful as a semantic tool-call signal. Backend `_ensure_started()` keeps
+its idempotent inspect-and-reuse logic (`container.py:809-928`) so later
+operations remain defensive after hibernation or outside the engine path.
 
 ### 2. A FUSE-backed filesystem, mounted in a private namespace around the harness process
 
@@ -193,8 +194,9 @@ today.
 - `agsandbox_backend.read_file`/`write_file`/`write_file_bytes`/`remove_files`/`_container_exec`
   (`base.py:532-613, 855-863`, `container.py:1119-1159`) — the FUSE callback server's entire
   backend, no new sandbox-side primitives needed.
-- `_ensure_started()`'s idempotent inspect-and-reuse logic (`container.py:809-928`) — called once
-  when a tool-call window opens; unchanged internals.
+- `_ensure_started()`'s idempotent inspect-and-reuse logic (`container.py:809-928`) — reached
+  through public `agSandbox.ensure_started()` during provisioner acquisition,
+  and defensively by later operations; unchanged backend internals.
 - `agpolicy.check(ag, event)` / `agdecision` (`agpolicy.py:26-58`) — a FUSE callback populates a
   new `agsyscallevent` (e.g. `syscall="fuse_open"`, `path` set, `argv`/`envp` left `None`) and
   calls the exact same policy hook, following the precedent already set by the

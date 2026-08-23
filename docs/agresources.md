@@ -30,7 +30,7 @@ Containers are started with every GPU on the host attached (`--gpus all` on Dock
 
 ## GPU semaphores
 
-Each GPU ID gets a `threading.Semaphore(1)`. `acquire_gpu()` is called internally by `exec()` — not by the `reserve_gpu` tool directly. `reserve_gpu` only sets `sandbox._gpu_virtual = True`. The physical semaphore is acquired at exec time: `acquire_gpu()` spins across all semaphores until one is free, then returns the GPU ID and sets `sandbox._gpu_id`. `release_gpu()` releases the semaphore. The physical GPU is released when: (a) `sandbox.stop()` (hibernate, between tool calls); (b) `sandbox.rm_container()` (skill failure); or (c) `sandbox.destroy()` — never mid-tool-call, and never just because a foreground exec finished or the live-PID set went empty.
+Each GPU ID gets a `threading.Semaphore(1)`. `acquire_gpu()` is called internally by `exec()` — not by the `reserve_gpu` tool directly. `reserve_gpu` only sets `sandbox._gpu_virtual = True`. The physical semaphore is acquired at exec time: `acquire_gpu()` spins across all semaphores until one is free, then returns the GPU ID and sets `sandbox._gpu_id`. `release_gpu()` releases the semaphore. The physical GPU is released by backend teardown after the associated work has been stopped: normally when provisioner finalization hibernates (`sandbox.stop()`) or discards (`sandbox.rm_container()`), and permanently on `sandbox.destroy()`. It is not released between tool calls or merely because one foreground exec finished.
 
 ## CPU and memory limits
 
@@ -64,34 +64,29 @@ CPU and memory limits are set by the sandbox on each tool call via `update_limit
 
 | Tool | Parameters | Effect |
 |---|---|---|
-| `reserve_gpu` | — | Reserves GPU access; a physical GPU is assigned lazily on the first bash call and held for the rest of the sandbox's lifetime. No parameters. |
+| `reserve_gpu` | — | Reserves GPU access; a physical GPU is assigned lazily on the first bash call and held through the active engine transaction, until backend teardown releases it. No parameters. |
 | `reserve_cpu` | `cpus` (float), `memory` (string, e.g. `"8g"`) | Boosts container resource limits |
 | `cpu_release` | — | Resets limits back to idle defaults (shown in tool description) |
 | `daemon_release` | `pid` (int) | Removes a PID from monitoring — skill completes without waiting for it |
 
 The agent calls these tools itself during a skill, just like any other tool. `daemon_release` is always in the tool list; GPU/CPU tools are added only when `agent.agresource_pool` is set (the default).
 
-**There is no `gpu_release` tool.** A GPU, once actually acquired, is held for the duration of a single hibernate cycle — released by `sandbox.stop()` between tool calls, same as `rm_container()`/`destroy()` — never by an explicit mid-skill call. This ties the real GPU semaphore's release to the same cadence as the runtime slot rather than to the agent remembering to release it, at the cost of the agent never being able to explicitly signal "done with the GPU early" mid-tool-call.
+**There is no `gpu_release` tool.** A GPU, once actually acquired, is held through the active engine transaction and is never released by an explicit tool call. `SandboxProvisioner.finalize()` selects the normal teardown after harness and host cleanup: hibernate after a safe commit when appropriate, or remove dirty live state after an attempted failure. Permanent `destroy()` remains a separate lifetime operation.
 
 ## Release guarantee
 
-GPU release is not a separate step — it happens *inside* `sandbox.stop()`/`sandbox.rm_container()`/`sandbox.destroy()` themselves (backend-level: `_ContainerBackendBase`/`_ChrootBackend`), always after that same call's own teardown (container stop/removal / `_kill_all_sandbox_processes()`) has already completed synchronously, and only once confirmed via `_container_running()`. Per-tool-call teardown (`agtool.py`'s `dispatch_tools()`) calls `sandbox.stop()` after every tool call — a hibernate that releases **both** the runtime slot and the GPU (see [container.md](sandbox/container.md)'s "GPU device access" for why this is safe: every GPU is attached to a GPU-reserving container up front, so a resumed container can be handed a different physical GPU without needing to be recreated). `_task()`'s `finally` block then calls `commit()` on success or `rm_container()` on failure once per skill, at the very end (see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert)):
+GPU release is not a separate step — it happens *inside* `sandbox.stop()`/`sandbox.rm_container()`/`sandbox.destroy()` themselves (backend-level: `_ContainerBackendBase`/`_ChrootBackend`), always after that same call's own teardown has completed synchronously. `SandboxProvisioner.finalize()` owns the success/failure durability decision once per execution, after execution-scoped services have stopped (see [agskill.md](agskill.md#execution-level-sandbox-finalization)):
 
 ```python
-finally:
-    if ag.sandbox is not None:
-        if _had_error:
-            ag.sandbox.rm_container()   # discards state; releases GPU + runtime slot too
-            ag.inbox.put(...)           # revert notice, drained at the next skill's start
-        else:
-            ag.sandbox.commit()        # checkpoints in place; does NOT touch the GPU or slot
-    if sandbox_lock is not None:
-        sandbox_lock.release()
+provisioner.finalize(lease, succeeded=execution_succeeded)
+# success: commit and optionally hibernate
+# attempted failure: discard dirty state and queue a revert notice
+# then provisioner teardown; release the sandbox lock last
 ```
 
-`commit()` never touches the GPU or the runtime slot — the container isn't stopped or removed, so there's nothing to release. The GPU is therefore actually freed every time the sandbox hibernates between tool calls, not just when a skill fails.
+`commit()` never touches the GPU or the runtime slot — the container isn't stopped or removed, so there is nothing to release. A successful finalization may hibernate after committing when no background work requires the backend to remain active; attempted failure removes the dirty live sandbox. If the provisioner intentionally leaves a committed backend active because work is still pending, its resources remain held.
 
-`agResourcePool.release_gpu()` itself does no waiting or polling at all (an earlier version threaded an `is_clear` predicate through it and blocked until the predicate passed or a timeout elapsed; that mechanism has been removed entirely) — it releases the semaphore immediately, unconditionally. Safety comes purely from the calling order above: by the time `stop()`/`rm_container()`/`destroy()` reach the GPU-release step, they have already torn down (or, for `stop()`, actually stopped) whatever the sandbox was running, so there's nothing left to re-check. GPU semaphores and CPU/memory limits are returned even if the skill raises an exception or `max_steps` is exceeded — the `finally` block above runs unconditionally regardless. The `sandbox_lock` release, held since provisioning, always happens last.
+`agResourcePool.release_gpu()` itself does no waiting or polling. Safety comes from call ordering: by the time `stop()`/`rm_container()`/`destroy()` release it, the relevant work has already been stopped or removed. The provisioner releases the sandbox lock last, including when execution or cleanup raises.
 
 ## `agResourcePool` API
 

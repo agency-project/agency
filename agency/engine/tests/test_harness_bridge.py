@@ -1,5 +1,5 @@
-# Tests for harness_bridge.py -- currently just the constructor contract; the
-# rest of HarnessManagerBridge is still an unimplemented skeleton.
+# Tests for harness_bridge.py -- construction is side-effect free; launching
+# the sandbox-side process remains the next implementation step.
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ import pytest
 from agency.engine.harness_bridge import HarnessManagerBridge
 
 
-def test_init_takes_no_arguments_and_raises_not_implemented():
-    with pytest.raises(NotImplementedError):
-        HarnessManagerBridge()
+def test_init_takes_no_arguments_without_launching_anything():
+    assert isinstance(HarnessManagerBridge(), HarnessManagerBridge)
 
 
 def test_init_rejects_a_positional_argument():

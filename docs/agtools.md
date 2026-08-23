@@ -22,9 +22,9 @@ Tools are the functions an LLM can call during a ReAct loop. Each tool is an `ag
 
 All filesystem tools (bash, read, write, edit, glob, grep) have two variants: a host-side singleton and a sandboxed factory function (`make_<tool>(sandbox)`) that routes all I/O through `docker/podman exec`.
 
-**There is no `gpu_release` tool.** A GPU, once actually acquired via `reserve_gpu`, is released only by `sandbox.rm_container()`/`sandbox.destroy()` — never by an explicit mid-skill call, and never by a mere hibernate (see [agresources.md](agresources.md#agent-callable-resource-tools) and [container.md](sandbox/container.md)'s "GPU device access").
+**There is no `gpu_release` tool.** A GPU is never released by an explicit mid-execution tool call. Backend teardown operations release it after stopping or removing the associated work; on the normal engine path, those operations are chosen by `SandboxProvisioner.finalize()` after harness and host cleanup (see [agresources.md](agresources.md#agent-callable-resource-tools) and [container.md](sandbox/container.md)'s "GPU device access").
 
-**`run_in_subprocess` no longer gates whether `stop()` runs after a tool call.** Every built-in tool above sets it `False` for an unrelated reason (they need to run synchronously against the same persistent sandbox object, not a disposable cloudpickled worker copy), but `agtool.py`'s `dispatch_tools()` now calls `sandbox.stop()` (hibernate only — no checkpoint or removal) after *every* tool call regardless of this flag — deferred only when `sandbox._has_pending_background_work()` is true, not based on this column at all.
+**`run_in_subprocess` has no lifecycle meaning.** Every built-in tool above sets it `False` because it must run synchronously against the same persistent sandbox object rather than a disposable cloudpickled worker copy. Tool dispatch never calls `ensure_started()`, `stop()`, `commit()`, or `rm_container()` as a transaction boundary; the provisioner owns those operations once per complete engine execution.
 
 ## Sandboxed tool construction
 
@@ -155,12 +155,13 @@ my_tool = agtool(
 
 ### `run_in_subprocess` flag
 
-Every `agtool` has a `run_in_subprocess` flag (default `True`). It controls **two** things simultaneously:
+Every `agtool` has a `run_in_subprocess` flag (default `True`). It controls tool
+execution placement and watchdog behavior, not the sandbox transaction:
 
 | | `run_in_subprocess=True` | `run_in_subprocess=False` |
 |---|---|---|
 | **Execution context** | Worker subprocess via `ProcessPoolExecutor` | Calling thread, in-process |
-| **Sandbox container** | Started on first call if not yet running | Never touched |
+| **Sandbox lifecycle** | No lifecycle ownership; the provisioner explicitly prepares the sandbox before harness launch | No lifecycle ownership; a sandbox-backed callable may still use the already-prepared facade |
 | **Process isolation** | Full — own GIL, own memory space | None — shares caller's state |
 | **Timeout enforced** | Yes (`TOOL_TIMEOUT_S`, default 30 s) | No — caller controls blocking |
 
@@ -203,13 +204,13 @@ skill = agskill("classify", "Classify this text.", replace_tools=[])
 
 `add_tools` extends the defaults; `replace_tools` overrides them entirely.
 
-## Tool hibernation, skill-level revert, and timeout
+## Execution-level finalization and tool timeout
 
 ### No per-tool checkpoint or revert
 
-A tool call's own success or failure has no effect on the sandbox's checkpoint state anymore. Every tool call ends with `sandbox.stop()` — a hibernate only (`docker/podman stop`, container kept, never committed or removed) — regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred until a later call finds nothing pending). See [container.md](sandbox/container.md)'s "Container lifecycle" for the full mechanics.
+A tool call's own success or failure has no effect on the sandbox's physical or checkpoint state. Tool dispatch does not call `stop()`, `commit()`, or `rm_container()`; the sandbox remains ready for the complete harness invocation. See [container.md](sandbox/container.md)'s "Container lifecycle" for the full mechanics.
 
-Checkpointing and revert both happen once per *skill* call instead, at `agskill.py`'s teardown: `sandbox.commit()` on success, `sandbox.rm_container()` (discarding everything since the last successful skill) on failure, with a revert notice delivered to the agent via its `inbox` rather than inlined into any one tool's result — see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert) for the full mechanics and why the notice can't live in the failed skill's own result.
+Checkpointing, revert, and optional hibernation happen once per complete execution instead, when `SandboxProvisioner.finalize()` runs after harness and host cleanup: `sandbox.commit()` on success, or `sandbox.rm_container()` plus an inbox notice after an attempted failure. Preparation failures before `mark_execution_attempted()` unwind without a revert notice — see [agskill.md](agskill.md#execution-level-sandbox-finalization).
 
 ### Agent-controlled timeout
 

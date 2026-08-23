@@ -1,4 +1,12 @@
-# Harness engine glue (`harness/agharness.py`, `harness/agharness_backends/`)
+# Legacy harness engine glue
+
+> **Historical document.** The implementation described below was relocated
+> to `agency/old_harness/` and is not the current execution path. Current
+> scheduling routes through `agentEngine.execute()` and
+> `ExecutionBuilder.execute()`. The new `HarnessManagerBridge` command protocol
+> and `CompletedResult` recovery are still a separate, unfinished migration;
+> do not treat the old `execute_harness()`/`agharness_backend` paths below as
+> live APIs.
 
 The `engine` seam on `agent` (see [agent.md](agent.md)) lets `agskill.run()` dispatch to an
 off-the-shelf coding-agent CLI instead of the native ReAct loop. `harness/agharness.py` holds what's
@@ -27,7 +35,7 @@ checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`
 
 1. Resolve the harness binary (`shutil.which`); missing binary → `agerror`, no launch attempted.
 2. Build the prompt via `agharness.build_user_turn_prompt(skill, skill_input)` (delegates to
-   `agskill._build_user_content` — the *exact* JSON-input convention the native loop's first user
+   `agskill.build_prompt_payload` — the *exact* JSON-input convention the native loop's first user
    message uses) plus, for a structured `output_schema`, a plain-text instruction from
    `agharness.build_output_format_instruction(skill)` — never injected as the harness's own system
    prompt or as a tool (see [Design_harness_integration.md](Design_harness_integration.md)).
