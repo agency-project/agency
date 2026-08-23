@@ -55,6 +55,14 @@ class HostServerManager(HostServerBase):
         self._server: "uvicorn.Server | None" = None
         self._server_thread: "threading.Thread | None" = None
 
+    @property
+    def harness_interaction_server(self) -> "HarnessInteractionServer":
+        return self._harness_interaction_server
+
+    @property
+    def host_mcp_server(self) -> "HostMcpServer":
+        return self._host_mcp_server
+
     def set_config(self, agconfig: "agConfig") -> None:
         self._configs = agconfig.HostServerManagerConfigs
         self._data_collector.set_config(agconfig)

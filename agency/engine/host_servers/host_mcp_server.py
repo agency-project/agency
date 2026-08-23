@@ -61,6 +61,9 @@ class HostMcpServer(HostServerBase):
         )
         server.add_tool(call_tool, name=tool.name, description=tool.description)
 
+    def collected_output(self) -> dict:
+        return dict(self._persistent_vars.get("submitted_output_store", {}))
+
     def build_app(self) -> "Starlette":
         server = MCPServer(name="agency-host-mcp-server")
 

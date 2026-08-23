@@ -11,6 +11,7 @@ import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from agency.agconfig import agConfig
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.agDataCollector import agDataCollectorConfigs
@@ -24,9 +25,9 @@ from agency.engine.host_servers.host_server_manager import (
 def _make_manager(tmp_path, policy=None):
     configs = HostServerManagerConfigs(uds_path=str(tmp_path / "host.sock"))
     data_collector_configs = agDataCollectorConfigs(db_path=str(tmp_path / "agent.db"))
-    agconfig = SimpleNamespace(
-        HostServerManagerConfigs=configs, agDataCollectorConfigs=data_collector_configs
-    )
+    agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
+    agconfig.HostServerManagerConfigs = configs
+    agconfig.agDataCollectorConfigs = data_collector_configs
     agent = SimpleNamespace(agconfig=agconfig, inbox=object())
     sandbox = SimpleNamespace()
     skill = SimpleNamespace(policy=policy if policy is not None else agpolicy())
@@ -42,9 +43,14 @@ def test_construction_wires_agent_and_skill_into_harness_interaction_server(tmp_
     assert manager._harness_interaction_server._policy is policy
 
 
-def test_does_not_expose_a_public_harness_interaction_server_property(tmp_path):
+def test_harness_interaction_server_property_returns_the_same_instance(tmp_path):
     manager, _, _ = _make_manager(tmp_path)
-    assert not hasattr(manager, "harness_interaction_server")
+    assert manager.harness_interaction_server is manager._harness_interaction_server
+
+
+def test_host_mcp_server_property_returns_the_same_instance(tmp_path):
+    manager, _, _ = _make_manager(tmp_path)
+    assert manager.host_mcp_server is manager._host_mcp_server
 
 
 def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
@@ -53,9 +59,9 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     db_path = f"/tmp/hsm_test_{token}.db"
     configs = HostServerManagerConfigs(uds_path=uds_path)
     data_collector_configs = agDataCollectorConfigs(db_path=db_path)
-    agconfig = SimpleNamespace(
-        HostServerManagerConfigs=configs, agDataCollectorConfigs=data_collector_configs
-    )
+    agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
+    agconfig.HostServerManagerConfigs = configs
+    agconfig.agDataCollectorConfigs = data_collector_configs
     agent = SimpleNamespace(agconfig=agconfig, inbox=object())
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())
