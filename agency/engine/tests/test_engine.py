@@ -166,21 +166,21 @@ def test_missing_output_fields_diffs_against_collected_output():
 
 
 # ---------------------------------------------------------------------------
-# run()
+# execute()
 # ---------------------------------------------------------------------------
 
 
-def test_run_stops_the_host_server_manager_even_when_bootup_is_not_implemented(monkeypatch):
+def test_execute_stops_the_host_server_manager_even_when_bootup_is_not_implemented(monkeypatch):
     holder = _install_fake_host_server_manager(monkeypatch, results=[])
     engine = agentEngine(_FakeAgent())
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
     with pytest.raises(NotImplementedError):
-        engine.run(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+        engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
     assert holder["manager"].started is True
     assert holder["manager"].stopped is True
 
 
-def test_run_calls_run_prompt_once_and_returns_execution_result_on_first_success(monkeypatch):
+def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_success(monkeypatch):
     holder = _install_fake_host_server_manager(
         monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
     )
@@ -192,7 +192,7 @@ def test_run_calls_run_prompt_once_and_returns_execution_result_on_first_success
     )
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
 
-    result = engine.run(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     manager = holder["manager"]
     assert manager.harness_interaction_server.run_prompt_calls == ["p0"]
@@ -201,7 +201,7 @@ def test_run_calls_run_prompt_once_and_returns_execution_result_on_first_success
     assert result == ("built", HarnessAttemptResult(ok=True, final_text="done"))
 
 
-def test_run_stops_immediately_on_a_failed_attempt_without_retrying(monkeypatch):
+def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypatch):
     holder = _install_fake_host_server_manager(
         monkeypatch, results=[HarnessAttemptResult(ok=False, error_message="boom")]
     )
@@ -211,13 +211,13 @@ def test_run_stops_immediately_on_a_failed_attempt_without_retrying(monkeypatch)
     monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
-    result = engine.run(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     assert holder["manager"].harness_interaction_server.run_prompt_calls == ["p0"]
     assert result == HarnessAttemptResult(ok=False, error_message="boom")
 
 
-def test_run_retries_on_missing_output_fields_then_succeeds(monkeypatch):
+def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
     holder = _install_fake_host_server_manager(
         monkeypatch,
         results=[
@@ -234,13 +234,13 @@ def test_run_retries_on_missing_output_fields_then_succeeds(monkeypatch):
     monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
-    result = engine.run(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     assert holder["manager"].harness_interaction_server.run_prompt_calls == ["p0", "p1"]
     assert result == HarnessAttemptResult(ok=True, final_text="second")
 
 
-def test_run_stops_retrying_once_retries_are_exhausted(monkeypatch):
+def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
     holder = _install_fake_host_server_manager(
         monkeypatch,
         results=[HarnessAttemptResult(ok=True, final_text=f"attempt-{i}") for i in range(3)],
@@ -253,14 +253,14 @@ def test_run_stops_retrying_once_retries_are_exhausted(monkeypatch):
     monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=2)
 
-    result = engine.run(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     # 1 initial attempt + 2 retries = 3 calls total, then gives up
     assert holder["manager"].harness_interaction_server.run_prompt_calls == ["p0", "retry", "retry"]
     assert result == HarnessAttemptResult(ok=True, final_text="attempt-2")
 
 
-def test_run_builds_execution_result_from_final_attempt(monkeypatch):
+def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     attempt = HarnessAttemptResult(ok=True, final_text="done")
     holder = _install_fake_host_server_manager(monkeypatch, results=[attempt])
     engine = agentEngine(_FakeAgent())
@@ -276,7 +276,7 @@ def test_run_builds_execution_result_from_final_attempt(monkeypatch):
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
     context = SimpleNamespace(marker="ctx")
 
-    result = engine.run(context, skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(context, skill, SimpleNamespace(), SimpleNamespace())
 
     assert result == "the-result"
     assert seen == {"context": context, "skill": skill, "attempt": attempt}

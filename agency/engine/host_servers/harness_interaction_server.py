@@ -91,7 +91,7 @@ class HarnessInteractionServer(HostServerBase):
     ) -> HarnessAttemptResult:
         """Deliver one prompt to the sandboxed harness manager via the inbox
         and block until it reports completion. Not an HTTP route -- called
-        directly by agentEngine.run(), in-process, on the agent's own
+        directly by agentEngine.execute(), in-process, on the agent's own
         worker thread. HostServerManager's uvicorn thread and anyio worker
         pool stay free to serve every other route while this blocks."""
         result_queue: "queue.Queue[HarnessAttemptResult]" = queue.Queue(maxsize=1)

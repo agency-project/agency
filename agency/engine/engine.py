@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 class agentEngine:
+    """Host-side execution owner for one agent."""
+
     def __init__(self, agent: "agent") -> None:
         self._agent = agent
         self._host_server_manager: "HostServerManager | None" = None
@@ -27,16 +29,18 @@ class agentEngine:
     @property
     def host_server_manager(self) -> "HostServerManager":
         if self._host_server_manager is None:
-            raise RuntimeError("run() has not built a HostServerManager yet")
+            raise RuntimeError("execute() has not built a HostServerManager yet")
         return self._host_server_manager
 
-    def run(
+    def execute(
         self,
         context: "agcontext",
         skill: "agskill",
         skill_input: "agdata",
         resource_pool: "agResourcePool",
+        max_steps: "int | None" = None,
     ) -> ExecutionResult:
+        """Execute one declarative skill request through the host services."""
         self._host_server_manager = HostServerManager(
             self._agent, self._agent.sandbox, skill, resource_pool
         )
