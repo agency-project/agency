@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from agency.agdata import agdata
+from agency.agcontext import agcontext
+from agency.agschema import agschema
 from agency.engine import engine as mod
 from agency.engine.engine import AgentEngine
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
@@ -332,3 +334,92 @@ def test_run_attempt_returns_original_rpc_response_without_host_callback():
 
     assert result is expected
     assert seen == [HarnessAttemptRequest(prompt=prompt, harness="claude_code", max_steps=7)]
+
+
+# ---------------------------------------------------------------------------
+# _build_execution_result
+# ---------------------------------------------------------------------------
+
+
+def test_build_execution_result_converts_successful_plain_text_attempt():
+    engine = AgentEngine(_FakeAgent())
+    engine._execution_prompt = PromptPayload("system", "do the work")
+    context = agcontext(messages=[{"role": "assistant", "content": "prior"}])
+    skill = SimpleNamespace(output_schema=None, _build_system_prompt=lambda: "system")
+
+    result = engine._build_execution_result(
+        context,
+        skill,
+        HarnessAttemptResult(ok=True, final_text="done", input_tokens=4, output_tokens=2),
+    )
+
+    assert result.ok is True
+    assert result.output == agdata(result="done")
+    assert result.context is context
+    assert context.total_input_tokens == 4
+    assert context.total_output_tokens == 2
+    assert context.messages == [
+        {"role": "assistant", "content": "prior"},
+        {"role": "user", "content": "do the work"},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert result.delta == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "do the work"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
+def test_build_execution_result_uses_collected_structured_output():
+    engine = AgentEngine(_FakeAgent())
+    engine._host_server_manager = SimpleNamespace(
+        host_mcp_server=SimpleNamespace(
+            collected_output=lambda: {"summary": "finished", "count": 2}
+        )
+    )
+    skill = SimpleNamespace(
+        output_schema=agschema(agdata(summary=str, count=int)),
+        _build_system_prompt=lambda: "system",
+    )
+
+    result = engine._build_execution_result(
+        agcontext(), skill, HarnessAttemptResult(ok=True, final_text="ignored")
+    )
+
+    assert result.ok is True
+    assert result.output == agdata(summary="finished", count=2)
+
+
+def test_build_execution_result_reports_incomplete_structured_output():
+    engine = AgentEngine(_FakeAgent())
+    engine._host_server_manager = SimpleNamespace(
+        host_mcp_server=SimpleNamespace(collected_output=lambda: {"summary": "finished"})
+    )
+    skill = SimpleNamespace(
+        output_schema=agschema(agdata(summary=str, count=int)),
+        _build_system_prompt=lambda: "system",
+    )
+
+    result = engine._build_execution_result(
+        agcontext(), skill, HarnessAttemptResult(ok=True, final_text="done")
+    )
+
+    assert result.ok is False
+    assert result.output.error == result.error_message
+    assert "count" in result.error_message
+
+
+def test_build_execution_result_converts_failed_or_missing_attempt_to_error():
+    engine = AgentEngine(_FakeAgent())
+    skill = SimpleNamespace(output_schema=None, _build_system_prompt=lambda: "system")
+
+    failed = engine._build_execution_result(
+        agcontext(), skill, HarnessAttemptResult(ok=False, error_message="daemon failed")
+    )
+    missing = engine._build_execution_result(agcontext(), skill, None)
+
+    assert failed.ok is False
+    assert failed.output.error == "daemon failed"
+    assert failed.error_message == "daemon failed"
+    assert missing.ok is False
+    assert missing.output.error == "no attempt was made"

@@ -24,6 +24,7 @@ class AgentEngine:
         self._agent = agent
         self._host_server_manager: "HostServerManager | None" = None
         self._sandbox_interaction_client: "SandboxInteractionClient | None" = None
+        self._execution_prompt: "PromptPayload | None" = None
 
     def set_config(self, agconfig: "agConfig") -> None:
         if self._host_server_manager is not None:
@@ -67,6 +68,7 @@ class AgentEngine:
 
             # build the prompt
             prompt = self._build_prompt_payload(skill, skill_input)
+            self._execution_prompt = prompt
             retries_left = skill.max_output_schema_retries
             attempt: "HarnessAttemptResult | None" = None
             while True:
@@ -136,4 +138,54 @@ class AgentEngine:
     def _build_execution_result(
         self, context: "agcontext", skill: "agskill", attempt: "HarnessAttemptResult | None"
     ) -> ExecutionResult:
-        raise NotImplementedError
+        from ..agdata import agdata, agerror
+
+        system_message = {"role": "system", "content": skill._build_system_prompt()}
+        if attempt is None or not attempt.ok:
+            message = attempt.error_message if attempt is not None else "no attempt was made"
+            return ExecutionResult(
+                output=agerror(message),
+                context=context,
+                delta=[system_message],
+                ok=False,
+                error_message=message,
+            )
+
+        output_schema = skill.output_schema
+        if output_schema is not None and output_schema.raw_key() is None:
+            collected = self._host_server_manager.host_mcp_server.collected_output()
+            missing = sorted(set(output_schema._data) - set(collected))
+            if missing:
+                message = (
+                    "structured output incomplete after retries -- submit_output was never "
+                    "called for: " + ", ".join(missing)
+                )
+                output = agerror(message)
+                ok = False
+                error_message = message
+            else:
+                output = agdata(**collected)
+                ok = True
+                error_message = ""
+        else:
+            output_key = output_schema.raw_key() if output_schema is not None else "result"
+            output = agdata(**{output_key: attempt.final_text})
+            ok = True
+            error_message = ""
+
+        context.total_input_tokens += attempt.input_tokens
+        context.total_output_tokens += attempt.output_tokens
+
+        messages: "list[dict]" = []
+        if self._execution_prompt is not None:
+            messages.append({"role": "user", "content": self._execution_prompt.user_content})
+        messages.append({"role": "assistant", "content": attempt.final_text})
+        context.messages.extend(messages)
+
+        return ExecutionResult(
+            output=output,
+            context=context,
+            delta=[system_message, *messages],
+            ok=ok,
+            error_message=error_message,
+        )
