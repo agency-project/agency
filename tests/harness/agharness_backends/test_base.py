@@ -13,16 +13,16 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agcontext import agcontext
 from agency.agdata import agdata, agerror
-from agency.harness.agharness_backends.base import (
+from agency.harness.adapters.base import (
     AttemptResult,
     agharness_backend,
     agHarnessConfig,
 )
-from agency.harness.agharness_backends.opencode import _OpencodeBackend
-from agency.harness.agharness_backends.claude_code import _ClaudeCodeBackend
-from agency.harness.agharness_backends.codex import _CodexBackend
-from agency.harness.agharness_backends.grok import _GrokBackend
-from agency.harness.agharness_backends.native import _NativeBackend
+from agency.harness.adapters.opencode import _OpencodeBackend
+from agency.harness.adapters.claude_code import _ClaudeCodeBackend
+from agency.harness.adapters.codex import _CodexBackend
+from agency.harness.adapters.grok import _GrokBackend
+from agency.harness.adapters.native import _NativeBackend
 from agency.agskill import agskill
 
 

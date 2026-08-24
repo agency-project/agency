@@ -105,7 +105,7 @@ def _run_one(spec: ModelSpec, run_root: Path) -> tuple[bool, str]:
     agent.log_dir = model_dir / "logs"
     agent.output_dir = None
 
-    ag = agent(agconfig=_config_for(spec), engine="native")
+    ag = agent(agconfig=_config_for(spec), harness="native")
     try:
         result = ag.run(
             _probe_skill(),
