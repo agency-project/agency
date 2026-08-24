@@ -45,7 +45,7 @@ def resolve_mediation_mode(mediation_mode: str) -> str:
     through unchanged (an explicit request is never silently overridden)."""
     if mediation_mode != "auto":
         return mediation_mode
-    from .agproxy_ptrace import ptrace_available
+    from .ptrace.supervisor import ptrace_available
 
     return "ptrace" if ptrace_available() else "native_hooks"
 

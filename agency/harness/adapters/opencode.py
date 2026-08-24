@@ -62,7 +62,7 @@ class _OpencodeBackend(agharness_backend):
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from .. import agharness
         from ..agproxy_llm import get_shared_gateway
-        from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
+        from ..ptrace.supervisor import agProxyPtrace, wire_to_sandbox
 
         sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
 

@@ -30,15 +30,15 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from ..agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
-from ..agpolicy import agdecision
-from ._syscall_event import agsyscallevent
-from .agproxy_ptrace_internal._tracer_loop import SeccompStop, StopDecision, TracerLoop
+from ...agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
+from ...agpolicy import agdecision
+from .._syscall_event import agsyscallevent
+from ._tracer_loop import SeccompStop, StopDecision, TracerLoop
 
 if TYPE_CHECKING:
-    from ..agconfig import agConfig
-    from ..agent import agent
-    from ..agpolicy import agpolicy
+    from ...agconfig import agConfig
+    from ...agent import agent
+    from ...agpolicy import agpolicy
 
 
 _ptrace_available_cache: "bool | None" = None
@@ -65,7 +65,7 @@ def _probe_ptrace_available() -> bool:
     if platform.machine() not in ("x86_64", "AMD64"):
         return False
     try:
-        from .agproxy_ptrace_internal import _ctypes_defs as pt
+        from .ptrace import _ctypes_defs as pt
     except Exception:
         return False
     try:
@@ -204,7 +204,7 @@ class _ProcessLifecycleProfiler:
     def for_active_session(
         cls, ag: "agent | None", envp: "dict[str, str]", *, timing: str = "exact"
     ) -> "_ProcessLifecycleProfiler | None":
-        from ..profiler import agprof
+        from ...profiler import agprof
 
         if not agprof.enabled():
             return None
@@ -222,7 +222,7 @@ class _ProcessLifecycleProfiler:
         )
 
     def on_spawn(self, pid: int) -> None:
-        from ..profiler import agprof
+        from ...profiler import agprof
 
         start_perf_ns = time.perf_counter_ns()
         start_wall_ns = time.time_ns()
@@ -292,7 +292,7 @@ class _ProcessLifecycleProfiler:
 
     def finalize(self) -> None:
         """Preserve every still-live process as an interrupted agprof span."""
-        from ..profiler import agprof
+        from ...profiler import agprof
 
         with self._lock:
             if self._finalized:
@@ -465,7 +465,7 @@ class agProxyPtrace:
         )
 
         if container_launch:
-            from .agproxy_ptrace_internal._in_container_launcher import InContainerRelay
+            from ..old_ptrace._in_container_launcher import InContainerRelay
 
             relay = InContainerRelay(
                 sandbox=sandbox,

@@ -193,7 +193,7 @@ class _ClaudeCodeBackend(agharness_backend):
     ) -> AttemptResult:
         from .. import agharness
         from ...profiler import agprof
-        from ..agproxy_ptrace import agProxyPtrace, wire_to_sandbox
+        from ..ptrace.supervisor import agProxyPtrace, wire_to_sandbox
 
         binary = self.binary_path or self._DEFAULT_BINARY
         # See docs/Design_harness_integration.md's Prerequisites: a
