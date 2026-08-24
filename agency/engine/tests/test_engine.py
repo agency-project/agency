@@ -95,12 +95,12 @@ def test_host_server_manager_property_raises_before_run():
 # ---------------------------------------------------------------------------
 
 
-def test_set_config_forwards_to_agent_change_config():
+def test_set_config_does_not_propagate_back_to_agent():
     agent = _FakeAgent()
     engine = AgentEngine(agent)
     new_cfg = SimpleNamespace(marker="new")
     engine.set_config(new_cfg)
-    assert agent.change_config_calls == [new_cfg]
+    assert agent.change_config_calls == []
 
 
 def test_set_config_does_not_touch_host_server_manager_when_not_yet_built():

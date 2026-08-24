@@ -330,7 +330,8 @@ class agent:
         """Replace this agent's agconfig with a clone of the given one, and
         push that same clone down to every sub-object that holds its own
         independent copy (``self.llm`` -- and its backend --, ``self.log``,
-        and ``self.sandbox`` if one has been created). Reassigning
+        ``self.sandbox`` if one has been created, and ``self.engine``).
+        Reassigning
         ``self.agconfig`` alone does not reach those clones, so this is the
         supported way to change live config (e.g. ``max_completion_tokens``)
         after construction."""
@@ -339,6 +340,7 @@ class agent:
         self.log.change_config(self.agconfig)
         if self.sandbox is not None:
             self.sandbox.change_config(self.agconfig)
+        self.engine.set_config(self.agconfig)
         self._emit_config()
 
     def get_config_copy(self) -> "agConfig | None":

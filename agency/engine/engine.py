@@ -22,7 +22,6 @@ class AgentEngine:
         self._host_server_manager: "HostServerManager | None" = None
 
     def set_config(self, agconfig: "agConfig") -> None:
-        self._agent.change_config(agconfig)
         if self._host_server_manager is not None:
             self._host_server_manager.set_config(agconfig)
 
