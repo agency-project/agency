@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 
 from agency.agpolicy import agpolicy
 from agency.engine.host_servers.interaction_server import HostInteractionServer
-from agency.engine.types import HarnessAttemptResult
 from agency.harness._syscall_event import agsyscallevent
+from agency.harness.protocol import HarnessAttemptResult
 
 
 # ---------------------------------------------------------------------------

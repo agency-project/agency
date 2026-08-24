@@ -9,23 +9,6 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class PromptPayload:
-    system_instruction: str
-    user_content: "str | list[dict]"
-    output_instruction: "str | None"
-
-
-@dataclass
-class HarnessAttemptResult:
-    ok: bool
-    final_text: str = ""
-    input_tokens: int = 0
-    output_tokens: int = 0
-    session_id: "str | None" = None
-    error_message: str = ""
-
-
-@dataclass
 class ExecutionResult:
     output: "agdata"
     context: "agcontext"

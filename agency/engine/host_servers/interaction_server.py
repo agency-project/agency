@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from ..types import HarnessAttemptResult
 from ...harness._syscall_event import agsyscallevent
+from ...harness.protocol import HarnessAttemptResult
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:

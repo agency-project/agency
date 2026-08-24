@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..harness.protocol import HarnessAttemptResult, PromptPayload
 from .host_servers.host_server_manager import HostServerManager
-from .types import ExecutionResult, HarnessAttemptResult, PromptPayload
+from .types import ExecutionResult
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig

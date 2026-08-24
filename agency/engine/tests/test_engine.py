@@ -10,7 +10,7 @@ import pytest
 from agency.agdata import agdata
 from agency.engine import engine as mod
 from agency.engine.engine import AgentEngine
-from agency.engine.types import HarnessAttemptResult, PromptPayload
+from agency.harness.protocol import HarnessAttemptResult, PromptPayload
 
 # ---------------------------------------------------------------------------
 # Helpers
