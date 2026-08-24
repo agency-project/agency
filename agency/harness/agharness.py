@@ -211,8 +211,6 @@ class _LoggingAllowAllPolicy:
         self._ag = ag
 
     def check(self, ag, event):
-        from ..agpolicy import agdecision
-
         try:
             self._ag.log._tool_call(
                 event.syscall,
@@ -223,20 +221,21 @@ class _LoggingAllowAllPolicy:
         except Exception as _e:
             # logging is best-effort; never let it block the traced process
             print(f"[agharness] WARNING: failed to log syscall {event.syscall!r}: {_e}")
-        return agdecision.allow()
+        return True
 
     def check_tool(self, ag, tool_name: str, tool_input: dict):
-        from ..agpolicy import agdecision
-
         try:
             self._ag.log._tool_call(tool_name, tool_input, {}, 0)
         except Exception as _e:
             # logging is best-effort; never let it block the harness
             print(f"[agharness] WARNING: failed to log tool call {tool_name!r}: {_e}")
-        return agdecision.allow()
+        return True
 
 
 def default_policy(ag: "agent"):
+    syscall_policy = getattr(ag, "__dict__", {}).get("syscall_policy")
+    if syscall_policy is not None:
+        return syscall_policy
     return _LoggingAllowAllPolicy(ag)
 
 

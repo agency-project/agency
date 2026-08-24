@@ -12,9 +12,14 @@ import socket
 import struct
 import time
 import uuid
+from dataclasses import asdict
+from typing import TYPE_CHECKING
 
 import httpx
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
+
+if TYPE_CHECKING:
+    from .._syscall_event import agsyscallevent
 
 
 def _recv_exactly(sock, n: int) -> bytes:
@@ -96,6 +101,14 @@ class HostServicesClient:
             "decision": "allow" if result.get("allowed") else "deny",
             "reason": result.get("reason"),
         }
+
+    def check_syscall_policy(self, syscall: "agsyscallevent") -> "bool | tuple[bool, str]":
+        response = self.client.post("/interaction/check_syscall", json=asdict(syscall))
+        response.raise_for_status()
+        result = response.json()
+        allowed = bool(result.get("allowed"))
+        reason = result.get("reason")
+        return (allowed, reason) if reason else allowed
 
     def dispatch(self, token: str, kwargs: dict):
         """Non-streaming: returns a real `ChatCompletion`. Streaming:

@@ -93,8 +93,7 @@ def test_default_policy_check_returns_allow():
     ag.log = MagicMock()
     policy = agharness.default_policy(ag)
     event = MagicMock(syscall="execve", argv=["/bin/echo"], path=None)
-    decision = policy.check(ag, event)
-    assert decision.kind == "allow"
+    assert policy.check(ag, event) is True
     ag.log._tool_call.assert_called_once()
 
 
@@ -103,5 +102,4 @@ def test_default_policy_logging_failure_does_not_raise():
     ag.log._tool_call.side_effect = RuntimeError("log write failed")
     policy = agharness.default_policy(ag)
     event = MagicMock(syscall="execve", argv=["/bin/echo"], path=None)
-    decision = policy.check(ag, event)  # must not raise
-    assert decision.kind == "allow"
+    assert policy.check(ag, event) is True  # must not raise

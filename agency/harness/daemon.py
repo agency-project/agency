@@ -30,6 +30,16 @@ from .servers import SandboxInteractionServer
 _HARNESS_API_PORT = 8766
 
 
+class _HostSyscallPolicy:
+    """Ptrace policy adapter backed by the host interaction service."""
+
+    def __init__(self, host_services: HostServicesClient) -> None:
+        self._host_services = host_services
+
+    def check(self, _agent, syscall):
+        return self._host_services.check_syscall_policy(syscall)
+
+
 class _LocalSandboxBackend:
     IMAGE_KIND = "container"
 
@@ -71,6 +81,7 @@ class _LocalSandbox:
 class _HarnessApiServer:
     def __init__(self, host_uds_path: str, port: int) -> None:
         self._bridge = HostServicesClient(host_uds_path, None)
+        self.syscall_policy = _HostSyscallPolicy(self._bridge)
         self._port = port
         self._server: "uvicorn.Server | None" = None
         self._thread: "threading.Thread | None" = None
@@ -130,6 +141,7 @@ def _run_adapter_attempt(
     harness_base_url: str,
     model: str,
     engine_name: str,
+    syscall_policy,
 ) -> HarnessAttemptResult:
     try:
         adapter = agharness_backend.for_config(request.harness, agconfig)
@@ -152,6 +164,7 @@ def _run_adapter_attempt(
             agname=engine_name,
             llm=SimpleNamespace(backend=SimpleNamespace(model=model)),
             log=SimpleNamespace(_tool_call=lambda *_args, **_kwargs: None),
+            syscall_policy=syscall_policy,
         )
         skill = SimpleNamespace(name=engine_name, add_tools=None, replace_tools=None)
         launch = SimpleNamespace(token=f"daemon-{engine_name}")
@@ -203,6 +216,7 @@ class HarnessManager:
                 self._harness_api.base_url,
                 self._harness_api.resolve_model(),
                 self._engine_name,
+                self._harness_api.syscall_policy,
             )
         except Exception as exc:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")

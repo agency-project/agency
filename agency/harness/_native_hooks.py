@@ -6,7 +6,7 @@ this module exists only for the case it explicitly isn't (non-Linux, or a
 sandboxed environment where `ptrace_available()` genuinely returns False).
 
 Scope deliberately narrow: this provides the hook-JSON <-> `agsyscallevent`/
-`agdecision` translation (the part worth writing once, correctly, since
+allow-or-deny translation (the part worth writing once, correctly, since
 Claude Code's and Codex's PreToolUse/PostToolUse hook payload shapes are
 near-identical), and `resolve_mediation_mode()` to decide which path a
 launch should take. It is NOT wired into `claude_code.py`/`opencode.py`/
@@ -32,12 +32,7 @@ under the backends it happens to currently only be used to support.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from ._syscall_event import agsyscallevent
-
-if TYPE_CHECKING:
-    from ..agpolicy import agdecision
 
 
 def resolve_mediation_mode(mediation_mode: str) -> str:
@@ -76,24 +71,15 @@ def hook_payload_to_syscallevent(payload: dict):
     )
 
 
-def decision_to_hook_response(decision: "agdecision") -> dict:
-    """Translate an `agdecision` back into the `PreToolUse` JSON response
-    shape Claude Code/Codex hooks expect (`hookSpecificOutput` with
-    `permissionDecision` + optional `updatedInput`)."""
-    if decision.kind == "deny":
+def decision_to_hook_response(decision: "bool | tuple[bool, str]") -> dict:
+    """Translate the shared allow-or-deny result into hook JSON."""
+    allowed, reason = decision if isinstance(decision, tuple) else (decision, None)
+    if not allowed:
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": decision.reason or "denied by agpolicy",
-            }
-        }
-    if decision.kind == "rewrite" and decision.new_args:
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "updatedInput": {"command": " ".join(decision.new_args)},
+                "permissionDecisionReason": reason or "denied by agpolicy",
             }
         }
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
