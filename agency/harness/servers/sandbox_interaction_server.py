@@ -56,6 +56,8 @@ class SandboxInteractionServer:
                 prompt=prompt,
                 harness=payload["harness"],
                 max_steps=payload.get("max_steps"),
+                resume_session_id=payload.get("resume_session_id"),
+                prior_session_blob_b64=payload.get("prior_session_blob_b64"),
             )
             return JSONResponse(asdict(self._attempt_handler(request)))
 

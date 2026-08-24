@@ -71,6 +71,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
                 input_tokens=12,
                 output_tokens=3,
                 session_id="mock-session",
+                session_blob_b64="bW9jay1ibG9i",
             )
 
         sandbox_server = HarnessManager(
@@ -121,6 +122,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
             input_tokens=12,
             output_tokens=3,
             session_id="mock-session",
+            session_blob_b64="bW9jay1ibG9i",
         )
     finally:
         release_attempt_result.set()

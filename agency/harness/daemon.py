@@ -8,6 +8,7 @@ HTTP-over-UDS request that submitted them.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import signal
 import subprocess
@@ -175,8 +176,12 @@ def _run_adapter_attempt(
             launch,
             skill,
             prompt=_render_attempt_prompt(request),
-            resume_session_id=None,
-            prior_session_blob=None,
+            resume_session_id=request.resume_session_id,
+            prior_session_blob=(
+                base64.b64decode(request.prior_session_blob_b64)
+                if request.prior_session_blob_b64 is not None
+                else None
+            ),
             max_steps=request.max_steps,
         )
     except Exception as exc:
@@ -187,6 +192,11 @@ def _run_adapter_attempt(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         session_id=result.session_id,
+        session_blob_b64=(
+            base64.b64encode(result.session_blob).decode("ascii")
+            if result.session_blob is not None
+            else None
+        ),
         error_message=result.error_message,
     )
 

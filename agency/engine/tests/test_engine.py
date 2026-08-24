@@ -25,6 +25,7 @@ class _FakeAgent:
         self.sandbox = SimpleNamespace(marker="sandbox")
         self.harness = "claude_code"
         self.agname = "test-agent"
+        self._harness_sessions = {}
         self.change_config_calls = []
         self.inbox = queue.Queue()
 
@@ -272,6 +273,55 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
 
     assert [request.prompt for request in holder["requests"]] == [p0, p1]
     assert result == HarnessAttemptResult(ok=True, final_text="second")
+
+
+def test_execute_transports_and_captures_session_blobs(monkeypatch):
+    holder = _install_fake_host_server_manager(
+        monkeypatch,
+        results=[
+            HarnessAttemptResult(
+                ok=True,
+                final_text="first",
+                session_id="session-2",
+                session_blob_b64="dXBkYXRlZA==",
+            ),
+            HarnessAttemptResult(
+                ok=True,
+                final_text="second",
+                session_id="session-2",
+                session_blob_b64="ZmluYWw=",
+            ),
+        ],
+        collected_sequence=[{}, {"summary": "x"}],
+    )
+    agent = _FakeAgent()
+    agent._harness_sessions["claude_code"] = {
+        "session_id": "session-1",
+        "blob_b64": "cHJpb3I=",
+    }
+    engine = AgentEngine(agent)
+    prompt = PromptPayload("system", "prompt")
+    monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: prompt)
+    monkeypatch.setattr(engine, "_build_retry_prompt", lambda *_args, **_kwargs: prompt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda _c, _s, attempt: attempt)
+    skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=1)
+
+    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+
+    first, second = holder["requests"]
+    assert (first.resume_session_id, first.prior_session_blob_b64) == (
+        "session-1",
+        "cHJpb3I=",
+    )
+    assert (second.resume_session_id, second.prior_session_blob_b64) == (
+        "session-2",
+        "dXBkYXRlZA==",
+    )
+    assert agent._harness_sessions["claude_code"] == {
+        "session_id": "session-2",
+        "blob_b64": "ZmluYWw=",
+    }
+    assert result.final_text == "second"
 
 
 def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):

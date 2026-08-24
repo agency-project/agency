@@ -10,6 +10,8 @@ def test_harness_attempt_request_round_trips_through_json():
     request = HarnessAttemptRequest(
         harness="claude_code",
         max_steps=20,
+        resume_session_id="session-122",
+        prior_session_blob_b64="cHJpb3I=",
         prompt=PromptPayload(
             system_instruction="system",
             user_content="fix the bug",
@@ -26,6 +28,8 @@ def test_harness_attempt_request_round_trips_through_json():
         },
         "harness": "claude_code",
         "max_steps": 20,
+        "resume_session_id": "session-122",
+        "prior_session_blob_b64": "cHJpb3I=",
     }
     prompt = PromptPayload(**decoded.pop("prompt"))
     assert HarnessAttemptRequest(prompt=prompt, **decoded) == request
@@ -53,6 +57,7 @@ def test_harness_attempt_result_round_trips_through_json():
         input_tokens=100,
         output_tokens=20,
         session_id="session-123",
+        session_blob_b64="c2Vzc2lvbiBzdGF0ZQ==",
     )
 
     decoded = json.loads(json.dumps(asdict(result)))
@@ -63,6 +68,7 @@ def test_harness_attempt_result_round_trips_through_json():
         "input_tokens": 100,
         "output_tokens": 20,
         "session_id": "session-123",
+        "session_blob_b64": "c2Vzc2lvbiBzdGF0ZQ==",
         "error_message": "",
     }
     assert HarnessAttemptResult(**decoded) == result

@@ -1,13 +1,57 @@
 from __future__ import annotations
 
+import base64
 import uuid
 from pathlib import Path
 
 from agency.agconfig import agConfig
 from agency.engine.clients import SandboxInteractionClient
 from agency.harness import daemon
+from agency.harness.adapters.base import AttemptResult, agharness_backend
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
+
+
+def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
+    seen = {}
+
+    class FakeAdapter(agharness_backend):
+        engine_key = "fake"
+
+        def _run_attempt(self, *args, **kwargs):
+            seen.update(kwargs)
+            return AttemptResult(
+                ok=True,
+                final_text="done",
+                session_id="session-2",
+                session_blob=b"updated session state",
+            )
+
+    monkeypatch.setattr(
+        agharness_backend,
+        "for_config",
+        classmethod(lambda cls, name, config: FakeAdapter(config)),
+    )
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system", "user"),
+        harness="fake",
+        resume_session_id="session-1",
+        prior_session_blob_b64=base64.b64encode(b"prior session state").decode("ascii"),
+    )
+
+    result = daemon._run_adapter_attempt(
+        request,
+        agConfig(),
+        "http://127.0.0.1:8766",
+        "model",
+        "agent-1",
+        object(),
+    )
+
+    assert seen["resume_session_id"] == "session-1"
+    assert seen["prior_session_blob"] == b"prior session state"
+    assert result.session_id == "session-2"
+    assert base64.b64decode(result.session_blob_b64) == b"updated session state"
 
 
 def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
@@ -65,6 +109,7 @@ def test_harness_manager_returns_attempt_result_on_original_rpc():
         input_tokens=5,
         output_tokens=2,
         session_id="session-1",
+        session_blob_b64="c2Vzc2lvbiBzdGF0ZQ==",
     )
     seen = []
     manager = HarnessManager(
