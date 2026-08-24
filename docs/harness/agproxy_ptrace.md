@@ -1,4 +1,4 @@
-# Syscall-level supervisor (`harness/agproxy_ptrace.py`, `harness/agproxy_ptrace_internal/`)
+# Syscall-level supervisor (`harness/ptrace/`)
 
 > See [Design_harness_integration.md](../Design_harness_integration.md) ("Component 3") for the
 > full design rationale — this doc covers the concrete implementation.
@@ -10,20 +10,20 @@ and, transitively, tracer of everything it forks/execs (`PTRACE_O_TRACEFORK`/`_V
 observing every trapped syscall before it runs — with no cooperation required from the traced
 binary, unlike a harness's own hook system.
 
-x86_64 Linux only — `seccomp`+`PTRACE_EVENT_SECCOMP` has no macOS/BSD equivalent. Guarded at
-import time by `harness/agproxy_ptrace_internal/_ctypes_defs.py`'s `_arch_guard()`.
+x86_64 Linux only — `seccomp`+`PTRACE_EVENT_SECCOMP` has no macOS/BSD equivalent. The
+architecture-specific implementation is loaded only when a launch begins; `ptrace_available()`
+returns `False` without importing it on unsupported hosts.
 
 ## Public API
 
 ```python
-from agency.harness.agproxy_ptrace import agProxyPtrace, ptrace_available
-from agency.agpolicy import agpolicy, agdecision
+from agency.harness.ptrace.supervisor import agProxyPtrace, ptrace_available
 
-class MyPolicy(agpolicy):
-    def check(self, ag, event) -> agdecision:
+class MyPolicy:
+    def check(self, ag, event) -> bool | tuple[bool, str]:
         if event.argv and event.argv[0] == "/bin/rm":
-            return agdecision.deny("no rm allowed")
-        return agdecision.allow()
+            return (False, "no rm allowed")
+        return True
 
 px = agProxyPtrace()
 handle = px.launch(["some-cli", "--flag"], envp={"PATH": "/usr/bin"}, cwd="/workspace", policy=MyPolicy())
@@ -49,11 +49,10 @@ stdout, stderr, returncode = handle.wait(timeout=300)
   candidate that fails produces no callback. `PTRACE_EVENT_CLONE` tracees are checked by thread-group ID;
   non-leader threads remain traced internally but do not reach these process callbacks. Registering
   after some events have already happened still replays them — see `TracerLoop`'s backlog lists.
-  Pass `include_exit_code=True` to `.on_exit()` for `(pid, exit_code)`. This is the seam Phase 2
-  wires into `agsandbox_backend.ingest_ptrace_pids()` and agprof lifecycle spans.
-- Host ptrace lifecycle spans carry `timing="exact"`. In-container lifecycle callbacks cross the
-  UDS relay before the host timestamps them, so those spans explicitly carry
-  `timing="host-observed"` rather than hiding unmeasured boundary jitter behind an exact label.
+  Pass `include_exit_code=True` to `.on_exit()` for `(pid, exit_code)`. These events also feed
+  agprof lifecycle spans.
+- Ptrace runs in the sandbox Harness Manager daemon, so process lifecycle timestamps are local
+  to the tracer and carry `timing="exact"`; there is no separate relay protocol.
 - `.kill()` — SIGKILLs every currently-known traced pid.
 - `ptrace_available()` — process-lifetime-cached probe (mirrors
   `sandbox/chroot.py`'s `chroot_available()`): a live fork+`PTRACE_TRACEME` smoke test,
@@ -74,8 +73,7 @@ class agsyscallevent:
     timestamp: float
 ```
 
-Only `execve`/`execveat` argument resolution is implemented so far (Phase 1) — `openat`/`open`
-path resolution and process lifecycle event routing land in Phase 2.
+`execve`/`execveat` argument and `openat`/`open` path resolution are implemented.
 
 ## Config
 
@@ -88,10 +86,9 @@ path resolution and process lifecycle event routing land in Phase 2.
 | `syscalls` | dynamic | `("execve", "execveat")` | Which syscalls the seccomp filter traps. |
 | `profiler` | dynamic | `None` | Reserved for a future heavyweight process profiler (for example `perf`). The low-cost agprof process-lifecycle spans are automatic whenever an agprof session is active and do not consume this selector. |
 | `disable_harness_native_sandbox` | dynamic | `True` | Advisory only — see the design doc's "Design Tensions" on seccomp filter stacking. |
-| `enabled_for_sandbox` | global | `False` | Whether agsandbox container backends add the `CAP_SYS_PTRACE` + custom seccomp profile a containerized traced process needs (Phase 2). |
 | `attach_timeout_s` | global | `30` | Ceiling on waiting for the traced process's initial post-`TRACEME` stop. |
 
-## Implementation notes (`harness/agproxy_ptrace_internal/`)
+## Implementation notes (`harness/ptrace/`)
 
 - **`_ctypes_defs.py`** — raw `ptrace()`/`process_vm_readv()`/`process_vm_writev()` bindings.
   Every FFI call site sets `restype`/`argtypes` explicitly: an unconfigured `ctypes` foreign
@@ -119,11 +116,8 @@ path resolution and process lifecycle event routing land in Phase 2.
     that would race with and could steal the exit status those other call sites are waiting on.
     Verified during development against a concurrent unrelated `subprocess.Popen` child, which
     was reaped correctly through `subprocess`'s own machinery, untouched by this loop.
-  - A `deny` decision skips the syscall (`orig_rax = -1`) and sets `rax` to `-EPERM` in two
-    separate `GETREGS`/`SETREGS` round-trips (combining both writes into one `SETREGS` call is
-    unverified and not attempted). A `rewrite` decision injects new `argv`/path strings into
-    scratch stack memory below the tracee's `rsp` (`_ctypes_defs.inject_argv`) and repoints
-    `rdi`/`rsi` at them before resuming.
+  - A denied syscall is skipped (`orig_rax = -1`) and reports `EPERM`; an allowed syscall resumes
+    normally. The current `agpolicy` contract is allow/deny only.
   - Output (stdout/stderr) is drained continuously by dedicated reader threads for the lifetime
     of the launch, not just inside `wait()` — a traced process that writes more than one pipe
     buffer's worth of output before anyone reads it would otherwise deadlock.
