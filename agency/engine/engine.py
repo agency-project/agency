@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..agconfig import agConfig
 from ..harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
+from ..sandbox.agsandbox import agSandbox, agSandboxConfig
 from .harness_daemon_launcher import ensure_harness_daemon
 from .host_servers.host_server_manager import HostServerManager
 from .types import ExecutionResult
@@ -45,6 +48,8 @@ class AgentEngine:
         max_steps: "int | None" = None,
     ) -> ExecutionResult:
         """Execute one declarative skill request through the host services."""
+
+        self.ensure_sandbox()
 
         # Start connections
         self._host_server_manager = HostServerManager(
@@ -109,6 +114,31 @@ class AgentEngine:
                 self._sandbox_interaction_client.close()
                 self._sandbox_interaction_client = None
             self._host_server_manager.stop()
+
+    # ------------------------------------------------------------------
+    # sandbox lifecycle
+    # ------------------------------------------------------------------
+
+    def ensure_sandbox(self) -> "agSandbox":
+        """Provision this agent's sandbox before execution begins."""
+        if self._agent.sandbox is not None:
+            return self._agent.sandbox
+
+        output_dir = (
+            self._agent.agconfig.get("agent", "output_dir", type(self._agent).output_dir)
+            if self._agent.agconfig is not None
+            else type(self._agent).output_dir
+        )
+        agent_output_dir = Path(output_dir) / self._agent.agname if output_dir else None
+        sandbox_config = self._agent.agconfig
+        if agent_output_dir is not None:
+            sandbox_config = sandbox_config.clone() if sandbox_config else agConfig()
+            agSandboxConfig(sandbox_config).add_mount(
+                "agent_output", agent_output_dir, "/agent_output"
+            )
+
+        self._agent.sandbox = agSandbox(self._agent.agname, agconfig=sandbox_config)
+        return self._agent.sandbox
 
     # ------------------------------------------------------------------
     # internal

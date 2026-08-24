@@ -3,7 +3,6 @@ import json
 import threading
 import time
 from concurrent.futures import Future
-from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agpolicy import agpolicy
@@ -14,8 +13,8 @@ from .agschema import agschema
 from .agcontext import agcontext
 from .agtool import agtool
 from .llm.agllm import agllm
-from .sandbox.agsandbox import agSandbox, agSandboxConfig
-from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
+from .sandbox.agsandbox import agSandbox
+from .agconfig import DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
 from .aglog import _ts
 
@@ -494,26 +493,17 @@ class agskill:
                 # value's own contents in place.
                 local_skill_input = agdata(**dict(skill_input._data))
 
-                # ── 2. Provision sandbox — created once on first run and reused
-                #    across subsequent runs via its internal checkpoint image.
-                if ag.sandbox is None:
-                    with agprof.span("sandbox:provision"):
-                        # [REFACTOR] Do smth with out dir
-                        _out_dir = (
-                            ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
-                            if ag.agconfig is not None
-                            else type(ag).output_dir
-                        )
-                        _out = Path(_out_dir) / ag.agname if _out_dir else None
-                        sb_cfg = ag.agconfig
-                        if _out is not None:
-                            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-                            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
-                        ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
+                # Sandbox provisioning now belongs to the engine. This
+                # explicit call is temporary: agskill still owns lock
+                # acquisition in this step and therefore needs the sandbox
+                # before execute() begins.
+                with agprof.span("sandbox:provision"):
+                    ag.engine.ensure_sandbox()
 
                 # Hold the sandbox's lock for the rest of the skill run so a
                 # sandbox shared across agents is never driven by more than
                 # one skill run at a time — released in the teardown below.
+                assert ag.sandbox is not None
                 sandbox_lock = ag.sandbox._lock
                 sandbox_lock.acquire()
 
@@ -527,9 +517,7 @@ class agskill:
                 ag._set_ui_state("skill", skill=self.name)
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
-                # ── 3. Delegate actual execution to the Agent Engine.
-                # agskill owns only the scheduling/future wrapper; it is passed
-                # to the engine as the declarative skill definition.
+                # ── 2. Delegate actual execution to the Agent Engine.
                 execution = ag.engine.execute(
                     context=prev_ctx,
                     skill=self,
@@ -537,6 +525,7 @@ class agskill:
                     resource_pool=type(ag).agresource_pool,
                     max_steps=max_steps,
                 )
+
                 outer_result = execution.output
                 updated_ctx = execution.context
                 outer_delta = execution.delta

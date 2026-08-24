@@ -20,6 +20,8 @@ from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult,
 
 
 class _FakeAgent:
+    output_dir = None
+
     def __init__(self):
         self.agconfig = SimpleNamespace(marker="agconfig")
         self.sandbox = SimpleNamespace(marker="sandbox")
@@ -194,6 +196,58 @@ def test_missing_output_fields_diffs_against_collected_output():
 # ---------------------------------------------------------------------------
 # execute()
 # ---------------------------------------------------------------------------
+
+
+def test_execute_provisions_sandbox_before_building_host_services(monkeypatch):
+    holder = _install_fake_host_server_manager(
+        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
+    )
+    agent = _FakeAgent()
+    agent.agconfig = None
+    agent.sandbox = None
+    sandbox = SimpleNamespace(marker="provisioned")
+    created = []
+
+    def fake_sandbox(agname, *, agconfig):
+        created.append((agname, agconfig))
+        return sandbox
+
+    monkeypatch.setattr(mod, "agSandbox", fake_sandbox)
+    engine = AgentEngine(agent)
+    monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: "prompt")
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: "result")
+    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
+
+    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+
+    assert result == "result"
+    assert created == [("test-agent", None)]
+    assert agent.sandbox is sandbox
+    assert holder["manager"].sandbox is sandbox
+
+
+def test_ensure_sandbox_preserves_agent_output_mount(monkeypatch, tmp_path):
+    monkeypatch.setattr(_FakeAgent, "output_dir", tmp_path)
+    agent = _FakeAgent()
+    agent.agconfig = None
+    agent.sandbox = None
+    captured = {}
+    sandbox = SimpleNamespace(marker="provisioned")
+
+    def fake_sandbox(agname, *, agconfig):
+        captured["agname"] = agname
+        captured["agconfig"] = agconfig
+        return sandbox
+
+    monkeypatch.setattr(mod, "agSandbox", fake_sandbox)
+
+    result = AgentEngine(agent).ensure_sandbox()
+
+    assert result is sandbox
+    assert captured["agname"] == "test-agent"
+    assert captured["agconfig"].get("agSandbox", "mounts", {}) == {
+        "agent_output": (str(tmp_path / "test-agent"), "/agent_output", "rw")
+    }
 
 
 def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypatch):
