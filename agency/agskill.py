@@ -509,6 +509,9 @@ class agskill:
                     resource_pool=type(ag).agresource_pool,
                     max_steps=max_steps,
                 )
+                outer_result = execution.output
+                updated_ctx = execution.context
+                outer_delta = execution.delta
 
                 outer_result = execution.output
                 updated_ctx = execution.context
