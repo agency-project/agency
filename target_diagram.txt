@@ -1,0 +1,57 @@
+agent.run(skill, input)
+        ↓
+agskill.run(agent, input)
+compatibility / scheduling wrapper only
+        ↓
+AgentDriverEngine.execute(...)
+        ↓
+acquire/create sandbox
+acquire sandbox lock
+start/ensure host services
+ensure Harness Manager daemon
+        ↓
+┌──────────────────── HOST ─────────────────────┐
+│                                               │
+│              Agent Driver Engine              │
+│                       │                       │
+│                HostServerManager              │
+│          ┌────────────┼────────────┐           │
+│          │            │            │           │
+│   Interaction      LLM Handler   Host MCP     │
+│   / Policy         Server        Server       │
+│   / Control                                   │
+└──────────┬────────────┬────────────┬───────────┘
+           └────────────┼────────────┘
+                        │
+                       UDS
+                        │
+┌─────────────────── SANDBOX ───────────────────┐
+│                       │                       │
+│          Sandbox-side Interaction Layer       │
+│                       │                       │
+│               Harness Manager daemon          │
+│                       │                       │
+│              harness-specific adapter         │
+│                       │                       │
+│     native / Claude / Codex / OpenCode / Grok│
+│                       │                       │
+│              ┌────────┴────────┐              │
+│              │ ptrace/seccomp │              │
+│              │ supervision    │              │
+│              └────────┬────────┘              │
+│                       │                       │
+│        sandbox processes/files/tools          │
+└───────────────────────────────────────────────┘
+
+                     HARNESS
+                   /         \
+                  /           \
+        local execution       service traffic
+              │                     │
+       ptrace/seccomp         sandbox interaction
+              │                     │
+      files/processes              UDS
+      shell/syscalls                │
+                              host services
+                             /      |      \
+                          policy   LLM     MCP
