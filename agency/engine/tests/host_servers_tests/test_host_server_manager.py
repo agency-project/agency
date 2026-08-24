@@ -15,7 +15,7 @@ from agency.agconfig import agConfig
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.agDataCollector import agDataCollectorConfigs
-from agency.engine.host_servers.interaction_server import HarnessInteractionServer
+from agency.engine.host_servers.interaction_server import HostInteractionServer
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
     HostServerManagerConfigs,
@@ -35,17 +35,17 @@ def _make_manager(tmp_path, policy=None):
     return HostServerManager(agent, sandbox, skill, resource_pool), agent, skill
 
 
-def test_construction_wires_agent_and_skill_into_harness_interaction_server(tmp_path):
+def test_construction_wires_agent_and_skill_into_interaction_server(tmp_path):
     policy = agpolicy()
     manager, agent, skill = _make_manager(tmp_path, policy=policy)
-    assert isinstance(manager._harness_interaction_server, HarnessInteractionServer)
-    assert manager._harness_interaction_server._agent is agent
-    assert manager._harness_interaction_server._policy is policy
+    assert isinstance(manager._interaction_server, HostInteractionServer)
+    assert manager._interaction_server._agent is agent
+    assert manager._interaction_server._policy is policy
 
 
-def test_harness_interaction_server_property_returns_the_same_instance(tmp_path):
+def test_interaction_server_property_returns_the_same_instance(tmp_path):
     manager, _, _ = _make_manager(tmp_path)
-    assert manager.harness_interaction_server is manager._harness_interaction_server
+    assert manager.interaction_server is manager._interaction_server
 
 
 def test_host_mcp_server_property_returns_the_same_instance(tmp_path):

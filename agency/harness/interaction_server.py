@@ -57,19 +57,6 @@ def build_router(bridge: "_HostBridge") -> APIRouter:
     async def agprof_status():
         return JSONResponse({"configured": bridge.profiler_uds_path is not None})
 
-    # The endpoint a harness-independent loop polls before every turn (the
-    # standalone `native_harness` package's own react loop, see that
-    # package's `bridge_client.py`); forwards to agmanager_host, which is
-    # the only place ag._check_pause()/ag._drain_inbox() exist.
-    @router.post("/internal/check_in")
-    async def check_in(request: Request):
-        body = await request.json()
-        token = body.get("token")
-        if not token:
-            return JSONResponse({"error": "missing token"}, status_code=401)
-        messages = await asyncio.to_thread(bridge.check_in, token)
-        return JSONResponse({"messages": messages})
-
     # This agent's model's context window, for a caller (native_harness's
     # own compaction, see that package's `compaction.py`) that runs its own
     # ReAct loop and needs to know when to compact -- mirrors the old

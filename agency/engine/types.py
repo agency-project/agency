@@ -10,9 +10,9 @@ if TYPE_CHECKING:
 
 @dataclass
 class PromptPayload:
-    prompt: "str | list"
-    output_format_instruction: "str | None"
-    extra_system: "str | None"
+    system_instruction: str
+    user_content: "str | list[dict]"
+    output_instruction: "str | None"
 
 
 @dataclass

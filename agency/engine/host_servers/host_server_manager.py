@@ -11,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from ..agDataCollector import agDataCollector
-from .interaction_server import HarnessInteractionServer
+from .interaction_server import HostInteractionServer
 from .host_mcp_server import HostMcpServer
 from .host_server_base import HostServerBase
 from .llm_handler_server import LlmHandlerServer
@@ -42,13 +42,11 @@ class HostServerManager(HostServerBase):
         self._data_collector = agDataCollector(agent.agconfig)
         self._llm_handler_server = LlmHandlerServer(agent.agconfig)
         self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool)
-        self._harness_interaction_server = HarnessInteractionServer(
-            agent, skill, self._data_collector
-        )
+        self._interaction_server = HostInteractionServer(agent, skill, self._data_collector)
         self._server_instances: "list[HostServerBase]" = [
             self._llm_handler_server,
             self._host_mcp_server,
-            self._harness_interaction_server,
+            self._interaction_server,
         ]
         self.set_config(agent.agconfig)
 
@@ -56,8 +54,8 @@ class HostServerManager(HostServerBase):
         self._server_thread: "threading.Thread | None" = None
 
     @property
-    def harness_interaction_server(self) -> "HarnessInteractionServer":
-        return self._harness_interaction_server
+    def interaction_server(self) -> "HostInteractionServer":
+        return self._interaction_server
 
     @property
     def host_mcp_server(self) -> "HostMcpServer":
@@ -82,8 +80,8 @@ class HostServerManager(HostServerBase):
             ("/llm", self._llm_handler_server, self._llm_handler_server.build_app()),
             (
                 "/interaction",
-                self._harness_interaction_server,
-                self._harness_interaction_server.build_app(),
+                self._interaction_server,
+                self._interaction_server.build_app(),
             ),
             # MCP's Streamable HTTP app defines the exact route /mcp.
             # Mount it last at the root so that route remains /mcp rather

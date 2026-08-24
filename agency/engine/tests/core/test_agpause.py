@@ -5,7 +5,7 @@ wait_all_paused()/wait_all_resumed() and the run_allowed/paused_ack/
 _check_pause() machinery they depended on were retired along with the
 host-side in-process pause checkpoint -- pausing is now a message delivered
 through the harness manager (see agent.pause()/resume()/is_paused() and
-HarnessInteractionServer.update_state())."""
+HostInteractionServer.update_state())."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock

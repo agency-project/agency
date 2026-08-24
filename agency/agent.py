@@ -101,7 +101,7 @@ class agent_state:
     atomic. One instance lives on agent._state.
 
     update_state() is the only way to change the display fields — called by
-    HarnessInteractionServer.update_state() as the harness manager reports
+    HostInteractionServer.update_state() as the harness manager reports
     its own execution state, or by agpause.py's _BlockCtx for the
     blocked_on_dependency transition.
     """
@@ -469,7 +469,7 @@ class agent:
 
     def is_paused(self) -> bool:
         """True once the harness manager has reported this agent as actually
-        paused (see update_state(), called from HarnessInteractionServer)."""
+        paused (see update_state(), called from HostInteractionServer)."""
         return self._state.state == "paused"
 
     def is_settled(

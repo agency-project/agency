@@ -98,12 +98,6 @@ class _HostBridge:
             "reason": result.get("reason"),
         }
 
-    def check_in(self, token: str) -> list:
-        resp = self.client.post("/interaction/check_inbox")
-        if resp.status_code != 200:
-            return []
-        return resp.json().get("messages") or []
-
     def dispatch(self, token: str, kwargs: dict):
         """Non-streaming: returns a real `ChatCompletion`. Streaming:
         returns a generator of `ChatCompletionChunk` -- same contract the
