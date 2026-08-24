@@ -209,7 +209,7 @@ skill = agskill("classify", "Classify this text.", replace_tools=[])
 
 A tool call's own success or failure has no effect on the sandbox's checkpoint state anymore. Every tool call ends with `sandbox.stop()` — a hibernate only (`docker/podman stop`, container kept, never committed or removed) — regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred until a later call finds nothing pending). See [container.md](sandbox/container.md)'s "Container lifecycle" for the full mechanics.
 
-Checkpointing and revert both happen once per *skill* call instead, at `agskill.py`'s teardown: `sandbox.commit()` on success, `sandbox.rm_container()` (discarding everything since the last successful skill) on failure, with a revert notice delivered to the agent via its `inbox` rather than inlined into any one tool's result — see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert) for the full mechanics and why the notice can't live in the failed skill's own result.
+Checkpointing and revert both happen once per *skill* call inside `AgentEngine.execute()`: `sandbox.commit()` on success, `sandbox.rm_container()` on failure, with a revert notice delivered to the agent via its `inbox`. The engine holds `sandbox._lock` through that decision and releases it in `finally`.
 
 ### Agent-controlled timeout
 

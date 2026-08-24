@@ -12,6 +12,7 @@ from agency.agcontext import agcontext
 from agency.agschema import agschema
 from agency.engine import engine as mod
 from agency.engine.engine import AgentEngine
+from agency.engine.types import ExecutionResult
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
 # ---------------------------------------------------------------------------
@@ -19,12 +20,59 @@ from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult,
 # ---------------------------------------------------------------------------
 
 
+class _TrackingLock:
+    def __init__(self, events):
+        self.events = events
+        self.held = False
+
+    def acquire(self):
+        assert not self.held
+        self.held = True
+        self.events.append("acquire")
+
+    def release(self):
+        assert self.held
+        self.events.append("release")
+        self.held = False
+
+
+class _FakeSandbox:
+    def __init__(self, marker="sandbox"):
+        self.marker = marker
+        self.events = []
+        self._lock = _TrackingLock(self.events)
+        self.background_work_pending = False
+        self.commit_error = None
+        self.discard_error = None
+
+    def commit(self):
+        assert self._lock.held
+        self.events.append("commit")
+        if self.commit_error is not None:
+            raise self.commit_error
+
+    def rm_container(self):
+        assert self._lock.held
+        self.events.append("discard")
+        if self.discard_error is not None:
+            raise self.discard_error
+
+    def _has_pending_background_work(self):
+        assert self._lock.held
+        self.events.append("check_background_work")
+        return self.background_work_pending
+
+    def stop(self):
+        assert self._lock.held
+        self.events.append("stop")
+
+
 class _FakeAgent:
     output_dir = None
 
     def __init__(self):
         self.agconfig = SimpleNamespace(marker="agconfig")
-        self.sandbox = SimpleNamespace(marker="sandbox")
+        self.sandbox = _FakeSandbox()
         self.harness = "claude_code"
         self.agname = "test-agent"
         self._harness_sessions = {}
@@ -205,7 +253,7 @@ def test_execute_provisions_sandbox_before_building_host_services(monkeypatch):
     agent = _FakeAgent()
     agent.agconfig = None
     agent.sandbox = None
-    sandbox = SimpleNamespace(marker="provisioned")
+    sandbox = _FakeSandbox(marker="provisioned")
     created = []
 
     def fake_sandbox(agname, *, agconfig):
@@ -214,13 +262,14 @@ def test_execute_provisions_sandbox_before_building_host_services(monkeypatch):
 
     monkeypatch.setattr(mod, "agSandbox", fake_sandbox)
     engine = AgentEngine(agent)
+    execution = ExecutionResult(output=agdata(result="done"), context=agcontext(), delta=[])
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: "prompt")
-    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: "result")
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
-    assert result == "result"
+    assert result is execution
     assert created == [("test-agent", None)]
     assert agent.sandbox is sandbox
     assert holder["manager"].sandbox is sandbox
@@ -250,6 +299,133 @@ def test_ensure_sandbox_preserves_agent_output_mount(monkeypatch, tmp_path):
     }
 
 
+def test_execute_holds_lock_through_successful_commit_and_stop(monkeypatch):
+    agent = _FakeAgent()
+    engine = AgentEngine(agent)
+    execution = ExecutionResult(output=agdata(done=True), context=agcontext(), delta=[])
+
+    def fake_execute_harness(*_args, **_kwargs):
+        assert agent.sandbox._lock.held
+        agent.sandbox.events.append("execute")
+        return execution
+
+    monkeypatch.setattr(engine, "_execute_harness", fake_execute_harness)
+
+    result = engine.execute(
+        SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    )
+
+    assert result is execution
+    assert agent.sandbox.events == [
+        "acquire",
+        "execute",
+        "commit",
+        "check_background_work",
+        "stop",
+        "release",
+    ]
+
+
+def test_execute_discards_failed_result_before_releasing_lock(monkeypatch):
+    agent = _FakeAgent()
+    engine = AgentEngine(agent)
+    execution = ExecutionResult(
+        output=agdata(error="boom"),
+        context=agcontext(),
+        delta=[],
+        ok=False,
+        error_message="boom",
+    )
+    monkeypatch.setattr(
+        engine,
+        "_execute_harness",
+        lambda *_args, **_kwargs: agent.sandbox.events.append("execute") or execution,
+    )
+
+    result = engine.execute(
+        SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    )
+
+    assert result is execution
+    assert agent.sandbox.events == ["acquire", "execute", "discard", "release"]
+    assert "previous skill call failed" in agent.inbox.get_nowait()
+
+
+def test_execute_discards_raised_exception_and_releases_lock(monkeypatch):
+    agent = _FakeAgent()
+    engine = AgentEngine(agent)
+
+    def fail(*_args, **_kwargs):
+        agent.sandbox.events.append("execute")
+        raise RuntimeError("harness failed")
+
+    monkeypatch.setattr(engine, "_execute_harness", fail)
+
+    with pytest.raises(RuntimeError, match="harness failed"):
+        engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+
+    assert agent.sandbox.events == ["acquire", "execute", "discard", "release"]
+    assert agent.sandbox._lock.held is False
+
+
+def test_execute_discards_commit_failure_and_releases_lock(monkeypatch):
+    agent = _FakeAgent()
+    agent.sandbox.commit_error = RuntimeError("commit failed")
+    engine = AgentEngine(agent)
+    execution = ExecutionResult(output=agdata(done=True), context=agcontext(), delta=[])
+    monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+
+    assert agent.sandbox.events == [
+        "acquire",
+        "commit",
+        "check_background_work",
+        "stop",
+        "discard",
+        "release",
+    ]
+    assert agent.sandbox._lock.held is False
+
+
+def test_execute_releases_lock_when_discard_fails(monkeypatch):
+    agent = _FakeAgent()
+    agent.sandbox.discard_error = RuntimeError("discard failed")
+    engine = AgentEngine(agent)
+    execution = ExecutionResult(
+        output=agdata(error="boom"),
+        context=agcontext(),
+        delta=[],
+        ok=False,
+        error_message="boom",
+    )
+    monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
+
+    with pytest.raises(RuntimeError, match="discard failed"):
+        engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+
+    assert agent.sandbox.events == ["acquire", "discard", "release"]
+    assert agent.sandbox._lock.held is False
+
+
+def test_execute_defers_stop_while_background_work_is_pending(monkeypatch):
+    agent = _FakeAgent()
+    agent.sandbox.background_work_pending = True
+    engine = AgentEngine(agent)
+    execution = ExecutionResult(output=agdata(done=True), context=agcontext(), delta=[])
+    monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
+
+    engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+
+    assert agent.sandbox.events == [
+        "acquire",
+        "commit",
+        "check_background_work",
+        "release",
+    ]
+
+
 def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypatch):
     holder = _install_fake_host_server_manager(monkeypatch, results=[])
     monkeypatch.setattr(
@@ -270,10 +446,9 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
         monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
     )
     engine = AgentEngine(_FakeAgent())
+    execution = ExecutionResult(output=agdata(result="done"), context=agcontext(), delta=[])
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
-    monkeypatch.setattr(
-        engine, "_build_execution_result", lambda context, skill, attempt: ("built", attempt)
-    )
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
@@ -283,7 +458,7 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     assert holder["requests"][0].harness == "claude_code"
     assert manager.started is True
     assert manager.stopped is True
-    assert result == ("built", HarnessAttemptResult(ok=True, final_text="done"))
+    assert result is execution
 
 
 def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypatch):
@@ -291,14 +466,21 @@ def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypa
         monkeypatch, results=[HarnessAttemptResult(ok=False, error_message="boom")]
     )
     engine = AgentEngine(_FakeAgent())
+    execution = ExecutionResult(
+        output=agdata(error="boom"),
+        context=agcontext(),
+        delta=[],
+        ok=False,
+        error_message="boom",
+    )
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
-    monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     assert [request.prompt for request in holder["requests"]] == ["p0"]
-    assert result == HarnessAttemptResult(ok=False, error_message="boom")
+    assert result is execution
 
 
 def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
@@ -311,6 +493,7 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
         collected_sequence=[{}, {"summary": "x"}],
     )
     engine = AgentEngine(_FakeAgent())
+    execution = ExecutionResult(output=agdata(summary="x"), context=agcontext(), delta=[])
     p0 = PromptPayload("the-system", "p0", None)
     p1 = PromptPayload("the-system", "p1", None)
     prompts = iter([p0, p1])
@@ -320,13 +503,13 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
         "_build_retry_prompt",
         lambda missing, *, system_instruction: next(prompts),
     )
-    monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     assert [request.prompt for request in holder["requests"]] == [p0, p1]
-    assert result == HarnessAttemptResult(ok=True, final_text="second")
+    assert result is execution
 
 
 def test_execute_transports_and_captures_session_blobs(monkeypatch):
@@ -354,10 +537,11 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
         "blob_b64": "cHJpb3I=",
     }
     engine = AgentEngine(agent)
+    execution = ExecutionResult(output=agdata(result="second"), context=agcontext(), delta=[])
     prompt = PromptPayload("system", "prompt")
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: prompt)
     monkeypatch.setattr(engine, "_build_retry_prompt", lambda *_args, **_kwargs: prompt)
-    monkeypatch.setattr(engine, "_build_execution_result", lambda _c, _s, attempt: attempt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=1)
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
@@ -375,7 +559,7 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
         "session_id": "session-2",
         "blob_b64": "ZmluYWw=",
     }
-    assert result.final_text == "second"
+    assert result is execution
 
 
 def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
@@ -385,6 +569,7 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
         collected_sequence=[{}, {}, {}],
     )
     engine = AgentEngine(_FakeAgent())
+    execution = ExecutionResult(output=agdata(result="attempt-2"), context=agcontext(), delta=[])
     p0 = PromptPayload("the-system", "p0", None)
     retry = PromptPayload("the-system", "retry", None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: p0)
@@ -393,14 +578,14 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
         "_build_retry_prompt",
         lambda missing, *, system_instruction: retry,
     )
-    monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=2)
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     # 1 initial attempt + 2 retries = 3 calls total, then gives up
     assert [request.prompt for request in holder["requests"]] == [p0, retry, retry]
-    assert result == HarnessAttemptResult(ok=True, final_text="attempt-2")
+    assert result is execution
 
 
 def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
@@ -409,10 +594,11 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     engine = AgentEngine(_FakeAgent())
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     seen = {}
+    expected = ExecutionResult(output=agdata(result="done"), context=agcontext(), delta=[])
 
     def fake_build_result(context, skill, got_attempt):
         seen["context"], seen["skill"], seen["attempt"] = context, skill, got_attempt
-        return "the-result"
+        return expected
 
     monkeypatch.setattr(engine, "_build_execution_result", fake_build_result)
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
@@ -420,7 +606,7 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
 
     result = engine.execute(context, skill, SimpleNamespace(), SimpleNamespace())
 
-    assert result == "the-result"
+    assert result is expected
     assert seen == {"context": context, "skill": skill, "attempt": attempt}
     assert holder["manager"].stopped is True
 

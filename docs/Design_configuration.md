@@ -101,7 +101,7 @@ The fix is exactly what the message says — `clone()` for a fresh `agConfig` wi
 cfg2 = ag.agconfig.clone()
 agSandboxConfig(cfg2).add_mount("data", new_host_dir, "/data")
 ag.sandbox.destroy()      # tear down the old container -- it's still on the old mount
-ag.sandbox  = None        # agskill only provisions a new sandbox when this is None
+ag.sandbox  = None        # AgentEngine provisions a new sandbox when this is None
 ag.agconfig = cfg2        # the next run() creates a fresh sandbox that resolves "data" from cfg2
 ```
 

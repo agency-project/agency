@@ -75,23 +75,25 @@ The agent calls these tools itself during a skill, just like any other tool. `da
 
 ## Release guarantee
 
-GPU release is not a separate step — it happens *inside* `sandbox.stop()`/`sandbox.rm_container()`/`sandbox.destroy()` themselves (backend-level: `_ContainerBackendBase`/`_ChrootBackend`), always after that same call's own teardown (container stop/removal / `_kill_all_sandbox_processes()`) has already completed synchronously, and only once confirmed via `_container_running()`. Per-tool-call teardown (`agtool.py`'s `dispatch_tools()`) calls `sandbox.stop()` after every tool call — a hibernate that releases **both** the runtime slot and the GPU (see [container.md](sandbox/container.md)'s "GPU device access" for why this is safe: every GPU is attached to a GPU-reserving container up front, so a resumed container can be handed a different physical GPU without needing to be recreated). `_task()`'s `finally` block then calls `commit()` on success or `rm_container()` on failure once per skill, at the very end (see [agskill.md](agskill.md#tool-call-hibernation-and-skill-level-revert)):
+GPU release is not a separate step — it happens *inside* `sandbox.stop()`/`sandbox.rm_container()`/`sandbox.destroy()` themselves. `AgentEngine.execute()` owns the final skill boundary while holding `sandbox._lock`:
 
 ```python
+sandbox_lock.acquire()
+try:
+    execution = run_harness(...)
+    if execution.ok:
+        sandbox.commit()
+        if not sandbox._has_pending_background_work():
+            sandbox.stop()
+    else:
+        sandbox.rm_container()
 finally:
-    if ag.sandbox is not None:
-        if _had_error:
-            ag.sandbox.rm_container()   # discards state; releases GPU + runtime slot too
-            ag.inbox.put(...)           # revert notice, drained at the next skill's start
-        else:
-            ag.sandbox.commit()        # checkpoints in place; does NOT touch the GPU or slot
-    if sandbox_lock is not None:
-        sandbox_lock.release()
+    sandbox_lock.release()
 ```
 
 `commit()` never touches the GPU or the runtime slot — the container isn't stopped or removed, so there's nothing to release. The GPU is therefore actually freed every time the sandbox hibernates between tool calls, not just when a skill fails.
 
-`agResourcePool.release_gpu()` itself does no waiting or polling at all (an earlier version threaded an `is_clear` predicate through it and blocked until the predicate passed or a timeout elapsed; that mechanism has been removed entirely) — it releases the semaphore immediately, unconditionally. Safety comes purely from the calling order above: by the time `stop()`/`rm_container()`/`destroy()` reach the GPU-release step, they have already torn down (or, for `stop()`, actually stopped) whatever the sandbox was running, so there's nothing left to re-check. GPU semaphores and CPU/memory limits are returned even if the skill raises an exception or `max_steps` is exceeded — the `finally` block above runs unconditionally regardless. The `sandbox_lock` release, held since provisioning, always happens last.
+`agResourcePool.release_gpu()` itself does no waiting or polling. Safety comes from the calling order above: teardown completes before resource release, and the engine releases `sandbox_lock` last even when execution or teardown raises.
 
 ## `agResourcePool` API
 

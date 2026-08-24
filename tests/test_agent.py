@@ -158,9 +158,6 @@ def test_run_dispatches_to_agent_engine(harness_name):
     calls = []
 
     class FakeAgentEngine:
-        def ensure_sandbox(self):
-            return ag.sandbox
-
         def execute(self, **kwargs):
             calls.append(kwargs)
             return ExecutionResult(
