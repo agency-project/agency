@@ -79,21 +79,29 @@ class HostServerManager(HostServerBase):
 
         Path(self._configs.uds_path).parent.mkdir(parents=True, exist_ok=True)
         sub_apps = [
-            (f"/{type(server_instance).__name__}", server_instance.build_app())
-            for server_instance in self._server_instances
+            ("/llm", self._llm_handler_server, self._llm_handler_server.build_app()),
+            (
+                "/interaction",
+                self._harness_interaction_server,
+                self._harness_interaction_server.build_app(),
+            ),
+            # MCP's Streamable HTTP app defines the exact route /mcp.
+            # Mount it last at the root so that route remains /mcp rather
+            # than becoming /mcp/mcp or redirecting to /mcp/.
+            ("/", self._host_mcp_server, self._host_mcp_server.build_app()),
         ]
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI):
             async with AsyncExitStack() as stack:
-                for server_instance, (_, sub_app) in zip(self._server_instances, sub_apps):
+                for _, server_instance, sub_app in sub_apps:
                     ctx = server_instance.lifespan_context(sub_app)
                     if ctx is not None:
                         await stack.enter_async_context(ctx)
                 yield
 
         app = FastAPI(lifespan=lifespan)
-        for prefix, sub_app in sub_apps:
+        for prefix, _, sub_app in sub_apps:
             app.mount(prefix, sub_app)
         config = uvicorn.Config(app, uds=self._configs.uds_path, log_level="warning")
         server = uvicorn.Server(config)

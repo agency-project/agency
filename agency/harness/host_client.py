@@ -12,6 +12,7 @@ import json
 import socket
 import struct
 import time
+import uuid
 
 import httpx
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
@@ -54,11 +55,13 @@ class _HostBridge:
         self._profiler_synced_tokens: "set[str]" = set()
 
     def validate_token(self, token: str) -> bool:
-        resp = self.client.post("/internal/validate_token", json={"token": token})
-        return resp.status_code == 200 and bool(resp.json().get("valid"))
+        # The host UDS is private to one agent. Bearer-token validation is
+        # therefore owned by the sandbox-side daemon, not a host routing
+        # registry shared by multiple agents.
+        return bool(token)
 
     def resolve_model(self, token: str) -> str:
-        resp = self.client.post("/internal/resolve_model", json={"token": token})
+        resp = self.client.get("/llm/resolve_model")
         resp.raise_for_status()
         return resp.json()["model"]
 
@@ -71,7 +74,7 @@ class _HostBridge:
         graceful-when-unknown behavior `agllm.py`'s own `maybe_compact()`
         already has."""
         try:
-            resp = self.client.post("/internal/context_limit", json={"token": token})
+            resp = self.client.get("/llm/context_limit")
             if resp.status_code != 200:
                 return None
             return resp.json().get("context_limit")
@@ -79,17 +82,24 @@ class _HostBridge:
             return None
 
     def log_warning(self, token: str, message: str) -> None:
-        self.client.post("/internal/log_warning", json={"token": token, "message": message})
+        self.client.post(
+            "/interaction/record_event",
+            json={"type": "warning", "payload": {"message": message}},
+        )
 
     def check_tool_policy(self, token: str, tool_name: str, tool_input: dict) -> dict:
         resp = self.client.post(
-            "/internal/check_tool_policy",
-            json={"token": token, "tool_name": tool_name, "tool_input": tool_input},
+            "/interaction/check_tool",
+            json={"tool_name": tool_name, "tool_input": tool_input},
         )
-        return resp.json()
+        result = resp.json()
+        return {
+            "decision": "allow" if result.get("allowed") else "deny",
+            "reason": result.get("reason"),
+        }
 
     def check_in(self, token: str) -> list:
-        resp = self.client.post("/internal/check_in", json={"token": token})
+        resp = self.client.post("/interaction/check_inbox")
         if resp.status_code != 200:
             return []
         return resp.json().get("messages") or []
@@ -102,26 +112,76 @@ class _HostBridge:
         if kwargs.get("stream"):
 
             def gen():
-                with self.client.stream(
-                    "POST", "/internal/dispatch", json={"token": token, "kwargs": kwargs}
-                ) as resp:
+                completion_id = f"chatcmpl_{uuid.uuid4().hex}"
+                with self.client.stream("POST", "/llm/dispatch", json=kwargs) as resp:
                     if resp.status_code != 200:
                         resp.read()
                         raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
                     for line in resp.iter_lines():
-                        if not line or not line.startswith("data: "):
+                        if not line:
                             continue
-                        payload = line[len("data: ") :]
-                        if payload == "[DONE]":
+                        item = json.loads(line)
+                        if item["type"] == "error":
+                            raise RuntimeError(f"host dispatch failed: {item['message']}")
+                        if item["type"] == "delta":
+                            yield ChatCompletionChunk.model_validate(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": kwargs.get("model", ""),
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": item["content"]},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
+                            continue
+                        if item["type"] == "done":
+                            message = item.get("message") or {}
+                            delta = {}
+                            if message.get("tool_calls"):
+                                delta["tool_calls"] = [
+                                    {"index": index, **tool_call}
+                                    for index, tool_call in enumerate(message["tool_calls"])
+                                ]
+                            chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": kwargs.get("model", ""),
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}],
+                            }
+                            if item.get("usage") is not None:
+                                chunk["usage"] = item["usage"]
+                            yield ChatCompletionChunk.model_validate(chunk)
                             return
-                        yield ChatCompletionChunk.model_validate(json.loads(payload))
 
             return gen()
 
-        resp = self.client.post("/internal/dispatch", json={"token": token, "kwargs": kwargs})
+        resp = self.client.post("/llm/dispatch", json=kwargs)
         if resp.status_code != 200:
             raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
-        return ChatCompletion.model_validate(resp.json())
+        result = resp.json()
+        completion = {
+            "id": f"chatcmpl_{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": kwargs.get("model", ""),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": result["message"],
+                    "finish_reason": result.get("stop_reason"),
+                }
+            ],
+        }
+        if result.get("usage") is not None:
+            completion["usage"] = result["usage"]
+        return ChatCompletion.model_validate(completion)
 
     def forward_profiler_event(self, token: str, event: dict) -> dict:
         if self.profiler_uds_path is None:

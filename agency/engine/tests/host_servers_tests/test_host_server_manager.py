@@ -75,7 +75,7 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
                 transport=httpx2.AsyncHTTPTransport(uds=uds_path), base_url="http://localhost"
             )
             async with streamable_http_client(
-                "http://localhost/HostMcpServer/mcp", http_client=client
+                "http://localhost/mcp", http_client=client
             ) as streams:
                 read, write = streams[0], streams[1]
                 async with ClientSession(read, write) as session:
@@ -91,6 +91,16 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
             "submit_output",
             "submitted_output",
         }
+
+        with httpx2.Client(
+            transport=httpx2.HTTPTransport(uds=uds_path), base_url="http://localhost"
+        ) as client:
+            assert client.get("/llm/resolve_model").json() == {"model": "test-model"}
+            assert client.post(
+                "/interaction/check_tool",
+                json={"tool_name": "unknown", "tool_input": {}},
+            ).json() == {"allowed": True, "reason": None}
+            assert client.get("/LlmHandlerServer/resolve_model").status_code == 404
     finally:
         manager.stop()
         Path(uds_path).unlink(missing_ok=True)
