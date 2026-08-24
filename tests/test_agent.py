@@ -10,6 +10,8 @@ from agency.agtool import agtool
 from agency.agent import agent
 from agency.agname import agname as _agname
 from agency.agconfig import agConfig
+from agency.engine import AgentEngine
+from agency.engine.types import ExecutionResult
 
 # ---------------------------------------------------------------------------
 # Streaming mock helpers (agskill uses stream=True)
@@ -125,64 +127,61 @@ def test_repr():
 
 
 # ---------------------------------------------------------------------------
-# engine -- the seam between the native ReAct loop and an off-the-shelf
+# harness -- the seam between the native ReAct loop and an off-the-shelf
 # harness (see docs/Design_harness_integration.md)
 # ---------------------------------------------------------------------------
 
 
-def test_engine_defaults_to_native():
+def test_harness_defaults_to_native():
     ag = make_agent()
-    assert ag.engine == "native"
+    assert ag.harness == "native"
+    assert isinstance(ag.engine, AgentEngine)
 
 
-def test_engine_explicit_constructor_arg():
-    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), engine="claude_code")
-    assert ag.engine == "claude_code"
+def test_harness_explicit_constructor_arg():
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), harness="claude_code")
+    assert ag.harness == "claude_code"
 
 
-def test_engine_from_agconfig():
+def test_harness_from_agconfig():
     from agency.agent import agAgentConfig
 
     cfg = agConfig(
-        agAgentConfig(engine="opencode"), {"agllm_backend": {"api_key": "k", "model": ""}}
+        agAgentConfig(harness="opencode"), {"agllm_backend": {"api_key": "k", "model": ""}}
     )
     ag = agent(agconfig=cfg)
-    assert ag.engine == "opencode"
+    assert ag.harness == "opencode"
 
 
-def test_run_dispatches_to_execute_harness_when_native():
-    """Every engine, "native" included, now goes through execute_harness()
-    -- agharness_backend.for_config() resolves "native" to _NativeBackend,
-    a genuine drop-in like every other engine's backend, so _task() no
-    longer branches on ag.engine at all (Phase 0)."""
+@pytest.mark.parametrize("harness_name", ["native", "claude_code"])
+def test_run_dispatches_to_agent_engine(harness_name):
     calls = []
 
-    def fake_execute_harness(ag, prev_ctx, inp, max_steps=None, **_):
-        calls.append("harness")
-        return agdata(done=True), prev_ctx, []
+    class FakeAgentEngine:
+        def execute(self, **kwargs):
+            calls.append(kwargs)
+            return ExecutionResult(
+                output=agdata(done=True),
+                context=kwargs["context"],
+                delta=[],
+            )
 
     skill = agskill(name="s", system_prompt="")
-    skill.execute_harness = fake_execute_harness
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), harness=harness_name)
+    assert isinstance(ag.engine, AgentEngine)
+    sandbox = MagicMock()
+    sandbox._lock = threading.RLock()
+    sandbox._has_pending_background_work.return_value = False
+    ag.sandbox = sandbox
+    ag.engine = FakeAgentEngine()
 
-    ag = make_agent()
-    assert ag.engine == "native"
-    ag.run(skill, agdata()).done
-    assert calls == ["harness"]
+    result = ag.run(skill, agdata(task="go"), max_steps=7)
 
-
-def test_run_dispatches_to_execute_harness_when_engine_not_native():
-    calls = []
-
-    def fake_execute_harness(ag, prev_ctx, inp, max_steps=None, **_):
-        calls.append("harness")
-        return agdata(done=True), prev_ctx, []
-
-    skill = agskill(name="s", system_prompt="")
-    skill.execute_harness = fake_execute_harness
-
-    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), engine="claude_code")
-    ag.run(skill, agdata()).done
-    assert calls == ["harness"]
+    assert result.done is True
+    assert len(calls) == 1
+    assert calls[0]["skill"] is skill
+    assert calls[0]["skill_input"].to_dict() == {"task": "go"}
+    assert calls[0]["max_steps"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +337,11 @@ def test_fork_inherits_config():
     assert forked.llm.backend.as_dict() == ag.llm.backend.as_dict()
 
 
-def test_fork_inherits_engine():
-    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), engine="claude_code")
+def test_fork_inherits_harness_and_creates_engine():
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), harness="claude_code")
     forked = agent.fork(ag)
-    assert forked.engine == "claude_code"
+    assert forked.harness == "claude_code"
+    assert isinstance(forked.engine, AgentEngine)
 
 
 def test_fork_deep_copies_history():
@@ -692,14 +692,14 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     _agname._allocated.discard(saved_agname)
 
 
-def test_save_and_load_restores_engine(tmp_path, monkeypatch):
+def test_save_and_load_restores_harness(tmp_path, monkeypatch):
     import subprocess as _sp
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
     ag = agent(
         agconfig=_llm_agconfig({"api_key": "k", "model": "m"}),
-        engine="claude_code",
+        harness="claude_code",
     )
 
     ckpt = tmp_path / "agent.ckpt"
@@ -709,14 +709,15 @@ def test_save_and_load_restores_engine(tmp_path, monkeypatch):
     _agname._allocated.discard(saved_agname)
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
-    assert ag2.engine == "claude_code"
+    assert ag2.harness == "claude_code"
+    assert isinstance(ag2.engine, AgentEngine)
     del ag2
     _agname._allocated.discard(saved_agname)
 
 
-def test_load_defaults_engine_to_native_when_absent(tmp_path, monkeypatch):
-    """A checkpoint saved before `engine` existed (or a plain native agent's
-    checkpoint) has no "engine" key at all -- load() must not choke on that,
+def test_load_defaults_harness_to_native_when_absent(tmp_path, monkeypatch):
+    """A checkpoint saved before `harness` existed (or a plain native agent's
+    checkpoint) has no "harness" key at all -- load() must not choke on that,
     it should just default to "native"."""
     import json
     import subprocess as _sp
@@ -730,7 +731,7 @@ def test_load_defaults_engine_to_native_when_absent(tmp_path, monkeypatch):
     del ag
     _agname._allocated.discard(saved_agname)
 
-    # Strip "engine" back out of the saved state.json to simulate an
+    # Strip "harness" back out of the saved state.json to simulate an
     # older checkpoint, then reload from the doctored tarball.
     import tarfile
     import io
@@ -738,7 +739,7 @@ def test_load_defaults_engine_to_native_when_absent(tmp_path, monkeypatch):
     with tarfile.open(ckpt, "r:gz") as tar:
         members = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
     state = json.loads(members["state.json"])
-    del state["engine"]
+    del state["harness"]
     members["state.json"] = json.dumps(state).encode()
     with tarfile.open(ckpt, "w:gz") as tar:
         for name, data in members.items():
@@ -747,7 +748,8 @@ def test_load_defaults_engine_to_native_when_absent(tmp_path, monkeypatch):
             tar.addfile(info, io.BytesIO(data))
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
-    assert ag2.engine == "native"
+    assert ag2.harness == "native"
+    assert isinstance(ag2.engine, AgentEngine)
     del ag2
     _agname._allocated.discard(saved_agname)
     # Container filesystem round-trip (write_file → save → load → read_file)
@@ -1587,6 +1589,18 @@ def test_agent_change_config_reaches_llm():
     ag = make_agent()
     ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
     assert ag.llm.backend.temperature == 0.2
+
+
+def test_agent_change_config_propagates_owned_clone_to_engine():
+    ag = make_agent()
+    engine = MagicMock()
+    ag.engine = engine
+    new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
+
+    ag.change_config(new_cfg)
+
+    engine.set_config.assert_called_once_with(ag.agconfig)
+    assert ag.agconfig is not new_cfg
 
 
 def test_agent_change_config_clones_given_agconfig():

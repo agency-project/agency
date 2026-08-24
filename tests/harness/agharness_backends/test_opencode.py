@@ -17,7 +17,7 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
-from agency.harness.agharness_backends.opencode import (
+from agency.harness.adapters.opencode import (
     _OpencodeBackend,
     opencode_available,
 )
@@ -74,8 +74,7 @@ def test_execute_launches_via_agproxy_ptrace_and_returns_raw_text():
     handle = _make_handle(stdout="the final answer")
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox") as mock_wire,
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway = MagicMock()
         mock_gateway.base_url = "http://127.0.0.1:1"
@@ -88,31 +87,8 @@ def test_execute_launches_via_agproxy_ptrace_and_returns_raw_text():
     assert result.result == "the final answer"
     assert ctx is prev_ctx  # SAME object, mutated in place -- not a new one
     assert len(delta) == 3  # [system, user, assistant]
-    mock_wire.assert_called_once_with(handle, ag.sandbox)
     mock_gateway.register.assert_called_once()
     mock_gateway.unregister.assert_called_once()
-
-
-def test_execute_skips_wire_to_sandbox_when_no_sandbox():
-    backend = _OpencodeBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent(with_sandbox=False)
-    prev_ctx = agcontext()
-
-    handle = _make_handle(stdout="ok")
-    with (
-        patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox") as mock_wire,
-    ):
-        mock_gateway = MagicMock()
-        mock_gateway.base_url = "http://127.0.0.1:1"
-        mock_gateway_getter.return_value = mock_gateway
-        mock_px_cls.return_value.launch.return_value = handle
-
-        backend.execute(ag, prev_ctx, agdata(task="go"), None, skill=skill)
-
-    mock_wire.assert_not_called()
 
 
 def test_execute_nonzero_exit_returns_agerror():
@@ -124,8 +100,7 @@ def test_execute_nonzero_exit_returns_agerror():
     handle = _make_handle(stdout="", stderr="boom", rc=1)
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway = MagicMock()
         mock_gateway.base_url = "http://127.0.0.1:1"
@@ -148,8 +123,7 @@ def test_execute_recovers_structured_output_schema():
     handle = _make_handle(stdout='{"answer": "42"}')
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway = MagicMock()
         mock_gateway.base_url = "http://127.0.0.1:1"

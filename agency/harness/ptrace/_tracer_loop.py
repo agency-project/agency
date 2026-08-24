@@ -16,11 +16,10 @@ this at the cost of a small, bounded poll latency -- verified during
 development against a concurrent unrelated `subprocess.Popen` child (it gets
 reaped correctly through subprocess's own machinery, untouched by this loop).
 
-Decoupled from `agpolicy`/`agsyscallevent`/`agdecision` on purpose: this
+Decoupled from `agpolicy`/`agsyscallevent` on purpose: this
 module takes a plain `syscall_hook` callback trading in the lightweight
-`SeccompStop`/`StopDecision` shapes below, so `agproxy_ptrace.py` (the
-public module, which imports FROM here) is the only place that adapts to
-the public `agpolicy` interface -- avoids a circular import and keeps this
+`SeccompStop`/`StopDecision` shapes below, so `supervisor.py` is the only
+place that adapts to the public `agpolicy` interface -- avoids a circular import and keeps this
 package's only job "run the ptrace mechanics correctly."
 """
 
@@ -34,8 +33,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from ..ptrace import _ctypes_defs as pt
-from ..ptrace import _seccomp_filter
+from . import _ctypes_defs as pt
+from . import _seccomp_filter
 
 
 @dataclass

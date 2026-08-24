@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import queue
 from types import SimpleNamespace
 
-import pytest
 from fastapi.testclient import TestClient
 
 from agency.agpolicy import agpolicy
 from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.harness._syscall_event import agsyscallevent
-from agency.harness.protocol import HarnessAttemptResult
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +89,7 @@ def _make_syscall(
 
 
 # ---------------------------------------------------------------------------
-# __init__ / set_config
+# __init__
 # ---------------------------------------------------------------------------
 
 
@@ -101,19 +98,6 @@ def test_init_stores_agent_and_skills_policy():
     server, agent = _make_server(policy=policy)
     assert server._agent is agent
     assert server._policy is policy
-
-
-def test_init_calls_set_config_with_agents_agconfig():
-    agconfig = SimpleNamespace(marker="the-config")
-    server, agent = _make_server(agconfig=agconfig)
-    assert server._agconfig is agconfig
-
-
-def test_set_config_replaces_the_stored_agconfig():
-    server, _ = _make_server()
-    new_agconfig = SimpleNamespace(marker="new")
-    server.set_config(new_agconfig)
-    assert server._agconfig is new_agconfig
 
 
 # ---------------------------------------------------------------------------
@@ -417,52 +401,11 @@ def test_build_app_record_event_route_delegates_to_data_collector():
     assert collector.events == [("warning", {"message": "bad shape"}, None, False)]
 
 
-# ---------------------------------------------------------------------------
-# attempt-result callback
-# ---------------------------------------------------------------------------
-
-
-def test_report_attempt_result_with_no_pending_attempt_is_a_noop():
-    server, _ = _make_server()
-    server.report_attempt_result({"ok": True, "final_text": "x"})  # should not raise
-
-
-def test_expected_attempt_result_is_delivered_by_report_callback():
-    server, _ = _make_server()
-    waiter = server.expect_attempt_result()
-    server.report_attempt_result({"ok": True, "final_text": "done"})
-    result = server.wait_for_attempt_result(waiter, timeout=2.0)
-    assert result == HarnessAttemptResult(ok=True, final_text="done")
-
-
-def test_only_one_attempt_result_can_be_pending():
-    server, _ = _make_server()
-    waiter = server.expect_attempt_result()
-    with pytest.raises(RuntimeError, match="already pending"):
-        server.expect_attempt_result()
-    server.cancel_expected_attempt(waiter)
-
-
-def test_wait_for_attempt_result_raises_queue_empty_on_timeout():
-    server, _ = _make_server()
-    waiter = server.expect_attempt_result()
-    with pytest.raises(queue.Empty):
-        server.wait_for_attempt_result(waiter, timeout=0.05)
-    server.cancel_expected_attempt(waiter)
-
-
-def test_build_app_report_attempt_result_route_delegates():
+def test_build_app_has_no_final_attempt_result_callback_route():
     server, _ = _make_server()
     client = TestClient(server.build_app())
-    waiter = server.expect_attempt_result()
-
     response = client.post("/report_attempt_result", json={"ok": True, "final_text": "hi"})
-
-    assert response.status_code == 200
-    assert response.json() == {"ok": True}
-    assert server.wait_for_attempt_result(waiter, timeout=2.0) == HarnessAttemptResult(
-        ok=True, final_text="hi"
-    )
+    assert response.status_code == 404
 
 
 def test_build_app_record_span_route_delegates_to_data_collector():

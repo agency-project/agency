@@ -225,7 +225,7 @@ def _print_profile_report(profile_dir: Path) -> None:
         return
 
     print("\n" + "=" * 78)
-    print(f"agprof summary -- engine={ENGINE}  schema_version={metrics['schema_version']}")
+    print(f"agprof summary -- harness={ENGINE}  schema_version={metrics['schema_version']}")
     print("=" * 78)
 
     sampling = metrics["sampling"]
@@ -348,7 +348,7 @@ def _workload() -> None:
     """The three phases. Everything below is ordinary Agency code -- the only
     profiler-aware lines are the ``agprof.span`` / ``agprof.annotate`` calls,
     which are no-ops when profiling is off."""
-    ag = agent(agconfig=cfg, engine=ENGINE)
+    ag = agent(agconfig=cfg, harness=ENGINE)
 
     # Phase 1 -- network.
     with agprof.span("example:phase1_network"):

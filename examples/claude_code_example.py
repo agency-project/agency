@@ -2,7 +2,7 @@
 Example: same agent/skills as base_example.py, but driven by the real
 `claude` CLI (Claude Code) instead of the native ReAct loop.
 
-Set engine="claude_code" on the agent and Claude Code's own LLM traffic is
+Set harness="claude_code" on the agent and Claude Code's own LLM traffic is
 transparently routed through agproxy_llm to whatever agllm backend is
 configured below (see docs/agharness.md) -- Claude Code keeps its own
 system prompt/scaffolding/tools; agency only occupies the LLM endpoint and
@@ -101,9 +101,9 @@ def main():
         replace_tools=[],
     )
 
-    # engine="claude_code" -- dispatches through agharness_backend instead of
+    # harness="claude_code" -- dispatches through agharness_backend instead of
     # the native ReAct loop; everything else about agent.run() is unchanged.
-    ag = agent(agconfig=cfg, engine="claude_code")
+    ag = agent(agconfig=cfg, harness="claude_code")
 
     print(">> [file_manager] write and verify a note")
     r1 = ag.run(

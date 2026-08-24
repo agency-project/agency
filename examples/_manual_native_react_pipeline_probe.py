@@ -2,7 +2,7 @@
 
 This is deliberately parallel to ``_manual_v1messages_pipeline_probe.py``:
 it runs the same 6-step multi-file task with the same schemas and LLM
-configuration, but selects ``engine="native"``. It therefore tests the
+configuration, but selects ``harness="native"``. It therefore tests the
 native backend through the same public ``agent.run()`` harness abstraction
 that the Claude Code probe uses, without the Claude CLI or its /v1/messages
 adapter in the path.
@@ -92,7 +92,7 @@ def main():
     # ``native`` is an agharness backend too: its ReAct loop runs inside
     # the sandbox container and is reached through the same agent.run()
     # dispatch contract as an external harness engine.
-    ag = agent(agconfig=cfg, engine="native")
+    ag = agent(agconfig=cfg, harness="native")
 
     print(">> [file_manager] 6-step multi-file ocean-facts task")
     r1 = ag.run(

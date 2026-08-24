@@ -1,4 +1,4 @@
-"""Manual probe (not pytest): same engine="claude_code" Agency harness
+"""Manual probe (not pytest): same harness="claude_code" Agency harness
 pipeline as claude_code_example.py, but running the same 6-step
 multi-file task used in the direct-CLI native-Bedrock vs ANTHROPIC_BASE_URL
 comparison, so the two can be compared apples-to-apples.
@@ -88,7 +88,7 @@ def main():
         ),
     )
 
-    ag = agent(agconfig=cfg, engine="claude_code")
+    ag = agent(agconfig=cfg, harness="claude_code")
 
     print(">> [file_manager] 6-step multi-file ocean-facts task")
     r1 = ag.run(

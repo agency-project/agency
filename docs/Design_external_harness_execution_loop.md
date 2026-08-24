@@ -120,10 +120,10 @@ sequenceDiagram
 
 **Setup (Agency-controlled, before the black box)**
 
-1. **Dispatch.** `agskill.run()` checks `ag.engine`: `"native"` goes to
+1. **Dispatch.** `agskill.run()` checks `ag.harness`: `"native"` goes to
    `execute_react` (untouched); anything else goes to
    `agharness_backend.for_config(ag.agconfig).execute(...)` — for
-   `engine="claude_code"`, that's `_ClaudeCodeBackend.execute()`.
+   `harness="claude_code"`, that's `_ClaudeCodeBackend.execute()`.
 2. **Resolve the binary.** Host/chroot: `shutil.which(binary)` on the host
    PATH. Container-backed: `ag.sandbox.exec("which claude")` — resolved
    *inside* the container, since that's where it will actually run.
@@ -147,39 +147,24 @@ sequenceDiagram
    `--resume <session_id>` is added to `argv`. See
    [Design_harness_history.md](Design_harness_history.md) for why this file
    is opaque to Agency and what "the path it'll look for it at" means.
-7. **(Container-backed only) Bridge the LLM gateway in.** `agproxy_llm`'s
-   TCP listener is host-bound and wasn't reachable from inside this
-   environment's container networking; `gateway.ensure_uds_started()`
-   starts (idempotently) a Unix-socket listener instead, and
-   `start_llm_relay()` deploys+launches `_tcp_to_uds_relay.py` inside the
-   container, forwarding a container-local TCP port to that socket over the
-   bind-mounted directory every container-backed sandbox already has
-   (`agutil.agharness_llm_gateway_dir`).
-8. **Build `envp`.** `ANTHROPIC_BASE_URL` points at the gateway directly
-   (host/chroot) or at the in-container relay's local port (container-backed);
-   `ANTHROPIC_AUTH_TOKEN` carries the bearer token; `CLAUDE_CONFIG_DIR` points
-   at `config_home` (this is what makes step 6/the post-run capture land in
-   a place Agency actually controls, instead of the real `~/.claude`).
-9. **Launch.** `agProxyPtrace.launch(argv, envp, cwd=config_home, policy,
-   ag, sandbox)` — dispatches on `sandbox._backend.IMAGE_KIND`:
-   - **Container-backed:** `InContainerRelay` deploys `_in_container_entrypoint.py`
-     into the container (`write_file_bytes`) and runs it via
-     `docker/podman exec -i`. That entrypoint — not Agency's own process —
-     does the `fork()`, because `docker exec` attaches into the container's
-     existing namespaces: a fork from *inside* it lands the traced child in
-     the *container's* PID namespace, which a host-side fork structurally
-     cannot do.
-   - **Host/chroot:** `TracerLoop` forks directly, same mechanics, on the
-     host.
-   Either way: `PTRACE_TRACEME`, install a seccomp filter
+7. **Start the host services and sandbox daemon.** `AgentEngine` starts the
+   host-side HTTP services on a UDS, then `ensure_harness_daemon()` launches
+   one Harness Manager daemon through the sandbox backend and passes it the
+   bridged host-services socket path.
+8. **Submit the attempt.** The engine sends a `HarnessAttemptRequest` to the
+   daemon. The daemon builds the adapter environment, including the local
+   proxy URL and isolated config home.
+9. **Launch.** The adapter calls the single `harness/ptrace/` supervisor in
+   the daemon process. Because the daemon is already inside the sandbox, its
+   fork lands in the correct PID and mount namespaces without another
+   launcher or relay. The traced child performs `PTRACE_TRACEME`, installs a seccomp filter
    (`SECCOMP_RET_TRACE` on `execve`/`execveat` by default — the filter's
    default action is `ALLOW`, so only the listed syscalls ever generate a
    stop), then `execve(claude, argv, envp)`. **This `execve` is the last
    thing Agency controls before the black box starts.**
-10. `wire_to_sandbox(handle, ag.sandbox)` hooks the launch's spawn/exit
-    events into the sandbox's own PID bookkeeping
-    (`ingest_ptrace_pids`), so `get_live_pids()`/`wait_for_processes()`
-    reflect a harness-driven agent exactly as they would a native one.
+10. Each intercepted syscall is sent to the host interaction service over
+    the host-services UDS. Its allow/deny response is applied before the
+    traced process resumes.
 
 **Inside the black box — observed only at two seams**
 

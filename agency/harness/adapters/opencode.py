@@ -62,7 +62,7 @@ class _OpencodeBackend(agharness_backend):
     ) -> "tuple[agdata, agcontext, list[dict]]":
         from .. import agharness
         from ..agproxy_llm import get_shared_gateway
-        from ..ptrace.supervisor import agProxyPtrace, wire_to_sandbox
+        from ..ptrace.supervisor import agProxyPtrace
 
         sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
 
@@ -101,9 +101,6 @@ class _OpencodeBackend(agharness_backend):
             px = agProxyPtrace(ag.agconfig)
             policy = agharness.default_policy(ag)
             handle = px.launch(argv, envp, cwd=str(config_home), policy=policy, ag=ag)
-            if ag.sandbox is not None:
-                wire_to_sandbox(handle, ag.sandbox)
-
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
         finally:
             gateway.unregister(token)

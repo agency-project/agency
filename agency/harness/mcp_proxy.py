@@ -1,10 +1,7 @@
 """Generic reverse proxy for the MCP tool surface, for `agmanager_harness`.
 
-Forwards to `agmanager_host`'s own `/mcp` mount over the bridged UDS.
-Replaces the old `agproxy_ptrace_internal`'s `start_tcp_relay`/
-`stop_tcp_relay` (a separate subprocess doing a raw byte-level TCP<->UDS
-relay) with an ordinary HTTP reverse-proxy route on this same process --
-simpler, and one fewer process to launch/track per agent. See
+Forwards to `agmanager_host`'s own `/mcp` mount over the bridged UDS using
+an ordinary HTTP reverse-proxy route on this same process. See
 `agmanager_harness.py`'s module docstring for the full design.
 
 Known simplification: buffers each proxied response instead of streaming
@@ -33,10 +30,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 if TYPE_CHECKING:
-    from .clients.host_services_client import _HostBridge
+    from .clients.host_services_client import HostServicesClient
 
 
-def build_router(bridge: "_HostBridge") -> APIRouter:
+def build_router(bridge: "HostServicesClient") -> APIRouter:
     router = APIRouter()
 
     # Exact path, not a wildcard sub-path: agmanager_host's own MCP mount

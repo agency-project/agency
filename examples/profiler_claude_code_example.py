@@ -7,7 +7,7 @@ This file and ``profiler_native_example.py`` are deliberately the same script
 compare a third-party CLI harness against Agency's in-container ReAct loop on
 identical work.
 
-``engine="claude_code"`` dispatches through agharness_backend instead of the
+``harness="claude_code"`` dispatches through agharness_backend instead of the
 native loop. Claude Code keeps its own system prompt, scaffolding, and tools;
 Agency occupies only the LLM endpoint and the syscall boundary of its process
 tree. The `claude` CLI must be installed and authenticated on this host
@@ -256,7 +256,7 @@ def _print_profile_report(profile_dir: Path) -> None:
         return
 
     print("\n" + "=" * 78)
-    print(f"agprof summary -- engine={ENGINE}  schema_version={metrics['schema_version']}")
+    print(f"agprof summary -- harness={ENGINE}  schema_version={metrics['schema_version']}")
     print("=" * 78)
 
     sampling = metrics["sampling"]
@@ -385,7 +385,7 @@ def _workload() -> None:
     """The three phases. Everything below is ordinary Agency code -- the only
     profiler-aware lines are the ``agprof.span`` / ``agprof.annotate`` calls,
     which are no-ops when profiling is off."""
-    ag = agent(agconfig=cfg, engine=ENGINE)
+    ag = agent(agconfig=cfg, harness=ENGINE)
 
     # Phase 1 -- network.
     with agprof.span("example:phase1_network"):

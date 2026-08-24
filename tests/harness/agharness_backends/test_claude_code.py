@@ -32,7 +32,7 @@ from agency.sandbox import agSandboxBackendConfig
 from agency.llm import agBedrockBackendConfig
 from agency.agdata import agdata
 from agency.agent import agent
-from agency.harness.agharness_backends.claude_code import (
+from agency.harness.adapters.claude_code import (
     _ClaudeCodeBackend,
     claude_code_available,
 )
@@ -109,7 +109,7 @@ def test_run_attempt_parses_json_result_field(_patch_which_finds_claude):
 
     payload = json.dumps({"result": "Hi there!", "usage": {"input_tokens": 5, "output_tokens": 2}})
     handle = _make_handle(stdout=payload)
-    with patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
         mock_px_cls.return_value.launch.return_value = handle
         attempt = _run_attempt(backend, ag)
 
@@ -131,12 +131,12 @@ def test_run_attempt_does_not_override_home(monkeypatch, _patch_which_finds_clau
     captured_envp = {}
     captured_argv = []
 
-    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+    def fake_launch(argv, envp, *, cwd, policy, ag):
         captured_argv.extend(argv)
         captured_envp.update(envp)
         return handle
 
-    with patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
         mock_px_cls.return_value.launch.side_effect = fake_launch
         _run_attempt(backend, ag, harness_base_url="http://harness.local", token="tok-1")
 
@@ -156,13 +156,13 @@ def test_run_attempt_enables_exact_claude_hooks_only_while_profiling(_patch_whic
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+    def fake_launch(argv, envp, *, cwd, policy, ag):
         captured["argv"] = argv
         captured["envp"] = envp
         return handle
 
     with (
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as ptrace_cls,
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls,
         patch("agency.profiler.agprof.enabled", return_value=True),
     ):
         ptrace_cls.return_value.launch.side_effect = fake_launch
@@ -179,7 +179,7 @@ def test_run_attempt_nonzero_exit_returns_error(_patch_which_finds_claude):
     ag = _make_agent(with_sandbox=False)
 
     handle = _make_handle(stdout="", stderr="auth error", rc=1)
-    with patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
         mock_px_cls.return_value.launch.return_value = handle
         attempt = _run_attempt(backend, ag)
 
@@ -197,11 +197,11 @@ def test_run_attempt_threads_resume_session_id_into_argv(_patch_which_finds_clau
     handle = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+    def fake_launch(argv, envp, *, cwd, policy, ag):
         captured["argv"] = argv
         return handle
 
-    with patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
         mock_px_cls.return_value.launch.side_effect = fake_launch
         attempt = _run_attempt(backend, ag, resume_session_id="sess-abc")
 
@@ -216,11 +216,11 @@ def test_run_attempt_omits_resume_flag_for_a_fresh_session(_patch_which_finds_cl
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag, sandbox=None):
+    def fake_launch(argv, envp, *, cwd, policy, ag):
         captured["argv"] = argv
         return handle
 
-    with patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls:
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
         mock_px_cls.return_value.launch.side_effect = fake_launch
         _run_attempt(backend, ag, resume_session_id=None)
 
@@ -270,7 +270,7 @@ def test_real_claude_raw_text_end_to_end():
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
 
-    ag = agent(agconfig=cfg, engine="claude_code")
+    ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
         name="two_word_greeting_test",
         system_prompt="Respond with exactly the two words requested, nothing else.",
@@ -304,7 +304,7 @@ def test_real_claude_tool_call_history_is_not_flattened():
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
-    ag = agent(agconfig=cfg, engine="claude_code")
+    ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
         name="claude_tool_history_test",
         system_prompt=(
@@ -338,7 +338,7 @@ def test_real_claude_structured_output_end_to_end():
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
     )
 
-    ag = agent(agconfig=cfg, engine="claude_code")
+    ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
         name="structured_greeting_test",
         system_prompt="You produce a structured greeting.",
@@ -375,7 +375,7 @@ def test_real_claude_history_continues_across_a_fresh_sandbox():
     import uuid
 
     ag = agent(
-        agconfig=cfg, sandbox=agSandbox(str(uuid.uuid4()), agconfig=cfg), engine="claude_code"
+        agconfig=cfg, sandbox=agSandbox(str(uuid.uuid4()), agconfig=cfg), harness="claude_code"
     )
     try:
         r1 = ag.run(

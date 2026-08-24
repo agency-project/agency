@@ -35,6 +35,19 @@ def _make_manager(tmp_path, policy=None):
     return HostServerManager(agent, sandbox, skill, resource_pool), agent, skill
 
 
+def test_construction_provisions_runtime_paths_when_config_has_no_ad_hoc_attributes():
+    agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
+    agent = SimpleNamespace(agconfig=agconfig, inbox=object())
+    skill = SimpleNamespace(policy=agpolicy())
+
+    manager = HostServerManager(agent, SimpleNamespace(), skill, SimpleNamespace())
+
+    assert manager._configs.uds_path.endswith(".sock")
+    assert manager._data_collector._configs.db_path == str(
+        Path(manager._configs.uds_path).with_suffix(".sqlite3")
+    )
+
+
 def test_construction_wires_agent_and_skill_into_interaction_server(tmp_path):
     policy = agpolicy()
     manager, agent, skill = _make_manager(tmp_path, policy=policy)

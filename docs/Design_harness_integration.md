@@ -1,7 +1,7 @@
 # Harness Integration Design
 
-> **Status:** implemented (all six build phases). `agharness`/`harness/agharness_backends/`,
-> `agproxy_llm`, `agproxy_ptrace`/`harness/agproxy_ptrace_internal/`, and `agpolicy` all exist in the
+> **Status:** implemented (all six build phases). `engine/`, `harness/daemon.py`,
+> `harness/adapters/`, `harness/ptrace/`, and `agpolicy` contain the current implementation
 > codebase, per this document's design — see [agharness.md](agharness.md),
 > [agproxy_llm.md](harness/agproxy_llm.md), [agproxy_ptrace.md](harness/agproxy_ptrace.md), and
 > [agpolicy.md](agpolicy.md) for the concrete implementation, and the plan referenced in that work
@@ -271,10 +271,10 @@ both the native `dispatch_tools` retrofit (future work, unchanged from before) a
   supervisor should perform the `unshare`/chroot setup itself (as the direct ancestor process) and
   fork the harness as its traced child from inside that same namespace, so credential/namespace
   checks resolve the same way they already do for the backend's own `_container_exec`.
-- **Cross-namespace tracing — adopted direction: bridge it, not avoid it.** A docker/podman-backed
-  `agSandbox` runs its container in its own separate PID namespace, and `agproxy_ptrace`'s Python
-  code today forks from wherever the *calling* process runs (typically the host-side agency
-  process, not inside that container). The harness must execute *inside* that container's namespace
+- **Cross-namespace tracing — run the supervisor inside the sandbox.** A docker/podman-backed
+  `agSandbox` runs its container in its own separate PID namespace. The Harness Manager daemon and
+  `harness/ptrace/` supervisor run inside that sandbox, so the tracer forks from the same namespace
+  in which the harness must execute. The harness therefore executes *inside* the container's namespace
   — so its filesystem writes land in the same workspace the rest of that agent's tools see, and so
   its own built-in tools resolve real container-native paths with no interception layer standing
   in for the kernel — which means the supervisor itself needs to run inside that namespace too.
@@ -284,21 +284,10 @@ both the native `dispatch_tools` retrofit (future work, unchanged from before) a
   files visible without the harness ever entering it (see
   [Design_harness_filesystem.md](Design_harness_filesystem.md), now superseded) — specifically to
   avoid building this bridge. That direction was reconsidered: running the harness inside the
-  container is the adopted design after all, so the bridge has to be built rather than designed
-  around. Concretely: a small in-container entrypoint, launched via `docker exec` (or the
-  equivalent `podman exec`) into the already-running sandbox container, performs the same
-  fork/`PTRACE_TRACEME`/seccomp-install/`execve` sequence `agproxy_ptrace.launch()` already does on
-  the host — but since `docker exec` attaches its process into the container's existing namespaces,
-  the `fork()` inside it lands the traced child in the *container's* PID namespace, which is the
-  actual fix (a parent cannot relocate an already-running child into a different namespace after
-  the fact; the fork has to happen from inside it). This entrypoint carries no policy logic of its
-  own — it relays each trapped syscall event to the host-side `agpolicy.check()` over its own
-  stdio (the `docker exec` process's stdin/stdout are already a persistent bidirectional stream, so
-  no separate socket is required for a first implementation) and applies whatever
-  allow/deny/rewrite decision comes back, exactly as the host-level tracer loop does today. Building
-  and testing this bridge is now the active implementation task — see
-  `harness/agproxy_ptrace_internal/` for where the host-side tracer loop already lives
-  and what's being extended.
+  container is the adopted design after all. `ensure_harness_daemon()` launches the daemon through
+  the sandbox backend; the daemon then invokes the local tracer directly. Trapped syscall events
+  cross the existing host-services UDS to `agpolicy.check()`, and the allow/deny response returns on
+  that same request. There is no second ptrace implementation or ptrace-specific relay.
 - **Interaction with a harness's own internal OS-level sandboxing** (Codex's bwrap/seatbelt/landlock
   Bash sandbox, Claude Code's `sandbox.enabled`) has not been separately verified — those run as
   descendants of the traced harness process, so the same ancestor-of-descendant permission argument
@@ -335,7 +324,7 @@ cfg = agConfig(
         disable_harness_native_sandbox=True,
     ),
 )
-ag = agent(agconfig=cfg, engine="claude_code")
+ag = agent(agconfig=cfg, harness="claude_code")
 result = ag.run(my_existing_skill, agdata(task=...))    # completely unchanged call site
 ```
 
@@ -355,9 +344,8 @@ is unaffected, exactly as in the prior draft.
 `harness/agmcp_server.py`'s shared `agMCPServer` (Phase 4 of the container-unification
 plan; see the plan's own doc/PR for the full design) exposes `reserve_cpu`/`cpu_release`/
 `daemon_release`/`submit_output` as real MCP tools, reached by `claude_code.py` today via
-`--mcp-config`/`--strict-mcp-config` (bridged into the container over the same UDS mount as the
-in-container LLM gateway, via a revived generic TCP-to-UDS relay -- see
-`agproxy_ptrace_internal/_in_container_launcher.py`'s `start_tcp_relay`) and by `native.py`'s
+`--mcp-config`/`--strict-mcp-config` (reached through the Harness Manager's HTTP proxy over the
+host-services UDS) and by `native.py`'s
 in-container react loop via a real `mcp` client. `submit_output` replaces the schema-reprompting
 approach described below FOR THOSE TWO ENGINES: structured output is now collected via tool calls
 and read back through `agmcp_server.collected_output(token)`, not parsed post-hoc from the harness's
@@ -490,7 +478,7 @@ All six phases are implemented and tested; this section is kept as the historica
    own forked descendants, which the kernel permits without `CAP_SYS_PTRACE`. See "Prerequisites"
    above for the corrected finding and the real gap it surfaced instead (a docker/podman
    container's separate PID namespace vs. a host-forked supervisor).
-3. **`agent.engine` seam** (`agent.py`/`agskill.py`) + **`agproxy_llm` (chat-completions route) +
+3. **`agent.harness` seam** (`agent.py`/`agskill.py`) + **`agproxy_llm` (chat-completions route) +
    opencode backend** — the smallest real-harness integration slice. No `opencode` binary was
    installable in the development environment (no Node/Bun), so this backend is verified by
    mocked tests only.

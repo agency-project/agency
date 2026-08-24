@@ -15,7 +15,7 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
-from agency.harness.agharness_backends.grok import _GrokBackend, grok_available
+from agency.harness.adapters.grok import _GrokBackend, grok_available
 from agency.agskill import agskill
 
 
@@ -85,8 +85,7 @@ def test_execute_parses_json_result_and_routes_through_gateway():
     handle = _make_handle(stdout=payload)
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox") as mock_wire,
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         apply(mock_gateway_getter, mock_px_cls)
@@ -99,7 +98,6 @@ def test_execute_parses_json_result_and_routes_through_gateway():
     assert ctx.total_input_tokens == 5
     assert ctx.total_output_tokens == 2
     assert backend.session_resume_id == "sess-1"
-    mock_wire.assert_called_once_with(handle, ag.sandbox)
     mock_gateway.register.assert_called_once()
     mock_gateway.unregister.assert_called_once()
 
@@ -120,8 +118,7 @@ def test_execute_uses_grok_home_for_config_isolation():
 
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         mock_gateway_getter.return_value = mock_gateway
@@ -153,8 +150,7 @@ def test_execute_writes_chat_completions_config_toml():
 
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, _ = _patched_gateway_and_ptrace(handle)
         mock_gateway_getter.return_value = mock_gateway
@@ -168,25 +164,6 @@ def test_execute_writes_chat_completions_config_toml():
     assert mock_gateway.base_url in content
 
 
-def test_execute_skips_wire_to_sandbox_when_no_sandbox():
-    backend = _GrokBackend(agConfig())
-    skill = agskill(name="s", system_prompt="do the thing")
-    ag = _make_agent(with_sandbox=False)
-
-    handle = _make_handle(stdout='{"text": "ok"}')
-    with (
-        patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox") as mock_wire,
-    ):
-        mock_gateway, apply = _patched_gateway_and_ptrace(handle)
-        apply(mock_gateway_getter, mock_px_cls)
-
-        backend.execute(ag, agcontext(), agdata(task="go"), None, skill=skill)
-
-    mock_wire.assert_not_called()
-
-
 def test_execute_nonzero_exit_returns_agerror():
     backend = _GrokBackend(agConfig())
     skill = agskill(name="s", system_prompt="do the thing")
@@ -196,8 +173,7 @@ def test_execute_nonzero_exit_returns_agerror():
     handle = _make_handle(stdout="", stderr="auth error", rc=1)
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         apply(mock_gateway_getter, mock_px_cls)
@@ -218,8 +194,7 @@ def test_execute_recovers_structured_output_schema():
     handle = _make_handle(stdout=json.dumps({"text": '{"answer": "42"}'}))
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         apply(mock_gateway_getter, mock_px_cls)

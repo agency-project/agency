@@ -14,7 +14,7 @@ import pytest
 from agency.agconfig import agConfig
 from agency.agdata import agdata, agerror
 from agency.agcontext import agcontext
-from agency.harness.agharness_backends.codex import _CodexBackend, codex_available
+from agency.harness.adapters.codex import _CodexBackend, codex_available
 from agency.agskill import agskill
 
 
@@ -83,8 +83,7 @@ def test_execute_parses_ndjson_agent_message():
     handle = _make_handle(stdout=stdout)
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox") as mock_wire,
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         apply(mock_gateway_getter, mock_px_cls)
@@ -93,7 +92,6 @@ def test_execute_parses_ndjson_agent_message():
     assert not isinstance(result, agerror)
     assert result.result == "hi"
     assert ctx is prev_ctx
-    mock_wire.assert_called_once_with(handle, ag.sandbox)
     mock_gateway.register.assert_called_once()
     mock_gateway.unregister.assert_called_once()
 
@@ -107,8 +105,7 @@ def test_execute_nonzero_exit_returns_agerror():
     handle = _make_handle(stdout="", stderr="boom", rc=1)
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         apply(mock_gateway_getter, mock_px_cls)
@@ -130,8 +127,7 @@ def test_execute_recovers_structured_output_schema():
     handle = _make_handle(stdout=stdout)
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, apply = _patched_gateway_and_ptrace(handle)
         apply(mock_gateway_getter, mock_px_cls)
@@ -160,8 +156,7 @@ def test_execute_writes_model_providers_config_toml():
 
     with (
         patch("agency.harness.agproxy_llm.get_shared_gateway") as mock_gateway_getter,
-        patch("agency.harness.agproxy_ptrace.agProxyPtrace") as mock_px_cls,
-        patch("agency.harness.agproxy_ptrace.wire_to_sandbox"),
+        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls,
     ):
         mock_gateway, _ = _patched_gateway_and_ptrace(handle)
         mock_gateway_getter.return_value = mock_gateway

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -10,10 +10,10 @@ from typing import TYPE_CHECKING
 import uvicorn
 from fastapi import FastAPI
 
-from ..agDataCollector import agDataCollector
+from ...agutil import new_uds_path
+from ..agDataCollector import agDataCollector, agDataCollectorConfigs
 from .host_interaction_server import HostInteractionServer
 from .host_mcp_server import HostMcpServer
-from .host_server_base import HostServerBase
 from .llm_handler_server import LlmHandlerServer
 
 if TYPE_CHECKING:
@@ -31,7 +31,7 @@ class HostServerManagerConfigs:
     shutdown_timeout_s: float = 10.0
 
 
-class HostServerManager(HostServerBase):
+class HostServerManager:
     def __init__(
         self,
         agent: "agent",
@@ -39,15 +39,11 @@ class HostServerManager(HostServerBase):
         skill: "agskill",
         resource_pool: "agResourcePool",
     ) -> None:
+        self._ensure_runtime_configs(agent.agconfig)
         self._data_collector = agDataCollector(agent.agconfig)
         self._llm_handler_server = LlmHandlerServer(agent.agconfig)
         self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool)
         self._interaction_server = HostInteractionServer(agent, skill, self._data_collector)
-        self._server_instances: "list[HostServerBase]" = [
-            self._llm_handler_server,
-            self._host_mcp_server,
-            self._interaction_server,
-        ]
         self.set_config(agent.agconfig)
 
         self._server: "uvicorn.Server | None" = None
@@ -62,40 +58,50 @@ class HostServerManager(HostServerBase):
         return self._host_mcp_server
 
     def set_config(self, agconfig: "agConfig") -> None:
+        self._ensure_runtime_configs(agconfig)
         self._configs = agconfig.HostServerManagerConfigs
         self._data_collector.set_config(agconfig)
-        for server_instance in self._server_instances:
-            server_instance.set_config(agconfig)
+        self._llm_handler_server.set_config(agconfig)
+
+    def _ensure_runtime_configs(self, agconfig: "agConfig") -> None:
+        manager_configs = agconfig.__dict__.get("HostServerManagerConfigs")
+        if manager_configs is None:
+            manager_configs = getattr(self, "_configs", None)
+        if manager_configs is None:
+            manager_configs = HostServerManagerConfigs(uds_path=new_uds_path("host"))
+        agconfig.HostServerManagerConfigs = manager_configs
+
+        collector_configs = agconfig.__dict__.get("agDataCollectorConfigs")
+        if collector_configs is None and hasattr(self, "_data_collector"):
+            collector_configs = self._data_collector._configs
+        if collector_configs is None:
+            database_path = str(Path(manager_configs.uds_path).with_suffix(".sqlite3"))
+            collector_configs = agDataCollectorConfigs(db_path=database_path)
+        agconfig.agDataCollectorConfigs = collector_configs
 
     def start(self) -> str:
         if self._server is not None:
             return self._configs.uds_path
 
         self._data_collector.start()
-        for server_instance in self._server_instances:
-            server_instance.start()
 
         Path(self._configs.uds_path).parent.mkdir(parents=True, exist_ok=True)
+        mcp_app = self._host_mcp_server.build_app()
         sub_apps = [
-            ("/llm", self._llm_handler_server, self._llm_handler_server.build_app()),
+            ("/llm", self._llm_handler_server.build_app()),
             (
                 "/interaction",
-                self._interaction_server,
                 self._interaction_server.build_app(),
             ),
             # MCP's Streamable HTTP app defines the exact route /mcp.
             # Mount it last at the root so that route remains /mcp rather
             # than becoming /mcp/mcp or redirecting to /mcp/.
-            ("/", self._host_mcp_server, self._host_mcp_server.build_app()),
+            ("/", mcp_app),
         ]
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI):
-            async with AsyncExitStack() as stack:
-                for _, server_instance, sub_app in sub_apps:
-                    ctx = server_instance.lifespan_context(sub_app)
-                    if ctx is not None:
-                        await stack.enter_async_context(ctx)
+            async with self._host_mcp_server.lifespan_context(mcp_app):
                 yield
 
         app = FastAPI(lifespan=lifespan)
@@ -123,6 +129,5 @@ class HostServerManager(HostServerBase):
         self._server = None
         self._server_thread = None
 
-        for server_instance in self._server_instances:
-            server_instance.stop()
+        self._llm_handler_server.stop()
         self._data_collector.stop()

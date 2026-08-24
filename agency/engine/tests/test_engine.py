@@ -8,9 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from agency.agdata import agdata
+from agency.agcontext import agcontext
+from agency.agschema import agschema
 from agency.engine import engine as mod
 from agency.engine.engine import AgentEngine
-from agency.harness.protocol import HarnessAttemptResult, PromptPayload
+from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -21,6 +23,9 @@ class _FakeAgent:
     def __init__(self):
         self.agconfig = SimpleNamespace(marker="agconfig")
         self.sandbox = SimpleNamespace(marker="sandbox")
+        self.harness = "claude_code"
+        self.agname = "test-agent"
+        self._harness_sessions = {}
         self.change_config_calls = []
         self.inbox = queue.Queue()
 
@@ -33,12 +38,8 @@ class _FakeAgent:
 
 
 def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=None):
-    """Patches engine.py's HostServerManager import with a fake whose
-    attempt-result waiter pops from `results` in order, and whose
-    host_mcp_server.collected_output() steps through `collected_sequence`.
-    Returns a dict that records the constructed manager and directly sent
-    daemon prompts."""
-    holder: dict = {"sent_prompts": []}
+    """Install a fake host manager and request/response daemon client."""
+    holder: dict = {"requests": []}
     remaining_results = list(results)
     collected_iter = iter(collected_sequence) if collected_sequence is not None else None
 
@@ -52,21 +53,14 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             self.stopped = False
             self.set_config_calls = []
 
-            def wait_for_attempt_result(waiter, timeout=None):
-                return remaining_results.pop(0)
-
-            self.interaction_server = SimpleNamespace(
-                expect_attempt_result=lambda: object(),
-                wait_for_attempt_result=wait_for_attempt_result,
-                cancel_expected_attempt=lambda waiter: None,
-            )
             self.host_mcp_server = SimpleNamespace(
                 collected_output=lambda: next(collected_iter) if collected_iter is not None else {}
             )
             holder["manager"] = self
 
-        def start(self) -> None:
+        def start(self) -> str:
             self.started = True
+            return "/tmp/host.sock"
 
         def stop(self) -> None:
             self.stopped = True
@@ -75,10 +69,26 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             self.set_config_calls.append(agconfig)
 
     monkeypatch.setattr(mod, "HostServerManager", _FakeHostServerManager)
+
+    class _FakeClient:
+        def __init__(self):
+            self.closed = False
+
+        def run_harness_attempt(self, request):
+            holder["requests"].append(request)
+            return remaining_results.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    client = _FakeClient()
+    holder["client"] = client
     monkeypatch.setattr(
-        AgentEngine,
-        "_send_run_attempt",
-        lambda self, prompt: holder["sent_prompts"].append(prompt),
+        mod,
+        "ensure_harness_daemon",
+        lambda sandbox, host_uds_path, engine_name, agconfig: SimpleNamespace(
+            client=lambda: client
+        ),
     )
     return holder
 
@@ -186,11 +196,16 @@ def test_missing_output_fields_diffs_against_collected_output():
 # ---------------------------------------------------------------------------
 
 
-def test_execute_stops_the_host_server_manager_even_when_bootup_is_not_implemented(monkeypatch):
+def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypatch):
     holder = _install_fake_host_server_manager(monkeypatch, results=[])
+    monkeypatch.setattr(
+        mod,
+        "ensure_harness_daemon",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("launch failed")),
+    )
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="launch failed"):
         engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
     assert holder["manager"].started is True
     assert holder["manager"].stopped is True
@@ -201,7 +216,6 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
         monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
     )
     engine = AgentEngine(_FakeAgent())
-    monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(
         engine, "_build_execution_result", lambda context, skill, attempt: ("built", attempt)
@@ -211,7 +225,8 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     manager = holder["manager"]
-    assert holder["sent_prompts"] == ["p0"]
+    assert [request.prompt for request in holder["requests"]] == ["p0"]
+    assert holder["requests"][0].harness == "claude_code"
     assert manager.started is True
     assert manager.stopped is True
     assert result == ("built", HarnessAttemptResult(ok=True, final_text="done"))
@@ -222,14 +237,13 @@ def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypa
         monkeypatch, results=[HarnessAttemptResult(ok=False, error_message="boom")]
     )
     engine = AgentEngine(_FakeAgent())
-    monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
-    assert holder["sent_prompts"] == ["p0"]
+    assert [request.prompt for request in holder["requests"]] == ["p0"]
     assert result == HarnessAttemptResult(ok=False, error_message="boom")
 
 
@@ -243,7 +257,6 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
         collected_sequence=[{}, {"summary": "x"}],
     )
     engine = AgentEngine(_FakeAgent())
-    monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     p0 = PromptPayload("the-system", "p0", None)
     p1 = PromptPayload("the-system", "p1", None)
     prompts = iter([p0, p1])
@@ -258,8 +271,57 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
 
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
-    assert holder["sent_prompts"] == [p0, p1]
+    assert [request.prompt for request in holder["requests"]] == [p0, p1]
     assert result == HarnessAttemptResult(ok=True, final_text="second")
+
+
+def test_execute_transports_and_captures_session_blobs(monkeypatch):
+    holder = _install_fake_host_server_manager(
+        monkeypatch,
+        results=[
+            HarnessAttemptResult(
+                ok=True,
+                final_text="first",
+                session_id="session-2",
+                session_blob_b64="dXBkYXRlZA==",
+            ),
+            HarnessAttemptResult(
+                ok=True,
+                final_text="second",
+                session_id="session-2",
+                session_blob_b64="ZmluYWw=",
+            ),
+        ],
+        collected_sequence=[{}, {"summary": "x"}],
+    )
+    agent = _FakeAgent()
+    agent._harness_sessions["claude_code"] = {
+        "session_id": "session-1",
+        "blob_b64": "cHJpb3I=",
+    }
+    engine = AgentEngine(agent)
+    prompt = PromptPayload("system", "prompt")
+    monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: prompt)
+    monkeypatch.setattr(engine, "_build_retry_prompt", lambda *_args, **_kwargs: prompt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda _c, _s, attempt: attempt)
+    skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=1)
+
+    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+
+    first, second = holder["requests"]
+    assert (first.resume_session_id, first.prior_session_blob_b64) == (
+        "session-1",
+        "cHJpb3I=",
+    )
+    assert (second.resume_session_id, second.prior_session_blob_b64) == (
+        "session-2",
+        "dXBkYXRlZA==",
+    )
+    assert agent._harness_sessions["claude_code"] == {
+        "session_id": "session-2",
+        "blob_b64": "ZmluYWw=",
+    }
+    assert result.final_text == "second"
 
 
 def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
@@ -269,7 +331,6 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
         collected_sequence=[{}, {}, {}],
     )
     engine = AgentEngine(_FakeAgent())
-    monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     p0 = PromptPayload("the-system", "p0", None)
     retry = PromptPayload("the-system", "retry", None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: p0)
@@ -284,7 +345,7 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
     result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
 
     # 1 initial attempt + 2 retries = 3 calls total, then gives up
-    assert holder["sent_prompts"] == [p0, retry, retry]
+    assert [request.prompt for request in holder["requests"]] == [p0, retry, retry]
     assert result == HarnessAttemptResult(ok=True, final_text="attempt-2")
 
 
@@ -292,7 +353,6 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     attempt = HarnessAttemptResult(ok=True, final_text="done")
     holder = _install_fake_host_server_manager(monkeypatch, results=[attempt])
     engine = AgentEngine(_FakeAgent())
-    monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     seen = {}
 
@@ -309,3 +369,107 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     assert result == "the-result"
     assert seen == {"context": context, "skill": skill, "attempt": attempt}
     assert holder["manager"].stopped is True
+
+
+def test_run_attempt_returns_original_rpc_response_without_host_callback():
+    expected = HarnessAttemptResult(ok=True, final_text="same response")
+    seen = []
+    engine = AgentEngine(_FakeAgent())
+    engine._sandbox_interaction_client = SimpleNamespace(
+        run_harness_attempt=lambda request: seen.append(request) or expected
+    )
+    prompt = PromptPayload("system", "user")
+
+    result = engine._run_attempt(prompt, max_steps=7)
+
+    assert result is expected
+    assert seen == [HarnessAttemptRequest(prompt=prompt, harness="claude_code", max_steps=7)]
+
+
+# ---------------------------------------------------------------------------
+# _build_execution_result
+# ---------------------------------------------------------------------------
+
+
+def test_build_execution_result_converts_successful_plain_text_attempt():
+    engine = AgentEngine(_FakeAgent())
+    engine._execution_prompt = PromptPayload("system", "do the work")
+    context = agcontext(messages=[{"role": "assistant", "content": "prior"}])
+    skill = SimpleNamespace(output_schema=None, _build_system_prompt=lambda: "system")
+
+    result = engine._build_execution_result(
+        context,
+        skill,
+        HarnessAttemptResult(ok=True, final_text="done", input_tokens=4, output_tokens=2),
+    )
+
+    assert result.ok is True
+    assert result.output == agdata(result="done")
+    assert result.context is context
+    assert context.total_input_tokens == 4
+    assert context.total_output_tokens == 2
+    assert context.messages == [
+        {"role": "assistant", "content": "prior"},
+        {"role": "user", "content": "do the work"},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert result.delta == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "do the work"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
+def test_build_execution_result_uses_collected_structured_output():
+    engine = AgentEngine(_FakeAgent())
+    engine._host_server_manager = SimpleNamespace(
+        host_mcp_server=SimpleNamespace(
+            collected_output=lambda: {"summary": "finished", "count": 2}
+        )
+    )
+    skill = SimpleNamespace(
+        output_schema=agschema(agdata(summary=str, count=int)),
+        _build_system_prompt=lambda: "system",
+    )
+
+    result = engine._build_execution_result(
+        agcontext(), skill, HarnessAttemptResult(ok=True, final_text="ignored")
+    )
+
+    assert result.ok is True
+    assert result.output == agdata(summary="finished", count=2)
+
+
+def test_build_execution_result_reports_incomplete_structured_output():
+    engine = AgentEngine(_FakeAgent())
+    engine._host_server_manager = SimpleNamespace(
+        host_mcp_server=SimpleNamespace(collected_output=lambda: {"summary": "finished"})
+    )
+    skill = SimpleNamespace(
+        output_schema=agschema(agdata(summary=str, count=int)),
+        _build_system_prompt=lambda: "system",
+    )
+
+    result = engine._build_execution_result(
+        agcontext(), skill, HarnessAttemptResult(ok=True, final_text="done")
+    )
+
+    assert result.ok is False
+    assert result.output.error == result.error_message
+    assert "count" in result.error_message
+
+
+def test_build_execution_result_converts_failed_or_missing_attempt_to_error():
+    engine = AgentEngine(_FakeAgent())
+    skill = SimpleNamespace(output_schema=None, _build_system_prompt=lambda: "system")
+
+    failed = engine._build_execution_result(
+        agcontext(), skill, HarnessAttemptResult(ok=False, error_message="daemon failed")
+    )
+    missing = engine._build_execution_result(agcontext(), skill, None)
+
+    assert failed.ok is False
+    assert failed.output.error == "daemon failed"
+    assert failed.error_message == "daemon failed"
+    assert missing.ok is False
+    assert missing.output.error == "no attempt was made"

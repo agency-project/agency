@@ -1,4 +1,4 @@
-# Harness engine glue (`harness/agharness.py`, `harness/agharness_backends/`)
+# Harness engine glue (`engine/`, `harness/daemon.py`, `harness/adapters/`)
 
 The `engine` seam on `agent` (see [agent.md](agent.md)) lets `agskill.run()` dispatch to an
 off-the-shelf coding-agent CLI instead of the native ReAct loop. `harness/agharness.py` holds what's
@@ -9,17 +9,17 @@ selected via `agharness_backend.for_config(engine, agconfig)` — the exact same
 ## The engine seam
 
 ```python
-ag = agent(agconfig=cfg, engine="claude_code")   # "native" (default), "opencode", "claude_code", "codex", "grok"
+ag = agent(agconfig=cfg, harness="claude_code")   # "native" (default), "opencode", "claude_code", "codex", "grok"
 result = ag.run(my_skill, agdata(task=...))       # completely unchanged call site
 ```
 
-`agskill.run()`'s `_task()` branches on `ag.engine`: `"native"` calls `execute_react()` (untouched);
+`agskill.run()`'s `_task()` branches on `ag.harness`: `"native"` calls `execute_react()` (untouched);
 anything else calls `agskill.execute_harness()`, which validates input the same way `execute_react`
-does, then dispatches to `agharness_backend.for_config(ag.engine, ag.agconfig).execute(...)`. Both
+does, then dispatches to `agharness_backend.for_config(ag.harness, ag.agconfig).execute(...)`. Both
 paths return the same `(result, ctx, delta)` contract — `ctx` is the *same* `prev_ctx` object,
 mutated in place; `delta` is `[system_prompt_message] + every message appended this call`.
 
-`agent.engine` round-trips through `fork()`, `save()`/`load()` (defaults to `"native"` if a
+`agent.harness` round-trips through `fork()`, `save()`/`load()` (defaults to `"native"` if a
 checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`'s `__init__`/`fork`/
 `save`/`load` for the four exact insertion points.
 
@@ -33,15 +33,12 @@ checkpoint predates this field) exactly like `agent.llm` does — see `agent.py`
    prompt or as a tool (see [Design_harness_integration.md](Design_harness_integration.md)).
 3. Materialize an isolated config home (`agharness.materialize_config_home`) so concurrent agents
    never share a harness's own config/credentials directory.
-4. Launch via `agProxyPtrace(ag.agconfig).launch(argv, envp, cwd=..., policy=agharness.default_policy(ag), ag=ag)`
-   — real syscall-level tracing (see [agproxy_ptrace.md](harness/agproxy_ptrace.md)), not a plain
-   `subprocess.run`. `agharness.default_policy(ag)` allows everything but logs every intercepted
-   syscall through `ag.log`, so a harness-driven agent's execution is observable in the
-   webui/logs exactly like a native one's, even with no real security policy wired up yet
-   (see [agpolicy.md](agpolicy.md) for the eventual retrofit).
-5. `agproxy_ptrace.wire_to_sandbox(handle, ag.sandbox)` if a sandbox is attached, so
-   `ag.sandbox.get_live_pids()`/`.wait_for_processes()` reflect the harness's process tree.
-6. `handle.wait(timeout=...)` — blocks for the harness to finish; non-zero exit → `agerror`.
+4. `AgentEngine` sends a `HarnessAttemptRequest` to the sandbox Harness Manager daemon.
+5. The daemon launches external harnesses through the local `agProxyPtrace` implementation
+   (see [agproxy_ptrace.md](harness/agproxy_ptrace.md)). Intercepted syscalls are synchronously
+   checked by the host interaction server over the host-services UDS.
+6. `handle.wait(timeout=...)` blocks for the harness to finish; non-zero exit becomes a failed
+   `HarnessAttemptResult`.
 7. Parse the harness's own final-answer text out of its headless output (backend-specific: a
    single JSON `"result"`/`"text"` field for Claude Code/Grok Build, best-effort NDJSON scanning
    for opencode/Codex).

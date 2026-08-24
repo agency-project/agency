@@ -30,7 +30,7 @@ from .agproxy_llm_adapters import (
 from .common import extract_bearer_token
 
 if TYPE_CHECKING:
-    from .clients.host_services_client import _HostBridge
+    from .clients.host_services_client import HostServicesClient
 
 
 def _mid_array_system_warning(body: dict) -> "str | None":
@@ -55,7 +55,7 @@ def _mid_array_system_warning(body: dict) -> "str | None":
     )
 
 
-def build_router(bridge: "_HostBridge") -> APIRouter:
+def build_router(bridge: "HostServicesClient") -> APIRouter:
     import asyncio
 
     router = APIRouter()

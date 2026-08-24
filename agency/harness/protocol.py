@@ -17,6 +17,9 @@ class HarnessAttemptRequest:
     prompt: PromptPayload
     harness: str
     max_steps: "int | None" = None
+    resume_session_id: "str | None" = None
+    # Session files are opaque bytes, so the JSON protocol carries them as base64.
+    prior_session_blob_b64: "str | None" = None
 
 
 @dataclass
@@ -26,6 +29,8 @@ class HarnessAttemptResult:
     input_tokens: int = 0
     output_tokens: int = 0
     session_id: "str | None" = None
+    # Base64-encoded adapter session state paired with ``session_id``.
+    session_blob_b64: "str | None" = None
     error_message: str = ""
 
 
