@@ -155,6 +155,24 @@ class AgentEngine:
         )
         return self._sandbox_interaction_client.run_harness_attempt(request)
 
+    def _run_attempt(self, prompt: PromptPayload) -> HarnessAttemptResult:
+        interaction = self._host_server_manager.interaction_server
+        waiter = interaction.expect_attempt_result()
+        try:
+            self._send_run_attempt(prompt)
+            return interaction.wait_for_attempt_result(waiter)
+        except BaseException:
+            interaction.cancel_expected_attempt(waiter)
+            raise
+
+    def _send_run_attempt(self, prompt: PromptPayload) -> None:
+        """Send one attempt directly to the sandbox daemon server.
+
+        The host-side protocol boundary is explicit now; the daemon client
+        will implement it once the sandbox-side server exists.
+        """
+        raise NotImplementedError("sandbox daemon client is not configured")
+
     def _missing_output_fields(self, skill: "agskill") -> "list[str]":
         if skill.output_schema is None:
             return []
