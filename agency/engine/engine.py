@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from ..agskill import agskill
 
 
-class agentEngine:
+class AgentEngine:
     """Host-side execution owner for one agent."""
 
     def __init__(self, agent: "agent") -> None:

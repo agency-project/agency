@@ -527,10 +527,10 @@ class agskill:
                 ag._set_ui_state("skill", skill=self.name)
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
-                # ── 3. Delegate actual execution to the Agent Driver Engine.
+                # ── 3. Delegate actual execution to the Agent Engine.
                 # agskill owns only the scheduling/future wrapper; it is passed
                 # to the engine as the declarative skill definition.
-                execution = ag.driver_engine.execute(
+                execution = ag.engine.execute(
                     context=prev_ctx,
                     skill=self,
                     skill_input=local_skill_input,
@@ -818,8 +818,8 @@ class agskill:
             )
 
         backend = agharness_backend.for_config(
-            ag.engine, ag.agconfig
-        )  # [REFACTOR] ag.engine should be part of ag.config
+            ag.harness, ag.agconfig
+        )  # [REFACTOR] ag.harness should be part of ag.config
 
         # Manager/bridge lifecycle lives HERE, at this one shared choke
         # point -- not duplicated per backend. See agharness_backends/
@@ -881,7 +881,7 @@ class agskill:
             # `launch_in_container_entrypoint`), which is what makes this
             # safe for native specifically.
             # [REFACTOR] Why do we wait on the host side? Check process tracking implementation
-            if ag.engine == "native":
+            if ag.harness == "native":
                 agSandbox.wait_for_processes(  # [REFACTOR] Returns a message, should be inside the container.
                     ag.sandbox,
                     self.name,

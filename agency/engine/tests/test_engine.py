@@ -1,4 +1,4 @@
-# Tests for engine.py -- agentEngine, the per-launch host-side orchestrator.
+# Tests for engine.py -- AgentEngine, the per-launch host-side orchestrator.
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 
 from agency.agdata import agdata
 from agency.engine import engine as mod
-from agency.engine.engine import agentEngine
+from agency.engine.engine import AgentEngine
 from agency.engine.types import HarnessAttemptResult, PromptPayload
 
 # ---------------------------------------------------------------------------
@@ -79,13 +79,13 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
 
 def test_init_stores_agent_and_starts_with_no_host_server_manager():
     agent = _FakeAgent()
-    engine = agentEngine(agent)
+    engine = AgentEngine(agent)
     assert engine._agent is agent
     assert engine._host_server_manager is None
 
 
 def test_host_server_manager_property_raises_before_run():
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     with pytest.raises(RuntimeError):
         engine.host_server_manager
 
@@ -97,21 +97,21 @@ def test_host_server_manager_property_raises_before_run():
 
 def test_set_config_forwards_to_agent_change_config():
     agent = _FakeAgent()
-    engine = agentEngine(agent)
+    engine = AgentEngine(agent)
     new_cfg = SimpleNamespace(marker="new")
     engine.set_config(new_cfg)
     assert agent.change_config_calls == [new_cfg]
 
 
 def test_set_config_does_not_touch_host_server_manager_when_not_yet_built():
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     engine.set_config(SimpleNamespace())  # should not raise
 
 
 def test_set_config_forwards_to_host_server_manager_when_built(monkeypatch):
     holder = _install_fake_host_server_manager(monkeypatch, results=[])
     agent = _FakeAgent()
-    engine = agentEngine(agent)
+    engine = AgentEngine(agent)
     engine._host_server_manager = mod.HostServerManager(agent, agent.sandbox, None, None)
     new_cfg = SimpleNamespace(marker="new")
     engine.set_config(new_cfg)
@@ -130,7 +130,7 @@ def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
         agharness, "build_user_turn_prompt", lambda skill, skill_input: "the-prompt"
     )
     monkeypatch.setattr(agharness, "build_output_format_instruction", lambda skill: "the-format")
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     payload = engine._build_prompt_payload(SimpleNamespace(), SimpleNamespace())
     assert payload == PromptPayload(
         prompt="the-prompt", output_format_instruction="the-format", extra_system=None
@@ -138,7 +138,7 @@ def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
 
 
 def test_build_retry_prompt_mentions_missing_fields():
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     payload = engine._build_retry_prompt(["a", "b"])
     assert "a" in payload.prompt and "b" in payload.prompt
     assert "submit_output" in payload.prompt
@@ -151,13 +151,13 @@ def test_build_retry_prompt_mentions_missing_fields():
 
 
 def test_missing_output_fields_empty_when_skill_has_no_output_schema():
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(output_schema=None)
     assert engine._missing_output_fields(skill) == []
 
 
 def test_missing_output_fields_diffs_against_collected_output():
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     engine._host_server_manager = SimpleNamespace(
         host_mcp_server=SimpleNamespace(collected_output=lambda: {"summary": "hi"})
     )
@@ -172,7 +172,7 @@ def test_missing_output_fields_diffs_against_collected_output():
 
 def test_execute_stops_the_host_server_manager_even_when_bootup_is_not_implemented(monkeypatch):
     holder = _install_fake_host_server_manager(monkeypatch, results=[])
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
     with pytest.raises(NotImplementedError):
         engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
@@ -184,7 +184,7 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     holder = _install_fake_host_server_manager(
         monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
     )
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(
@@ -205,7 +205,7 @@ def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypa
     holder = _install_fake_host_server_manager(
         monkeypatch, results=[HarnessAttemptResult(ok=False, error_message="boom")]
     )
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda context, skill, attempt: attempt)
@@ -226,7 +226,7 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
         ],
         collected_sequence=[{}, {"summary": "x"}],
     )
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     prompts = iter(["p0", "p1"])
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: next(prompts))
@@ -246,7 +246,7 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
         results=[HarnessAttemptResult(ok=True, final_text=f"attempt-{i}") for i in range(3)],
         collected_sequence=[{}, {}, {}],
     )
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_retry_prompt", lambda missing: "retry")
@@ -263,7 +263,7 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
 def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     attempt = HarnessAttemptResult(ok=True, final_text="done")
     holder = _install_fake_host_server_manager(monkeypatch, results=[attempt])
-    engine = agentEngine(_FakeAgent())
+    engine = AgentEngine(_FakeAgent())
     monkeypatch.setattr(engine, "_ensure_harness_manager_launched", lambda: None)
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     seen = {}

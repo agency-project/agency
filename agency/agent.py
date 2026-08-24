@@ -39,7 +39,7 @@ from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .profiler import agprof
-from .engine import agentEngine
+from .engine import AgentEngine
 
 
 # Exists only to register agent's config fields (via __set_name__ at import
@@ -49,7 +49,7 @@ from .engine import agentEngine
 class _AgAgentFields:
     checkpoint_save_timeout_s = DynamicConfigParam("agent", default=600)
     checkpoint_load_timeout_s = DynamicConfigParam("agent", default=600)
-    engine = DynamicConfigParam(
+    harness = DynamicConfigParam(
         "agent", default="native"
     )  # Looked up via agharness_backend.for_config() and run through
     # agskill.execute_harness() -- see agskill.py's _task(). "native" runs
@@ -217,10 +217,10 @@ class agent:
         llm: "agllm | None" = None,
         sandbox: "agSandbox | None" = None,
         agconfig: "agConfig | None" = None,
-        engine: "str | None" = None,
+        harness: "str | None" = None,
     ):
         with agprof.span("agent:create"):
-            self._initialize(agname, llm, sandbox, agconfig, engine)
+            self._initialize(agname, llm, sandbox, agconfig, harness)
 
     # [REFACTOR] Why separate?
     def _initialize(
@@ -229,7 +229,7 @@ class agent:
         llm: "agllm | None",
         sandbox: "agSandbox | None",
         agconfig: "agConfig | None",
-        engine: "str | None",
+        harness: "str | None",
     ) -> None:
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
@@ -270,14 +270,14 @@ class agent:
         )
 
         self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
-        self.engine: str = (
-            engine if engine is not None else _AgAgentFields(self.agconfig).engine
+        self.harness: str = (
+            harness if harness is not None else _AgAgentFields(self.agconfig).harness
         )  # [REFACTOR] Change to config only
         self.ctx: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
-        self.driver_engine = agentEngine(self)
+        self.engine = AgentEngine(self)
 
         _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
@@ -524,7 +524,7 @@ class agent:
 
         Delegates scheduling and future creation to skill.run(self, ...). The
         skill worker sends actual execution back through this agent's
-        driver_engine. Calls on the same agent are serialized via the context
+        engine. Calls on the same agent are serialized via the context
         future chain.
         """
         if max_steps is None:
@@ -574,7 +574,8 @@ class agent:
         # the matching comment in __init__.
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.llm = agllm(ag.agconfig)
-        ag.engine = src.engine
+        ag.harness = src.harness
+        ag.engine = AgentEngine(ag)
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
         # Native harness continuity is part of the agent's logical history,
@@ -684,7 +685,7 @@ class agent:
         state = {
             "agname": self.agname,
             "parent_agent_id": self._parent_agent_id,
-            "engine": self.engine,
+            "harness": self.harness,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
             "history": self.ctx.messages,
             "ts": _ts(),
@@ -788,7 +789,9 @@ class agent:
             if k not in _already_set:
                 ag.agconfig.set("agllm_backend", k, v)
         ag.llm = agllm(ag.agconfig)
-        ag.engine = state.get("engine", "native")
+        # Accept the old checkpoint key so existing snapshots remain loadable.
+        ag.harness = state.get("harness", state.get("engine", "native"))
+        ag.engine = AgentEngine(ag)
         ag.ctx = agcontext(messages=list(state.get("history", [])))
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
