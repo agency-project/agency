@@ -14,7 +14,7 @@ harness's own hook system (Claude Code's `PreToolUse`, opencode's
 tool-dispatch code chooses to report. See docs/Design_harness_integration.md
 ("Component 3") for the full design rationale.
 
-x86_64 Linux only (see agproxy_ptrace_internal/_ctypes_defs.py's
+x86_64 Linux only (see ptrace/_ctypes_defs.py's
 `_arch_guard()`) -- `seccomp`+`PTRACE_EVENT_SECCOMP` has no macOS/BSD
 equivalent.
 """
@@ -31,9 +31,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from ...agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
-from ...agpolicy import agdecision
 from .._syscall_event import agsyscallevent
-from ._tracer_loop import SeccompStop, StopDecision, TracerLoop
 
 if TYPE_CHECKING:
     from ...agconfig import agConfig
@@ -43,6 +41,23 @@ if TYPE_CHECKING:
 
 _ptrace_available_cache: "bool | None" = None
 _ptrace_available_lock = threading.Lock()
+
+
+def _load_tracer_loop(*args, **kwargs):
+    """Import the architecture-specific tracer only when a launch begins."""
+    from ._tracer_loop import TracerLoop as tracer_loop
+
+    return tracer_loop(*args, **kwargs)
+
+
+# Kept as a replaceable factory so unit tests can exercise orchestration on
+# non-x86 hosts without importing the architecture-specific ctypes module.
+TracerLoop = _load_tracer_loop
+
+
+@dataclass
+class _TraceDecision:
+    kind: str
 
 
 def ptrace_available() -> bool:
@@ -65,7 +80,7 @@ def _probe_ptrace_available() -> bool:
     if platform.machine() not in ("x86_64", "AMD64"):
         return False
     try:
-        from .ptrace import _ctypes_defs as pt
+        from . import _ctypes_defs as pt
     except Exception:
         return False
     try:
@@ -441,54 +456,21 @@ class agProxyPtrace:
         cwd: str = "",
         policy: "agpolicy",
         ag: "agent | None" = None,
-        sandbox=None,
     ) -> agProxyPtraceHandle:
-        """*sandbox*, when given, selects the launch path: a docker/podman-
-        backed sandbox (`IMAGE_KIND == "container"`) forks the traced child
-        *inside the container* via a `docker/podman exec`-launched
-        entrypoint (see `agproxy_ptrace_internal/_in_container_launcher.py`
-        for why a host-side `fork()` cannot land a child in a different PID
-        namespace). Any other sandbox (chroot, or none at all -- a bare
-        host-level launch) uses the existing host-fork `TracerLoop` path,
-        unchanged."""
+        """Launch one process tree under the daemon's local tracer.
+
+        The Harness Manager daemon already runs inside the sandbox, so the
+        traced child is forked in the correct PID and mount namespaces. There
+        is deliberately no host-to-container relay path here.
+        """
         syscalls = _AgPtraceFields(self._agconfig).syscalls
-        container_launch = (
-            sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"
-        )
         process_profiler = _ProcessLifecycleProfiler.for_active_session(
             ag,
             envp,
-            # In-container spawn/exit notifications cross a UDS before their
-            # host callbacks run, so their host-clock boundaries include
-            # unmeasured relay jitter and must not claim exact timing.
-            timing="host-observed" if container_launch else "exact",
+            timing="exact",
         )
 
-        if container_launch:
-            from ..old_ptrace._in_container_launcher import InContainerRelay
-
-            relay = InContainerRelay(
-                sandbox=sandbox,
-                policy=policy,
-                ag=ag,
-            )
-            handle = agProxyPtraceHandle(relay, process_profiler)
-            if process_profiler is not None:
-                handle.on_spawn(_isolated_profiler_callback(process_profiler.on_spawn))
-                handle.on_exec(_isolated_profiler_callback(process_profiler.on_exec))
-                handle.on_exit(
-                    _isolated_profiler_callback(process_profiler.on_exit),
-                    include_exit_code=True,
-                )
-            try:
-                relay.start(argv, envp, cwd, syscalls)
-            except BaseException:
-                if process_profiler is not None:
-                    process_profiler.finalize()
-                raise
-            return handle
-
-        def syscall_hook(stop: SeccompStop) -> StopDecision:
+        def syscall_hook(stop) -> _TraceDecision:
             event = agsyscallevent(
                 syscall=stop.syscall,
                 pid=stop.pid,
@@ -499,11 +481,8 @@ class agProxyPtrace:
                 timestamp=stop.timestamp,
             )
             decision = policy.check(ag, event)
-            if decision.kind == "deny":
-                return StopDecision(kind="deny")
-            if decision.kind == "rewrite":
-                return StopDecision(kind="rewrite", new_args=decision.new_args)
-            return StopDecision(kind="allow")
+            allowed = decision[0] if isinstance(decision, tuple) else decision
+            return _TraceDecision(kind="allow" if allowed else "deny")
 
         loop = TracerLoop(syscalls=syscalls, syscall_hook=syscall_hook)
         handle = agProxyPtraceHandle(loop, process_profiler)
@@ -523,26 +502,10 @@ class agProxyPtrace:
         return handle
 
 
-def wire_to_sandbox(handle: agProxyPtraceHandle, sandbox) -> None:
-    """Feed *handle*'s fork/exit events into *sandbox*'s PID bookkeeping, so
-    `sandbox.get_live_pids()`/`.wait_for_processes()`/`.pid_status_summary()`
-    reflect a harness-driven agent's traced process tree exactly as they
-    would a native agent's — see `agsandbox_backend.ingest_ptrace_pids()`
-    (sandbox/base.py) for what "reflect" means precisely
-    (ptrace-sourced pids are trusted independent of the sandbox's own
-    `/proc` scan). Called by `agharness_backends` right after `launch()`;
-    not required for launches that don't need sandbox-level PID tracking
-    (e.g. a bare host-level launch with no agSandbox at all)."""
-    handle.on_spawn(lambda pid: sandbox._backend.ingest_ptrace_pids(spawned={pid}))
-    handle.on_exit(lambda pid: sandbox._backend.ingest_ptrace_pids(exited={pid}))
-
-
 __all__ = [
     "agsyscallevent",
-    "agdecision",
     "agPtraceConfig",
     "agProxyPtrace",
-    "wire_to_sandbox",
     "agProxyPtraceHandle",
     "ptrace_available",
 ]

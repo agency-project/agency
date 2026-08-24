@@ -50,33 +50,13 @@ _BARE_THREAD_ALLOWLIST = {
         "agency/manager/agmanager_host/profiler_ingest.py",
         "ProfilerIngest.ensure_uds_started",
     ): (1, "UDS ingest server"),
-    # ptrace transport and subprocess pipe plumbing.
+    # ptrace supervision and subprocess pipe plumbing.
     (
-        "agency/harness/agproxy_ptrace_internal/_in_container_entrypoint.py",
-        "_Tracer.run",
-    ): (2, "subprocess pipe drainers"),
-    (
-        "agency/harness/agproxy_ptrace_internal/_in_container_launcher.py",
-        "InContainerRelay.start",
-    ): (2, "diagnostic and relay readers"),
-    (
-        "agency/harness/agproxy_ptrace_internal/_in_container_launcher.py",
-        "InContainerRelay._drain_diagnostics",
-    ): (2, "subprocess pipe drainers"),
-    (
-        "agency/harness/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
-        "_handle_connection",
-    ): (2, "bidirectional relay pumps"),
-    (
-        "agency/harness/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
-        "main",
-    ): (1, "per-connection handler"),
-    (
-        "agency/harness/agproxy_ptrace_internal/_tracer_loop.py",
+        "agency/harness/ptrace/_tracer_loop.py",
         "TracerLoop.start",
     ): (1, "tracer loop"),
     (
-        "agency/harness/agproxy_ptrace_internal/_tracer_loop.py",
+        "agency/harness/ptrace/_tracer_loop.py",
         "TracerLoop._fork_and_exec",
     ): (2, "subprocess pipe readers"),
     # General background I/O and UI maintenance.

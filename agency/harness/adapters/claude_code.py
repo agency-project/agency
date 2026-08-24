@@ -193,7 +193,7 @@ class _ClaudeCodeBackend(agharness_backend):
     ) -> AttemptResult:
         from .. import agharness
         from ...profiler import agprof
-        from ..ptrace.supervisor import agProxyPtrace, wire_to_sandbox
+        from ..ptrace.supervisor import agProxyPtrace
 
         binary = self.binary_path or self._DEFAULT_BINARY
         # See docs/Design_harness_integration.md's Prerequisites: a
@@ -367,10 +367,7 @@ class _ClaudeCodeBackend(agharness_backend):
                 cwd=str(config_home),
                 policy=policy,
                 ag=ag,
-                sandbox=ag.sandbox if in_container else None,
             )
-            if ag.sandbox is not None:
-                wire_to_sandbox(handle, ag.sandbox)
 
             stdout, stderr, rc = handle.wait(timeout=_DEFAULT_TIMEOUT_S)
             _dbg = os.environ.get("AGENCY_DEBUG_RAW_STDOUT_DUMP")
