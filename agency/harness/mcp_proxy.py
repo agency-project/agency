@@ -33,10 +33,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 if TYPE_CHECKING:
-    from .clients.host_services_client import _HostBridge
+    from .clients.host_services_client import HostServicesClient
 
 
-def build_router(bridge: "_HostBridge") -> APIRouter:
+def build_router(bridge: "HostServicesClient") -> APIRouter:
     router = APIRouter()
 
     # Exact path, not a wildcard sub-path: agmanager_host's own MCP mount

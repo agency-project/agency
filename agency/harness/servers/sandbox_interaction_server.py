@@ -45,6 +45,10 @@ class SandboxInteractionServer:
     def build_app(self) -> FastAPI:
         app = FastAPI()
 
+        @app.get("/health")
+        def _health() -> JSONResponse:
+            return JSONResponse({"ready": True})
+
         @app.post("/harness_attempt")
         def _harness_attempt(payload: dict) -> JSONResponse:
             prompt = PromptPayload(**payload["prompt"])

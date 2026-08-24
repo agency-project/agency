@@ -2,7 +2,7 @@
 
 Everything the container-side process cannot decide on its own (real LLM
 dispatch, policy decisions, logging, pause/inbox state) goes through
-`_HostBridge`, never a second, separately-credentialed path. Used by the
+`HostServicesClient`, never a second, separately-credentialed path. Used by the
 harness-facing LLM, interaction, and MCP routes."""
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _send_framed(sock, payload: dict) -> None:
     sock.sendall(struct.pack(">Q", len(body)) + body)
 
 
-class _HostBridge:
+class HostServicesClient:
     """Thin client wrapping this agent's one bridged connection to its
     `agmanager_host` instance."""
 
@@ -218,4 +218,4 @@ class _HostBridge:
             sock.close()
 
 
-__all__ = ["_HostBridge"]
+__all__ = ["HostServicesClient"]
