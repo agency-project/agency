@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
+from ..agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_in_container
 from .clients import SandboxInteractionClient
 
 if TYPE_CHECKING:
@@ -97,8 +97,15 @@ def ensure_harness_daemon(
     )
     config_json = json.dumps(_daemon_config(agconfig), separators=(",", ":"))
 
+    ensure_python_packages_in_container(
+        sandbox,
+        ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp"],
+        timeout_s=180,
+    )
+
     # Actual launch of the daemon
     command = (
+        "PATH=/opt/agency_harness_bin:/usr/local/bin:/usr/bin:/bin "
         f"PYTHONPATH={shlex.quote(AGENCY_PACKAGE_CONTAINER_MOUNT)} "
         "exec python3 -m agency.harness.daemon "
         f"--sandbox-uds {shlex.quote(handle.container_sandbox_uds_path)} "

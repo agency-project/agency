@@ -105,7 +105,7 @@ class HostServerManager:
                 yield
 
         app = FastAPI(lifespan=lifespan)
-        for prefix, _, sub_app in sub_apps:
+        for prefix, sub_app in sub_apps:
             app.mount(prefix, sub_app)
         config = uvicorn.Config(app, uds=self._configs.uds_path, log_level="warning")
         server = uvicorn.Server(config)
