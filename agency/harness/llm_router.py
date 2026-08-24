@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ...harness.agproxy_llm_adapters import (
+from .agproxy_llm_adapters import (
     anthropic_messages_to_openai,
     openai_response_to_anthropic_message,
     openai_chunks_to_anthropic_sse,
@@ -30,7 +30,7 @@ from ...harness.agproxy_llm_adapters import (
 from .common import extract_bearer_token
 
 if TYPE_CHECKING:
-    from .host_bridge import _HostBridge
+    from .clients.host_services_client import _HostBridge
 
 
 def _mid_array_system_warning(body: dict) -> "str | None":

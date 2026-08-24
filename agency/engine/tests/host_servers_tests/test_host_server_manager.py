@@ -15,7 +15,7 @@ from agency.agconfig import agConfig
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.agDataCollector import agDataCollectorConfigs
-from agency.engine.host_servers.harness_interaction_server import HarnessInteractionServer
+from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
     HostServerManagerConfigs,
@@ -35,17 +35,17 @@ def _make_manager(tmp_path, policy=None):
     return HostServerManager(agent, sandbox, skill, resource_pool), agent, skill
 
 
-def test_construction_wires_agent_and_skill_into_harness_interaction_server(tmp_path):
+def test_construction_wires_agent_and_skill_into_interaction_server(tmp_path):
     policy = agpolicy()
     manager, agent, skill = _make_manager(tmp_path, policy=policy)
-    assert isinstance(manager._harness_interaction_server, HarnessInteractionServer)
-    assert manager._harness_interaction_server._agent is agent
-    assert manager._harness_interaction_server._policy is policy
+    assert isinstance(manager._interaction_server, HostInteractionServer)
+    assert manager._interaction_server._agent is agent
+    assert manager._interaction_server._policy is policy
 
 
-def test_harness_interaction_server_property_returns_the_same_instance(tmp_path):
+def test_interaction_server_property_returns_the_same_instance(tmp_path):
     manager, _, _ = _make_manager(tmp_path)
-    assert manager.harness_interaction_server is manager._harness_interaction_server
+    assert manager.interaction_server is manager._interaction_server
 
 
 def test_host_mcp_server_property_returns_the_same_instance(tmp_path):
@@ -75,7 +75,7 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
                 transport=httpx2.AsyncHTTPTransport(uds=uds_path), base_url="http://localhost"
             )
             async with streamable_http_client(
-                "http://localhost/HostMcpServer/mcp", http_client=client
+                "http://localhost/mcp", http_client=client
             ) as streams:
                 read, write = streams[0], streams[1]
                 async with ClientSession(read, write) as session:
@@ -91,6 +91,16 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
             "submit_output",
             "submitted_output",
         }
+
+        with httpx2.Client(
+            transport=httpx2.HTTPTransport(uds=uds_path), base_url="http://localhost"
+        ) as client:
+            assert client.get("/llm/resolve_model").json() == {"model": "test-model"}
+            assert client.post(
+                "/interaction/check_tool",
+                json={"tool_name": "unknown", "tool_input": {}},
+            ).json() == {"allowed": True, "reason": None}
+            assert client.get("/LlmHandlerServer/resolve_model").status_code == 404
     finally:
         manager.stop()
         Path(uds_path).unlink(missing_ok=True)

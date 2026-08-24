@@ -1,17 +1,17 @@
-# Tests for harness_interaction_server.py -- the tool/syscall mediation point.
+# Tests for host_interaction_server.py -- the tool/syscall mediation point.
 
 from __future__ import annotations
 
 import queue
-import threading
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agency.agpolicy import agpolicy
-from agency.engine.host_servers.harness_interaction_server import HarnessInteractionServer
-from agency.engine.types import HarnessAttemptResult
+from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.harness._syscall_event import agsyscallevent
+from agency.harness.protocol import HarnessAttemptResult
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ def _make_server(policy=None, agconfig=None, drain_inbox=None, data_collector=No
     agent = _make_agent(agconfig, drain_inbox)
     skill = _make_skill(policy)
     data_collector = data_collector if data_collector is not None else _FakeDataCollector()
-    return HarnessInteractionServer(agent, skill, data_collector), agent
+    return HostInteractionServer(agent, skill, data_collector), agent
 
 
 def _make_syscall(
@@ -252,45 +252,6 @@ def test_check_syscall_falls_back_to_default_for_unregistered_syscall_name():
 
 
 # ---------------------------------------------------------------------------
-# check_inbox
-# ---------------------------------------------------------------------------
-
-
-def test_check_inbox_returns_empty_list_when_nothing_pending():
-    server, _ = _make_server()
-    assert server.check_inbox() == []
-
-
-def test_check_inbox_returns_messages_drained_from_the_agent():
-    def drain_inbox(messages):
-        messages.append({"role": "user", "content": "hello"})
-        messages.append({"role": "user", "content": "world"})
-        return True
-
-    server, _ = _make_server(drain_inbox=drain_inbox)
-    assert server.check_inbox() == [
-        {"role": "user", "content": "hello"},
-        {"role": "user", "content": "world"},
-    ]
-
-
-def test_check_inbox_passes_a_fresh_list_to_agent_drain_inbox_each_call():
-    seen_lists = []
-
-    def drain_inbox(messages):
-        seen_lists.append(messages)
-        messages.append({"role": "user", "content": "x"})
-        return True
-
-    server, _ = _make_server(drain_inbox=drain_inbox)
-    first = server.check_inbox()
-    second = server.check_inbox()
-    assert first == [{"role": "user", "content": "x"}]
-    assert second == [{"role": "user", "content": "x"}]
-    assert seen_lists[0] is not seen_lists[1]
-
-
-# ---------------------------------------------------------------------------
 # build_app / HTTP routes
 # ---------------------------------------------------------------------------
 
@@ -327,24 +288,11 @@ def test_build_app_check_tool_route_denies_when_hook_raises():
     assert "boom" in body["reason"]
 
 
-def test_build_app_check_inbox_route_returns_drained_messages():
-    def drain_inbox(messages):
-        messages.append({"role": "user", "content": "hello"})
-        return True
-
-    server, _ = _make_server(drain_inbox=drain_inbox)
-    client = TestClient(server.build_app())
-    response = client.post("/check_inbox")
-    assert response.status_code == 200
-    assert response.json() == {"messages": [{"role": "user", "content": "hello"}]}
-
-
-def test_build_app_check_inbox_route_returns_empty_list_when_nothing_pending():
+def test_build_app_has_no_daemon_command_polling_route():
     server, _ = _make_server()
     client = TestClient(server.build_app())
     response = client.post("/check_inbox")
-    assert response.status_code == 200
-    assert response.json() == {"messages": []}
+    assert response.status_code == 404
 
 
 def test_build_app_check_syscall_route_allows():
@@ -470,62 +418,51 @@ def test_build_app_record_event_route_delegates_to_data_collector():
 
 
 # ---------------------------------------------------------------------------
-# run_prompt / report_attempt_result
+# attempt-result callback
 # ---------------------------------------------------------------------------
 
 
-def test_report_attempt_result_with_no_pending_run_prompt_is_a_noop():
+def test_report_attempt_result_with_no_pending_attempt_is_a_noop():
     server, _ = _make_server()
     server.report_attempt_result({"ok": True, "final_text": "x"})  # should not raise
 
 
-def test_run_prompt_puts_run_attempt_message_on_inbox_and_returns_reported_result():
-    server, agent = _make_server()
-    agent.inbox = queue.Queue()
-    seen_messages = []
-
-    def report_after_seeing_the_message():
-        seen_messages.append(agent.inbox.get(timeout=2.0))
-        server.report_attempt_result({"ok": True, "final_text": "done"})
-
-    t = threading.Thread(target=report_after_seeing_the_message)
-    t.start()
-    result = server.run_prompt("the-prompt", timeout=2.0)
-    t.join(timeout=2.0)
-
-    assert seen_messages == [{"type": "run_attempt", "prompt": "the-prompt"}]
+def test_expected_attempt_result_is_delivered_by_report_callback():
+    server, _ = _make_server()
+    waiter = server.expect_attempt_result()
+    server.report_attempt_result({"ok": True, "final_text": "done"})
+    result = server.wait_for_attempt_result(waiter, timeout=2.0)
     assert result == HarnessAttemptResult(ok=True, final_text="done")
 
 
-def test_run_prompt_raises_queue_empty_on_timeout_with_no_report():
-    server, agent = _make_server()
-    agent.inbox = queue.Queue()
-    try:
-        server.run_prompt("the-prompt", timeout=0.05)
-        assert False, "expected queue.Empty"
-    except queue.Empty:
-        pass
+def test_only_one_attempt_result_can_be_pending():
+    server, _ = _make_server()
+    waiter = server.expect_attempt_result()
+    with pytest.raises(RuntimeError, match="already pending"):
+        server.expect_attempt_result()
+    server.cancel_expected_attempt(waiter)
+
+
+def test_wait_for_attempt_result_raises_queue_empty_on_timeout():
+    server, _ = _make_server()
+    waiter = server.expect_attempt_result()
+    with pytest.raises(queue.Empty):
+        server.wait_for_attempt_result(waiter, timeout=0.05)
+    server.cancel_expected_attempt(waiter)
 
 
 def test_build_app_report_attempt_result_route_delegates():
-    server, agent = _make_server()
-    agent.inbox = queue.Queue()
+    server, _ = _make_server()
     client = TestClient(server.build_app())
-    result_holder = {}
-
-    def call_run_prompt():
-        result_holder["result"] = server.run_prompt("the-prompt", timeout=2.0)
-
-    t = threading.Thread(target=call_run_prompt)
-    t.start()
-    agent.inbox.get(timeout=2.0)  # wait until run_prompt has registered its pending queue
+    waiter = server.expect_attempt_result()
 
     response = client.post("/report_attempt_result", json={"ok": True, "final_text": "hi"})
-    t.join(timeout=2.0)
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert result_holder["result"] == HarnessAttemptResult(ok=True, final_text="hi")
+    assert server.wait_for_attempt_result(waiter, timeout=2.0) == HarnessAttemptResult(
+        ok=True, final_text="hi"
+    )
 
 
 def test_build_app_record_span_route_delegates_to_data_collector():

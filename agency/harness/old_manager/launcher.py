@@ -1,3 +1,6 @@
+# should be moved in interaction servers
+
+
 """Host-side launcher for `agmanager_harness.py`'s standalone,
 container-side process.
 
@@ -17,6 +20,7 @@ actually use; `launch_in_container()` is the one-shot primitive underneath
 it, not idempotent on its own (same split as native.py's
 `launch_in_container_entrypoint`/`_ensure_entrypoint`)."""
 
+'''
 from __future__ import annotations
 
 import shlex
@@ -177,7 +181,7 @@ def ensure_launched_locally(host_manager: "agHostAgentManager", timeout_s: float
     import uvicorn
 
     from .agmanager_harness import build_app
-    from .host_bridge import _HostBridge
+    from ..clients.host_services_client import _HostBridge
 
     host_uds = host_manager.ensure_uds_started()
     profiler_uds = host_manager.ensure_profiler_uds_started()
@@ -205,3 +209,4 @@ def ensure_launched_locally(host_manager: "agHostAgentManager", timeout_s: float
 
 
 __all__ = ["launch_in_container", "ensure_launched", "ensure_launched_locally"]
+'''

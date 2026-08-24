@@ -450,8 +450,9 @@ class agskill:
     ) -> agdata:
         """Submit a skill run on *ag* and return a pending agdata immediately.
 
-        Spawns a daemon thread that runs execute_harness() and resolves futures
-        when done.  Same-agent calls are serialized via the context future chain.
+        Spawns a daemon thread that delegates execution to the agent's driver
+        engine and resolves futures when done. Same-agent calls are serialized
+        via the context future chain.
         """
         prev_ctx = ag.ctx
         result_future: Future[agdata] = Future()
@@ -526,18 +527,19 @@ class agskill:
                 ag._set_ui_state("skill", skill=self.name)
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
-                # ── 3. Run the skill via this agent's configured engine.
-                # Every engine, "native" included, is now an
-                # agharness_backend (see agharness_backends/base.py's
-                # for_config()) -- native.py's own in-container react loop
-                # is just the one whose "binary" happens to be agency's
-                # own code. See execute_harness().
-                outer_result, updated_ctx, outer_delta = self.execute_harness(
-                    ag,
-                    prev_ctx,
-                    local_skill_input,
-                    max_steps,
+                # ── 3. Delegate actual execution to the Agent Engine.
+                # agskill owns only the scheduling/future wrapper; it is passed
+                # to the engine as the declarative skill definition.
+                execution = ag.engine.execute(
+                    context=prev_ctx,
+                    skill=self,
+                    skill_input=local_skill_input,
+                    resource_pool=type(ag).agresource_pool,
+                    max_steps=max_steps,
                 )
+                outer_result = execution.output
+                updated_ctx = execution.context
+                outer_delta = execution.delta
 
             except Exception as exc:
                 outer_result = agerror(format_exception(exc))
@@ -780,7 +782,7 @@ class agskill:
         host-side, sandbox-based operations with no dependency on which
         backend actually dispatched the call.
         """
-        from .harness.agharness_backends.base import agharness_backend
+        from .harness.adapters.base import agharness_backend
 
         input_error = (
             self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
@@ -816,8 +818,8 @@ class agskill:
             )
 
         backend = agharness_backend.for_config(
-            ag.engine, ag.agconfig
-        )  # [REFACTOR] ag.engine should be part of ag.config
+            ag.harness, ag.agconfig
+        )  # [REFACTOR] ag.harness should be part of ag.config
 
         # Manager/bridge lifecycle lives HERE, at this one shared choke
         # point -- not duplicated per backend. See agharness_backends/
@@ -879,7 +881,7 @@ class agskill:
             # `launch_in_container_entrypoint`), which is what makes this
             # safe for native specifically.
             # [REFACTOR] Why do we wait on the host side? Check process tracking implementation
-            if ag.engine == "native":
+            if ag.harness == "native":
                 agSandbox.wait_for_processes(  # [REFACTOR] Returns a message, should be inside the container.
                     ag.sandbox,
                     self.name,

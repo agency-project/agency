@@ -1,3 +1,6 @@
+# features should be on host_interaction_server.py
+
+'''
 """Policy-check, profiler-hook, and pause/inbox-check-in bridge routes for
 `agmanager_harness`.
 
@@ -89,3 +92,5 @@ def build_router(bridge: "_HostBridge") -> APIRouter:
 
 
 __all__ = ["build_router"]
+
+'''

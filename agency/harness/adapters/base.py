@@ -6,10 +6,10 @@ its tunables as plain attributes, and a `for_config()` selector with lazy,
 function-local imports of the concrete backends (avoids a circular import,
 same reasoning as llm).
 
-Selection dispatches on the `engine` string itself (e.g. `ag.engine ==
-"claude_code"`, set via `agent(engine=...)` -- see docs/agent.md's engine
-seam) rather than a separate `provider` config field: `ag.engine` is
-already the authoritative "which engine" signal (Component 4 of
+Selection dispatches on the `harness` string itself (e.g. `ag.harness ==
+"claude_code"`, set via `agent(harness=...)` -- see docs/agent.md's harness
+seam) rather than a separate `provider` config field: `ag.harness` is
+already the authoritative "which harness" signal (Component 4 of
 docs/Design_harness_integration.md), so there is no second place a user
 would need to keep in sync with it.
 
@@ -92,7 +92,7 @@ class agHarnessConfig(_AgConfigViewBase):
     """View over an agConfig for pre-setting agharness fields in one call::
 
         cfg = agConfig(agHarnessConfig(gateway_mode="translate"))
-        ag = agent(agconfig=cfg, engine="codex")
+        ag = agent(agconfig=cfg, harness="codex")
 
     See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
     """
@@ -400,24 +400,24 @@ class agharness_backend(AgHarnessFields):
         raise NotImplementedError
 
     @staticmethod
-    def for_config(engine: str, agconfig: "agConfig") -> "agharness_backend":
+    def for_config(harness: str, agconfig: "agConfig") -> "agharness_backend":
         from .claude_code import _ClaudeCodeBackend
         from .codex import _CodexBackend
         from .grok import _GrokBackend
         from .native import _NativeBackend
         from .opencode import _OpencodeBackend
 
-        if engine == "native":
+        if harness == "native":
             return _NativeBackend(agconfig)
-        if engine == "opencode":
+        if harness == "opencode":
             return _OpencodeBackend(agconfig)
-        if engine == "claude_code":
+        if harness == "claude_code":
             return _ClaudeCodeBackend(agconfig)
-        if engine == "codex":
+        if harness == "codex":
             return _CodexBackend(agconfig)
-        if engine == "grok":
+        if harness == "grok":
             return _GrokBackend(agconfig)
         raise ValueError(
-            f"Unknown harness engine {engine!r} -- set agent(engine=...) to one of "
+            f"Unknown harness {harness!r} -- set agent(harness=...) to one of "
             f"'native', 'opencode', 'claude_code', 'codex', 'grok'"
         )

@@ -33,7 +33,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 if TYPE_CHECKING:
-    from .host_bridge import _HostBridge
+    from .clients.host_services_client import _HostBridge
 
 
 def build_router(bridge: "_HostBridge") -> APIRouter:

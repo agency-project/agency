@@ -1,3 +1,5 @@
+# functionality should be moved into daemon.py and interaction_server.py
+
 """New: one container-side agent manager PER AGENT, assembled by
 `build_app()` and run via `main()`.
 
@@ -81,6 +83,7 @@ problem (there is no hook point inside a third-party CLI's own loop to
 inject this), not something this endpoint's mere existence fixes.
 """
 
+"""
 from __future__ import annotations
 
 import sys
@@ -116,3 +119,4 @@ def main(argv: "list[str] | None" = None) -> None:
 
 if __name__ == "__main__":
     main()
+"""

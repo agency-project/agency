@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from .engine import agentEngine
-from .host_servers.harness_interaction_server import HarnessInteractionServer
+from .engine import AgentEngine
+from .host_servers.host_interaction_server import HostInteractionServer
 from .types import ExecutionResult
 
 __all__ = [
-    "agentEngine",
-    "HarnessInteractionServer",
+    "AgentEngine",
+    "HostInteractionServer",
     "ExecutionResult",
 ]

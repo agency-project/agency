@@ -1,3 +1,5 @@
+"""Host interaction server routes and pending attempt-result callback state."""
+
 from __future__ import annotations
 
 import queue
@@ -7,18 +9,17 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from ...engine.types import HarnessAttemptResult
 from ...harness._syscall_event import agsyscallevent
+from ...harness.protocol import HarnessAttemptResult
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
     from ...agent import agent
     from ...agskill import agskill
-    from ...engine.agDataCollector import agDataCollector
-    from ...engine.types import PromptPayload
+    from ..agDataCollector import agDataCollector
 
 
-class HarnessInteractionServer(HostServerBase):
+class HostInteractionServer(HostServerBase):
     def __init__(self, agent: "agent", skill: "agskill", data_collector: "agDataCollector") -> None:
         self._agent = agent
         self._policy = skill.policy
@@ -46,11 +47,6 @@ class HarnessInteractionServer(HostServerBase):
         except Exception as exc:
             return (False, f"hook raised: {exc}")
         return result if isinstance(result, tuple) else (result, None)
-
-    def check_inbox(self) -> "list[dict]":
-        messages: "list[dict]" = []
-        self._agent._drain_inbox(messages)
-        return messages
 
     def update_state(
         self, new_state: str, skill: "str | None" = None, tool: "str | None" = None
@@ -86,19 +82,25 @@ class HarnessInteractionServer(HostServerBase):
             call_label=call_label,
         )
 
-    def run_prompt(
-        self, prompt: "PromptPayload", timeout: "float | None" = None
-    ) -> HarnessAttemptResult:
-        """Deliver one prompt to the sandboxed harness manager via the inbox
-        and block until it reports completion. Not an HTTP route -- called
-        directly by agentEngine.run(), in-process, on the agent's own
-        worker thread. HostServerManager's uvicorn thread and anyio worker
-        pool stay free to serve every other route while this blocks."""
+    def expect_attempt_result(self) -> "queue.Queue[HarnessAttemptResult]":
         result_queue: "queue.Queue[HarnessAttemptResult]" = queue.Queue(maxsize=1)
         with self._lock:
+            if self._pending_result_queue is not None:
+                raise RuntimeError("an attempt result is already pending")
             self._pending_result_queue = result_queue
-        self._agent.inbox.put({"type": "run_attempt", "prompt": prompt})
+        return result_queue
+
+    def wait_for_attempt_result(
+        self,
+        result_queue: "queue.Queue[HarnessAttemptResult]",
+        timeout: "float | None" = None,
+    ) -> HarnessAttemptResult:
         return result_queue.get(timeout=timeout)
+
+    def cancel_expected_attempt(self, result_queue: "queue.Queue[HarnessAttemptResult]") -> None:
+        with self._lock:
+            if self._pending_result_queue is result_queue:
+                self._pending_result_queue = None
 
     def report_attempt_result(self, result: dict) -> None:
         with self._lock:
@@ -113,10 +115,6 @@ class HarnessInteractionServer(HostServerBase):
         def _check_tool(request: dict) -> JSONResponse:
             allowed, reason = self.check_tool(request["tool_name"], request["tool_input"])
             return JSONResponse({"allowed": allowed, "reason": reason})
-
-        @app.post("/check_inbox")
-        def _check_inbox() -> JSONResponse:
-            return JSONResponse({"messages": self.check_inbox()})
 
         @app.post("/check_syscall")
         def _check_syscall(request: dict) -> JSONResponse:

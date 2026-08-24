@@ -34,8 +34,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from . import _ctypes_defs as pt
-from . import _seccomp_filter
+from ..ptrace import _ctypes_defs as pt
+from ..ptrace import _seccomp_filter
 
 
 @dataclass
