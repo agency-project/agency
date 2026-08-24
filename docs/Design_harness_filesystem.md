@@ -2,8 +2,8 @@
 
 > **Status: SUPERSEDED.** The project reconsidered and decided to run the harness process inside
 > the sandbox container after all — [Design_harness_integration.md](Design_harness_integration.md)'s
-> "Prerequisites" and "Design Tensions" sections now describe the adopted in-container supervisor
-> bridge (a `docker exec`-launched entrypoint plus an IPC relay to the host-side `agpolicy`), which
+> "Prerequisites" and "Design Tensions" sections now describe the adopted sandbox-local Harness
+> Manager daemon and its host-services UDS policy connection, which
 > this document's constraint #1 explicitly argued against building. That argument is preserved
 > below as a record of why the FUSE approach was attempted and what it would have cost, not because
 > it's still the plan. The filesystem-visibility gap this document exists to close doesn't need
@@ -163,7 +163,7 @@ its stdin and reading results off stdout, amortizing exec-setup cost into one lo
 
 #### Where the mount setup runs
 
-`TracerLoop._child_exec()` (`agproxy_ptrace_internal/_tracer_loop.py:257-289`) is the traced
+`TracerLoop._child_exec()` (`harness/ptrace/_tracer_loop.py`) is the traced
 child's pre-`execve` code, run in exactly the process that needs the new mount namespace (mount
 namespace changes must happen in the process that will use them — a parent can't set this up on a
 child's behalf after the fact). Confirmed order today: dup stdio → `chdir(cwd)` (line 268) →
