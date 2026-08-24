@@ -1,17 +1,13 @@
-"""Host interaction server routes and pending attempt-result callback state."""
+"""Host interaction server routes used during a sandbox harness attempt."""
 
 from __future__ import annotations
 
-import queue
-import threading
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from ...harness._syscall_event import agsyscallevent
-from ...harness.protocol import HarnessAttemptResult
-from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
     from ...agent import agent
@@ -19,14 +15,11 @@ if TYPE_CHECKING:
     from ..agDataCollector import agDataCollector
 
 
-class HostInteractionServer(HostServerBase):
+class HostInteractionServer:
     def __init__(self, agent: "agent", skill: "agskill", data_collector: "agDataCollector") -> None:
         self._agent = agent
         self._policy = skill.policy
         self._data_collector = data_collector
-        self._lock = threading.Lock()
-        self._pending_result_queue: "queue.Queue[HarnessAttemptResult] | None" = None
-        self.set_config(agent.agconfig)
 
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
         hook = (self._policy.tool_hooks or {}).get(tool_name)
@@ -82,32 +75,6 @@ class HostInteractionServer(HostServerBase):
             call_label=call_label,
         )
 
-    def expect_attempt_result(self) -> "queue.Queue[HarnessAttemptResult]":
-        result_queue: "queue.Queue[HarnessAttemptResult]" = queue.Queue(maxsize=1)
-        with self._lock:
-            if self._pending_result_queue is not None:
-                raise RuntimeError("an attempt result is already pending")
-            self._pending_result_queue = result_queue
-        return result_queue
-
-    def wait_for_attempt_result(
-        self,
-        result_queue: "queue.Queue[HarnessAttemptResult]",
-        timeout: "float | None" = None,
-    ) -> HarnessAttemptResult:
-        return result_queue.get(timeout=timeout)
-
-    def cancel_expected_attempt(self, result_queue: "queue.Queue[HarnessAttemptResult]") -> None:
-        with self._lock:
-            if self._pending_result_queue is result_queue:
-                self._pending_result_queue = None
-
-    def report_attempt_result(self, result: dict) -> None:
-        with self._lock:
-            q, self._pending_result_queue = self._pending_result_queue, None
-        if q is not None:
-            q.put(HarnessAttemptResult(**result))
-
     def build_app(self) -> FastAPI:
         app = FastAPI()
 
@@ -149,11 +116,6 @@ class HostInteractionServer(HostServerBase):
                 parent=request.get("parent"),
                 call_label=request.get("call_label"),
             )
-            return JSONResponse({"ok": True})
-
-        @app.post("/report_attempt_result")
-        def _report_attempt_result(request: dict) -> JSONResponse:
-            self.report_attempt_result(request)
             return JSONResponse({"ok": True})
 
         return app

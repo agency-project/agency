@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..harness.protocol import HarnessAttemptResult, PromptPayload
+from ..harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
+from .harness_daemon_launcher import ensure_harness_daemon
 from .host_servers.host_server_manager import HostServerManager
 from .types import ExecutionResult
 
@@ -43,17 +44,34 @@ class AgentEngine:
         max_steps: "int | None" = None,
     ) -> ExecutionResult:
         """Execute one declarative skill request through the host services."""
+
+        # Start connections
         self._host_server_manager = HostServerManager(
             self._agent, self._agent.sandbox, skill, resource_pool
         )
-        self._host_server_manager.start()
+        host_uds_path = self._host_server_manager.start()
         try:
-            self._ensure_harness_manager_launched()
+            # start harness manager daemon
+            engine_name = str(
+                getattr(self._agent, "agname", getattr(self._agent, "harness", "agent"))
+            )
+            handle = ensure_harness_daemon(
+                self._agent.sandbox,
+                host_uds_path,
+                engine_name,
+                agconfig=self._agent.agconfig,
+            )
+
+            # Obtain Host -> Sandbox handle
+            self._sandbox_interaction_client = handle.client()
+
+            # build the prompt
             prompt = self._build_prompt_payload(skill, skill_input)
             retries_left = skill.max_output_schema_retries
             attempt: "HarnessAttemptResult | None" = None
             while True:
-                attempt = self._run_attempt(prompt)
+                # Send the request through sandbox interaction server
+                attempt = self._run_attempt(prompt, max_steps=max_steps)
                 if not attempt.ok:
                     break
                 missing = self._missing_output_fields(skill)
@@ -65,14 +83,14 @@ class AgentEngine:
                 )
             return self._build_execution_result(context, skill, attempt)
         finally:
+            if self._sandbox_interaction_client is not None:
+                self._sandbox_interaction_client.close()
+                self._sandbox_interaction_client = None
             self._host_server_manager.stop()
 
     # ------------------------------------------------------------------
     # internal
     # ------------------------------------------------------------------
-
-    def _ensure_harness_manager_launched(self) -> None:
-        raise NotImplementedError
 
     def _build_prompt_payload(self, skill: "agskill", skill_input: "agdata") -> PromptPayload:
         from ..harness import agharness
@@ -96,23 +114,17 @@ class AgentEngine:
             output_instruction=None,
         )
 
-    def _run_attempt(self, prompt: PromptPayload) -> HarnessAttemptResult:
-        interaction = self._host_server_manager.interaction_server
-        waiter = interaction.expect_attempt_result()
-        try:
-            self._send_run_attempt(prompt)
-            return interaction.wait_for_attempt_result(waiter)
-        except BaseException:
-            interaction.cancel_expected_attempt(waiter)
-            raise
-
-    def _send_run_attempt(self, prompt: PromptPayload) -> None:
-        """Send one attempt directly to the sandbox daemon server.
-
-        The host-side protocol boundary is explicit now; the daemon client
-        will implement it once the sandbox-side server exists.
-        """
-        raise NotImplementedError("sandbox daemon client is not configured")
+    def _run_attempt(
+        self, prompt: PromptPayload, *, max_steps: "int | None" = None
+    ) -> HarnessAttemptResult:
+        if self._sandbox_interaction_client is None:
+            raise RuntimeError("Harness Manager client is not configured")
+        request = HarnessAttemptRequest(
+            prompt=prompt,
+            harness=self._agent.harness,
+            max_steps=max_steps,
+        )
+        return self._sandbox_interaction_client.run_harness_attempt(request)
 
     def _missing_output_fields(self, skill: "agskill") -> "list[str]":
         if skill.output_schema is None:

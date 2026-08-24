@@ -22,6 +22,11 @@ class SandboxInteractionClient:
         response.raise_for_status()
         return HarnessAttemptResult(**response.json())
 
+    def is_ready(self) -> bool:
+        response = self._client.get("/health")
+        response.raise_for_status()
+        return response.json() == {"ready": True}
+
     def close(self) -> None:
         self._client.close()
 

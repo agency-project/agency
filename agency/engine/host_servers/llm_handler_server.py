@@ -14,7 +14,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ...llm import API_CONN_EXCS, API_ERROR_EXCS, BAD_REQUEST_EXCS, RATE_LIMIT_EXCS, agllm_backend
 from ...llm.agllm import agllm
-from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
     from ...agconfig import agConfig
@@ -131,7 +130,7 @@ class _StreamHandle:
         self._close_stream()
 
 
-class LlmHandlerServer(HostServerBase):
+class LlmHandlerServer:
     def __init__(self, agconfig: "agConfig") -> None:
         self._active_handles: "set[_StreamHandle]" = set()
         self._active_handles_lock = threading.Lock()

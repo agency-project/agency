@@ -9,7 +9,6 @@ from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
 from mcp.server.transport_security import TransportSecuritySettings
 
 from ...agdata import agdata
-from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
@@ -20,7 +19,7 @@ if TYPE_CHECKING:
     from ...sandbox.agsandbox import agSandbox
 
 
-class HostMcpServer(HostServerBase):
+class HostMcpServer:
     def __init__(
         self, sandbox: "agSandbox", skill: "agskill", resource_pool: "agResourcePool"
     ) -> None:
