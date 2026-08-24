@@ -93,6 +93,7 @@ def test_init_stores_agent_and_starts_with_no_host_server_manager():
     engine = AgentEngine(agent)
     assert engine._agent is agent
     assert engine._host_server_manager is None
+    assert engine._sandbox_interaction_client is None
 
 
 def test_host_server_manager_property_raises_before_run():

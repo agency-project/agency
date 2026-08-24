@@ -1,10 +1,9 @@
-"""This agent's one bridged connection to its `agmanager_host` instance.
+"""Client for the host services exposed to this sandbox over ``host.sock``.
 
 Everything the container-side process cannot decide on its own (real LLM
 dispatch, policy decisions, logging, pause/inbox state) goes through
-`_HostBridge`, never a second, separately-credentialed path. Used by
-`llm_routing.py`, `hooks_bridge.py`, and `mcp_proxy.py` -- see
-`agmanager_harness.py`'s module docstring for the full design."""
+`_HostBridge`, never a second, separately-credentialed path. Used by the
+harness-facing LLM, interaction, and MCP routes."""
 
 from __future__ import annotations
 

@@ -181,7 +181,7 @@ def ensure_launched_locally(host_manager: "agHostAgentManager", timeout_s: float
     import uvicorn
 
     from .agmanager_harness import build_app
-    from ..host_client import _HostBridge
+    from ..clients.host_services_client import _HostBridge
 
     host_uds = host_manager.ensure_uds_started()
     profiler_uds = host_manager.ensure_profiler_uds_started()

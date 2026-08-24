@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..agent import agent
     from ..agresources import agResourcePool
     from ..agskill import agskill
+    from .clients import SandboxInteractionClient
 
 
 class AgentEngine:
@@ -21,6 +22,7 @@ class AgentEngine:
     def __init__(self, agent: "agent") -> None:
         self._agent = agent
         self._host_server_manager: "HostServerManager | None" = None
+        self._sandbox_interaction_client: "SandboxInteractionClient | None" = None
 
     def set_config(self, agconfig: "agConfig") -> None:
         if self._host_server_manager is not None:

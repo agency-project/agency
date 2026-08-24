@@ -11,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from ..agDataCollector import agDataCollector
-from .interaction_server import HostInteractionServer
+from .host_interaction_server import HostInteractionServer
 from .host_mcp_server import HostMcpServer
 from .host_server_base import HostServerBase
 from .llm_handler_server import LlmHandlerServer

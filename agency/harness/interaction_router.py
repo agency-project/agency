@@ -1,5 +1,4 @@
-"""Policy-check, profiler-hook, and pause/inbox-check-in bridge routes for
-`agmanager_harness`.
+"""Harness-facing policy, profiler, and context-limit bridge routes.
 
 None of these decide anything themselves -- each forwards to
 `agmanager_host` over the bridged UDS, which is the only place `ag`/real
@@ -18,10 +17,10 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..common import extract_bearer_token
+from .common import extract_bearer_token
 
 if TYPE_CHECKING:
-    from ..host_client import _HostBridge
+    from .clients.host_services_client import _HostBridge
 
 
 def build_router(bridge: "_HostBridge") -> APIRouter:

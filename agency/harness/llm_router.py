@@ -30,7 +30,7 @@ from .agproxy_llm_adapters import (
 from .common import extract_bearer_token
 
 if TYPE_CHECKING:
-    from .host_client import _HostBridge
+    from .clients.host_services_client import _HostBridge
 
 
 def _mid_array_system_warning(body: dict) -> "str | None":

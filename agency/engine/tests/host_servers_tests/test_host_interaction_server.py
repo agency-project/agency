@@ -1,4 +1,4 @@
-# Tests for the host interaction server -- the tool/syscall mediation point.
+# Tests for host_interaction_server.py -- the tool/syscall mediation point.
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agency.agpolicy import agpolicy
-from agency.engine.host_servers.interaction_server import HostInteractionServer
+from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.harness._syscall_event import agsyscallevent
 from agency.harness.protocol import HarnessAttemptResult
 

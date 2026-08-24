@@ -1,3 +1,5 @@
+"""Host interaction server routes and pending attempt-result callback state."""
+
 from __future__ import annotations
 
 import queue
