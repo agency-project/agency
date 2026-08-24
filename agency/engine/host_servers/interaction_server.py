@@ -7,15 +7,15 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from ...engine.types import HarnessAttemptResult
+from ..types import HarnessAttemptResult
 from ...harness._syscall_event import agsyscallevent
 from .host_server_base import HostServerBase
 
 if TYPE_CHECKING:
     from ...agent import agent
     from ...agskill import agskill
-    from ...engine.agDataCollector import agDataCollector
-    from ...engine.types import PromptPayload
+    from ..agDataCollector import agDataCollector
+    from ..types import PromptPayload
 
 
 class HarnessInteractionServer(HostServerBase):

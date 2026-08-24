@@ -15,7 +15,7 @@ from agency.agconfig import agConfig
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.agDataCollector import agDataCollectorConfigs
-from agency.engine.host_servers.harness_interaction_server import HarnessInteractionServer
+from agency.engine.host_servers.interaction_server import HarnessInteractionServer
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
     HostServerManagerConfigs,

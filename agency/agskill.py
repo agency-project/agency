@@ -782,7 +782,7 @@ class agskill:
         host-side, sandbox-based operations with no dependency on which
         backend actually dispatched the call.
         """
-        from .harness.agharness_backends.base import agharness_backend
+        from .harness.adapters.base import agharness_backend
 
         input_error = (
             self.input_schema.validate_input(skill_input) if self.input_schema is not None else None

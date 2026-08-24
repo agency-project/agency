@@ -39,6 +39,7 @@ from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .profiler import agprof
+from .engine import agentEngine
 
 
 # Exists only to register agent's config fields (via __set_name__ at import
@@ -276,6 +277,7 @@ class agent:
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
+        self.driver_engine = agentEngine(self)
 
         _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
@@ -520,8 +522,10 @@ class agent:
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
         """Submit the skill and return a pending agdata immediately.
 
-        Delegates all threading, sandboxing, and execution to skill.run(self, ...).
-        Calls on the same agent are serialized via the context future chain.
+        Delegates scheduling and future creation to skill.run(self, ...). The
+        skill worker sends actual execution back through this agent's
+        driver_engine. Calls on the same agent are serialized via the context
+        future chain.
         """
         if max_steps is None:
             return skill.run(self, skill_input)
