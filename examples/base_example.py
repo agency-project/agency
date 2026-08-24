@@ -79,7 +79,6 @@ def main():
         ),
         input_schema=agdata(question=str),
         output_schema=agdata(answer=str),
-        replace_tools=[],
     )
 
     # No tools= argument — uses the default sandboxed tool list

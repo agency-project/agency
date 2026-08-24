@@ -31,25 +31,21 @@ _AGENCY_ROOT = _REPO_ROOT / "agency"
 _BARE_THREAD_ALLOWLIST = {
     # Harness transcript/service plumbing.
     (
-        "agency/harness/agharness_backends/base.py",
+        "agency/harness/adapters/base.py",
         "agharness_backend.execute",
     ): (1, "transcript polling"),
     (
-        "agency/manager/agmanager_harness/launcher.py",
-        "ensure_launched_locally",
-    ): (1, "bare-host in-process TCP server"),
+        "agency/harness/daemon.py",
+        "_HarnessApiServer.start",
+    ): (1, "harness API server"),
     (
-        "agency/manager/agmanager_host/agmanager_host.py",
-        "agHostAgentManager.start",
-    ): (1, "TCP server"),
+        "agency/engine/host_servers/host_server_manager.py",
+        "HostServerManager.start",
+    ): (1, "host UDS server"),
     (
-        "agency/manager/agmanager_host/agmanager_host.py",
-        "agHostAgentManager.ensure_uds_started",
-    ): (1, "UDS server"),
-    (
-        "agency/manager/agmanager_host/profiler_ingest.py",
-        "ProfilerIngest.ensure_uds_started",
-    ): (1, "UDS ingest server"),
+        "agency/harness/servers/sandbox_interaction_server.py",
+        "SandboxInteractionServer.start",
+    ): (1, "sandbox interaction server"),
     # ptrace supervision and subprocess pipe plumbing.
     (
         "agency/harness/ptrace/_tracer_loop.py",
@@ -59,6 +55,28 @@ _BARE_THREAD_ALLOWLIST = {
         "agency/harness/ptrace/_tracer_loop.py",
         "TracerLoop._fork_and_exec",
     ): (2, "subprocess pipe readers"),
+    # Retained legacy relay modules are still shipped, but their raw threads
+    # are transport/pipe plumbing rather than task work.
+    (
+        "agency/harness/old_ptrace/_in_container_entrypoint.py",
+        "_Tracer.run",
+    ): (2, "legacy subprocess pipe readers"),
+    (
+        "agency/harness/old_ptrace/_in_container_launcher.py",
+        "InContainerRelay.start",
+    ): (2, "legacy relay plumbing"),
+    (
+        "agency/harness/old_ptrace/_in_container_launcher.py",
+        "InContainerRelay._drain_diagnostics",
+    ): (2, "legacy subprocess pipe readers"),
+    (
+        "agency/harness/old_ptrace/_tcp_to_uds_relay.py",
+        "_handle_connection",
+    ): (2, "legacy socket pumps"),
+    (
+        "agency/harness/old_ptrace/_tcp_to_uds_relay.py",
+        "main",
+    ): (1, "legacy connection dispatcher"),
     # General background I/O and UI maintenance.
     ("agency/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
     ("agency/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
@@ -146,6 +164,10 @@ def _bare_thread_calls() -> Counter[tuple[str, str]]:
         # ``._module.py``. They are binary metadata, not Python sources or
         # executable thread sites.
         if path.name.startswith("._"):
+            continue
+        # The guard audits threads shipped by the library, not concurrency
+        # intentionally created by the library's own tests.
+        if "tests" in path.relative_to(_AGENCY_ROOT).parts:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         threading_aliases, thread_aliases = _thread_import_aliases(tree)

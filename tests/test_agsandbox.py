@@ -70,7 +70,12 @@ def _make_sandbox(**kwargs):
     uid = str(uuid.uuid4())
     agconfig = kwargs.pop("agconfig", None)
     cfg = agConfig(agSandboxBackendConfig(backend="docker"), agconfig)
-    return agSandbox(uid, agconfig=cfg, **kwargs)
+    # Configuration-only tests do not need a live daemon.  The production
+    # selector now validates explicit runtimes eagerly, so isolate those unit
+    # tests from the daemon probe while leaving @docker operations untouched.
+    with patch("agency.sandbox.base.shutil.which", return_value="/usr/bin/docker"):
+        with patch("agency.sandbox.container._runtime_works", return_value=True):
+            return agSandbox(uid, agconfig=cfg, **kwargs)
 
 
 def _agconfig_with_output_dir(output_dir):
@@ -1368,6 +1373,7 @@ class TestAgSandboxPersistentDispatch:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxExec:
     @docker
     def setup_method(self, _):
@@ -1418,6 +1424,7 @@ class TestAgSandboxExec:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxExecDetached:
     @docker
     def setup_method(self, _):
@@ -1623,6 +1630,7 @@ class TestEnsurePythonPackagesInContainer:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxFileIO:
     @docker
     def setup_method(self, _):
@@ -1726,6 +1734,7 @@ class TestAgSandboxReadFileUnit:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxPIDTracking:
     @docker
     def setup_method(self, _):
@@ -1859,6 +1868,7 @@ class TestAgSandboxPIDTracking:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxIngestPtracePids:
     """`ingest_ptrace_pids()` is the alternate _watched_pids population path
     fed by agproxy_ptrace's fork/exit events for harness-driven agents (see
@@ -1983,6 +1993,7 @@ class TestIngestPtracePidsUnit:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxResourceLimits:
     @docker
     def setup_method(self, _):
@@ -2023,6 +2034,7 @@ class TestAgSandboxResourceLimits:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestSandboxedTools:
     """bash/write/edit/daemon_release-via-tool-wrapper coverage was retired
     here along with agency/tools/{bash,write,edit,resource}.py themselves
@@ -2061,6 +2073,7 @@ class TestSandboxedTools:
         assert any("SECRET" in m["text"] for m in r.matches)
 
 
+@docker
 class TestResourceTools:
     """reserve_gpu/reserve_cpu/cpu_release-via-tool-wrapper coverage was
     retired here along with agency/tools/resource.py itself

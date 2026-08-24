@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from agency.agconfig import agConfig
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
+from agency.profiler import agprof
 
 # ---------------------------------------------------------------------------
 # Fakes -- duck-typed to match what serialize helpers read via getattr,
@@ -247,6 +248,49 @@ def test_start_stream_relays_text_deltas_then_done():
     assert items[2]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
     handle._thread.join(timeout=2.0)
     assert client.closed is True
+
+
+def test_start_stream_uses_spawn_traced(monkeypatch):
+    calls = []
+    real_spawn_traced = agprof.spawn_traced
+
+    def record_spawn(fn, *args, **kwargs):
+        calls.append((fn, args, kwargs))
+        return real_spawn_traced(fn, *args, **kwargs)
+
+    monkeypatch.setattr(agprof, "spawn_traced", record_spawn)
+    server, _ = _make_server(create_fn=lambda **kwargs: iter([]))
+    handle = server.start_stream({"messages": []})
+    assert _drain(handle)[-1]["type"] == "done"
+    handle._thread.join(timeout=2.0)
+
+    assert len(calls) == 1
+    assert calls[0][0] == server._run_stream_producer
+    assert calls[0][2] == {"daemon": True}
+
+
+def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tmp_path):
+    """The LLM attempt remains a child of the agent run across HTTP + thread hops."""
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    def create(**kwargs):
+        return iter([_FakeChunk([_FakeChoice(delta=_FakeDelta(content="Hi"))])])
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("engine-run"):
+            server = LlmHandlerServer(
+                _cfg(model="gpt-test"),
+                parent_context=agprof.current_span_context(),
+            )
+            client = _FakeClient(create)
+            server._backend.make_client = lambda timeout: client
+            response = TestClient(server.build_app()).post(
+                "/dispatch", json={"messages": [], "stream": True}
+            )
+            assert response.status_code == 200
+
+    records = {record[1]: record for record in agprof._records}
+    assert records["llm:attempt[0]"][8] == records["engine-run"][7]
 
 
 def test_start_stream_accumulates_tool_call_argument_fragments():

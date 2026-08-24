@@ -39,9 +39,13 @@ class HostServerManager:
         skill: "agskill",
         resource_pool: "agResourcePool",
     ) -> None:
+        from ...profiler import agprof
+
         self._ensure_runtime_configs(agent.agconfig)
         self._data_collector = agDataCollector(agent.agconfig)
-        self._llm_handler_server = LlmHandlerServer(agent.agconfig)
+        self._llm_handler_server = LlmHandlerServer(
+            agent.agconfig, parent_context=agprof.current_span_context()
+        )
         self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool)
         self._interaction_server = HostInteractionServer(agent, skill, self._data_collector)
         self.set_config(agent.agconfig)

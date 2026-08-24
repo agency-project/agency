@@ -14,6 +14,7 @@ import io
 import json
 import os
 import stat
+import pytest
 
 from agency.sandbox._layer_squash import (
     merge_layer_tars,
@@ -282,7 +283,10 @@ class TestOverlayDiffToTar:
     mknod works for this specific device number in this environment."""
 
     def _mkwhiteout(self, path):
-        os.mknod(str(path), mode=0o644 | stat.S_IFCHR, device=os.makedev(0, 0))
+        try:
+            os.mknod(str(path), mode=0o644 | stat.S_IFCHR, device=os.makedev(0, 0))
+        except (AttributeError, PermissionError, OSError) as exc:
+            pytest.skip(f"character-device whiteouts cannot be created on this host: {exc}")
 
     def test_regular_files_and_dirs_preserved(self, tmp_path):
         diff_dir = tmp_path / "diff"

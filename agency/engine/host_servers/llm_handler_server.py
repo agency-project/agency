@@ -131,9 +131,14 @@ class _StreamHandle:
 
 
 class LlmHandlerServer:
-    def __init__(self, agconfig: "agConfig") -> None:
+    def __init__(self, agconfig: "agConfig", *, parent_context=None) -> None:
         self._active_handles: "set[_StreamHandle]" = set()
         self._active_handles_lock = threading.Lock()
+        # HTTP/UDS requests are handled on the host server's own thread, so
+        # their contextvars do not automatically inherit the agent run span.
+        # Keep the durable OTel context captured by HostServerManager and use
+        # it explicitly for every LLM attempt span.
+        self._parent_context = parent_context
         self.set_config(agconfig)
 
     def set_config(self, agconfig: "agConfig") -> None:
@@ -150,15 +155,15 @@ class LlmHandlerServer:
         return self._dispatch_once(self._build_kwargs(request))
 
     def start_stream(self, request: dict) -> "_StreamHandle":
+        from ...profiler import agprof
+
         kwargs = self._build_kwargs(request)
         kwargs["stream"] = True
         kwargs["stream_options"] = {"include_usage": True}
         q: "queue.Queue[dict]" = queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
         cancel_event = threading.Event()
         handle = _StreamHandle(q, cancel_event, on_done=lambda: self._deregister(handle))
-        thread = threading.Thread(
-            target=self._run_stream_producer, args=(kwargs, handle), daemon=True
-        )
+        thread = agprof.spawn_traced(self._run_stream_producer, kwargs, handle, daemon=True)
         handle._thread = thread
         with self._active_handles_lock:
             self._active_handles.add(handle)
@@ -230,7 +235,7 @@ class LlmHandlerServer:
 
         client = self._backend.make_client(self._client_timeout())
         try:
-            with agprof.span("llm:attempt[0]") as attempt_span:
+            with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
                 _annotate(
                     attempt_span, model=self._backend.model, provider=type(self._backend).__name__
                 )
@@ -268,7 +273,7 @@ class LlmHandlerServer:
         content_parts: "list[str]" = []
         tool_calls_raw: "dict[int, dict]" = {}
         try:
-            with agprof.span("llm:attempt[0]") as attempt_span:
+            with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
                 _annotate(
                     attempt_span, model=self._backend.model, provider=type(self._backend).__name__
                 )

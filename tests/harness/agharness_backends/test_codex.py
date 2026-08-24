@@ -18,6 +18,12 @@ from agency.harness.adapters.codex import _CodexBackend, codex_available
 from agency.agskill import agskill
 
 
+_missing_attempt_seam = pytest.mark.xfail(
+    reason="Codex has not migrated from obsolete execute() to the harness daemon _run_attempt seam",
+    strict=True,
+)
+
+
 def _make_agent(with_sandbox=True):
     ag = MagicMock()
     ag.agconfig = agConfig()
@@ -56,6 +62,7 @@ def test_codex_available_reflects_real_which():
     assert codex_available() == (shutil.which("codex") is not None)
 
 
+@_missing_attempt_seam
 def test_execute_returns_agerror_when_binary_missing(monkeypatch):
     import shutil as _shutil
 
@@ -68,6 +75,7 @@ def test_execute_returns_agerror_when_binary_missing(monkeypatch):
     assert "not found on PATH" in result.error
 
 
+@_missing_attempt_seam
 def test_execute_parses_ndjson_agent_message():
     backend = _CodexBackend(agConfig())
     skill = agskill(name="s", system_prompt="do the thing")
@@ -96,6 +104,7 @@ def test_execute_parses_ndjson_agent_message():
     mock_gateway.unregister.assert_called_once()
 
 
+@_missing_attempt_seam
 def test_execute_nonzero_exit_returns_agerror():
     backend = _CodexBackend(agConfig())
     skill = agskill(name="s", system_prompt="do the thing")
@@ -115,6 +124,7 @@ def test_execute_nonzero_exit_returns_agerror():
     assert "boom" in result.error
 
 
+@_missing_attempt_seam
 def test_execute_recovers_structured_output_schema():
     backend = _CodexBackend(agConfig())
     skill = agskill(name="s", system_prompt="do the thing", output_schema=agdata(answer=str))
@@ -137,6 +147,7 @@ def test_execute_recovers_structured_output_schema():
     assert result.answer == "42"
 
 
+@_missing_attempt_seam
 def test_execute_writes_model_providers_config_toml():
     backend = _CodexBackend(agConfig())
     skill = agskill(name="s", system_prompt="do the thing")

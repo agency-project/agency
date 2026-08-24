@@ -6,6 +6,32 @@ from agency.agskill import agskill
 from agency.aglog import aglog
 from agency.agent import agent
 from agency.agconfig import agConfig
+from agency.engine import AgentEngine
+from agency.engine.types import ExecutionResult
+
+
+@pytest.fixture(autouse=True)
+def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
+    """Exercise logging through the current AgentEngine dispatch seam."""
+    real_execute = AgentEngine.execute
+
+    def execute(self, *, context, skill, skill_input, resource_pool, max_steps=None):
+        stub = getattr(skill, "_test_execute", None)
+        if stub is None:
+            return real_execute(
+                self,
+                context=context,
+                skill=skill,
+                skill_input=skill_input,
+                resource_pool=resource_pool,
+                max_steps=max_steps,
+            )
+        output, updated_context, delta = stub(
+            self._agent, context, skill_input, max_steps=max_steps
+        )
+        return ExecutionResult(output=output, context=updated_context, delta=delta)
+
+    monkeypatch.setattr(AgentEngine, "execute", execute)
 
 
 def make_agent(tools=None) -> agent:
@@ -25,7 +51,7 @@ def make_skill(name: str = "s", out: dict | None = None):
         new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
         return agdata(**(out or {"ok": True})), agcontext(messages=new_msgs), []
 
-    sk.execute_harness = fake_execute_react
+    sk._test_execute = fake_execute_react
     return sk
 
 

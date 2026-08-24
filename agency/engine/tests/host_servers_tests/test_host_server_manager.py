@@ -20,6 +20,7 @@ from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
     HostServerManagerConfigs,
 )
+from agency.profiler import agprof
 
 
 def _make_manager(tmp_path, policy=None):
@@ -54,6 +55,15 @@ def test_construction_wires_agent_and_skill_into_interaction_server(tmp_path):
     assert isinstance(manager._interaction_server, HostInteractionServer)
     assert manager._interaction_server._agent is agent
     assert manager._interaction_server._policy is policy
+
+
+def test_construction_captures_run_context_for_llm_requests(tmp_path, monkeypatch):
+    parent_context = object()
+    monkeypatch.setattr(agprof, "current_span_context", lambda: parent_context)
+
+    manager, _, _ = _make_manager(tmp_path)
+
+    assert manager._llm_handler_server._parent_context is parent_context
 
 
 def test_interaction_server_property_returns_the_same_instance(tmp_path):

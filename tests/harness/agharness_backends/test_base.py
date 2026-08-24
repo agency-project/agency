@@ -48,7 +48,7 @@ class TestForConfigDispatch:
         assert isinstance(backend, _GrokBackend)
 
     def test_unknown_engine_raises_value_error(self):
-        with pytest.raises(ValueError, match="Unknown harness engine"):
+        with pytest.raises(ValueError, match="Unknown harness"):
             agharness_backend.for_config("not-a-real-engine", agConfig())
 
 

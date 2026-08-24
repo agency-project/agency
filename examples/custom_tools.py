@@ -103,7 +103,7 @@ find_papers_skill = agskill(
     ),
     input_schema=agdata(topic=str),
     output_schema=agdata(papers=[{"title": str, "url": str, "abstract": str}], count=int),
-    replace_tools=[search_papers],
+    add_host_mcp_tools=[search_papers],
 )
 
 
@@ -178,7 +178,7 @@ summarise_paper_skill = agskill(
     ),
     input_schema=agdata(title=str, url=str, abstract=str),
     output_schema=agdata(summary=str),
-    replace_tools=[fetch_paper],
+    add_host_mcp_tools=[fetch_paper],
 )
 
 compile_report_skill = agskill(

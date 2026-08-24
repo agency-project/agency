@@ -128,13 +128,22 @@ _UDS_PREFIXES = [
 
 
 @pytest.fixture
-def _fresh_gateway(tmp_path, monkeypatch):
+def _fresh_gateway(monkeypatch):
     """Point the gateway root at a scratch dir and clear the per-process
-    caches, so each test gets its own root/run without touching the real one."""
-    monkeypatch.setattr(_agutil, "agency_tmp_root", lambda: tmp_path)
+    caches, so each test gets its own short, socket-safe root/run."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    # pytest's macOS tmp_path includes the test name and routinely exceeds
+    # sockaddr_un.sun_path's 108-byte budget before the socket basename is
+    # added.  Production deliberately uses /tmp/agency for the same reason.
+    root = Path(tempfile.mkdtemp(prefix="agt-", dir="/tmp"))
+    monkeypatch.setattr(_agutil, "agency_tmp_root", lambda: root)
     monkeypatch.setattr(_agutil, "_gateway_dir", None)
     monkeypatch.setattr(_agutil, "_gateway_reap_done", False)
-    yield tmp_path
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _dead_pid() -> int:

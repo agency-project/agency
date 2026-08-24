@@ -98,7 +98,6 @@ def main():
         ),
         input_schema=agdata(question=str),
         output_schema=agdata(answer=str),
-        replace_tools=[],
     )
 
     # harness="claude_code" -- dispatches through agharness_backend instead of

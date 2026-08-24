@@ -57,7 +57,13 @@ def _make_sandbox(**kwargs):
     uid = str(uuid.uuid4())
     agconfig = kwargs.pop("agconfig", None)
     cfg = agConfig(agSandboxBackendConfig(backend="docker"), agconfig)
-    return agSandbox(uid, agconfig=cfg, **kwargs)
+    # Unit tests below mock the backend's command runner after construction.
+    # Backend selection now performs a live daemon check during construction,
+    # so stub only that selection probe; tests marked @docker still exercise a
+    # real daemon through their actual backend operations.
+    with patch("agency.sandbox.base.shutil.which", return_value="/usr/bin/docker"):
+        with patch("agency.sandbox.container._runtime_works", return_value=True):
+            return agSandbox(uid, agconfig=cfg, **kwargs)
 
 
 # ---------------------------------------------------------------------------

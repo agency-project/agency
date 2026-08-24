@@ -1,7 +1,9 @@
 """Tests for agskill as a self-contained ReAct skill."""
 
 import json
+import shutil
 from unittest.mock import MagicMock
+import pytest
 from agency.agdata import agdata
 from agency.agcontext import agcontext
 from agency.agconfig import agConfig
@@ -17,6 +19,17 @@ LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
 
 LLM_CONFIG = {"api_key": "test", "model": ""}
 LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
+
+
+def _docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    from agency.sandbox.container import _runtime_works
+
+    return _runtime_works("docker")
+
+
+docker = pytest.mark.skipif(not _docker_available(), reason="Docker daemon not reachable")
 
 
 def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s=5):
@@ -724,6 +737,7 @@ def test_build_initial_messages_fires_full_history_fn():
 # does with the object it passed in.
 
 
+@docker
 def test_run_does_not_mutate_callers_shared_input_object():
     """Regression test: run() must not mutate the skill_input object the
     caller passed in -- prepare_inputs_in_sandbox()'s offload rewrite must
@@ -765,6 +779,7 @@ def test_run_does_not_mutate_callers_shared_input_object():
             ag.sandbox.destroy()
 
 
+@docker
 def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
     """Two agents' run() calls sharing one input agdata (the exact
     ClassificationTeam.run() pattern) must each read back their own

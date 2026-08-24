@@ -512,6 +512,8 @@ class TestKeyringQuotaDiagnostics:
         finally:
             _container._container_semaphore.release()
         assert limit_after == limit
+        if before_held == "?" or after_held == "?":
+            pytest.skip("sem_getvalue is unavailable on this platform")
         assert int(after_held) == int(before_held) + 1
 
     def test_semaphore_held_count_falls_back_to_unknown_on_error(self):
