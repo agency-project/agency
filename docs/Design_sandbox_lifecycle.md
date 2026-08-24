@@ -73,7 +73,7 @@ tool returns result
 
 The grace period passed to `docker/podman stop` is always `0`: the sandbox's entrypoint is always `tail -f /dev/null`, which never handles `SIGTERM`, so a nonzero grace period would only ever be wasted wall-clock time waiting out a timeout that always fires.
 
-Checkpointing (`commit()`) and discarding (`rm_container()`) still exist, but no longer happen at this granularity — they run once per *skill* call, in `agskill.py`'s teardown, after the whole ReAct loop (every tool call inside it) has finished. See "Skill-call boundary: commit or discard" below and `Design_execution_loop.md`'s step 3d for the full teardown sequence.
+Checkpointing (`commit()`) and discarding (`rm_container()`) still exist, but no longer happen at this granularity — they run once per *skill* call inside `AgentEngine.execute()`, after the harness attempt has finished. See "Skill-call boundary: commit or discard" below and `Design_execution_loop.md`'s step 3d for the full teardown sequence.
 
 **Not gated by `run_in_subprocess` anymore.** Earlier, this whole block only ran for tools with `run_in_subprocess=True` — a parameter that traces back to one literally named `need_sandbox`, renamed in an unrelated architecture refactor without revisiting whether the `stop()` gate still made sense under the new name. Since every built-in sandboxed tool (`bash`, `read`, `write`, `edit`, …) sets `run_in_subprocess=False` for unrelated reasons (they need to run synchronously against the same persistent object, not a disposable worker copy), that old gate meant `stop()` was never actually being called after any of them. `stop()` now runs after every tool call regardless of that flag, gated only on whether background work is pending.
 
@@ -105,7 +105,7 @@ This keeps at most one container alive per agent during active tool execution. T
 
 ## Skill-call boundary: commit or discard
 
-`stop()` only ever hibernates — nothing durable happens to the sandbox's checkpoint until the skill itself finishes, in `agskill.py`'s `_task()` `finally` block, still holding `ag.sandbox._lock` (see "Concurrency controls" below):
+`stop()` only ever hibernates — nothing durable happens to the sandbox's checkpoint until `AgentEngine.execute()` finishes the harness attempt, still holding `sandbox._lock` (see "Concurrency controls" below):
 
 | Skill outcome | What happens |
 |---|---|
@@ -143,15 +143,15 @@ A third mechanism guards a different axis — not Docker daemon load, but **excl
 
 | Lock | Scope | Held by | Guards |
 |---|---|---|---|
-| `agSandbox._lock` (`threading.RLock`) | Per `agSandbox` instance | `agskill.py`'s `_task()`, for the full duration of one skill run (acquired right after provisioning, released only after teardown's `commit()`/`rm_container()` call has finished) | Two skill runs interleaving `exec()` / `stop()` / `_ensure_started()` / `commit()` / `rm_container()` against the *same* container. There's no ownership flag anymore that ties a sandbox to exactly one agent, so a shared `agSandbox` (e.g. handed from one agent to another) needs this to stay safe. |
+| `agSandbox._lock` (`threading.RLock`) | Per `agSandbox` instance | `AgentEngine.execute()`, from immediately after provisioning through harness execution and final `commit()`/`rm_container()`/optional `stop()` | Two engine executions interleaving lifecycle operations against the *same* container. A shared `agSandbox` still needs this even when it moves between agents. |
 
-This lock is reentrant and thread-local to whichever thread is running the skill — every per-tool-call `stop()`/`_ensure_started()` described above, `wait_for_processes()`'s polling, and the single teardown `commit()`/`rm_container()` call all happen on that same thread, so they re-acquire the already-held lock at no cost. The lock is *not* acquired automatically by `agSandbox`'s methods themselves; only `agskill`'s session-scoped acquire/release around a whole skill run establishes the "one skill run at a time" invariant. See `Design_architecture.md`'s "Per-sandbox mutex" section and `agsandbox.md`'s "Concurrent access" section for the full rationale, including why the lock is excluded from pickling.
+This lock is reentrant and thread-local to whichever thread is running the engine. Per-tool lifecycle calls and final teardown re-acquire the already-held lock at no cost. The lock is *not* acquired automatically by `agSandbox` methods; the engine's execution-scoped acquire/release establishes the invariant. See `Design_architecture.md` and `agsandbox.md` for the full rationale.
 
 ---
 
 ## Dangling image accumulation and cleanup
 
-Every successful *skill* call (not tool call — `commit()` now runs at most once per skill, from `agskill.py`'s teardown; see "Skill-call boundary: commit or discard" above) commits the container state with the same tag:
+Every successful *skill* call (not tool call — `commit()` now runs at most once per engine execution; see "Skill-call boundary: commit or discard" above) commits the container state with the same tag:
 
 ```
 docker commit <container> agency/lifecycle-<agname>
@@ -263,7 +263,7 @@ agSandbox.wait_for_processes() called — train_pid is in _watched_pids
     and the ReAct loop continues (LLM may read output, wait, or call more tools)
 ```
 
-Only once `train.py` has actually finished does the *next* tool call's `dispatch_tools()` find `_has_pending_background_work()` false and finally call `sandbox.stop()` — hibernating a container that, by then, has nothing left running inside it anyway. If the skill then finishes successfully, `agskill.py`'s teardown calls `ag.sandbox.commit()` (see "Skill-call boundary: commit or discard" above) — a step entirely separate from any of the per-tool-call `stop()` calls that came before it.
+Only once `train.py` has actually finished does the *next* tool call find `_has_pending_background_work()` false and finally call `sandbox.stop()`. If the skill then finishes successfully, `AgentEngine.execute()` calls `sandbox.commit()` at the execution boundary — a step separate from any per-tool hibernation that came before it.
 
 > **Note**: a background process spawned inside one tool call *does* survive into later tool calls, for as long as it's still tracked as pending — `stop()` is deferred, not forced, so the container backing it is left untouched while it's running. It only dies once it finishes on its own, or once something removes it from `_watched_pids` (a natural exit, or `daemon_release` — see Case 4) and a subsequent tool call's `stop()` actually runs and hibernates (killing everything still inside) the container.
 

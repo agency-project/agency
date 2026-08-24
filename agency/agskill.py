@@ -1,9 +1,7 @@
 from __future__ import annotations
 import json
-import threading
 import time
 from concurrent.futures import Future
-from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from .agdata import agdata, agerror
 from .agpolicy import agpolicy
@@ -14,8 +12,8 @@ from .agschema import agschema
 from .agcontext import agcontext
 from .agtool import agtool
 from .llm.agllm import agllm
-from .sandbox.agsandbox import agSandbox, agSandboxConfig
-from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
+from .sandbox.agsandbox import agSandbox
+from .agconfig import DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
 from .aglog import _ts
 
@@ -468,7 +466,6 @@ class agskill:
             history_before: list[dict] = []
             _prev_input_tokens: int = 0
             _prev_output_tokens: int = 0
-            sandbox_lock: "threading.RLock | None" = None
             # Fallback for the final logging step below if an exception hits
             # before the defensive copy further down is made.
             local_skill_input = skill_input
@@ -494,29 +491,6 @@ class agskill:
                 # value's own contents in place.
                 local_skill_input = agdata(**dict(skill_input._data))
 
-                # ── 2. Provision sandbox — created once on first run and reused
-                #    across subsequent runs via its internal checkpoint image.
-                if ag.sandbox is None:
-                    with agprof.span("sandbox:provision"):
-                        # [REFACTOR] Do smth with out dir
-                        _out_dir = (
-                            ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
-                            if ag.agconfig is not None
-                            else type(ag).output_dir
-                        )
-                        _out = Path(_out_dir) / ag.agname if _out_dir else None
-                        sb_cfg = ag.agconfig
-                        if _out is not None:
-                            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-                            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
-                        ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
-
-                # Hold the sandbox's lock for the rest of the skill run so a
-                # sandbox shared across agents is never driven by more than
-                # one skill run at a time — released in the teardown below.
-                sandbox_lock = ag.sandbox._lock
-                sandbox_lock.acquire()
-
                 history_before = list(prev_ctx.messages)
                 _prev_input_tokens = prev_ctx.total_input_tokens
                 _prev_output_tokens = prev_ctx.total_output_tokens
@@ -527,9 +501,7 @@ class agskill:
                 ag._set_ui_state("skill", skill=self.name)
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
-                # ── 3. Delegate actual execution to the Agent Engine.
-                # agskill owns only the scheduling/future wrapper; it is passed
-                # to the engine as the declarative skill definition.
+                # ── 2. Delegate actual execution to the Agent Engine.
                 execution = ag.engine.execute(
                     context=prev_ctx,
                     skill=self,
@@ -541,6 +513,10 @@ class agskill:
                 updated_ctx = execution.context
                 outer_delta = execution.delta
 
+                outer_result = execution.output
+                updated_ctx = execution.context
+                outer_delta = execution.delta
+
             except Exception as exc:
                 outer_result = agerror(format_exception(exc))
                 updated_ctx = prev_ctx
@@ -548,66 +524,11 @@ class agskill:
                 history_before = list(prev_ctx.messages)
                 ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
             finally:
-                # ── 4. Teardown — commit or discard the sandbox; this is
-                # the only rollback boundary (no per-tool rollback -- the
-                # container is persistent for the whole skill call).
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 ag._set_ui_state("error" if _had_error else "finished")
-                if ag.sandbox is not None:
-                    if _had_error:
-                        # Discard everything since the last successful
-                        # skill's commit(). The notice can't go into this
-                        # skill's own result (already final by this point)
-                        # -- it goes on the inbox instead, so the NEXT
-                        # skill call's loop (via ag._drain_inbox(), run
-                        # before its first LLM call -- native's own loop
-                        # does this in-process; harness-driven engines have
-                        # no equivalent drain point today) surfaces it right
-                        # as the agent resumes sandbox work, rather than
-                        # never telling it at all.
-                        with agprof.span("teardown:discard"):
-                            ag.sandbox.rm_container()
-                        ag.inbox.put(
-                            "Note: the previous skill call failed. Its sandbox "
-                            "workspace changes have been discarded and the "
-                            "workspace has been reverted to the last "
-                            "successful checkpoint."
-                        )
-                    else:
-                        # commit() squashes automatically once the layer
-                        # chain's actual depth crosses checkpoint_squash_
-                        # max_depth -- see its docstring for why that's a
-                        # depth-triggered check, not a fixed commit count.
-                        #
-                        # Hibernate afterward: execute_react()'s output path
-                        # (recover_outputs / remove_files) re-wakes a
-                        # container that the last tool call already
-                        # hibernated, and commit() itself leaves the
-                        # container running. Without this stop(), finished
-                        # agents (especially one-shot forks) hold a session
-                        # keyring forever while sitting on `tail -f
-                        # /dev/null`. Same pending-work deferral as
-                        # agtool.py -- wait_for_processes() should already
-                        # have drained background jobs before we get here.
-                        with agprof.span("teardown:commit"):
-                            try:
-                                ag.sandbox.commit()
-                            finally:
-                                if (
-                                    not ag.sandbox._has_pending_background_work()
-                                ):  # [REFACTOR] What happens if this is true? Shouldn't we wait?
-                                    try:
-                                        ag.sandbox.stop()
-                                    except Exception as _e:
-                                        print(
-                                            f"[agskill] WARNING: post-commit hibernate "
-                                            f"failed for {ag.agname}: {_e}"
-                                        )
-                if sandbox_lock is not None:
-                    sandbox_lock.release()
                 agpause.set_current_worker_agent(None)  # [REFACTOR] What does this do?
 
-            # ── 5. Log result and commit token counts.
+            # ── 3. Log result and commit token counts.
             ts_end = _ts()
             assert outer_result is not None
             input_dict = local_skill_input.to_dict()

@@ -223,7 +223,7 @@ This guard prevents a single oversized tool result (e.g. a raw PDF fetched via `
 
 There's no per-tool-call checkpoint or revert anymore — a single tool call's own success or failure has no bearing on whether the sandbox gets checkpointed or discarded. Instead, after every tool call the container is only *hibernated* (`sandbox.stop()`, a `docker/podman stop` that never removes the container — see [container.md](sandbox/container.md)'s "Container lifecycle"), regardless of whether the tool succeeded or failed, unless it left background work still running in the sandbox (in which case `stop()` is deferred entirely for this call; a later call that finds nothing pending is what actually hibernates it).
 
-Rollback happens once per *skill* call instead, at `_task()`'s teardown:
+Rollback happens once per *skill* call instead, inside `AgentEngine.execute()` while it still holds `sandbox._lock`:
 
 - On success: `sandbox.commit()` checkpoints the container's current state to `agency/lifecycle-<name>` **without removing or stopping it** — the very next skill call resumes directly from the same container, no `run` needed.
 - On failure (the skill's own result contains `"error"`, or an exception escaped): `sandbox.rm_container()` force-removes the container, discarding everything since the last successful skill's `commit()`. The next tool call's `_ensure_started()` recreates fresh from that previous `agency/lifecycle-<name>` — i.e. the last successfully committed state — which is what makes this a revert: nothing is rolled back explicitly, the bad state is simply never checkpointed forward.

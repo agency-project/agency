@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..agconfig import agConfig
 from ..harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
+from ..profiler import agprof
+from ..sandbox.agsandbox import agSandbox, agSandboxConfig
 from .harness_daemon_launcher import ensure_harness_daemon
 from .host_servers.host_server_manager import HostServerManager
 from .types import ExecutionResult
@@ -44,14 +48,54 @@ class AgentEngine:
         resource_pool: "agResourcePool",
         max_steps: "int | None" = None,
     ) -> ExecutionResult:
-        """Execute one declarative skill request through the host services."""
+        """Execute one request and own its complete sandbox transaction."""
+
+        with agprof.span("sandbox:provision"):
+            sandbox = self.ensure_sandbox()
+        sandbox_lock = sandbox._lock
+        sandbox_lock.acquire()
+        try:
+            try:
+                execution = self._execute_harness(
+                    context,
+                    skill,
+                    skill_input,
+                    resource_pool,
+                    max_steps=max_steps,
+                )
+            except BaseException:
+                self._discard_sandbox(sandbox)
+                raise
+
+            if self._execution_failed(execution):
+                self._discard_sandbox(sandbox)
+                return execution
+
+            try:
+                self._commit_sandbox(sandbox)
+            except BaseException:
+                self._discard_sandbox(sandbox)
+                raise
+            return execution
+        finally:
+            sandbox_lock.release()
+
+    def _execute_harness(
+        self,
+        context: "agcontext",
+        skill: "agskill",
+        skill_input: "agdata",
+        resource_pool: "agResourcePool",
+        max_steps: "int | None" = None,
+    ) -> ExecutionResult:
+        """Run host services and the sandbox-side harness while locked."""
 
         # Start connections
         self._host_server_manager = HostServerManager(
             self._agent, self._agent.sandbox, skill, resource_pool
         )
-        host_uds_path = self._host_server_manager.start()
         try:
+            host_uds_path = self._host_server_manager.start()
             # start harness manager daemon
             engine_name = str(
                 getattr(self._agent, "agname", getattr(self._agent, "harness", "agent"))
@@ -111,6 +155,57 @@ class AgentEngine:
             self._host_server_manager.stop()
 
     # ------------------------------------------------------------------
+    # sandbox lifecycle
+    # ------------------------------------------------------------------
+
+    def ensure_sandbox(self) -> "agSandbox":
+        """Provision this agent's sandbox before execution begins."""
+        if self._agent.sandbox is not None:
+            return self._agent.sandbox
+
+        output_dir = (
+            self._agent.agconfig.get("agent", "output_dir", type(self._agent).output_dir)
+            if self._agent.agconfig is not None
+            else type(self._agent).output_dir
+        )
+        agent_output_dir = Path(output_dir) / self._agent.agname if output_dir else None
+        sandbox_config = self._agent.agconfig
+        if agent_output_dir is not None:
+            sandbox_config = sandbox_config.clone() if sandbox_config else agConfig()
+            agSandboxConfig(sandbox_config).add_mount(
+                "agent_output", agent_output_dir, "/agent_output"
+            )
+
+        self._agent.sandbox = agSandbox(self._agent.agname, agconfig=sandbox_config)
+        return self._agent.sandbox
+
+    def _execution_failed(self, execution: ExecutionResult) -> bool:
+        return not execution.ok
+
+    def _discard_sandbox(self, sandbox: "agSandbox") -> None:
+        with agprof.span("teardown:discard"):
+            sandbox.rm_container()
+        self._agent.inbox.put(
+            "Note: the previous skill call failed. Its sandbox workspace "
+            "changes have been discarded and the workspace has been reverted "
+            "to the last successful checkpoint."
+        )
+
+    def _commit_sandbox(self, sandbox: "agSandbox") -> None:
+        with agprof.span("teardown:commit"):
+            try:
+                sandbox.commit()
+            finally:
+                if not sandbox._has_pending_background_work():
+                    try:
+                        sandbox.stop()
+                    except Exception as exc:
+                        print(
+                            f"[engine] WARNING: post-commit hibernate failed "
+                            f"for {self._agent.agname}: {exc}"
+                        )
+
+    # ------------------------------------------------------------------
     # internal
     # ------------------------------------------------------------------
 
@@ -154,24 +249,6 @@ class AgentEngine:
             prior_session_blob_b64=prior_session_blob_b64,
         )
         return self._sandbox_interaction_client.run_harness_attempt(request)
-
-    def _run_attempt(self, prompt: PromptPayload) -> HarnessAttemptResult:
-        interaction = self._host_server_manager.interaction_server
-        waiter = interaction.expect_attempt_result()
-        try:
-            self._send_run_attempt(prompt)
-            return interaction.wait_for_attempt_result(waiter)
-        except BaseException:
-            interaction.cancel_expected_attempt(waiter)
-            raise
-
-    def _send_run_attempt(self, prompt: PromptPayload) -> None:
-        """Send one attempt directly to the sandbox daemon server.
-
-        The host-side protocol boundary is explicit now; the daemon client
-        will implement it once the sandbox-side server exists.
-        """
-        raise NotImplementedError("sandbox daemon client is not configured")
 
     def _missing_output_fields(self, skill: "agskill") -> "list[str]":
         if skill.output_schema is None:

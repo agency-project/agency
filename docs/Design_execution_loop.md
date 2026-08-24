@@ -60,96 +60,52 @@ r2 = ag.run(summarize_skill, agdata(text=r1))    # r1 resolved here inside _task
 
 Immediately after — before touching the sandbox — `ag._check_pause(self.name)` runs once. This honors a `pause()` requested before this run even started, so an agent paused while idle never provisions a sandbox or makes an LLM call. See `agent.md`'s "Pause and resume" section for the other checkpoint (once per ReAct-loop iteration, 4d below).
 
-### 3b. Sandbox provisioning and locking
+### 3b. Engine-owned sandbox transaction
+
+`agskill._task()` delegates to `AgentEngine.execute()` after resolving inputs and recording the skill start. The engine performs the sandbox transaction atomically:
 
 ```python
-if ag.sandbox is None:
-    _out_dir = (
-        ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
-        if ag.agconfig is not None else type(ag).output_dir
-    )
-    _out = Path(_out_dir) / ag.agname if _out_dir else None
-    sb_cfg = ag.agconfig
-    if _out is not None:
-        sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-        agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
-    ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
-
-# Hold the sandbox's lock for the rest of the skill run so a sandbox
-# shared across agents is never driven by more than one skill run
-# at a time — released in the teardown below.
-sandbox_lock = ag.sandbox._lock
+sandbox = self.ensure_sandbox()
+sandbox_lock = sandbox._lock
 sandbox_lock.acquire()
+try:
+    execution = self._execute_harness(...)
+    if not execution.ok:
+        self._discard_sandbox(sandbox)
+    else:
+        self._commit_sandbox(sandbox)
+    return execution
+finally:
+    sandbox_lock.release()
 ```
 
-Sandbox creation is lazy — only on the first skill run that needs tools, and only if `ag.sandbox` isn't already set (either from a prior run on this agent, or a caller-provided sandbox passed to `agent(sandbox=...)`). There's no "external sandbox" special case anymore — whoever created the `agSandbox`, this skill run provisions it if missing and manages its lifecycle identically.
+Sandbox creation remains lazy and preserves caller-provided sandboxes. Keeping the `RLock` on `agSandbox` protects handoff and sharing across agents; putting its lifecycle in `AgentEngine.execute()` ensures harness execution, host-service shutdown, commit/discard, and optional post-commit hibernation all share one exception boundary.
 
-Immediately after provisioning, `_task()` acquires `ag.sandbox._lock` (a `threading.RLock`, one per `agSandbox` instance) and holds it until the teardown in 3d releases it. This matters because a single `agSandbox` object can now be shared across more than one agent (e.g. handed from one agent to another, as in `examples/sandbox_handoff.py`); the lock ensures two skill runs never interleave `exec()`/`stop()`/`_ensure_started()`/`commit()`/`rm_container()` calls against the same container. Everything the ReAct loop does to the sandbox — each tool call's own `stop()`/`_ensure_started()` (hibernate/resume only — see `Design_sandbox_lifecycle.md`), `wait_for_processes()` polling, and the single `commit()`/`rm_container()` call at teardown (3d below) — happens on this same thread, so those calls reentrantly reuse the lock this thread already holds at no cost.
-
-### 3c. Skill execution
+### 3c. Harness execution
 
 ```python
-outer_result, updated_ctx, outer_delta = self.execute_react(
-    ag, prev_ctx, skill_input, max_steps,
+execution = ag.engine.execute(
+    context=prev_ctx,
+    skill=self,
+    skill_input=skill_input,
+    resource_pool=type(ag).agresource_pool,
+    max_steps=max_steps,
 )
 ```
 
-`execute_react()` returns a 3-tuple: `(result: agdata, updated_ctx: agcontext, ctx_delta: list[dict])`. Token counts accumulate inside `prev_ctx` during the run and are committed back via `prev_ctx.total_input_tokens` / `prev_ctx.total_output_tokens`.
+The standardized `ExecutionResult` carries the output, updated context, history delta, and success state. `agskill` consumes that result but does not manage sandbox lifecycle.
 
-### 3d. Exception handling
+### 3d. Exception handling and teardown
 
-The entire body of `_task` is wrapped in `try / except / finally`:
+If harness execution raises, the engine discards the sandbox and re-raises. If it returns `ExecutionResult(ok=False)`, the engine discards and returns that failed result. A successful result is committed, then the sandbox is stopped unless background work remains. Commit failures trigger a discard attempt. The outer `finally` releases `sandbox._lock` even when harness execution, commit, discard, or stop fails.
 
-```python
-try:
-    prev_ctx.resolve_prev_dependencies()
-    skill_input.resolve_input_dependencies()
-    ...
-    outer_result, updated_ctx, outer_delta = self.execute_react(...)
-
-except Exception as exc:
-    outer_result  = agerror(format_exception(exc))
-    updated_ctx   = prev_ctx
-    outer_delta   = []
-
-finally:
-    # Teardown — commit or discard the sandbox; this is now the only
-    # rollback boundary (per-tool-call rollback no longer exists — see
-    # agtool.py's dispatch_tools() / Design_sandbox_lifecycle.md).
-    _had_error = outer_result is not None and bool(outer_result._data.get("error"))
-    ag._set_ui_state("error" if _had_error else "finished")
-    if ag.sandbox is not None:
-        if _had_error:
-            # Discard everything since the last successful skill's
-            # commit(). The notice can't go into this skill's own result
-            # (already final by this point) -- it goes on the inbox
-            # instead, so the NEXT skill call's execute_react loop (via
-            # ag._drain_inbox(), run before its first LLM call) surfaces
-            # it right as the agent resumes sandbox work.
-            ag.sandbox.rm_container()
-            ag.inbox.put(
-                "Note: the previous skill call failed. Its sandbox "
-                "workspace changes have been discarded and the "
-                "workspace has been reverted to the last "
-                "successful checkpoint."
-            )
-        else:
-            # commit() squashes automatically once the layer chain's
-            # actual depth crosses checkpoint_squash_max_depth -- see
-            # its docstring for why that's a depth-triggered check, not
-            # a fixed commit count.
-            ag.sandbox.commit()
-    if sandbox_lock is not None:
-        sandbox_lock.release()
-```
-
-The `finally` block always runs, and is where the sandbox lifecycle decision that used to happen after *every tool call* now happens exactly *once*, at the end of the whole skill. On success, `commit()` checkpoints the container's current filesystem into its lifecycle image **without removing or even stopping the container** — the next skill run, on this agent or whichever one next holds this `agSandbox`, resumes directly from the very same container object. On failure, `rm_container()` force-removes the container outright, discarding everything since the last successful skill's `commit()`, and a revert notice is queued onto `ag.inbox` (see "Sandbox rollback and the inbox notice" below) since the failing result is already final by this point. Neither branch calls `stop()` — a container that's still running or hibernating from the ReAct loop's own per-tool-call `stop()` calls is left exactly as it was; only `commit()`/`rm_container()` change anything durable. There is no separate GPU-release step in this `finally` block: `commit()` never touches the GPU (the container isn't stopped or removed, so there's nothing to release), and `rm_container()` releases it as part of removal, same as `destroy()` does. The GPU's actual release cadence is set one level up, in the per-tool-call `stop()` calls this `finally` block doesn't touch at all: every hibernate between tool calls now releases the GPU too (re-acquired, possibly a *different* physical GPU, on the next `exec()`) — see `sandbox/container.md`'s "GPU device access" for why attaching every GPU up front to a GPU-reserving container makes that safe. Finally, the per-sandbox lock acquired in 3b is released last, so nothing else can touch this sandbox until this skill run's own teardown has fully finished.
+`agskill._task()` only translates a raised engine exception into `agerror`, updates UI state, and completes logging/futures. It contains no sandbox-lock or teardown logic.
 
 ### Sandbox rollback and the inbox notice
 
-Rollback now happens at exactly one point in the whole system: this `finally` block, once per skill call — replacing an older design where every individual tool call inside `dispatch_tools()` decided for itself whether to checkpoint or discard the sandbox. A single tool call failing partway through an otherwise-successful skill no longer discards anything by itself; only the skill's own final outcome (an `"error"` key in `outer_result`, or an exception that escaped `execute_react()`) decides, and it decides for the *entire* skill run's worth of tool calls at once.
+Rollback now happens at exactly one point in the whole system: `AgentEngine.execute()`, once per skill call. A single failed tool call does not discard anything by itself; only the standardized execution result or an exception escaping the harness decides for the entire run.
 
-Because `rm_container()` runs from inside `finally` — after `outer_result` is already computed and about to be returned to the caller — there is no way to attach a note to that same result the way an inline `workspace_reverted` key once could. Instead, the notice is pushed onto `ag.inbox` (a plain `queue.Queue[str]`), and surfaces at the very start of the *next* skill call: step 4d below shows `ag._drain_inbox(messages)` running every ReAct-loop iteration, including the first — before that skill's first LLM call — turning any queued string into a `{"role": "user", ...}` conversation turn. The agent therefore learns about the revert as it resumes sandbox work on the next skill, not inside the failed skill's own output.
+The engine pushes the revert notice onto `ag.inbox` after `rm_container()` succeeds. It surfaces at the start of the next skill call rather than modifying the already-computed failed result.
 
 `"finished"`/`"error"` are both leaf states `agent.is_settled()` treats as trivially settled (alongside `"inactive"` and `"paused"`) — a `wait_all_paused()` call covering this agent won't block once `_task()` reaches this line, regardless of whether `pause()` was ever called.
 
