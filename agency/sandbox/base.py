@@ -395,32 +395,12 @@ class agsandbox_backend(AgSandboxBackendFields):
 
         Default: delegate to ``_container_exec()`` -- a container's own exec
         session runs inside its own procfs view, which IS the right process
-        table for `_snapshot_pids()`/`get_live_pids()` to read for docker and
-        podman. Overridden by `_ChrootBackend`, which has no isolated procfs
+        table for `get_live_pids()` to read for docker and podman. Overridden
+        by `_ChrootBackend`, which has no isolated procfs
         of its own to exec into (see its module docstring) and must instead
         read the real host `/proc` directly, unchrooted.
         """
         return self._container_exec(script, timeout=timeout, shell="sh")
-
-    def _snapshot_pids(self) -> set[int]:
-        """Return the set of all live PIDs currently in the container, excluding
-        the snapshot shell itself so that monitoring shells are not mistaken
-        for user-spawned processes."""
-        out, _ = self._read_proc_table(
-            "__SELF=$$\n"
-            "for __d in /proc/[0-9]*; do\n"
-            '  [ -f "$__d/status" ] || continue\n'
-            "  __p=${__d##*/}\n"
-            '  [ "$__p" != "$__SELF" ] && echo "$__p"\n'
-            "done",
-            timeout=self.inspect_timeout_s,
-        )
-        pids: set[int] = set()
-        for line in out.splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pids.add(int(line))
-        return pids
 
     def _exec_with_pid_tracking(
         self, env_export: str, cmd: str, workdir: str, timeout: int

@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 
 _DEFAULT_LIMIT = 2000
 _MAX_BYTES = 50 * 1024
-_MAX_LINE_LEN = 2000
 
 # ---------------------------------------------------------------------------
 # Constants

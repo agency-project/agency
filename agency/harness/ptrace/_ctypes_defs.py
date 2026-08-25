@@ -8,8 +8,8 @@ unsupported architecture.
 
 Every raw ptrace() call site sets `restype`/`argtypes` explicitly -- ctypes
 defaults an unconfigured foreign function's return type to `c_int` (32-bit),
-which silently truncates the 64-bit word `PTRACE_PEEKDATA`/`PTRACE_PEEKTEXT`
-return (the actual data read from tracee memory), corrupting any string or
+which silently truncates the 64-bit word returned by `PTRACE_PEEKDATA` (the
+actual data read from tracee memory), corrupting any string or
 pointer read back through it. This was caught by hand during development
 (see the design doc's implementation notes) and is exactly the kind of bug
 that reproduces silently rather than raising, so it is asserted here once at
@@ -50,27 +50,17 @@ _configure_libc()
 # ---------------------------------------------------------------------------
 
 PTRACE_TRACEME = 0
-PTRACE_PEEKTEXT = 1
 PTRACE_PEEKDATA = 2
-PTRACE_POKETEXT = 4
-PTRACE_POKEDATA = 5
 PTRACE_CONT = 7
-PTRACE_KILL = 8
-PTRACE_SINGLESTEP = 9
 PTRACE_GETREGS = 12
 PTRACE_SETREGS = 13
-PTRACE_ATTACH = 16
-PTRACE_DETACH = 17
-PTRACE_SYSCALL = 24
 PTRACE_SETOPTIONS = 0x4200
 PTRACE_GETEVENTMSG = 0x4201
 
-PTRACE_O_TRACESYSGOOD = 0x00000001
 PTRACE_O_TRACEFORK = 0x00000002
 PTRACE_O_TRACEVFORK = 0x00000004
 PTRACE_O_TRACECLONE = 0x00000008
 PTRACE_O_TRACEEXEC = 0x00000010
-PTRACE_O_TRACEVFORKDONE = 0x00000020
 PTRACE_O_TRACEEXIT = 0x00000040
 PTRACE_O_TRACESECCOMP = 0x00000080
 
@@ -78,7 +68,6 @@ PTRACE_EVENT_FORK = 1
 PTRACE_EVENT_VFORK = 2
 PTRACE_EVENT_CLONE = 3
 PTRACE_EVENT_EXEC = 4
-PTRACE_EVENT_VFORK_DONE = 5
 PTRACE_EVENT_EXIT = 6
 PTRACE_EVENT_SECCOMP = 7
 

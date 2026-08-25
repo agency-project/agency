@@ -26,15 +26,7 @@ Workflow — follow these steps in order:
 
 
 class agplan(agskill):
-    """Planning / analysis skill: read-only tools, no code execution.
-
-    When run with a sandbox, provides read, grep, glob, and webfetch.
-    When run without a sandbox, has no tools (pure-reasoning mode).
-    The base planning prompt is prepended to the caller's system_prompt.
-
-    Does not accept replace_tools (tool set is fixed by the class).
-    Use add_tools to inject additional read-only tools (e.g. web search).
-    """
+    """Planning/analysis skill with a planning prompt and optional tools."""
 
     def __init__(
         self,
@@ -53,23 +45,3 @@ class agplan(agskill):
             output_schema=output_schema,
             max_output_schema_retries=max_output_schema_retries,
         )
-
-    def _build_tools(self, sandbox, pool, term, log, _ensure_read: bool = False):
-        from ..tools import make_read, make_grep, make_glob, webfetch
-
-        if sandbox is not None:
-            active_tools: list[agtool] = [
-                make_read(sandbox),
-                make_grep(sandbox),
-                make_glob(sandbox),
-                webfetch,
-            ]
-        else:
-            active_tools = []
-        if self.add_tools:
-            active_tools.extend(self.add_tools)
-        for t in active_tools:
-            t.attach_logger(term, log)
-        tool_map = {t.name: t for t in active_tools}
-        openai_tools = [t.to_openai_tool() for t in active_tools] or None
-        return active_tools, tool_map, openai_tools

@@ -1,23 +1,7 @@
-"""Codex CLI backend.
+"""Codex CLI harness adapter.
 
-Structural implementation only -- no `codex` binary was installable in the
-environment this was developed in (no network path to it was verified),
-so this backend's `execute()` follows the exact same shape as
-`_ClaudeCodeBackend`/`_OpencodeBackend` (isolated config home,
-`agproxy_ptrace` launch, output-schema recovery) but is exercised only by
-mocked tests (see tests/harness/agharness_backends/test_codex.py), never against
-a live process.
-
-Codex speaks the OpenAI Responses API only (`wire_api="chat"` was removed
-upstream), routed at `agproxy_llm`'s `/v1/responses` route (`gateway_mode=
-"translate"` -- see agproxy_llm.py/agproxy_llm_adapters.py's Responses-API
-adapter). This backend writes a `[model_providers.agency-proxy]` block into
-an isolated `CODEX_HOME/config.toml` pointing `base_url` at the gateway and
-selects it as the active provider; the gateway token is passed via an env
-var named by `env_key` (Codex's config schema wants an env-var *name*, not
-an inline key, per its documented config.toml shape) -- the Responses-API
-wire adapter itself is unverified against a live `codex` binary (same
-"no binary available" caveat as the rest of this module).
+Builds an isolated Codex configuration, launches the CLI through the sandbox
+daemon, and normalizes its JSONL output.
 """
 
 from __future__ import annotations

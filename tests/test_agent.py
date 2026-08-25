@@ -20,8 +20,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
 
     ``agskill.run`` now delegates to ``AgentEngine.execute``.  These tests
     exercise run/future/history behavior, so their execution doubles belong
-    at that engine seam rather than on the retired host-side
-    ``agskill.execute_harness`` path.
+    at that engine seam.
     """
     real_execute = AgentEngine.execute
 

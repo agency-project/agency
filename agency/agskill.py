@@ -1,8 +1,7 @@
 from __future__ import annotations
 import json
-import time
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 from .agdata import agdata, agerror
 from .agpolicy import agpolicy
 from .agtype import agtype
@@ -12,7 +11,6 @@ from .agschema import agschema
 from .agcontext import agcontext
 from .agtool import agtool
 from .llm.agllm import agllm
-from .sandbox.agsandbox import agSandbox
 from .agconfig import DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
 from .aglog import _ts
@@ -403,39 +401,6 @@ class agskill:
         content.extend(extra_blocks)
         return content
 
-    def _build_initial_messages(  # [REFACTOR] Unused?
-        self,
-        skill_input: agdata,
-        agent_context: agcontext,
-        _extra_system: "str | None",
-        live_messages_fn: "Callable | None",
-        full_history_fn: "Callable | None",
-    ) -> "tuple[list[dict], int]":
-        """Build initial messages list. Returns (messages, n_before)."""
-        # n_before records how many messages were in agent_context before this skill run
-        # started.  After the run, messages[n_before+1:] (skipping the leading
-        # system prompt) is the "delta" — the new turns added by this call.
-        n_before = len(agent_context.messages)
-
-        # Three-part structure: [system] + persistent history from agent_context + [new user turn].
-        messages: list[dict] = (
-            [{"role": "system", "content": self._build_system_prompt(_extra_system)}]
-            + list(agent_context.messages)
-            + [{"role": "user", "content": self._build_user_content(skill_input)}]
-        )
-
-        # Push the conversation (minus system prompt) to the live UI view so the
-        # user can see the running history before the first LLM response arrives.
-        if live_messages_fn:
-            live_messages_fn(messages[1:])  # [REFACTOR] Why 1:?
-
-        # Log the system prompt and the new user message to the full-history sink
-        # (e.g. aglog file writer) so they appear in debug transcripts.
-        if full_history_fn:
-            full_history_fn(messages[0])
-            full_history_fn(messages[-1])  # [REFACTOR] Why 0 and -1?
-        return messages, n_before
-
     # ------------------------------------------------------------------
     # Scheduling wrapper — non-blocking, returns pending agdata
     # ------------------------------------------------------------------
@@ -478,8 +443,8 @@ class agskill:
                     prev_ctx.resolve_prev_dependencies()
                     skill_input.resolve_input_dependencies()
 
-                # Defensive shallow copy: prepare_inputs_in_sandbox() (called
-                # below, via execute_harness) mutates its skill_input argument
+                # Defensive shallow copy: prepare_inputs_in_sandbox() in the
+                # engine mutates its skill_input argument
                 # in place (offloading oversized/agtype fields to sandbox
                 # paths). If a caller hands the same agdata object to more
                 # than one concurrent run() call (e.g. one shared input
@@ -510,10 +475,6 @@ class agskill:
                     sandbox=ag.sandbox,
                     max_steps=max_steps,
                 )
-                outer_result = execution.output
-                updated_ctx = execution.context
-                outer_delta = execution.delta
-
                 outer_result = execution.output
                 updated_ctx = execution.context
                 outer_delta = execution.delta
@@ -653,170 +614,6 @@ class agskill:
         pending = self.run(ag, skill_input, max_steps)
         await loop.run_in_executor(None, pending._resolve)
         return pending
-
-    # ------------------------------------------------------------------
-    # execute_react() (the old host-process ReAct loop -- LLM calls direct
-    # from the host, tool dispatch via agtool.py's dispatch_tools() with a
-    # per-tool-call sandbox hibernate) was retired here. Every engine,
-    # native included, now runs through execute_harness() below -- native's
-    # own loop lives in a persistent in-container process
-    # (agharness_backends/native.py), not in this host process.
-    # ------------------------------------------------------------------
-
-    def execute_harness(  # [REFACTOR]  Can be inlined into run()?
-        self,
-        ag: "agent",
-        prev_ctx: agcontext,
-        skill_input: agdata,
-        max_steps: "int | None" = None,
-    ) -> "tuple[agdata, agcontext, list[dict]]":
-        # [REFACTOR] Too much text
-        """Run this skill against *ag* via its configured `agharness_backend`
-        -- called unconditionally by `agskill.run()`'s `_task()` for every
-        engine, native included (native is just another backend whose
-        "binary" happens to be agency's own code). Same contract
-        `execute_react()` used to promise on its own: `ctx` is the SAME
-        `prev_ctx` object passed in, mutated in place (`.messages`/
-        `.total_input_tokens`/`.total_output_tokens`); `delta` is
-        `[system_prompt_message] + every message appended since this call
-        started`. By the time `_task()` reaches this branch,
-        `prev_ctx.resolve_prev_dependencies()` has already run (agskill.py's
-        `_task()`), so `.messages` is already a concrete resolved list --
-        this method does not need to resolve futures itself.
-
-        See docs/Design_harness_integration.md for the design this
-        implements: the skill's system prompt + input become a plain
-        user-turn prompt (never injected as the harness's own system
-        prompt or a tool), and the harness's own built-in tools/compaction
-        run untouched -- mediation happens at the syscall level via
-        agproxy_ptrace, not through this method.
-
-        Also where every engine gets agtype/oversized-input offloading and
-        agtype-output recovery -- the same `agschema.prepare_inputs_in_
-        sandbox()`/`recover_outputs()` operations `execute_react()` used to
-        call itself, hoisted up here so they're one shared, engine-agnostic
-        implementation instead of five. A background-job wait
-        (`agSandbox.wait_for_processes()`, `execute_react()`'s third such
-        operation) is only called here for the `native` engine, NOT hoisted
-        for all five -- see the call site's own comment for why the other
-        four engines' ptrace-tracked child processes make that unsafe today.
-        Both hoisted operations are
-        host-side, sandbox-based operations with no dependency on which
-        backend actually dispatched the call.
-        """
-        from .harness.adapters.base import agharness_backend
-
-        input_error = (
-            self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
-        )
-        if input_error is not None:
-            sys_msg = {"role": "system", "content": self._build_system_prompt()}
-            return agerror(input_error), prev_ctx, [sys_msg]
-
-        _input_suffix = f"_{int(time.time() * 1000)}"
-        with agprof.span("input:prepare"):
-            _offloaded_paths, auto_fields = (
-                self.input_schema.prepare_inputs_in_sandbox(
-                    skill_input,
-                    ag.sandbox,
-                    self.name,
-                    suffix=_input_suffix,
-                    context_limit=ag.llm.context_limit,
-                    agconfig=ag.agconfig,
-                )
-                if self.input_schema is not None
-                else ([], [])
-            )
-        extra_system: "str | None" = None
-        if auto_fields:
-            field_list = ", ".join(f"`{f}`" for f in auto_fields)
-            extra_system = (
-                f"\nNote: The following input fields contain large content "
-                f"that has been automatically saved to temporary files in "
-                f"your sandbox: {field_list}. The file paths are shown in "
-                f"the input JSON. Use the read tool to access the full "
-                f"content. WARNING: these files are temporary and will be "
-                f"automatically deleted after this task ends."
-            )
-
-        backend = agharness_backend.for_config(
-            ag.harness, ag.agconfig
-        )  # [REFACTOR] ag.harness should be part of ag.config
-
-        # Manager/bridge lifecycle lives HERE, at this one shared choke
-        # point -- not duplicated per backend. See agharness_backends/
-        # base.py's execute() docstring and agharness.py's own
-        # get_or_create_host_manager()/ensure_harness_bridge() docstrings
-        # for why this moved out of each backend's own execute().
-        from .harness import agharness
-
-        host_manager = agharness.get_or_create_host_manager(ag, ag.agconfig)
-        # ensure_harness_bridge() itself picks container-backed vs
-        # bare-host/chroot mode -- always returns a real base URL now,
-        # never None; a backend that only supports one mode (native_harness
-        # requires container-backed) checks agharness.is_container_backed()
-        # itself, not harness_base_url's presence.
-        harness_base_url = agharness.ensure_harness_bridge(ag.sandbox, host_manager)
-
-        launch = host_manager.register_launch(
-            skill=self,
-            exact_tool_events=getattr(backend, "uses_exact_tool_events", False)
-            and agprof.enabled(),
-        )
-        try:
-            result, updated_ctx, delta = backend.execute(
-                ag,
-                prev_ctx,
-                skill_input,
-                max_steps,
-                skill=self,
-                extra_system=extra_system,
-                host_manager=host_manager,
-                harness_base_url=harness_base_url,
-                launch=launch,
-            )
-        finally:
-            launch.unregister()
-            ag.sandbox.remove_files(_offloaded_paths)
-        if not isinstance(result, agerror):
-            # Give a background job the agent kicked off (e.g. `cmd &` via
-            # a bash-style tool call) a chance to finish before this skill
-            # call's container gets committed/stopped -- same protection
-            # `execute_react()` gives itself.
-            #
-            # Scoped to `native` only, NOT hoisted for every engine as
-            # originally planned: a real-Bedrock/real-`claude` regression
-            # test run surfaced that the 4 external-harness engines leave
-            # ptrace-tracked child PIDs in `agsandbox_backend._watched_pids`
-            # that never receive an `ingest_ptrace_pids(exited=...)` call
-            # even long after the harness CLI's own top-level process has
-            # exited (confirmed: `wait_for_processes()` blocked for the
-            # full 5-minute `ping_interval_s` on 7 real claude_code.py
-            # end-to-end tests before this was narrowed to native-only).
-            # That looks like a pre-existing gap in agproxy_ptrace's PID
-            # exit-event delivery, never exercised before because nothing
-            # called `wait_for_processes()` for a harness-driven engine
-            # until this hoist -- a separate investigation, not something
-            # to paper over here. Native's own persistent entrypoint
-            # process is deliberately excluded from monitoring instead
-            # (`agSandbox.release_daemon()`, see native.py's
-            # `launch_in_container_entrypoint`), which is what makes this
-            # safe for native specifically.
-            # [REFACTOR] Why do we wait on the host side? Check process tracking implementation
-            if ag.harness == "native":
-                agSandbox.wait_for_processes(  # [REFACTOR] Returns a message, should be inside the container.
-                    ag.sandbox,
-                    self.name,
-                    ag.terminal,
-                    ag.log,
-                    str(ag.agname),
-                    type(ag).ping_interval_s,
-                    type(ag).poll_interval_s,
-                    ag._set_ui_state,
-                )
-            if self.output_schema is not None:
-                self.output_schema.recover_outputs(result, ag.sandbox)
-        return result, updated_ctx, delta
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

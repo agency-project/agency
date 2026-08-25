@@ -508,26 +508,6 @@ def new_uds_path(prefix: str) -> str:
     return path
 
 
-def reserve_uds_path(current: "str | None", prefix: str) -> str:
-    """The path a service should bind: its previously-reserved one if it has
-    one, otherwise a fresh path from `new_uds_path`.
-
-    Reusing the path across restarts is what makes recovery possible at all.
-    A container is told its bridge's socket name once, at launch, and neither
-    docker nor podman can change a running container's mounts -- so a
-    restarted server that minted a *new* random name would be invisible to
-    every container already pointed at the old one. Any stale file left at
-    the reserved path is removed first, since binding onto an existing socket
-    file fails outright.
-    """
-    if current:
-        from pathlib import Path
-
-        Path(current).unlink(missing_ok=True)
-        return current
-    return new_uds_path(prefix)
-
-
 def uds_listener_is_live(path: "str | None", thread) -> bool:
     """True only if *path* still exists on disk AND *thread* is still
     serving it -- the two ways a UDS listener silently stops working while

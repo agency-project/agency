@@ -51,8 +51,7 @@ class _AgAgentFields:
     checkpoint_load_timeout_s = DynamicConfigParam("agent", default=600)
     harness = DynamicConfigParam(
         "agent", default="native"
-    )  # Looked up via agharness_backend.for_config() and run through
-    # agskill.execute_harness() -- see agskill.py's _task(). "native" runs
+    )  # Looked up via agharness_backend.for_config() by AgentEngine. "native" runs
     # agency's own react loop as a persistent in-container process
     # (agharness_backends/native.py); any other value names an external
     # harness engine (claude_code/codex/opencode/grok).

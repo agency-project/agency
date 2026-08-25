@@ -1,67 +1,8 @@
-"""Claude Code backend.
+"""Claude Code harness adapter.
 
-**Implements `_run_attempt()`, not `execute()`.** Everything generic
-across every harness-driven engine -- prompt building, the structured-
-output reprompt-retry loop, session-blob bookkeeping, live per-turn
-transcript polling, building the final `(result, ctx, delta)` -- lives in
-`agharness_backends/base.py`'s shared template method now (see that
-module's docstring). This module only builds `claude`'s argv/env from
-`harness_base_url`/`launch.token`, launches it under `agProxyPtrace`
-tracing, and parses its one-line JSON result.
-
-**LLM routing, policy, and profiler hooks all collapse onto ONE bridge
-now**: `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`, `AGPOLICY_BASE_URL`/
-`AGPOLICY_TOKEN`, and `AGPROF_BASE_URL`/`AGPROF_TOKEN` are all just
-`harness_base_url`/`launch.token` now -- `agmanager_harness` already
-serves `/v1/messages` (Anthropic Messages, translated to chat-completions
-and dispatched through `agmanager_host`), `/agpolicy/check_tool`, and
-`/agprof/hook` on that SAME process. This replaces four separate old
-bridges (`agllm_terminus`+`agproxy_llm`/`agproxy_llm_in_container` for LLM
-routing, `agmcp_server` for MCP tools, `agprof_ingest` for profiling) with
-one. The permission-hook script (`_harness_permission_hook.py`) itself
-needed zero changes -- it already only ever spoke to
-`<base_url>/agpolicy/check_tool` and `<base_url>/agprof/hook` with a
-bearer token, exactly what `agmanager_harness` exposes.
-
-**No more MCP relay subprocess**: `--mcp-config` points directly at
-`<harness_base_url>/mcp` (`agharness.mcp_config_for()`) -- `agmanager_harness`
-itself already reverse-proxies that to `agmanager_host`'s real MCP tools
-(see that package's `mcp_proxy.py`), so the old `start_tcp_relay`/
-`stop_tcp_relay` UDS<->TCP bridge (a whole extra subprocess launched and
-torn down per call) is gone entirely.
-
-**Bare-host launches now ALSO go through `agmanager_harness`** -- run
-in-process on the host instead of inside a container (see `agharness.
-ensure_harness_bridge()`/`agmanager_harness.launcher.
-ensure_launched_locally()`), rather than the old host-resident `agproxy_llm`
-gateway. `harness_base_url` is never None; `in_container` still decides
-binary resolution, config-home location, and session-blob I/O, exactly as
-before.
-
-Everything else (isolated config home, agproxy_ptrace launch + tracing,
-session continuity, output-schema recovery) is unchanged from the original
-design and was verified against the real `claude` CLI (v2.1.212) during
-development.
-
-**Test suite fallout, not silently left broken**: every mocked test in
-`tests/harness/agharness_backends/test_claude_code.py` that
-calls `backend.execute(...)` directly (the pre-refactor signature, with no
-`host_manager`/`harness_base_url`/`launch`, mocking `get_shared_gateway`/
-`get_shared_terminus`/`get_shared_mcp_server`/`get_shared_profiler_ingest`,
-none of which this module calls anymore) now fails -- same category of
-fallout as `native.py`'s migration, and for the same reason: the test
-exercises an interface this module no longer has. The three `real_claude`-
-marked end-to-end tests additionally assert against `agllm_terminus.
-get_shared_terminus(cfg).request_log`, which this module never writes to
-either now (see `agmanager_host.llm_dispatch.LLMDispatcher.request_log`
-instead). Porting or replacing these is a necessary follow-up this pass
-does not include -- see this file's own scratchpad integration tests
-(built during the migration, not part of the real suite) for coverage of
-the NEW design instead: real ptrace-traced launch, real `/v1/messages`
-translation round-trip through `agmanager_harness`, session resume, and
-the error paths, all validated against a minimal fake `claude` binary
-stand-in (real Anthropic CLI behavior is untouched by this migration and
-not what needs re-validating)."""
+Builds the Claude CLI invocation, routes it through the sandbox daemon's
+policy-aware runtime, and normalizes its JSON result.
+"""
 
 from __future__ import annotations
 
@@ -166,9 +107,6 @@ def _write_session_blob(sandbox, in_container: bool, path: str, data: bytes) -> 
 
 
 class _ClaudeCodeBackend(agharness_backend):
-    engine_key = "claude_code"
-    uses_exact_tool_events = True
-
     _DEFAULT_BINARY = "claude"
 
     def run_daemon_attempt(

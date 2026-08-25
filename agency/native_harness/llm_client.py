@@ -7,10 +7,8 @@ and "fully standalone" the same code path with zero special-casing:
   `agmanager_harness` instance (`<bridge-base-url>/v1/chat/completions`,
   see that package's `llm_routing.py`), `api_key` is the per-launch bearer
   token. Every dispatch lands on `agmanager_host`'s `/internal/dispatch`,
-  which already records this token's running transcript on every turn --
-  the same mechanism `native.py`'s old `_LiveTranscriptPusher` already
-  polls, so live visibility falls out of this for free, no special
-  streaming-output CLI flag needed.
+  which records this token's running transcript on every turn, so live
+  visibility needs no special streaming-output CLI flag.
 - Standalone: `base_url`/`api_key` point at a real OpenAI-compatible
   provider directly.
 

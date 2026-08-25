@@ -5,7 +5,6 @@ import shutil
 from unittest.mock import MagicMock
 import pytest
 from agency.agdata import agdata
-from agency.agcontext import agcontext
 from agency.agconfig import agConfig
 from agency.agschema import agschema
 from agency.agskill import agskill
@@ -196,43 +195,6 @@ def test_system_prompt_type_names_shown_correctly():
 
 
 # ---------------------------------------------------------------------------
-# System prompt is sent but NOT stored in history
-# ---------------------------------------------------------------------------
-
-
-def test_system_prompt_prepended_to_llm_call():
-    # _build_initial_messages() is the shared, engine-agnostic method both
-    # execute_react() and every agharness_backend's execute() build their
-    # first turn from -- calling it directly tests the same contract
-    # without needing a real (or execute_react-only) loop around it.
-    s = make_skill()
-    messages, _n_before = s._build_initial_messages(agdata(x=1), agcontext(), None, None, None)
-    assert messages[0]["role"] == "system"
-    assert messages[0]["content"] == "You are a summarisation assistant."
-
-
-def test_system_prompt_not_in_returned_history():
-    s = make_skill()
-    messages, _n_before = s._build_initial_messages(agdata(x=1), agcontext(), None, None, None)
-    # The delta a caller appends back to agcontext.messages is messages[1:]
-    # (dropping the system prompt) -- see _build_initial_messages()'s own
-    # docstring on n_before/messages[n_before+1:].
-    roles = [m["role"] for m in messages[1:]]
-    assert "system" not in roles
-
-
-def test_existing_history_included_in_call():
-    s = make_skill()
-    prior = agcontext(
-        messages=[{"role": "user", "content": "prior"}, {"role": "assistant", "content": "ok"}]
-    )
-    messages, _n_before = s._build_initial_messages(agdata(x=1), prior, None, None, None)
-    # system at [0], prior messages at [1] and [2], new user at [-1]
-    assert messages[1]["content"] == "prior"
-    assert messages[-1]["role"] == "user"
-
-
-# ---------------------------------------------------------------------------
 # Tool call path
 # ---------------------------------------------------------------------------
 
@@ -259,10 +221,7 @@ def test_existing_history_included_in_call():
 
 
 def test_input_schema_missing_field_returns_error():
-    # input_schema validation is shared, engine-agnostic code
-    # (self.input_schema.validate_input(), called directly by both
-    # execute_react() and execute_harness() before any engine/backend is
-    # touched) -- testing it directly here needs no LLM/loop at all.
+    # Input schema validation is engine-agnostic, so it needs no live harness.
     s = agskill(
         name="s",
         system_prompt="",
@@ -649,191 +608,6 @@ def test_validate_input_schema_mismatch_returns_error():
     error = agschema(agdata(x=agrawstring)).validate_input(agdata())
     assert error is not None
     assert "x" in error
-
-
-# ---------------------------------------------------------------------------
-# agskill._build_initial_messages
-# ---------------------------------------------------------------------------
-
-
-def test_build_initial_messages_structure():
-    s = make_skill()
-    history = agcontext(messages=[{"role": "user", "content": "prior"}])
-    msgs, n_before = s._build_initial_messages(agdata(q="hi"), history, None, None, None)
-    assert msgs[0]["role"] == "system"
-    assert msgs[1]["content"] == "prior"
-    assert msgs[-1]["role"] == "user"
-    assert n_before == 1
-
-
-def test_build_initial_messages_fires_live_fn():
-    s = make_skill()
-    live_calls = []
-    s._build_initial_messages(agdata(), agcontext(), None, lambda m: live_calls.append(m), None)
-    assert len(live_calls) == 1
-
-
-def test_build_initial_messages_fires_full_history_fn():
-    s = make_skill()
-    history_items = []
-    s._build_initial_messages(
-        agdata(q="test"), agcontext(), None, None, lambda m: history_items.append(m["role"])
-    )
-    assert "system" in history_items
-    assert "user" in history_items
-
-
-# ---------------------------------------------------------------------------
-# run() — sandbox process monitoring
-# ---------------------------------------------------------------------------
-
-
-# test_run_continues_loop_when_sandbox_has_live_pids /
-# test_run_injects_process_completed_message / test_run_clean_sandbox_returns_immediately
-# were retired here: they tested execute_react()'s specific "loop back and
-# reprompt the model" behavior when agSandbox.wait_for_processes()/
-# get_live_pids() finds pending background work after a final answer --
-# retired along with the per-tool-call hibernate model itself (Phase 1).
-# execute_harness() now calls wait_for_processes() once, non-looping, for
-# native only (see that method's own comment) -- there is no equivalent
-# "reprompt and continue in the same call" behavior to test for any engine
-# today.
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# run() — thinking extraction from stream
-# ---------------------------------------------------------------------------
-
-
-# test_run_extracts_thinking_from_think_tag was retired here, not ported:
-# it tested agllm.py's own <think>-tag stripping (build_assistant_msg's
-# `_thinking` extraction) around execute_react()'s streaming reassembly.
-# Native's own reassembly (_native_in_container_entrypoint.py's
-# _dispatch_via_terminus) does no such stripping today -- a genuine
-# behavior gap, not a like-for-like port; noted in native.py's own
-# "Known gaps" docstring section rather than silently dropped.
-
-# test_run_returns_token_counts was retired here: covered fast, for native,
-# by tests/harness/agharness_backends/test_native_loop_fast.py's
-# test_token_usage_is_tracked (proving _run_react_loop()'s response usage
-# is real, accumulated per-dispatch data, not an execute_react()-only
-# concern anymore).
-
-
-# ---------------------------------------------------------------------------
-# run() defensively copies skill_input before mutating it
-# ---------------------------------------------------------------------------
-#
-# prepare_inputs_in_sandbox() (called from execute_react(), itself called from
-# run()'s _task()) mutates its skill_input argument in place -- offloaded
-# agtype/oversized fields get overwritten with a sandbox path reference. If a
-# caller hands the *same* agdata object to more than one concurrently-running
-# agent.run() call (a real pattern: fanning one shared input out to several
-# agents, e.g. autoresearch's ClassificationTeam.run()), those calls race on
-# that shared mutation -- whichever run finishes its offload last clobbers the
-# field with its own path, leaving every other run trying to read a file that
-# only exists in that one run's own sandbox. _task() must give each run its
-# own private copy from the moment it starts, regardless of what the caller
-# does with the object it passed in.
-
-
-@docker
-def test_run_does_not_mutate_callers_shared_input_object():
-    """Regression test: run() must not mutate the skill_input object the
-    caller passed in -- prepare_inputs_in_sandbox()'s offload rewrite must
-    land on a private copy, not the caller's own object."""
-    from agency.agschema import agSchemaConfig
-    from agency.sandbox import agSandboxBackendConfig
-
-    # Force the docker sandbox backend: sandbox' "auto" selection
-    # prefers podman over docker when both are usable, but CI's
-    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
-    # podman has no local image and would try (and fail) to pull one.
-    cfg = agConfig(
-        agSchemaConfig(input_offload_chars=10),
-        agSandboxBackendConfig(backend="docker"),
-        {"agllm_backend": LLM_CONFIG},
-    )
-    s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
-
-    def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
-        s.input_schema.prepare_inputs_in_sandbox(
-            skill_input,
-            ag.sandbox,
-            s.name,
-            context_limit=ag.llm.context_limit,
-            agconfig=ag.agconfig,
-        )
-        return agdata(answer=skill_input.text), prev_ctx, []
-
-    s.execute_harness = fake_execute_react
-
-    shared_input = agdata(text="x" * 100)
-    ag = _agent_cls(agconfig=cfg)
-    try:
-        result = ag.run(s, shared_input)
-        assert "saved to" in result.answer  # this run's own copy WAS offloaded
-        assert shared_input.text == "x" * 100  # the caller's object was not
-    finally:
-        if ag.sandbox is not None:
-            ag.sandbox.destroy()
-
-
-@docker
-def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
-    """Two agents' run() calls sharing one input agdata (the exact
-    ClassificationTeam.run() pattern) must each read back their own
-    offloaded file, not race on the shared object's mutation."""
-    from agency.agschema import agSchemaConfig
-    from agency.sandbox import agSandboxBackendConfig
-
-    # Force the docker sandbox backend: sandbox' "auto" selection
-    # prefers podman over docker when both are usable, but CI's
-    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
-    # podman has no local image and would try (and fail) to pull one.
-    cfg = agConfig(
-        agSchemaConfig(input_offload_chars=10),
-        agSandboxBackendConfig(backend="docker"),
-        {"agllm_backend": LLM_CONFIG},
-    )
-    s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
-
-    def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
-        s.input_schema.prepare_inputs_in_sandbox(
-            skill_input,
-            ag.sandbox,
-            s.name,
-            context_limit=ag.llm.context_limit,
-            agconfig=ag.agconfig,
-        )
-        from agency.tools.read import make_read
-
-        path = skill_input.text.split("saved to ")[1].split(" —")[0]
-        r = make_read(ag.sandbox).fn(agdata(file_path=path))
-        return agdata(answer=r.content), prev_ctx, []
-
-    s.execute_harness = fake_execute_react
-
-    shared_input = agdata(text="x" * 100)
-    agents = [_agent_cls(agconfig=cfg) for _ in range(2)]
-    try:
-        pending = [a.run(s, shared_input) for a in agents]
-        for p in pending:
-            assert "x" * 100 in p.answer
-        assert shared_input.text == "x" * 100
-    finally:
-        for a in agents:
-            if a.sandbox is not None:
-                a.sandbox.destroy()
-
-
-# plan_mode / replace_tools were removed from agskill entirely in this
-# refactor (see agency/agskill.py) -- add_tools was renamed to
-# add_host_mcp_tools and now only extends the default host_mcp_tools set,
-# never replaces it, so there is no "replace"/"plan_mode suppresses tools"
-# concept left to test. See test_add_host_mcp_tools_extends_the_defaults
-# and test_host_mcp_tools_defaults_to_the_default_set below for the current
-# equivalent coverage.
 
 
 # ---------------------------------------------------------------------------

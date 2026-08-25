@@ -1060,9 +1060,7 @@ class _ContainerBackendBase(agsandbox_backend):
         agprof.container_started(label, cgroup_dir, daemon_dir, daemon_kind)
 
     def _snapshot_pids_started(self) -> set[int]:
-        """Same PID listing as base._snapshot_pids(), routed through
-        _container_exec_started() instead of _container_exec() -- see that
-        method's docstring for why this is required here."""
+        """List live PIDs through `_container_exec_started()` while starting."""
         out, _ = self._container_exec_started(
             "__SELF=$$\n"
             "for __d in /proc/[0-9]*; do\n"

@@ -102,11 +102,7 @@ _cg_registry: "dict[str, str]" = {}  # label (agname) -> cgroup dir
 _daemon_cg: "dict[str, str]" = {}  # cgroup dir -> agg kind ("conmon"/"dockerd")
 _cg_lock = threading.Lock()
 
-# Pseudo thread-id lane for spans reconstructed after the fact (e.g.
-# agprof_derive's terminus-transcript-diffed turn/tool boundaries) rather
-# than measured live on a calling thread. Negative and out of range of any
-# real `threading.get_native_id()` value, so it never collides with a real
-# thread lane in the summary or the Perfetto trace.
+# Pseudo thread-id lane for spans observed outside a local calling thread.
 _DERIVED_TID = -1
 
 
@@ -666,10 +662,9 @@ def start_external_span(
 ) -> "_ObservedSpan | None":
     """Open a host-owned span whose interval is ended by a later callback.
 
-    This is the live counterpart to :func:`record_derived_span`: it is for
-    ptrace process lifecycles and remotely reported starts where shutdown may
-    happen before a matching end arrives.  Open handles participate in
-    agprof's normal interruption accounting.  The caller may safely call
+    It is used for ptrace process lifecycles and remotely reported starts where
+    shutdown may happen before a matching end arrives. Open handles participate
+    in agprof's normal interruption accounting. The caller may safely call
     ``handle.update(...)`` and ``handle.end(...)`` from unrelated threads.
     """
     # Registration and the session-state check are one transaction with
@@ -741,95 +736,6 @@ def cancel_external_span(external_span: "_ObservedSpan | None") -> None:
                 return
             external_span._ended = True
             external_span._cancelled = True
-
-
-def record_derived_span(
-    name: str,
-    *,
-    start_perf_ns: int,
-    end_perf_ns: int,
-    start_wall_ns: int,
-    end_wall_ns: int,
-    metadata: "dict | None" = None,
-    parent_context=None,
-) -> None:
-    """Append a span for an interval reconstructed after the fact — e.g.
-    agprof_derive's terminus-transcript-diffed turn/tool boundaries — rather
-    than measured live on a calling thread via ``span()``'s enter/exit.
-
-    No thread ever executed on the interval as far as this process can see,
-    so there is nothing to attribute ``cpu_ns``/``runqueue_ms`` to; both stay
-    absent rather than reported as zero (a busy interval and an unmeasured
-    one must not render identically). It uses *parent_context* when the
-    correlation registry resolved one; otherwise it is explicitly parentless
-    rather than adopting whatever span happens to be ambient in the terminus
-    request thread. No-op when profiling is off.
-
-    *start_perf_ns*/*end_perf_ns* must be ``time.perf_counter_ns()`` values
-    (agprof's internal clock, see ``_records``' docstring); *start_wall_ns*/
-    *end_wall_ns* the corresponding ``time.time_ns()`` values, for the OTel
-    span's own timestamps.
-    """
-    s = _session
-    if s is None:
-        return
-    metadata = dict(metadata or {})
-    metadata.setdefault("timing", "derived")
-    if parent_context is None:
-        from opentelemetry.context import Context
-
-        parent_context = Context()
-    span = s.tracer.start_span(name, context=parent_context, start_time=start_wall_ns)
-    for key, value in metadata.items():
-        span.set_attribute(key, _otel_attribute(value))
-    span.end(end_time=end_wall_ns)
-    span_context = span.get_span_context()
-    parent = span.parent
-    _records.append(
-        (
-            _DERIVED_TID,
-            name,
-            start_perf_ns,
-            max(0, end_perf_ns - start_perf_ns),
-            None,
-            None,
-            metadata,
-            span_context.span_id if span_context is not None else None,
-            parent.span_id if parent is not None else None,
-        )
-    )
-
-
-def ingest_remote_span(
-    name: str,
-    *,
-    start_perf_ns: int,
-    end_perf_ns: int,
-    start_wall_ns: int,
-    end_wall_ns: int,
-    metadata: "dict | None" = None,
-    parent_context=None,
-    source: str = "container_asserted",
-) -> None:
-    """Mint a host-owned span from a timestamp pair asserted remotely.
-
-    Remote code reports neutral timing facts; it never constructs an OTel
-    span itself.  Stamping provenance here means a container cannot make an
-    asserted interval look like a host-observed one.  CPU and run-queue time
-    remain unmeasured, as with other reconstructed intervals.
-    """
-    attributes = dict(metadata or {})
-    attributes["timing"] = "exact"
-    attributes["provenance"] = source
-    record_derived_span(
-        name,
-        start_perf_ns=start_perf_ns,
-        end_perf_ns=end_perf_ns,
-        start_wall_ns=start_wall_ns,
-        end_wall_ns=end_wall_ns,
-        metadata=attributes,
-        parent_context=parent_context,
-    )
 
 
 def _unpack_record(record) -> tuple:
@@ -1564,10 +1470,8 @@ def _build_summary(records) -> "dict[str, dict]":
         )
         row["calls"] += 1
         row["wall_ms"] += wall / 1e6
-        # cpu is None for spans reconstructed after the fact (see
-        # record_derived_span) -- nothing executed on a thread this process
-        # observed, so there is no cpu/blocked split to contribute; leave
-        # those totals as whatever the record's own live spans measured.
+        # Some externally observed spans have no local CPU measurement, so
+        # they contribute wall time but no CPU/blocked split.
         if cpu is not None:
             row["cpu_ms"] += cpu / 1e6
             rq = runq or 0

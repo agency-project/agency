@@ -107,9 +107,6 @@ class McpToolset:
                 schemas.append(schema)
         return schemas
 
-    def has_tool(self, tool_name: str) -> bool:
-        return tool_name in self._tool_owner
-
     def call(self, tool_name: str, arguments_json: str) -> str:
         try:
             arguments = json.loads(arguments_json) if arguments_json else {}

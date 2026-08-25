@@ -29,11 +29,7 @@ _AGENCY_ROOT = _REPO_ROOT / "agency"
 # (repository-relative path, lexical class/function scope); counts distinguish
 # multiple reviewed calls in one scope without relying on brittle line numbers.
 _BARE_THREAD_ALLOWLIST = {
-    # Harness transcript/service plumbing.
-    (
-        "agency/harness/adapters/base.py",
-        "agharness_backend.execute",
-    ): (1, "transcript polling"),
+    # Harness service plumbing.
     (
         "agency/harness/daemon.py",
         "_HarnessApiServer.start",
@@ -55,37 +51,11 @@ _BARE_THREAD_ALLOWLIST = {
         "agency/harness/ptrace/_tracer_loop.py",
         "TracerLoop._fork_and_exec",
     ): (2, "subprocess pipe readers"),
-    # Retained legacy relay modules are still shipped, but their raw threads
-    # are transport/pipe plumbing rather than task work.
-    (
-        "agency/harness/old_ptrace/_in_container_entrypoint.py",
-        "_Tracer.run",
-    ): (2, "legacy subprocess pipe readers"),
-    (
-        "agency/harness/old_ptrace/_in_container_launcher.py",
-        "InContainerRelay.start",
-    ): (2, "legacy relay plumbing"),
-    (
-        "agency/harness/old_ptrace/_in_container_launcher.py",
-        "InContainerRelay._drain_diagnostics",
-    ): (2, "legacy subprocess pipe readers"),
-    (
-        "agency/harness/old_ptrace/_tcp_to_uds_relay.py",
-        "_handle_connection",
-    ): (2, "legacy socket pumps"),
-    (
-        "agency/harness/old_ptrace/_tcp_to_uds_relay.py",
-        "main",
-    ): (1, "legacy connection dispatcher"),
     # General background I/O and UI maintenance.
     ("agency/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
     ("agency/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
     ("agency/agwebui/emitter.py", "agwebui_emitter.emit"): (1, "event pruning"),
     ("agency/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),
-    (
-        "agency/profiler/agprof_emit.py",
-        "RemoteProfilerEmitter.__init__",
-    ): (1, "bounded telemetry sender"),
     ("agency/tools/human.py", "ask_human_and_wait"): (1, "stdin reader"),
 }
 

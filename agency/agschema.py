@@ -320,17 +320,11 @@ class agschema:
         """Validate and recover a harness's single raw final-answer text
         against this schema, in one call.
 
-        The native ReAct loop collects structured output incrementally,
-        one field at a time, through per-field `return_<field>` tool calls
-        (`make_return_output_agtool`/`make_field_handler` above) --
-        `agskill.execute_harness()`'s harness path instead gets one raw
-        text blob back and needs the whole-schema equivalent of that
-        validation + recovery in a single step, which didn't exist as a
-        single entry point before this method: this is pure composition of
+        Harness adapters return one raw text blob, so this provides the
+        whole-schema validation and recovery step as a pure composition of
         `check()` (whole-schema field presence/type validation, already
         used for input validation despite the name) and `recover_outputs()`
-        (per-agtype-field `.recover()`, already used by `execute_react()`'s
-        own success path) -- no new validation logic.
+        (per-agtype-field `.recover()`) -- no new validation logic.
 
         Returns `(data, paths)` on success (`paths` are the sandbox paths
         `recover_outputs()` produced, for parity with `execute_react()`'s

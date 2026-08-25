@@ -26,9 +26,7 @@ Output: a single JSON object on stdout, `{"result", "usage", "session_id"}`
 `claude_code.py`'s `_parse_result_json` already parses. No streaming
 output format: live per-turn visibility, when bridged, comes from agency
 polling `agmanager_host`'s own live transcript for this run's token (the
-same mechanism the old `native.py`'s `_LiveTranscriptPusher` already used),
-not from anything this CLI prints -- see the conversation this package
-came out of for why that's sufficient and no new output mode was built."""
+same transcript used by the host UI), not from anything this CLI prints."""
 
 from __future__ import annotations
 
