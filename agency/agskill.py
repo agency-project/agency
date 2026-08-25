@@ -507,6 +507,7 @@ class agskill:
                     skill=self,
                     skill_input=local_skill_input,
                     resource_pool=type(ag).agresource_pool,
+                    sandbox=ag.sandbox,
                     max_steps=max_steps,
                 )
                 outer_result = execution.output

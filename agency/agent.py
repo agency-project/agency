@@ -529,6 +529,16 @@ class agent:
         engine. Calls on the same agent are serialized via the context
         future chain.
         """
+        if self.sandbox is None:
+            sandbox_config = self.agconfig
+            agent_output_dir = self.output_path
+            if agent_output_dir is not None:
+                sandbox_config = sandbox_config.clone() if sandbox_config else agConfig()
+                agSandboxConfig(sandbox_config).add_mount(
+                    "agent_output", agent_output_dir, "/agent_output"
+                )
+            self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
+
         if max_steps is None:
             return skill.run(self, skill_input)
         return skill.run(self, skill_input, max_steps=max_steps)

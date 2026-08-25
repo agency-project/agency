@@ -133,13 +133,12 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
 
     client = _FakeClient()
     holder["client"] = client
-    monkeypatch.setattr(
-        mod,
-        "ensure_harness_daemon",
-        lambda sandbox, host_uds_path, engine_name, agconfig: SimpleNamespace(
-            client=lambda: client
-        ),
-    )
+
+    def fake_ensure_harness_daemon(sandbox, host_uds_path, engine_name, agconfig):
+        holder["daemon_sandbox"] = sandbox
+        return SimpleNamespace(client=lambda: client)
+
+    monkeypatch.setattr(mod, "ensure_harness_daemon", fake_ensure_harness_daemon)
     return holder
 
 
@@ -246,57 +245,39 @@ def test_missing_output_fields_diffs_against_collected_output():
 # ---------------------------------------------------------------------------
 
 
-def test_execute_provisions_sandbox_before_building_host_services(monkeypatch):
-    holder = _install_fake_host_server_manager(
-        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
-    )
+def test_execute_uses_only_the_explicit_sandbox(monkeypatch):
     agent = _FakeAgent()
-    agent.agconfig = None
-    agent.sandbox = None
-    sandbox = _FakeSandbox(marker="provisioned")
-    created = []
-
-    def fake_sandbox(agname, *, agconfig):
-        created.append((agname, agconfig))
-        return sandbox
-
-    monkeypatch.setattr(mod, "agSandbox", fake_sandbox)
+    agent_sandbox = agent.sandbox
+    explicit_sandbox = _FakeSandbox(marker="explicit")
     engine = AgentEngine(agent)
     execution = ExecutionResult(output=agdata(result="done"), context=agcontext(), delta=[])
-    monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: "prompt")
-    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
-    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
 
-    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    def fake_execute_harness(*args, **_kwargs):
+        assert args[4] is explicit_sandbox
+        explicit_sandbox.events.append("execute")
+        return execution
+
+    monkeypatch.setattr(engine, "_execute_harness", fake_execute_harness)
+
+    result = engine.execute(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        explicit_sandbox,
+    )
 
     assert result is execution
-    assert created == [("test-agent", None)]
-    assert agent.sandbox is sandbox
-    assert holder["manager"].sandbox is sandbox
-
-
-def test_ensure_sandbox_preserves_agent_output_mount(monkeypatch, tmp_path):
-    monkeypatch.setattr(_FakeAgent, "output_dir", tmp_path)
-    agent = _FakeAgent()
-    agent.agconfig = None
-    agent.sandbox = None
-    captured = {}
-    sandbox = SimpleNamespace(marker="provisioned")
-
-    def fake_sandbox(agname, *, agconfig):
-        captured["agname"] = agname
-        captured["agconfig"] = agconfig
-        return sandbox
-
-    monkeypatch.setattr(mod, "agSandbox", fake_sandbox)
-
-    result = AgentEngine(agent).ensure_sandbox()
-
-    assert result is sandbox
-    assert captured["agname"] == "test-agent"
-    assert captured["agconfig"].get("agSandbox", "mounts", {}) == {
-        "agent_output": (str(tmp_path / "test-agent"), "/agent_output", "rw")
-    }
+    assert agent.sandbox is agent_sandbox
+    assert agent_sandbox.events == []
+    assert explicit_sandbox.events == [
+        "acquire",
+        "execute",
+        "commit",
+        "check_background_work",
+        "stop",
+        "release",
+    ]
 
 
 def test_execute_holds_lock_through_successful_commit_and_stop(monkeypatch):
@@ -312,7 +293,11 @@ def test_execute_holds_lock_through_successful_commit_and_stop(monkeypatch):
     monkeypatch.setattr(engine, "_execute_harness", fake_execute_harness)
 
     result = engine.execute(
-        SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        agent.sandbox,
     )
 
     assert result is execution
@@ -343,7 +328,11 @@ def test_execute_discards_failed_result_before_releasing_lock(monkeypatch):
     )
 
     result = engine.execute(
-        SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        agent.sandbox,
     )
 
     assert result is execution
@@ -362,7 +351,13 @@ def test_execute_discards_raised_exception_and_releases_lock(monkeypatch):
     monkeypatch.setattr(engine, "_execute_harness", fail)
 
     with pytest.raises(RuntimeError, match="harness failed"):
-        engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+        engine.execute(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            agent.sandbox,
+        )
 
     assert agent.sandbox.events == ["acquire", "execute", "discard", "release"]
     assert agent.sandbox._lock.held is False
@@ -376,7 +371,13 @@ def test_execute_discards_commit_failure_and_releases_lock(monkeypatch):
     monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
 
     with pytest.raises(RuntimeError, match="commit failed"):
-        engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+        engine.execute(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            agent.sandbox,
+        )
 
     assert agent.sandbox.events == [
         "acquire",
@@ -403,7 +404,13 @@ def test_execute_releases_lock_when_discard_fails(monkeypatch):
     monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
 
     with pytest.raises(RuntimeError, match="discard failed"):
-        engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+        engine.execute(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            agent.sandbox,
+        )
 
     assert agent.sandbox.events == ["acquire", "discard", "release"]
     assert agent.sandbox._lock.held is False
@@ -416,7 +423,13 @@ def test_execute_defers_stop_while_background_work_is_pending(monkeypatch):
     execution = ExecutionResult(output=agdata(done=True), context=agcontext(), delta=[])
     monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
 
-    engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+    engine.execute(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        agent.sandbox,
+    )
 
     assert agent.sandbox.events == [
         "acquire",
@@ -436,7 +449,9 @@ def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypa
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
     with pytest.raises(RuntimeError, match="launch failed"):
-        engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+        engine.execute(
+            SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+        )
     assert holder["manager"].started is True
     assert holder["manager"].stopped is True
 
@@ -451,11 +466,15 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
 
-    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(
+        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+    )
 
     manager = holder["manager"]
     assert [request.prompt for request in holder["requests"]] == ["p0"]
     assert holder["requests"][0].harness == "claude_code"
+    assert manager.sandbox is engine._agent.sandbox
+    assert holder["daemon_sandbox"] is engine._agent.sandbox
     assert manager.started is True
     assert manager.stopped is True
     assert result is execution
@@ -477,7 +496,9 @@ def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypa
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
-    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(
+        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+    )
 
     assert [request.prompt for request in holder["requests"]] == ["p0"]
     assert result is execution
@@ -506,7 +527,9 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
-    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(
+        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+    )
 
     assert [request.prompt for request in holder["requests"]] == [p0, p1]
     assert result is execution
@@ -544,7 +567,9 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=1)
 
-    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(
+        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), agent.sandbox
+    )
 
     first, second = holder["requests"]
     assert (first.resume_session_id, first.prior_session_blob_b64) == (
@@ -581,7 +606,9 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=2)
 
-    result = engine.execute(SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(
+        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+    )
 
     # 1 initial attempt + 2 retries = 3 calls total, then gives up
     assert [request.prompt for request in holder["requests"]] == [p0, retry, retry]
@@ -596,18 +623,26 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     seen = {}
     expected = ExecutionResult(output=agdata(result="done"), context=agcontext(), delta=[])
 
-    def fake_build_result(context, skill, got_attempt):
+    def fake_build_result(context, skill, got_attempt, sandbox):
         seen["context"], seen["skill"], seen["attempt"] = context, skill, got_attempt
+        seen["sandbox"] = sandbox
         return expected
 
     monkeypatch.setattr(engine, "_build_execution_result", fake_build_result)
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
     context = SimpleNamespace(marker="ctx")
 
-    result = engine.execute(context, skill, SimpleNamespace(), SimpleNamespace())
+    result = engine.execute(
+        context, skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+    )
 
     assert result is expected
-    assert seen == {"context": context, "skill": skill, "attempt": attempt}
+    assert seen == {
+        "context": context,
+        "skill": skill,
+        "attempt": attempt,
+        "sandbox": engine._agent.sandbox,
+    }
     assert holder["manager"].stopped is True
 
 
@@ -641,6 +676,7 @@ def test_build_execution_result_converts_successful_plain_text_attempt():
         context,
         skill,
         HarnessAttemptResult(ok=True, final_text="done", input_tokens=4, output_tokens=2),
+        engine._agent.sandbox,
     )
 
     assert result.ok is True
@@ -673,7 +709,31 @@ def test_build_execution_result_uses_collected_structured_output():
     )
 
     result = engine._build_execution_result(
-        agcontext(), skill, HarnessAttemptResult(ok=True, final_text="ignored")
+        agcontext(),
+        skill,
+        HarnessAttemptResult(ok=True, final_text="ignored"),
+        engine._agent.sandbox,
+    )
+
+    assert result.ok is True
+    assert result.output == agdata(summary="finished", count=2)
+
+
+def test_build_execution_result_accepts_valid_structured_json_without_mcp_calls():
+    engine = AgentEngine(_FakeAgent())
+    engine._host_server_manager = SimpleNamespace(
+        host_mcp_server=SimpleNamespace(collected_output=lambda: {})
+    )
+    skill = SimpleNamespace(
+        output_schema=agschema(agdata(summary=str, count=int)),
+        _build_system_prompt=lambda: "system",
+    )
+
+    result = engine._build_execution_result(
+        agcontext(),
+        skill,
+        HarnessAttemptResult(ok=True, final_text='{"summary": "finished", "count": 2}'),
+        engine._agent.sandbox,
     )
 
     assert result.ok is True
@@ -691,7 +751,10 @@ def test_build_execution_result_reports_incomplete_structured_output():
     )
 
     result = engine._build_execution_result(
-        agcontext(), skill, HarnessAttemptResult(ok=True, final_text="done")
+        agcontext(),
+        skill,
+        HarnessAttemptResult(ok=True, final_text="done"),
+        engine._agent.sandbox,
     )
 
     assert result.ok is False
@@ -704,9 +767,12 @@ def test_build_execution_result_converts_failed_or_missing_attempt_to_error():
     skill = SimpleNamespace(output_schema=None, _build_system_prompt=lambda: "system")
 
     failed = engine._build_execution_result(
-        agcontext(), skill, HarnessAttemptResult(ok=False, error_message="daemon failed")
+        agcontext(),
+        skill,
+        HarnessAttemptResult(ok=False, error_message="daemon failed"),
+        engine._agent.sandbox,
     )
-    missing = engine._build_execution_result(agcontext(), skill, None)
+    missing = engine._build_execution_result(agcontext(), skill, None, engine._agent.sandbox)
 
     assert failed.ok is False
     assert failed.output.error == "daemon failed"

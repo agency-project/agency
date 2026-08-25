@@ -146,9 +146,8 @@ class agSandbox(_AgSandboxFields):
         # construct multiple sandboxes -- each gets its own auto-suffixed
         # claim instead.
         self._agname = _agname.allocate_agname(f"sandbox_{agname}")
-        # Held by agskill for the full duration of a skill run so a sandbox
-        # shared across agents is never driven by more than one skill run
-        # at a time. See agskill.py's _task().
+        # AgentEngine holds this for a complete execution so two agents sharing
+        # this facade cannot interleave harness or teardown operations.
         self._lock = threading.RLock()
         self._destroyed = False
         # Cloned so this sandbox's own agconfig is independent of the
@@ -336,49 +335,61 @@ class agSandbox(_AgSandboxFields):
     # ------------------------------------------------------------------
 
     def _container_exec(self, *args, **kwargs):
-        return self._backend._container_exec(*args, **kwargs)
+        with self._lock:
+            return self._backend._container_exec(*args, **kwargs)
 
     def exec(self, *args, **kwargs):
-        with agprof.span("sandbox:exec"):
-            return self._backend.exec(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:exec"):
+                return self._backend.exec(*args, **kwargs)
 
     def exec_detached(self, *args, **kwargs) -> None:
-        return self._backend.exec_detached(*args, **kwargs)
+        with self._lock:
+            return self._backend.exec_detached(*args, **kwargs)
 
     def read_file(self, *args, **kwargs):
-        with agprof.span("sandbox:read_file"):
-            return self._backend.read_file(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:read_file"):
+                return self._backend.read_file(*args, **kwargs)
 
     def read_file_bytes(self, *args, **kwargs):
-        with agprof.span("sandbox:read_file_bytes"):
-            return self._backend.read_file_bytes(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:read_file_bytes"):
+                return self._backend.read_file_bytes(*args, **kwargs)
 
     def write_file(self, *args, **kwargs):
-        with agprof.span("sandbox:write_file"):
-            return self._backend.write_file(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:write_file"):
+                return self._backend.write_file(*args, **kwargs)
 
     def write_file_bytes(self, *args, **kwargs):
-        with agprof.span("sandbox:write_file_bytes"):
-            return self._backend.write_file_bytes(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:write_file_bytes"):
+                return self._backend.write_file_bytes(*args, **kwargs)
 
     def update_limits(self, *args, **kwargs) -> None:
-        with agprof.span("sandbox:update_limits"):
-            self._backend.update_limits(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:update_limits"):
+                self._backend.update_limits(*args, **kwargs)
 
     def commit(self, *args, **kwargs) -> bool:
-        with agprof.span("sandbox:commit"):
-            return self._backend.commit(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:commit"):
+                return self._backend.commit(*args, **kwargs)
 
     def stop(self, *args, **kwargs) -> None:
-        with agprof.span("sandbox:stop"):
-            self._backend.stop(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:stop"):
+                self._backend.stop(*args, **kwargs)
 
     def rm_container(self, *args, **kwargs) -> None:
-        with agprof.span("sandbox:rm"):
-            self._backend.rm_container(*args, **kwargs)
+        with self._lock:
+            with agprof.span("sandbox:rm"):
+                self._backend.rm_container(*args, **kwargs)
 
     def restore(self, *args, **kwargs) -> None:
-        self._backend.restore(*args, **kwargs)
+        with self._lock:
+            self._backend.restore(*args, **kwargs)
 
     def release_daemon(self, pid: int) -> None:
         self._backend.release_daemon(pid)
