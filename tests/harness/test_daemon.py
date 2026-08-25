@@ -7,7 +7,7 @@ from pathlib import Path
 from agency.agconfig import agConfig
 from agency.engine.clients import SandboxInteractionClient
 from agency.harness import daemon
-from agency.harness.adapters.base import AttemptResult, agharness_backend
+from agency.harness.adapters.base import AdapterRuntime, AttemptResult, agharness_backend
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
@@ -18,7 +18,8 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
     class FakeAdapter(agharness_backend):
         engine_key = "fake"
 
-        def _run_attempt(self, *args, **kwargs):
+        def run_daemon_attempt(self, runtime, **kwargs):
+            seen["runtime"] = runtime
             seen.update(kwargs)
             return AttemptResult(
                 ok=True,
@@ -50,6 +51,9 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
 
     assert seen["resume_session_id"] == "session-1"
     assert seen["prior_session_blob"] == b"prior session state"
+    assert isinstance(seen["runtime"], AdapterRuntime)
+    assert seen["runtime"].engine_name == "agent-1"
+    assert seen["runtime"].model == "model"
     assert result.session_id == "session-2"
     assert base64.b64decode(result.session_blob_b64) == b"updated session state"
 

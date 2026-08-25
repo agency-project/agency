@@ -25,7 +25,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
     """
     real_execute = AgentEngine.execute
 
-    def execute(self, *, context, skill, skill_input, resource_pool, max_steps=None):
+    def execute(self, *, context, skill, skill_input, resource_pool, sandbox, max_steps=None):
         stub = getattr(skill, "_test_execute", None)
         if stub is None:
             return real_execute(
@@ -34,6 +34,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
                 skill=skill,
                 skill_input=skill_input,
                 resource_pool=resource_pool,
+                sandbox=sandbox,
                 max_steps=max_steps,
             )
         output, updated_context, delta = stub(
@@ -113,7 +114,12 @@ def _llm_agconfig(d: dict) -> agConfig:
 
 
 def make_agent() -> agent:
-    return agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}))
+    sandbox = MagicMock()
+    sandbox._lock = threading.RLock()
+    return agent(
+        agconfig=_llm_agconfig({"api_key": "k", "model": ""}),
+        sandbox=sandbox,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +156,58 @@ def test_run_calls_named_agskill():
     result = ag.run(skill, agdata(task="go"))
     assert result.done is True  # blocks until done
     assert called == [{"task": "go"}]
+
+
+def test_run_retains_and_reuses_injected_sandbox():
+    supplied_sandbox = MagicMock()
+    seen = []
+
+    class FakeSkill:
+        def run(self, ag, skill_input, max_steps=None):
+            seen.append(ag.sandbox)
+            return agdata(done=True)
+
+    ag = agent(
+        agconfig=_llm_agconfig({"api_key": "k", "model": ""}),
+        sandbox=supplied_sandbox,
+    )
+
+    ag.run(FakeSkill(), agdata())
+    ag.run(FakeSkill(), agdata())
+
+    assert ag.sandbox is supplied_sandbox
+    assert seen == [supplied_sandbox, supplied_sandbox]
+
+
+def test_run_creates_sandbox_facade_with_output_mount(monkeypatch, tmp_path):
+    import importlib
+
+    created = []
+    facade = MagicMock()
+
+    def fake_sandbox(agname, *, agconfig):
+        created.append((agname, agconfig))
+        return facade
+
+    class FakeSkill:
+        def run(self, ag, skill_input, max_steps=None):
+            return agdata(done=True)
+
+    agent_module = importlib.import_module("agency.agent")
+    monkeypatch.setattr(agent_module, "agSandbox", fake_sandbox)
+    monkeypatch.setattr(agent, "output_dir", tmp_path)
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}))
+
+    result = ag.run(FakeSkill(), agdata())
+
+    assert result.done is True
+    assert ag.sandbox is facade
+    assert len(created) == 1
+    agname, sandbox_config = created[0]
+    assert agname == ag.agname
+    assert sandbox_config.get("agSandbox", "mounts", {}) == {
+        "agent_output": (str(tmp_path / ag.agname), "/agent_output", "rw")
+    }
 
 
 def test_repr():
@@ -212,6 +270,7 @@ def test_run_dispatches_to_agent_engine(harness_name):
     assert len(calls) == 1
     assert calls[0]["skill"] is skill
     assert calls[0]["skill_input"].to_dict() == {"task": "go"}
+    assert calls[0]["sandbox"] is sandbox
     assert calls[0]["max_steps"] == 7
 
 

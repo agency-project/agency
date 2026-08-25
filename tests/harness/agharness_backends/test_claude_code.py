@@ -22,7 +22,6 @@ suite doesn't require real API access to run.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,6 +35,7 @@ from agency.harness.adapters.claude_code import (
     _ClaudeCodeBackend,
     claude_code_available,
 )
+from agency.harness.adapters.base import AdapterRuntime
 from agency.agskill import agskill
 
 
@@ -76,13 +76,17 @@ def _run_attempt(
     resume_session_id=None,
     prior_session_blob=None,
 ):
-    skill = agskill(name="s", system_prompt="do the thing")
-    return backend._run_attempt(
-        ag,
-        None,
-        harness_base_url,
-        SimpleNamespace(token=token),
-        skill,
+    runtime = AdapterRuntime(
+        agconfig=ag.agconfig,
+        model=ag.llm.backend.model,
+        engine_name=ag.agname,
+        harness_base_url=harness_base_url,
+        token=token,
+        syscall_policy=MagicMock(),
+        sandbox=ag.sandbox,
+    )
+    return backend.run_daemon_attempt(
+        runtime,
         prompt=prompt,
         resume_session_id=resume_session_id,
         prior_session_blob=prior_session_blob,

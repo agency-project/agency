@@ -1,5 +1,8 @@
 """Tests for aglog — automatic skill call logging on agent."""
 
+import threading
+from unittest.mock import MagicMock
+
 import pytest
 from agency.agdata import agdata
 from agency.agskill import agskill
@@ -15,7 +18,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
     """Exercise logging through the current AgentEngine dispatch seam."""
     real_execute = AgentEngine.execute
 
-    def execute(self, *, context, skill, skill_input, resource_pool, max_steps=None):
+    def execute(self, *, context, skill, skill_input, resource_pool, sandbox, max_steps=None):
         stub = getattr(skill, "_test_execute", None)
         if stub is None:
             return real_execute(
@@ -24,6 +27,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
                 skill=skill,
                 skill_input=skill_input,
                 resource_pool=resource_pool,
+                sandbox=sandbox,
                 max_steps=max_steps,
             )
         output, updated_context, delta = stub(
@@ -39,7 +43,9 @@ def make_agent(tools=None) -> agent:
     if tools is not None:
         kwargs["tools"] = tools
     cfg = agConfig({"agllm_backend": {"api_key": "k", "model": "m"}})
-    return agent(agconfig=cfg, **kwargs)
+    sandbox = MagicMock()
+    sandbox._lock = threading.RLock()
+    return agent(agconfig=cfg, sandbox=sandbox, **kwargs)
 
 
 def make_skill(name: str = "s", out: dict | None = None):

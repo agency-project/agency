@@ -89,6 +89,70 @@ def _agconfig_with_output_dir(output_dir):
     return cfg
 
 
+def test_facade_construction_does_not_start_backend():
+    from agency.agconfig import agConfig
+    from agency.sandbox.agsandbox import agSandbox
+
+    backend = MagicMock()
+    with patch(
+        "agency.sandbox.agsandbox.agsandbox_backend.for_config",
+        return_value=backend,
+    ):
+        sandbox = agSandbox(str(uuid.uuid4()), agconfig=agConfig())
+
+    try:
+        backend._ensure_started.assert_not_called()
+        backend.exec.assert_not_called()
+    finally:
+        sandbox.destroy()
+
+
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [
+        ("exec", ("true",)),
+        ("exec_detached", ("true",)),
+        ("read_file", ("/workspace/file.txt",)),
+        ("write_file", ("/workspace/file.txt", "content")),
+        ("commit", ()),
+        ("stop", ()),
+    ],
+)
+def test_public_facade_operation_uses_shared_lock(operation, args):
+    from agency.sandbox.agsandbox import agSandbox
+
+    sandbox = agSandbox.__new__(agSandbox)
+    sandbox._agname = "lock-test"
+    sandbox._destroyed = True
+    sandbox._lock = threading.RLock()
+    sandbox._backend = MagicMock()
+
+    attempted = threading.Event()
+    entered_backend = threading.Event()
+    errors = []
+    getattr(sandbox._backend, operation).side_effect = lambda *_args, **_kwargs: (
+        entered_backend.set()
+    )
+
+    def call_operation():
+        attempted.set()
+        try:
+            getattr(sandbox, operation)(*args)
+        except Exception as exc:
+            errors.append(exc)
+
+    with sandbox._lock:
+        worker = threading.Thread(target=call_operation)
+        worker.start()
+        assert attempted.wait(timeout=1)
+        assert not entered_backend.wait(timeout=0.05)
+
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert entered_backend.is_set()
+    assert errors == []
+
+
 # ---------------------------------------------------------------------------
 # detect_gpus
 # ---------------------------------------------------------------------------
