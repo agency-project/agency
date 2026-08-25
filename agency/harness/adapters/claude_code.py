@@ -70,14 +70,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-from .base import AttemptResult, agharness_backend
-
-if TYPE_CHECKING:
-    from ...agent import agent
-    from ...agskill import agskill
-    from ...manager.agmanager_host import agHostAgentManager, LaunchHandle
+from .base import AdapterRuntime, AttemptResult, agharness_backend
 
 
 def claude_code_available() -> bool:
@@ -178,13 +171,9 @@ class _ClaudeCodeBackend(agharness_backend):
 
     _DEFAULT_BINARY = "claude"
 
-    def _run_attempt(
+    def run_daemon_attempt(
         self,
-        ag: "agent",
-        host_manager: "agHostAgentManager",
-        harness_base_url: "str | None",
-        launch: "LaunchHandle",
-        skill: "agskill",
+        runtime: AdapterRuntime,
         *,
         prompt: str,
         resume_session_id: "str | None",
@@ -202,10 +191,16 @@ class _ClaudeCodeBackend(agharness_backend):
         # in the same workspace the rest of that agent's tools see), a
         # chroot-backed (or no) sandbox keeps the existing bare-host launch
         # -- the jail already IS a real host directory, nothing to bridge.
-        in_container = agharness.is_container_backed(ag.sandbox)
+        if runtime.suppress_builtin_tools:
+            return AttemptResult(
+                ok=False,
+                error_message="claude_code does not support replace_tools=[] in daemon mode",
+            )
+
+        in_container = agharness.is_container_backed(runtime.sandbox)
 
         if in_container:
-            resolved = _resolve_binary_in_container(ag.sandbox, binary)
+            resolved = _resolve_binary_in_container(runtime.sandbox, binary)
         else:
             resolved = shutil.which(binary)
         if resolved is None:
@@ -222,15 +217,17 @@ class _ClaudeCodeBackend(agharness_backend):
 
         if in_container:
             config_home = agharness.materialize_config_home_in_container(
-                ag, ag.sandbox, launch.token
+                runtime.engine_name, runtime.sandbox, runtime.token
             )
         else:
-            config_home = agharness.materialize_config_home(ag, launch.token, harness_base_url)
+            config_home = agharness.materialize_config_home(
+                runtime.engine_name, runtime.token, runtime.harness_base_url
+            )
 
         try:
             if resume_session_id and prior_session_blob is not None:
                 _write_session_blob(
-                    ag.sandbox,
+                    runtime.sandbox,
                     in_container,
                     _session_path(str(config_home), resume_session_id),
                     prior_session_blob,
@@ -249,7 +246,7 @@ class _ClaudeCodeBackend(agharness_backend):
             hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
             hook_path = f"{config_home}/agpolicy_hook.py"
             if in_container:
-                ag.sandbox.write_file_bytes(hook_path, hook_src)
+                runtime.sandbox.write_file_bytes(hook_path, hook_src)
             else:
                 Path(hook_path).write_bytes(hook_src)
             hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
@@ -271,7 +268,9 @@ class _ClaudeCodeBackend(agharness_backend):
             # with the isolated config_home/cwd (no `.mcp.json` lives
             # there) but cheap, explicit insurance against ever silently
             # inheriting some other server.
-            mcp_config = json.dumps(agharness.mcp_config_for(harness_base_url, launch.token))
+            mcp_config = json.dumps(
+                agharness.mcp_config_for(runtime.harness_base_url, runtime.token)
+            )
 
             envp = {
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -285,15 +284,15 @@ class _ClaudeCodeBackend(agharness_backend):
                 # claude-driven agent's LLM calls must go through this
                 # agent's own configured agConfig backend, not whatever
                 # this host happens to have lying around.
-                "ANTHROPIC_BASE_URL": harness_base_url,
-                "ANTHROPIC_AUTH_TOKEN": launch.token,
+                "ANTHROPIC_BASE_URL": runtime.harness_base_url,
+                "ANTHROPIC_AUTH_TOKEN": runtime.token,
                 # Lets agpolicy_hook.py (registered above as the
                 # PreToolUse hook) reach agmanager_harness's own
                 # /agpolicy/check_tool route -- same base_url/token as the
                 # LLM traffic above, since it's the same process and the
                 # same per-run bearer token identifies the same agent.
-                "AGPOLICY_BASE_URL": harness_base_url,
-                "AGPOLICY_TOKEN": launch.token,
+                "AGPOLICY_BASE_URL": runtime.harness_base_url,
+                "AGPOLICY_TOKEN": runtime.token,
                 # Also explicitly unset so the CLI can't fall back to a
                 # locally-configured Bedrock/API-key credential path.
                 "CLAUDE_CODE_USE_BEDROCK": "0",
@@ -313,8 +312,8 @@ class _ClaudeCodeBackend(agharness_backend):
             if profile_hook_events:
                 # Off-path stays free when profiling is disabled: without
                 # these variables the shared hook skips its profiler POST.
-                envp["AGPROF_BASE_URL"] = harness_base_url
-                envp["AGPROF_TOKEN"] = launch.token
+                envp["AGPROF_BASE_URL"] = runtime.harness_base_url
+                envp["AGPROF_TOKEN"] = runtime.token
             if in_container:
                 # Deliberately does NOT forward the host's HOME: it points
                 # to a path that's meaningless (or, worse, coincidentally
@@ -341,8 +340,7 @@ class _ClaudeCodeBackend(agharness_backend):
                 if "HOME" in os.environ:
                     envp["HOME"] = os.environ["HOME"]
 
-            px = agProxyPtrace(ag.agconfig)
-            policy = agharness.default_policy(ag)
+            px = agProxyPtrace(runtime.agconfig)
 
             argv = [
                 resolved,
@@ -365,8 +363,8 @@ class _ClaudeCodeBackend(agharness_backend):
                 argv,
                 envp,
                 cwd=str(config_home),
-                policy=policy,
-                ag=ag,
+                policy=runtime.syscall_policy,
+                ag=None,
             )
 
             stdout, stderr, rc = handle.wait(timeout=_DEFAULT_TIMEOUT_S)
@@ -385,7 +383,9 @@ class _ClaudeCodeBackend(agharness_backend):
             if session_id:
                 try:
                     session_blob = _read_session_blob(
-                        ag.sandbox, in_container, _session_path(str(config_home), session_id)
+                        runtime.sandbox,
+                        in_container,
+                        _session_path(str(config_home), session_id),
                     )
                 except Exception:  # noqa: S110 - session persistence is best-effort
                     session_blob = None
@@ -400,7 +400,7 @@ class _ClaudeCodeBackend(agharness_backend):
             )
         finally:
             if in_container:
-                agharness.cleanup_config_home_in_container(ag.sandbox, config_home)
+                agharness.cleanup_config_home_in_container(runtime.sandbox, config_home)
             else:
                 agharness.cleanup_config_home(config_home)
 

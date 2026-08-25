@@ -23,16 +23,7 @@ from __future__ import annotations
 
 import json
 import shutil
-import uuid
-from typing import TYPE_CHECKING
-
-from ...agdata import agdata, agerror
-from .base import agharness_backend
-
-if TYPE_CHECKING:
-    from ...agent import agent
-    from ...agcontext import agcontext
-    from ...agskill import agskill
+from .base import AdapterRuntime, AttemptResult, agharness_backend
 
 
 def opencode_available() -> bool:
@@ -44,52 +35,41 @@ class _OpencodeBackend(agharness_backend):
     _PROVIDER_NAME = "agency-proxy"
     _DEFAULT_TIMEOUT_S = 600
 
-    def execute(
+    def run_daemon_attempt(
         self,
-        ag: "agent",
-        prev_ctx: "agcontext",
-        skill_input: agdata,
-        max_steps: "int | None",
+        runtime: AdapterRuntime,
         *,
-        skill: "agskill",
-        extra_system: "str | None" = None,
-        # Not migrated yet -- see base.py's execute() docstring; this
-        # backend still constructs its own get_shared_gateway()/
-        # get_shared_profiler_ingest() bridges below, the old way.
-        host_manager=None,
-        harness_base_url: "str | None" = None,
-        launch=None,
-    ) -> "tuple[agdata, agcontext, list[dict]]":
+        prompt: str,
+        resume_session_id: "str | None",
+        prior_session_blob: "bytes | None",
+        max_steps: "int | None",
+    ) -> AttemptResult:
         from .. import agharness
-        from ..agproxy_llm import get_shared_gateway
         from ..ptrace.supervisor import agProxyPtrace
 
-        sys_msg = {"role": "system", "content": skill._build_system_prompt(extra_system)}
+        if runtime.suppress_builtin_tools:
+            return AttemptResult(
+                ok=False,
+                error_message="opencode does not support replace_tools=[] in daemon mode",
+            )
 
         binary = self.binary_path or self._DEFAULT_BINARY
         resolved = shutil.which(binary)
         if resolved is None:
-            return agerror(f"opencode binary {binary!r} not found on PATH"), prev_ctx, [sys_msg]
+            return AttemptResult(
+                ok=False, error_message=f"opencode binary {binary!r} not found on PATH"
+            )
 
-        gateway = get_shared_gateway(ag.agconfig)
-        from ..agprof_ingest import get_shared_profiler_ingest
-
-        profiler_ingest = get_shared_profiler_ingest()
-        token = uuid.uuid4().hex
-        gateway.register(token, ag)
-        profiler_ingest.register(token, ag)
-
-        config_home = agharness.materialize_config_home(ag, token, gateway.base_url)
+        config_home = agharness.materialize_config_home(
+            runtime.engine_name, runtime.token, runtime.harness_base_url
+        )
         try:
-            model = getattr(ag.llm.backend, "model", "") or "default"
-            self._write_opencode_config(config_home, gateway.base_url, token, model)
-
-            prompt = agharness.build_user_turn_prompt(skill, skill_input)
-            if not isinstance(prompt, str):
-                prompt = json.dumps(prompt)
-            extra = agharness.build_output_format_instruction(skill)
-            if extra:
-                prompt = prompt + extra
+            self._write_opencode_config(
+                config_home,
+                runtime.harness_base_url,
+                runtime.token,
+                runtime.model or "default",
+            )
 
             argv = [resolved, "run", "--format", "json", prompt]
             envp = {
@@ -98,34 +78,26 @@ class _OpencodeBackend(agharness_backend):
                 "OPENCODE_CONFIG": str(config_home / "opencode.json"),
             }
 
-            px = agProxyPtrace(ag.agconfig)
-            policy = agharness.default_policy(ag)
-            handle = px.launch(argv, envp, cwd=str(config_home), policy=policy, ag=ag)
+            px = agProxyPtrace(runtime.agconfig)
+            handle = px.launch(
+                argv,
+                envp,
+                cwd=str(config_home),
+                policy=runtime.syscall_policy,
+                ag=None,
+            )
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
         finally:
-            gateway.unregister(token)
-            profiler_ingest.unregister(token)
             agharness.cleanup_config_home(config_home)
 
         if rc != 0:
-            return (
-                agerror(f"opencode exited with code {rc}: {stderr or stdout}"),
-                prev_ctx,
-                [sys_msg],
+            return AttemptResult(
+                ok=False,
+                error_message=f"opencode exited with code {rc}: {stderr or stdout}",
             )
 
         final_text = self._parse_output_events(stdout)
-        user_msg = {"role": "user", "content": prompt}
-        assistant_msg = {"role": "assistant", "content": final_text}
-
-        if skill.output_schema is not None and skill.output_schema.raw_key() is None:
-            result, _paths = skill.output_schema.validate_and_recover(final_text, ag.sandbox)
-        else:
-            out_key = skill.output_schema.raw_key() if skill.output_schema is not None else "result"
-            result = agdata(**{out_key: final_text})
-
-        prev_ctx.messages = [user_msg, assistant_msg]
-        return result, prev_ctx, [sys_msg, user_msg, assistant_msg]
+        return AttemptResult(ok=True, final_text=final_text)
 
     def _write_opencode_config(self, config_home, base_url: str, token: str, model: str) -> None:
         config = {

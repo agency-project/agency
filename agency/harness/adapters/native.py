@@ -75,14 +75,7 @@ from __future__ import annotations
 import json
 import shlex
 import uuid
-from typing import TYPE_CHECKING
-
-from .base import AttemptResult, agharness_backend
-
-if TYPE_CHECKING:
-    from ...agent import agent
-    from ...agskill import agskill
-    from ...manager.agmanager_host import agHostAgentManager, LaunchHandle
+from .base import AdapterRuntime, AttemptResult, agharness_backend
 
 _DEFAULT_TIMEOUT_S = 600
 
@@ -95,13 +88,9 @@ def _session_file_path(session_dir: str, session_id: str) -> str:
 class _NativeBackend(agharness_backend):
     engine_key = "native"
 
-    def _run_attempt(
+    def run_daemon_attempt(
         self,
-        ag: "agent",
-        host_manager: "agHostAgentManager",
-        harness_base_url: "str | None",
-        launch: "LaunchHandle",
-        skill: "agskill",
+        runtime: AdapterRuntime,
         *,
         prompt: str,
         resume_session_id: "str | None",
@@ -117,7 +106,7 @@ class _NativeBackend(agharness_backend):
         # (PYTHONPATH/package bind-mount, ensure_python_packages_in_container,
         # sandbox.exec() itself), so it checks the sandbox's own kind
         # directly, a real, current limitation, not a silently-accepted no-op.
-        if not agharness.is_container_backed(ag.sandbox):
+        if not agharness.is_container_backed(runtime.sandbox):
             return AttemptResult(
                 ok=False,
                 error_message=(
@@ -126,22 +115,12 @@ class _NativeBackend(agharness_backend):
                 ),
             )
 
-        suppress_builtins = skill.replace_tools is not None
-        custom_tool_objs = skill.replace_tools if suppress_builtins else (skill.add_tools or [])
-        if custom_tool_objs:
-            return AttemptResult(
-                ok=False,
-                error_message=(
-                    "native's standalone harness does not support skill.add_tools/replace_tools "
-                    "(custom Python closures shipped into the container) -- expose custom tools "
-                    "via an MCP server instead, the same extension mechanism every other harness "
-                    "uses (--mcp-config)"
-                ),
-            )
+        suppress_builtins = runtime.suppress_builtin_tools
 
         from ...agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_in_container
 
-        sandbox = ag.sandbox
+        sandbox = runtime.sandbox
+        assert sandbox is not None
         ensure_python_packages_in_container(
             sandbox, ["httpx", "httpx2", "mcp", "html2text"], timeout_s=180
         )
@@ -151,7 +130,9 @@ class _NativeBackend(agharness_backend):
         # the whole execute() call) -- session continuity across attempts
         # flows through AttemptResult.session_blob/resume_session_id now,
         # not directory reuse, so each attempt can be fully self-contained.
-        scratch_dir = agharness.materialize_config_home_in_container(ag, sandbox, uuid.uuid4().hex)
+        scratch_dir = agharness.materialize_config_home_in_container(
+            runtime.engine_name, sandbox, uuid.uuid4().hex
+        )
         offload_dir = f"{scratch_dir}/long_tool_call_outputs"
         try:
             if resume_session_id and prior_session_blob is not None:
@@ -159,7 +140,7 @@ class _NativeBackend(agharness_backend):
                     _session_file_path(scratch_dir, resume_session_id), prior_session_blob
                 )
 
-            mcp_config = agharness.mcp_config_for(harness_base_url, launch.token)
+            mcp_config = agharness.mcp_config_for(runtime.harness_base_url, runtime.token)
             pkg_pythonpath = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/agency"
             run_id = uuid.uuid4().hex[:8]
             stdout_path = f"{scratch_dir}/stdout-{run_id}.json"
@@ -172,15 +153,15 @@ class _NativeBackend(agharness_backend):
                 "-p",
                 shlex.quote(prompt),
                 "--model",
-                shlex.quote(ag.llm.backend.model or ""),
+                shlex.quote(runtime.model or ""),
                 "--max-steps",
                 str(max_steps or 20),
                 "--output-format",
                 "json",
                 "--bridge-base-url",
-                shlex.quote(harness_base_url),
+                shlex.quote(runtime.harness_base_url),
                 "--bridge-token",
-                shlex.quote(launch.token),
+                shlex.quote(runtime.token),
                 "--mcp-config",
                 shlex.quote(json.dumps(mcp_config)),
                 "--session-dir",

@@ -26,13 +26,17 @@ if TYPE_CHECKING:
     from ..agskill import agskill
 
 
-def materialize_config_home(ag: "agent", token: str, base_url: str) -> Path:
+def _runtime_name(owner: "agent | str") -> str:
+    return owner if isinstance(owner, str) else owner.agname
+
+
+def materialize_config_home(ag: "agent | str", token: str, base_url: str) -> Path:
     """Create a fresh, isolated directory for one harness launch's config
     home. Concrete backends write their own harness-specific config files
     (env vars, provider blocks, etc. pointing at *base_url* with *token*)
     into this directory -- what to write is backend-specific, only the
     "give me an isolated directory" part is shared."""
-    return Path(tempfile.mkdtemp(prefix=f"agharness-{ag.agname}-"))
+    return Path(tempfile.mkdtemp(prefix=f"agharness-{_runtime_name(ag)}-"))
 
 
 def cleanup_config_home(path: Path) -> None:
@@ -49,7 +53,7 @@ def is_container_backed(sandbox) -> bool:
     return sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"
 
 
-def materialize_config_home_in_container(ag: "agent", sandbox, token: str) -> str:
+def materialize_config_home_in_container(ag: "agent | str", sandbox, token: str) -> str:
     """In-container counterpart to `materialize_config_home` -- creates a
     fresh, isolated directory INSIDE *sandbox*'s own container filesystem
     instead of a host tempdir. Required once the harness process itself
@@ -61,7 +65,7 @@ def materialize_config_home_in_container(ag: "agent", sandbox, token: str) -> st
     `materialize_config_home`/`cleanup_config_home`'s own pairing."""
     import shlex
 
-    path = f"/tmp/agharness-{ag.agname}-{token}"
+    path = f"/tmp/agharness-{_runtime_name(ag)}-{token}"
     sandbox.exec(f"mkdir -p {shlex.quote(path)}", workdir="/")
     return path
 

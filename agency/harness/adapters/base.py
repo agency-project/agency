@@ -29,13 +29,10 @@ Claude Code/Codex/opencode/Grok), building its argv/env from
 a migrated concrete backend implements; everything else lives here, once,
 instead of five times.
 
-**Migration status**: `native.py`'s `_NativeBackend` implements
-`_run_attempt()` and inherits this template. `claude_code.py`/`codex.py`/
-`opencode.py`/`grok.py` still define their OWN `execute()` (which simply
-shadows this template method entirely -- ordinary Python override, no
-special-casing needed here) and construct their own bridge singletons the
-old way; migrating one of them means deleting its `execute()` override and
-implementing `_run_attempt()` instead, exactly like `native.py` did.
+**Current daemon path**: every concrete backend implements
+`run_daemon_attempt(AdapterRuntime, ...)`. The older `execute()` template
+below is retained temporarily for legacy-test compatibility, but
+`AgentEngine` and the sandbox daemon do not call it.
 """
 
 from __future__ import annotations
@@ -44,7 +41,7 @@ import base64
 import json
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from ...agconfig import DynamicConfigParam, _AgConfigViewBase
 from ...agdata import agdata, agerror
@@ -121,6 +118,36 @@ class AttemptResult:
     error_message: str = ""
 
 
+class AdapterSandbox(Protocol):
+    """Filesystem/command surface available to an adapter inside the daemon."""
+
+    def exec(self, cmd: str, workdir: str = "/workspace", timeout: int = 600): ...
+
+    def read_file(self, path: str) -> str: ...
+
+    def read_file_bytes(self, path: str) -> bytes: ...
+
+    def write_file_bytes(self, path: str, data: bytes) -> None: ...
+
+
+@dataclass(frozen=True)
+class AdapterRuntime:
+    """Explicit sandbox-daemon dependencies for one harness attempt.
+
+    This deliberately is not an ``agent``. Host-owned agent, skill, manager,
+    logging, and UI state must not leak across the host/sandbox boundary.
+    """
+
+    agconfig: "agConfig"
+    model: str
+    engine_name: str
+    harness_base_url: str
+    token: str
+    syscall_policy: object
+    sandbox: "AdapterSandbox | None" = None
+    suppress_builtin_tools: bool = False
+
+
 class _LiveTranscriptPusher:
     """Mirrors `execute_react()`'s per-step UI hooks while a harness CLI
     runs as one blocking call, by polling `host_manager.
@@ -173,10 +200,7 @@ class agharness_backend(AgHarnessFields):
     `agharness_backend.for_config(engine, agconfig)` to get the right
     subclass; don't instantiate a subclass directly."""
 
-    #: Set by each concrete subclass that implements `_run_attempt()` --
-    #: the key `ag._harness_sessions` is stored/looked up under. Backends
-    #: that still override `execute()` directly (not yet migrated) don't
-    #: need this at all.
+    #: Session-state key used by the retired host-side template method.
     engine_key: str = ""
 
     #: True for a backend whose own PreToolUse/PostToolUse hook reports
@@ -196,6 +220,18 @@ class agharness_backend(AgHarnessFields):
 
     def get_config_copy(self) -> "agConfig":
         return self._agconfig.clone()
+
+    def run_daemon_attempt(
+        self,
+        runtime: AdapterRuntime,
+        *,
+        prompt: str,
+        resume_session_id: "str | None",
+        prior_session_blob: "bytes | None",
+        max_steps: "int | None",
+    ) -> AttemptResult:
+        """Run one CLI attempt through the narrow sandbox-daemon seam."""
+        raise NotImplementedError
 
     def execute(
         self,

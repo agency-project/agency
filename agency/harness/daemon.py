@@ -14,8 +14,8 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Callable
 
 import uvicorn
@@ -23,7 +23,7 @@ from fastapi import FastAPI
 
 from ..agconfig import agConfig
 from . import interaction_router, llm_router, mcp_proxy
-from .adapters.base import AttemptResult, agharness_backend
+from .adapters.base import AdapterRuntime, AttemptResult, agharness_backend
 from .clients.host_services_client import HostServicesClient
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
 from .servers import SandboxInteractionServer
@@ -146,7 +146,7 @@ def _run_adapter_attempt(
 ) -> HarnessAttemptResult:
     try:
         adapter = agharness_backend.for_config(request.harness, agconfig)
-        if type(adapter)._run_attempt is agharness_backend._run_attempt:
+        if type(adapter).run_daemon_attempt is agharness_backend.run_daemon_attempt:
             return HarnessAttemptResult(
                 ok=False,
                 error_message=(
@@ -155,26 +155,21 @@ def _run_adapter_attempt(
                 ),
             )
 
-        # The daemon is already inside the sandbox. Native still needs the local
-        # filesystem/command facade; external CLIs must use the adapter's bare-
-        # process path so they are not launched through a nested container exec.
-        sandbox = _LocalSandbox() if request.harness == "native" else None
-        agent = SimpleNamespace(
+        # The daemon is already inside the sandbox. Native uses a local
+        # filesystem facade; external CLIs launch directly in this process's
+        # namespace. No host-side agent or skill object crosses this boundary.
+        runtime = AdapterRuntime(
             agconfig=agconfig,
-            sandbox=sandbox,
-            agname=engine_name,
-            llm=SimpleNamespace(backend=SimpleNamespace(model=model)),
-            log=SimpleNamespace(_tool_call=lambda *_args, **_kwargs: None),
+            model=model,
+            engine_name=engine_name,
+            harness_base_url=harness_base_url,
+            token=f"daemon-{uuid.uuid4().hex}",
             syscall_policy=syscall_policy,
+            sandbox=_LocalSandbox() if request.harness == "native" else None,
+            suppress_builtin_tools=request.suppress_builtin_tools,
         )
-        skill = SimpleNamespace(name=engine_name, add_tools=None, replace_tools=None)
-        launch = SimpleNamespace(token=f"daemon-{engine_name}")
-        result: AttemptResult = adapter._run_attempt(
-            agent,
-            SimpleNamespace(),
-            harness_base_url,
-            launch,
-            skill,
+        result: AttemptResult = adapter.run_daemon_attempt(
+            runtime,
             prompt=_render_attempt_prompt(request),
             resume_session_id=request.resume_session_id,
             prior_session_blob=(
