@@ -83,18 +83,6 @@ class agLLMConfig(_AgConfigViewBase):
     _OWNER = "agllm"
 
 
-# _llm_call_semaphore/_get_llm_call_semaphore/_llm_call_semaphore_slot were
-# retired here along with agllm.call() itself, their only caller.
-
-
-# _SUMMARY_SYSTEM lives in agllm_pure.py now (agllm_pure.SUMMARY_SYSTEM) --
-# shared, unmodified, with the in-container native entrypoint's own
-# compaction (see that module's docstring for why it's split out).
-
-
-# LLMCallResult was retired here along with agllm.call() itself, its only
-# production constructor.
-
 # ---------------------------------------------------------------------------
 # agllm class
 # ---------------------------------------------------------------------------
@@ -134,12 +122,6 @@ class agllm(_AgLLMFields):
 
     def build_kwargs(self, messages: list[dict], openai_tools: "list | None" = None) -> dict:
         return agllm.build_llm_kwargs(self.backend, messages, openai_tools)
-
-    # _retry_backoff_s()/call() were retired here along with execute_react()
-    # itself: call()'s only production caller. The terminus does its own
-    # single-attempt streaming dispatch (never calls agllm.call()); native's
-    # entrypoint dispatches via its own _dispatch_via_terminus with its own,
-    # differently-scoped retry policy (see that function's docstring).
 
     # ------------------------------------------------------------------
     # Static methods — pure functions on config/data, no instance needed
@@ -329,11 +311,3 @@ class agllm(_AgLLMFields):
         """Trim oversized tool results; only activates when savings reach
         agllm_pure.PRUNE_MIN_FREE_TOKENS."""
         return agllm_pure.prune_tool_outputs(messages)
-
-    # compact()/maybe_compact() were retired here along with execute_react()
-    # itself: their only production caller. Native's own compaction
-    # (_native_in_container_entrypoint.py's _maybe_compact) uses the same
-    # algorithm via the still-alive, still-tested agllm_pure.py (see
-    # tests/test_agllm_pure.py and this file's own estimate_tokens/prune/
-    # tail_start/should_compact static methods above, all thin delegates to
-    # that module).
