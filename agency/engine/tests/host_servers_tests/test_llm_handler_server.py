@@ -397,7 +397,7 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
 # ---------------------------------------------------------------------------
 
 
-def test_handle_relay_deregisters_from_active_handles_on_completion():
+def test_handle_relay_stays_in_handles_on_completion():
     def create(**kwargs):
         return iter([_FakeChunk([_FakeChoice(delta=_FakeDelta(content="hi"))])])
 
@@ -405,7 +405,7 @@ def test_handle_relay_deregisters_from_active_handles_on_completion():
     handle = server.start_stream({"messages": []})
     first = handle.first()
     list(handle.relay(first))
-    assert handle not in server._active_handles
+    assert handle in server._handles
 
 
 def test_cancel_sets_event_and_closes_stream_ref_once():
@@ -416,7 +416,7 @@ def test_cancel_sets_event_and_closes_stream_ref_once():
             close_calls.append(1)
 
     server, _ = _make_server(create_fn=lambda **kw: iter([]))
-    handle = mod._StreamHandle(mod.queue.Queue(), threading.Event(), on_done=lambda: None)
+    handle = mod._StreamHandle(mod.queue.Queue(), threading.Event())
     handle._set_stream_ref(_Stream())
     handle.cancel()
     handle.cancel()
@@ -446,7 +446,7 @@ def test_producer_stops_early_when_cancelled_mid_stream():
     assert client.closed is True
 
 
-def test_stop_cancels_and_joins_all_active_handles():
+def test_stop_cancels_and_joins_all_handles():
     # Simulates a producer stuck reading the first chunk. Real cancellation
     # can only unblock this via closing the underlying connection (what
     # cancel() does) -- setting cancel_event alone wouldn't reach a thread
@@ -478,7 +478,7 @@ def test_stop_cancels_and_joins_all_active_handles():
     assert not handle._thread.is_alive()
 
 
-def test_stop_with_no_active_handles_returns_immediately():
+def test_stop_with_no_handles_returns_immediately():
     server, _ = _make_server(create_fn=lambda **kw: iter([]))
     server.stop()  # should not raise or hang
 

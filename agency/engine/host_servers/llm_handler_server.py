@@ -87,14 +87,43 @@ class _StreamHandle:
     route touches; _run_stream_producer reaches in directly since it's an
     internal collaborator, not a public interface."""
 
-    def __init__(self, q: "queue.Queue[dict]", cancel_event: threading.Event, on_done) -> None:
+    def __init__(self, q: "queue.Queue[dict]", cancel_event: threading.Event) -> None:
         self._queue = q
         self._cancel_event = cancel_event
-        self._on_done = on_done
         self._thread: "threading.Thread | None" = None
         self._stream_ref_lock = threading.Lock()
         self._stream_ref = None
         self._stream_closed = False
+        # This connection's own exchange -- kept on the handle rather than a
+        # shared instance-wide list so one connection's in-progress writes
+        # can never race another connection's. See
+        # LlmHandlerServer.get_transcripts(). None until the first
+        # register_stream_exchange() call creates it.
+        self._entry: "dict | None" = None
+        self._transcript_lock = threading.Lock()
+
+    def get_transcript(self) -> "list[dict]":
+        with self._transcript_lock:
+            return [dict(self._entry)] if self._entry is not None else []
+
+    def register_stream_exchange(self, item: "dict | None" = None, **entry_fields) -> None:
+        """Update this connection's transcript entry -- creating it on the
+        first call -- with entry_fields, then push item (if given) onto the
+        response queue. One call so the transcript and the streamed
+        response can never drift out of sync with each other."""
+        with self._transcript_lock:
+            if self._entry is None:
+                self._entry = {
+                    "request": None,
+                    "response": None,
+                    "usage": None,
+                    "finish_reason": None,
+                    "streaming": True,
+                    "ts": time.time(),
+                }
+            self._entry.update(entry_fields)
+        if item is not None:
+            self._queue.put(item)
 
     def _set_stream_ref(self, stream) -> None:
         with self._stream_ref_lock:
@@ -123,7 +152,6 @@ class _StreamHandle:
             self.cancel()
             if self._thread is not None:
                 self._thread.join(timeout=5.0)
-            self._on_done()
 
     def cancel(self) -> None:
         self._cancel_event.set()
@@ -132,14 +160,48 @@ class _StreamHandle:
 
 class LlmHandlerServer:
     def __init__(self, agconfig: "agConfig", *, parent_context=None) -> None:
-        self._active_handles: "set[_StreamHandle]" = set()
-        self._active_handles_lock = threading.Lock()
+        self._handles: "list[_StreamHandle]" = []
+        self._handles_lock = threading.Lock()
         # HTTP/UDS requests are handled on the host server's own thread, so
         # their contextvars do not automatically inherit the agent run span.
         # Keep the durable OTel context captured by HostServerManager and use
         # it explicitly for every LLM attempt span.
         self._parent_context = parent_context
+        # Non-streaming exchanges only -- a streaming call's exchange lives
+        # on its own _StreamHandle instead (see _StreamHandle.get_transcript),
+        # so each connection's in-progress writes can't race another
+        # connection's.
+        self._transcript: "list[dict]" = []
+        self._transcript_lock = threading.Lock()
         self.set_config(agconfig)
+
+    def get_transcripts(self) -> "list[dict]":
+        """Every LLM exchange dispatched so far: this instance's own
+        non-streaming exchanges plus every streaming connection's own
+        exchange, concatenated. Each entry is ``{request, response, usage,
+        finish_reason, streaming, ts}`` -- ``streaming`` is True while a
+        streamed entry's ``response`` is still being filled in."""
+        with self._transcript_lock:
+            entries = [dict(entry) for entry in self._transcript]
+        with self._handles_lock:
+            handles = list(self._handles)
+        for handle in handles:
+            entries.extend(handle.get_transcript())
+        return entries
+
+    def _record_exchange(
+        self, request: dict, message: dict, usage: "dict | None", finish_reason: "str | None"
+    ) -> None:
+        entry = {
+            "request": request,
+            "response": message,
+            "usage": usage,
+            "finish_reason": finish_reason,
+            "streaming": False,
+            "ts": time.time(),
+        }
+        with self._transcript_lock:
+            self._transcript.append(entry)
 
     def set_config(self, agconfig: "agConfig") -> None:
         self._agconfig = agconfig
@@ -162,17 +224,17 @@ class LlmHandlerServer:
         kwargs["stream_options"] = {"include_usage": True}
         q: "queue.Queue[dict]" = queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
         cancel_event = threading.Event()
-        handle = _StreamHandle(q, cancel_event, on_done=lambda: self._deregister(handle))
+        handle = _StreamHandle(q, cancel_event)
         thread = agprof.spawn_traced(self._run_stream_producer, kwargs, handle, daemon=True)
         handle._thread = thread
-        with self._active_handles_lock:
-            self._active_handles.add(handle)
+        with self._handles_lock:
+            self._handles.append(handle)
         thread.start()
         return handle
 
     def stop(self) -> None:
-        with self._active_handles_lock:
-            handles = list(self._active_handles)
+        with self._handles_lock:
+            handles = list(self._handles)
         for handle in handles:
             handle.cancel()
         for handle in handles:
@@ -257,10 +319,13 @@ class LlmHandlerServer:
                     input_tokens=(usage or {}).get("prompt_tokens", 0),
                     output_tokens=(usage or {}).get("completion_tokens", 0),
                 )
+                message = _serialize_result_message(result)
+                finish_reason = _finish_reason(result)
+                self._record_exchange(kwargs, message, usage, finish_reason)
                 return {
-                    "message": _serialize_result_message(result),
+                    "message": message,
                     "usage": usage,
-                    "stop_reason": _finish_reason(result),
+                    "stop_reason": finish_reason,
                 }
         finally:
             client.close()
@@ -283,12 +348,12 @@ class LlmHandlerServer:
                     first_chunk = next(stream_iter)
                 except StopIteration:
                     _annotate(attempt_span, outcome="success")
-                    handle._queue.put(
-                        {
-                            "type": "done",
-                            "message": {"role": "assistant", "content": None},
-                            "usage": None,
-                        }
+                    empty_message = {"role": "assistant", "content": None}
+                    handle.register_stream_exchange(
+                        {"type": "done", "message": empty_message, "usage": None},
+                        request=kwargs,
+                        response=empty_message,
+                        streaming=False,
                     )
                     return
                 except BAD_REQUEST_EXCS as e:
@@ -306,6 +371,9 @@ class LlmHandlerServer:
                 _annotate(attempt_span, ttft_ms=round((time.perf_counter() - t0) * 1000, 3))
 
                 usage = None
+                handle.register_stream_exchange(
+                    request=kwargs, response={"role": "assistant", "content": ""}
+                )
                 try:
                     for chunk in itertools.chain([first_chunk], stream_iter):
                         if handle._cancel_event.is_set():
@@ -314,12 +382,26 @@ class LlmHandlerServer:
                         if chunk_usage is not None:
                             usage = chunk_usage
                         text = self._accumulate_chunk(chunk, content_parts, tool_calls_raw)
-                        if text:
-                            handle._queue.put({"type": "delta", "content": text})
+                        chunk_finish_reason = _finish_reason(chunk)
+                        fields = {
+                            "response": {"role": "assistant", "content": "".join(content_parts)}
+                        }
+                        if chunk_usage is not None:
+                            fields["usage"] = chunk_usage
+                        if chunk_finish_reason is not None:
+                            fields["finish_reason"] = chunk_finish_reason
+                        item = {"type": "delta", "content": text} if text else None
+                        handle.register_stream_exchange(item, **fields)
                 except BaseException as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    handle._queue.put(
-                        {"type": "error", "message": str(e), "transient": False, "status_code": 500}
+                    error_item = {
+                        "type": "error",
+                        "message": str(e),
+                        "transient": False,
+                        "status_code": 500,
+                    }
+                    handle.register_stream_exchange(
+                        error_item, streaming=False, error=f"{type(e).__name__}: {e}"
                     )
                     return
 
@@ -327,7 +409,12 @@ class LlmHandlerServer:
                 message = {"role": "assistant", "content": "".join(content_parts) or None}
                 if tool_calls_raw:
                     message["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
-                handle._queue.put({"type": "done", "message": message, "usage": usage})
+                handle.register_stream_exchange(
+                    {"type": "done", "message": message, "usage": usage},
+                    response=message,
+                    usage=usage,
+                    streaming=False,
+                )
         finally:
             handle._close_stream()
 
@@ -359,7 +446,3 @@ class LlmHandlerServer:
                 if arguments:
                     slot["function"]["arguments"] += arguments
         return content
-
-    def _deregister(self, handle: "_StreamHandle") -> None:
-        with self._active_handles_lock:
-            self._active_handles.discard(handle)
