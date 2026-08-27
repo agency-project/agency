@@ -163,6 +163,14 @@ def test_host_server_manager_property_raises_before_run():
 
 # ---------------------------------------------------------------------------
 # set_config
+def test_llm_transcripts_are_empty_before_run_and_forwarded_after():
+    engine = AgentEngine(_FakeAgent())
+    assert engine.llm_transcripts == []
+    transcripts = [{"request": {}, "response": {}}]
+    engine._host_server_manager = SimpleNamespace(llm_transcripts=transcripts)
+    assert engine.llm_transcripts is transcripts
+
+
 # ---------------------------------------------------------------------------
 
 

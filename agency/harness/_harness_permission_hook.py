@@ -42,6 +42,13 @@ _PROFILER_TIMEOUT_S = 0.1
 _MAX_PROFILER_FIELD_CHARS = 64 * 1024
 
 
+def _policy_tool_name(name: str) -> str:
+    # Harnesses prefix MCP tools with their server name; host policies use
+    # the server-local names shared by every harness.
+    prefix = "mcp__agency__"
+    return name[len(prefix) :] if name.startswith(prefix) else name
+
+
 def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -74,7 +81,7 @@ def main() -> int:
 
 
 def _check_tool_policy(payload: dict) -> "tuple[str, str | None]":
-    tool_name = payload.get("tool_name", "")
+    tool_name = _policy_tool_name(payload.get("tool_name", ""))
     tool_input = payload.get("tool_input") or {}
 
     base_url = os.environ.get("AGPOLICY_BASE_URL")

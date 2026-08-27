@@ -58,6 +58,7 @@ class SandboxInteractionServer:
                 max_steps=payload.get("max_steps"),
                 resume_session_id=payload.get("resume_session_id"),
                 prior_session_blob_b64=payload.get("prior_session_blob_b64"),
+                suppress_builtin_tools=payload.get("suppress_builtin_tools", False),
             )
             return JSONResponse(asdict(self._attempt_handler(request)))
 

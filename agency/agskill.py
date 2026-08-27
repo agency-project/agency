@@ -341,21 +341,15 @@ class agskill:
                     "\nRespond with plain text only — no JSON wrapping, no markdown code fences."
                 )
             else:
-                # Structured output — model must call one return_<field> tool per output field.
-                field_tools = ", ".join(f"return_{f}" for f in self.output_schema._data)
                 field_lines = "\n".join(
                     f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
                 )
-                parts.append(  # [REFACTOR] Better prompting
-                    f"\nTo return your results, call the appropriate return_<field> tool "
-                    f"once for each required output field ({field_tools}). "
-                    f"Required fields:\n"
-                    f"{field_lines}\n\n"
-                    "- Call each return_<field> tool separately — one field per call.\n"
-                    "- Only call a return_<field> tool when you have the final value ready — "
-                    "return the output itself as the tool argument. "
-                    "Never call a return_<field> tool with empty or missing arguments.\n"
-                    "- You may continue using other tools after registering outputs if needed."
+                parts.append(
+                    "\nTo return your results, call submit_output once for each required "
+                    "field, passing its name as `field` and its final value as `value`. "
+                    f"Required fields:\n{field_lines}\n\n"
+                    "Do not submit empty or provisional values. You may continue using other "
+                    "tools until every required field is ready."
                 )
         return "\n".join(parts)
 

@@ -127,6 +127,17 @@ _UDS_PREFIXES = [
 ]
 
 
+def test_runtime_root_accepts_an_absolute_override(monkeypatch):
+    monkeypatch.setenv("AGENCY_RUNTIME_ROOT", "/tmp/agency-user")
+    assert str(_agutil.agency_tmp_root()) == "/tmp/agency-user"
+
+
+def test_runtime_root_rejects_a_relative_override(monkeypatch):
+    monkeypatch.setenv("AGENCY_RUNTIME_ROOT", "relative/agency")
+    with pytest.raises(ValueError, match="must be absolute"):
+        _agutil.agency_tmp_root()
+
+
 @pytest.fixture
 def _fresh_gateway(monkeypatch):
     """Point the gateway root at a scratch dir and clear the per-process
@@ -158,13 +169,15 @@ def test_gateway_dir_ignores_tmpdir(tmp_path, monkeypatch):
     deleted by scratch-space cleanup policies -- survivable for a temp file,
     fatal for a live socket."""
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+    runtime_root = tmp_path.parent / "explicit-agency-runtime"
+    monkeypatch.setenv("AGENCY_RUNTIME_ROOT", str(runtime_root))
     monkeypatch.setattr(_agutil, "_gateway_dir", None)
     monkeypatch.setattr(_agutil, "_gateway_reap_done", True)
 
     gateway = agharness_llm_gateway_dir()
 
     assert str(tmp_path) not in str(gateway)
-    assert str(gateway).startswith("/tmp/agency/gw/")
+    assert str(gateway).startswith(f"{runtime_root}/gw/")
 
 
 def test_gateway_dir_is_run_scoped_and_records_its_owner(_fresh_gateway):

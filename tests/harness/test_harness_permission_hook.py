@@ -127,3 +127,19 @@ def test_missing_tool_use_id_skips_profiler_without_blocking(monkeypatch, capsys
 def test_profiler_timeout_budget_stays_at_or_below_200ms_per_tool():
     # Pre and Post each make at most one synchronous telemetry request.
     assert hook._PROFILER_TIMEOUT_S * 2 <= 0.2
+
+
+def test_mcp_tool_name_is_normalized_for_host_policy(monkeypatch):
+    observed = {}
+
+    def urlopen(request, timeout):
+        observed.update(json.loads(request.data))
+        return _Response({"decision": "allow"})
+
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+    payload = _payload()
+    payload["tool_name"] = "mcp__agency__read"
+
+    assert hook._check_tool_policy(payload)[0] == "allow"

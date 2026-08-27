@@ -144,6 +144,33 @@ def test_dispatch_returns_message_usage_stop_reason():
     assert client.closed is True
 
 
+def test_dispatch_exposes_a_deep_copied_transcript():
+    server, _ = _make_server(
+        create_fn=lambda **_kwargs: _FakeResult(
+            [_FakeChoice(message=_FakeMessage(content="answer"), finish_reason="stop")],
+            usage=_FakeUsage(5, 2),
+        )
+    )
+    request = {
+        "messages": [{"role": "user", "content": "question"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "read", "parameters": {"type": "object"}},
+            }
+        ],
+    }
+
+    server.dispatch(request)
+    transcripts = server.get_transcripts()
+
+    assert transcripts[0]["request"]["messages"] == request["messages"]
+    assert transcripts[0]["response"] == {"role": "assistant", "content": "answer"}
+    assert transcripts[0]["usage"]["total_tokens"] == 7
+    transcripts[0]["request"]["messages"].clear()
+    assert server.get_transcripts()[0]["request"]["messages"] == request["messages"]
+
+
 def test_dispatch_includes_tool_calls_when_present():
     def create(**kwargs):
         tc = _FakeToolCall(index=0, id="call_1", name="bash", arguments='{"cmd":"ls"}')

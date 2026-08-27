@@ -53,10 +53,18 @@ class _CodexBackend(agharness_backend):
                 config_home, runtime.harness_base_url, runtime.model or "default"
             )
 
-            # --ignore-user-config keeps this run from inheriting the
-            # caller's own ~/.codex/config.toml, matching the same
-            # isolated-config-home intent as the other two backends.
-            argv = [resolved, "exec", "--json", "--ignore-user-config", prompt]
+            # CODEX_HOME already isolates both config and state. Loading that
+            # config is required for the Agency provider and MCP server.
+            argv = [
+                resolved,
+                "exec",
+                "--json",
+                "--strict-config",
+                "--skip-git-repo-check",
+                "--ignore-rules",
+                "--ephemeral",
+                prompt,
+            ]
             envp = {
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
                 "CODEX_HOME": str(config_home),
@@ -83,28 +91,89 @@ class _CodexBackend(agharness_backend):
                 ok=False, error_message=f"codex exited with code {rc}: {stderr or stdout}"
             )
 
+        unsupported = self._parse_unsupported_tool_events(stdout)
+        if unsupported:
+            return AttemptResult(
+                ok=False,
+                error_message=(
+                    "codex used tools outside the harness contract: "
+                    + ", ".join(sorted(unsupported))
+                ),
+            )
+
         final_text = self._parse_output_events(stdout)
-        return AttemptResult(ok=True, final_text=final_text)
+        usage = self._parse_usage_events(stdout)
+        return AttemptResult(
+            ok=True,
+            final_text=final_text,
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+        )
 
     def _write_codex_config(self, config_home, base_url: str, model: str) -> None:
+        quote = json.dumps
         toml_text = (
-            f'model = "{model}"\n'
-            f'model_provider = "{self._PROVIDER_NAME}"\n'
+            f"model = {quote(model)}\n"
+            f"model_provider = {quote(self._PROVIDER_NAME)}\n"
+            f'approval_policy = "never"\n'
+            f'sandbox_mode = "read-only"\n'
+            f'web_search = "disabled"\n'
+            f"\n"
+            f"[agents]\n"
+            f"enabled = false\n"
+            f"\n"
+            f"[features]\n"
+            f"remote_plugin = false\n"
+            f"shell_tool = false\n"
+            f"unified_exec = false\n"
             f"\n"
             f"[model_providers.{self._PROVIDER_NAME}]\n"
             f'name = "Agency Proxy"\n'
-            f'base_url = "{base_url}/v1"\n'
-            f'env_key = "{self._ENV_KEY_NAME}"\n'
+            f"base_url = {quote(f'{base_url}/v1')}\n"
+            f"env_key = {quote(self._ENV_KEY_NAME)}\n"
             f'wire_api = "responses"\n'
+            f"\n"
+            f"[mcp_servers.agency]\n"
+            f"url = {quote(f'{base_url}/mcp')}\n"
+            f"bearer_token_env_var = {quote(self._ENV_KEY_NAME)}\n"
+            f"required = true\n"
+            f'default_tools_approval_mode = "approve"\n'
         )
         (config_home / "config.toml").write_text(toml_text)
 
     @staticmethod
+    def _parse_usage_events(stdout: str) -> dict[str, int]:
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "turn.completed":
+                continue
+            reported = event.get("usage") or {}
+            usage["input_tokens"] += int(reported.get("input_tokens") or 0)
+            usage["output_tokens"] += int(reported.get("output_tokens") or 0)
+        return usage
+
+    @staticmethod
+    def _parse_unsupported_tool_events(stdout: str) -> set[str]:
+        unsupported = set()
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item = event.get("item") if isinstance(event, dict) else None
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if item_type in {"command_execution", "file_change", "web_search"}:
+                unsupported.add(item_type)
+        return unsupported
+
+    @staticmethod
     def _parse_output_events(stdout: str) -> str:
         """Best-effort extraction of the final `agent_message` item's text
-        from `codex exec --json`'s NDJSON event stream -- unverified
-        against a live run (no `codex` binary available), see this
-        module's docstring."""
+        from `codex exec --json`'s NDJSON event stream."""
         last_text = ""
         for line in stdout.splitlines():
             line = line.strip()

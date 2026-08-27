@@ -83,6 +83,7 @@ class _HarnessApiServer:
     def __init__(self, host_uds_path: str, port: int) -> None:
         self._bridge = HostServicesClient(host_uds_path, None)
         self.syscall_policy = _HostSyscallPolicy(self._bridge)
+        self.request_budget = llm_router.LlmRequestBudget()
         self._port = port
         self._server: "uvicorn.Server | None" = None
         self._thread: "threading.Thread | None" = None
@@ -93,7 +94,7 @@ class _HarnessApiServer:
 
     def start(self, timeout_s: float = 10.0) -> None:
         app = FastAPI()
-        app.include_router(llm_router.build_router(self._bridge))
+        app.include_router(llm_router.build_router(self._bridge, self.request_budget))
         app.include_router(interaction_router.build_router(self._bridge))
         app.include_router(mcp_proxy.build_router(self._bridge))
         server = uvicorn.Server(
@@ -214,6 +215,7 @@ class HarnessManager:
         self._interaction_server = SandboxInteractionServer(sandbox_uds_path, handler)
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
+        self._harness_api.request_budget.reset(request.max_steps)
         try:
             return _run_adapter_attempt(
                 request,
@@ -225,6 +227,8 @@ class HarnessManager:
             )
         except Exception as exc:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")
+        finally:
+            self._harness_api.request_budget.reset(None)
 
     def start(self) -> str:
         self._harness_api.start()

@@ -408,6 +408,64 @@ def test_responses_tools_to_openai_flattens_to_nested():
     ]
 
 
+def test_responses_namespace_tools_are_flattened_with_reversible_names():
+    namespace_map = {}
+    converted = responses_tools_to_openai(
+        [
+            {
+                "type": "namespace",
+                "name": "mcp__agency",
+                "description": "Agency tools",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            }
+        ],
+        namespace_map=namespace_map,
+    )
+
+    assert converted[0]["function"]["name"] == "mcp__agency__read"
+    assert namespace_map == {"mcp__agency__read": ("mcp__agency", "read")}
+
+
+def test_responses_namespaced_history_uses_flattened_chat_tool_name():
+    body = {
+        "model": "m",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "mcp__agency",
+                "description": "Agency tools",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            }
+        ],
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call1",
+                "namespace": "mcp__agency",
+                "name": "read",
+                "arguments": '{"path":"README.md"}',
+            }
+        ],
+    }
+
+    kwargs = responses_request_to_openai(body)
+
+    assert kwargs["messages"][0]["tool_calls"][0]["function"]["name"] == ("mcp__agency__read")
+
+
 # ---------------------------------------------------------------------------
 # OpenAI response -> Responses API response
 # ---------------------------------------------------------------------------
@@ -433,6 +491,20 @@ def test_openai_response_to_responses_api_function_call():
     assert out["output"][0]["call_id"] == "call1"
     assert out["output"][0]["name"] == "get_weather"
     assert out["output"][0]["arguments"] == '{"city": "SF"}'
+
+
+def test_openai_response_restores_responses_namespace():
+    tc = _ToolCall(id="call1", name="mcp__agency__read", arguments='{"path":"README.md"}')
+    resp = _Response([_Choice(message=_Message(content=None, tool_calls=[tc]))])
+
+    out = openai_response_to_responses_api(
+        resp,
+        "m",
+        namespace_map={"mcp__agency__read": ("mcp__agency", "read")},
+    )
+
+    assert out["output"][0]["name"] == "read"
+    assert out["output"][0]["namespace"] == "mcp__agency"
 
 
 # ---------------------------------------------------------------------------
@@ -489,3 +561,37 @@ def test_openai_chunks_to_responses_sse_function_call_stream():
     assert fc_item["name"] == "get_weather"
     assert fc_item["arguments"] == '{"city": "SF"}'
     assert fc_item["call_id"] == "call1"
+
+
+def test_openai_chunks_restore_responses_namespace():
+    chunks = [
+        _Chunk(
+            choices=[
+                _Choice(
+                    delta=_Delta(
+                        tool_calls=[
+                            _ToolCall(
+                                id="call1",
+                                name="mcp__agency__read",
+                                arguments='{"path":"README.md"}',
+                                index=0,
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+    ]
+
+    frames = "".join(
+        openai_chunks_to_responses_sse(
+            chunks,
+            "m",
+            namespace_map={"mcp__agency__read": ("mcp__agency", "read")},
+        )
+    )
+    events = _parse_sse(frames)
+    items = [data["item"] for kind, data in events if kind == "response.output_item.done"]
+
+    assert items[0]["name"] == "read"
+    assert items[0]["namespace"] == "mcp__agency"

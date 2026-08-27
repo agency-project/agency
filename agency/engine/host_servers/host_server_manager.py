@@ -61,6 +61,10 @@ class HostServerManager:
     def host_mcp_server(self) -> "HostMcpServer":
         return self._host_mcp_server
 
+    @property
+    def llm_transcripts(self) -> list[dict]:
+        return self._llm_handler_server.get_transcripts()
+
     def set_config(self, agconfig: "agConfig") -> None:
         self._ensure_runtime_configs(agconfig)
         self._configs = agconfig.HostServerManagerConfigs

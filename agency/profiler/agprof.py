@@ -159,9 +159,16 @@ def _cgroup_reexec_command(slice_name: str, cgroup_dir: str) -> list[str]:
     home = os.environ.get("HOME") or str(Path.home())
     original_argv = list(getattr(sys, "orig_argv", ())) or [sys.executable, *sys.argv]
     scope_name = slice_name.removesuffix(".slice") + ".scope"
+    # systemd supplies a minimal default PATH. Keep executable resolution
+    # identical on both sides of the profiling boundary.
     profiler_environment = [
         f"{key}={os.environ[key]}"
-        for key in ("AGENCY_PROFILE", "AGENCY_PROFILE_DIR", "AGENCY_PROFILE_SCOPE")
+        for key in (
+            "PATH",
+            "AGENCY_PROFILE",
+            "AGENCY_PROFILE_DIR",
+            "AGENCY_PROFILE_SCOPE",
+        )
         if key in os.environ
     ]
     return [

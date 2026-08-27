@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import queue
@@ -187,7 +188,7 @@ class LlmHandlerServer:
             handles = list(self._handles)
         for handle in handles:
             entries.extend(handle.get_transcript())
-        return entries
+        return copy.deepcopy(entries)
 
     def _record_exchange(
         self, request: dict, message: dict, usage: "dict | None", finish_reason: "str | None"

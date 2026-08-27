@@ -38,6 +38,12 @@ class AgentEngine:
             raise RuntimeError("execute() has not built a HostServerManager yet")
         return self._host_server_manager
 
+    @property
+    def llm_transcripts(self) -> list[dict]:
+        if self._host_server_manager is None:
+            return []
+        return self._host_server_manager.llm_transcripts
+
     def execute(
         self,
         context: "agcontext",

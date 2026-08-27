@@ -762,6 +762,7 @@ def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
     monkeypatch.setattr(agprof.os, "getgid", lambda: 5678)
     monkeypatch.setenv("USER", "benchmark")
     monkeypatch.setenv("HOME", "/home/benchmark")
+    monkeypatch.setenv("PATH", "/home/benchmark/.local/bin:/usr/bin")
     monkeypatch.setattr(agprof.uuid, "uuid4", lambda: type("U", (), {"hex": "abcdef012345"})())
     monkeypatch.setattr(
         agprof.os,
@@ -777,6 +778,7 @@ def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
     slice_name = slice_arg.split("=", 1)[1]
     assert slice_name.startswith("agprof-")
     assert f"AGENCY_PROFILE_CGROUP_PARENT={slice_name}" in command
+    assert "PATH=/home/benchmark/.local/bin:/usr/bin" in command
     assert any(
         arg == f"AGENCY_PROFILE_CGROUP=/sys/fs/cgroup/agprof.slice/{slice_name}" for arg in command
     )

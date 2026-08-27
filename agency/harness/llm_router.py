@@ -13,6 +13,7 @@ docstring for the full design and its reuse policy for
 
 from __future__ import annotations
 
+import threading
 import uuid
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,36 @@ from .common import extract_bearer_token
 
 if TYPE_CHECKING:
     from .clients.host_services_client import HostServicesClient
+
+
+class LlmRequestBudget:
+    """Bound real model calls consistently across different harness loops."""
+
+    def __init__(self) -> None:
+        self._remaining: int | None = None
+        self._lock = threading.Lock()
+
+    def reset(self, limit: int | None) -> None:
+        with self._lock:
+            self._remaining = None if limit is None else max(0, limit)
+
+    def claim(self) -> bool:
+        with self._lock:
+            if self._remaining is None:
+                return True
+            if self._remaining == 0:
+                return False
+            self._remaining -= 1
+            return True
+
+
+def _limit_response(*, anthropic: bool = False) -> JSONResponse:
+    error = {
+        "type": "invalid_request_error",
+        "message": "Agency harness max_steps exhausted",
+    }
+    payload = {"type": "error", "error": error} if anthropic else {"error": error}
+    return JSONResponse(payload, status_code=400)
 
 
 def _mid_array_system_warning(body: dict) -> "str | None":
@@ -55,7 +86,7 @@ def _mid_array_system_warning(body: dict) -> "str | None":
     )
 
 
-def build_router(bridge: "HostServicesClient") -> APIRouter:
+def build_router(bridge: "HostServicesClient", budget: LlmRequestBudget | None = None) -> APIRouter:
     import asyncio
 
     router = APIRouter()
@@ -67,6 +98,8 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             return JSONResponse(
                 {"error": {"message": "unknown or missing bearer token"}}, status_code=401
             )
+        if budget is not None and not budget.claim():
+            return _limit_response()
         body = await request.json()
         if body.get("stream"):
 
@@ -93,6 +126,8 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
                 },
                 status_code=401,
             )
+        if budget is not None and not budget.claim():
+            return _limit_response(anthropic=True)
         body = await request.json()
         # Route to THIS agent's own configured model, never whatever
         # default Claude Code itself requested -- same reasoning as the
@@ -146,23 +181,30 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             return JSONResponse(
                 {"error": {"message": "unknown or missing bearer token"}}, status_code=401
             )
+        if budget is not None and not budget.claim():
+            return _limit_response()
         body = await request.json()
         model = bridge.resolve_model(token)
         request_id = f"resp_{uuid.uuid4().hex}"
-        openai_kwargs = responses_request_to_openai(body)
+        namespace_map: dict[str, tuple[str, str]] = {}
+        openai_kwargs = responses_request_to_openai(body, namespace_map=namespace_map)
         openai_kwargs["model"] = model
 
         if body.get("stream"):
 
             def sse_gen():
                 chunks = bridge.dispatch(token, openai_kwargs)
-                for frame in openai_chunks_to_responses_sse(chunks, model, request_id):
+                for frame in openai_chunks_to_responses_sse(
+                    chunks, model, request_id, namespace_map=namespace_map
+                ):
                     yield frame
 
             return StreamingResponse(sse_gen(), media_type="text/event-stream")
 
         resp = await asyncio.to_thread(bridge.dispatch, token, openai_kwargs)
-        return JSONResponse(openai_response_to_responses_api(resp, model, request_id))
+        return JSONResponse(
+            openai_response_to_responses_api(resp, model, request_id, namespace_map=namespace_map)
+        )
 
     return router
 

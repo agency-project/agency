@@ -388,26 +388,50 @@ def openai_chunks_to_anthropic_sse(chunks, model: str, request_id: "str | None" 
 # ---------------------------------------------------------------------------
 
 
-def responses_tools_to_openai(tools) -> "list[dict] | None":
-    """Responses API tool defs are flat (`{"type":"function","name":...,
-    "description":...,"parameters":...}`) -- chat-completions nests them
-    under a `function` key."""
+def _flattened_tool_name(namespace: str | None, name: str) -> str:
+    return f"{namespace}__{name}" if namespace else name
+
+
+def responses_tools_to_openai(
+    tools, *, namespace_map: "dict[str, tuple[str, str]] | None" = None
+) -> "list[dict] | None":
+    """Flatten Responses namespace tools for chat-completions backends.
+
+    Codex groups each MCP server under a Responses-only ``namespace`` tool.
+    Chat-completions models need ordinary functions, while Codex needs the
+    namespace restored on the returned call to route it back to MCP.
+    """
     if not tools:
         return None
     converted = []
-    for t in tools:
-        if t.get("type") != "function":
+    for tool in tools:
+        if tool.get("type") == "function":
+            functions = [(None, tool)]
+        elif tool.get("type") == "namespace":
+            namespace = tool.get("name")
+            functions = [
+                (namespace, inner)
+                for inner in tool.get("tools", [])
+                if inner.get("type") == "function"
+            ]
+        else:
             continue
-        converted.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": t.get("name", ""),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters") or {"type": "object", "properties": {}},
-                },
-            }
-        )
+
+        for namespace, function in functions:
+            name = _flattened_tool_name(namespace, function.get("name", ""))
+            if namespace and namespace_map is not None:
+                namespace_map[name] = (namespace, function.get("name", ""))
+            converted.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": function.get("description", ""),
+                        "parameters": function.get("parameters")
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+            )
     return converted or None
 
 
@@ -427,10 +451,13 @@ def _responses_content_to_text(content) -> str:
     return "" if content is None else str(content)
 
 
-def responses_request_to_openai(body: dict) -> dict:
+def responses_request_to_openai(
+    body: dict, *, namespace_map: "dict[str, tuple[str, str]] | None" = None
+) -> dict:
     """OpenAI `POST /v1/responses` request body -> `client.chat.completions.
     create(**kwargs)` kwargs."""
     openai_messages: list[dict] = []
+    tools = responses_tools_to_openai(body.get("tools"), namespace_map=namespace_map)
 
     instructions = body.get("instructions")
     if instructions:
@@ -454,7 +481,9 @@ def responses_request_to_openai(body: dict) -> dict:
                                 "id": item.get("call_id", ""),
                                 "type": "function",
                                 "function": {
-                                    "name": item.get("name", ""),
+                                    "name": _flattened_tool_name(
+                                        item.get("namespace"), item.get("name", "")
+                                    ),
                                     "arguments": item.get("arguments", "{}"),
                                 },
                             }
@@ -487,13 +516,18 @@ def responses_request_to_openai(body: dict) -> dict:
         kwargs["temperature"] = body["temperature"]
     if "top_p" in body:
         kwargs["top_p"] = body["top_p"]
-    tools = responses_tools_to_openai(body.get("tools"))
     if tools:
         kwargs["tools"] = tools
     return kwargs
 
 
-def openai_response_to_responses_api(resp, model: str, request_id: "str | None" = None) -> dict:
+def openai_response_to_responses_api(
+    resp,
+    model: str,
+    request_id: "str | None" = None,
+    *,
+    namespace_map: "dict[str, tuple[str, str]] | None" = None,
+) -> dict:
     """Non-streaming OpenAI chat-completion response -> an OpenAI Responses
     API response object."""
     request_id = request_id or f"resp_{uuid.uuid4().hex}"
@@ -513,16 +547,18 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
             }
         )
     for tc in getattr(message, "tool_calls", None) or []:
-        output.append(
-            {
-                "type": "function_call",
-                "id": f"fc_{uuid.uuid4().hex}",
-                "call_id": tc.id,
-                "name": tc.function.name,
-                "arguments": tc.function.arguments,
-                "status": "completed",
-            }
-        )
+        identity = (namespace_map or {}).get(tc.function.name)
+        item = {
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex}",
+            "call_id": tc.id,
+            "name": identity[1] if identity else tc.function.name,
+            "arguments": tc.function.arguments,
+            "status": "completed",
+        }
+        if identity:
+            item["namespace"] = identity[0]
+        output.append(item)
 
     usage = getattr(resp, "usage", None)
     input_tokens = getattr(usage, "prompt_tokens", 0) or 0
@@ -543,7 +579,13 @@ def openai_response_to_responses_api(resp, model: str, request_id: "str | None" 
     }
 
 
-def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" = None):
+def openai_chunks_to_responses_sse(
+    chunks,
+    model: str,
+    request_id: "str | None" = None,
+    *,
+    namespace_map: "dict[str, tuple[str, str]] | None" = None,
+):
     """OpenAI-style streaming chunks -> a Responses API SSE stream.
 
     Not verified against a live `codex` binary (see codex.py's docstring) --
@@ -639,26 +681,32 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                         text_item_id = None
                         text_parts = []
                     fc_id = f"fc_{uuid.uuid4().hex}"
+                    flattened_name = getattr(tc.function, "name", "") or ""
+                    identity = (namespace_map or {}).get(flattened_name)
                     tool_blocks[tc_index] = {
                         "output_index": output_index,
                         "id": fc_id,
                         "call_id": getattr(tc, "id", "") or "",
-                        "name": getattr(tc.function, "name", "") or "",
+                        "name": identity[1] if identity else flattened_name,
+                        "namespace": identity[0] if identity else None,
                         "args_parts": [],
                     }
+                    item = {
+                        "type": "function_call",
+                        "id": fc_id,
+                        "call_id": tool_blocks[tc_index]["call_id"],
+                        "name": tool_blocks[tc_index]["name"],
+                        "arguments": "",
+                        "status": "in_progress",
+                    }
+                    if identity:
+                        item["namespace"] = identity[0]
                     yield _sse(
                         "response.output_item.added",
                         {
                             "type": "response.output_item.added",
                             "output_index": output_index,
-                            "item": {
-                                "type": "function_call",
-                                "id": fc_id,
-                                "call_id": tool_blocks[tc_index]["call_id"],
-                                "name": tool_blocks[tc_index]["name"],
-                                "arguments": "",
-                                "status": "in_progress",
-                            },
+                            "item": item,
                         },
                     )
                     output_index += 1
@@ -699,6 +747,7 @@ def openai_chunks_to_responses_sse(chunks, model: str, request_id: "str | None" 
                     "id": block["id"],
                     "call_id": block["call_id"],
                     "name": block["name"],
+                    **({"namespace": block["namespace"]} if block["namespace"] else {}),
                     "arguments": "".join(block["args_parts"]),
                     "status": "completed",
                 },

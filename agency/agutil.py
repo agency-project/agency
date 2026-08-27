@@ -313,10 +313,10 @@ def agency_tmp_root():
     (`agent._DEFAULT_LOG_DIR`) and the UDS gateway (`agharness_llm_gateway_dir`)
     both live under here.
 
-    Deliberately hardcoded to `/tmp/agency` rather than derived from
-    `tempfile.gettempdir()`: `gettempdir()` honours `$TMPDIR`, which on a
-    shared host is routinely redirected to scratch space under an aggressive
-    cleanup policy. Files there are *supposed* to be deletable, which is
+    Defaults to `/tmp/agency`; an absolute `AGENCY_RUNTIME_ROOT` may isolate
+    users on a shared host. `tempfile.gettempdir()` and `$TMPDIR` remain
+    ignored because shared scratch is routinely subject to aggressive cleanup.
+    Files there are *supposed* to be deletable, which is
     survivable for a scratch file and fatal for a live socket -- a reaped
     socket leaves the server advertising a path that no longer exists, and
     every request across the bridge then fails with a bare ENOENT (observed
@@ -329,9 +329,14 @@ def agency_tmp_root():
     A short root matters for a second reason -- see `UDS_SUN_PATH_MAX` and
     `new_uds_path`: every character here is spent from a 108-byte budget.
     """
+    import os
     from pathlib import Path
 
-    return Path("/tmp/agency")
+    override = os.environ.get("AGENCY_RUNTIME_ROOT")
+    root = Path(override) if override else Path("/tmp/agency")
+    if not root.is_absolute():
+        raise ValueError(f"AGENCY_RUNTIME_ROOT must be absolute, got {override!r}")
+    return root
 
 
 def agharness_llm_gateway_dir():

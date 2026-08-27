@@ -57,7 +57,8 @@ def test_system_prompt_no_output_json_when_raw_output():
 def test_system_prompt_keeps_json_for_normal_output():
     sk = agskill("t", "Summarise.", output_schema=agdata(summary=str))
     prompt = sk._build_system_prompt()
-    assert "return_summary" in prompt
+    assert "submit_output" in prompt
+    assert "return_summary" not in prompt
 
 
 def test_system_prompt_keeps_input_json_for_normal_input():

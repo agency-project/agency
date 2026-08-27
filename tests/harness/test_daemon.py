@@ -4,11 +4,15 @@ import base64
 import uuid
 from pathlib import Path
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from agency.agconfig import agConfig
 from agency.engine.clients import SandboxInteractionClient
 from agency.harness import daemon
 from agency.harness.adapters.base import AdapterRuntime, AttemptResult, agharness_backend
 from agency.harness.daemon import HarnessManager
+from agency.harness.llm_router import LlmRequestBudget, build_router
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
 
@@ -66,6 +70,7 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
     )
     expected = HarnessAttemptResult(ok=True, final_text="done")
     seen = []
+    budget_resets = []
     manager = HarnessManager.__new__(HarnessManager)
     manager._agconfig = agConfig()
     manager._engine_name = "agent-1"
@@ -76,6 +81,9 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
             "base_url": "http://127.0.0.1:8766",
             "resolve_model": lambda self: "model",
             "syscall_policy": object(),
+            "request_budget": type(
+                "Budget", (), {"reset": lambda self, limit: budget_resets.append(limit)}
+            )(),
         },
     )()
 
@@ -96,6 +104,42 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
             manager._harness_api.syscall_policy,
         )
     ]
+    assert budget_resets == [4, None]
+
+
+def test_llm_request_budget_rejects_calls_after_max_steps():
+    budget = LlmRequestBudget()
+    budget.reset(2)
+    assert budget.claim()
+    assert budget.claim()
+    assert not budget.claim()
+    budget.reset(None)
+    assert budget.claim()
+
+
+def test_llm_router_returns_non_retryable_error_when_budget_is_exhausted():
+    class Bridge:
+        @staticmethod
+        def validate_token(token):
+            return bool(token)
+
+        @staticmethod
+        def dispatch(*_args, **_kwargs):
+            raise AssertionError("exhausted requests must not reach the model")
+
+    budget = LlmRequestBudget()
+    budget.reset(0)
+    app = FastAPI()
+    app.include_router(build_router(Bridge(), budget))
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer benchmark"},
+        json={"messages": [{"role": "user", "content": "inspect"}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Agency harness max_steps exhausted"
 
 
 def test_harness_manager_returns_attempt_result_on_original_rpc():
@@ -106,6 +150,7 @@ def test_harness_manager_returns_attempt_result_on_original_rpc():
         prompt=PromptPayload("system", "user", "output"),
         harness="claude_code",
         max_steps=8,
+        suppress_builtin_tools=True,
     )
     expected = HarnessAttemptResult(
         ok=True,
