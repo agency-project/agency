@@ -111,7 +111,7 @@ class AgentEngine:
             self._execution_prompt = prompt
             retries_left = skill.max_output_schema_retries
             attempt: "HarnessAttemptResult | None" = None
-            prior_session = getattr(self._agent, "_harness_sessions", {}).get(self._agent.harness)
+            prior_session = context.harness_sessions.get(self._agent.harness)
             resume_session_id = prior_session.get("session_id") if prior_session else None
             prior_session_blob_b64 = prior_session.get("blob_b64") if prior_session else None
             while True:
@@ -129,11 +129,7 @@ class AgentEngine:
                     resume_session_id = attempt.session_id
                     prior_session_blob_b64 = attempt.session_blob_b64
                     if attempt.session_blob_b64 is not None:
-                        sessions = getattr(self._agent, "_harness_sessions", None)
-                        if sessions is None:
-                            sessions = {}
-                            self._agent._harness_sessions = sessions
-                        sessions[self._agent.harness] = {
+                        context.harness_sessions[self._agent.harness] = {
                             "session_id": attempt.session_id,
                             "blob_b64": attempt.session_blob_b64,
                         }

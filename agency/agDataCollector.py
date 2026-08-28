@@ -32,7 +32,15 @@ class agDataCollector:
         self._last_flush_ts = 0.0
 
     def set_config(self, agconfig: "agConfig") -> None:
-        self._configs = agconfig.agDataCollectorConfigs
+        configs = agconfig.__dict__.get("agDataCollectorConfigs")
+        if configs is None:
+            configs = getattr(self, "_configs", None)
+            if configs is None:
+                raise ValueError(
+                    "agDataCollector requires agconfig.agDataCollectorConfigs on first use"
+                )
+            agconfig.agDataCollectorConfigs = configs
+        self._configs = configs
 
     def start(self) -> None:
         Path(self._configs.db_path).parent.mkdir(parents=True, exist_ok=True)

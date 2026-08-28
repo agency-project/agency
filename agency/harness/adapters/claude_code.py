@@ -73,11 +73,11 @@ def _resolve_binary_in_container(sandbox, binary: str) -> "str | None":
 # recovers the exact original conversation, with real prompt-cache hits;
 # without the file, --resume fails cleanly ("No conversation found").
 #
-# Deliberately NOT the source of truth for history -- ag.ctx stays that,
-# engine-agnostic and sandbox-independent. This is a per-engine, opt-in
-# optimization: extracted from and reinjected into whatever sandbox handles
-# the next call, stored on the agent itself (ag._harness_sessions, and
-# agent.save()/load()'s state.json), never on the sandbox's own filesystem.
+# Deliberately NOT the source of truth for history -- ag.ctx.recent_transcript
+# stays that. This is a per-engine, opt-in optimization: extracted from and
+# reinjected into whatever sandbox handles the next call, stored on
+# ag.ctx.harness_sessions (and agent.save()/load()'s state.json), never on
+# the sandbox's own filesystem.
 _SESSION_SLUG_RE = re.compile(r"[^a-zA-Z0-9]")
 
 

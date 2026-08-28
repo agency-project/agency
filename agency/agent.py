@@ -281,16 +281,6 @@ class agent:
         self._snapshot_messages: list[dict] = []
         self.inbox: queue.Queue[str] = queue.Queue()
         self._state = agent_state(str(self.agname))
-        # Per-harness-engine native session continuity (see
-        # docs/Design_harness_history.md) -- {"claude_code": {"session_id":
-        # ..., "blob_b64": ...}, ...}. Deliberately NOT part of `self.ctx`:
-        # `agcontext` stays the portable, engine-agnostic history object
-        # (attachable to any sandbox); this is a per-engine optimization
-        # layered on top, extracted from and reinjected into whatever
-        # sandbox handles the next call, never a replacement for it. Empty
-        # until a harness backend that supports this (currently only
-        # claude_code.py) actually populates it after a run.
-        self._harness_sessions: "dict[str, dict]" = {}  # [REFACTOR] Merge with full_history?
 
         _live_agents.add(self)
 
@@ -558,11 +548,6 @@ class agent:
         ag.engine = AgentEngine(ag)
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
-        # Native harness continuity is part of the agent's logical history,
-        # just like ``ctx``.  A fork must inherit the snapshot that existed at
-        # fork time while remaining free to advance its own external-engine
-        # session without mutating the parent (or a sibling fork).
-        ag._harness_sessions = copy.deepcopy(src._harness_sessions)
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
@@ -675,12 +660,12 @@ class agent:
             # container.tar is in -- a chroot snapshot directory and a
             # docker/podman image tag are unrelated formats.
             state["sandbox_image_kind"] = self.sandbox.image_kind
-        if self._harness_sessions:
+        if self.ctx.harness_sessions:
             # See docs/Design_harness_history.md -- travels with the
             # agent's own checkpoint, not with container.tar, so it's
             # available regardless of which sandbox this checkpoint is
             # later restored onto.
-            state["harness_sessions"] = self._harness_sessions
+            state["harness_sessions"] = self.ctx.harness_sessions
         state_bytes = json.dumps(state, indent=2).encode()
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -772,7 +757,10 @@ class agent:
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
         ag.engine = AgentEngine(ag)
-        ag.ctx = agcontext(recent_transcript=list(state.get("history", [])))
+        ag.ctx = agcontext(
+            recent_transcript=list(state.get("history", [])),
+            harness_sessions=state.get("harness_sessions", {}),
+        )
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
@@ -804,7 +792,6 @@ class agent:
         ag._snapshot_messages: list[dict] = []
         ag.inbox: queue.Queue = queue.Queue()
         ag._state = agent_state(str(ag.agname))
-        ag._harness_sessions = state.get("harness_sessions", {})
 
         _live_agents.add(ag)
 

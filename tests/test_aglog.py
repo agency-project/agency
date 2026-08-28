@@ -33,7 +33,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
             self._agent, context, skill_input, max_steps=max_steps
         )
         context.recent_transcript = updated_context.recent_transcript
-        context.compaction_summary = updated_context.compaction_summary
+        context.harness_sessions = updated_context.harness_sessions
         return output
 
     monkeypatch.setattr(AgentEngine, "execute", execute)

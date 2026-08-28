@@ -39,7 +39,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
             self._agent, context, skill_input, max_steps=max_steps
         )
         context.recent_transcript = updated_context.recent_transcript
-        context.compaction_summary = updated_context.compaction_summary
+        context.harness_sessions = updated_context.harness_sessions
         return output
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
@@ -442,14 +442,14 @@ def test_fork_deep_copies_history():
 
 def test_fork_deep_copies_harness_sessions():
     ag = make_agent()
-    ag._harness_sessions = {"claude_code": {"session_id": "session-1", "blob_b64": "c3RhdGU="}}
+    ag.ctx.harness_sessions = {"claude_code": {"session_id": "session-1", "blob_b64": "c3RhdGU="}}
 
     forked = agent.fork(ag)
-    forked._harness_sessions["claude_code"]["session_id"] = "session-2"
+    forked.ctx.harness_sessions["claude_code"]["session_id"] = "session-2"
 
-    assert ag._harness_sessions["claude_code"]["session_id"] == "session-1"
-    assert forked._harness_sessions is not ag._harness_sessions
-    assert forked._harness_sessions["claude_code"] is not ag._harness_sessions["claude_code"]
+    assert ag.ctx.harness_sessions["claude_code"]["session_id"] == "session-1"
+    assert forked.ctx.harness_sessions is not ag.ctx.harness_sessions
+    assert forked.ctx.harness_sessions["claude_code"] is not ag.ctx.harness_sessions["claude_code"]
 
 
 def test_fork_copies_history_and_config():

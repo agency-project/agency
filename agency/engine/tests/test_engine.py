@@ -75,7 +75,6 @@ class _FakeAgent:
         self.sandbox = _FakeSandbox()
         self.harness = "claude_code"
         self.agname = "test-agent"
-        self._harness_sessions = {}
         self.change_config_calls = []
         self.inbox = queue.Queue()
 
@@ -455,7 +454,7 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
 
     result = engine.execute(
-        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+        agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
     )
 
     manager = holder["manager"]
@@ -479,7 +478,7 @@ def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypa
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
     result = engine.execute(
-        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+        agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
     )
 
     assert [request.prompt for request in holder["requests"]] == ["p0"]
@@ -510,7 +509,7 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
 
     result = engine.execute(
-        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+        agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
     )
 
     assert [request.prompt for request in holder["requests"]] == [p0, p1]
@@ -537,10 +536,9 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
         collected_sequence=[{}, {"summary": "x"}],
     )
     agent = _FakeAgent()
-    agent._harness_sessions["claude_code"] = {
-        "session_id": "session-1",
-        "blob_b64": "cHJpb3I=",
-    }
+    context = agcontext(
+        harness_sessions={"claude_code": {"session_id": "session-1", "blob_b64": "cHJpb3I="}}
+    )
     engine = AgentEngine(agent)
     execution = agdata(result="second")
     prompt = PromptPayload("system", "prompt")
@@ -549,9 +547,7 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=1)
 
-    result = engine.execute(
-        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), agent.sandbox
-    )
+    result = engine.execute(context, skill, SimpleNamespace(), SimpleNamespace(), agent.sandbox)
 
     first, second = holder["requests"]
     assert (first.resume_session_id, first.prior_session_blob_b64) == (
@@ -562,7 +558,7 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
         "session-2",
         "dXBkYXRlZA==",
     )
-    assert agent._harness_sessions["claude_code"] == {
+    assert context.harness_sessions["claude_code"] == {
         "session_id": "session-2",
         "blob_b64": "ZmluYWw=",
     }
@@ -589,7 +585,7 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=2)
 
     result = engine.execute(
-        SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+        agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
     )
 
     # 1 initial attempt + 2 retries = 3 calls total, then gives up
@@ -612,7 +608,7 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
 
     monkeypatch.setattr(engine, "_build_execution_result", fake_build_result)
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
-    context = SimpleNamespace(marker="ctx")
+    context = SimpleNamespace(marker="ctx", harness_sessions={})
 
     result = engine.execute(
         context, skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox

@@ -460,7 +460,7 @@ class agskill:
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
                 # ── 2. Delegate actual execution to the Agent Engine.
-                execution = ag.engine.execute(
+                outer_result = ag.engine.execute(
                     context=prev_ctx,
                     skill=self,
                     skill_input=local_skill_input,
@@ -468,7 +468,6 @@ class agskill:
                     sandbox=ag.sandbox,
                     max_steps=max_steps,
                 )
-                outer_result = execution.output
 
             except Exception as exc:
                 outer_result = agerror(format_exception(exc))

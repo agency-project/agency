@@ -365,10 +365,11 @@ def test_real_claude_structured_output_end_to_end():
 @real_claude
 def test_real_claude_history_continues_across_a_fresh_sandbox():
     """Session continuity (docs/Design_harness_history.md) travels with the
-    AGENT (`ag._harness_sessions`), not with any particular container: call 1
-    tells the agent a fact, then `ag.sandbox` is swapped for a brand-new
-    sandbox (a different container instance) before call 2 asks the agent to
-    recall that fact via `--resume` against the captured session blob."""
+    AGENT (`ag.ctx.harness_sessions`), not with any particular container:
+    call 1 tells the agent a fact, then `ag.sandbox` is swapped for a
+    brand-new sandbox (a different container instance) before call 2 asks
+    the agent to recall that fact via `--resume` against the captured
+    session blob."""
     cfg = agConfig(
         agSandboxBackendConfig(backend="docker"),
         agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
@@ -392,7 +393,7 @@ def test_real_claude_history_continues_across_a_fresh_sandbox():
         raw1 = r1.to_dict()
         assert "error" not in raw1, raw1
 
-        stored = ag._harness_sessions.get("claude_code")
+        stored = ag.ctx.harness_sessions.get("claude_code")
         assert stored and stored.get("session_id"), "no session captured after call 1"
     finally:
         ag.sandbox.rm_container()

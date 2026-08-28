@@ -11,24 +11,22 @@ if TYPE_CHECKING:
 class agcontext:
     """Persistent conversation state owned by an agent and passed through each skill run.
 
-    Accumulates across all skill calls on the same agent so compaction state
-    carries forward for the lifetime of the agent session.
-
     Fields
     ------
     recent_transcript   : reconstructed transcript of the most recent skill run
                            (overwritten each run, not accumulated)
-    compaction_summary  : rolling summary produced by conversation compaction
+    harness_sessions    : per-harness session continuity, e.g.
+                           {"claude_code": {"session_id": ..., "blob_b64": ...}}
     """
 
     def __init__(
         self,
         recent_transcript: "list[dict] | None" = None,
-        compaction_summary: "str | None" = None,
+        harness_sessions: "dict[str, dict] | None" = None,
         _future: "Future[agcontext] | None" = None,
     ) -> None:
         self.recent_transcript = recent_transcript if recent_transcript is not None else []
-        self.compaction_summary = compaction_summary
+        self.harness_sessions = harness_sessions if harness_sessions is not None else {}
         self._future = _future
 
     # ------------------------------------------------------------------
@@ -45,7 +43,7 @@ class agcontext:
         with agpause.note_blocked_on(agpause.producer_of(self._future)):
             prev_ctx = self._future.result()
         self.recent_transcript = prev_ctx.recent_transcript
-        self.compaction_summary = prev_ctx.compaction_summary
+        self.harness_sessions = prev_ctx.harness_sessions
         self._future = None
 
     # ------------------------------------------------------------------
@@ -66,13 +64,13 @@ class agcontext:
         self.resolve_prev_dependencies()
         return agcontext(
             recent_transcript=copy.deepcopy(self.recent_transcript),
-            compaction_summary=self.compaction_summary,
+            harness_sessions=copy.deepcopy(self.harness_sessions),
         )
 
     def __repr__(self) -> str:
         pending = " (pending)" if self._future is not None else ""
         return (
             f"agcontext(recent_transcript={len(self.recent_transcript)}"
-            f"  compact={'yes' if self.compaction_summary else 'no'}"
+            f"  harnesses={sorted(self.harness_sessions)}"
             f"){pending}"
         )
