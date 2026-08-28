@@ -11,28 +11,23 @@ if TYPE_CHECKING:
 class agcontext:
     """Persistent conversation state owned by an agent and passed through each skill run.
 
-    Accumulates across all skill calls on the same agent so token totals and
-    compaction state carry forward for the lifetime of the agent session.
+    Accumulates across all skill calls on the same agent so compaction state
+    carries forward for the lifetime of the agent session.
 
     Fields
     ------
-    messages            : conversation history (excludes the per-skill system prompt)
-    total_input_tokens  : cumulative input tokens across all LLM calls so far
-    total_output_tokens : cumulative output tokens across all LLM calls so far
+    recent_transcript   : reconstructed transcript of the most recent skill run
+                           (overwritten each run, not accumulated)
     compaction_summary  : rolling summary produced by conversation compaction
     """
 
     def __init__(
         self,
-        messages: "list[dict] | None" = None,
-        total_input_tokens: int = 0,
-        total_output_tokens: int = 0,
+        recent_transcript: "list[dict] | None" = None,
         compaction_summary: "str | None" = None,
         _future: "Future[agcontext] | None" = None,
     ) -> None:
-        self.messages = messages if messages is not None else []
-        self.total_input_tokens = total_input_tokens
-        self.total_output_tokens = total_output_tokens
+        self.recent_transcript = recent_transcript if recent_transcript is not None else []
         self.compaction_summary = compaction_summary
         self._future = _future
 
@@ -49,9 +44,7 @@ class agcontext:
             return
         with agpause.note_blocked_on(agpause.producer_of(self._future)):
             prev_ctx = self._future.result()
-        self.messages = prev_ctx.messages
-        self.total_input_tokens = prev_ctx.total_input_tokens
-        self.total_output_tokens = prev_ctx.total_output_tokens
+        self.recent_transcript = prev_ctx.recent_transcript
         self.compaction_summary = prev_ctx.compaction_summary
         self._future = None
 
@@ -59,31 +52,27 @@ class agcontext:
     # Helpers
     # ------------------------------------------------------------------
 
-    def get_resolved_messages(self) -> "list[dict]":
-        """Block until pending, then return a snapshot of the message list."""
+    def get_resolved_transcript(self) -> "list[dict]":
+        """Block until pending, then return a snapshot of the recent transcript."""
         self.resolve_prev_dependencies()
-        return list(self.messages)
+        return list(self.recent_transcript)
 
-    def set_messages(self, messages: "list[dict]") -> None:
-        """Replace the message list directly."""
-        self.messages = list(messages)
+    def set_transcript(self, recent_transcript: "list[dict]") -> None:
+        """Replace the recent transcript directly."""
+        self.recent_transcript = list(recent_transcript)
 
     def copy(self) -> "agcontext":
         """Return a deep copy of the resolved context (blocks if pending)."""
         self.resolve_prev_dependencies()
         return agcontext(
-            messages=copy.deepcopy(self.messages),
-            total_input_tokens=self.total_input_tokens,
-            total_output_tokens=self.total_output_tokens,
+            recent_transcript=copy.deepcopy(self.recent_transcript),
             compaction_summary=self.compaction_summary,
         )
 
     def __repr__(self) -> str:
         pending = " (pending)" if self._future is not None else ""
         return (
-            f"agcontext(msgs={len(self.messages)}"
-            f"  in={self.total_input_tokens}"
-            f"  out={self.total_output_tokens}"
+            f"agcontext(recent_transcript={len(self.recent_transcript)}"
             f"  compact={'yes' if self.compaction_summary else 'no'}"
             f"){pending}"
         )

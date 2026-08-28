@@ -11,7 +11,6 @@ from agency.agent import agent
 from agency.agname import agname as _agname
 from agency.agconfig import agConfig
 from agency.engine import AgentEngine
-from agency.engine.types import ExecutionResult
 
 
 @pytest.fixture(autouse=True)
@@ -36,10 +35,12 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
                 sandbox=sandbox,
                 max_steps=max_steps,
             )
-        output, updated_context, delta = stub(
+        output, updated_context, _delta = stub(
             self._agent, context, skill_input, max_steps=max_steps
         )
-        return ExecutionResult(output=output, context=updated_context, delta=delta)
+        context.recent_transcript = updated_context.recent_transcript
+        context.compaction_summary = updated_context.compaction_summary
+        return output
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
 
@@ -248,11 +249,7 @@ def test_run_dispatches_to_agent_engine(harness_name):
     class FakeAgentEngine:
         def execute(self, **kwargs):
             calls.append(kwargs)
-            return ExecutionResult(
-                output=agdata(done=True),
-                context=kwargs["context"],
-                delta=[],
-            )
+            return agdata(done=True)
 
     skill = agskill(name="s", system_prompt="")
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), harness=harness_name)
@@ -282,11 +279,11 @@ def test_history_updated_after_run():
     skill = agskill(name="s", system_prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        new_msgs = list(prev_ctx.messages) + [
+        new_msgs = list(prev_ctx.recent_transcript) + [
             {"role": "user", "content": inp.to_json()},
             {"role": "assistant", "content": "{}"},
         ]
-        return agdata(ok=True), agcontext(messages=new_msgs), []
+        return agdata(ok=True), agcontext(recent_transcript=new_msgs), []
 
     skill._test_execute = fake_execute_react
     ag = make_agent()
@@ -309,8 +306,8 @@ def test_sequential_calls_serialize_via_history_chain():
         def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
             with lock:
                 order.append(name)
-            new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
-            return agdata(name=name), agcontext(messages=new_msgs), []
+            new_msgs = list(prev_ctx.recent_transcript) + [{"role": "user", "content": name}]
+            return agdata(name=name), agcontext(recent_transcript=new_msgs), []
 
         sk._test_execute = fake_execute_react
         return sk
@@ -340,7 +337,7 @@ def test_history_passed_to_agskill():
 
     ag.run(skill, agdata(x=1))
     _ = ag.history  # sync
-    assert received["hist"].messages[0]["content"] == "prior"
+    assert received["hist"].recent_transcript[0]["content"] == "prior"
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +467,7 @@ def test_fork_waits_for_inflight_task():
     skill = agskill("s", "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        new_ctx = agcontext(messages=[{"role": "user", "content": str(inp.v)}])
+        new_ctx = agcontext(recent_transcript=[{"role": "user", "content": str(inp.v)}])
         return agdata(v=inp.v), new_ctx, []
 
     skill._test_execute = fake_execute_react
@@ -492,7 +489,7 @@ def test_fork_runs_do_not_update_parent_history():
     skill = agskill("s", "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        new_ctx = agcontext(messages=[{"role": "user", "content": "fork_msg"}])
+        new_ctx = agcontext(recent_transcript=[{"role": "user", "content": "fork_msg"}])
         return agdata(ok=True), new_ctx, []
 
     skill._test_execute = fake_execute_react
@@ -538,7 +535,7 @@ def test_fork_sees_parent_history_at_fork_time():
     skill = agskill("s", "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        seen["hist"] = list(prev_ctx.messages)
+        seen["hist"] = list(prev_ctx.recent_transcript)
         return agdata(), prev_ctx, []
 
     skill._test_execute = fake_execute_react
@@ -755,7 +752,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     skill_write = agskill(name="write", system_prompt="")
 
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
-        new_ctx = agcontext(messages=[{"role": "assistant", "content": "42"}])
+        new_ctx = agcontext(recent_transcript=[{"role": "assistant", "content": "42"}])
         return agdata(answer="42"), new_ctx, []
 
     skill_write._test_execute = fake_write
@@ -772,7 +769,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     assert ag2.agname == saved_agname
-    assert len(ag2.ctx.messages) > 0
+    assert len(ag2.ctx.recent_transcript) > 0
     assert ag2 in agent.all()
 
     events = ag2.log.events

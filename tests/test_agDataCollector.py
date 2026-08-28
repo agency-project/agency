@@ -9,7 +9,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from agency.engine.agDataCollector import agDataCollector, agDataCollectorConfigs
+from agency.agDataCollector import agDataCollector, agDataCollectorConfigs
 
 
 # ---------------------------------------------------------------------------

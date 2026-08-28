@@ -10,9 +10,9 @@ from fastapi.responses import JSONResponse
 from ...harness._syscall_event import agsyscallevent
 
 if TYPE_CHECKING:
+    from ...agDataCollector import agDataCollector
     from ...agent import agent
     from ...agskill import agskill
-    from ..agDataCollector import agDataCollector
 
 
 class HostInteractionServer:

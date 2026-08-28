@@ -11,7 +11,6 @@ import uvicorn
 from fastapi import FastAPI
 
 from ...agutil import new_uds_path
-from ..agDataCollector import agDataCollector, agDataCollectorConfigs
 from .host_interaction_server import HostInteractionServer
 from .host_mcp_server import HostMcpServer
 from .llm_handler_server import LlmHandlerServer
@@ -42,7 +41,7 @@ class HostServerManager:
         from ...profiler import agprof
 
         self._ensure_runtime_configs(agent.agconfig)
-        self._data_collector = agDataCollector(agent.agconfig)
+        self._data_collector = agent.data_collector
         self._llm_handler_server = LlmHandlerServer(
             agent.agconfig, parent_context=agprof.current_span_context()
         )
@@ -61,10 +60,13 @@ class HostServerManager:
     def host_mcp_server(self) -> "HostMcpServer":
         return self._host_mcp_server
 
+    @property
+    def llm_handler_server(self) -> "LlmHandlerServer":
+        return self._llm_handler_server
+
     def set_config(self, agconfig: "agConfig") -> None:
         self._ensure_runtime_configs(agconfig)
         self._configs = agconfig.HostServerManagerConfigs
-        self._data_collector.set_config(agconfig)
         self._llm_handler_server.set_config(agconfig)
 
     def _ensure_runtime_configs(self, agconfig: "agConfig") -> None:
@@ -75,19 +77,9 @@ class HostServerManager:
             manager_configs = HostServerManagerConfigs(uds_path=new_uds_path("host"))
         agconfig.HostServerManagerConfigs = manager_configs
 
-        collector_configs = agconfig.__dict__.get("agDataCollectorConfigs")
-        if collector_configs is None and hasattr(self, "_data_collector"):
-            collector_configs = self._data_collector._configs
-        if collector_configs is None:
-            database_path = str(Path(manager_configs.uds_path).with_suffix(".sqlite3"))
-            collector_configs = agDataCollectorConfigs(db_path=database_path)
-        agconfig.agDataCollectorConfigs = collector_configs
-
     def start(self) -> str:
         if self._server is not None:
             return self._configs.uds_path
-
-        self._data_collector.start()
 
         Path(self._configs.uds_path).parent.mkdir(parents=True, exist_ok=True)
         mcp_app = self._host_mcp_server.build_app()
@@ -134,4 +126,3 @@ class HostServerManager:
         self._server_thread = None
 
         self._llm_handler_server.stop()
-        self._data_collector.stop()

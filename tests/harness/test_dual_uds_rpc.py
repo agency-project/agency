@@ -6,9 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agency.agconfig import agConfig
+from agency.agDataCollector import agDataCollector, agDataCollectorConfigs
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
-from agency.engine.agDataCollector import agDataCollectorConfigs
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
     HostServerManagerConfigs,
@@ -42,7 +42,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
     config = agConfig({"agllm_backend": {"model": "test-model"}})
     config.HostServerManagerConfigs = HostServerManagerConfigs(uds_path=str(host_socket))
     config.agDataCollectorConfigs = agDataCollectorConfigs(db_path=str(database))
-    agent = SimpleNamespace(agconfig=config, inbox=object())
+    agent = SimpleNamespace(agconfig=config, inbox=object(), data_collector=agDataCollector(config))
     skill = agskill(
         name="mock-attempt",
         system_prompt="mock",

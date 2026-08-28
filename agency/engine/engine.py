@@ -7,7 +7,6 @@ from ..profiler import agprof
 from ..sandbox.agsandbox import agSandbox
 from .harness_daemon_launcher import ensure_harness_daemon
 from .host_servers.host_server_manager import HostServerManager
-from .types import ExecutionResult
 
 if TYPE_CHECKING:
     from ..agconfig import agConfig
@@ -46,14 +45,14 @@ class AgentEngine:
         resource_pool: "agResourcePool",
         sandbox: agSandbox,
         max_steps: "int | None" = None,
-    ) -> ExecutionResult:
+    ) -> "agdata":
         """Execute one request and own its complete sandbox transaction."""
 
         sandbox_lock = sandbox._lock
         sandbox_lock.acquire()
         try:
             try:
-                execution = self._execute_harness(
+                output = self._execute_harness(
                     context,
                     skill,
                     skill_input,
@@ -65,16 +64,16 @@ class AgentEngine:
                 self._discard_sandbox(sandbox)
                 raise
 
-            if self._execution_failed(execution):
+            if self._execution_failed(output):
                 self._discard_sandbox(sandbox)
-                return execution
+                return output
 
             try:
                 self._commit_sandbox(sandbox)
             except BaseException:
                 self._discard_sandbox(sandbox)
                 raise
-            return execution
+            return output
         finally:
             sandbox_lock.release()
 
@@ -86,7 +85,7 @@ class AgentEngine:
         resource_pool: "agResourcePool",
         sandbox: agSandbox,
         max_steps: "int | None" = None,
-    ) -> ExecutionResult:
+    ) -> "agdata":
         """Run host services and the sandbox-side harness while locked."""
 
         # Start connections
@@ -154,8 +153,10 @@ class AgentEngine:
                 self._sandbox_interaction_client = None
             self._host_server_manager.stop()
 
-    def _execution_failed(self, execution: ExecutionResult) -> bool:
-        return not execution.ok
+    def _execution_failed(self, output: "agdata") -> bool:
+        from ..agdata import agerror
+
+        return isinstance(output, agerror)
 
     def _discard_sandbox(self, sandbox: "agSandbox") -> None:
         with agprof.span("teardown:discard"):
@@ -276,19 +277,17 @@ class AgentEngine:
         skill: "agskill",
         attempt: "HarnessAttemptResult | None",
         sandbox: agSandbox,
-    ) -> ExecutionResult:
+    ) -> "agdata":
         from ..agdata import agdata, agerror
 
-        system_message = {"role": "system", "content": skill._build_system_prompt()}
+        needle = self._execution_prompt.user_content if self._execution_prompt is not None else None
+        context.recent_transcript = (
+            self._host_server_manager.llm_handler_server.get_main_transcript(needle)
+        )
+
         if attempt is None or not attempt.ok:
             message = attempt.error_message if attempt is not None else "no attempt was made"
-            return ExecutionResult(
-                output=agerror(message),
-                context=context,
-                delta=[system_message],
-                ok=False,
-                error_message=message,
-            )
+            return agerror(message)
 
         output_schema = skill.output_schema
         if output_schema is not None and output_schema.raw_key() is None:
@@ -296,40 +295,14 @@ class AgentEngine:
             missing = sorted(set(output_schema._data) - set(collected))
             recovered = self._recover_structured_output(skill, attempt, sandbox)
             if not missing:
-                output = agdata(**collected)
-                ok = True
-                error_message = ""
-            elif recovered is not None:
-                output = recovered
-                ok = True
-                error_message = ""
-            else:
-                message = (
-                    "structured output incomplete after retries -- response was not valid JSON "
-                    "and submit_output was never called for: " + ", ".join(missing)
-                )
-                output = agerror(message)
-                ok = False
-                error_message = message
-        else:
-            output_key = output_schema.raw_key() if output_schema is not None else "result"
-            output = agdata(**{output_key: attempt.final_text})
-            ok = True
-            error_message = ""
+                return agdata(**collected)
+            if recovered is not None:
+                return recovered
+            message = (
+                "structured output incomplete after retries -- response was not valid JSON "
+                "and submit_output was never called for: " + ", ".join(missing)
+            )
+            return agerror(message)
 
-        context.total_input_tokens += attempt.input_tokens
-        context.total_output_tokens += attempt.output_tokens
-
-        messages: "list[dict]" = []
-        if self._execution_prompt is not None:
-            messages.append({"role": "user", "content": self._execution_prompt.user_content})
-        messages.append({"role": "assistant", "content": attempt.final_text})
-        context.messages.extend(messages)
-
-        return ExecutionResult(
-            output=output,
-            context=context,
-            delta=[system_message, *messages],
-            ok=ok,
-            error_message=error_message,
-        )
+        output_key = output_schema.raw_key() if output_schema is not None else "result"
+        return agdata(**{output_key: attempt.final_text})

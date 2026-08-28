@@ -12,9 +12,9 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from agency.agconfig import agConfig
+from agency.agDataCollector import agDataCollector, agDataCollectorConfigs
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
-from agency.engine.agDataCollector import agDataCollectorConfigs
 from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
@@ -29,24 +29,20 @@ def _make_manager(tmp_path, policy=None):
     agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
     agconfig.HostServerManagerConfigs = configs
     agconfig.agDataCollectorConfigs = data_collector_configs
-    agent = SimpleNamespace(agconfig=agconfig, inbox=object())
+    agent = SimpleNamespace(
+        agconfig=agconfig, inbox=object(), data_collector=agDataCollector(agconfig)
+    )
     sandbox = SimpleNamespace()
     skill = SimpleNamespace(policy=policy if policy is not None else agpolicy())
     resource_pool = SimpleNamespace()
     return HostServerManager(agent, sandbox, skill, resource_pool), agent, skill
 
 
-def test_construction_provisions_runtime_paths_when_config_has_no_ad_hoc_attributes():
-    agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
-    agent = SimpleNamespace(agconfig=agconfig, inbox=object())
-    skill = SimpleNamespace(policy=agpolicy())
-
-    manager = HostServerManager(agent, SimpleNamespace(), skill, SimpleNamespace())
+def test_construction_uses_the_agents_own_data_collector(tmp_path):
+    manager, agent, _ = _make_manager(tmp_path)
 
     assert manager._configs.uds_path.endswith(".sock")
-    assert manager._data_collector._configs.db_path == str(
-        Path(manager._configs.uds_path).with_suffix(".sqlite3")
-    )
+    assert manager._data_collector is agent.data_collector
 
 
 def test_construction_wires_agent_and_skill_into_interaction_server(tmp_path):
@@ -85,7 +81,9 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
     agconfig.HostServerManagerConfigs = configs
     agconfig.agDataCollectorConfigs = data_collector_configs
-    agent = SimpleNamespace(agconfig=agconfig, inbox=object())
+    agent = SimpleNamespace(
+        agconfig=agconfig, inbox=object(), data_collector=agDataCollector(agconfig)
+    )
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())
     resource_pool = SimpleNamespace()

@@ -59,13 +59,11 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
     ag.terminal = MagicMock()
     ag._state = _agent_state_cls("test")
     ag.log = MagicMock()
-    ag.log.token_usage = {}
     ag.agname = "test"
     ag._set_ui_state = MagicMock()
     ag._push_live_messages = MagicMock()
     ag._append_full_history = MagicMock()
     ag._next_inbox_msg = MagicMock(return_value=None)
-    ag.push_token_count_update_to_ui = MagicMock()
     return ag
 
 

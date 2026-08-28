@@ -29,6 +29,7 @@ _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 from .agdata import agdata
 from .agcontext import agcontext
+from .agDataCollector import agDataCollector, agDataCollectorConfigs
 from .aglog import aglog, _ts
 from .agterm import agterm
 from .sandbox.agsandbox import agSandbox, agSandboxConfig
@@ -190,25 +191,6 @@ class agent:
     # with no agconfig= kwarg) still pick up a run-wide agConfig.
     default_agconfig: "ClassVar[agConfig | None]" = None  # [REFACTOR] Remove
 
-    # Global token counter — accumulates across all agents and skill calls.
-    _global_input_tokens: ClassVar[int] = 0
-    _global_output_tokens: ClassVar[int] = 0
-    _global_token_lock: ClassVar[threading.Lock] = threading.Lock()
-
-    @classmethod
-    def _add_global_tokens(cls, inp: int, out: int) -> None:
-        with cls._global_token_lock:
-            cls._global_input_tokens += inp
-            cls._global_output_tokens += out
-
-    @classmethod
-    def global_token_usage(cls) -> dict:
-        """Framework-wide cumulative token usage across all agents and skill calls."""
-        with cls._global_token_lock:  # [REFACTOR] Lock needed for read?
-            inp = cls._global_input_tokens
-            out = cls._global_output_tokens
-        return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
-
     def __init__(
         self,
         agname: str | None = None,
@@ -287,6 +269,15 @@ class agent:
         self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
         self.terminal = agterm(self.agname)
 
+        data_collector_configs = self.agconfig.__dict__.get("agDataCollectorConfigs")
+        if data_collector_configs is None:
+            data_collector_configs = agDataCollectorConfigs(
+                db_path=str(log_dir / f"{self.agname}_data.sqlite3")
+            )
+            self.agconfig.agDataCollectorConfigs = data_collector_configs
+        self.data_collector = agDataCollector(self.agconfig)
+        self.data_collector.start()
+
         self._snapshot_messages: list[dict] = []
         self.inbox: queue.Queue[str] = queue.Queue()
         self._state = agent_state(str(self.agname))
@@ -329,7 +320,8 @@ class agent:
         """Replace this agent's agconfig with a clone of the given one, and
         push that same clone down to every sub-object that holds its own
         independent copy (``self.llm`` -- and its backend --, ``self.log``,
-        ``self.sandbox`` if one has been created, and ``self.engine``).
+        ``self.data_collector``, ``self.sandbox`` if one has been created,
+        and ``self.engine``).
         Reassigning
         ``self.agconfig`` alone does not reach those clones, so this is the
         supported way to change live config (e.g. ``max_completion_tokens``)
@@ -337,6 +329,7 @@ class agent:
         self.agconfig = agconfig.clone()
         self.llm.change_config(self.agconfig)
         self.log.change_config(self.agconfig)
+        self.data_collector.set_config(self.agconfig)
         if self.sandbox is not None:
             self.sandbox.change_config(self.agconfig)
         self.engine.set_config(self.agconfig)
@@ -365,17 +358,13 @@ class agent:
         return f"/agent_output/{self.agname}"
 
     @property
-    def token_usage(self) -> dict:
-        return self.log.token_usage
-
-    @property
     def history(self) -> agdata:
         """Return the current history, blocking until any in-flight task finishes."""
-        return agdata(messages=self.ctx.get_resolved_messages())
+        return agdata(messages=self.ctx.get_resolved_transcript())
 
     @history.setter
     def history(self, value: agdata) -> None:
-        self.ctx.set_messages(value._data.get("messages", []))
+        self.ctx.set_transcript(value._data.get("messages", []))
 
     @property
     def full_history(self) -> list[dict]:
@@ -495,26 +484,6 @@ class agent:
             _seen.add(self.agname)
             return producer.is_settled(_seen)
         return self._state.state in _SETTLED_LEAF_STATES
-
-    # [REFACTOR] Single emition point?
-    def push_token_count_update_to_ui(self, skill_inp: int, skill_out: int) -> None:
-        """Push a live token update to the webui (called from agskill mid-loop)."""
-        try:
-            from . import agwebui as _agwebui
-
-            if _agwebui._active is None:
-                return
-            _gl = agent.global_token_usage()
-            _before = self.log.token_usage
-            _agwebui._active.emitter.token_update(
-                self.agname,
-                _before["input_tokens"] + skill_inp,
-                _before["output_tokens"] + skill_out,
-                _gl["input_tokens"],
-                _gl["output_tokens"],
-            )
-        except Exception as _e:
-            print(f"[agent] WARNING: live token_update push failed for {self.agname}: {_e}")
 
     # ------------------------------------------------------------------
     # Execution — delegates to agskill
@@ -698,7 +667,7 @@ class agent:
             "parent_agent_id": self._parent_agent_id,
             "harness": self.harness,
             "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
-            "history": self.ctx.messages,
+            "history": self.ctx.recent_transcript,
             "ts": _ts(),
         }
         if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
@@ -803,7 +772,7 @@ class agent:
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
         ag.engine = AgentEngine(ag)
-        ag.ctx = agcontext(messages=list(state.get("history", [])))
+        ag.ctx = agcontext(recent_transcript=list(state.get("history", [])))
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig

@@ -97,7 +97,7 @@ class _StreamHandle:
         # This connection's own exchange -- kept on the handle rather than a
         # shared instance-wide list so one connection's in-progress writes
         # can never race another connection's. See
-        # LlmHandlerServer.get_transcripts(). None until the first
+        # LlmHandlerServer.get_all_transcripts(). None until the first
         # register_stream_exchange() call creates it.
         self._entry: "dict | None" = None
         self._transcript_lock = threading.Lock()
@@ -167,20 +167,12 @@ class LlmHandlerServer:
         # Keep the durable OTel context captured by HostServerManager and use
         # it explicitly for every LLM attempt span.
         self._parent_context = parent_context
-        # Non-streaming exchanges only -- a streaming call's exchange lives
-        # on its own _StreamHandle instead (see _StreamHandle.get_transcript),
-        # so each connection's in-progress writes can't race another
-        # connection's.
+        # Non-streaming exchanges only
         self._transcript: "list[dict]" = []
         self._transcript_lock = threading.Lock()
         self.set_config(agconfig)
 
-    def get_transcripts(self) -> "list[dict]":
-        """Every LLM exchange dispatched so far: this instance's own
-        non-streaming exchanges plus every streaming connection's own
-        exchange, concatenated. Each entry is ``{request, response, usage,
-        finish_reason, streaming, ts}`` -- ``streaming`` is True while a
-        streamed entry's ``response`` is still being filled in."""
+    def get_all_transcripts(self) -> "list[dict]":
         with self._transcript_lock:
             entries = [dict(entry) for entry in self._transcript]
         with self._handles_lock:
@@ -188,6 +180,24 @@ class LlmHandlerServer:
         for handle in handles:
             entries.extend(handle.get_transcript())
         return entries
+
+    def get_main_transcript(self, needle: "str | None" = None) -> "list[dict]":
+        entries = self.get_all_transcripts()
+        if not entries:
+            return []
+        candidates = entries
+        if needle is not None:
+            matching = [
+                e
+                for e in entries
+                if any(m.get("content") == needle for m in e["request"]["messages"])
+            ]
+            if matching:
+                candidates = matching
+        best = max(candidates, key=lambda e: len(e["request"]["messages"]))
+        messages = [m for m in best["request"]["messages"] if m.get("role") != "system"]
+        messages.append(best["response"])
+        return messages
 
     def _record_exchange(
         self, request: dict, message: dict, usage: "dict | None", finish_reason: "str | None"

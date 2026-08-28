@@ -10,7 +10,6 @@ from .profiler import agprof
 from .agschema import agschema
 from .agcontext import agcontext
 from .agtool import agtool
-from .llm.agllm import agllm
 from .agconfig import DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
 from .aglog import _ts
@@ -426,11 +425,7 @@ class agskill:
 
         def _task() -> None:  # [REFACTOR] Why wrap in task?
             outer_result: agdata | None = None
-            updated_ctx: agcontext = prev_ctx
-            outer_delta: list[dict] = []
             history_before: list[dict] = []
-            _prev_input_tokens: int = 0
-            _prev_output_tokens: int = 0
             # Fallback for the final logging step below if an exception hits
             # before the defensive copy further down is made.
             local_skill_input = skill_input
@@ -456,9 +451,7 @@ class agskill:
                 # value's own contents in place.
                 local_skill_input = agdata(**dict(skill_input._data))
 
-                history_before = list(prev_ctx.messages)
-                _prev_input_tokens = prev_ctx.total_input_tokens
-                _prev_output_tokens = prev_ctx.total_output_tokens
+                history_before = list(prev_ctx.recent_transcript)
 
                 ag.terminal.log(
                     "SKILL ▶  ", f"{self.name}  input={list(local_skill_input._data.keys())}"
@@ -476,21 +469,17 @@ class agskill:
                     max_steps=max_steps,
                 )
                 outer_result = execution.output
-                updated_ctx = execution.context
-                outer_delta = execution.delta
 
             except Exception as exc:
                 outer_result = agerror(format_exception(exc))
-                updated_ctx = prev_ctx
-                outer_delta = []
-                history_before = list(prev_ctx.messages)
+                history_before = list(prev_ctx.recent_transcript)
                 ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
             finally:
                 _had_error = outer_result is not None and bool(outer_result._data.get("error"))
                 ag._set_ui_state("error" if _had_error else "finished")
                 agpause.set_current_worker_agent(None)  # [REFACTOR] What does this do?
 
-            # ── 3. Log result and commit token counts.
+            # ── 3. Log result.
             ts_end = _ts()
             assert outer_result is not None
             input_dict = local_skill_input.to_dict()
@@ -508,8 +497,6 @@ class agskill:
                 )
             else:
                 ag.terminal.log("SKILL ✓  ", f"{self.name}  output={list(result_dict.keys())}")
-            outer_input_tokens = updated_ctx.total_input_tokens - _prev_input_tokens
-            outer_output_tokens = updated_ctx.total_output_tokens - _prev_output_tokens
             try:
                 ag.log._record(
                     self.name,
@@ -517,56 +504,19 @@ class agskill:
                     ts_end,
                     input_dict,
                     result_dict,
-                    len(updated_ctx.messages),
+                    len(prev_ctx.recent_transcript),
                     history_before=history_before,
-                    history_delta=outer_delta,
-                    input_tokens=outer_input_tokens,
-                    output_tokens=outer_output_tokens,
+                    history_delta=prev_ctx.recent_transcript,
                 )
-                type(ag)._add_global_tokens(
-                    outer_input_tokens, outer_output_tokens
-                )  # [REFACTOR] Where is the add for local tokens??
-                _ag_usage = (
-                    ag.log.token_usage
-                )  # [REFACTOR] Is ag.log the right place to get token usage?
-                _gl_usage = type(ag).global_token_usage()
-                try:
-                    from . import agwebui as _agwebui  # [REFACTOR] Why lazy import?
-
-                    if _agwebui._active is not None:
-                        _agwebui._active.emitter.token_update(
-                            ag.agname,
-                            _ag_usage["input_tokens"],
-                            _ag_usage["output_tokens"],
-                            _gl_usage["input_tokens"],
-                            _gl_usage["output_tokens"],
-                        )
-                except Exception as _e:
-                    print(
-                        f"[agskill] WARNING: post-skill token_update push failed for {ag.agname}: {_e}"
-                    )
             except Exception as log_exc:
                 ag.terminal.log("SKILL ✗  ", f"[log error] {log_exc}")
 
             # ── 6. Resolve result future — unblocks the caller immediately.
-            ag._snapshot_messages = list(updated_ctx.messages)
+            ag._snapshot_messages = list(prev_ctx.recent_transcript)
             result_future.set_result(outer_result)
 
-            # ── 7. Prune history, then resolve ctx future for the next chained call. # [REFACTOR] What kind of pruning and auto context management do we have?
-            try:
-                with agprof.span("prune"):
-                    pruned_msgs = agllm._prune_tool_outputs(
-                        updated_ctx.messages
-                    )  # [REFACTOR] Why is this part of agllm?
-                if pruned_msgs is not updated_ctx.messages:
-                    updated_ctx.messages = pruned_msgs
-                    ag.terminal.log(
-                        "PRUNE    ", f"{self.name}  history pruned to {len(pruned_msgs)} msgs"
-                    )
-            except Exception as prune_exc:
-                ag.terminal.log("PRUNE ✗  ", f"{self.name}  pruning failed: {prune_exc}")
-
-            ctx_future.set_result(updated_ctx)
+            # ── 7. Resolve ctx future for the next chained call.
+            ctx_future.set_result(prev_ctx)
 
         # Set synchronously, before the thread even starts, so there is no
         # window where a run is genuinely in flight but ui_state still reads

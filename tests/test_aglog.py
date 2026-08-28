@@ -10,7 +10,6 @@ from agency.aglog import aglog
 from agency.agent import agent
 from agency.agconfig import agConfig
 from agency.engine import AgentEngine
-from agency.engine.types import ExecutionResult
 
 
 @pytest.fixture(autouse=True)
@@ -30,10 +29,12 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
                 sandbox=sandbox,
                 max_steps=max_steps,
             )
-        output, updated_context, delta = stub(
+        output, updated_context, _delta = stub(
             self._agent, context, skill_input, max_steps=max_steps
         )
-        return ExecutionResult(output=output, context=updated_context, delta=delta)
+        context.recent_transcript = updated_context.recent_transcript
+        context.compaction_summary = updated_context.compaction_summary
+        return output
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
 
@@ -54,8 +55,8 @@ def make_skill(name: str = "s", out: dict | None = None):
     sk = agskill(name, "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        new_msgs = list(prev_ctx.messages) + [{"role": "user", "content": name}]
-        return agdata(**(out or {"ok": True})), agcontext(messages=new_msgs), []
+        new_msgs = list(prev_ctx.recent_transcript) + [{"role": "user", "content": name}]
+        return agdata(**(out or {"ok": True})), agcontext(recent_transcript=new_msgs), []
 
     sk._test_execute = fake_execute_react
     return sk
