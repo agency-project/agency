@@ -55,11 +55,6 @@ class _GrokBackend(agharness_backend):
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
 
-        if runtime.suppress_builtin_tools:
-            return AttemptResult(
-                ok=False, error_message="grok does not support replace_tools=[] in daemon mode"
-            )
-
         binary = self.binary_path or self._DEFAULT_BINARY
         resolved = shutil.which(binary)
         if resolved is None:

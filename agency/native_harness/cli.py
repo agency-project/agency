@@ -71,7 +71,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help='JSON, same shape as Claude Code\'s own flag: {"mcpServers": {"name": '
         '{"type": "http", "url": "...", "headers": {...}}}}',
     )
-    p.add_argument("--no-builtin-tools", action="store_true")
     p.add_argument("--offload-dir", default=_DEFAULT_OFFLOAD_DIR)
     return p
 
@@ -124,7 +123,6 @@ def main(argv: "list[str] | None" = None) -> int:
         context_limit=context_limit,
         max_steps=args.max_steps,
         offload_dir=args.offload_dir,
-        no_builtin_tools=args.no_builtin_tools,
     )
 
     if result.status != "done":

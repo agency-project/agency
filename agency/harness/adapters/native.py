@@ -44,8 +44,6 @@ class _NativeBackend(agharness_backend):
                 ),
             )
 
-        suppress_builtins = runtime.suppress_builtin_tools
-
         from ...agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_in_container
 
         sandbox = runtime.sandbox
@@ -100,8 +98,6 @@ class _NativeBackend(agharness_backend):
             ]
             if resume_session_id:
                 argv += ["--resume", shlex.quote(resume_session_id)]
-            if suppress_builtins:
-                argv.append("--no-builtin-tools")
 
             cmd = (
                 f"cd /workspace && PYTHONPATH={shlex.quote(pkg_pythonpath)} "

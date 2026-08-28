@@ -129,12 +129,6 @@ class _ClaudeCodeBackend(agharness_backend):
         # in the same workspace the rest of that agent's tools see), a
         # chroot-backed (or no) sandbox keeps the existing bare-host launch
         # -- the jail already IS a real host directory, nothing to bridge.
-        if runtime.suppress_builtin_tools:
-            return AttemptResult(
-                ok=False,
-                error_message="claude_code does not support replace_tools=[] in daemon mode",
-            )
-
         in_container = agharness.is_container_backed(runtime.sandbox)
 
         if in_container:

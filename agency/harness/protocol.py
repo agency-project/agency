@@ -20,10 +20,6 @@ class HarnessAttemptRequest:
     resume_session_id: "str | None" = None
     # Session files are opaque bytes, so the JSON protocol carries them as base64.
     prior_session_blob_b64: "str | None" = None
-    # Python tool closures cannot cross the JSON host/sandbox boundary.
-    # The host rejects non-empty custom tool sets before sending a request;
-    # an explicit empty replacement may still suppress built-in tools.
-    suppress_builtin_tools: bool = False
 
 
 @dataclass

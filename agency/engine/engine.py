@@ -48,32 +48,40 @@ class AgentEngine:
     ) -> "agdata":
         """Execute one request and own its complete sandbox transaction."""
 
+        from ..agdata import agerror
+
         sandbox_lock = sandbox._lock
         sandbox_lock.acquire()
         try:
+            failed = True
             try:
                 output = self._execute_harness(
-                    context,
-                    skill,
-                    skill_input,
-                    resource_pool,
-                    sandbox,
-                    max_steps=max_steps,
+                    context, skill, skill_input, resource_pool, sandbox, max_steps=max_steps
                 )
-            except BaseException:
-                self._discard_sandbox(sandbox)
-                raise
-
-            if self._execution_failed(output):
-                self._discard_sandbox(sandbox)
+                if not isinstance(output, agerror):
+                    failed = False
+                    with agprof.span("teardown:commit"):
+                        try:
+                            sandbox.commit()
+                        finally:
+                            if not sandbox._has_pending_background_work():
+                                try:
+                                    sandbox.stop()
+                                except Exception as exc:
+                                    print(
+                                        f"[engine] WARNING: post-commit hibernate failed "
+                                        f"for {self._agent.agname}: {exc}"
+                                    )
                 return output
-
-            try:
-                self._commit_sandbox(sandbox)
-            except BaseException:
-                self._discard_sandbox(sandbox)
-                raise
-            return output
+            finally:
+                if failed:
+                    with agprof.span("teardown:discard"):
+                        sandbox.rm_container()
+                    self._agent.inbox.put(
+                        "Note: the previous skill call failed. Its sandbox workspace "
+                        "changes have been discarded and the workspace has been reverted "
+                        "to the last successful checkpoint."
+                    )
         finally:
             sandbox_lock.release()
 
@@ -118,7 +126,6 @@ class AgentEngine:
                 # Send the request through sandbox interaction server
                 attempt = self._run_attempt(
                     prompt,
-                    skill=skill,
                     max_steps=max_steps,
                     resume_session_id=resume_session_id,
                     prior_session_blob_b64=prior_session_blob_b64,
@@ -148,34 +155,6 @@ class AgentEngine:
                 self._sandbox_interaction_client.close()
                 self._sandbox_interaction_client = None
             self._host_server_manager.stop()
-
-    def _execution_failed(self, output: "agdata") -> bool:
-        from ..agdata import agerror
-
-        return isinstance(output, agerror)
-
-    def _discard_sandbox(self, sandbox: "agSandbox") -> None:
-        with agprof.span("teardown:discard"):
-            sandbox.rm_container()
-        self._agent.inbox.put(
-            "Note: the previous skill call failed. Its sandbox workspace "
-            "changes have been discarded and the workspace has been reverted "
-            "to the last successful checkpoint."
-        )
-
-    def _commit_sandbox(self, sandbox: "agSandbox") -> None:
-        with agprof.span("teardown:commit"):
-            try:
-                sandbox.commit()
-            finally:
-                if not sandbox._has_pending_background_work():
-                    try:
-                        sandbox.stop()
-                    except Exception as exc:
-                        print(
-                            f"[engine] WARNING: post-commit hibernate failed "
-                            f"for {self._agent.agname}: {exc}"
-                        )
 
     # ------------------------------------------------------------------
     # internal
@@ -207,34 +186,18 @@ class AgentEngine:
         self,
         prompt: PromptPayload,
         *,
-        skill: "agskill | None" = None,
         max_steps: "int | None" = None,
         resume_session_id: "str | None" = None,
         prior_session_blob_b64: "str | None" = None,
     ) -> HarnessAttemptResult:
         if self._sandbox_interaction_client is None:
             raise RuntimeError("Harness Manager client is not configured")
-        replacement_tools = getattr(skill, "replace_tools", None) if skill is not None else None
-        custom_tools = (
-            replacement_tools
-            if replacement_tools is not None
-            else (getattr(skill, "add_tools", None) if skill is not None else None)
-        )
-        if custom_tools:
-            return HarnessAttemptResult(
-                ok=False,
-                error_message=(
-                    "custom Python add_tools/replace_tools cannot cross the harness daemon "
-                    "boundary; expose them through MCP instead"
-                ),
-            )
         request = HarnessAttemptRequest(
             prompt=prompt,
             harness=self._agent.harness,
             max_steps=max_steps,
             resume_session_id=resume_session_id,
             prior_session_blob_b64=prior_session_blob_b64,
-            suppress_builtin_tools=replacement_tools is not None,
         )
         return self._sandbox_interaction_client.run_harness_attempt(request)
 
@@ -254,7 +217,7 @@ class AgentEngine:
         attempt: "HarnessAttemptResult",
         sandbox: agSandbox,
     ) -> "agdata | None":
-        """Accept the JSON response contract used by non-MCP harnesses."""
+        """Handle the plain JSON response contract used by non-MCP harnesses."""
         from ..agdata import agerror
 
         output_schema = skill.output_schema

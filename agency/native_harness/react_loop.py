@@ -49,16 +49,15 @@ def run_react_loop(
     context_limit: "int | None" = None,
     max_steps: int = _DEFAULT_MAX_STEPS,
     offload_dir: str = "./long_tool_call_outputs",
-    no_builtin_tools: bool = False,
 ) -> ReactLoopResult:
     messages = list(messages)
     total_input_tokens = 0
     total_output_tokens = 0
     previous_summary: "str | None" = None
 
-    dispatch_table = {} if no_builtin_tools else dict(tools.TOOL_DISPATCH)
-    tool_schemas = [] if no_builtin_tools else list(tools.BUILTIN_TOOL_SCHEMAS.values())
-    have_tool = set() if no_builtin_tools else set(tools.BUILTIN_TOOL_SCHEMAS.keys())
+    dispatch_table = dict(tools.TOOL_DISPATCH)
+    tool_schemas = list(tools.BUILTIN_TOOL_SCHEMAS.values())
+    have_tool = set(tools.BUILTIN_TOOL_SCHEMAS.keys())
 
     mcp_schemas = mcp.discover() if mcp is not None else []
     for schema in mcp_schemas:

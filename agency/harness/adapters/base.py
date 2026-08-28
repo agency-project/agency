@@ -109,7 +109,6 @@ class AdapterRuntime:
     token: str
     syscall_policy: object
     sandbox: "AdapterSandbox | None" = None
-    suppress_builtin_tools: bool = False
 
 
 class agharness_backend(AgHarnessFields):

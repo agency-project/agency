@@ -166,7 +166,6 @@ def _run_adapter_attempt(
             token=f"daemon-{uuid.uuid4().hex}",
             syscall_policy=syscall_policy,
             sandbox=_LocalSandbox() if request.harness == "native" else None,
-            suppress_builtin_tools=request.suppress_builtin_tools,
         )
         result: AttemptResult = adapter.run_daemon_attempt(
             runtime,

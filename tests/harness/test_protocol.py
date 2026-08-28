@@ -30,7 +30,6 @@ def test_harness_attempt_request_round_trips_through_json():
         "max_steps": 20,
         "resume_session_id": "session-122",
         "prior_session_blob_b64": "cHJpb3I=",
-        "suppress_builtin_tools": False,
     }
     prompt = PromptPayload(**decoded.pop("prompt"))
     assert HarnessAttemptRequest(prompt=prompt, **decoded) == request
