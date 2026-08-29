@@ -11,6 +11,7 @@ from agency.agent import agent
 from agency.agname import agname as _agname
 from agency.agconfig import agConfig
 from agency.engine import AgentEngine
+from agency.llm.agllm import agllm
 
 
 @pytest.fixture(autouse=True)
@@ -420,7 +421,7 @@ def test_fork_inherits_config():
     ag = make_agent()
 
     forked = agent.fork(ag)
-    assert forked.llm.backend.as_dict() == ag.llm.backend.as_dict()
+    assert agllm.for_config(forked.agconfig).as_dict() == agllm.for_config(ag.agconfig).as_dict()
 
 
 def test_fork_inherits_harness_and_creates_engine():
@@ -457,7 +458,7 @@ def test_fork_copies_history_and_config():
     ag.history = agdata(messages=[{"role": "user", "content": "prior"}])
 
     forked = agent.fork(ag)
-    assert forked.llm.backend.as_dict() == ag.llm.backend.as_dict()
+    assert agllm.for_config(forked.agconfig).as_dict() == agllm.for_config(ag.agconfig).as_dict()
     assert len(forked.history.messages) == 1
     assert forked.history.messages[0]["content"] == "prior"
 
@@ -1671,12 +1672,6 @@ def test_random_offload_agtype_skip_fuzz():
 # ---------------------------------------------------------------------------
 
 
-def test_agent_change_config_reaches_llm():
-    ag = make_agent()
-    ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
-    assert ag.llm.backend.temperature == 0.2
-
-
 def test_agent_change_config_propagates_owned_clone_to_engine():
     ag = make_agent()
     engine = MagicMock()
@@ -1694,7 +1689,7 @@ def test_agent_change_config_clones_given_agconfig():
     new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
     ag.change_config(new_cfg)
     new_cfg.agllm_backend.temperature = 0.9
-    assert ag.llm.backend.temperature == 0.2
+    assert ag.agconfig.get("agllm_backend", "temperature") == 0.2
 
 
 def test_agent_change_config_updates_agconfig_attr():

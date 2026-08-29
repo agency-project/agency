@@ -1,7 +1,7 @@
 """vLLM backend.
 
 vLLM speaks the OpenAI-compatible chat.completions API, so it has no backend
-class of its own -- `agllm_backend.for_config()` routes provider="vllm"
+class of its own -- `agllm.for_config()` routes provider="vllm"
 straight to `._openai._OpenAICompatibleBackend` (after checking base_url is
 set, since unlike real OpenAI a vLLM endpoint has no well-known default
 URL). This module only adds the vLLM-specific config surface: the extra

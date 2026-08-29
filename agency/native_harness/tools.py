@@ -2,9 +2,7 @@
 edit, glob, grep, webfetch, todowrite.
 
 Ported from the old `_native_in_container_entrypoint.py` (same
-implementation, same schemas, sourced from the same `agtool_pure.py` this
-package loads by path -- see `pure_loader.py`'s docstring for why that's
-reuse, not duplication). Plain `subprocess`/file I/O throughout: this
+implementation, same schemas). Plain `subprocess`/file I/O throughout: this
 process already runs inside whatever filesystem it's launched in (a
 sandbox container, or a user's own machine for a fully standalone run), so
 there is no `sandbox.exec()`/agtool bridge to reuse and no reason to invent
@@ -19,13 +17,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import uuid
-
-from .pure_loader import load_agtool_pure
-
-_agtool_pure = load_agtool_pure()
-_READ_DEFAULT_LIMIT = _agtool_pure.READ_DEFAULT_LIMIT
+from typing import Generator
 
 _BASH_TIMEOUT_S = 120
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
@@ -34,9 +30,488 @@ _WEBFETCH_MAX_TIMEOUT = 120
 
 # Same default as agtool.py's `_AgToolFields.output_offload_chars` (the
 # host-side dispatch_tools()'s own threshold) -- kept as a plain constant
-# since this package can't import agconfig (see pure_loader.py's docstring
-# on why it avoids the `agency.*` import chain entirely).
+# since this package can't import agconfig (see this package's own
+# `__init__.py` docstring on why it avoids the `agency.*` import chain
+# entirely).
 _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas (OpenAI function-calling `parameters` shape) -- single
+# source of truth for this harness's own tool schemas.
+# ---------------------------------------------------------------------------
+
+BASH_PARAMS = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string", "description": "The shell command to execute"},
+        "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds (default 120). For long-running commands pass this here — do NOT use the shell timeout command, which has no effect on the tool watchdog.",
+        },
+        "workdir": {"type": "string", "description": "Working directory (optional)"},
+    },
+    "required": ["command"],
+}
+
+READ_PARAMS = {
+    "type": "object",
+    "properties": {
+        "file_path": {"type": "string", "description": "Absolute path to the file or directory"},
+        "offset": {
+            "type": "integer",
+            "description": "Line number to start reading from (1-indexed)",
+        },
+        "limit": {"type": "integer", "description": "Maximum number of lines to read"},
+    },
+    "required": ["file_path"],
+}
+
+WRITE_PARAMS = {
+    "type": "object",
+    "properties": {
+        "file_path": {"type": "string", "description": "Absolute path to the file to write"},
+        "content": {"type": "string", "description": "Content to write"},
+    },
+    "required": ["file_path", "content"],
+}
+
+EDIT_PARAMS = {
+    "type": "object",
+    "properties": {
+        "file_path": {"type": "string", "description": "Absolute path to the file to edit"},
+        "old_string": {"type": "string", "description": "The text to replace"},
+        "new_string": {"type": "string", "description": "The replacement text"},
+        "replace_all": {
+            "type": "boolean",
+            "description": "Replace all occurrences (default false)",
+        },
+    },
+    "required": ["file_path", "old_string", "new_string"],
+}
+
+GLOB_PARAMS = {
+    "type": "object",
+    "properties": {
+        "pattern": {"type": "string", "description": "Glob pattern to match files against"},
+        "path": {"type": "string", "description": "Directory to search (defaults to /workspace)"},
+    },
+    "required": ["pattern"],
+}
+
+GREP_PARAMS = {
+    "type": "object",
+    "properties": {
+        "pattern": {"type": "string", "description": "Regex pattern to search for"},
+        "path": {
+            "type": "string",
+            "description": "File or directory to search (defaults to /workspace)",
+        },
+        "include": {"type": "string", "description": "File glob filter (e.g. '*.py')"},
+    },
+    "required": ["pattern"],
+}
+
+WEBFETCH_PARAMS = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "URL to fetch (must be http:// or https://)"},
+        "format": {
+            "type": "string",
+            "enum": ["markdown", "text", "html"],
+            "description": "Output format (default: markdown)",
+        },
+        "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds (max 120, default 30)",
+        },
+    },
+    "required": ["url"],
+}
+
+TODOWRITE_PARAMS = {
+    "type": "object",
+    "properties": {
+        "todos": {
+            "type": "array",
+            "description": "The updated todo list",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Task description"},
+                    "status": {
+                        "type": "string",
+                        "description": "pending | in_progress | completed | cancelled",
+                    },
+                    "priority": {"type": "string", "description": "high | medium | low"},
+                },
+                "required": ["content", "status", "priority"],
+            },
+        }
+    },
+    "required": ["todos"],
+}
+
+
+# ---------------------------------------------------------------------------
+# glob / grep: shell command construction + output parsing
+# ---------------------------------------------------------------------------
+
+GLOB_LIMIT = 100
+GREP_LIMIT = 100
+GREP_MAX_LINE_LEN = 2000
+
+
+def glob_command(pattern: str, path: str) -> str:
+    return (
+        f"rg --files --glob {shlex.quote(pattern)} {shlex.quote(path)} 2>/dev/null "
+        f"|| find {shlex.quote(path)} -name {shlex.quote(pattern)} -type f 2>/dev/null"
+    )
+
+
+def parse_glob_output(output: str) -> dict:
+    files = [line.strip() for line in output.splitlines() if line.strip()]
+    truncated = len(files) > GLOB_LIMIT
+    files = sorted(files[:GLOB_LIMIT])
+    return {"files": files, "count": len(files), "truncated": truncated}
+
+
+def grep_command(pattern: str, path: str, include: "str | None") -> str:
+    cmd = f"rg --json --no-ignore {shlex.quote(pattern)} {shlex.quote(path)}"
+    if include:
+        cmd += f" --glob {shlex.quote(include)}"
+    cmd += " 2>/dev/null || true"
+    return cmd
+
+
+def parse_grep_json_output(output: str) -> dict:
+    matches: "list[dict]" = []
+    for line in output.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "match":
+            continue
+        data = obj["data"]
+        matches.append(
+            {
+                "path": data["path"]["text"],
+                "line": data["line_number"],
+                "text": data["lines"]["text"],
+            }
+        )
+
+    truncated = len(matches) > GREP_LIMIT
+    matches = matches[:GREP_LIMIT]
+    for m in matches:
+        if len(m["text"]) > GREP_MAX_LINE_LEN:
+            m["text"] = m["text"][:GREP_MAX_LINE_LEN] + "..."
+
+    return {"matches": matches, "count": len(matches), "truncated": truncated}
+
+
+# ---------------------------------------------------------------------------
+# read: pagination
+# ---------------------------------------------------------------------------
+
+READ_DEFAULT_LIMIT = 2000
+READ_MAX_BYTES = 50 * 1024
+READ_MAX_LINE_LEN = 2000
+
+
+def paginate_text(content: str, offset: int, limit: int) -> dict:
+    """Apply offset/limit pagination to file content. Returns a plain dict
+    with the same field names: type, content, offset, lines_shown,
+    total_lines, truncated."""
+    all_lines = content.splitlines(keepends=True)
+    total = len(all_lines)
+    start = offset - 1
+    page_lines = all_lines[start : start + limit]
+
+    raw: list[str] = []
+    bytes_used = 0
+    cut = False
+    for i, line in enumerate(page_lines):
+        text = line.rstrip("\n")
+        if len(text) > READ_MAX_LINE_LEN:
+            text = text[:READ_MAX_LINE_LEN] + "... (truncated)"
+        size = len(text.encode()) + 1
+        if bytes_used + size > READ_MAX_BYTES:
+            cut = True
+            break
+        raw.append(f"{start + i + 1}: {text}")
+        bytes_used += size
+
+    more = cut or (start + len(page_lines) < total)
+    return {
+        "type": "file",
+        "content": "\n".join(raw),
+        "offset": offset,
+        "lines_shown": len(raw),
+        "total_lines": total,
+        "truncated": more,
+    }
+
+
+# ---------------------------------------------------------------------------
+# edit: fuzzy-match replace pipeline -- port of opencode's edit.ts replacer,
+# 9 strategies tried in order, first unique match wins.
+# ---------------------------------------------------------------------------
+
+BLOCK_ANCHOR_MIN_LINES = 3
+BLOCK_ANCHOR_SCORE_THRESHOLD = 0.3
+CONTEXT_AWARE_MATCH_RATIO = 0.5
+
+Replacer = Generator[str, None, None]
+
+
+def _simple(content: str, find: str) -> Generator[str, None, None]:
+    if find in content:
+        yield find
+
+
+def _line_trimmed(content: str, find: str) -> Generator[str, None, None]:
+    orig = content.split("\n")
+    search = find.split("\n")
+    if search and search[-1] == "":
+        search.pop()
+    for i in range(len(orig) - len(search) + 1):
+        if all(orig[i + j].strip() == search[j].strip() for j in range(len(search))):
+            start = sum(len(orig[k]) + 1 for k in range(i))
+            end = start + sum(len(orig[i + k]) + 1 for k in range(len(search))) - 1
+            yield content[start:end]
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + (0 if ca == cb else 1))
+        prev = curr
+    return prev[len(b)]
+
+
+def _block_anchor(content: str, find: str) -> Generator[str, None, None]:
+    orig = content.split("\n")
+    search = find.split("\n")
+    if len(search) and search[-1] == "":
+        search.pop()
+    if len(search) < BLOCK_ANCHOR_MIN_LINES:
+        return
+    first, last = search[0].strip(), search[-1].strip()
+
+    candidates: list[tuple[int, int]] = []
+    for i, line in enumerate(orig):
+        if line.strip() != first:
+            continue
+        for j in range(i + 2, len(orig)):
+            if orig[j].strip() == last:
+                candidates.append((i, j))
+                break
+
+    def _score(start: int, end: int) -> float:
+        block = orig[start : end + 1]
+        mid_count = min(len(search) - 2, len(block) - 2)
+        if mid_count <= 0:
+            return 1.0
+        total = 0.0
+        for k in range(1, mid_count + 1):
+            a, b = orig[start + k].strip(), search[k].strip()
+            mx = max(len(a), len(b))
+            total += (1 - _levenshtein(a, b) / mx) if mx else 1.0
+        return total / mid_count
+
+    if len(candidates) == 1:
+        s, e = candidates[0]
+        if _score(s, e) >= 0.0:
+            start = sum(len(orig[k]) + 1 for k in range(s))
+            end = start + sum(len(orig[s + k]) + 1 for k in range(e - s + 1)) - 1
+            yield content[start:end]
+    else:
+        best, best_score = None, -1.0
+        for s, e in candidates:
+            sc = _score(s, e)
+            if sc > best_score:
+                best_score, best = sc, (s, e)
+        if best and best_score >= BLOCK_ANCHOR_SCORE_THRESHOLD:
+            s, e = best
+            start = sum(len(orig[k]) + 1 for k in range(s))
+            end = start + sum(len(orig[s + k]) + 1 for k in range(e - s + 1)) - 1
+            yield content[start:end]
+
+
+def _whitespace_normalized(content: str, find: str) -> Generator[str, None, None]:
+    norm = lambda t: re.sub(r"\s+", " ", t).strip()
+    nf = norm(find)
+    lines = content.split("\n")
+    find_lines = find.split("\n")
+    for i, line in enumerate(lines):
+        if norm(line) == nf:
+            yield line
+        elif norm(line).__contains__(nf) and len(find_lines) == 1:
+            words = re.escape(find.strip()).replace(r"\ ", r"\s+")
+            m = re.search(words, line)
+            if m:
+                yield m.group(0)
+    if len(find_lines) > 1:
+        for i in range(len(lines) - len(find_lines) + 1):
+            block = lines[i : i + len(find_lines)]
+            if norm("\n".join(block)) == nf:
+                yield "\n".join(block)
+
+
+def _indentation_flexible(content: str, find: str) -> Generator[str, None, None]:
+    def strip_indent(t: str) -> str:
+        ls = t.split("\n")
+        non_empty = [l for l in ls if l.strip()]
+        if not non_empty:
+            return t
+        min_ind = min(len(l) - len(l.lstrip()) for l in non_empty)
+        return "\n".join(l if not l.strip() else l[min_ind:] for l in ls)
+
+    nf = strip_indent(find)
+    find_lines = find.split("\n")
+    orig = content.split("\n")
+    for i in range(len(orig) - len(find_lines) + 1):
+        block = orig[i : i + len(find_lines)]
+        if strip_indent("\n".join(block)) == nf:
+            yield "\n".join(block)
+
+
+def _escape_normalized(content: str, find: str) -> Generator[str, None, None]:
+    _esc = {
+        "n": "\n",
+        "t": "\t",
+        "r": "\r",
+        "'": "'",
+        '"': '"',
+        "`": "`",
+        "\\": "\\",
+        "\n": "\n",
+        "$": "$",
+    }
+
+    def unescape(s: str) -> str:
+        return re.sub(r"\\(.)", lambda m: _esc.get(m.group(1), m.group(0)), s)
+
+    uf = unescape(find)
+    if uf in content:
+        yield uf
+    orig = content.split("\n")
+    find_lines = uf.split("\n")
+    for i in range(len(orig) - len(find_lines) + 1):
+        block = "\n".join(orig[i : i + len(find_lines)])
+        if unescape(block) == uf:
+            yield block
+
+
+def _trimmed_boundary(content: str, find: str) -> Generator[str, None, None]:
+    tf = find.strip()
+    if tf == find:
+        return
+    if tf in content:
+        yield tf
+    orig = content.split("\n")
+    find_lines = find.split("\n")
+    for i in range(len(orig) - len(find_lines) + 1):
+        block = "\n".join(orig[i : i + len(find_lines)])
+        if block.strip() == tf:
+            yield block
+
+
+def _context_aware(content: str, find: str) -> Generator[str, None, None]:
+    orig = content.split("\n")
+    find_lines = find.split("\n")
+    if len(find_lines) and find_lines[-1] == "":
+        find_lines.pop()
+    if len(find_lines) < BLOCK_ANCHOR_MIN_LINES:
+        return
+    first, last = find_lines[0].strip(), find_lines[-1].strip()
+    for i, line in enumerate(orig):
+        if line.strip() != first:
+            continue
+        for j in range(i + 2, len(orig)):
+            if orig[j].strip() == last:
+                block = orig[i : j + 1]
+                if len(block) == len(find_lines):
+                    mid_non_empty = [
+                        (block[k].strip(), find_lines[k].strip())
+                        for k in range(1, len(block) - 1)
+                        if block[k].strip() or find_lines[k].strip()
+                    ]
+                    if (
+                        not mid_non_empty
+                        or sum(a == b for a, b in mid_non_empty) / len(mid_non_empty)
+                        >= CONTEXT_AWARE_MATCH_RATIO
+                    ):
+                        yield "\n".join(block)
+                break
+
+
+def _multi_occurrence(content: str, find: str) -> Generator[str, None, None]:
+    start = 0
+    while True:
+        idx = content.find(find, start)
+        if idx == -1:
+            break
+        yield find
+        start = idx + len(find)
+
+
+_STRATEGIES = [
+    _simple,
+    _line_trimmed,
+    _block_anchor,
+    _whitespace_normalized,
+    _indentation_flexible,
+    _escape_normalized,
+    _trimmed_boundary,
+    _context_aware,
+    _multi_occurrence,
+]
+
+
+def replace(content: str, old: str, new: str, replace_all: bool = False) -> str:
+    """Apply the fuzzy-match replace pipeline. Raises ValueError on
+    identical old/new, no match, or an ambiguous (multiple-match) result --
+    same contract as the tool this backs."""
+    if old == new:
+        raise ValueError("old_string and new_string are identical — no change to apply.")
+
+    not_found = True
+    for strategy in _STRATEGIES:
+        for candidate in strategy(content, old):
+            idx = content.find(candidate)
+            if idx == -1:
+                continue
+            not_found = False
+            if replace_all:
+                return content.replace(candidate, new)
+            last_idx = content.rfind(candidate)
+            if idx != last_idx:
+                continue
+            return content[:idx] + new + content[idx + len(candidate) :]
+
+    if not_found:
+        raise ValueError(
+            "Could not find old_string in the file. "
+            "It must match exactly (including whitespace and indentation)."
+        )
+    raise ValueError(
+        "Found multiple matches for old_string. "
+        "Provide more surrounding context to make the match unique."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
 
 
 def _parse_tool_args(arguments_json: str) -> dict:
@@ -66,7 +541,7 @@ def _run_read_tool(arguments_json: str) -> str:
     args = _parse_tool_args(arguments_json)
     file_path = str(args.get("file_path", ""))
     offset = int(args.get("offset") or 1)
-    limit = int(args.get("limit") or _READ_DEFAULT_LIMIT)
+    limit = int(args.get("limit") or READ_DEFAULT_LIMIT)
 
     if os.path.isdir(file_path):
         try:
@@ -91,7 +566,7 @@ def _run_read_tool(arguments_json: str) -> str:
             content = f.read()
     except Exception as e:
         return json.dumps({"error": str(e)})
-    result = _agtool_pure.paginate_text(content, offset, limit)
+    result = paginate_text(content, offset, limit)
     result["path"] = file_path
     return json.dumps(result)
 
@@ -129,7 +604,7 @@ def _run_edit_tool(arguments_json: str) -> str:
         return json.dumps({"error": str(e)})
 
     try:
-        updated = _agtool_pure.replace(content, old_string, new_string, replace_all)
+        updated = replace(content, old_string, new_string, replace_all)
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(updated)
         return json.dumps({"path": file_path, "success": True})
@@ -143,12 +618,12 @@ def _run_glob_tool(arguments_json: str) -> str:
     path = str(args.get("path") or ".")
     try:
         proc = subprocess.run(
-            ["bash", "-c", _agtool_pure.glob_command(pattern, path)],
+            ["bash", "-c", glob_command(pattern, path)],
             capture_output=True,
             timeout=30,
             text=True,
         )
-        return json.dumps(_agtool_pure.parse_glob_output(proc.stdout))
+        return json.dumps(parse_glob_output(proc.stdout))
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -160,12 +635,12 @@ def _run_grep_tool(arguments_json: str) -> str:
     include = args.get("include")
     try:
         proc = subprocess.run(
-            ["bash", "-c", _agtool_pure.grep_command(pattern, path, include)],
+            ["bash", "-c", grep_command(pattern, path, include)],
             capture_output=True,
             timeout=30,
             text=True,
         )
-        return json.dumps(_agtool_pure.parse_grep_json_output(proc.stdout))
+        return json.dumps(parse_grep_json_output(proc.stdout))
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -296,46 +771,34 @@ TOOL_DISPATCH = {
     "todowrite": _run_todowrite_tool,
 }
 
-# Same name/params/description as the host-side sandboxed tools
-# (agency/tools/*.py), sourced from the same `agtool_pure` module they
-# themselves import their PARAMS dicts from -- one place defines what these
-# tools look like to a model, not two copies that could drift.
 BUILTIN_TOOL_SCHEMAS = {
-    "bash": _tool_schema(
-        "bash", "Execute a bash command and return its output.", _agtool_pure.BASH_PARAMS
-    ),
+    "bash": _tool_schema("bash", "Execute a bash command and return its output.", BASH_PARAMS),
     "read": _tool_schema(
-        "read",
-        "Read a file (with optional offset/limit) or list a directory.",
-        _agtool_pure.READ_PARAMS,
+        "read", "Read a file (with optional offset/limit) or list a directory.", READ_PARAMS
     ),
     "write": _tool_schema(
-        "write",
-        "Write content to a file, creating parent directories if needed.",
-        _agtool_pure.WRITE_PARAMS,
+        "write", "Write content to a file, creating parent directories if needed.", WRITE_PARAMS
     ),
     "edit": _tool_schema(
-        "edit",
-        "Replace a string in a file. Uses fuzzy matching as fallback.",
-        _agtool_pure.EDIT_PARAMS,
+        "edit", "Replace a string in a file. Uses fuzzy matching as fallback.", EDIT_PARAMS
     ),
     "glob": _tool_schema(
         "glob",
         "Find files matching a glob pattern. Defaults to the current directory.",
-        _agtool_pure.GLOB_PARAMS,
+        GLOB_PARAMS,
     ),
     "grep": _tool_schema(
         "grep",
         "Search for a regex pattern in file contents. Defaults to the current directory.",
-        _agtool_pure.GREP_PARAMS,
+        GREP_PARAMS,
     ),
     "webfetch": _tool_schema(
         "webfetch",
         "Fetch a URL and return its content as text, markdown, or raw HTML.",
-        _agtool_pure.WEBFETCH_PARAMS,
+        WEBFETCH_PARAMS,
     ),
     "todowrite": _tool_schema(
-        "todowrite", "Update the todo list with a new set of items.", _agtool_pure.TODOWRITE_PARAMS
+        "todowrite", "Update the todo list with a new set of items.", TODOWRITE_PARAMS
     ),
 }
 

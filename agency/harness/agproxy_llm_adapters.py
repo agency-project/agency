@@ -1,7 +1,7 @@
 """Reverse-direction wire adapters for `agproxy_llm`: harness-native request
 formats (Anthropic Messages API, OpenAI Responses API) <-> the
-`.chat.completions.create(**kwargs)` shape every `agllm_backend.make_client()`
-exposes uniformly (see `llm/base.py`).
+`.chat.completions.create(**kwargs)` shape every `agllm.make_client()`
+exposes uniformly (see `llm/agllm.py`).
 
 This is deliberately the *opposite* direction from `llm/anthropic.py`'s
 `_openai_messages_to_anthropic`/`_anthropic_stream_to_openai_chunks` (those

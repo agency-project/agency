@@ -5,6 +5,7 @@ from agency.agteam import agteam
 from agency.agskill import agskill
 from agency.agdata import agdata
 from agency.agconfig import agConfig
+from agency.llm.agllm import agllm
 
 
 def _llm_agconfig(d: dict) -> agConfig:
@@ -169,7 +170,7 @@ def test_agent_inherits_team_llm_config(llm_cfg):
             pass
 
     team = _T(agconfig=_llm_agconfig(llm_cfg))
-    assert team.ag.llm.backend.as_dict() == llm_cfg
+    assert agllm.for_config(team.ag.agconfig).as_dict() == llm_cfg
 
 
 def test_multiple_agents_in_setup_all_registered():
@@ -494,7 +495,7 @@ def test_team_change_config_clones_given_agconfig():
 def test_team_change_config_propagates_to_spawned_agents():
     team = _EchoTeam()
     team.change_config(_llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2}))
-    assert team.agent.llm.backend.temperature == 0.2
+    assert team.agent.agconfig.get("agllm_backend", "temperature") == 0.2
 
 
 def test_team_get_config_copy_returns_clone_not_same_object():

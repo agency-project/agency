@@ -1,26 +1,16 @@
-"""LLM backend base class, shared config, and backend selection.
+"""Shared LLM backend config fields and cross-SDK exception tuples.
 
-An `agllm` instance builds exactly one `agllm_backend` from its config (via
-`agllm_backend.for_config()`) and reuses it for every client it needs — the
-streaming call in `agllm.call()`, the summarisation call in `agllm.compact()`,
-and the model-listing lookup in `agllm.fetch_context_limit()`. Backend
-selection logic (OpenAI-compatible vs. Amazon Bedrock, and within Bedrock,
-the OpenAI-compatible Mantle gateway vs. Anthropic's native Messages API)
-lives here instead of being duplicated at each call site.
-
-Every backend's client exposes the same surface agllm.call()/.compact() use:
-`.chat.completions.create(**kwargs)` (streaming or not) and `.close()`.
-
-The concrete backends themselves live in sibling modules -- `.openai`,
-`.vllm`, `.anthropic`, `.bedrock` -- each importing `agllm_backend` from here
-to subclass it. Every reference back from *this* module to *those* is
-therefore a lazy, function-local import (inside `for_config()` below) rather
-than a module-level one, to avoid a circular import.
+The actual backend class (config-holding, client-building, selection-
+dispatching) is `agllm`, in the sibling `.agllm` module -- kept there rather
+than here so `from agency.llm.agllm import agllm` keeps working as the one
+stable import path regardless of internal reshuffling. This module holds
+what's genuinely shared infrastructure instead: `AgLLMBackendFields` (every
+backend's config fields, as descriptors), the per-provider `*BackendConfig`
+view classes, and the cross-SDK exception-translation tuples.
 """
 
 from __future__ import annotations
 from typing import ClassVar
-import httpx
 import openai
 
 from ..agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
@@ -49,13 +39,14 @@ __all__ = [
 # Class-based LLM config -- every per-call LLM request parameter (model,
 # api_key, temperature, ...) is a DynamicConfigParam, the same descriptor
 # machinery every other framework class uses for its tunables (see agllm.py's
-# _AgLLMFields). `agllm_backend` inherits this class, so every concrete
-# backend (._openai._OpenAICompatibleBackend, ._anthropic._AnthropicBackend,
-# ...) reads its parameters as plain attributes (self.model, self.api_key, ...).
+# _AgLLMFields). `agllm` (in the sibling `.agllm` module) inherits this
+# class, so every concrete backend (._openai._OpenAICompatibleBackend,
+# ._anthropic._AnthropicBackend, ...) reads its parameters as plain
+# attributes (self.model, self.api_key, ...).
 #
 # Descriptors are registered once, at class-body-execution time, and shared
 # via ordinary inheritance. Values are NOT stored privately per instance --
-# `agllm_backend.__init__` points self._agconfig at the exact agConfig the
+# `agllm.__init__` points self._agconfig at the exact agConfig the
 # caller built its config on (typically via `cfg.agllm_backend.model = ...`
 # before constructing anything), so a later `cfg.agllm_backend.temperature =
 # 0.9` is visible on the next read, same as any other DynamicConfigParam.
@@ -226,8 +217,8 @@ class _AgProviderBackendConfig(agLLMBackendConfig):
             self.update(**fields)
 
 
-# Exception-translation tuples so callers (agllm.call()) can catch both
-# backend families without importing the anthropic package directly.
+# Exception-translation tuples so callers (e.g. LlmHandlerServer) can catch
+# both backend families without importing the anthropic package directly.
 BAD_REQUEST_EXCS: tuple = (openai.BadRequestError,) + (
     (_anthropic_sdk.BadRequestError,) if _anthropic_sdk else ()
 )
@@ -244,86 +235,3 @@ RATE_LIMIT_EXCS: tuple = (openai.RateLimitError,) + (
 # more specific tuples above first — BadRequestError/RateLimitError/connection
 # errors are all subclasses of these and get their own handling.
 API_ERROR_EXCS: tuple = (openai.APIError,) + ((_anthropic_sdk.APIError,) if _anthropic_sdk else ())
-
-
-# ---------------------------------------------------------------------------
-# Backend base class + factory
-# ---------------------------------------------------------------------------
-
-
-class agllm_backend(AgLLMBackendFields):
-    """One backend instance per agconfig — knows how to build a client and
-    answer capability questions (model listing, tokenize endpoint). Use
-    `agllm_backend.for_config(agconfig)` to get the right subclass; don't
-    instantiate a subclass directly.
-
-    Inherits AgLLMBackendFields so every concrete backend reads its
-    parameters as plain attributes (self.model, self.api_key, ...). The
-    given agConfig is cloned (self._agconfig) -- so this backend's own config
-    is independent of the caller's; mutating the caller's original agConfig
-    afterward does not affect this backend. To change this backend's live
-    config, call ``change_config()`` (or, for one-off dynamic fields, mutate
-    ``backend._agconfig`` directly since that object is used fresh on every
-    call).
-    """
-
-    def __init__(self, agconfig: "agConfig") -> None:
-        self._agconfig = agconfig.clone()
-
-    def change_config(self, agconfig: "agConfig") -> None:
-        """Replace this backend's agconfig with a clone of the given one."""
-        self._agconfig = agconfig.clone()
-
-    def get_config_copy(self) -> "agConfig":
-        """Return a clone of this backend's agconfig."""
-        return self._agconfig.clone()
-
-    @staticmethod
-    def for_config(agconfig: "agConfig") -> "agllm_backend":
-        from .bedrock import (
-            _is_anthropic_bedrock_model,
-            _AnthropicBedrockBackend,
-            _OpenAICompatibleBedrockBackend,
-            _AnthropicAWSBackend,
-        )
-        from .anthropic import _AnthropicBackend
-        from .openai import _OpenAICompatibleBackend
-
-        provider = agconfig.get("agllm_backend", "provider")
-        model = agconfig.get("agllm_backend", "model", "") or ""
-        if provider == "bedrock":
-            if _is_anthropic_bedrock_model(model):
-                return _AnthropicBedrockBackend(agconfig)
-            return _OpenAICompatibleBedrockBackend(agconfig)
-        if provider in ("anthropicAWS", "anthropic_aws"):
-            return _AnthropicAWSBackend(agconfig)
-        if provider == "anthropic":
-            return _AnthropicBackend(agconfig)
-        if provider == "vllm" and not agconfig.get("agllm_backend", "base_url"):
-            raise ValueError(
-                "agVLLMBackendConfig (provider='vllm') requires base_url "
-                "-- point it at your vLLM/OpenAI-compatible endpoint (e.g. "
-                "'http://localhost:8000/v1')."
-            )
-        return _OpenAICompatibleBackend(agconfig)
-
-    def make_client(self, timeout: httpx.Timeout):
-        """Build and return a client exposing `.chat.completions.create()` and `.close()`."""
-        raise NotImplementedError
-
-    def list_models(self) -> list:
-        """Best-effort model listing, used for context-limit lookups. Exceptions
-        propagate to the caller (agllm.fetch_context_limit already wraps this).
-        Override to return [] for backends with no listing capability."""
-        client = self.make_client(httpx.Timeout(self.model_listing_timeout_seconds))
-        return list(client.models.list())
-
-    def tokenize_url(self) -> "str | None":
-        """Root URL for a vLLM-style /tokenize endpoint, or None if unsupported."""
-        return None
-
-    def known_context_limit(self, model: str) -> "int | None":
-        """Static fallback context window for models with no listing API to
-        query (e.g. Bedrock's native invoke_model). None if unknown — the
-        caller (agllm.fetch_context_limit) falls back to _AgLLMFields.default_context_limit.default."""
-        return None

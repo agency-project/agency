@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ...llm import API_CONN_EXCS, API_ERROR_EXCS, BAD_REQUEST_EXCS, RATE_LIMIT_EXCS, agllm_backend
+from ...llm import API_CONN_EXCS, API_ERROR_EXCS, BAD_REQUEST_EXCS, RATE_LIMIT_EXCS
 from ...llm.agllm import agllm
 
 if TYPE_CHECKING:
@@ -215,13 +215,13 @@ class LlmHandlerServer:
 
     def set_config(self, agconfig: "agConfig") -> None:
         self._agconfig = agconfig
-        self._backend = agllm_backend.for_config(agconfig)
+        self._backend = agllm.for_config(agconfig)
 
     def resolve_model(self) -> str:
         return self._backend.model or ""
 
     def context_limit(self) -> int:
-        return agllm.fetch_context_limit(self._backend)
+        return self._backend.fetch_context_limit()
 
     def dispatch(self, request: dict) -> dict:
         return self._dispatch_once(self._build_kwargs(request))
@@ -288,7 +288,7 @@ class LlmHandlerServer:
     # ------------------------------------------------------------------
 
     def _build_kwargs(self, request: dict) -> dict:
-        kwargs = agllm.build_llm_kwargs(self._backend, request["messages"], request.get("tools"))
+        kwargs = self._backend.build_kwargs(request["messages"], request.get("tools"))
         if request.get("tool_choice") is not None:
             kwargs["tool_choice"] = request["tool_choice"]
         return kwargs

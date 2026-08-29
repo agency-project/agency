@@ -14,7 +14,8 @@ import os
 import re
 import httpx
 
-from .base import _AgProviderBackendConfig, agllm_backend
+from .base import _AgProviderBackendConfig
+from .agllm import agllm
 
 try:
     import anthropic as _anthropic_sdk
@@ -212,15 +213,15 @@ class _FakeChunk:
 
 def _anthropic_stream_to_openai_chunks(stream):
     """Translate an Anthropic Messages-API SSE stream into OpenAI-style chunks
-    matching what agllm.call()'s streaming loop expects.
+    matching what a streaming dispatch loop (`LlmHandlerServer`) expects.
 
     Tool-call JSON input is buffered per content block and emitted as a single
     chunk on content_block_stop, rather than streamed fragment-by-fragment.
-    agllm.call() never renders partial tool-call arguments to the user (only
-    text/thinking feed live_messages_fn), so nothing is lost — and emitting
-    one complete chunk instead of many small ones avoids relying on every
-    fragment individually surviving whatever consumes this generator (e.g.
-    agutil._iter_batched's background-thread queue).
+    Partial tool-call arguments are never rendered to a live viewer anyway
+    (only text/thinking feed a live display), so nothing is lost — and
+    emitting one complete chunk instead of many small ones avoids relying on
+    every fragment individually surviving whatever consumes this generator
+    (e.g. agutil._iter_batched's background-thread queue).
     """
     input_tokens = 0
     output_tokens = 0
@@ -282,7 +283,7 @@ def _anthropic_stream_to_openai_chunks(stream):
     for index in sorted(tool_blocks):
         block = tool_blocks[index]
         print(
-            f"[agllm_backend] WARNING: tool_use block {block['name']!r} "
+            f"[agllm] WARNING: tool_use block {block['name']!r} "
             f"(id={block['id']}) truncated mid-stream (likely hit max_tokens) "
             f"— flushing partial arguments instead of dropping the call"
         )
@@ -322,8 +323,7 @@ class _FakeNonStreamChoice:
 
 class _AnthropicNonStreamResponse:
     """Mimics openai.types.chat.ChatCompletion's `.choices[0].message.content`
-    surface for a non-streaming Anthropic Messages API response — used by
-    agllm.compact(), which doesn't stream."""
+    surface for a non-streaming Anthropic Messages API response."""
 
     __slots__ = ("choices",)
 
@@ -415,8 +415,8 @@ class _AnthropicBedrockChat:
 
 class _AnthropicBedrockChatClient:
     """Drop-in replacement for the subset of openai.OpenAI's interface
-    agllm.call()/.compact() use (`.chat.completions.create()`, `.close()`),
-    wrapping an already-constructed anthropic SDK client (`Anthropic`,
+    callers use (`.chat.completions.create()`, `.close()`), wrapping an
+    already-constructed anthropic SDK client (`Anthropic`,
     `AnthropicBedrock`, or `AnthropicAWS` -- all three expose `.messages.create()`
     alike, which is all this wrapper needs)."""
 
@@ -430,7 +430,7 @@ class _AnthropicBedrockChatClient:
             close()
 
 
-class _AnthropicBackend(agllm_backend):
+class _AnthropicBackend(agllm):
     """Claude models via the first-party Anthropic API (api.anthropic.com) —
     the anthropic SDK's plain Anthropic client (Messages API shape). Reuses
     the same _AnthropicBedrockChatClient adapter as the Bedrock backend since

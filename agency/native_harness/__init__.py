@@ -21,8 +21,10 @@ Confirmed empirically: with `agency/` on `PYTHONPATH` this way, `agency`
 never appears in `sys.modules` at all, and neither does `openai`/
 `anthropic`/`boto3` -- only `native_harness` and whatever
 `llm_client.py`/`mcp_client.py` actually need (`httpx`, `httpx2`, `mcp`).
-`pure_loader.py` reuses `agtool_pure.py`/`agllm_pure.py` by raw file path
-for the same reason -- see that module's docstring.
+Every submodule here (`tools.py`, `compaction.py`, ...) is a normal,
+ordinary member of this package -- no separate raw-file-path loading is
+needed for anything, since nothing outside this package depends on their
+contents.
 
 A future agency backend launching this as a real harness (mirroring
 `claude_code.py`'s launch of the real `claude` binary) would set

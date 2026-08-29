@@ -27,6 +27,13 @@ _DEFAULT_LOG_DIR = _agency_tmp_root() / f"{_RUN_TS}_{_RUN_ID}"
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 
+def _llm_config_snapshot(agconfig: "agConfig") -> dict:
+    """Backend config fields for logging/checkpointing, minus the secret
+    api_key -- a fresh, cheap (no network I/O) construction each call, not a
+    persisted instance."""
+    return {k: v for k, v in agllm.for_config(agconfig).as_dict().items() if k != "api_key"}
+
+
 from .agdata import agdata
 from .agcontext import agcontext
 from .agDataCollector import agDataCollector, agDataCollectorConfigs
@@ -195,46 +202,41 @@ class agent:
         self,
         agname: str | None = None,
         *,
-        llm: "agllm | None" = None,
         sandbox: "agSandbox | None" = None,
         agconfig: "agConfig | None" = None,
         harness: "str | None" = None,
     ):
         with agprof.span("agent:create"):
-            self._initialize(agname, llm, sandbox, agconfig, harness)
+            self._initialize(agname, sandbox, agconfig, harness)
 
     # [REFACTOR] Why separate?
     def _initialize(
         self,
         agname: "str | None",
-        llm: "agllm | None",
         sandbox: "agSandbox | None",
         agconfig: "agConfig | None",
         harness: "str | None",
     ) -> None:
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
-        if llm is None:  # [REFACTOR] Why not next to set llm mem var
-            if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
-                from ._context import _active_team as _at
+        if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
+            from ._context import _active_team as _at
 
-                _t = _at.get(None)
-                if (
-                    _t is not None
-                    and _t.agconfig is not None
-                    and _t.agconfig.data.get("agllm_backend")
-                ):  # [REFACTOR] Why do we have auto team-config inheritance only when agllm_backend exists?
-                    # Adopt the team's agconfig outright (not just for the LLM
-                    # fields) -- log_dir/output_dir/sandbox settings etc. should
-                    # also come from it, matching "agents inherit the team's
-                    # agconfig automatically" (see agteam's docstring).
-                    _src_agconfig = _t.agconfig
-                else:
-                    raise TypeError(
-                        "agent() requires an agconfig with LLM fields set "
-                        "(e.g. cfg.agllm_backend.model = ...), or llm=, "
-                        "when called outside an agteam context"
-                    )
+            _t = _at.get(None)
+            if (
+                _t is not None and _t.agconfig is not None and _t.agconfig.data.get("agllm_backend")
+            ):  # [REFACTOR] Why do we have auto team-config inheritance only when agllm_backend exists?
+                # Adopt the team's agconfig outright (not just for the LLM
+                # fields) -- log_dir/output_dir/sandbox settings etc. should
+                # also come from it, matching "agents inherit the team's
+                # agconfig automatically" (see agteam's docstring).
+                _src_agconfig = _t.agconfig
+            else:
+                raise TypeError(
+                    "agent() requires an agconfig with LLM fields set "
+                    "(e.g. cfg.agllm_backend.model = ...) when called "
+                    "outside an agteam context"
+                )
 
         # Cloned so this agent's own agconfig is independent of whatever
         # source it was built from (an explicit agconfig=, agent.default_agconfig,
@@ -250,7 +252,6 @@ class agent:
             None  # [REFACTOR]  Why do we need to keep reference of parent agent id?
         )
 
-        self.llm: agllm = llm if llm is not None else agllm(self.agconfig)
         self.harness: str = (
             harness if harness is not None else _AgAgentFields(self.agconfig).harness
         )  # [REFACTOR] Change to config only
@@ -292,32 +293,30 @@ class agent:
 
         team_name = _team.team_name if _team is not None else None
 
-        ctx = (
-            f"  context={self.llm.context_limit}" if self.llm.context_limit else "  context=unknown"
-        )
+        _llm_config = _llm_config_snapshot(self.agconfig)
+        _context_limit = _llm_config.get("context_limit")
+        ctx = f"  context={_context_limit}" if _context_limit else "  context=unknown"
         team_tag = f"  team={team_name}" if team_name else ""
-        self.terminal.log("CREATED  ", f"model={self.llm.backend.model or '?'}{ctx}{team_tag}")
+        self.terminal.log("CREATED  ", f"model={_llm_config.get('model') or '?'}{ctx}{team_tag}")
         self.log._lifecycle(
             "created",
             agname=self.agname,
             team=team_name,
-            llm_config={k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
-            context_limit=self.llm.context_limit,
+            llm_config=_llm_config,
+            context_limit=_context_limit,
         )
         self._emit_config()  # [REFACTOR] Maybe refactor into a separate agent_logging.py
 
     def change_config(self, agconfig: "agConfig") -> None:
         """Replace this agent's agconfig with a clone of the given one, and
         push that same clone down to every sub-object that holds its own
-        independent copy (``self.llm`` -- and its backend --, ``self.log``,
-        ``self.data_collector``, ``self.sandbox`` if one has been created,
-        and ``self.engine``).
+        independent copy (``self.log``, ``self.data_collector``,
+        ``self.sandbox`` if one has been created, and ``self.engine``).
         Reassigning
         ``self.agconfig`` alone does not reach those clones, so this is the
         supported way to change live config (e.g. ``max_completion_tokens``)
         after construction."""
         self.agconfig = agconfig.clone()
-        self.llm.change_config(self.agconfig)
         self.log.change_config(self.agconfig)
         self.data_collector.set_config(self.agconfig)
         if self.sandbox is not None:
@@ -543,7 +542,6 @@ class agent:
         # Cloned so the fork's own agconfig is independent of src's -- see
         # the matching comment in __init__.
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
-        ag.llm = agllm(ag.agconfig)
         ag.harness = src.harness
         ag.engine = AgentEngine(ag)
         src.ctx.resolve_prev_dependencies()
@@ -583,7 +581,7 @@ class agent:
             agname=ag.agname,
             parent_agname=src.agname,
             team=team_name,
-            llm_config={k: v for k, v in ag.llm.backend.as_dict().items() if k != "api_key"},
+            llm_config=_llm_config_snapshot(ag.agconfig),
         )
         ag._emit_config()
         return ag
@@ -651,7 +649,7 @@ class agent:
             "agname": self.agname,
             "parent_agent_id": self._parent_agent_id,
             "harness": self.harness,
-            "llm_config": {k: v for k, v in self.llm.backend.as_dict().items() if k != "api_key"},
+            "llm_config": _llm_config_snapshot(self.agconfig),
             "history": self.ctx.recent_transcript,
             "ts": _ts(),
         }
@@ -753,7 +751,6 @@ class agent:
         for k, v in state.get("llm_config", {}).items():
             if k not in _already_set:
                 ag.agconfig.set("agllm_backend", k, v)
-        ag.llm = agllm(ag.agconfig)
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
         ag.engine = AgentEngine(ag)

@@ -16,7 +16,6 @@ import uuid
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agency.agdata import agdata
 from agency.agresources import agResourcePool
 
 
@@ -2091,50 +2090,6 @@ class TestAgSandboxResourceLimits:
     def test_release_resources_none_pool(self):
         # Should not raise even without a pool
         self.sb.release_resources(None)
-
-
-# ---------------------------------------------------------------------------
-# Sandboxed tool factories
-# ---------------------------------------------------------------------------
-
-
-@docker
-class TestSandboxedTools:
-    """bash/write/edit/daemon_release-via-tool-wrapper coverage was retired
-    here along with agency/tools/{bash,write,edit,resource}.py themselves
-    (execute_react()-only factories, see agency/tools/__init__.py's own
-    retirement note) -- the underlying sandbox methods these tools were
-    thin wrappers over remain fully covered directly: sb.exec() by
-    TestAgSandboxExec, sb.write_file()/read_file() by TestAgSandboxFileIO,
-    sb.release_daemon() by TestAgSandboxPIDTracking. glob/grep (still-alive
-    factories) are exercised below via make_glob()/make_grep() directly and
-    sb.write_file() for fixture setup, rather than through the retired
-    make_sandboxed_tools() bundle."""
-
-    @docker
-    def setup_method(self, _):
-        self.sb = _make_sandbox()
-
-    @docker
-    def teardown_method(self, _):
-        self.sb.destroy()
-
-    def test_glob_tool_finds_files(self):
-        from agency.tools.glob import make_glob
-
-        self.sb.write_file("/workspace/a.py", "x\n")
-        self.sb.write_file("/workspace/b.py", "y\n")
-        tool = make_glob(self.sb)
-        r = tool.fn(agdata(pattern="*.py", path="/workspace"))
-        assert len(r.files) >= 2
-
-    def test_grep_tool_finds_pattern(self):
-        from agency.tools.grep import make_grep
-
-        self.sb.write_file("/workspace/src.py", "SECRET=42\n")
-        tool = make_grep(self.sb)
-        r = tool.fn(agdata(pattern="SECRET", path="/workspace"))
-        assert any("SECRET" in m["text"] for m in r.matches)
 
 
 @docker

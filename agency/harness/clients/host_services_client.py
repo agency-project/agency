@@ -74,9 +74,9 @@ class HostServicesClient:
         own ReAct loop and needs to know when to compact (native_harness's
         `compaction.py`, mirroring the old `_native_in_container_
         entrypoint.py`'s `_fetch_context_limit`). Returns None on any
-        failure -- compaction just never triggers in that case, same
-        graceful-when-unknown behavior `agllm.py`'s own `maybe_compact()`
-        already has."""
+        failure -- compaction just never triggers in that case, the same
+        graceful-when-unknown behavior `native_harness/compaction.py`'s
+        `maybe_compact()` already has."""
         try:
             resp = self.client.get("/llm/context_limit")
             if resp.status_code != 200:

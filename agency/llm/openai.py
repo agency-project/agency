@@ -4,7 +4,8 @@ from __future__ import annotations
 import httpx
 import openai
 
-from .base import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS, agllm_backend
+from .base import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS
+from .agllm import agllm
 
 
 class agOpenAIBackendConfig(_AgProviderBackendConfig):
@@ -21,7 +22,7 @@ class agOpenAIBackendConfig(_AgProviderBackendConfig):
     )
 
 
-class _OpenAICompatibleBackend(agllm_backend):
+class _OpenAICompatibleBackend(agllm):
     """Default backend: OpenAI, vLLM, or any other OpenAI-compatible endpoint."""
 
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:

@@ -16,12 +16,13 @@ agent.
     argument, so the skill can't complete its required output field within
     a few ReAct steps.
   - Every framework object clones whatever agConfig it's given at
-    construction time, so `cfg`, `ag.agconfig`, `ag.llm._agconfig`, and
-    `ag.llm.backend._agconfig` are all independent copies -- mutating `cfg`
-    (or even `ag.agconfig`) after `agent(agconfig=cfg)` no longer reaches
-    `ag.llm`. `ag.change_config(new_cfg)` pushes a fresh agConfig down
-    through `ag.llm` (and its backend), `ag.log`, and `ag.sandbox` -- no new
-    agent, no sandbox teardown -- and the very next call sees it.
+    construction time, so `cfg` and `ag.agconfig` are independent copies --
+    mutating `cfg` after `agent(agconfig=cfg)` no longer reaches `ag`.
+    `ag.change_config(new_cfg)` replaces `ag.agconfig` and pushes a fresh
+    clone down through `ag.log`, `ag.data_collector`, and `ag.sandbox` -- no
+    new agent, no sandbox teardown. The LLM dispatch itself (inside the
+    harness daemon) reads `ag.agconfig` fresh on every skill execution, so
+    it picks up the change on the very next call with nothing further to push.
 
 See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 
@@ -103,9 +104,9 @@ def main():
         # tool call, or the truncated JSON never parsed, that access raises.
         print(f"Failed as expected: {e}\n")
 
-    # ag.llm.backend re-reads max_completion_tokens fresh on every call, so
-    # ag.change_config(new_cfg) makes the bump visible on the very next LLM
-    # call -- no new agent, no sandbox teardown needed.
+    # The harness daemon re-reads max_completion_tokens fresh on every call,
+    # so ag.change_config(new_cfg) makes the bump visible on the very next
+    # LLM call -- no new agent, no sandbox teardown needed.
     print(
         "Bumping max_completion_tokens: 32 -> 4096 (dynamic update via ag.change_config, same agent)\n"
     )

@@ -1,29 +1,13 @@
 from __future__ import annotations
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
-from .. import agllm_pure
-from ..agutil import _strip_thinking, _extract_thinking
-from .base import agllm_backend, AgLLMBackendFields
+from .base import AgLLMBackendFields
 from ..agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
 
 # Exists to register agllm's config fields (via __set_name__ at import time)
-# and hold their hardcoded defaults as plain class attributes -- agllm
-# inherits from this below, so self.max_retries etc. work via the inherited
-# ConfigParam descriptors exactly as if they were declared directly on agllm.
+# and hold their hardcoded defaults as plain class attributes.
 class _AgLLMFields:
-    # Kept as plain (non-descriptor) class attributes because other code in
-    # this file reads them directly in a @staticmethod, where there's no
-    # instance/agconfig to read a ConfigParam descriptor through.
-    CHARS_PER_TOKEN = 4  # Rough chars-per-token ratio for char-count token estimates.
-    TOKENIZE_TIMEOUT_SECONDS = 5.0
-    COMPACT_THRESHOLD = 0.9  # Fraction of context_limit that triggers compaction.
-    TAIL_FRACTION = 0.25
-    TAIL_MIN_TOKENS = 2_000
-    TAIL_MAX_TOKENS = 8_000
-    TOOL_OUTPUT_MAX_CHARS = 2_000
-    PRUNE_MIN_FREE_TOKENS = 20_000
-
     call_max_concurrency = GlobalConfigParam(
         "agllm", default=256
     )  # Max simultaneous in-flight LLM streaming calls across all skills.
@@ -65,11 +49,6 @@ class _AgLLMFields:
     default_context_limit = DynamicConfigParam(
         "agllm", default=200_000
     )  # Fallback context window size when model reports none.
-    summary_task_input_max_chars = DynamicConfigParam("agllm", default=800)
-    summary_assistant_content_max_chars = DynamicConfigParam("agllm", default=800)
-    summary_role_content_max_chars = DynamicConfigParam("agllm", default=1000)
-    summary_max_tokens = DynamicConfigParam("agllm", default=20000)
-    tail_turns = DynamicConfigParam("agllm", default=3)
 
 
 class agLLMConfig(_AgConfigViewBase):
@@ -84,60 +63,127 @@ class agLLMConfig(_AgConfigViewBase):
 
 
 # ---------------------------------------------------------------------------
-# agllm class
+# agllm class -- one instance per agconfig, built via agllm.for_config().
+# Combines what used to be two classes: the per-provider backend (config
+# holding, client building, capability hooks) and a thin outer wrapper
+# around it. Inherits both AgLLMBackendFields (per-call backend params --
+# model, api_key, temperature, ...) and _AgLLMFields (process-wide policy --
+# retry/timeout/concurrency) so every concrete backend reads both as plain
+# attributes.
 # ---------------------------------------------------------------------------
 
 
-class agllm(_AgLLMFields):
-    """Encapsulates an LLM configuration and provides methods for building
-    requests and executing streaming calls against that configuration."""
+class agllm(AgLLMBackendFields, _AgLLMFields):
+    """One instance per agconfig — knows how to build a client, answer
+    capability questions (model listing, tokenize endpoint, context limit),
+    and build request kwargs. Use `agllm.for_config(agconfig)` to get the
+    right concrete subclass; don't instantiate a subclass directly.
 
-    def __init__(
-        self,
-        agconfig: "agConfig",
-        context_limit: "int | None" = None,
-    ) -> None:
-        self._agconfig: agConfig = agconfig.clone()
-        self.backend: agllm_backend = agllm_backend.for_config(self._agconfig)
-        self.context_limit: int = (
-            context_limit if context_limit is not None else agllm.fetch_context_limit(self.backend)
-        )
+    The given agConfig is cloned (self._agconfig) -- so this instance's own
+    config is independent of the caller's; mutating the caller's original
+    agConfig afterward does not affect it. To change its live config, call
+    ``change_config()`` (or, for one-off dynamic fields, mutate
+    ``instance._agconfig`` directly since that object is used fresh on every
+    call).
+    """
+
+    def __init__(self, agconfig: "agConfig") -> None:
+        self._agconfig = agconfig.clone()
 
     def change_config(self, agconfig: "agConfig") -> None:
-        """Replace this llm's agconfig (and its backend's) with a clone of
-        the given one. Mutating ``self._agconfig`` in place does not reach
-        ``self.backend`` -- it holds its own independent clone -- so this is
-        the supported way to push a live config change through to the next
-        LLM call."""
+        """Replace this instance's agconfig with a clone of the given one."""
         self._agconfig = agconfig.clone()
-        self.backend.change_config(self._agconfig)
 
     def get_config_copy(self) -> "agConfig":
-        """Return a clone of this llm's agconfig."""
+        """Return a clone of this instance's agconfig."""
         return self._agconfig.clone()
 
-    # ------------------------------------------------------------------
-    # Instance methods — delegate to static methods using self.backend
-    # ------------------------------------------------------------------
+    @staticmethod
+    def for_config(agconfig: "agConfig") -> "agllm":
+        from .bedrock import (
+            _is_anthropic_bedrock_model,
+            _AnthropicBedrockBackend,
+            _OpenAICompatibleBedrockBackend,
+            _AnthropicAWSBackend,
+        )
+        from .anthropic import _AnthropicBackend
+        from .openai import _OpenAICompatibleBackend
+
+        provider = agconfig.get("agllm_backend", "provider")
+        model = agconfig.get("agllm_backend", "model", "") or ""
+        if provider == "bedrock":
+            if _is_anthropic_bedrock_model(model):
+                return _AnthropicBedrockBackend(agconfig)
+            return _OpenAICompatibleBedrockBackend(agconfig)
+        if provider in ("anthropicAWS", "anthropic_aws"):
+            return _AnthropicAWSBackend(agconfig)
+        if provider == "anthropic":
+            return _AnthropicBackend(agconfig)
+        if provider == "vllm" and not agconfig.get("agllm_backend", "base_url"):
+            raise ValueError(
+                "agVLLMBackendConfig (provider='vllm') requires base_url "
+                "-- point it at your vLLM/OpenAI-compatible endpoint (e.g. "
+                "'http://localhost:8000/v1')."
+            )
+        return _OpenAICompatibleBackend(agconfig)
+
+    def make_client(self, timeout: httpx.Timeout):
+        """Build and return a client exposing `.chat.completions.create()` and `.close()`."""
+        raise NotImplementedError
+
+    def list_models(self) -> list:
+        """Best-effort model listing, used for context-limit lookups. Exceptions
+        propagate to the caller (fetch_context_limit already wraps this).
+        Override to return [] for backends with no listing capability."""
+        client = self.make_client(httpx.Timeout(self.model_listing_timeout_seconds))
+        return list(client.models.list())
+
+    def tokenize_url(self) -> "str | None":
+        """Root URL for a vLLM-style /tokenize endpoint, or None if unsupported."""
+        return None
+
+    def known_context_limit(self, model: str) -> "int | None":
+        """Static fallback context window for models with no listing API to
+        query (e.g. Bedrock's native invoke_model). None if unknown — the
+        caller (fetch_context_limit) falls back to _AgLLMFields.default_context_limit.default."""
+        return None
+
+    def fetch_context_limit(self) -> int:
+        """Return this instance's model's context window size. Always live
+        (never cached) -- call it fresh whenever the current value matters.
+
+        Priority:
+        1. ``self.context_limit`` — explicit user override
+        2. Live API model listing — vLLM's ``max_model_len`` (a model_extra
+           field) or the Anthropic API's ``max_input_tokens`` (a typed field)
+        3. ``self.known_context_limit()`` — static fallback (e.g. Bedrock,
+           which has no model-listing API at all)
+        4. ``_AgLLMFields.default_context_limit.default`` — safe fallback so compaction always runs
+        """
+        if self.context_limit is not None:
+            return int(self.context_limit)
+        model_id = self.model or ""
+        try:
+            all_models = self.list_models()
+            candidates = [m for m in all_models if m.id == model_id] or all_models
+            for info in candidates:
+                extra = getattr(info, "model_extra", None) or {}
+                if "max_model_len" in extra:
+                    return int(extra["max_model_len"])
+                max_input_tokens = getattr(info, "max_input_tokens", None)
+                if max_input_tokens is not None:
+                    return int(max_input_tokens)
+        except Exception as _e:
+            print(f"[agllm] WARNING: failed to retrieve max_model_len from API: {_e}")
+        known = self.known_context_limit(model_id)
+        if known is not None:
+            return known
+        print(
+            f"[agllm] WARNING: context limit unknown, falling back to {_AgLLMFields.default_context_limit.default}"
+        )
+        return _AgLLMFields.default_context_limit.default
 
     def build_kwargs(self, messages: list[dict], openai_tools: "list | None" = None) -> dict:
-        return agllm.build_llm_kwargs(self.backend, messages, openai_tools)
-
-    # ------------------------------------------------------------------
-    # Static methods — pure functions on config/data, no instance needed
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_llm_kwargs(
-        llm_config: "agConfig | AgLLMBackendFields",
-        messages: list[dict],
-        openai_tools: "list | None",
-    ) -> dict:
-        backend = (
-            llm_config
-            if isinstance(llm_config, AgLLMBackendFields)
-            else agllm_backend.for_config(llm_config)
-        )
         _OPENAI_GEN_PARAMS = {
             "temperature",
             "reasoning_effort",
@@ -165,21 +211,21 @@ class agllm(_AgLLMFields):
                 wire_msg["content"] = ""
             wire_messages.append(wire_msg)
         kwargs: dict = dict(
-            model=backend.model or "",
+            model=self.model or "",
             messages=wire_messages,
         )
         for _p in _OPENAI_GEN_PARAMS:
-            val = getattr(backend, _p)
+            val = getattr(self, _p)
             if val is not None:
                 kwargs[_p] = val
-        if backend.max_tokens is not None:
+        if self.max_tokens is not None:
             print(
                 "[agllm] WARNING: llm_config['max_tokens'] is deprecated; use 'max_completion_tokens' instead."
             )
-            kwargs.setdefault("max_completion_tokens", backend.max_tokens)
-        _extra_body: dict = dict(backend.extra_body or {})
+            kwargs.setdefault("max_completion_tokens", self.max_tokens)
+        _extra_body: dict = dict(self.extra_body or {})
         for _p in _EXTRA_BODY_GEN_PARAMS:
-            val = getattr(backend, _p)
+            val = getattr(self, _p)
             if val is not None:
                 _extra_body[_p] = val
         if _extra_body:
@@ -187,127 +233,3 @@ class agllm(_AgLLMFields):
         if openai_tools:
             kwargs["tools"] = openai_tools
         return kwargs
-
-    @staticmethod
-    def build_assistant_msg(
-        content_parts: list[str],
-        reasoning_parts: list[str],
-        tool_calls_raw: dict[int, dict],
-    ) -> dict:
-        full_content = "".join(content_parts)
-        full_reasoning = "".join(reasoning_parts)
-        msg_dict: dict = {"role": "assistant"}
-        if full_reasoning:
-            msg_dict["_thinking"] = full_reasoning
-            if full_content:
-                msg_dict["content"] = full_content
-        elif full_content:
-            thinking = _extract_thinking(full_content)
-            if thinking:
-                msg_dict["_thinking"] = thinking
-            msg_dict["content"] = _strip_thinking(full_content)
-        if tool_calls_raw:
-            msg_dict["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
-        return msg_dict
-
-    @staticmethod
-    def fetch_context_limit(llm_config: "agConfig | agllm_backend") -> int:
-        """Return the model's context window size.
-
-        Priority:
-        1. ``backend.context_limit`` — explicit user override
-        2. Live API model listing — vLLM's ``max_model_len`` (a model_extra
-           field) or the Anthropic API's ``max_input_tokens`` (a typed field)
-        3. ``backend.known_context_limit()`` — static fallback (e.g. Bedrock,
-           which has no model-listing API at all)
-        4. ``_AgLLMFields.default_context_limit.default`` — safe fallback so compaction always runs
-        """
-        backend = (
-            llm_config
-            if isinstance(llm_config, AgLLMBackendFields)
-            else agllm_backend.for_config(llm_config)
-        )
-        if backend.context_limit is not None:
-            return int(backend.context_limit)
-        model_id = backend.model or ""
-        try:
-            all_models = backend.list_models()
-            candidates = [m for m in all_models if m.id == model_id] or all_models
-            for info in candidates:
-                extra = getattr(info, "model_extra", None) or {}
-                if "max_model_len" in extra:
-                    return int(extra["max_model_len"])
-                max_input_tokens = getattr(info, "max_input_tokens", None)
-                if max_input_tokens is not None:
-                    return int(max_input_tokens)
-        except Exception as _e:
-            print(f"[agllm] WARNING: failed to retrieve max_model_len from API: {_e}")
-        known = backend.known_context_limit(model_id)
-        if known is not None:
-            return known
-        print(
-            f"[agllm] WARNING: context limit unknown, falling back to {_AgLLMFields.default_context_limit.default}"
-        )
-        return _AgLLMFields.default_context_limit.default
-
-    # ------------------------------------------------------------------
-    # Compaction — token estimation, pruning, summarisation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def estimate_messages_tokens(messages: list[dict]) -> int:
-        """Rough total token count for a list of messages (~4 chars per
-        token) -- delegates to agllm_pure, shared with the in-container
-        native entrypoint's own compaction (see that module's docstring)."""
-        return agllm_pure.estimate_messages_tokens(messages)
-
-    @staticmethod
-    def _estimate_tokens(msg: dict) -> int:
-        return agllm_pure.estimate_tokens(msg)
-
-    @staticmethod
-    def count_messages_tokens(messages: list[dict], llm_config: "agConfig | agllm_backend") -> int:
-        """Token count via the vLLM /tokenize endpoint, falling back to char estimate."""
-        backend = (
-            llm_config
-            if isinstance(llm_config, AgLLMBackendFields)
-            else agllm_backend.for_config(llm_config)
-        )
-        root = backend.tokenize_url()
-        if root:
-            try:
-                resp = httpx.post(
-                    f"{root}/tokenize",
-                    json={
-                        "model": backend.model or "",
-                        "messages": [
-                            {k: v for k, v in m.items() if not k.startswith("_")} for m in messages
-                        ],
-                    },
-                    timeout=_AgLLMFields.TOKENIZE_TIMEOUT_SECONDS,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if "count" in data:
-                    return int(data["count"])
-                if "tokens" in data:
-                    return len(data["tokens"])
-            except Exception as _e:
-                print(f"[agllm] remote tokenize endpoint failed, using local estimate: {_e}")
-        return agllm.estimate_messages_tokens(messages)
-
-    @staticmethod
-    def should_compact(prompt_tokens: int, context_limit: int) -> bool:
-        return agllm_pure.should_compact(prompt_tokens, context_limit)
-
-    @staticmethod
-    def _tail_start(
-        conv: list[dict], context_limit: int, tail_turns: int = _AgLLMFields.tail_turns.default
-    ) -> int:
-        return agllm_pure.tail_start(conv, context_limit, tail_turns)
-
-    @staticmethod
-    def _prune_tool_outputs(messages: list[dict]) -> list[dict]:
-        """Trim oversized tool results; only activates when savings reach
-        agllm_pure.PRUNE_MIN_FREE_TOKENS."""
-        return agllm_pure.prune_tool_outputs(messages)

@@ -8,16 +8,13 @@ from agency.agdata import agdata
 from agency.agconfig import agConfig
 from agency.agschema import agschema
 from agency.agskill import agskill
-from agency.llm.agllm import _AgLLMFields, agllm
+from agency.llm.agllm import _AgLLMFields
 from agency.agtool import agtool
 from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
 
 LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
 LLM_IDLE_TIMEOUT = _AgLLMFields.idle_timeout.default
 LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
-
-LLM_CONFIG = {"api_key": "test", "model": ""}
-LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
 
 
 def _docker_available() -> bool:
@@ -31,7 +28,7 @@ def _docker_available() -> bool:
 docker = pytest.mark.skipif(not _docker_available(), reason="Docker daemon not reachable")
 
 
-def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s=5):
+def make_mock_agent(sandbox=None, ping_interval_s=300, poll_interval_s=5):
     _ping = ping_interval_s
     _poll = poll_interval_s
 
@@ -43,7 +40,6 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
         _drain_inbox = _agent_cls._drain_inbox
 
     ag = _MockAgent()
-    ag.llm = llm or LLM
     if sandbox is not None:
         ag.sandbox = sandbox
     else:
@@ -338,7 +334,9 @@ def test_no_schemas_system_prompt_unchanged():
 
 from agency.llm.agllm import agllm as _agllm_mod
 
-build_llm_kwargs = _agllm_mod.build_llm_kwargs
+
+def build_llm_kwargs(cfg, messages, openai_tools=None):
+    return _agllm_mod.for_config(cfg).build_kwargs(messages, openai_tools)
 
 
 def _llm_cfg(**fields) -> agConfig:
@@ -381,48 +379,6 @@ def test_build_llm_kwargs_tools_included_when_provided():
 def test_build_llm_kwargs_no_tools_key_when_none():
     kw = build_llm_kwargs(_llm_cfg(model="m"), [], None)
     assert "tools" not in kw
-
-
-# ---------------------------------------------------------------------------
-# build_assistant_msg
-# ---------------------------------------------------------------------------
-
-build_assistant_msg = _agllm_mod.build_assistant_msg
-
-
-def test_build_assistant_msg_plain_content():
-    msg = build_assistant_msg(["hello", " world"], [], {})
-    assert msg["role"] == "assistant"
-    assert msg["content"] == "hello world"
-
-
-def test_build_assistant_msg_reasoning_parts():
-    msg = build_assistant_msg(["answer"], ["think ", "harder"], {})
-    assert msg["_thinking"] == "think harder"
-    assert msg["content"] == "answer"
-
-
-def test_build_assistant_msg_think_tag_stripped():
-    msg = build_assistant_msg(["<think>reasoning</think>answer"], [], {})
-    assert msg.get("_thinking") == "reasoning"
-    assert msg["content"] == "answer"
-
-
-def test_build_assistant_msg_tool_calls_included():
-    tc = {0: {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}}
-    msg = build_assistant_msg([], [], tc)
-    assert len(msg["tool_calls"]) == 1
-    assert msg["tool_calls"][0]["function"]["name"] == "f"
-
-
-def test_build_assistant_msg_tool_calls_sorted_by_index():
-    tc = {
-        1: {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
-        0: {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
-    }
-    msg = build_assistant_msg([], [], tc)
-    assert msg["tool_calls"][0]["function"]["name"] == "a"
-    assert msg["tool_calls"][1]["function"]["name"] == "b"
 
 
 # ---------------------------------------------------------------------------

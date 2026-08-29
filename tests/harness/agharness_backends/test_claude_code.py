@@ -43,7 +43,7 @@ def _make_agent(with_sandbox=True):
     ag = MagicMock()
     ag.agname = "test-agent"
     ag.agconfig = agConfig()
-    ag.llm.backend.model = "test-model"
+    ag.model = "test-model"
     ag.sandbox = MagicMock() if with_sandbox else None
     return ag
 
@@ -78,7 +78,7 @@ def _run_attempt(
 ):
     runtime = AdapterRuntime(
         agconfig=ag.agconfig,
-        model=ag.llm.backend.model,
+        model=ag.model,
         engine_name=ag.agname,
         harness_base_url=harness_base_url,
         token=token,

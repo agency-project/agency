@@ -13,7 +13,7 @@ invoke_model API, in the Anthropic Messages API shape (the `anthropic` SDK's
 `anthropic.claude-sonnet-5` foundation-model ID — the bare ID 400s with "on-
 demand throughput isn't supported."
 
-`for_config()` (`.base`) picks between `_AnthropicBedrockBackend` and
+`for_config()` (`.agllm`) picks between `_AnthropicBedrockBackend` and
 `_OpenAICompatibleBedrockBackend` based on the model ID
 (`_is_anthropic_bedrock_model()`), and routes provider='anthropicAWS' to
 `_AnthropicAWSBackend` directly (no model-based branching -- there's no
@@ -33,8 +33,8 @@ from .base import (
     _AgProviderBackendConfig,
     _OPENAI_GEN_FIELDS,
     _VLLM_EXTRA_GEN_FIELDS,
-    agllm_backend,
 )
+from .agllm import agllm
 from .openai import _OpenAICompatibleBackend
 from .anthropic import (
     _AnthropicBedrockChatClient,
@@ -164,7 +164,7 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
         return None  # Bedrock has no vLLM-style /tokenize endpoint
 
 
-class _AnthropicBedrockBackend(agllm_backend):
+class _AnthropicBedrockBackend(agllm):
     """Claude models on Amazon Bedrock — native invoke_model API via the
     anthropic SDK's AnthropicBedrock client (Messages API shape)."""
 
@@ -187,7 +187,7 @@ class _AnthropicBedrockBackend(agllm_backend):
         return _known_anthropic_context_window(model)
 
 
-class _AnthropicAWSBackend(agllm_backend):
+class _AnthropicAWSBackend(agllm):
     """Claude Platform on AWS via the anthropic SDK's AnthropicAWS client.
 
     Auth (resolved by the SDK): SigV4 via the default AWS credential chain,

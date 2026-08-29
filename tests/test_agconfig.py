@@ -19,7 +19,6 @@ from agency.agconfig import (
 )
 from agency.llm.agllm import agllm
 from agency.llm import (
-    agllm_backend,
     AgLLMBackendFields,
     agLLMBackendConfig,
     agVLLMBackendConfig,
@@ -663,9 +662,9 @@ class TestAgLLMBackendConfig:
 
     def test_result_usable_directly_by_agllm(self):
         cfg = agConfig(agLLMBackendConfig(model="m", api_key="k"))
-        llm = agllm(cfg, context_limit=128_000)
-        assert llm.backend.model == "m"
-        assert llm.backend.api_key == "k"
+        llm = agllm.for_config(cfg)
+        assert llm.model == "m"
+        assert llm.api_key == "k"
 
     def test_unknown_field_raises_type_error(self):
         with pytest.raises(TypeError, match="bogus_field"):
@@ -701,44 +700,42 @@ class TestAgLLMBackendConfig:
 
 class TestBackendOwnsPrivateAgConfig:
     def test_backend_is_agllmbackendfields(self):
-        backend = agllm_backend.for_config(_cfg(model="m"))
+        backend = agllm.for_config(_cfg(model="m"))
         assert isinstance(backend, AgLLMBackendFields)
 
     def test_backend_clones_the_given_agconfig(self):
         """The backend's own agconfig is independent of the caller's --
         mutating cfg afterward must not affect an already-built backend."""
         cfg = _cfg(model="m")
-        backend = agllm_backend.for_config(cfg)
+        backend = agllm.for_config(cfg)
         assert backend._agconfig is not cfg
         assert backend.model == "m"
         cfg.agllm_backend.model = "changed"
         assert backend.model == "m"
 
     def test_config_values_readable_as_attributes(self):
-        backend = agllm_backend.for_config(
-            _cfg(model="gpt-x", api_key="k", temperature=0.5, top_k=40)
-        )
+        backend = agllm.for_config(_cfg(model="gpt-x", api_key="k", temperature=0.5, top_k=40))
         assert backend.model == "gpt-x"
         assert backend.api_key == "k"
         assert backend.temperature == 0.5
         assert backend.top_k == 40
 
     def test_unset_fields_default_to_none(self):
-        backend = agllm_backend.for_config(_cfg(model="m"))
+        backend = agllm.for_config(_cfg(model="m"))
         assert backend.workspace_id is None
         assert backend.extra_body is None
 
     def test_as_dict_reflects_config(self):
         cfg = _cfg(model="m", api_key="k")
-        backend = agllm_backend.for_config(cfg)
+        backend = agllm.for_config(cfg)
         assert backend.as_dict() == {"model": "m", "api_key": "k"}
 
     def test_two_backend_instances_over_separate_agconfigs_have_independent_values(self):
         """Each backend is given its own agConfig -- values on one instance
         must never leak into another, even though the DynamicConfigParam
         descriptors are shared class attributes."""
-        a = agllm_backend.for_config(_cfg(model="model-a", api_key="key-a"))
-        b = agllm_backend.for_config(_cfg(model="model-b", api_key="key-b"))
+        a = agllm.for_config(_cfg(model="model-a", api_key="key-a"))
+        b = agllm.for_config(_cfg(model="model-b", api_key="key-b"))
         assert a.model == "model-a"
         assert b.model == "model-b"
         assert a.api_key == "key-a"
@@ -746,8 +743,8 @@ class TestBackendOwnsPrivateAgConfig:
         assert a._agconfig is not b._agconfig
 
     def test_setting_attribute_on_one_instance_does_not_affect_another(self):
-        a = agllm_backend.for_config(_cfg(model="model-a"))
-        b = agllm_backend.for_config(_cfg(model="model-b"))
+        a = agllm.for_config(_cfg(model="model-a"))
+        b = agllm.for_config(_cfg(model="model-b"))
         a.model = "changed"
         assert a.model == "changed"
         assert b.model == "model-b"
@@ -761,39 +758,37 @@ class TestGlobalTunables:
     on collection order."""
 
     def test_default_max_tokens_readable_from_any_backend_instance(self):
-        backend = agllm_backend.for_config(_cfg(model="m"))
+        backend = agllm.for_config(_cfg(model="m"))
         assert backend.default_max_tokens == 128000
 
     def test_model_listing_timeout_readable_from_any_backend_instance(self):
-        backend = agllm_backend.for_config(_cfg(model="m"))
+        backend = agllm.for_config(_cfg(model="m"))
         assert backend.model_listing_timeout_seconds == 10.0
 
 
 class TestForConfigDispatch:
     def test_plain_config_returns_openai_compatible(self):
-        assert isinstance(agllm_backend.for_config(_cfg(model="m")), _OpenAICompatibleBackend)
+        assert isinstance(agllm.for_config(_cfg(model="m")), _OpenAICompatibleBackend)
 
     def test_bedrock_provider_non_anthropic_model(self):
-        backend = agllm_backend.for_config(
-            _cfg(provider="bedrock", model="nvidia.x", region="us-east-2")
-        )
+        backend = agllm.for_config(_cfg(provider="bedrock", model="nvidia.x", region="us-east-2"))
         assert isinstance(backend, _OpenAICompatibleBedrockBackend)
 
     def test_bedrock_provider_anthropic_model(self):
-        backend = agllm_backend.for_config(
+        backend = agllm.for_config(
             _cfg(provider="bedrock", model="us.anthropic.claude-sonnet-5", region="us-east-2")
         )
         assert isinstance(backend, _AnthropicBedrockBackend)
 
     def test_anthropic_provider(self):
         assert isinstance(
-            agllm_backend.for_config(_cfg(provider="anthropic", model="claude-sonnet-5")),
+            agllm.for_config(_cfg(provider="anthropic", model="claude-sonnet-5")),
             _AnthropicBackend,
         )
 
     def test_anthropic_aws_provider(self):
         assert isinstance(
-            agllm_backend.for_config(_cfg(provider="anthropicAWS", model="claude-sonnet-5")),
+            agllm.for_config(_cfg(provider="anthropicAWS", model="claude-sonnet-5")),
             _AnthropicAWSBackend,
         )
 
@@ -837,20 +832,19 @@ class TestAttributeBackedClientConstruction:
 
 class TestAgllmUsesAgConfig:
     def test_agllm_reads_backend_from_agconfig(self):
-        llm = agllm(_cfg(model="gpt-x"), context_limit=128_000)
-        assert llm.backend.model == "gpt-x"
-        assert isinstance(llm.backend, _OpenAICompatibleBackend)
+        llm = agllm.for_config(_cfg(model="gpt-x"))
+        assert llm.model == "gpt-x"
+        assert isinstance(llm, _OpenAICompatibleBackend)
 
     def test_agllm_backend_attributes_reflect_config(self):
-        llm = agllm(
+        llm = agllm.for_config(
             _cfg(model="claude-sonnet-5", temperature=0.3, provider="anthropic"),
-            context_limit=128_000,
         )
-        assert llm.backend.model == "claude-sonnet-5"
-        assert llm.backend.temperature == 0.3
+        assert llm.model == "claude-sonnet-5"
+        assert llm.temperature == 0.3
 
     def test_build_kwargs_unaffected(self):
-        llm = agllm(_cfg(model="claude-sonnet-5", temperature=0.3), context_limit=128_000)
+        llm = agllm.for_config(_cfg(model="claude-sonnet-5", temperature=0.3))
         kw = llm.build_kwargs([{"role": "user", "content": "hi"}])
         assert kw["temperature"] == 0.3
         assert kw["model"] == "claude-sonnet-5"
@@ -925,30 +919,30 @@ class TestProviderBackendConfigClasses:
 
     def test_vllm_config_routes_to_openai_compatible_backend(self):
         cfg = agConfig(agVLLMBackendConfig(model="m", base_url="http://localhost:8000/v1"))
-        assert isinstance(agllm_backend.for_config(cfg), _OpenAICompatibleBackend)
+        assert isinstance(agllm.for_config(cfg), _OpenAICompatibleBackend)
 
     def test_vllm_config_without_base_url_raises(self):
         cfg = agConfig(agVLLMBackendConfig(model="m"))
         with pytest.raises(ValueError, match="base_url"):
-            agllm_backend.for_config(cfg)
+            agllm.for_config(cfg)
 
     def test_openai_config_routes_to_openai_compatible_backend(self):
         cfg = agConfig(agOpenAIBackendConfig(model="m"))
-        assert isinstance(agllm_backend.for_config(cfg), _OpenAICompatibleBackend)
+        assert isinstance(agllm.for_config(cfg), _OpenAICompatibleBackend)
 
     def test_anthropic_config_routes_to_anthropic_backend(self):
         cfg = agConfig(agAnthropicBackendConfig(model="claude-sonnet-5"))
-        assert isinstance(agllm_backend.for_config(cfg), _AnthropicBackend)
+        assert isinstance(agllm.for_config(cfg), _AnthropicBackend)
 
     def test_bedrock_config_routes_to_openai_compatible_bedrock_for_non_anthropic_model(self):
         cfg = agConfig(agBedrockBackendConfig(model="minimax.minimax-m2", region="us-east-1"))
-        assert isinstance(agllm_backend.for_config(cfg), _OpenAICompatibleBedrockBackend)
+        assert isinstance(agllm.for_config(cfg), _OpenAICompatibleBedrockBackend)
 
     def test_bedrock_config_routes_to_anthropic_bedrock_for_anthropic_model(self):
         cfg = agConfig(
             agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5", region="us-east-1")
         )
-        assert isinstance(agllm_backend.for_config(cfg), _AnthropicBedrockBackend)
+        assert isinstance(agllm.for_config(cfg), _AnthropicBedrockBackend)
 
     def test_two_provider_configs_composed_stay_independent(self):
         """Each is a separate agConfig unless explicitly merged -- picking
@@ -1082,10 +1076,6 @@ def test_llm_default_context_limit_default_accessor():
     assert _AgLLMFields.default_context_limit.default == 200_000
 
 
-def test_llm_tail_turns_default_accessor():
-    assert _AgLLMFields.tail_turns.default == 3
-
-
 def test_tool_timeout_s_default_accessor():
     assert _AgToolFields.timeout_s.default == 1800
 
@@ -1108,4 +1098,4 @@ def test_default_accessor_matches_actual_bare_instance_read():
     separate constant that could drift from it."""
     assert _AgToolFields().timeout_s == _AgToolFields.timeout_s.default
     assert _AgSchemaFields().input_offload_chars == _AgSchemaFields.input_offload_chars.default
-    assert _AgLLMFields().tail_turns == _AgLLMFields.tail_turns.default
+    assert _AgLLMFields().default_context_limit == _AgLLMFields.default_context_limit.default
