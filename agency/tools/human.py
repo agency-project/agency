@@ -32,6 +32,8 @@ def ask_human_and_wait(agname: str, question: str, timeout_s: "float | None", ag
         import uuid as _uuid
 
         ask_id = _uuid.uuid4().hex[:ASK_ID_HEX_LENGTH]
+        # DATACOLLECTOR: append, correlate (ask_id) -- pairs with the later human_reply;
+        # also needs a "waiting" latest-style status while blocked.
         reply = _agwebui._active.emitter.ask_human(agname, ask_id, question, timeout_s=timeout_s)
     else:
         print(f"\n[{agname}] asks: {question}")

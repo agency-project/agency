@@ -84,6 +84,8 @@ class HostServicesClient:
             return None
 
     def log_warning(self, token: str, message: str) -> None:
+        # DATACOLLECTOR: append -- the one existing production call already wired through
+        # record_event(type="warning"); model other emission points after this shape.
         self.client.post(
             "/interaction/record_event",
             json={"type": "warning", "payload": {"message": message}},

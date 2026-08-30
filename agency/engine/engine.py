@@ -68,6 +68,7 @@ class AgentEngine:
                                 try:
                                     sandbox.stop()
                                 except Exception as exc:
+                                    # DATACOLLECTOR: append -- ad-hoc print, uncaptured by any structured channel today.
                                     print(
                                         f"[engine] WARNING: post-commit hibernate failed "
                                         f"for {self._agent.agname}: {exc}"

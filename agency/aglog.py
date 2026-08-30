@@ -37,6 +37,7 @@ class agLogConfig(_AgConfigViewBase):
     _OWNER = "aglog"
 
 
+# DATACOLLECTOR: drop -- superseded by agDataCollector once callers below move to record_event/record_span directly.
 class aglog(_AgLogFields):
     """Structured, thread-safe log of all agskill calls and lifecycle events on an agent.
 

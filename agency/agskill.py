@@ -457,6 +457,8 @@ class agskill:
                     "SKILL ▶  ", f"{self.name}  input={list(local_skill_input._data.keys())}"
                 )
                 ag._set_ui_state("skill", skill=self.name)
+                # DATACOLLECTOR: append, correlate -- start half of the skill_start/skill_error
+                # pair; could be modeled as a span (start here, end/error below).
                 ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
 
                 # ── 2. Delegate actual execution to the Agent Engine.
@@ -491,12 +493,17 @@ class agskill:
                     "SKILL ✗  ",
                     f"{self.name}  error={str(result_dict['error'])[:_error_log_truncate]}",
                 )
+                # DATACOLLECTOR: append, correlate -- end half of the skill_start/skill_error
+                # pair; note the success path has no matching "skill_end" entry today.
                 ag._append_full_history(
                     {"type": "skill_error", "skill": self.name, "error": str(result_dict["error"])}
                 )
             else:
                 ag.terminal.log("SKILL ✓  ", f"{self.name}  output={list(result_dict.keys())}")
             try:
+                # DATACOLLECTOR: append -- one entry per skill completion; payload embeds the
+                # full history_before/history_delta message list (large -- decide truncation
+                # or collapse policy before this goes through the common channel).
                 ag.log._record(
                     self.name,
                     ts_start,

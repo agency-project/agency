@@ -141,6 +141,8 @@ class agent_state:
         self._emit()
 
     def _emit(self) -> None:  # [REFACTOR] "PUSH" to agwebui?
+        # DATACOLLECTOR: latest, keyed by agname -- current (state, skill, tool) only, no
+        # history needed.
         try:
             from . import agwebui as _agwebui
 
@@ -298,6 +300,7 @@ class agent:
         ctx = f"  context={_context_limit}" if _context_limit else "  context=unknown"
         team_tag = f"  team={team_name}" if team_name else ""
         self.terminal.log("CREATED  ", f"model={_llm_config.get('model') or '?'}{ctx}{team_tag}")
+        # DATACOLLECTOR: append -- one-shot lifecycle event, correlate by agname.
         self.log._lifecycle(
             "created",
             agname=self.agname,
@@ -374,6 +377,8 @@ class agent:
         self, msg: dict
     ) -> None:  # [REFACTOR] File-write method? Maybe rename?
         """Append one message to the append-only full history (thread-safe write)."""
+        # DATACOLLECTOR: append -- full per-agent transcript; non-message entries also
+        # trigger the latest-snapshot push below.
         self._full_history.append(msg)
         with self._full_history_path.open("a") as f:
             f.write(json.dumps(msg) + "\n")
@@ -388,6 +393,7 @@ class agent:
         so its config editor can show/edit it without a round trip into this
         (isolated) execution process. Called on construction and after every
         change_config()."""
+        # DATACOLLECTOR: latest, keyed by agname -- current dynamic-config snapshot only.
         if self.agconfig is None:
             return
         try:
@@ -399,6 +405,10 @@ class agent:
             print(f"[agent] WARNING: agent_config push failed for {self.agname}: {_e}")
 
     def _push_live_messages(self, messages: list) -> None:
+        # DATACOLLECTOR: append+latest -- ships the full current message list wholesale
+        # each call (snapshot, not delta); consumer needs both "current messages" (latest)
+        # and a history scrubber (append). Candidate for collapse if called at streaming
+        # frequency.
         self._snapshot_messages = list(messages)
         try:
             from . import agwebui as _agwebui
@@ -436,12 +446,15 @@ class agent:
         checkpoint. Non-blocking — delivered as an inbox entry the harness
         manager drains via check_inbox()."""
         self.inbox.put({"type": "pause"})
+        # DATACOLLECTOR: append -- currently terminal-only; no structured event exists for
+        # pause/resume requests today.
         self.terminal.log("PAUSE ▶  ", "requested")
 
     def resume(self) -> None:
         """Clear a pause request. Non-blocking — delivered as an inbox entry
         the harness manager drains via check_inbox()."""
         self.inbox.put({"type": "resume"})
+        # DATACOLLECTOR: append -- same gap as pause() above.
         self.terminal.log("PAUSE ✓  ", "resumed")
 
     def is_paused(self) -> bool:
@@ -525,6 +538,7 @@ class agent:
         _live_agents.discard(self)
         try:
             self.terminal.log("DESTROYED", "")
+            # DATACOLLECTOR: append -- one-shot lifecycle event.
             self.log._lifecycle("destroyed", agname=self.agname)
         except Exception as _e:
             print(f"[agent] WARNING: __del__ log failed for {getattr(self, 'agname', '?')}: {_e}")
@@ -576,6 +590,8 @@ class agent:
         team_name = _team.team_name if _team is not None else None
 
         ag.terminal.log("FORKED   ", f"from {src.agname}")
+        # DATACOLLECTOR: append, correlate (parent_agname) -- lifecycle event linking the
+        # fork to its source agent.
         ag.log._lifecycle(
             "forked",
             agname=ag.agname,
@@ -697,6 +713,7 @@ class agent:
 
         size_kb = path.stat().st_size // 1024
         self.terminal.log("CKPT ✓   ", f"saved → {path}  ({size_kb} KB)")
+        # DATACOLLECTOR: append -- one-shot lifecycle event.
         self.log._lifecycle("saved", agname=self.agname, path=str(path), size_kb=size_kb)
 
     @classmethod
@@ -793,6 +810,7 @@ class agent:
         _live_agents.add(ag)
 
         ag.terminal.log("LOADED   ", f"from {path}")
+        # DATACOLLECTOR: append -- one-shot lifecycle event.
         ag.log._lifecycle(
             "loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts")
         )

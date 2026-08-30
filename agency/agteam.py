@@ -102,12 +102,16 @@ class agteam:
         parent_team_name = parent.team_name if parent is not None else None
         log_dir = _Agent.log_dir
         self._log = _aglog(log_dir / "_teams.jsonl" if log_dir else None)
+        # DATACOLLECTOR: append, correlate (parent_team) -- team lifecycle event; this call
+        # currently omits agname, which is a pre-existing bug in aglog.dump() for team logs
+        # (moot once aglog is dropped, but the parent/child correlation still needs a home).
         self._log._lifecycle(
             "created",
             team=self.team_name,
             parent_team=parent_team_name,
         )
         if parent_team_name is not None:
+            # DATACOLLECTOR: drop -- redundant with the _lifecycle append two lines above.
             print(
                 f"  [agteam] {self.team_name} created inside {parent_team_name}",
                 file=sys.stderr,
@@ -124,6 +128,8 @@ class agteam:
             from . import agwebui as _agwebui
 
             if _agwebui._active is not None:
+                # DATACOLLECTOR: registry -- append-once list keyed by team_name, updated
+                # as agents join.
                 _agwebui._active.emitter.team_registered(
                     self.team_name,
                     [a.agname for a in self._agents],

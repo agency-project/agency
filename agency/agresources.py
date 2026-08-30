@@ -559,6 +559,9 @@ class agResourcePool(_AgResourcePoolFields):
         two threads racing there can make two sandboxes believe they hold
         the same physical GPU -- an actual invariant, not a status number.)
         """
+        # DATACOLLECTOR: latest (singleton) + collapse -- one shared resource_state row,
+        # called on every acquire/release; high-frequency callers may need bucketed
+        # downsampling like agwebui's own _PRUNE_* mechanism.
         try:
             from . import agwebui as _agwebui
 
