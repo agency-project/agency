@@ -265,6 +265,7 @@ def _probe_chroot_available() -> bool:
             # single candidate's failure as fatal to capability detection.
             # Runs at most once per candidate, cached after the first
             # success, so this print is not a per-call cost.
+            # DATACOLLECTOR: append -- process-level (runs before any agname exists), routine candidate-probe failure.
             print(f"[agsandbox_backend] chroot capability probe {prefix} failed: {_e}")
             continue
         if proc.returncode == 0:
@@ -662,6 +663,7 @@ class _ChrootBackend(agsandbox_backend):
             except ProcessLookupError:
                 pass
             except Exception as _e:
+                # DATACOLLECTOR: append, agname=self._name -- best-effort courtesy signal, low priority.
                 print(
                     f"[agsandbox_backend] WARNING: failed to kill process group {pgid} in {self._name}: {_e}"
                 )

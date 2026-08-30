@@ -101,6 +101,7 @@ def _cleanup_all_sandboxes() -> None:
         try:
             sandbox.destroy()
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=sandbox._agname -- exceptional (atexit teardown failure).
             print(f"[agsandbox] WARNING: atexit destroy failed for {sandbox._agname}: {_e}")
 
 
@@ -415,6 +416,8 @@ class agSandbox(_AgSandboxFields):
         try:
             self.destroy()
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- exceptional, and __del__'s only
+            # surfacing mechanism (Python otherwise swallows the exception silently).
             print(f"[agsandbox] WARNING: destroy() failed during __del__ for {self._agname}: {_e}")
 
     def destroy(self) -> None:

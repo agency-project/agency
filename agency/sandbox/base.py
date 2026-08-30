@@ -234,6 +234,8 @@ def run_with_unkillable_child_grace(
     except _FutureTimeoutError:
         if on_give_up is not None:
             on_give_up()
+        # DATACOLLECTOR: append -- no agname in scope here (only argv); genuinely exceptional
+        # (unkillable/D-state child), worth surfacing prominently once folded in.
         print(
             f"[agsandbox_backend] WARNING: {' '.join(args)} did not exit within "
             f"{timeout + grace_s}s even after SIGKILL (unkillable/D-state child?) -- "
@@ -841,6 +843,7 @@ class agsandbox_backend(AgSandboxBackendFields):
             try:
                 self.update_limits(cpus=pool.idle_cpus, memory=pool.idle_memory)
             except Exception as _e:
+                # DATACOLLECTOR: append, agname=self._name -- best-effort failure, low priority.
                 print(f"[agsandbox_backend] WARNING: update_limits failed for {self._name}: {_e}")
 
     def remove_files(self, paths: list[str]) -> None:
@@ -851,6 +854,7 @@ class agsandbox_backend(AgSandboxBackendFields):
             try:
                 self._container_exec(f"rm -f {_shlex.quote(path)}", shell="sh")
             except Exception as _e:
+                # DATACOLLECTOR: append, agname=self._name -- best-effort cleanup failure, low priority.
                 print(f"[agsandbox_backend] WARNING: failed to remove offloaded file {path}: {_e}")
 
 

@@ -88,6 +88,7 @@ class _PodmanBackend(_ContainerBackendBase):
                 ).stdout.decode("utf-8", errors="replace")
             )
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning.
             print(
                 f"[agsandbox_backend] WARNING: `podman info` failed, fast squash path "
                 f"unavailable for this backend's lifetime: {_e}",
@@ -111,6 +112,7 @@ class _PodmanBackend(_ContainerBackendBase):
             store = info["store"]
             return (Path(store["graphRoot"]), store.get("graphDriverName", ""))
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning.
             print(
                 f"[agsandbox_backend] WARNING: `podman info` output missing "
                 f"store.graphRoot, fast squash path unavailable: {_e}",
@@ -156,6 +158,7 @@ class _PodmanBackend(_ContainerBackendBase):
                 if uid_map is not None and gid_map is not None:
                     result = (uid_map, gid_map)
                 else:
+                    # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning.
                     print(
                         "[agsandbox_backend] WARNING: rootless Podman confirmed but "
                         "host.idMappings has no usable uidmap/gidmap -- uid/gid "
@@ -165,6 +168,7 @@ class _PodmanBackend(_ContainerBackendBase):
                         flush=True,
                     )
             except Exception as _e:
+                # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning.
                 print(
                     f"[agsandbox_backend] WARNING: could not parse `podman info`'s "
                     f"host.idMappings: {_e}",
@@ -222,6 +226,7 @@ class _PodmanBackend(_ContainerBackendBase):
             return None  # already warned in _podman_info()/_podman_graph_root_and_driver()
         data_root, driver = root_and_driver
         if driver != "overlay":
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this backend's lifetime.
             print(
                 f"[agsandbox_backend] WARNING: unsupported podman storage driver "
                 f"{driver!r} -- fast squash path unavailable for this backend's lifetime",
@@ -233,6 +238,7 @@ class _PodmanBackend(_ContainerBackendBase):
         try:
             layers = json.loads(layers_json.read_text())
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
             print(
                 f"[agsandbox_backend] WARNING: could not read/parse {layers_json}: {_e}",
                 file=__import__("sys").stderr,
@@ -245,6 +251,7 @@ class _PodmanBackend(_ContainerBackendBase):
                 if entry.get("diff-digest") == diff_id:
                     layer_id = entry.get("id")
         except (AttributeError, TypeError) as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
             print(
                 f"[agsandbox_backend] WARNING: {layers_json} has an unexpected shape: {_e}",
                 file=__import__("sys").stderr,
@@ -252,6 +259,7 @@ class _PodmanBackend(_ContainerBackendBase):
             )
             return None
         if not layer_id:
+            # DATACOLLECTOR: append, agname=self._agname -- routine, expected on first squash cycle.
             print(
                 f"[agsandbox_backend] WARNING: no layers.json entry found for "
                 f"diff_id {diff_id} in {layers_json} -- fast squash unavailable "
@@ -262,6 +270,7 @@ class _PodmanBackend(_ContainerBackendBase):
             return None
         diff_dir = data_root / "overlay" / layer_id / "diff"
         if not diff_dir.is_dir():
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
             print(
                 f"[agsandbox_backend] WARNING: layers.json entry for diff_id "
                 f"{diff_id} points at {diff_dir}, which doesn't exist -- fast "

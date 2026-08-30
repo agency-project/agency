@@ -212,6 +212,7 @@ def reap_orphaned_containers() -> None:
         try:
             _do_reap_orphaned_containers()
         except Exception as _e:
+            # DATACOLLECTOR: append -- host-level, no single agname (runs once per process at startup).
             print(f"[agsandbox_backend] WARNING: startup container reap failed: {_e}")
 
 
@@ -240,6 +241,8 @@ def _do_reap_orphaned_containers() -> None:
             continue
         if owner_pid == own_pid or _pid_alive(owner_pid):
             continue  # still owned by a live process (or ourselves) -- leave it
+        # DATACOLLECTOR: append -- informational (routine cleanup action), host-level; the
+        # orphaned agent's own process is already dead, so this can't reach its data_collector.
         print(
             f"[agsandbox_backend] Reaping container {name!r} ({container_id[:12]}), "
             f"orphaned by dead process {owner_pid} (likely SIGKILL'd)",
@@ -325,6 +328,7 @@ def _reap_orphaned_lifecycle_images(runtime: str, own_pid: int) -> None:
             # reaching here means the tag vanished (e.g. removed by a
             # concurrent process) or its label value was somehow
             # unparseable -- rare. Unknown either way, never treat as dead.
+            # DATACOLLECTOR: append -- host-level, no single agname.
             print(
                 f"[agsandbox_backend] WARNING: could not read owner_pid label for "
                 f"lifecycle image {tag!r}, skipping: {_e}",
@@ -345,6 +349,7 @@ def _reap_orphaned_lifecycle_images(runtime: str, own_pid: int) -> None:
             if in_use.stdout.strip():
                 continue  # a container -- possibly a fresh owner reusing this tag -- is still running from it
         except Exception as _e:
+            # DATACOLLECTOR: append -- host-level, no single agname.
             print(
                 f"[agsandbox_backend] WARNING: could not confirm lifecycle image {tag!r} "
                 f"is unused, skipping rather than risk deleting a live image: {_e}",
@@ -352,6 +357,8 @@ def _reap_orphaned_lifecycle_images(runtime: str, own_pid: int) -> None:
                 flush=True,
             )
             continue
+        # DATACOLLECTOR: append -- informational (routine cleanup action), host-level; the
+        # orphaned agent's own process is already dead, so this can't reach its data_collector.
         print(
             f"[agsandbox_backend] Reaping lifecycle image {tag!r}, "
             f"orphaned by dead process {owner_pid} (likely SIGKILL'd)",
@@ -611,6 +618,7 @@ class _ContainerBackendBase(agsandbox_backend):
         try:
             _container_semaphore.release()
         except ValueError as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- real invariant-violation signal.
             print(
                 f"[agsandbox_backend] WARNING: container-slot semaphore double-release: {_e}",
                 file=__import__("sys").stderr,
@@ -1675,6 +1683,7 @@ class _ContainerBackendBase(agsandbox_backend):
             # path re-baseline (falls back to self._base_image instead,
             # which will fail its prefix check again and fall back once
             # more, exactly like before this re-baselining existed).
+            # DATACOLLECTOR: append, agname=self._agname -- best-effort failure, low priority.
             print(
                 f"[agsandbox_backend] WARNING: could not record post-squash chain "
                 f"for tag {tag}, next squash will fall back to export/import again: {_e}",
@@ -1867,6 +1876,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     _prev_result.stdout.decode("utf-8", errors="replace").strip() or None
                 )
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- best-effort cleanup lookup failure.
             print(
                 f"[agsandbox_backend] WARNING: could not inspect existing image for tag "
                 f"{tag} before commit: {_e}",
@@ -1925,6 +1935,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 else:
                     self._rmi(previous_image_id)
             except Exception as _e:
+                # DATACOLLECTOR: append, agname=self._agname -- best-effort cleanup failure, low priority.
                 print(
                     f"[agsandbox_backend] WARNING: could not check/delete previous image "
                     f"{previous_image_id} for tag {tag}: {_e}",
@@ -1944,6 +1955,7 @@ class _ContainerBackendBase(agsandbox_backend):
         try:
             should_squash = len(self._image_diff_ids(tag)) >= self.checkpoint_squash_max_depth
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- degrade warning (squash may run more often than intended).
             print(
                 f"[agsandbox_backend] WARNING: could not check chain depth for tag "
                 f"{tag}, skipping this cycle's squash check: {_e}",
@@ -1977,6 +1989,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 if result and result.returncode == 0:
                     old_image_id = result.stdout.decode("utf-8", errors="replace").strip() or None
             except Exception as _e:
+                # DATACOLLECTOR: append, agname=self._agname -- best-effort cleanup lookup failure.
                 print(
                     f"[agsandbox_backend] WARNING: could not inspect existing image for tag {tag}: {_e}",
                     file=__import__("sys").stderr,
@@ -1991,6 +2004,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     self._build_accumulator_for_squash(tag)
                     self._accumulator_squash_commit(tag)
                 except Exception as _fast_e:
+                    # DATACOLLECTOR: append, agname=self._agname -- degrade warning, falling back to slower squash path.
                     print(
                         f"[agsandbox_backend] WARNING: fast squash path failed for "
                         f"tag {tag}, falling back to export/import: {_fast_e}",
@@ -2004,6 +2018,7 @@ class _ContainerBackendBase(agsandbox_backend):
                         # succeeded -- a squash failure just means the layer
                         # chain keeps growing until the next attempt, not that
                         # this cycle's checkpoint is lost.
+                        # DATACOLLECTOR: append, agname=self._agname -- ongoing degradation signal (layer chain growing).
                         print(
                             f"[agsandbox_backend] WARNING: squash failed for tag {tag}, "
                             f"layer chain will keep growing until the next attempt: {_e}",
@@ -2043,6 +2058,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     else:
                         self._rmi(old_image_id)
                 except Exception as _e:
+                    # DATACOLLECTOR: append, agname=self._agname -- best-effort cleanup failure, low priority.
                     print(
                         f"[agsandbox_backend] WARNING: could not check/delete old image {old_image_id}: {_e}",
                         file=__import__("sys").stderr,
@@ -2067,6 +2083,7 @@ class _ContainerBackendBase(agsandbox_backend):
                         shell="sh",
                     )
                 except Exception as _e:
+                    # DATACOLLECTOR: append, agname=self._name -- best-effort courtesy signal, low priority.
                     print(
                         f"[agsandbox_backend] WARNING: failed to kill PIDs {pids} in {self._name} during restore: {_e}"
                     )
@@ -2097,6 +2114,7 @@ class _ContainerBackendBase(agsandbox_backend):
                     f"kill {pids} 2>/dev/null; true", timeout=self.exec_quick_timeout_s, shell="sh"
                 )
             except Exception as _e:
+                # DATACOLLECTOR: append, agname via container_name -- best-effort courtesy signal, low priority.
                 print(
                     f"[agsandbox_backend] WARNING: failed to kill PIDs {pids} in {container_name}: {_e}"
                 )
@@ -2123,6 +2141,7 @@ class _ContainerBackendBase(agsandbox_backend):
             try:
                 self._rmi(self._checkpoint_image, force=True)
             except Exception as _e:
+                # DATACOLLECTOR: append, agname via container_name -- best-effort cleanup failure, low priority.
                 print(
                     f"[agsandbox_backend] WARNING: checkpoint image cleanup failed for {container_name}: {_e}"
                 )

@@ -117,6 +117,7 @@ class _DockerBackend(_ContainerBackendBase):
                 ).stdout.decode("utf-8", errors="replace")
             )
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning.
             print(
                 f"[agsandbox_backend] WARNING: `docker info` failed, fast squash path "
                 f"unavailable for this backend's lifetime: {_e}",
@@ -139,6 +140,7 @@ class _DockerBackend(_ContainerBackendBase):
         try:
             return (Path(info["DockerRootDir"]), info.get("Driver", ""))
         except Exception as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning.
             print(
                 f"[agsandbox_backend] WARNING: `docker info` output missing "
                 f"DockerRootDir, fast squash path unavailable: {_e}",
@@ -214,6 +216,7 @@ class _DockerBackend(_ContainerBackendBase):
                 entries.append((int(parts[0]), int(parts[1]), int(parts[2])))
             return entries or None
         except (OSError, ValueError) as _e:
+            # DATACOLLECTOR: append -- static helper, no agname in scope (caller already has one).
             print(
                 f"[agsandbox_backend] WARNING: could not parse {path} for rootless "
                 f"uid/gid translation: {_e}",
@@ -234,6 +237,7 @@ class _DockerBackend(_ContainerBackendBase):
         result = None
         pid = self._find_dockerd_pid()
         if pid is None:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning.
             print(
                 "[agsandbox_backend] WARNING: rootless Docker confirmed but dockerd's "
                 "own PID could not be found -- uid/gid translation unavailable, fast "
@@ -303,6 +307,7 @@ class _DockerBackend(_ContainerBackendBase):
             except Exception as _e:
                 # Expected when this prefix can't even be launched (missing
                 # binary, sudo denied, …); try the next candidate.
+                # DATACOLLECTOR: append, agname=self._agname -- routine candidate-probe failure, low priority.
                 print(
                     f"[agsandbox_backend] WARNING: ctr probe {' '.join(prefix)} failed: {_e}",
                     file=__import__("sys").stderr,
@@ -313,6 +318,7 @@ class _DockerBackend(_ContainerBackendBase):
                 result = prefix
                 break
             if completed is not None:
+                # DATACOLLECTOR: append, agname=self._agname -- routine candidate-probe failure, low priority.
                 print(
                     f"[agsandbox_backend] WARNING: ctr probe {' '.join(prefix)} exited "
                     f"{completed.returncode}: "
@@ -321,6 +327,7 @@ class _DockerBackend(_ContainerBackendBase):
                     flush=True,
                 )
         if result is None:
+            # DATACOLLECTOR: append, agname=self._agname -- terminal fast-squash degrade warning for this backend's lifetime.
             print(
                 "[agsandbox_backend] WARNING: neither `ctr` nor `sudo -n ctr` is usable "
                 "on this host -- containerd overlayfs fast squash path unavailable for "
@@ -340,6 +347,7 @@ class _DockerBackend(_ContainerBackendBase):
         """
         chain_id = _chain_id_for_diff_ids(diff_ids)
         if chain_id is None:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
             print(
                 "[agsandbox_backend] WARNING: could not compute a containerd ChainID "
                 "(empty diff_ids) -- fast squash unavailable for this cycle",
@@ -359,6 +367,7 @@ class _DockerBackend(_ContainerBackendBase):
                 timeout=self.inspect_timeout_s,
             )
             if created.returncode != 0:
+                # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
                 print(
                     f"[agsandbox_backend] WARNING: `ctr snapshots view` failed for "
                     f"chain {chain_id}: "
@@ -374,6 +383,7 @@ class _DockerBackend(_ContainerBackendBase):
                 timeout=self.inspect_timeout_s,
             )
             if mounts.returncode != 0:
+                # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
                 print(
                     f"[agsandbox_backend] WARNING: `ctr snapshots mounts` failed for "
                     f"chain {chain_id}: {mounts.stderr.strip()}",
@@ -383,6 +393,7 @@ class _DockerBackend(_ContainerBackendBase):
                 return None
             diff_dir = _parse_ctr_mounts_top_fs(mounts.stdout or "")
             if diff_dir is None:
+                # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
                 print(
                     f"[agsandbox_backend] WARNING: could not parse a diff directory "
                     f"out of `ctr snapshots mounts` output for chain {chain_id}: "
@@ -406,6 +417,7 @@ class _DockerBackend(_ContainerBackendBase):
                 except Exception as _e:
                     # Best-effort: fold will see an unreadable dir and
                     # degrade to None below rather than hard-failing.
+                    # DATACOLLECTOR: append, agname=self._agname -- best-effort failure, low priority.
                     print(
                         f"[agsandbox_backend] WARNING: could not chmod "
                         f"containerd snapshot {diff_dir.parent} for fast squash: {_e}",
@@ -414,6 +426,7 @@ class _DockerBackend(_ContainerBackendBase):
                     )
             try:
                 if not diff_dir.is_dir():
+                    # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
                     print(
                         f"[agsandbox_backend] WARNING: containerd snapshot diff dir "
                         f"{diff_dir} does not exist -- fast squash unavailable for "
@@ -424,6 +437,7 @@ class _DockerBackend(_ContainerBackendBase):
                     return None
                 next(diff_dir.iterdir(), None)
             except OSError as _e:
+                # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
                 print(
                     f"[agsandbox_backend] WARNING: containerd snapshot diff dir "
                     f"{diff_dir} is not readable: {_e}",
@@ -435,6 +449,7 @@ class _DockerBackend(_ContainerBackendBase):
         except Exception as _e:
             # Any unexpected ctr/mounts failure: fast path unavailable,
             # caller falls back to export/import.
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
             print(
                 f"[agsandbox_backend] WARNING: containerd overlayfs layer lookup failed: {_e}",
                 file=__import__("sys").stderr,
@@ -450,6 +465,7 @@ class _DockerBackend(_ContainerBackendBase):
                 )
             except Exception as _e:
                 # Best-effort cleanup of the temporary view snapshot.
+                # DATACOLLECTOR: append, agname=self._agname -- best-effort cleanup failure, low priority.
                 print(
                     f"[agsandbox_backend] WARNING: could not remove temporary "
                     f"ctr snapshot view {view}: {_e}",
@@ -468,6 +484,7 @@ class _DockerBackend(_ContainerBackendBase):
                         continue
                     cache_id = (entry / "cache-id").read_text().strip()
                 except (OSError, UnicodeDecodeError) as _e:
+                    # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
                     print(
                         f"[agsandbox_backend] WARNING: could not read layerdb entry "
                         f"{entry}, skipping it: {_e}",
@@ -477,6 +494,7 @@ class _DockerBackend(_ContainerBackendBase):
                     continue
                 diff_dir = data_root / "overlay2" / cache_id / "diff"
                 if not diff_dir.is_dir():
+                    # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
                     print(
                         f"[agsandbox_backend] WARNING: layerdb entry {entry} for "
                         f"diff_id {diff_id} points at {diff_dir}, which doesn't "
@@ -487,12 +505,14 @@ class _DockerBackend(_ContainerBackendBase):
                     return None
                 return diff_dir
         except OSError as _e:
+            # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
             print(
                 f"[agsandbox_backend] WARNING: could not list {layerdb_root}: {_e}",
                 file=__import__("sys").stderr,
                 flush=True,
             )
             return None
+        # DATACOLLECTOR: append, agname=self._agname -- routine, expected on first squash cycle.
         print(
             f"[agsandbox_backend] WARNING: no overlay2 layerdb entry found for "
             f"diff_id {diff_id} under {layerdb_root} -- fast squash unavailable "
@@ -524,6 +544,7 @@ class _DockerBackend(_ContainerBackendBase):
             return self._locate_overlay2_layer_diff_dir(data_root, diff_id)
         if driver == "overlayfs":
             if not diff_ids or diff_ids[-1] != diff_id:
+                # DATACOLLECTOR: append, agname=self._agname -- possible bug signal, not an env limitation.
                 print(
                     f"[agsandbox_backend] WARNING: _locate_layer_diff_dir() called "
                     f"without a matching diff_ids chain for {diff_id} (got {diff_ids!r}) "
@@ -534,6 +555,7 @@ class _DockerBackend(_ContainerBackendBase):
                 )
                 return None
             return self._locate_containerd_overlayfs_diff_dir(diff_ids)
+        # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this backend's lifetime.
         print(
             f"[agsandbox_backend] WARNING: unsupported docker storage driver "
             f"{driver!r} -- fast squash path unavailable for this backend's lifetime",

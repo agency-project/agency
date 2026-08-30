@@ -46,6 +46,8 @@ def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError as exc:
+        # DATACOLLECTOR: append -- this subprocess has zero agency imports and no transport
+        # to agDataCollector today; folding needs a new HTTP call here, not just a type name.
         print(f"[agpolicy hook] could not parse hook input: {exc}", file=sys.stderr)
         _emit("allow", "hook input was not valid JSON, failing open")
         return 0
@@ -80,6 +82,8 @@ def _check_tool_policy(payload: dict) -> "tuple[str, str | None]":
     base_url = os.environ.get("AGPOLICY_BASE_URL")
     token = os.environ.get("AGPOLICY_TOKEN")
     if not base_url or not token:
+        # DATACOLLECTOR: append -- security-relevant (policy fails open silently); same
+        # no-transport gap as above.
         print(
             "[agpolicy hook] AGPOLICY_BASE_URL/AGPOLICY_TOKEN not set, failing open",
             file=sys.stderr,
@@ -97,6 +101,8 @@ def _check_tool_policy(payload: dict) -> "tuple[str, str | None]":
         with urllib.request.urlopen(req, timeout=_POLICY_TIMEOUT_S) as resp:
             result = json.loads(resp.read())
     except Exception as exc:
+        # DATACOLLECTOR: append -- security-relevant (policy fails open silently); same
+        # no-transport gap as above.
         print(f"[agpolicy hook] check_tool request failed: {exc!r}, failing open", file=sys.stderr)
         return "allow", f"agpolicy gateway unreachable ({exc}), failing open"
 
@@ -110,6 +116,7 @@ def _post_profiler_event(payload: dict, hook_event_name: str) -> None:
         return
     tool_use_id = payload.get("tool_use_id")
     if not isinstance(tool_use_id, str) or not tool_use_id:
+        # DATACOLLECTOR: append, correlate (tool_use_id, missing here) -- same no-transport gap as above.
         print(
             f"[agprof hook] {hook_event_name} missing tool_use_id; telemetry skipped",
             file=sys.stderr,
@@ -161,8 +168,10 @@ def _post_profiler_event(payload: dict, hook_event_name: str) -> None:
         with urllib.request.urlopen(req, timeout=_PROFILER_TIMEOUT_S) as resp:
             result = json.loads(resp.read() or b"{}")
         if not result.get("ok"):
+            # DATACOLLECTOR: append, correlate (tool_use_id) -- same no-transport gap as above.
             print(f"[agprof hook] ingest rejected event: {result!r}", file=sys.stderr)
     except Exception as exc:
+        # DATACOLLECTOR: append, correlate (tool_use_id) -- same no-transport gap as above.
         print(f"[agprof hook] profiler request failed: {exc!r}, failing open", file=sys.stderr)
 
 

@@ -76,6 +76,7 @@ def _visible_device_remap(env_names: "tuple[str, ...]") -> dict[int, int]:
             if ids:
                 return {phys: idx for idx, phys in enumerate(ids)}
         except Exception as _e:
+            # DATACOLLECTOR: append -- process-level (pool is shared, not per-agent).
             print(f"[agresources] WARNING: could not parse {name}={val!r}: {_e}")
     return {}
 
@@ -109,6 +110,7 @@ def _allocate_gpu_markers_cuda(gpu_ids: list[int], marker_bytes: int) -> bool:
             cuda.cuMemAlloc_v2(ctypes.byref(ptr), marker_bytes)
             # Leave context current; allocation persists for the process lifetime.
         except Exception as _e:
+            # DATACOLLECTOR: append -- process-level (pool is shared, not per-agent).
             print(f"[agresources] WARNING: CUDA marker allocation failed for GPU {gpu_id}: {_e}")
     return True
 
@@ -137,6 +139,7 @@ def _allocate_gpu_markers_rocm(gpu_ids: list[int], marker_bytes: int) -> None:
             # Leave allocated; persists for the process lifetime, same as the
             # CUDA path above.
         except Exception as _e:
+            # DATACOLLECTOR: append -- process-level (pool is shared, not per-agent).
             print(f"[agresources] WARNING: ROCm marker allocation failed for GPU {gpu_id}: {_e}")
 
 
@@ -169,6 +172,7 @@ def _cvd_filter(gpu_ids: list[int]) -> list[int]:
             if allowed:
                 return [g for g in gpu_ids if g in allowed]
         except Exception as _e:
+            # DATACOLLECTOR: append -- process-level (pool is shared, not per-agent).
             print(f"[agresources] WARNING: could not parse {_env}={cvd!r}: {_e}")
     return gpu_ids
 
@@ -189,6 +193,7 @@ def detect_gpus() -> list[int]:
     except Exception as _e:
         # Expected on any host without an NVIDIA driver/nvidia-smi installed --
         # falls through to the ROCm probe below.
+        # DATACOLLECTOR: append -- process-level, routine expected fallback, low priority.
         print(f"[agresources] nvidia-smi probe failed, trying rocm-smi: {_e}")
     try:
         result = subprocess.run(
@@ -219,6 +224,7 @@ def detect_gpus() -> list[int]:
                 return _cvd_filter(ids)
     except Exception as _e:
         # Expected on any host without an AMD driver/rocm-smi installed.
+        # DATACOLLECTOR: append -- process-level, routine (end of fallback chain), low priority.
         print(f"[agresources] rocm-smi probe failed, no GPUs detected: {_e}")
     return []
 
@@ -320,6 +326,7 @@ def detect_memory_mb() -> int:
     except Exception as _e:
         # Expected on non-Linux hosts (e.g. macOS has no /proc) -- falls
         # through to the sysctl probe below.
+        # DATACOLLECTOR: append -- process-level, routine expected fallback (non-Linux host), low priority.
         print(f"[agresources] /proc/meminfo read failed, trying sysctl: {_e}")
     try:
         result = subprocess.run(
@@ -331,6 +338,7 @@ def detect_memory_mb() -> int:
         if result.returncode == 0:
             return int(result.stdout.strip()) // (1024 * 1024)
     except Exception as _e:
+        # DATACOLLECTOR: append -- process-level; both probes failed, worth real visibility.
         print(f"[agresources] sysctl memory probe failed, using configured fallback: {_e}")
     return _AgResourcePoolFields().memory_detect_fallback_mb
 
@@ -515,11 +523,13 @@ class agResourcePool(_AgResourcePoolFields):
         with self._gpu_cond:
             for gpu_id in gpu_ids:
                 if gpu_id not in self.gpus:
+                    # DATACOLLECTOR: append -- process-level, real usage-bug signal.
                     print(
                         f"[agresources] WARNING: release_gpus called with unknown gpu_id={gpu_id}"
                     )
                     continue
                 if gpu_id in self._free_gpus:
+                    # DATACOLLECTOR: append -- process-level, real invariant-violation signal.
                     print(f"[agresources] WARNING: GPU double-release for gpu_id={gpu_id}")
                     continue
                 self._free_gpus.add(gpu_id)
@@ -575,6 +585,7 @@ class agResourcePool(_AgResourcePoolFields):
                     memory_total_mb=self.total_memory_mb,
                 )
         except Exception as _e:
+            # DATACOLLECTOR: append -- fallback path of the latest+collapse emission tagged above.
             print(f"[agresources] WARNING: resource_update push failed: {_e}")
 
     def __repr__(self) -> str:
