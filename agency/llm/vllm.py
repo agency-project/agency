@@ -12,7 +12,7 @@ rejects.
 
 from __future__ import annotations
 
-from .base import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS, _VLLM_EXTRA_GEN_FIELDS
+from .agllm import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS, _VLLM_EXTRA_GEN_FIELDS
 from .openai import _OpenAICompatibleBackend
 
 # _OpenAICompatibleBackend isn't used below -- it's re-exported so callers

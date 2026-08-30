@@ -17,7 +17,6 @@ from agency.llm.bedrock import (
     _OpenAICompatibleBedrockBackend,
     _is_anthropic_bedrock_model,
 )
-from agency.llm.anthropic import _AnthropicBedrockChatClient
 
 
 def _cfg(**fields) -> agConfig:
@@ -201,7 +200,7 @@ class TestAnthropicBedrockBackend:
         mock_sdk.AnthropicBedrock.assert_called_once_with(
             aws_region="eu-west-1", timeout=httpx.Timeout(30.0)
         )
-        assert isinstance(client, _AnthropicBedrockChatClient)
+        assert client is mock_anthropic_client
 
     def test_make_client_defaults_region(self):
         backend = _AnthropicBedrockBackend(_cfg())
@@ -244,7 +243,7 @@ class TestAnthropicAWSBackend:
             aws_region="us-east-2",
             workspace_id="wrkspc_test",
         )
-        assert isinstance(client, _AnthropicBedrockChatClient)
+        assert client is mock_sdk.AnthropicAWS.return_value
 
     def test_env_var_fallbacks(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_AWS_API_KEY", "key-from-env")

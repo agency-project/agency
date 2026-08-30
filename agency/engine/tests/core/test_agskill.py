@@ -345,17 +345,23 @@ def _llm_cfg(**fields) -> agConfig:
 
 
 def test_build_llm_kwargs_model_and_messages():
-    msgs = [{"role": "user", "content": "hi"}]
+    msgs = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}]
     kw = build_llm_kwargs(_llm_cfg(model=""), msgs, None)
     assert kw["model"] == ""
-    assert kw["messages"] == msgs
+    assert kw["messages"] == [{"role": "user", "content": "hi"}]
 
 
 def test_build_llm_kwargs_strips_private_keys():
-    msgs = [{"role": "assistant", "content": "ok", "_thinking": "secret"}]
+    msgs = [
+        {
+            "role": "assistant",
+            "blocks": [{"type": "text", "index": 0, "text": "ok"}],
+            "_thinking": "secret",
+        }
+    ]
     kw = build_llm_kwargs(_llm_cfg(model="m"), msgs, None)
     assert "_thinking" not in kw["messages"][0]
-    assert "content" in kw["messages"][0]
+    assert kw["messages"][0]["content"] == "ok"
 
 
 def test_build_llm_kwargs_openai_gen_params():

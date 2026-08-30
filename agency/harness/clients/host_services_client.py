@@ -11,12 +11,10 @@ import json
 import socket
 import struct
 import time
-import uuid
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 import httpx
-from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 if TYPE_CHECKING:
     from .._syscall_event import agsyscallevent
@@ -110,84 +108,28 @@ class HostServicesClient:
         reason = result.get("reason")
         return (allowed, reason) if reason else allowed
 
-    def dispatch(self, token: str, kwargs: dict):
-        """Non-streaming: returns a real `ChatCompletion`. Streaming:
-        returns a generator of `ChatCompletionChunk` -- same contract the
-        old `agproxy_llm.py`'s `_dispatch()` gave its own adapters, so
-        `agproxy_llm_adapters.py`'s functions work unchanged here."""
-        if kwargs.get("stream"):
-
-            def gen():
-                completion_id = f"chatcmpl_{uuid.uuid4().hex}"
-                with self.client.stream("POST", "/llm/dispatch", json=kwargs) as resp:
-                    if resp.status_code != 200:
-                        resp.read()
-                        raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
-                    for line in resp.iter_lines():
-                        if not line:
-                            continue
-                        item = json.loads(line)
-                        if item["type"] == "error":
-                            raise RuntimeError(f"host dispatch failed: {item['message']}")
-                        if item["type"] == "delta":
-                            yield ChatCompletionChunk.model_validate(
-                                {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": kwargs.get("model", ""),
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": item["content"]},
-                                            "finish_reason": None,
-                                        }
-                                    ],
-                                }
-                            )
-                            continue
-                        if item["type"] == "done":
-                            message = item.get("message") or {}
-                            delta = {}
-                            if message.get("tool_calls"):
-                                delta["tool_calls"] = [
-                                    {"index": index, **tool_call}
-                                    for index, tool_call in enumerate(message["tool_calls"])
-                                ]
-                            chunk = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": kwargs.get("model", ""),
-                                "choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}],
-                            }
-                            if item.get("usage") is not None:
-                                chunk["usage"] = item["usage"]
-                            yield ChatCompletionChunk.model_validate(chunk)
-                            return
-
-            return gen()
-
-        resp = self.client.post("/llm/dispatch", json=kwargs)
+    def dispatch(self, token: str, agency_context: dict) -> dict:
+        resp = self.client.post("/llm/dispatch", json=agency_context)
         if resp.status_code != 200:
             raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
-        result = resp.json()
-        completion = {
-            "id": f"chatcmpl_{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": kwargs.get("model", ""),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": result["message"],
-                    "finish_reason": result.get("stop_reason"),
-                }
-            ],
-        }
-        if result.get("usage") is not None:
-            completion["usage"] = result["usage"]
-        return ChatCompletion.model_validate(completion)
+        return resp.json()
+
+    def dispatch_stream(self, token: str, agency_context: dict):
+        with self.client.stream(
+            "POST", "/llm/dispatch", json={**agency_context, "stream": True}
+        ) as resp:
+            if resp.status_code != 200:
+                resp.read()
+                raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                item = json.loads(line)
+                if item["type"] == "error":
+                    raise RuntimeError(f"host dispatch failed: {item['message']}")
+                yield item
+                if item["type"] == "done":
+                    return
 
     def forward_profiler_event(self, token: str, event: dict) -> dict:
         if self.profiler_uds_path is None:

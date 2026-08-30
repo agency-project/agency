@@ -1,6 +1,6 @@
-"""Tests for the Claude backend (agency.llm.anthropic) and the
-shared Anthropic Messages-API <-> OpenAI chat.completions adapter machinery
-it houses (also reused by .bedrock's Anthropic-family backends)."""
+"""Tests for the Claude backend (agency.llm.anthropic) -- direct agency
+<-> Anthropic-native translation, both directions, both streaming and
+non-streaming, no OpenAI-shape intermediate."""
 
 from __future__ import annotations
 
@@ -13,13 +13,10 @@ import httpx
 from agency.agconfig import agConfig
 from agency.llm.anthropic import (
     _AnthropicBackend,
-    _AnthropicBedrockChatClient,
-    _AnthropicBedrockCompletions,
-    _AnthropicNonStreamResponse,
-    _anthropic_stream_to_openai_chunks,
+    _agency_messages_to_anthropic,
+    _agency_tool_choice_to_anthropic,
+    _agency_tools_to_anthropic,
     _known_anthropic_context_window,
-    _openai_messages_to_anthropic,
-    _openai_tools_to_anthropic,
 )
 
 
@@ -28,8 +25,17 @@ def _cfg(**fields) -> agConfig:
     return agConfig({"agllm_backend": fields})
 
 
+def _ev(**kwargs):
+    return SimpleNamespace(**kwargs)
+
+
+class _SdkObj(SimpleNamespace):
+    def model_dump(self):
+        return dict(self.__dict__)
+
+
 # ---------------------------------------------------------------------------
-# _AnthropicBackend (first-party API, not Bedrock)
+# _AnthropicBackend -- client construction, model listing, context window
 # ---------------------------------------------------------------------------
 
 
@@ -49,7 +55,7 @@ class TestAnthropicBackend:
         mock_sdk.Anthropic.assert_called_once_with(
             api_key="sk-ant-from-config", timeout=httpx.Timeout(30.0)
         )
-        assert isinstance(client, _AnthropicBedrockChatClient)
+        assert client is mock_sdk.Anthropic.return_value
 
     def test_make_client_falls_back_to_env_var(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
@@ -77,7 +83,7 @@ class TestAnthropicBackend:
         with patch("agency.llm.anthropic._anthropic_sdk", None):
             assert backend.list_models() == []
 
-    def test_list_models_calls_raw_client_not_chat_wrapper(self):
+    def test_list_models_calls_raw_client(self):
         backend = _AnthropicBackend(_cfg(api_key="sk-ant-x"))
         mock_sdk = MagicMock()
         mock_raw_client = MagicMock()
@@ -188,66 +194,78 @@ class TestKnownAnthropicContextWindow:
         assert _known_anthropic_context_window("anthropic.claude-sonnet-50000") is None
 
 
-# ---------------------------------------------------------------------------
-# _openai_messages_to_anthropic
-# ---------------------------------------------------------------------------
+def _text_msg(role, text):
+    return {"role": role, "blocks": [{"type": "text", "index": 0, "text": text}]}
 
 
-class TestOpenAIMessagesToAnthropic:
+class TestAgencyMessagesToAnthropic:
     def test_system_message_extracted(self):
-        system, msgs = _openai_messages_to_anthropic(
-            [
-                {"role": "system", "content": "You are helpful."},
-                {"role": "user", "content": "hi"},
-            ]
+        system, msgs = _agency_messages_to_anthropic(
+            [_text_msg("system", "You are helpful."), _text_msg("user", "hi")]
         )
         assert system == "You are helpful."
         assert msgs == [{"role": "user", "content": "hi"}]
 
     def test_multiple_system_messages_joined(self):
-        system, _ = _openai_messages_to_anthropic(
+        system, _ = _agency_messages_to_anthropic(
             [
-                {"role": "system", "content": "Part 1."},
-                {"role": "system", "content": "Part 2."},
-                {"role": "user", "content": "hi"},
+                _text_msg("system", "Part 1."),
+                _text_msg("system", "Part 2."),
+                _text_msg("user", "hi"),
             ]
         )
         assert system == "Part 1.\n\nPart 2."
 
     def test_no_system_message_returns_none(self):
-        system, _ = _openai_messages_to_anthropic([{"role": "user", "content": "hi"}])
+        system, _ = _agency_messages_to_anthropic([_text_msg("user", "hi")])
         assert system is None
 
     def test_empty_system_content_not_appended(self):
-        system, _ = _openai_messages_to_anthropic(
-            [
-                {"role": "system", "content": ""},
-                {"role": "user", "content": "hi"},
-            ]
+        system, _ = _agency_messages_to_anthropic(
+            [{"role": "system", "blocks": []}, _text_msg("user", "hi")]
         )
         assert system is None
 
-    def test_plain_assistant_text(self):
-        _, msgs = _openai_messages_to_anthropic(
+    def test_assistant_text_citations_reconstructed(self):
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
+                _text_msg("user", "x"),
+                {
+                    "role": "assistant",
+                    "blocks": [
+                        {
+                            "type": "text",
+                            "index": 0,
+                            "text": "see source",
+                            "citations": [{"url": "http://x"}],
+                        }
+                    ],
+                },
             ]
+        )
+        assert msgs[1]["content"] == [
+            {"type": "text", "text": "see source", "citations": [{"url": "http://x"}]}
+        ]
+
+    def test_plain_assistant_text(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [_text_msg("user", "hi"), _text_msg("assistant", "hello")]
         )
         assert msgs[1] == {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
 
     def test_assistant_with_tool_call_becomes_tool_use_block(self):
-        _, msgs = _openai_messages_to_anthropic(
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "weather?"},
+                _text_msg("user", "weather?"),
                 {
                     "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
+                    "blocks": [
                         {
+                            "type": "tool_use",
+                            "index": 0,
                             "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+                            "name": "get_weather",
+                            "arguments": '{"city": "Paris"}',
                         }
                     ],
                 },
@@ -255,27 +273,24 @@ class TestOpenAIMessagesToAnthropic:
         )
         assert msgs[1]["role"] == "assistant"
         assert msgs[1]["content"] == [
-            {
-                "type": "tool_use",
-                "id": "call_1",
-                "name": "get_weather",
-                "input": {"city": "Paris"},
-            }
+            {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}
         ]
 
     def test_assistant_with_text_and_tool_call_both_present(self):
-        _, msgs = _openai_messages_to_anthropic(
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "weather?"},
+                _text_msg("user", "weather?"),
                 {
                     "role": "assistant",
-                    "content": "Let me check.",
-                    "tool_calls": [
+                    "blocks": [
+                        {"type": "text", "index": 0, "text": "Let me check."},
                         {
+                            "type": "tool_use",
+                            "index": 1,
                             "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "get_weather", "arguments": "{}"},
-                        }
+                            "name": "get_weather",
+                            "arguments": "{}",
+                        },
                     ],
                 },
             ]
@@ -285,17 +300,18 @@ class TestOpenAIMessagesToAnthropic:
         assert blocks[1]["type"] == "tool_use"
 
     def test_malformed_tool_call_arguments_become_empty_dict(self):
-        _, msgs = _openai_messages_to_anthropic(
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "x"},
+                _text_msg("user", "x"),
                 {
                     "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
+                    "blocks": [
                         {
+                            "type": "tool_use",
+                            "index": 0,
                             "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "f", "arguments": "not json"},
+                            "name": "f",
+                            "arguments": "not json",
                         }
                     ],
                 },
@@ -304,30 +320,38 @@ class TestOpenAIMessagesToAnthropic:
         assert msgs[1]["content"][0]["input"] == {}
 
     def test_assistant_no_content_no_tools_becomes_empty_string(self):
-        _, msgs = _openai_messages_to_anthropic(
-            [
-                {"role": "user", "content": "x"},
-                {"role": "assistant", "content": None},
-            ]
+        _, msgs = _agency_messages_to_anthropic(
+            [_text_msg("user", "x"), {"role": "assistant", "blocks": []}]
         )
         assert msgs[1] == {"role": "assistant", "content": ""}
 
     def test_tool_result_becomes_user_message_with_tool_result_block(self):
-        _, msgs = _openai_messages_to_anthropic(
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "weather?"},
+                _text_msg("user", "weather?"),
                 {
                     "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
+                    "blocks": [
                         {
+                            "type": "tool_use",
+                            "index": 0,
                             "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "get_weather", "arguments": "{}"},
+                            "name": "get_weather",
+                            "arguments": "{}",
                         }
                     ],
                 },
-                {"role": "tool", "content": "Sunny, 20C", "tool_call_id": "call_1"},
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {
+                            "type": "tool_result",
+                            "index": 0,
+                            "tool_call_id": "call_1",
+                            "text": "Sunny, 20C",
+                        }
+                    ],
+                },
             ]
         )
         assert msgs[2] == {
@@ -336,30 +360,52 @@ class TestOpenAIMessagesToAnthropic:
         }
 
     def test_consecutive_tool_results_merge_into_one_user_message(self):
-        _, msgs = _openai_messages_to_anthropic(
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "x"},
+                _text_msg("user", "x"),
                 {
                     "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
+                    "blocks": [
                         {
+                            "type": "tool_use",
+                            "index": 0,
                             "id": "c1",
-                            "type": "function",
-                            "function": {"name": "a", "arguments": "{}"},
+                            "name": "a",
+                            "arguments": "{}",
                         },
                         {
+                            "type": "tool_use",
+                            "index": 1,
                             "id": "c2",
-                            "type": "function",
-                            "function": {"name": "b", "arguments": "{}"},
+                            "name": "b",
+                            "arguments": "{}",
                         },
                     ],
                 },
-                {"role": "tool", "content": "result a", "tool_call_id": "c1"},
-                {"role": "tool", "content": "result b", "tool_call_id": "c2"},
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {
+                            "type": "tool_result",
+                            "index": 0,
+                            "tool_call_id": "c1",
+                            "text": "result a",
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {
+                            "type": "tool_result",
+                            "index": 0,
+                            "tool_call_id": "c2",
+                            "text": "result b",
+                        }
+                    ],
+                },
             ]
         )
-        # Only one user message should follow the assistant turn, with both results.
         tool_result_msgs = [
             m for m in msgs if m["role"] == "user" and isinstance(m["content"], list)
         ]
@@ -370,13 +416,16 @@ class TestOpenAIMessagesToAnthropic:
         ]
 
     def test_tool_result_after_assistant_creates_new_user_message(self):
-        """A tool result immediately after an assistant text turn (not a user
-        message with list content) must start a fresh user message."""
-        _, msgs = _openai_messages_to_anthropic(
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "x"},
-                {"role": "assistant", "content": "thinking out loud"},
-                {"role": "tool", "content": "result", "tool_call_id": "c1"},
+                _text_msg("user", "x"),
+                _text_msg("assistant", "thinking out loud"),
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {"type": "tool_result", "index": 0, "tool_call_id": "c1", "text": "result"}
+                    ],
+                },
             ]
         )
         assert msgs[2] == {
@@ -384,30 +433,138 @@ class TestOpenAIMessagesToAnthropic:
             "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "result"}],
         }
 
-    def test_unrecognized_role_dropped(self):
-        _, msgs = _openai_messages_to_anthropic(
+    def test_tool_result_raw_content_takes_priority_over_text(self):
+        _, msgs = _agency_messages_to_anthropic(
             [
-                {"role": "user", "content": "x"},
-                {"role": "function_call_result_legacy", "content": "should be dropped"},
+                _text_msg("user", "x"),
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {
+                            "type": "tool_result",
+                            "index": 0,
+                            "tool_call_id": "c1",
+                            "text": "a photo",
+                            "raw_content": [{"type": "image", "source": {"data": "abc"}}],
+                        }
+                    ],
+                },
             ]
+        )
+        assert msgs[1]["content"] == [
+            {
+                "type": "tool_result",
+                "tool_use_id": "c1",
+                "content": [{"type": "image", "source": {"data": "abc"}}],
+            }
+        ]
+
+    def test_unknown_block_in_user_message_reconstructed(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                {
+                    "role": "user",
+                    "blocks": [
+                        {"type": "text", "index": 0, "text": "look at this"},
+                        {
+                            "type": "anthropic_image",
+                            "index": 1,
+                            "data": {"source": {"type": "base64", "data": "abc"}},
+                        },
+                    ],
+                }
+            ]
+        )
+        assert msgs[0]["content"] == [
+            {"type": "text", "text": "look at this"},
+            {"type": "image", "source": {"type": "base64", "data": "abc"}},
+        ]
+
+    def test_unknown_block_in_assistant_message_reconstructed(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "x"),
+                {
+                    "role": "assistant",
+                    "blocks": [
+                        {
+                            "type": "anthropic_redacted_thinking",
+                            "index": 0,
+                            "data": {"data": "encrypted-blob"},
+                        }
+                    ],
+                },
+            ]
+        )
+        assert msgs[1]["content"] == [{"type": "redacted_thinking", "data": "encrypted-blob"}]
+
+    def test_foreign_origin_unknown_block_dropped_not_sent_to_anthropic(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "x"),
+                {
+                    "role": "assistant",
+                    "blocks": [
+                        {
+                            "type": "openai_responses_local_shell_call",
+                            "index": 0,
+                            "data": {"call_id": "c1"},
+                        }
+                    ],
+                },
+            ]
+        )
+        assert msgs[1]["content"] == ""
+
+    def test_streaming_origin_unknown_block_flattened_on_reconstruction(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "x"),
+                {
+                    "role": "assistant",
+                    "blocks": [
+                        {
+                            "type": "anthropic_server_tool_use",
+                            "index": 0,
+                            "data": [
+                                {
+                                    "start": {"id": "st1", "name": "web_search"},
+                                    "deltas": [
+                                        {"partial_json": '{"q": '},
+                                        {"partial_json": '"x"}'},
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+        assert msgs[1]["content"] == [
+            {
+                "type": "server_tool_use",
+                "id": "st1",
+                "name": "web_search",
+                "partial_json": '{"q": "x"}',
+            }
+        ]
+
+    def test_unrecognized_role_dropped(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [_text_msg("user", "x"), _text_msg("function_call_result_legacy", "should be dropped")]
         )
         assert len(msgs) == 1
 
 
-# ---------------------------------------------------------------------------
-# _openai_tools_to_anthropic
-# ---------------------------------------------------------------------------
-
-
-class TestOpenAIToolsToAnthropic:
+class TestAgencyToolsToAnthropic:
     def test_none_returns_none(self):
-        assert _openai_tools_to_anthropic(None) is None
+        assert _agency_tools_to_anthropic(None) is None
 
     def test_empty_list_returns_none(self):
-        assert _openai_tools_to_anthropic([]) is None
+        assert _agency_tools_to_anthropic([]) is None
 
     def test_converts_openai_function_tool_shape(self):
-        result = _openai_tools_to_anthropic(
+        result = _agency_tools_to_anthropic(
             [
                 {
                     "type": "function",
@@ -431,19 +588,17 @@ class TestOpenAIToolsToAnthropic:
         ]
 
     def test_missing_parameters_defaults_to_empty_object_schema(self):
-        result = _openai_tools_to_anthropic([{"type": "function", "function": {"name": "f"}}])
+        result = _agency_tools_to_anthropic([{"type": "function", "function": {"name": "f"}}])
         assert result[0]["input_schema"] == {"type": "object", "properties": {}}
 
     def test_flat_tool_shape_without_function_wrapper(self):
-        """Defensive fallback: a tool dict without a 'function' key is treated
-        as already flat."""
-        result = _openai_tools_to_anthropic([{"name": "f", "description": "d"}])
+        result = _agency_tools_to_anthropic([{"name": "f", "description": "d"}])
         assert result == [
             {"name": "f", "description": "d", "input_schema": {"type": "object", "properties": {}}}
         ]
 
     def test_multiple_tools_converted_in_order(self):
-        result = _openai_tools_to_anthropic(
+        result = _agency_tools_to_anthropic(
             [
                 {"type": "function", "function": {"name": "a"}},
                 {"type": "function", "function": {"name": "b"}},
@@ -453,15 +608,285 @@ class TestOpenAIToolsToAnthropic:
 
 
 # ---------------------------------------------------------------------------
-# _anthropic_stream_to_openai_chunks
+# _agency_tool_choice_to_anthropic
 # ---------------------------------------------------------------------------
 
 
-def _ev(**kwargs):
-    return SimpleNamespace(**kwargs)
+class TestAgencyToolChoiceToAnthropic:
+    def test_none_returns_none(self):
+        assert _agency_tool_choice_to_anthropic(None) is None
+
+    def test_auto(self):
+        assert _agency_tool_choice_to_anthropic("auto") == {"type": "auto"}
+
+    def test_required_maps_to_any(self):
+        assert _agency_tool_choice_to_anthropic("required") == {"type": "any"}
+
+    def test_named_function_choice(self):
+        result = _agency_tool_choice_to_anthropic({"type": "function", "function": {"name": "f"}})
+        assert result == {"type": "tool", "name": "f"}
+
+    def test_none_choice_maps_to_anthropic_none(self):
+        assert _agency_tool_choice_to_anthropic("none") == {"type": "none"}
+
+    def test_unrecognized_string_returns_none(self):
+        assert _agency_tool_choice_to_anthropic("nonsense") is None
 
 
-class TestAnthropicStreamToOpenAIChunks:
+# ---------------------------------------------------------------------------
+# _AnthropicBackend._format_context_agency_to_backend
+# ---------------------------------------------------------------------------
+
+
+class TestFormatContextAgencyToBackend:
+    def test_builds_kwargs_with_system_and_cache_control(self):
+        backend = _AnthropicBackend(
+            _cfg(
+                model="m",
+                max_completion_tokens=256,
+                temperature=0.5,
+                top_p=0.9,
+                extra_body={"top_k": 40},
+            )
+        )
+        kwargs = backend._format_context_agency_to_backend(
+            {
+                "messages": [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+            }
+        )
+        assert kwargs == {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+                    ],
+                }
+            ],
+            "max_tokens": 256,
+            "system": [
+                {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "top_k": 40,
+            "tools": [
+                {
+                    "name": "f",
+                    "description": "",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+
+    def test_no_messages_omits_last_message_cache_control(self):
+        backend = _AnthropicBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend(
+            {"messages": [_text_msg("system", "Be terse.")]}
+        )
+        assert kwargs["messages"] == []
+        assert kwargs["system"] == [
+            {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+        ]
+
+    def test_cache_control_lands_on_last_tool_result_block_not_first(self):
+        backend = _AnthropicBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend(
+            {
+                "messages": [
+                    _text_msg("user", "call the tool"),
+                    {
+                        "role": "assistant",
+                        "blocks": [
+                            {
+                                "type": "tool_use",
+                                "index": 0,
+                                "id": "t1",
+                                "name": "f",
+                                "arguments": "{}",
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "blocks": [
+                            {
+                                "type": "tool_result",
+                                "index": 0,
+                                "tool_call_id": "t1",
+                                "text": "result-1",
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+        tool_result_message = kwargs["messages"][-1]
+        assert tool_result_message["content"][-1] == {
+            "type": "tool_result",
+            "tool_use_id": "t1",
+            "content": "result-1",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+    def test_cache_control_does_not_mutate_caller_messages(self):
+        backend = _AnthropicBackend(_cfg(model="m"))
+        original_messages = [_text_msg("user", "ping")]
+        backend._format_context_agency_to_backend({"messages": original_messages})
+        assert original_messages == [_text_msg("user", "ping")]
+
+    def test_max_tokens_defaults_to_128000_when_omitted(self):
+        backend = _AnthropicBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend({"messages": [_text_msg("user", "x")]})
+        assert kwargs["max_tokens"] == 128000
+
+    def test_extra_body_without_top_k_is_ignored(self):
+        backend = _AnthropicBackend(_cfg(model="m", extra_body={"repetition_penalty": 1.1}))
+        kwargs = backend._format_context_agency_to_backend({"messages": [_text_msg("user", "x")]})
+        assert "top_k" not in kwargs
+
+    def test_no_system_message_omits_system_kwarg(self):
+        backend = _AnthropicBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend({"messages": [_text_msg("user", "x")]})
+        assert "system" not in kwargs
+
+    def test_tool_choice_included_when_given(self):
+        backend = _AnthropicBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend(
+            {"messages": [_text_msg("user", "x")], "tool_choice": "auto"}
+        )
+        assert kwargs["tool_choice"] == {"type": "auto"}
+
+    def test_no_tool_choice_omits_kwarg(self):
+        backend = _AnthropicBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend({"messages": [_text_msg("user", "x")]})
+        assert "tool_choice" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# _AnthropicBackend._call_backend / _call_backend_stream
+# ---------------------------------------------------------------------------
+
+
+class TestCallBackend:
+    def test_call_backend_calls_messages_create_and_closes_client(self):
+        mock_sdk = MagicMock()
+        mock_raw_client = MagicMock()
+        mock_raw_client.messages.create.return_value = _ev(content=[], usage=None, stop_reason=None)
+        mock_sdk.Anthropic.return_value = mock_raw_client
+        backend = _AnthropicBackend(_cfg(api_key="k"))
+        with patch("agency.llm.anthropic._anthropic_sdk", mock_sdk):
+            backend._call_backend({"model": "m", "messages": []})
+        mock_raw_client.messages.create.assert_called_once_with(model="m", messages=[])
+        mock_raw_client.close.assert_called_once()
+
+    def test_call_backend_stream_returns_raw_stream_and_client(self):
+        mock_sdk = MagicMock()
+        mock_raw_client = MagicMock()
+        mock_raw_client.messages.create.return_value = iter([])
+        mock_sdk.Anthropic.return_value = mock_raw_client
+        backend = _AnthropicBackend(_cfg(api_key="k"))
+        with patch("agency.llm.anthropic._anthropic_sdk", mock_sdk):
+            raw_stream, client = backend._call_backend_stream({"model": "m", "messages": []})
+        mock_raw_client.messages.create.assert_called_once_with(model="m", messages=[], stream=True)
+        assert client is mock_raw_client
+        assert list(raw_stream) == []
+
+
+# ---------------------------------------------------------------------------
+# _AnthropicBackend._format_context_backend_to_agency
+# ---------------------------------------------------------------------------
+
+
+class TestFormatContextBackendToAgency:
+    def test_extracts_text_blocks(self):
+        raw = _ev(
+            content=[_ev(type="text", text="Hello "), _ev(type="text", text="world")],
+            usage=None,
+            stop_reason="end_turn",
+        )
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["message"]["blocks"] == [
+            {"type": "text", "index": 0, "text": "Hello "},
+            {"type": "text", "index": 1, "text": "world"},
+        ]
+
+    def test_text_block_citations_preserved(self):
+        raw = _ev(
+            content=[_ev(type="text", text="see source", citations=[_SdkObj(url="http://x")])],
+            usage=None,
+            stop_reason="end_turn",
+        )
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["message"]["blocks"] == [
+            {"type": "text", "index": 0, "text": "see source", "citations": [{"url": "http://x"}]}
+        ]
+
+    def test_tool_use_block_preserved(self):
+        raw = _ev(
+            content=[_ev(type="tool_use", id="t1", name="f", input={})],
+            usage=None,
+            stop_reason="tool_use",
+        )
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["message"]["blocks"] == [
+            {"type": "tool_use", "index": 0, "id": "t1", "name": "f", "arguments": "{}"}
+        ]
+
+    def test_thinking_block_preserved_with_signature(self):
+        raw = _ev(
+            content=[_ev(type="thinking", thinking="pondering", signature="sig123")],
+            usage=None,
+            stop_reason="end_turn",
+        )
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["message"]["blocks"] == [
+            {"type": "thinking", "index": 0, "text": "pondering", "signature": "sig123"}
+        ]
+
+    def test_no_blocks_when_content_empty(self):
+        raw = _ev(content=[], usage=None, stop_reason="end_turn")
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["message"]["blocks"] == []
+
+    def test_usage_and_stop_reason_extracted(self):
+        raw = _ev(content=[], usage=_ev(input_tokens=10, output_tokens=5), stop_reason="end_turn")
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        assert result["stop_reason"] == "end_turn"
+
+    def test_unrecognized_content_block_preserved_as_unknown(self):
+        raw = _ev(
+            content=[_SdkObj(type="redacted_thinking", data="encrypted-blob")],
+            usage=None,
+            stop_reason="end_turn",
+        )
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["message"]["blocks"] == [
+            {
+                "type": "anthropic_redacted_thinking",
+                "index": 0,
+                "data": {"type": "redacted_thinking", "data": "encrypted-blob"},
+            }
+        ]
+
+    def test_unrecognized_block_without_model_dump_stored_as_is(self):
+        raw_block = _ev(type="server_tool_use", id="st1")
+        raw = _ev(content=[raw_block], usage=None, stop_reason="end_turn")
+        result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
+        assert result["message"]["blocks"] == [
+            {"type": "anthropic_server_tool_use", "index": 0, "data": raw_block}
+        ]
+
+
+# ---------------------------------------------------------------------------
+# _AnthropicBackend._format_stream_to_agency
+# ---------------------------------------------------------------------------
+
+
+class TestFormatStreamToAgency:
     def test_text_only_stream(self):
         stream = [
             _ev(type="message_start", message=_ev(usage=_ev(input_tokens=10))),
@@ -469,18 +894,44 @@ class TestAnthropicStreamToOpenAIChunks:
             _ev(type="content_block_delta", index=0, delta=_ev(type="text_delta", text="Hello")),
             _ev(type="content_block_delta", index=0, delta=_ev(type="text_delta", text=", world")),
             _ev(type="content_block_stop", index=0),
-            _ev(type="message_delta", usage=_ev(output_tokens=5)),
+            _ev(
+                type="message_delta", delta=_ev(stop_reason="end_turn"), usage=_ev(output_tokens=5)
+            ),
             _ev(type="message_stop"),
         ]
-        chunks = list(_anthropic_stream_to_openai_chunks(iter(stream)))
-        contents = [c.choices[0].delta.content for c in chunks if c.choices]
-        assert contents == ["Hello", ", world"]
-        final = chunks[-1]
-        assert final.usage.prompt_tokens == 10
-        assert final.usage.completion_tokens == 5
-        assert final.choices == []
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        text_items = [i for i in items if i["type"] == "block_delta" and i["block_type"] == "text"]
+        assert [i["text"] for i in text_items] == ["Hello", ", world"]
+        usage_item = items[-1]
+        assert usage_item["type"] == "usage"
+        assert usage_item["usage"] == {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        }
+        assert usage_item["stop_reason"] == "end_turn"
 
-    def test_thinking_delta_emits_reasoning_content(self):
+    def test_citations_delta_emitted_for_text_block(self):
+        stream = [
+            _ev(type="message_start", message=_ev(usage=_ev(input_tokens=1))),
+            _ev(type="content_block_start", index=0, content_block=_ev(type="text", text="")),
+            _ev(
+                type="content_block_delta", index=0, delta=_ev(type="text_delta", text="see source")
+            ),
+            _ev(
+                type="content_block_delta",
+                index=0,
+                delta=_SdkObj(type="citations_delta", citation=_SdkObj(url="http://x")),
+            ),
+            _ev(type="content_block_stop", index=0),
+        ]
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        citation_items = [i for i in items if i.get("citations")]
+        assert len(citation_items) == 1
+        assert citation_items[0]["block_type"] == "text"
+        assert citation_items[0]["citations"] == [{"url": "http://x"}]
+
+    def test_thinking_delta_emits_reasoning_item(self):
         stream = [
             _ev(type="message_start", message=_ev(usage=None)),
             _ev(
@@ -493,15 +944,39 @@ class TestAnthropicStreamToOpenAIChunks:
             ),
             _ev(type="content_block_stop", index=0),
         ]
-        chunks = list(_anthropic_stream_to_openai_chunks(iter(stream)))
-        reasoning = [c.choices[0].delta.reasoning_content for c in chunks if c.choices]
-        assert reasoning == ["pondering"]
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        thinking_items = [
+            i for i in items if i["type"] == "block_delta" and i["block_type"] == "thinking"
+        ]
+        assert [i.get("text") for i in thinking_items] == ["pondering"]
 
-    def test_tool_use_emits_single_chunk_with_full_arguments(self):
-        """Regression test: tool-call JSON must arrive as ONE chunk with the
-        complete concatenated arguments, not streamed fragment-by-fragment —
-        see llm.anthropic's docstring for why (a real bug found in
-        production: fragments could be dropped by downstream batching)."""
+    def test_signature_delta_emits_signature_item(self):
+        stream = [
+            _ev(type="message_start", message=_ev(usage=None)),
+            _ev(
+                type="content_block_start", index=0, content_block=_ev(type="thinking", thinking="")
+            ),
+            _ev(
+                type="content_block_delta",
+                index=0,
+                delta=_ev(type="thinking_delta", thinking="pondering"),
+            ),
+            _ev(
+                type="content_block_delta",
+                index=0,
+                delta=_ev(type="signature_delta", signature="sig-abc"),
+            ),
+            _ev(type="content_block_stop", index=0),
+        ]
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        sig_items = [i for i in items if i["type"] == "block_delta" and i.get("signature")]
+        assert len(sig_items) == 1
+        assert sig_items[0]["signature"] == "sig-abc"
+        assert sig_items[0]["index"] == 0
+
+    def test_tool_use_emits_single_item_with_full_arguments(self):
+        """Regression test: tool-call JSON must arrive as ONE item with the
+        complete concatenated arguments, not streamed fragment-by-fragment."""
         stream = [
             _ev(type="message_start", message=_ev(usage=_ev(input_tokens=1))),
             _ev(
@@ -525,26 +1000,25 @@ class TestAnthropicStreamToOpenAIChunks:
                 delta=_ev(type="input_json_delta", partial_json='"Paris"}'),
             ),
             _ev(type="content_block_stop", index=0),
-            _ev(type="message_delta", usage=_ev(output_tokens=1)),
+            _ev(
+                type="message_delta", delta=_ev(stop_reason="tool_use"), usage=_ev(output_tokens=1)
+            ),
         ]
-        chunks = list(_anthropic_stream_to_openai_chunks(iter(stream)))
-        tool_call_chunks = [c for c in chunks if c.choices and c.choices[0].delta.tool_calls]
-        assert len(tool_call_chunks) == 1
-        tc = tool_call_chunks[0].choices[0].delta.tool_calls[0]
-        assert tc.index == 0
-        assert tc.id == "toolu_1"
-        assert tc.function.name == "get_weather"
-        assert tc.function.arguments == '{"city": "Paris"}'
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        tool_items = [
+            i for i in items if i["type"] == "block_delta" and i["block_type"] == "tool_use"
+        ]
+        assert len(tool_items) == 1
+        assert tool_items[0]["index"] == 0
+        assert tool_items[0]["id"] == "toolu_1"
+        assert tool_items[0]["name"] == "get_weather"
+        assert tool_items[0]["arguments"] == '{"city": "Paris"}'
 
     def test_truncated_tool_use_is_flushed_not_dropped(self):
         """Regression: if the stream ends (e.g. stop_reason="max_tokens")
         while a tool_use block is still open, content_block_stop never fires
-        for it. Previously this silently dropped the tool call entirely,
-        producing a completely empty assistant turn with no error — the
-        real-world symptom being a harness that reprompts forever because it
-        thinks the model just didn't respond. The partial JSON must still be
-        flushed so the caller sees a (possibly unparseable) tool call attempt
-        instead of silence."""
+        for it. The partial JSON must still be flushed so the caller sees a
+        (possibly unparseable) tool call attempt instead of silence."""
         stream = [
             _ev(type="message_start", message=_ev(usage=_ev(input_tokens=1))),
             _ev(
@@ -563,15 +1037,73 @@ class TestAnthropicStreamToOpenAIChunks:
                 delta=_ev(type="input_json_delta", partial_json='"bar'),
             ),
             # stream ends here — no content_block_stop, no message_stop event needed
-            _ev(type="message_delta", usage=_ev(output_tokens=1)),
+            _ev(
+                type="message_delta",
+                delta=_ev(stop_reason="max_tokens"),
+                usage=_ev(output_tokens=1),
+            ),
         ]
-        chunks = list(_anthropic_stream_to_openai_chunks(iter(stream)))
-        tool_call_chunks = [c for c in chunks if c.choices and c.choices[0].delta.tool_calls]
-        assert len(tool_call_chunks) == 1
-        tc = tool_call_chunks[0].choices[0].delta.tool_calls[0]
-        assert tc.id == "toolu_1"
-        assert tc.function.name == "return_env_requirements"
-        assert tc.function.arguments == '{"foo": "bar'  # truncated, but present
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        tool_items = [
+            i for i in items if i["type"] == "block_delta" and i["block_type"] == "tool_use"
+        ]
+        assert len(tool_items) == 1
+        assert tool_items[0]["id"] == "toolu_1"
+        assert tool_items[0]["name"] == "return_env_requirements"
+        assert tool_items[0]["arguments"] == '{"foo": "bar'  # truncated, but present
+
+    def test_unrecognized_content_block_buffered_and_emitted_on_stop(self):
+        stream = [
+            _ev(type="message_start", message=_ev(usage=_ev(input_tokens=1))),
+            _ev(
+                type="content_block_start",
+                index=0,
+                content_block=_SdkObj(type="server_tool_use", id="st1", name="web_search"),
+            ),
+            _ev(
+                type="content_block_delta",
+                index=0,
+                delta=_SdkObj(type="input_json_delta", partial_json="{}"),
+            ),
+            _ev(type="content_block_stop", index=0),
+        ]
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        unknown_items = [
+            i
+            for i in items
+            if i["type"] == "block_delta" and i["block_type"] == "anthropic_server_tool_use"
+        ]
+        assert len(unknown_items) == 1
+        assert unknown_items[0]["data"]["start"] == {
+            "type": "server_tool_use",
+            "id": "st1",
+            "name": "web_search",
+        }
+        assert unknown_items[0]["data"]["deltas"] == [
+            {"type": "input_json_delta", "partial_json": "{}"}
+        ]
+
+    def test_unrecognized_content_block_flushed_if_stream_ends_without_stop(self):
+        stream = [
+            _ev(type="message_start", message=_ev(usage=_ev(input_tokens=1))),
+            _ev(
+                type="content_block_start",
+                index=0,
+                content_block=_SdkObj(type="server_tool_use", id="st1", name="web_search"),
+            ),
+            _ev(
+                type="message_delta",
+                delta=_ev(stop_reason="max_tokens"),
+                usage=_ev(output_tokens=1),
+            ),
+        ]
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        unknown_items = [
+            i
+            for i in items
+            if i["type"] == "block_delta" and i["block_type"] == "anthropic_server_tool_use"
+        ]
+        assert len(unknown_items) == 1
 
     def test_text_then_tool_use_at_nonzero_index(self):
         stream = [
@@ -594,290 +1126,42 @@ class TestAnthropicStreamToOpenAIChunks:
                 delta=_ev(type="input_json_delta", partial_json='{"city":"NYC"}'),
             ),
             _ev(type="content_block_stop", index=1),
-            _ev(type="message_delta", usage=_ev(output_tokens=1)),
+            _ev(
+                type="message_delta", delta=_ev(stop_reason="tool_use"), usage=_ev(output_tokens=1)
+            ),
         ]
-        chunks = list(_anthropic_stream_to_openai_chunks(iter(stream)))
-        text_chunks = [
-            c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        text_items = [i for i in items if i["type"] == "block_delta" and i["block_type"] == "text"]
+        tool_items = [
+            i for i in items if i["type"] == "block_delta" and i["block_type"] == "tool_use"
         ]
-        tool_chunks = [c for c in chunks if c.choices and c.choices[0].delta.tool_calls]
-        assert text_chunks == ["Checking..."]
-        assert len(tool_chunks) == 1
-        assert tool_chunks[0].choices[0].delta.tool_calls[0].index == 1
-        assert tool_chunks[0].choices[0].delta.tool_calls[0].function.arguments == '{"city":"NYC"}'
+        assert [i["text"] for i in text_items] == ["Checking..."]
+        assert len(tool_items) == 1
+        assert tool_items[0]["index"] == 1
+        assert tool_items[0]["arguments"] == '{"city":"NYC"}'
 
     def test_content_block_stop_without_prior_tool_use_emits_nothing(self):
         """content_block_stop for a text block (never registered in
-        tool_blocks) must not emit a spurious tool_call chunk."""
+        tool_blocks) must not emit a spurious tool_use item."""
         stream = [
             _ev(type="message_start", message=_ev(usage=None)),
             _ev(type="content_block_start", index=0, content_block=_ev(type="text", text="")),
             _ev(type="content_block_delta", index=0, delta=_ev(type="text_delta", text="hi")),
             _ev(type="content_block_stop", index=0),
         ]
-        chunks = list(_anthropic_stream_to_openai_chunks(iter(stream)))
-        tool_chunks = [c for c in chunks if c.choices and c.choices[0].delta.tool_calls]
-        assert tool_chunks == []
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        tool_items = [
+            i for i in items if i["type"] == "block_delta" and i["block_type"] == "tool_use"
+        ]
+        assert tool_items == []
 
-    def test_empty_stream_still_yields_final_usage_chunk(self):
-        chunks = list(_anthropic_stream_to_openai_chunks(iter([])))
-        assert len(chunks) == 1
-        assert chunks[0].usage.prompt_tokens == 0
-        assert chunks[0].usage.completion_tokens == 0
+    def test_empty_stream_still_yields_final_usage_item(self):
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter([])))
+        assert len(items) == 1
+        assert items[0]["type"] == "usage"
+        assert items[0]["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     def test_missing_usage_on_message_start_defaults_to_zero(self):
         stream = [_ev(type="message_start", message=_ev(usage=None))]
-        chunks = list(_anthropic_stream_to_openai_chunks(iter(stream)))
-        assert chunks[-1].usage.prompt_tokens == 0
-
-
-# ---------------------------------------------------------------------------
-# _AnthropicNonStreamResponse
-# ---------------------------------------------------------------------------
-
-
-class TestAnthropicNonStreamResponse:
-    def test_extracts_text_blocks(self):
-        message = _ev(content=[_ev(type="text", text="Hello "), _ev(type="text", text="world")])
-        resp = _AnthropicNonStreamResponse(message)
-        assert resp.choices[0].message.content == "Hello world"
-
-    def test_ignores_non_text_blocks(self):
-        message = _ev(
-            content=[
-                _ev(type="tool_use", id="t1", name="f", input={}),
-                _ev(type="text", text="answer"),
-            ]
-        )
-        resp = _AnthropicNonStreamResponse(message)
-        assert resp.choices[0].message.content == "answer"
-
-    def test_no_text_blocks_returns_empty_string(self):
-        message = _ev(content=[_ev(type="tool_use", id="t1", name="f", input={})])
-        resp = _AnthropicNonStreamResponse(message)
-        assert resp.choices[0].message.content == ""
-
-
-# ---------------------------------------------------------------------------
-# _AnthropicBedrockCompletions.create
-# ---------------------------------------------------------------------------
-
-
-class TestAnthropicBedrockCompletions:
-    def test_streaming_call_translates_kwargs_and_wraps_stream(self):
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = iter([])
-        completions = _AnthropicBedrockCompletions(mock_client)
-
-        result = completions.create(
-            model="us.anthropic.claude-sonnet-5",
-            messages=[
-                {"role": "system", "content": "Be terse."},
-                {"role": "user", "content": "hi"},
-            ],
-            stream=True,
-            max_tokens=256,
-            temperature=0.5,
-            top_p=0.9,
-            extra_body={"top_k": 40},
-            tools=[{"type": "function", "function": {"name": "f"}}],
-        )
-
-        mock_client.messages.create.assert_called_once_with(
-            stream=True,
-            model="us.anthropic.claude-sonnet-5",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
-                    ],
-                }
-            ],
-            max_tokens=256,
-            system=[{"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}],
-            temperature=0.5,
-            top_p=0.9,
-            top_k=40,
-            tools=[
-                {
-                    "name": "f",
-                    "description": "",
-                    "input_schema": {"type": "object", "properties": {}},
-                }
-            ],
-        )
-        # Streaming path returns the chunk-translating generator, not the raw stream.
-        assert hasattr(result, "__iter__")
-        assert not isinstance(result, MagicMock)
-
-    def test_non_streaming_call_defaults_and_returns_wrapped_response(self):
-        mock_message = _ev(content=[_ev(type="text", text="pong")])
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_message
-        completions = _AnthropicBedrockCompletions(mock_client)
-
-        result = completions.create(
-            model="us.anthropic.claude-sonnet-5",
-            messages=[{"role": "user", "content": "ping"}],
-        )
-
-        mock_client.messages.create.assert_called_once_with(
-            model="us.anthropic.claude-sonnet-5",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "ping", "cache_control": {"type": "ephemeral"}},
-                    ],
-                }
-            ],
-            max_tokens=128000,
-        )
-        assert isinstance(result, _AnthropicNonStreamResponse)
-        assert result.choices[0].message.content == "pong"
-
-    def test_no_messages_omits_last_message_cache_control(self):
-        mock_message = _ev(content=[_ev(type="text", text="pong")])
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_message
-        completions = _AnthropicBedrockCompletions(mock_client)
-
-        completions.create(
-            model="us.anthropic.claude-sonnet-5",
-            messages=[{"role": "system", "content": "Be terse."}],
-        )
-
-        mock_client.messages.create.assert_called_once_with(
-            model="us.anthropic.claude-sonnet-5",
-            messages=[],
-            max_tokens=128000,
-            system=[{"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}],
-        )
-
-    def test_cache_control_lands_on_last_tool_result_block_not_first(self):
-        # A tool-role message gets merged into the preceding user message's
-        # content list by _openai_messages_to_anthropic; the cache_control
-        # breakpoint must land on the *last* block of that list.
-        mock_message = _ev(content=[_ev(type="text", text="pong")])
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_message
-        completions = _AnthropicBedrockCompletions(mock_client)
-
-        completions.create(
-            model="us.anthropic.claude-sonnet-5",
-            messages=[
-                {"role": "user", "content": "call the tool"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {"id": "t1", "function": {"name": "f", "arguments": "{}"}},
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "t1", "content": "result-1"},
-            ],
-        )
-
-        sent_messages = mock_client.messages.create.call_args.kwargs["messages"]
-        tool_result_message = sent_messages[-1]
-        assert tool_result_message["content"][-1] == {
-            "type": "tool_result",
-            "tool_use_id": "t1",
-            "content": "result-1",
-            "cache_control": {"type": "ephemeral"},
-        }
-
-    def test_cache_control_does_not_mutate_caller_messages(self):
-        # anthropic_messages is a fresh structure built by
-        # _openai_messages_to_anthropic, but guard against a regression where
-        # cache_control gets written back into a shared/reused dict.
-        mock_message = _ev(content=[_ev(type="text", text="pong")])
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_message
-        completions = _AnthropicBedrockCompletions(mock_client)
-
-        original_messages = [{"role": "user", "content": "ping"}]
-        completions.create(model="us.anthropic.claude-sonnet-5", messages=original_messages)
-
-        assert original_messages == [{"role": "user", "content": "ping"}]
-
-    def test_max_tokens_defaults_to_128000_when_omitted(self):
-        # Regression: a 4096 default could truncate mid-tool-call on a large
-        # structured tool argument, silently dropping the call entirely.
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _ev(content=[])
-        _AnthropicBedrockCompletions(mock_client).create(
-            model="m",
-            messages=[{"role": "user", "content": "x"}],
-        )
-        _, kwargs = mock_client.messages.create.call_args
-        assert kwargs["max_tokens"] == 128000
-
-    def test_extra_body_without_top_k_is_ignored(self):
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _ev(content=[])
-        _AnthropicBedrockCompletions(mock_client).create(
-            model="m",
-            messages=[{"role": "user", "content": "x"}],
-            extra_body={"repetition_penalty": 1.1},
-        )
-        _, kwargs = mock_client.messages.create.call_args
-        assert "top_k" not in kwargs
-
-    def test_no_system_message_omits_system_kwarg(self):
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _ev(content=[])
-        _AnthropicBedrockCompletions(mock_client).create(
-            model="m",
-            messages=[{"role": "user", "content": "x"}],
-        )
-        _, kwargs = mock_client.messages.create.call_args
-        assert "system" not in kwargs
-
-    def test_ignores_unknown_openai_kwargs(self):
-        """stream_options and other OpenAI-only kwargs must be swallowed, not
-        forwarded to the Anthropic SDK (which would reject unknown params)."""
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _ev(content=[])
-        _AnthropicBedrockCompletions(mock_client).create(
-            model="m",
-            messages=[{"role": "user", "content": "x"}],
-            stream_options={"include_usage": True},
-            frequency_penalty=0.1,
-        )
-        _, kwargs = mock_client.messages.create.call_args
-        assert "stream_options" not in kwargs
-        assert "frequency_penalty" not in kwargs
-
-
-# ---------------------------------------------------------------------------
-# _AnthropicBedrockChatClient
-# ---------------------------------------------------------------------------
-
-
-class TestAnthropicBedrockChatClient:
-    def test_chat_completions_create_delegates_to_wrapped_client(self):
-        mock_anthropic_client = MagicMock()
-        mock_anthropic_client.messages.create.return_value = _ev(
-            content=[_ev(type="text", text="hi")]
-        )
-        client = _AnthropicBedrockChatClient(mock_anthropic_client)
-
-        result = client.chat.completions.create(
-            model="m", messages=[{"role": "user", "content": "x"}]
-        )
-        assert result.choices[0].message.content == "hi"
-
-    def test_close_calls_underlying_client_close(self):
-        mock_anthropic_client = MagicMock()
-        client = _AnthropicBedrockChatClient(mock_anthropic_client)
-        client.close()
-        mock_anthropic_client.close.assert_called_once()
-
-    def test_close_is_noop_when_underlying_client_has_no_close(self):
-        class NoClose:
-            pass
-
-        client = _AnthropicBedrockChatClient(NoClose())
-        client.close()  # must not raise
+        items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
+        assert items[-1]["usage"]["prompt_tokens"] == 0

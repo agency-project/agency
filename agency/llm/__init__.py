@@ -1,7 +1,7 @@
 """LLM backend abstraction for agllm.
 
-Split by concrete backend: `.agllm` (the backend class + selection logic),
-`.base` (shared config fields + exception tuples), `.openai`, `.vllm` (no
+Split by concrete backend: `.agllm` (the backend class, its config fields,
+selection logic, and the cross-SDK exception tuples), `.openai`, `.vllm` (no
 backend class of its own -- reuses `.openai`'s), `.anthropic`, `.bedrock`.
 This package's own namespace re-exports the same public surface the
 single-file `agllm_backend.py` module used to, so `from agency.llm import X`
@@ -9,8 +9,8 @@ single-file `agllm_backend.py` module used to, so `from agency.llm import X`
 agency.agllm_backend import X` did.
 """
 
-from .agllm import agllm
-from .base import (
+from .agllm import (
+    agllm,
     AgLLMBackendFields,
     agLLMBackendConfig,
     BAD_REQUEST_EXCS,

@@ -1,6 +1,6 @@
 """Tests for llm/agllm.py: agllm.for_config() dispatch, the base class's
 default method implementations, change_config/get_config_copy, and the
-cross-SDK exception-translation tuples (still in llm/base.py)."""
+cross-SDK exception-translation tuples."""
 
 from __future__ import annotations
 
@@ -11,8 +11,7 @@ import openai
 import pytest
 
 from agency.agconfig import agConfig
-from agency.llm.agllm import agllm
-from agency.llm.base import BAD_REQUEST_EXCS, API_CONN_EXCS
+from agency.llm.agllm import agllm, BAD_REQUEST_EXCS, API_CONN_EXCS
 from agency.llm.openai import _OpenAICompatibleBackend
 from agency.llm.bedrock import (
     _OpenAICompatibleBedrockBackend,
@@ -78,7 +77,11 @@ class TestForConfig:
     def test_anthropic_aws_provider_returns_anthropic_aws_backend(self):
         backend = agllm.for_config(_cfg(provider="anthropicAWS", model="claude-sonnet-5"))
         assert isinstance(backend, _AnthropicAWSBackend)
-        assert not isinstance(backend, _AnthropicBackend)
+        # _AnthropicAWSBackend subclasses _AnthropicBackend to inherit its
+        # agency<->Anthropic-native translation (same Messages API protocol,
+        # different transport) -- but dispatch must still pick the AWS-
+        # specific subclass, not the plain first-party one.
+        assert type(backend) is not _AnthropicBackend
 
     def test_anthropic_aws_snake_case_alias(self):
         backend = agllm.for_config(_cfg(provider="anthropic_aws", model="claude-sonnet-5"))

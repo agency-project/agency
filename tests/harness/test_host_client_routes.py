@@ -74,19 +74,17 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
     ]
 
 
-def test_bridge_dispatch_uses_llm_route_and_preserves_completion_contract():
+def test_bridge_dispatch_uses_llm_route_and_preserves_agency_response():
     seen = []
+    agency_response = {
+        "message": {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "hello"}]},
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        "stop_reason": "stop",
+    }
 
     def handler(request):
         seen.append((request.method, request.url.path, json.loads(request.content)))
-        return httpx.Response(
-            200,
-            json={
-                "message": {"role": "assistant", "content": "hello"},
-                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
-                "stop_reason": "stop",
-            },
-        )
+        return httpx.Response(200, json=agency_response)
 
     bridge = _bridge(handler)
     try:
@@ -94,31 +92,35 @@ def test_bridge_dispatch_uses_llm_route_and_preserves_completion_contract():
     finally:
         bridge.client.close()
 
-    assert result.choices[0].message.content == "hello"
+    assert result == agency_response
     assert seen == [("POST", "/llm/dispatch", {"model": "gpt-test", "messages": []})]
 
 
-def test_bridge_stream_dispatch_translates_host_ndjson_to_completion_chunks():
+def test_bridge_stream_dispatch_yields_wire_items_and_stops_at_done():
     def handler(request):
         assert request.url.path == "/llm/dispatch"
+        assert json.loads(request.content)["stream"] is True
         return httpx.Response(
             200,
             content=(
                 b'{"type":"delta","content":"hel"}\n'
                 b'{"type":"delta","content":"lo"}\n'
-                b'{"type":"done","message":{"role":"assistant","content":"hello"},'
-                b'"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n'
+                b'{"type":"done","message":{"role":"assistant","blocks":'
+                b'[{"type":"text","index":0,"text":"hello"}]},'
+                b'"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3},'
+                b'"stop_reason":"stop"}\n'
             ),
             headers={"content-type": "application/x-ndjson"},
         )
 
     bridge = _bridge(handler)
     try:
-        chunks = list(
-            bridge.dispatch("token", {"model": "gpt-test", "messages": [], "stream": True})
-        )
+        items = list(bridge.dispatch_stream("token", {"model": "gpt-test", "messages": []}))
     finally:
         bridge.client.close()
 
-    assert [chunk.choices[0].delta.content for chunk in chunks] == ["hel", "lo", None]
-    assert chunks[-1].choices[0].finish_reason == "stop"
+    assert items[0] == {"type": "delta", "content": "hel"}
+    assert items[1] == {"type": "delta", "content": "lo"}
+    assert items[2]["type"] == "done"
+    assert items[2]["stop_reason"] == "stop"
+    assert items[2]["message"]["blocks"] == [{"type": "text", "index": 0, "text": "hello"}]

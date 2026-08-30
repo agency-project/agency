@@ -26,7 +26,9 @@ LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localh
 def test_build_llm_kwargs_includes_reasoning_effort():
     cfg = agConfig(agOpenAIBackendConfig(model="gpt-5.6-luna", reasoning_effort="none"))
 
-    kwargs = build_llm_kwargs(cfg, [{"role": "user", "content": "hi"}], None)
+    kwargs = build_llm_kwargs(
+        cfg, [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}], None
+    )
 
     assert kwargs["reasoning_effort"] == "none"
 
@@ -48,13 +50,19 @@ def test_build_llm_kwargs_default_model():
 
 
 def test_build_llm_kwargs_messages_included():
-    msgs = [{"role": "user", "content": "hi"}]
+    msgs = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}]
     kw = build_llm_kwargs(_cfg(), msgs, None)
-    assert kw["messages"] == msgs
+    assert kw["messages"] == [{"role": "user", "content": "hi"}]
 
 
 def test_build_llm_kwargs_strips_underscore_keys_from_messages():
-    msgs = [{"role": "user", "content": "hi", "_thinking": "internal"}]
+    msgs = [
+        {
+            "role": "user",
+            "blocks": [{"type": "text", "index": 0, "text": "hi"}],
+            "_thinking": "internal",
+        }
+    ]
     kw = build_llm_kwargs(_cfg(), msgs, None)
     assert "_thinking" not in kw["messages"][0]
     assert kw["messages"][0]["content"] == "hi"

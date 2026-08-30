@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agency.agconfig import agConfig
-from agency.harness.adapters.base import AdapterRuntime, agharness_backend
+from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
 from agency.harness.adapters.claude_code import _ClaudeCodeBackend
 from agency.harness.adapters.codex import _CodexBackend
 from agency.harness.adapters.grok import _GrokBackend

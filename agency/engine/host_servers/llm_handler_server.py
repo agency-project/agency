@@ -31,43 +31,8 @@ def _annotate(span, **metadata) -> None:
         annotate(**metadata)
 
 
-def _serialize_usage(usage) -> "dict | None":
-    if usage is None:
-        return None
-    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens),
-    }
-
-
-def _serialize_result_message(result) -> dict:
-    choice = (result.choices or [None])[0]
-    if choice is None:
-        return {"role": "assistant", "content": None}
-    message = choice.message
-    out = {"role": "assistant", "content": getattr(message, "content", None)}
-    tool_calls = getattr(message, "tool_calls", None)
-    if tool_calls:
-        out["tool_calls"] = [
-            {
-                "id": getattr(tc, "id", "") or "",
-                "type": "function",
-                "function": {
-                    "name": getattr(tc.function, "name", "") or "",
-                    "arguments": getattr(tc.function, "arguments", "") or "",
-                },
-            }
-            for tc in tool_calls
-        ]
-    return out
-
-
-def _finish_reason(result) -> "str | None":
-    choice = (result.choices or [None])[0]
-    return getattr(choice, "finish_reason", None) if choice is not None else None
+def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
+    return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
 
 
 class _DispatchError(Exception):
@@ -81,12 +46,6 @@ class _DispatchError(Exception):
 
 
 class _StreamHandle:
-    """Bundles one streaming dispatch's queue/thread/cancel-event. Not a
-    thread itself -- start_stream() spawns the producer thread separately
-    and assigns it here. first()/relay() are the only surface build_app()'s
-    route touches; _run_stream_producer reaches in directly since it's an
-    internal collaborator, not a public interface."""
-
     def __init__(self, q: "queue.Queue[dict]", cancel_event: threading.Event) -> None:
         self._queue = q
         self._cancel_event = cancel_event
@@ -107,10 +66,6 @@ class _StreamHandle:
             return [dict(self._entry)] if self._entry is not None else []
 
     def register_stream_exchange(self, item: "dict | None" = None, **entry_fields) -> None:
-        """Update this connection's transcript entry -- creating it on the
-        first call -- with entry_fields, then push item (if given) onto the
-        response queue. One call so the transcript and the streamed
-        response can never drift out of sync with each other."""
         with self._transcript_lock:
             if self._entry is None:
                 self._entry = {
@@ -190,7 +145,11 @@ class LlmHandlerServer:
             matching = [
                 e
                 for e in entries
-                if any(m.get("content") == needle for m in e["request"]["messages"])
+                if any(
+                    b.get("text") == needle
+                    for m in e["request"]["messages"]
+                    for b in m.get("blocks", [])
+                )
             ]
             if matching:
                 candidates = matching
@@ -224,18 +183,40 @@ class LlmHandlerServer:
         return self._backend.fetch_context_limit()
 
     def dispatch(self, request: dict) -> dict:
-        return self._dispatch_once(self._build_kwargs(request))
+        from ...profiler import agprof
+
+        with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
+            _annotate(
+                attempt_span, model=self._backend.model, provider=type(self._backend).__name__
+            )
+            try:
+                result = self._backend.dispatch(request)
+            except BAD_REQUEST_EXCS as e:
+                _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
+                raise _DispatchError(str(e), status_code=400, transient=False) from e
+            except TRANSIENT_DISPATCH_EXCS as e:
+                _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
+                raise _DispatchError(str(e), status_code=503, transient=True) from e
+            except BaseException as e:
+                _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
+                raise
+            usage = result["usage"]
+            _annotate(
+                attempt_span,
+                outcome="success",
+                input_tokens=(usage or {}).get("prompt_tokens", 0),
+                output_tokens=(usage or {}).get("completion_tokens", 0),
+            )
+            self._record_exchange(request, result["message"], usage, result["stop_reason"])
+            return result
 
     def start_stream(self, request: dict) -> "_StreamHandle":
         from ...profiler import agprof
 
-        kwargs = self._build_kwargs(request)
-        kwargs["stream"] = True
-        kwargs["stream_options"] = {"include_usage": True}
         q: "queue.Queue[dict]" = queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
         cancel_event = threading.Event()
         handle = _StreamHandle(q, cancel_event)
-        thread = agprof.spawn_traced(self._run_stream_producer, kwargs, handle, daemon=True)
+        thread = agprof.spawn_traced(self._run_stream_producer, request, handle, daemon=True)
         handle._thread = thread
         with self._handles_lock:
             self._handles.append(handle)
@@ -293,60 +274,9 @@ class LlmHandlerServer:
             kwargs["tool_choice"] = request["tool_choice"]
         return kwargs
 
-    def _client_timeout(self) -> httpx.Timeout:
-        get = self._agconfig.get
-        return httpx.Timeout(
-            connect=get("agllm", "http_connect_timeout", 10.0),
-            read=get("agllm", "stream_timeout", 1200.0),
-            write=get("agllm", "http_write_timeout", 10.0),
-            pool=get("agllm", "http_pool_timeout", 10.0),
-        )
-
-    def _dispatch_once(self, kwargs: dict) -> dict:
+    def _run_stream_producer(self, request: dict, handle: "_StreamHandle") -> None:
         from ...profiler import agprof
 
-        client = self._backend.make_client(self._client_timeout())
-        try:
-            with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
-                _annotate(
-                    attempt_span, model=self._backend.model, provider=type(self._backend).__name__
-                )
-                try:
-                    result = client.chat.completions.create(**kwargs)
-                except BAD_REQUEST_EXCS as e:
-                    _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    raise _DispatchError(str(e), status_code=400, transient=False) from e
-                except TRANSIENT_DISPATCH_EXCS as e:
-                    _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    raise _DispatchError(str(e), status_code=503, transient=True) from e
-                except BaseException as e:
-                    _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    raise
-                usage = _serialize_usage(getattr(result, "usage", None))
-                _annotate(
-                    attempt_span,
-                    outcome="success",
-                    input_tokens=(usage or {}).get("prompt_tokens", 0),
-                    output_tokens=(usage or {}).get("completion_tokens", 0),
-                )
-                message = _serialize_result_message(result)
-                finish_reason = _finish_reason(result)
-                self._record_exchange(kwargs, message, usage, finish_reason)
-                return {
-                    "message": message,
-                    "usage": usage,
-                    "stop_reason": finish_reason,
-                }
-        finally:
-            client.close()
-
-    def _run_stream_producer(self, kwargs: dict, handle: "_StreamHandle") -> None:
-        from ...profiler import agprof
-
-        client = self._backend.make_client(self._client_timeout())
-        handle._set_stream_ref(client)
-        content_parts: "list[str]" = []
-        tool_calls_raw: "dict[int, dict]" = {}
         try:
             with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
                 _annotate(
@@ -354,14 +284,21 @@ class LlmHandlerServer:
                 )
                 t0 = time.perf_counter()
                 try:
-                    stream_iter = iter(client.chat.completions.create(**kwargs))
-                    first_chunk = next(stream_iter)
+                    stream_iter = iter(
+                        self._backend.dispatch_stream(request, on_client=handle._set_stream_ref)
+                    )
+                    first_item = next(stream_iter)
                 except StopIteration:
                     _annotate(attempt_span, outcome="success")
-                    empty_message = {"role": "assistant", "content": None}
+                    empty_message = {"role": "assistant", "blocks": []}
                     handle.register_stream_exchange(
-                        {"type": "done", "message": empty_message, "usage": None},
-                        request=kwargs,
+                        {
+                            "type": "done",
+                            "message": empty_message,
+                            "usage": None,
+                            "stop_reason": None,
+                        },
+                        request=request,
                         response=empty_message,
                         streaming=False,
                     )
@@ -380,28 +317,70 @@ class LlmHandlerServer:
                     return
                 _annotate(attempt_span, ttft_ms=round((time.perf_counter() - t0) * 1000, 3))
 
-                usage = None
                 handle.register_stream_exchange(
-                    request=kwargs, response={"role": "assistant", "content": ""}
+                    request=request, response={"role": "assistant", "blocks": []}
                 )
+                blocks: "dict[int, dict]" = {}
+                usage = None
+                stop_reason = None
                 try:
-                    for chunk in itertools.chain([first_chunk], stream_iter):
+                    for stream_item in itertools.chain([first_item], stream_iter):
                         if handle._cancel_event.is_set():
                             break
-                        chunk_usage = _serialize_usage(getattr(chunk, "usage", None))
-                        if chunk_usage is not None:
-                            usage = chunk_usage
-                        text = self._accumulate_chunk(chunk, content_parts, tool_calls_raw)
-                        chunk_finish_reason = _finish_reason(chunk)
-                        fields = {
-                            "response": {"role": "assistant", "content": "".join(content_parts)}
-                        }
-                        if chunk_usage is not None:
-                            fields["usage"] = chunk_usage
-                        if chunk_finish_reason is not None:
-                            fields["finish_reason"] = chunk_finish_reason
-                        item = {"type": "delta", "content": text} if text else None
-                        handle.register_stream_exchange(item, **fields)
+                        if stream_item["type"] == "usage":
+                            if stream_item.get("usage") is not None:
+                                usage = stream_item["usage"]
+                            if stream_item.get("stop_reason") is not None:
+                                stop_reason = stream_item["stop_reason"]
+                            continue
+                        idx = stream_item["index"]
+                        now = time.time()
+                        block = blocks.setdefault(
+                            idx,
+                            {
+                                "type": stream_item["block_type"],
+                                "index": idx,
+                                "text": "",
+                                "signature": "",
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
+                                "data": None,
+                                "citations": None,
+                                "ts_start": now,
+                            },
+                        )
+                        text_piece = stream_item.get("text") or ""
+                        if text_piece:
+                            block["text"] += text_piece
+                        citations_piece = stream_item.get("citations")
+                        if citations_piece:
+                            if block["citations"] is None:
+                                block["citations"] = []
+                            block["citations"].extend(citations_piece)
+                        sig_piece = stream_item.get("signature") or ""
+                        if sig_piece:
+                            block["signature"] += sig_piece
+                        if stream_item.get("id"):
+                            block["id"] = stream_item["id"]
+                        name_piece = stream_item.get("name") or ""
+                        if name_piece:
+                            block["name"] += name_piece
+                        args_piece = stream_item.get("arguments") or ""
+                        if args_piece:
+                            block["arguments"] += args_piece
+                        if stream_item.get("data") is not None:
+                            if block["data"] is None:
+                                block["data"] = []
+                            block["data"].append(stream_item["data"])
+                        block["ts_end"] = now
+                        message = _blocks_to_message(blocks)
+                        item = (
+                            {"type": "delta", "content": text_piece}
+                            if stream_item["block_type"] == "text" and text_piece
+                            else None
+                        )
+                        handle.register_stream_exchange(item, response=message)
                 except BaseException as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
                     error_item = {
@@ -415,44 +394,26 @@ class LlmHandlerServer:
                     )
                     return
 
-                _annotate(attempt_span, outcome="success")
-                message = {"role": "assistant", "content": "".join(content_parts) or None}
-                if tool_calls_raw:
-                    message["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
+                if handle._cancel_event.is_set():
+                    return
+                _annotate(
+                    attempt_span,
+                    outcome="success",
+                    input_tokens=(usage or {}).get("prompt_tokens", 0),
+                    output_tokens=(usage or {}).get("completion_tokens", 0),
+                )
+                message = _blocks_to_message(blocks)
                 handle.register_stream_exchange(
-                    {"type": "done", "message": message, "usage": usage},
+                    {
+                        "type": "done",
+                        "message": message,
+                        "usage": usage,
+                        "stop_reason": stop_reason,
+                    },
                     response=message,
                     usage=usage,
+                    finish_reason=stop_reason,
                     streaming=False,
                 )
         finally:
             handle._close_stream()
-
-    @staticmethod
-    def _accumulate_chunk(
-        chunk, content_parts: "list[str]", tool_calls_raw: "dict[int, dict]"
-    ) -> str:
-        choice = (chunk.choices or [None])[0]
-        if choice is None:
-            return ""
-        delta = choice.delta
-        content = getattr(delta, "content", None) or ""
-        if content:
-            content_parts.append(content)
-        for tc in getattr(delta, "tool_calls", None) or []:
-            idx = getattr(tc, "index", 0)
-            slot = tool_calls_raw.setdefault(
-                idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
-            )
-            tc_id = getattr(tc, "id", None)
-            if tc_id:
-                slot["id"] = tc_id
-            fn = getattr(tc, "function", None)
-            if fn is not None:
-                name = getattr(fn, "name", None)
-                if name:
-                    slot["function"]["name"] += name
-                arguments = getattr(fn, "arguments", None)
-                if arguments:
-                    slot["function"]["arguments"] += arguments
-        return content

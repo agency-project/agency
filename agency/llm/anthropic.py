@@ -1,12 +1,4 @@
-"""Claude backend, via the first-party Anthropic API (api.anthropic.com).
-
-Also houses the Anthropic Messages-API <-> OpenAI chat.completions adapter
-machinery (`_AnthropicBedrockChatClient` and everything it's built from) --
-`._bedrock` reuses it for both of its own Anthropic-family backends
-(`_AnthropicBedrockBackend`, `_AnthropicAWSBackend`), since all three only
-ever need `.messages.create()`, which every one of the underlying anthropic
-SDK clients (`Anthropic`, `AnthropicBedrock`, `AnthropicAWS`) exposes alike.
-"""
+"""Claude backend, via the first-party Anthropic API (api.anthropic.com)."""
 
 from __future__ import annotations
 import json
@@ -14,8 +6,7 @@ import os
 import re
 import httpx
 
-from .base import _AgProviderBackendConfig
-from .agllm import agllm
+from .agllm import agllm, _AgProviderBackendConfig
 
 try:
     import anthropic as _anthropic_sdk
@@ -71,12 +62,13 @@ def _known_anthropic_context_window(model: str) -> "int | None":
 class agAnthropicBackendConfig(_AgProviderBackendConfig):
     """agLLMBackendConfig restricted to the fields `_AnthropicBackend` (the
     first-party api.anthropic.com backend) actually forwards -- see
-    `_AnthropicBedrockCompletions.create()`, which every Anthropic-family
-    backend shares: only temperature, top_p, max_tokens/max_completion_tokens,
-    and extra_body["top_k"] are applied; frequency_penalty, presence_penalty,
-    n, stop, logprobs, seed, and the vLLM-only extras are silently dropped by
-    that adapter, so they're excluded here rather than accepted and ignored.
-    `provider` is fixed to "anthropic"."""
+    `_AnthropicBackend._format_context_agency_to_backend()`, which every
+    Anthropic-family backend shares: only temperature, top_p,
+    max_tokens/max_completion_tokens, and extra_body["top_k"] are applied;
+    frequency_penalty, presence_penalty, n, stop, logprobs, seed, and the
+    vLLM-only extras are silently dropped by that method, so they're
+    excluded here rather than accepted and ignored. `provider` is fixed to
+    "anthropic"."""
 
     _PROVIDER = "anthropic"
     _ALLOWED_FIELDS = frozenset(
@@ -98,54 +90,124 @@ class agAnthropicBackendConfig(_AgProviderBackendConfig):
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
 
 
-def _openai_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, list[dict]]":
-    """Convert OpenAI-style chat messages into (system_text, anthropic_messages)."""
+def _serialize_sdk_object(obj):
+    dump = getattr(obj, "model_dump", None)
+    return dump() if dump is not None else obj
+
+
+_ANTHROPIC_TYPE_PREFIX = "anthropic_"
+
+
+def _anthropic_native_block_type(native_type: str) -> str:
+    return f"{_ANTHROPIC_TYPE_PREFIX}{native_type}"
+
+
+def _flatten_unknown_fragment(fragment) -> dict:
+    if not isinstance(fragment, dict):
+        return {}
+    if "start" in fragment or "deltas" in fragment:
+        flat = dict(fragment.get("start") or {})
+        for delta in fragment.get("deltas") or []:
+            if not isinstance(delta, dict):
+                continue
+            for k, v in delta.items():
+                if isinstance(v, str) and isinstance(flat.get(k), str):
+                    flat[k] += v
+                else:
+                    flat[k] = v
+        return flat
+    return dict(fragment)
+
+
+def _unknown_block_to_anthropic(b: dict) -> dict:
+    data = b.get("data")
+    fragments = data if isinstance(data, list) else [data]
+    merged: dict = {}
+    for fragment in fragments:
+        flat = _flatten_unknown_fragment(fragment)
+        for k, v in flat.items():
+            if isinstance(v, str) and isinstance(merged.get(k), str):
+                merged[k] += v
+            else:
+                merged[k] = v
+    merged["type"] = b["type"][len(_ANTHROPIC_TYPE_PREFIX) :]
+    return merged
+
+
+def _text_block_to_anthropic(b: dict) -> dict:
+    block = {"type": "text", "text": b["text"]}
+    if b.get("citations"):
+        block["citations"] = b["citations"]
+    return block
+
+
+def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, list[dict]]":
     system_parts: list[str] = []
     out: list[dict] = []
 
     for m in messages:
         role = m.get("role")
-        content = m.get("content") or ""
+        blocks = m.get("blocks") or []
         if role == "system":
-            if content:
-                system_parts.append(content)
+            text = "".join(b["text"] for b in blocks if b["type"] == "text")
+            if text:
+                system_parts.append(text)
         elif role == "user":
-            out.append({"role": "user", "content": content})
+            has_non_text = any(b["type"] != "text" for b in blocks)
+            if not has_non_text:
+                text = "".join(b["text"] for b in blocks if b["type"] == "text")
+                out.append({"role": "user", "content": text})
+            else:
+                content_blocks = []
+                for b in blocks:
+                    if b["type"] == "text":
+                        content_blocks.append(_text_block_to_anthropic(b))
+                    elif b["type"].startswith(_ANTHROPIC_TYPE_PREFIX):
+                        content_blocks.append(_unknown_block_to_anthropic(b))
+                out.append({"role": "user", "content": content_blocks})
         elif role == "assistant":
-            blocks: list[dict] = []
-            if content:
-                blocks.append({"type": "text", "text": content})
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                try:
-                    tool_input = json.loads(fn.get("arguments") or "{}")
-                except ValueError:
-                    tool_input = {}
-                blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc.get("id", ""),
-                        "name": fn.get("name", ""),
-                        "input": tool_input,
-                    }
-                )
-            out.append({"role": "assistant", "content": blocks or content})
+            anthropic_blocks: list[dict] = []
+            for b in blocks:
+                if b["type"] == "text":
+                    anthropic_blocks.append(_text_block_to_anthropic(b))
+                elif b["type"] == "thinking":
+                    anthropic_blocks.append(
+                        {
+                            "type": "thinking",
+                            "thinking": b["text"],
+                            "signature": b.get("signature", ""),
+                        }
+                    )
+                elif b["type"] == "tool_use":
+                    try:
+                        tool_input = json.loads(b["arguments"] or "{}")
+                    except ValueError:
+                        tool_input = {}
+                    anthropic_blocks.append(
+                        {"type": "tool_use", "id": b["id"], "name": b["name"], "input": tool_input}
+                    )
+                elif b["type"].startswith(_ANTHROPIC_TYPE_PREFIX):
+                    anthropic_blocks.append(_unknown_block_to_anthropic(b))
+            text_only = "".join(b["text"] for b in blocks if b["type"] == "text")
+            out.append({"role": "assistant", "content": anthropic_blocks or text_only})
         elif role == "tool":
-            result_block = {
+            result_block = next((b for b in blocks if b["type"] == "tool_result"), None)
+            content = result_block.get("text", "") if result_block else ""
+            raw_content = result_block.get("raw_content") if result_block else None
+            result = {
                 "type": "tool_result",
-                "tool_use_id": m.get("tool_call_id", ""),
-                "content": content,
+                "tool_use_id": result_block.get("tool_call_id", "") if result_block else "",
+                "content": raw_content if raw_content is not None else content,
             }
             prev_content = out[-1]["content"] if out and out[-1]["role"] == "user" else None
             if isinstance(prev_content, list):
-                prev_content.append(result_block)
+                prev_content.append(result)
             else:
-                out.append({"role": "user", "content": [result_block]})
-        # unrecognized roles are dropped rather than sent to an API that would reject them
+                out.append({"role": "user", "content": [result]})
     return ("\n\n".join(system_parts) or None), out
 
 
-def _openai_tools_to_anthropic(tools: "list[dict] | None") -> "list[dict] | None":
+def _agency_tools_to_anthropic(tools: "list[dict] | None") -> "list[dict] | None":
     if not tools:
         return None
     converted = []
@@ -161,184 +223,27 @@ def _openai_tools_to_anthropic(tools: "list[dict] | None") -> "list[dict] | None
     return converted
 
 
-class _FakeToolCallFunction:
-    __slots__ = ("name", "arguments")
-
-    def __init__(self, name: str = "", arguments: str = "") -> None:
-        self.name = name
-        self.arguments = arguments
-
-
-class _FakeToolCallDelta:
-    __slots__ = ("index", "id", "function")
-
-    def __init__(self, index: int, id: str = "", name: str = "", arguments: str = "") -> None:
-        self.index = index
-        self.id = id
-        self.function = _FakeToolCallFunction(name, arguments)
-
-
-class _FakeDelta:
-    __slots__ = ("content", "tool_calls", "reasoning_content", "model_extra")
-
-    def __init__(self, content=None, tool_calls=None, reasoning_content=None) -> None:
-        self.content = content
-        self.tool_calls = tool_calls
-        self.reasoning_content = reasoning_content
-        self.model_extra = {}
-
-
-class _FakeChoice:
-    __slots__ = ("delta",)
-
-    def __init__(self, delta: _FakeDelta) -> None:
-        self.delta = delta
-
-
-class _FakeUsage:
-    __slots__ = ("prompt_tokens", "completion_tokens")
-
-    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
-        self.prompt_tokens = prompt_tokens
-        self.completion_tokens = completion_tokens
-
-
-class _FakeChunk:
-    __slots__ = ("choices", "usage")
-
-    def __init__(self, choices=(), usage=None) -> None:
-        self.choices = list(choices)
-        self.usage = usage
-
-
-def _anthropic_stream_to_openai_chunks(stream):
-    """Translate an Anthropic Messages-API SSE stream into OpenAI-style chunks
-    matching what a streaming dispatch loop (`LlmHandlerServer`) expects.
-
-    Tool-call JSON input is buffered per content block and emitted as a single
-    chunk on content_block_stop, rather than streamed fragment-by-fragment.
-    Partial tool-call arguments are never rendered to a live viewer anyway
-    (only text/thinking feed a live display), so nothing is lost — and
-    emitting one complete chunk instead of many small ones avoids relying on
-    every fragment individually surviving whatever consumes this generator
-    (e.g. agutil._iter_batched's background-thread queue).
-    """
-    input_tokens = 0
-    output_tokens = 0
-    tool_blocks: dict[int, dict] = {}  # index -> {"id", "name", "json_parts"}
-
-    for event in stream:
-        etype = getattr(event, "type", None)
-        if etype == "message_start":
-            usage = getattr(event.message, "usage", None)
-            if usage is not None:
-                input_tokens = getattr(usage, "input_tokens", 0) or 0
-        elif etype == "content_block_start":
-            block = event.content_block
-            if block.type == "tool_use":
-                tool_blocks[event.index] = {"id": block.id, "name": block.name, "json_parts": []}
-        elif etype == "content_block_delta":
-            delta = event.delta
-            kind = getattr(delta, "type", None)
-            if kind == "text_delta":
-                yield _FakeChunk(choices=[_FakeChoice(_FakeDelta(content=delta.text))])
-            elif kind == "thinking_delta":
-                yield _FakeChunk(
-                    choices=[_FakeChoice(_FakeDelta(reasoning_content=delta.thinking))]
-                )
-            elif kind == "input_json_delta":
-                block = tool_blocks.get(event.index)
-                if block is not None:
-                    block["json_parts"].append(delta.partial_json or "")
-        elif etype == "content_block_stop":
-            block = tool_blocks.pop(event.index, None)
-            if block is not None:
-                yield _FakeChunk(
-                    choices=[
-                        _FakeChoice(
-                            _FakeDelta(
-                                tool_calls=[
-                                    _FakeToolCallDelta(
-                                        index=event.index,
-                                        id=block["id"],
-                                        name=block["name"],
-                                        arguments="".join(block["json_parts"]),
-                                    )
-                                ]
-                            )
-                        )
-                    ]
-                )
-        elif etype == "message_delta":
-            usage = getattr(event, "usage", None)
-            if usage is not None:
-                output_tokens = getattr(usage, "output_tokens", 0) or output_tokens
-
-    # If the stream ended (e.g. stop_reason="max_tokens") while a tool_use
-    # block was still open, content_block_stop never fires for it and the
-    # tool call would otherwise vanish with no trace — the assistant turn
-    # comes out completely empty and callers loop forever re-requesting it.
-    # Flush whatever JSON was collected so far instead; a downstream
-    # json.loads() failure on truncated arguments is at least visible.
-    for index in sorted(tool_blocks):
-        block = tool_blocks[index]
-        print(
-            f"[agllm] WARNING: tool_use block {block['name']!r} "
-            f"(id={block['id']}) truncated mid-stream (likely hit max_tokens) "
-            f"— flushing partial arguments instead of dropping the call"
-        )
-        yield _FakeChunk(
-            choices=[
-                _FakeChoice(
-                    _FakeDelta(
-                        tool_calls=[
-                            _FakeToolCallDelta(
-                                index=index,
-                                id=block["id"],
-                                name=block["name"],
-                                arguments="".join(block["json_parts"]),
-                            )
-                        ]
-                    )
-                )
-            ]
-        )
-
-    yield _FakeChunk(usage=_FakeUsage(input_tokens, output_tokens))
-
-
-class _FakeMessage:
-    __slots__ = ("content",)
-
-    def __init__(self, content: str) -> None:
-        self.content = content
-
-
-class _FakeNonStreamChoice:
-    __slots__ = ("message",)
-
-    def __init__(self, message: _FakeMessage) -> None:
-        self.message = message
-
-
-class _AnthropicNonStreamResponse:
-    """Mimics openai.types.chat.ChatCompletion's `.choices[0].message.content`
-    surface for a non-streaming Anthropic Messages API response."""
-
-    __slots__ = ("choices",)
-
-    def __init__(self, anthropic_message) -> None:
-        text = "".join(
-            b.text for b in anthropic_message.content if getattr(b, "type", None) == "text"
-        )
-        self.choices = [_FakeNonStreamChoice(_FakeMessage(text))]
+def _agency_tool_choice_to_anthropic(tool_choice):
+    if tool_choice is None:
+        return None
+    if tool_choice == "auto":
+        return {"type": "auto"}
+    if tool_choice == "required":
+        return {"type": "any"}
+    if tool_choice == "none":
+        return {"type": "none"}
+    if isinstance(tool_choice, dict):
+        name = tool_choice.get("function", {}).get("name") or tool_choice.get("name")
+        if name:
+            return {"type": "tool", "name": name}
+    return None
 
 
 def _with_cache_control(content):
     """Return `content` with cache_control on its last block, normalizing a
     bare string into a single text block first (cache_control attaches to a
     content block, not to a string). Caller must pass content it's safe to
-    mutate — _openai_messages_to_anthropic() always builds fresh lists/dicts,
+    mutate — _agency_messages_to_anthropic() always builds fresh lists/dicts,
     never a reference into the caller's original messages."""
     if isinstance(content, str):
         content = [{"type": "text", "text": content}]
@@ -349,92 +254,9 @@ def _with_cache_control(content):
     return content
 
 
-class _AnthropicBedrockCompletions:
-    def __init__(self, anthropic_client) -> None:
-        self._client = anthropic_client
-
-    def create(
-        self,
-        *,
-        model,
-        messages,
-        stream=False,
-        stream_options=None,
-        max_tokens=None,
-        temperature=None,
-        top_p=None,
-        tools=None,
-        extra_body=None,
-        **_ignored,
-    ):
-        from .base import AgLLMBackendFields
-
-        system, anthropic_messages = _openai_messages_to_anthropic(messages)
-        kwargs: dict = dict(
-            model=model,
-            messages=anthropic_messages,
-            max_tokens=max_tokens or AgLLMBackendFields().default_max_tokens,
-        )
-        if system:
-            # Breakpoint on the system prompt: it's the largest, most static
-            # part of every request (agent instructions), and tools render
-            # before system in Anthropic's prefix order, so this one
-            # breakpoint caches tools + system together.
-            kwargs["system"] = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        if top_p is not None:
-            kwargs["top_p"] = top_p
-        if extra_body and "top_k" in extra_body:
-            kwargs["top_k"] = extra_body["top_k"]
-        anthropic_tools = _openai_tools_to_anthropic(tools)
-        if anthropic_tools:
-            kwargs["tools"] = anthropic_tools
-        if anthropic_messages:
-            # Second breakpoint on the latest turn. messages grows across
-            # calls in an agent loop, so this lets the *next* call read
-            # everything up to (not including) this turn from cache — the
-            # standard multi-turn caching pattern. Earlier breakpoints don't
-            # need to be resent; they remain valid read points.
-            anthropic_messages[-1] = dict(anthropic_messages[-1])
-            anthropic_messages[-1]["content"] = _with_cache_control(
-                anthropic_messages[-1]["content"]
-            )
-
-        if not stream:
-            return _AnthropicNonStreamResponse(self._client.messages.create(**kwargs))
-
-        raw_stream = self._client.messages.create(stream=True, **kwargs)
-        return _anthropic_stream_to_openai_chunks(raw_stream)
-
-
-class _AnthropicBedrockChat:
-    def __init__(self, anthropic_client) -> None:
-        self.completions = _AnthropicBedrockCompletions(anthropic_client)
-
-
-class _AnthropicBedrockChatClient:
-    """Drop-in replacement for the subset of openai.OpenAI's interface
-    callers use (`.chat.completions.create()`, `.close()`), wrapping an
-    already-constructed anthropic SDK client (`Anthropic`,
-    `AnthropicBedrock`, or `AnthropicAWS` -- all three expose `.messages.create()`
-    alike, which is all this wrapper needs)."""
-
-    def __init__(self, anthropic_client) -> None:
-        self._client = anthropic_client
-        self.chat = _AnthropicBedrockChat(anthropic_client)
-
-    def close(self) -> None:
-        close = getattr(self._client, "close", None)
-        if close:
-            close()
-
-
 class _AnthropicBackend(agllm):
     """Claude models via the first-party Anthropic API (api.anthropic.com) —
-    the anthropic SDK's plain Anthropic client (Messages API shape). Reuses
-    the same _AnthropicBedrockChatClient adapter as the Bedrock backend since
-    it only depends on `.messages.create()`, which both clients expose alike.
+    the anthropic SDK's plain Anthropic client (Messages API shape).
 
     For Claude Platform on AWS, prefer provider='anthropicAWS' and the
     AnthropicAWS client instead — it handles SigV4/API-key auth, region-
@@ -451,23 +273,19 @@ class _AnthropicBackend(agllm):
             kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
         return kwargs
 
-    def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
+    def make_client(self, timeout: httpx.Timeout):
         if _anthropic_sdk is None:
             raise RuntimeError(
                 "provider='anthropic' requires the 'anthropic' package: pip install anthropic"
             )
-        anthropic_client = _anthropic_sdk.Anthropic(**self._client_kwargs(timeout))
-        return _AnthropicBedrockChatClient(anthropic_client)
+        return _anthropic_sdk.Anthropic(**self._client_kwargs(timeout))
 
     def list_models(self) -> list:
-        # Unlike the chat-completions-shaped _AnthropicBedrockChatClient,
-        # the real /v1/models listing is only on the raw anthropic client.
         if _anthropic_sdk is None:
             return []
-        client = _anthropic_sdk.Anthropic(
-            **self._client_kwargs(httpx.Timeout(self.model_listing_timeout_seconds))
+        return list(
+            self.make_client(httpx.Timeout(self.model_listing_timeout_seconds)).models.list()
         )
-        return list(client.models.list())
 
     def tokenize_url(self) -> "str | None":
         return None
@@ -477,3 +295,249 @@ class _AnthropicBackend(agllm):
         # first; this covers new models this table hasn't been updated for yet
         # falling through, and any transient failure of the live lookup.
         return _known_anthropic_context_window(model)
+
+    @staticmethod
+    def _close(client) -> None:
+        close = getattr(client, "close", None)
+        if close:
+            close()
+
+    def _format_context_agency_to_backend(self, request: dict) -> dict:
+        system, anthropic_messages = _agency_messages_to_anthropic(request["messages"])
+        kwargs: dict = dict(
+            model=self.model or "",
+            messages=anthropic_messages,
+            max_tokens=self.max_completion_tokens or self.max_tokens or self.default_max_tokens,
+        )
+        if system:
+            # Breakpoint on the system prompt: it's the largest, most static
+            # part of every request (agent instructions), and tools render
+            # before system in Anthropic's prefix order, so this one
+            # breakpoint caches tools + system together.
+            kwargs["system"] = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
+        extra_body = self.extra_body or {}
+        if "top_k" in extra_body:
+            kwargs["top_k"] = extra_body["top_k"]
+        anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))
+        if anthropic_tools:
+            kwargs["tools"] = anthropic_tools
+        anthropic_tool_choice = _agency_tool_choice_to_anthropic(request.get("tool_choice"))
+        if anthropic_tool_choice is not None:
+            kwargs["tool_choice"] = anthropic_tool_choice
+        if anthropic_messages:
+            # Second breakpoint on the latest turn. messages grows across
+            # calls in an agent loop, so this lets the *next* call read
+            # everything up to (not including) this turn from cache — the
+            # standard multi-turn caching pattern. Earlier breakpoints don't
+            # need to be resent; they remain valid read points.
+            anthropic_messages[-1] = dict(anthropic_messages[-1])
+            anthropic_messages[-1]["content"] = _with_cache_control(
+                anthropic_messages[-1]["content"]
+            )
+        return kwargs
+
+    def _call_backend(self, backend_request: dict):
+        client = self.make_client(self._client_timeout())
+        try:
+            return client.messages.create(**backend_request)
+        finally:
+            self._close(client)
+
+    def _format_context_backend_to_agency(self, raw_result) -> dict:
+        blocks: "list[dict]" = []
+        for i, b in enumerate(raw_result.content):
+            btype = getattr(b, "type", None)
+            if btype == "text":
+                block = {"type": "text", "index": i, "text": b.text}
+                citations = getattr(b, "citations", None)
+                if citations:
+                    block["citations"] = [_serialize_sdk_object(c) for c in citations]
+                blocks.append(block)
+            elif btype == "tool_use":
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "index": i,
+                        "id": b.id,
+                        "name": b.name,
+                        "arguments": json.dumps(b.input),
+                    }
+                )
+            elif btype == "thinking":
+                blocks.append(
+                    {
+                        "type": "thinking",
+                        "index": i,
+                        "text": getattr(b, "thinking", "") or "",
+                        "signature": getattr(b, "signature", "") or "",
+                    }
+                )
+            else:
+                blocks.append(
+                    {
+                        "type": _anthropic_native_block_type(btype),
+                        "index": i,
+                        "data": _serialize_sdk_object(b),
+                    }
+                )
+        usage = getattr(raw_result, "usage", None)
+        input_tokens = (getattr(usage, "input_tokens", 0) or 0) if usage else 0
+        output_tokens = (getattr(usage, "output_tokens", 0) or 0) if usage else 0
+        return {
+            "message": {"role": "assistant", "blocks": blocks},
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "stop_reason": getattr(raw_result, "stop_reason", None),
+        }
+
+    def _call_backend_stream(self, backend_request: dict, on_client=None):
+        client = self.make_client(self._client_timeout())
+        if on_client is not None:
+            on_client(client)
+        raw_stream = client.messages.create(stream=True, **backend_request)
+        return raw_stream, client
+
+    def _format_stream_to_agency(self, raw_stream):
+        """Tool-call JSON input is buffered per content block and emitted as
+        a single item on content_block_stop, rather than fragment-by-
+        fragment. Partial tool-call arguments are never rendered to a live
+        viewer anyway, so nothing is lost — and emitting one complete item
+        instead of many small ones avoids relying on every fragment
+        individually surviving whatever consumes this generator."""
+        input_tokens = 0
+        output_tokens = 0
+        stop_reason = None
+        tool_blocks: "dict[int, dict]" = {}  # index -> {"id", "name", "json_parts"}
+        unknown_blocks: "dict[int, dict]" = {}  # index -> {"native_type", "start", "deltas"}
+
+        for event in raw_stream:
+            etype = getattr(event, "type", None)
+            if etype == "message_start":
+                usage = getattr(event.message, "usage", None)
+                if usage is not None:
+                    input_tokens = getattr(usage, "input_tokens", 0) or 0
+            elif etype == "content_block_start":
+                block = event.content_block
+                if block.type == "tool_use":
+                    tool_blocks[event.index] = {
+                        "id": block.id,
+                        "name": block.name,
+                        "json_parts": [],
+                    }
+                elif block.type not in ("text", "thinking"):
+                    unknown_blocks[event.index] = {
+                        "native_type": block.type,
+                        "start": _serialize_sdk_object(block),
+                        "deltas": [],
+                    }
+            elif etype == "content_block_delta":
+                delta = event.delta
+                kind = getattr(delta, "type", None)
+                if event.index in unknown_blocks:
+                    unknown_blocks[event.index]["deltas"].append(_serialize_sdk_object(delta))
+                elif kind == "text_delta":
+                    yield {
+                        "type": "block_delta",
+                        "index": event.index,
+                        "block_type": "text",
+                        "text": delta.text,
+                    }
+                elif kind == "thinking_delta":
+                    yield {
+                        "type": "block_delta",
+                        "index": event.index,
+                        "block_type": "thinking",
+                        "text": delta.thinking,
+                    }
+                elif kind == "signature_delta":
+                    yield {
+                        "type": "block_delta",
+                        "index": event.index,
+                        "block_type": "thinking",
+                        "signature": delta.signature,
+                    }
+                elif kind == "input_json_delta":
+                    block = tool_blocks.get(event.index)
+                    if block is not None:
+                        block["json_parts"].append(delta.partial_json or "")
+                elif kind == "citations_delta":
+                    yield {
+                        "type": "block_delta",
+                        "index": event.index,
+                        "block_type": "text",
+                        "citations": [_serialize_sdk_object(getattr(delta, "citation", None))],
+                    }
+            elif etype == "content_block_stop":
+                block = tool_blocks.pop(event.index, None)
+                if block is not None:
+                    yield {
+                        "type": "block_delta",
+                        "index": event.index,
+                        "block_type": "tool_use",
+                        "id": block["id"],
+                        "name": block["name"],
+                        "arguments": "".join(block["json_parts"]),
+                    }
+                unknown = unknown_blocks.pop(event.index, None)
+                if unknown is not None:
+                    yield {
+                        "type": "block_delta",
+                        "index": event.index,
+                        "block_type": _anthropic_native_block_type(unknown["native_type"]),
+                        "data": {"start": unknown["start"], "deltas": unknown["deltas"]},
+                    }
+            elif etype == "message_delta":
+                usage = getattr(event, "usage", None)
+                if usage is not None:
+                    output_tokens = getattr(usage, "output_tokens", 0) or output_tokens
+                delta_stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+                if delta_stop_reason is not None:
+                    stop_reason = delta_stop_reason
+
+        # If the stream ended (e.g. stop_reason="max_tokens") while a tool_use
+        # block was still open, content_block_stop never fires for it and the
+        # tool call would otherwise vanish with no trace — the assistant turn
+        # comes out completely empty and callers loop forever re-requesting it.
+        # Flush whatever JSON was collected so far instead; a downstream
+        # json.loads() failure on truncated arguments is at least visible.
+        for index in sorted(tool_blocks):
+            block = tool_blocks[index]
+            print(
+                f"[agllm] WARNING: tool_use block {block['name']!r} "
+                f"(id={block['id']}) truncated mid-stream (likely hit max_tokens) "
+                f"— flushing partial arguments instead of dropping the call"
+            )
+            yield {
+                "type": "block_delta",
+                "index": index,
+                "block_type": "tool_use",
+                "id": block["id"],
+                "name": block["name"],
+                "arguments": "".join(block["json_parts"]),
+            }
+
+        for index in sorted(unknown_blocks):
+            unknown = unknown_blocks[index]
+            yield {
+                "type": "block_delta",
+                "index": index,
+                "block_type": _anthropic_native_block_type(unknown["native_type"]),
+                "data": {"start": unknown["start"], "deltas": unknown["deltas"]},
+            }
+
+        yield {
+            "type": "usage",
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "stop_reason": stop_reason,
+        }

@@ -133,7 +133,7 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
     client = _FakeClient()
     holder["client"] = client
 
-    def fake_ensure_harness_daemon(sandbox, host_uds_path, engine_name, agconfig):
+    def fake_ensure_harness_daemon(sandbox, host_uds_path, engine_name, harness, agconfig):
         holder["daemon_sandbox"] = sandbox
         return SimpleNamespace(client=lambda: client)
 

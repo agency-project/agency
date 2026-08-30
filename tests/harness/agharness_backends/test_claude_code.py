@@ -35,7 +35,7 @@ from agency.harness.adapters.claude_code import (
     _ClaudeCodeBackend,
     claude_code_available,
 )
-from agency.harness.adapters.base import AdapterRuntime
+from agency.harness.adapters.agharness_backend import AdapterRuntime
 from agency.agskill import agskill
 
 

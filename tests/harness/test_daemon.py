@@ -7,7 +7,11 @@ from pathlib import Path
 from agency.agconfig import agConfig
 from agency.engine.clients import SandboxInteractionClient
 from agency.harness import daemon
-from agency.harness.adapters.base import AdapterRuntime, AttemptResult, agharness_backend
+from agency.harness.adapters.agharness_backend import (
+    AdapterRuntime,
+    AttemptResult,
+    agharness_backend,
+)
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
@@ -120,6 +124,7 @@ def test_harness_manager_returns_attempt_result_on_original_rpc():
         str(socket_path),
         str(socket_dir / "host.sock"),
         "agent-1",
+        "claude_code",
         attempt_handler=lambda got_request: seen.append(got_request) or expected,
         harness_api_port=0,
     )

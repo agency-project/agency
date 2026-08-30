@@ -35,9 +35,13 @@ class _FakeMessage:
 
 
 class _FakeDelta:
-    def __init__(self, content=None, tool_calls=None):
+    def __init__(self, content=None, tool_calls=None, **extra):
         self.content = content
         self.tool_calls = tool_calls
+        self._extra = extra
+
+    def model_dump(self):
+        return {"content": self.content, "tool_calls": self.tool_calls, **self._extra}
 
 
 class _FakeChoice:
@@ -137,7 +141,10 @@ def test_dispatch_returns_message_usage_stop_reason():
     server, client = _make_server(create_fn=create)
     result = server.dispatch({"messages": [{"role": "user", "content": "hi"}]})
     assert result == {
-        "message": {"role": "assistant", "content": "hi there"},
+        "message": {
+            "role": "assistant",
+            "blocks": [{"type": "text", "index": 0, "text": "hi there"}],
+        },
         "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
         "stop_reason": "stop",
     }
@@ -157,11 +164,13 @@ def test_dispatch_includes_tool_calls_when_present():
 
     server, _ = _make_server(create_fn=create)
     result = server.dispatch({"messages": []})
-    assert result["message"]["tool_calls"] == [
+    assert result["message"]["blocks"] == [
         {
+            "type": "tool_use",
+            "index": 0,
             "id": "call_1",
-            "type": "function",
-            "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
+            "name": "bash",
+            "arguments": '{"cmd":"ls"}',
         }
     ]
 
@@ -244,7 +253,12 @@ def test_start_stream_relays_text_deltas_then_done():
     assert [i["type"] for i in items] == ["delta", "delta", "done"]
     assert items[0]["content"] == "Hel"
     assert items[1]["content"] == "lo"
-    assert items[2]["message"] == {"role": "assistant", "content": "Hello"}
+    message = items[2]["message"]
+    assert message["role"] == "assistant"
+    assert len(message["blocks"]) == 1
+    block = message["blocks"][0]
+    assert block["type"] == "text" and block["text"] == "Hello"
+    assert "ts_start" in block and "ts_end" in block
     assert items[2]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
     handle._thread.join(timeout=2.0)
     assert client.closed is True
@@ -319,13 +333,28 @@ def test_start_stream_accumulates_tool_call_argument_fragments():
     items = _drain(handle)
     done = items[-1]
     assert done["type"] == "done"
-    assert done["message"]["tool_calls"] == [
-        {
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
-        }
-    ]
+    blocks = done["message"]["blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "tool_use"
+    assert blocks[0]["index"] == 0
+    assert blocks[0]["id"] == "call_1"
+    assert blocks[0]["name"] == "bash"
+    assert blocks[0]["arguments"] == '{"cmd":"ls"}'
+    handle._thread.join(timeout=2.0)
+
+
+def test_start_stream_preserves_unrecognized_delta_field_with_named_type():
+    def create(**kwargs):
+        return iter([_FakeChunk([_FakeChoice(delta=_FakeDelta(refusal="no"))])])
+
+    server, _ = _make_server(create_fn=create)
+    handle = server.start_stream({"messages": []})
+    items = _drain(handle)
+    done = items[-1]
+    blocks = done["message"]["blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "openai_chatcompletions_refusal"
+    assert blocks[0]["data"] == ["no"]
     handle._thread.join(timeout=2.0)
 
 
@@ -337,7 +366,12 @@ def test_start_stream_no_chunks_at_all_yields_immediate_done():
     handle = server.start_stream({"messages": []})
     items = _drain(handle)
     assert items == [
-        {"type": "done", "message": {"role": "assistant", "content": None}, "usage": None}
+        {
+            "type": "done",
+            "message": {"role": "assistant", "blocks": []},
+            "usage": None,
+            "stop_reason": None,
+        }
     ]
     handle._thread.join(timeout=2.0)
     assert client.closed is True
@@ -497,7 +531,10 @@ def test_build_app_dispatch_route_non_streaming():
     response = client.post("/dispatch", json={"messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
     assert response.json() == {
-        "message": {"role": "assistant", "content": "hi"},
+        "message": {
+            "role": "assistant",
+            "blocks": [{"type": "text", "index": 0, "text": "hi"}],
+        },
         "usage": None,
         "stop_reason": "stop",
     }
@@ -532,7 +569,11 @@ def test_build_app_dispatch_route_streaming_relays_ndjson_lines():
     lines = [json.loads(line) for line in response.text.strip().split("\n")]
     assert lines[0] == {"type": "delta", "content": "Hi"}
     assert lines[-1]["type"] == "done"
-    assert lines[-1]["message"] == {"role": "assistant", "content": "Hi"}
+    assert lines[-1]["message"]["role"] == "assistant"
+    blocks = lines[-1]["message"]["blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "text"
+    assert blocks[0]["text"] == "Hi"
 
 
 def test_build_app_dispatch_route_streaming_error_returns_error_status(monkeypatch):

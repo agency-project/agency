@@ -17,11 +17,7 @@ demand throughput isn't supported."
 `_OpenAICompatibleBedrockBackend` based on the model ID
 (`_is_anthropic_bedrock_model()`), and routes provider='anthropicAWS' to
 `_AnthropicAWSBackend` directly (no model-based branching -- there's no
-non-Anthropic equivalent on that product). All three Anthropic-family
-backends here reuse `.anthropic._AnthropicBedrockChatClient`, which adapts
-the Messages API to the OpenAI chat.completions interface (streaming and
-non-streaming) the rest of agllm.py is built around, so its streaming /
-tool-call / retry / compaction logic needs no changes to support any of them.
+non-Anthropic equivalent on that product).
 """
 
 from __future__ import annotations
@@ -29,15 +25,10 @@ import os
 import httpx
 import openai
 
-from .base import (
-    _AgProviderBackendConfig,
-    _OPENAI_GEN_FIELDS,
-    _VLLM_EXTRA_GEN_FIELDS,
-)
-from .agllm import agllm
+from .agllm import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS, _VLLM_EXTRA_GEN_FIELDS
 from .openai import _OpenAICompatibleBackend
 from .anthropic import (
-    _AnthropicBedrockChatClient,
+    _AnthropicBackend,
     _ANTHROPIC_BEDROCK_MODEL_RE,
     _known_anthropic_context_window,
 )
@@ -164,18 +155,17 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
         return None  # Bedrock has no vLLM-style /tokenize endpoint
 
 
-class _AnthropicBedrockBackend(agllm):
+class _AnthropicBedrockBackend(_AnthropicBackend):
     """Claude models on Amazon Bedrock — native invoke_model API via the
     anthropic SDK's AnthropicBedrock client (Messages API shape)."""
 
-    def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
+    def make_client(self, timeout: httpx.Timeout):
         if _anthropic_sdk is None:
             raise RuntimeError(
                 "Anthropic models on Bedrock require the 'anthropic' package: pip install anthropic"
             )
         region = self.region or "us-east-1"
-        anthropic_client = _anthropic_sdk.AnthropicBedrock(aws_region=region, timeout=timeout)
-        return _AnthropicBedrockChatClient(anthropic_client)
+        return _anthropic_sdk.AnthropicBedrock(aws_region=region, timeout=timeout)
 
     def list_models(self) -> list:
         return []  # Bedrock's native invoke_model API has no OpenAI-style /v1/models
@@ -187,7 +177,7 @@ class _AnthropicBedrockBackend(agllm):
         return _known_anthropic_context_window(model)
 
 
-class _AnthropicAWSBackend(agllm):
+class _AnthropicAWSBackend(_AnthropicBackend):
     """Claude Platform on AWS via the anthropic SDK's AnthropicAWS client.
 
     Auth (resolved by the SDK): SigV4 via the default AWS credential chain,
@@ -225,7 +215,7 @@ class _AnthropicAWSBackend(agllm):
             kwargs["base_url"] = base_url
         return kwargs
 
-    def make_client(self, timeout: httpx.Timeout) -> _AnthropicBedrockChatClient:
+    def make_client(self, timeout: httpx.Timeout):
         if _anthropic_sdk is None:
             raise RuntimeError(
                 "provider='anthropicAWS' requires the 'anthropic' package: pip install anthropic"
@@ -234,8 +224,7 @@ class _AnthropicAWSBackend(agllm):
             raise RuntimeError(
                 "provider='anthropicAWS' requires a recent 'anthropic' package with AnthropicAWS support"
             )
-        anthropic_client = _anthropic_sdk.AnthropicAWS(**self._client_kwargs(timeout))
-        return _AnthropicBedrockChatClient(anthropic_client)
+        return _anthropic_sdk.AnthropicAWS(**self._client_kwargs(timeout))
 
     def list_models(self) -> list:
         if _anthropic_sdk is None or not hasattr(_anthropic_sdk, "AnthropicAWS"):

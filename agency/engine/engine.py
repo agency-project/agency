@@ -108,6 +108,7 @@ class AgentEngine:
                 sandbox,
                 host_uds_path,
                 engine_name,
+                self._agent.harness,
                 agconfig=self._agent.agconfig,
             )
 

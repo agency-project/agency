@@ -72,6 +72,7 @@ def ensure_harness_daemon(
     sandbox: "agSandbox",
     host_uds_path: str,
     engine_name: str,
+    harness: str,
     *,
     agconfig: "agConfig | None" = None,
     timeout_s: float = 30.0,
@@ -111,6 +112,7 @@ def ensure_harness_daemon(
         f"--sandbox-uds {shlex.quote(handle.container_sandbox_uds_path)} "
         f"--host-uds {shlex.quote(handle.container_host_uds_path)} "
         f"--engine-name {shlex.quote(engine_name)} "
+        f"--harness {shlex.quote(harness)} "
         f"--config-json {shlex.quote(config_json)} "
         f"> {shlex.quote(_DAEMON_LOG_PATH)} 2>&1"
     )

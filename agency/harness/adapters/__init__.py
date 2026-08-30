@@ -7,6 +7,6 @@ selection logic; each concrete backend lives in its own sibling module and
 imports `agharness_backend` from `.base` to subclass it.
 """
 
-from .base import agharness_backend, agHarnessConfig, AgHarnessFields
+from .agharness_backend import agharness_backend, agHarnessConfig, AgHarnessFields
 
 __all__ = ["agharness_backend", "agHarnessConfig", "AgHarnessFields"]

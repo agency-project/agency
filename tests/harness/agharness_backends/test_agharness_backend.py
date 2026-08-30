@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 
 from agency.agconfig import agConfig
-from agency.harness.adapters.base import AdapterRuntime, agharness_backend, agHarnessConfig
+from agency.harness.adapters.agharness_backend import (
+    AdapterRuntime,
+    agharness_backend,
+    agHarnessConfig,
+)
 from agency.harness.adapters.opencode import _OpencodeBackend
 from agency.harness.adapters.claude_code import _ClaudeCodeBackend
 from agency.harness.adapters.codex import _CodexBackend
@@ -40,14 +44,6 @@ class TestForConfigDispatch:
 
 
 class TestAgHarnessConfig:
-    def test_sets_gateway_mode(self):
-        cfg = agConfig(agHarnessConfig(gateway_mode="translate"))
-        assert cfg.get("agharness", "gateway_mode") == "translate"
-
-    def test_default_gateway_mode_is_passthrough(self):
-        backend = agharness_backend.for_config("opencode", agConfig())
-        assert backend.gateway_mode == "passthrough"
-
     def test_binary_path_override(self):
         cfg = agConfig(agHarnessConfig(binary_path="/custom/opencode"))
         backend = agharness_backend.for_config("opencode", cfg)
@@ -81,14 +77,14 @@ class TestBaseDaemonAttemptNotImplemented:
 class TestChangeConfigAndGetConfigCopy:
     def test_change_config_clones(self):
         backend = agharness_backend.for_config("opencode", agConfig())
-        new_cfg = agConfig(agHarnessConfig(gateway_mode="translate"))
+        new_cfg = agConfig(agHarnessConfig(binary_path="/custom/opencode"))
         backend.change_config(new_cfg)
-        assert backend.gateway_mode == "translate"
-        new_cfg.set("agharness", "gateway_mode", "passthrough")
-        assert backend.gateway_mode == "translate"  # unaffected -- cloned
+        assert backend.binary_path == "/custom/opencode"
+        new_cfg.set("agharness", "binary_path", "/other/opencode")
+        assert backend.binary_path == "/custom/opencode"  # unaffected -- cloned
 
     def test_get_config_copy_returns_clone(self):
         backend = agharness_backend.for_config("opencode", agConfig())
         copy = backend.get_config_copy()
-        copy.set("agharness", "gateway_mode", "translate")
-        assert backend.gateway_mode == "passthrough"  # unaffected
+        copy.set("agharness", "binary_path", "/custom/opencode")
+        assert backend.binary_path is None  # unaffected

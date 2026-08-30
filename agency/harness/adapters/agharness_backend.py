@@ -30,15 +30,9 @@ if TYPE_CHECKING:
 
 class AgHarnessFields:
     """Every harness config field used by any backend, as
-    DynamicConfigParam descriptors -- see llm/base.py's
+    DynamicConfigParam descriptors -- see llm/agllm.py's
     AgLLMBackendFields for the same pattern."""
 
-    gateway_mode = DynamicConfigParam(
-        "agharness", default="passthrough"
-    )  # "passthrough" (the configured agllm backend already speaks the
-    # harness's wire format, forward requests unmodified through
-    # agproxy_llm) | "translate" (reshape requests/responses -- not
-    # implemented yet; only the passthrough route exists so far).
     session_resume_id = DynamicConfigParam(
         "agharness", default=None
     )  # the harness's own session id from a prior run on this agent, for
@@ -60,7 +54,7 @@ class AgHarnessFields:
 class agHarnessConfig(_AgConfigViewBase):
     """View over an agConfig for pre-setting agharness fields in one call::
 
-        cfg = agConfig(agHarnessConfig(gateway_mode="translate"))
+        cfg = agConfig(agHarnessConfig(mediation_mode="native_hooks"))
         ag = agent(agconfig=cfg, harness="codex")
 
     See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
@@ -136,6 +130,18 @@ class agharness_backend(AgHarnessFields):
         max_steps: "int | None",
     ) -> AttemptResult:
         """Run one CLI attempt through the narrow sandbox-daemon seam."""
+        raise NotImplementedError
+
+    def register(self, app, router) -> None:
+        raise NotImplementedError
+
+    def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
+        raise NotImplementedError
+
+    def _format_context_agency_to_harness(self, agency_response: dict) -> dict:
+        raise NotImplementedError
+
+    def _format_agency_stream_to_harness(self, agency_stream):
         raise NotImplementedError
 
     @staticmethod

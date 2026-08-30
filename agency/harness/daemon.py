@@ -22,8 +22,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from ..agconfig import agConfig
-from . import interaction_router, llm_router, mcp_proxy
-from .adapters.base import AdapterRuntime, AttemptResult, agharness_backend
+from . import interaction_router, mcp_proxy
+from .adapters.agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from .clients.host_services_client import HostServicesClient
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
 from .servers import SandboxInteractionServer
@@ -80,10 +80,11 @@ class _LocalSandbox:
 
 
 class _HarnessApiServer:
-    def __init__(self, host_uds_path: str, port: int) -> None:
+    def __init__(self, host_uds_path: str, port: int, harness_backend: agharness_backend) -> None:
         self._bridge = HostServicesClient(host_uds_path, None)
         self.syscall_policy = _HostSyscallPolicy(self._bridge)
         self._port = port
+        self._harness_backend = harness_backend
         self._server: "uvicorn.Server | None" = None
         self._thread: "threading.Thread | None" = None
 
@@ -93,7 +94,7 @@ class _HarnessApiServer:
 
     def start(self, timeout_s: float = 10.0) -> None:
         app = FastAPI()
-        app.include_router(llm_router.build_router(self._bridge))
+        self._harness_backend.register(app, self._bridge)
         app.include_router(interaction_router.build_router(self._bridge))
         app.include_router(mcp_proxy.build_router(self._bridge))
         server = uvicorn.Server(
@@ -201,6 +202,7 @@ class HarnessManager:
         sandbox_uds_path: str,
         host_uds_path: str,
         engine_name: str,
+        harness: str,
         *,
         agconfig: "agConfig | None" = None,
         attempt_handler: "Callable[[HarnessAttemptRequest], HarnessAttemptResult] | None" = None,
@@ -208,7 +210,8 @@ class HarnessManager:
     ) -> None:
         self._agconfig = agconfig if agconfig is not None else agConfig()
         self._engine_name = engine_name
-        self._harness_api = _HarnessApiServer(host_uds_path, harness_api_port)
+        harness_backend = agharness_backend.for_config(harness, self._agconfig)
+        self._harness_api = _HarnessApiServer(host_uds_path, harness_api_port, harness_backend)
         handler = attempt_handler if attempt_handler is not None else self._dispatch_attempt
         self._interaction_server = SandboxInteractionServer(sandbox_uds_path, handler)
 
@@ -243,6 +246,7 @@ def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
     parser.add_argument("--sandbox-uds", required=True)
     parser.add_argument("--host-uds", required=True)
     parser.add_argument("--engine-name", required=True)
+    parser.add_argument("--harness", required=True)
     parser.add_argument("--config-json", default="{}")
     parser.add_argument("--harness-api-port", type=int, default=_HARNESS_API_PORT)
     return parser.parse_args(argv)
@@ -254,6 +258,7 @@ def main(argv: "list[str] | None" = None) -> None:
         args.sandbox_uds,
         args.host_uds,
         args.engine_name,
+        args.harness,
         agconfig=agConfig(json.loads(args.config_json)),
         harness_api_port=args.harness_api_port,
     )

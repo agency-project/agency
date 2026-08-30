@@ -78,6 +78,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
             str(sandbox_socket),
             str(host_socket),
             "mock-agent",
+            "claude_code",
             attempt_handler=mock_attempt_handler,
             harness_api_port=0,
         )

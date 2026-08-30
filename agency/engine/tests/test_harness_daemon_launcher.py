@@ -24,6 +24,7 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
         sandbox,
         "/tmp/agency/gw/run/host-agent.sock",
         "agent-1",
+        "claude_code",
         agconfig=agConfig({"agharness": {"binary_path": "/bin/claude"}}),
         timeout_s=1.0,
     )
@@ -35,6 +36,7 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
     assert "python3 -m agency.harness.daemon" in command
     assert "--host-uds /var/run/agency_llm_gateway/host-agent.sock" in command
     assert "--sandbox-uds /var/run/agency_llm_gateway/sandbox-agent.sock" in command
+    assert "--harness claude_code" in command
     assert '"binary_path":"/bin/claude"' in command
     assert workdir == "/workspace"
 
@@ -53,6 +55,7 @@ def test_ensure_harness_daemon_waits_for_readiness_before_returning(monkeypatch)
         sandbox,
         "/tmp/host.sock",
         "agent-1",
+        "claude_code",
         timeout_s=1.0,
     )
 
@@ -68,12 +71,14 @@ def test_duplicate_ensure_reuses_ready_daemon_without_relaunching(monkeypatch):
         sandbox,
         "/tmp/host.sock",
         "agent-1",
+        "claude_code",
         timeout_s=1.0,
     )
     second = launcher.ensure_harness_daemon(
         sandbox,
         "/tmp/host.sock",
         "agent-1",
+        "claude_code",
         timeout_s=1.0,
     )
 
