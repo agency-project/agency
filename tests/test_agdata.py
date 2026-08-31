@@ -1,9 +1,6 @@
-import io
 import json
 import pytest
-from unittest.mock import MagicMock, patch
 
-import agency.agwebui as _agwebui_mod
 from agency.agdata import agdata, agerror
 
 
@@ -143,79 +140,18 @@ def test_pending_agdata_resolves_on_to_json():
 
 
 # ---------------------------------------------------------------------------
-# Error emission
+# agerror construction
 # ---------------------------------------------------------------------------
 
 
-class TestErrorEmission:
-    def test_error_string_prints_to_stderr(self):
-        """agerror('...') emits to stderr immediately at construction."""
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agerror("something went wrong")
-        assert "something went wrong" in buf.getvalue()
-
-    def test_error_string_contains_timestamp(self):
-        """Emitted line includes a HH:MM:SS timestamp."""
-        import re
-
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agerror("ts check")
-        assert re.search(r"\d{2}:\d{2}:\d{2}\.\d{3}", buf.getvalue())
-
-    def test_non_error_agdata_does_not_print(self):
-        """Normal agdata with no error field emits nothing."""
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agdata(x=1, y="hello")
-        assert buf.getvalue() == ""
-
-    def test_non_string_agerror_raises(self):
-        """agerror only accepts str — passing a type or non-str raises TypeError."""
-        with pytest.raises(TypeError):
-            agerror(str)  # type: ignore[arg-type]
-        with pytest.raises(TypeError):
-            agerror(42)  # type: ignore[arg-type]
-        with pytest.raises(TypeError):
-            agerror(None)  # type: ignore[arg-type]
-
-    def test_error_emitted_to_webui_when_active(self):
-        """When webui is active, the error line is sent to emitter.log via agterm."""
-        mock_webui = MagicMock()
-        mock_webui.emitter.log = MagicMock()
-        old = _agwebui_mod._active
-        _agwebui_mod._active = mock_webui
-        try:
-            agerror("webui error")
-        finally:
-            _agwebui_mod._active = old
-        calls = [str(c) for c in mock_webui.emitter.log.call_args_list]
-        assert any("webui error" in c for c in calls)
-
-    def test_error_always_goes_to_stderr_even_with_webui(self):
-        """Even when webui is active, errors (✗ events) still appear on stderr."""
-        mock_webui = MagicMock()
-        mock_webui.emitter.log = MagicMock()
-        old = _agwebui_mod._active
-        _agwebui_mod._active = mock_webui
-        try:
-            buf = io.StringIO()
-            with patch("agency.agterm.sys.stderr", buf):
-                agerror("always stderr")
-        finally:
-            _agwebui_mod._active = old
-        assert "always stderr" in buf.getvalue()
-
-    def test_multiple_errors_each_emit_once(self):
-        """Each separate agerror(...) emits exactly one line."""
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agerror("err A")
-            agerror("err B")
-        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
-        assert sum("err A" in l for l in lines) == 1
-        assert sum("err B" in l for l in lines) == 1
+def test_non_string_agerror_raises():
+    """agerror only accepts str — passing a type or non-str raises TypeError."""
+    with pytest.raises(TypeError):
+        agerror(str)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        agerror(42)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        agerror(None)  # type: ignore[arg-type]
 
 
 def test_pending_repr_before_resolution():

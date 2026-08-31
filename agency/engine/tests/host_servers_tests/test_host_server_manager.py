@@ -45,11 +45,10 @@ def test_construction_uses_the_agents_own_data_collector(tmp_path):
     assert manager._data_collector is agent.data_collector
 
 
-def test_construction_wires_agent_and_skill_into_interaction_server(tmp_path):
+def test_construction_wires_skill_into_interaction_server(tmp_path):
     policy = agpolicy()
-    manager, agent, skill = _make_manager(tmp_path, policy=policy)
+    manager, _, _ = _make_manager(tmp_path, policy=policy)
     assert isinstance(manager._interaction_server, HostInteractionServer)
-    assert manager._interaction_server._agent is agent
     assert manager._interaction_server._policy is policy
 
 

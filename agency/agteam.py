@@ -2,6 +2,7 @@ from __future__ import annotations
 import functools
 import weakref
 from concurrent.futures import Future
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ._context import _active_team
@@ -91,32 +92,29 @@ class agteam:
         parent = _active_team.get(None)
         self._parent_team: "agteam | None" = parent
 
-        # Log team creation to both terminal and file
-        from .agent import agent as _Agent
+        from .agent import agent as _Agent, _DEFAULT_LOG_DIR
         from .agname import agname as _agname
-        from .aglog import aglog as _aglog
-        import sys
+        from .agDataCollector import agDataCollector, agDataCollectorConfigs
 
         _base = config.get("name") or f"{type(self).__name__}"
         self.team_name: str = _agname.allocate_agname(_base)
         parent_team_name = parent.team_name if parent is not None else None
-        log_dir = _Agent.log_dir
-        self._log = _aglog(log_dir / "_teams.jsonl" if log_dir else None)
-        # DATACOLLECTOR: append, correlate (parent_team) -- team lifecycle event; this call
-        # currently omits agname, which is a pre-existing bug in aglog.dump() for team logs
-        # (moot once aglog is dropped, but the parent/child correlation still needs a home).
-        self._log._lifecycle(
-            "created",
-            team=self.team_name,
-            parent_team=parent_team_name,
+        log_dir = Path(_Agent.log_dir) if _Agent.log_dir is not None else _DEFAULT_LOG_DIR
+
+        # A standalone agconfig, never shared with (or reachable from) self.agconfig --
+        # a team's own agDataCollectorConfigs must never leak into an agent's config via
+        # `_t.agconfig.clone()` team-inheritance (see agent.py's _initialize()).
+        _dc_agconfig = agConfig()
+        _dc_agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
+            db_path=str(log_dir / f"{self.team_name}_data.sqlite3")
         )
-        if parent_team_name is not None:
-            # DATACOLLECTOR: drop -- redundant with the _lifecycle append two lines above.
-            print(
-                f"  [agteam] {self.team_name} created inside {parent_team_name}",
-                file=sys.stderr,
-                flush=True,
-            )
+        self.data_collector = agDataCollector(_dc_agconfig)
+        self.data_collector.start()
+        self.data_collector.record_event(
+            type="team_created",
+            payload={"team": self.team_name, "parent_team": parent_team_name},
+            term_message=f"[{self.team_name}] CREATED  parent={parent_team_name}",
+        )
 
         token = _active_team.set(self)
         try:
@@ -124,18 +122,11 @@ class agteam:
         finally:
             _active_team.reset(token)
 
-        try:
-            from . import agwebui as _agwebui
-
-            if _agwebui._active is not None:
-                # DATACOLLECTOR: registry -- append-once list keyed by team_name, updated
-                # as agents join.
-                _agwebui._active.emitter.team_registered(
-                    self.team_name,
-                    [a.agname for a in self._agents],
-                )
-        except Exception as _e:
-            print(f"[agteam] WARNING: team_registered push failed for {self.team_name}: {_e}")
+        self.data_collector.record_event(
+            type="team_registered",
+            payload={"team": self.team_name, "agents": [a.agname for a in self._agents]},
+            do_update=True,
+        )
 
     # ------------------------------------------------------------------
     # Override points
@@ -196,7 +187,6 @@ def _wrap_run(cls) -> None:
         future: Future = Future()
 
         def _task() -> None:
-            import sys
             import traceback
 
             token = _active_team.set(self)
@@ -204,8 +194,12 @@ def _wrap_run(cls) -> None:
                 result = original(self, *args, **kwargs)
                 future.set_result(result if isinstance(result, agdata) else agdata(result=result))
             except Exception as exc:
-                traceback.print_exc(file=sys.stderr)
-                sys.stderr.flush()
+                tb = traceback.format_exc()
+                self.data_collector.record_event(
+                    type="team_run_failed",
+                    payload={"team": self.team_name, "traceback": tb},
+                    term_message=tb,
+                )
                 future.set_exception(exc)
             finally:
                 _active_team.reset(token)

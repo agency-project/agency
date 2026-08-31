@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
-from . import agpause
 from .profiler import agprof
 from .agtype import agtype
 from .agutil import _camel_to_snake
@@ -38,12 +37,11 @@ class agdata:
         f = object.__getattribute__(self, "_future")
         if f is None:
             return
-        with agpause.note_blocked_on(agpause.producer_of(f)):
-            if f.done():
+        if f.done():
+            resolved = f.result()
+        else:
+            with agprof.span("sync:result_wait"):
                 resolved = f.result()
-            else:
-                with agprof.span("sync:result_wait"):
-                    resolved = f.result()
         resolved._resolve()  # chain: future may resolve to another pending agdata
         object.__setattr__(self, "_data", object.__getattribute__(resolved, "_data"))
         object.__setattr__(self, "_future", None)
@@ -188,11 +186,6 @@ class agerror(agdata):
             raise TypeError(f"agerror message must be a str, got {type(message).__name__}")
         object.__setattr__(self, "_future", None)
         object.__setattr__(self, "_data", {"error": message})
-        from .agterm import agterm as _agterm_cls
-
-        if not hasattr(agerror, "_term"):
-            agerror._term = _agterm_cls("agerror")
-        agerror._term.log("ERROR ✗  ", message, depth=2)
 
     def __getattr__(self, name: str):
         if name == "error":

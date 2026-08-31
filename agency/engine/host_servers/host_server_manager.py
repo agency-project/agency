@@ -43,10 +43,10 @@ class HostServerManager:
         self._ensure_runtime_configs(agent.agconfig)
         self._data_collector = agent.data_collector
         self._llm_handler_server = LlmHandlerServer(
-            agent.agconfig, parent_context=agprof.current_span_context()
+            agent.agconfig, self._data_collector, parent_context=agprof.current_span_context()
         )
-        self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool)
-        self._interaction_server = HostInteractionServer(agent, skill, self._data_collector)
+        self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool, self._data_collector)
+        self._interaction_server = HostInteractionServer(skill, self._data_collector)
         self.set_config(agent.agconfig)
 
         self._server: "uvicorn.Server | None" = None

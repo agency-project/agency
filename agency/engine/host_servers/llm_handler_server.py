@@ -17,6 +17,7 @@ from ...llm.agllm import agllm
 
 if TYPE_CHECKING:
     from ...agconfig import agConfig
+    from ...agDataCollector import agDataCollector
 
 TRANSIENT_DISPATCH_EXCS = (
     RATE_LIMIT_EXCS + API_CONN_EXCS + API_ERROR_EXCS + (ssl.SSLError, OSError, httpx.TransportError)
@@ -114,7 +115,10 @@ class _StreamHandle:
 
 
 class LlmHandlerServer:
-    def __init__(self, agconfig: "agConfig", *, parent_context=None) -> None:
+    def __init__(
+        self, agconfig: "agConfig", data_collector: "agDataCollector", *, parent_context=None
+    ) -> None:
+        self._data_collector = data_collector
         self._handles: "list[_StreamHandle]" = []
         self._handles_lock = threading.Lock()
         # HTTP/UDS requests are handled on the host server's own thread, so
@@ -185,6 +189,12 @@ class LlmHandlerServer:
     def dispatch(self, request: dict) -> dict:
         from ...profiler import agprof
 
+        self._data_collector.record_event(
+            type="agent_state",
+            payload={"state": "waiting_llm"},
+            do_update=True,
+            flush=True,
+        )
         with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
             _annotate(
                 attempt_span, model=self._backend.model, provider=type(self._backend).__name__
@@ -213,6 +223,12 @@ class LlmHandlerServer:
     def start_stream(self, request: dict) -> "_StreamHandle":
         from ...profiler import agprof
 
+        self._data_collector.record_event(
+            type="agent_state",
+            payload={"state": "waiting_llm"},
+            do_update=True,
+            flush=True,
+        )
         q: "queue.Queue[dict]" = queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
         cancel_event = threading.Event()
         handle = _StreamHandle(q, cancel_event)

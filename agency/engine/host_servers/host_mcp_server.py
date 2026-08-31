@@ -13,6 +13,7 @@ from ...agdata import agdata
 if TYPE_CHECKING:
     from starlette.applications import Starlette
 
+    from ...agDataCollector import agDataCollector
     from ...agresources import agResourcePool
     from ...agskill import agskill
     from ...agtool import agtool
@@ -21,11 +22,16 @@ if TYPE_CHECKING:
 
 class HostMcpServer:
     def __init__(
-        self, sandbox: "agSandbox", skill: "agskill", resource_pool: "agResourcePool"
+        self,
+        sandbox: "agSandbox",
+        skill: "agskill",
+        resource_pool: "agResourcePool",
+        data_collector: "agDataCollector",
     ) -> None:
         self._sandbox = sandbox
         self._skill = skill
         self._resource_pool = resource_pool
+        self._data_collector = data_collector
         self._persistent_vars: "dict[str, object]" = {}
         self._mcp_server: "MCPServer | None" = None
 
@@ -34,6 +40,12 @@ class HostMcpServer:
         required = set((tool.params or {}).get("required", list(properties.keys())))
 
         def call_tool(**kwargs: "object") -> dict:
+            self._data_collector.record_event(
+                type="agent_state",
+                payload={"state": "running_tools", "tool": tool.name},
+                do_update=True,
+                flush=True,
+            )
             persistent = {
                 var_name: self._persistent_vars.setdefault(var_name, factory())
                 for var_name, factory in tool.persistent_vars.items()

@@ -83,13 +83,21 @@ class _FakeClient:
         self.closed = True
 
 
+class _FakeDataCollector:
+    def __init__(self):
+        self.events = []
+
+    def record_event(self, type, payload, call_label=None, do_update=False, **_kw):
+        self.events.append((type, payload, call_label, do_update))
+
+
 def _cfg(**fields) -> agConfig:
     return agConfig({"agllm_backend": fields})
 
 
 def _make_server(create_fn=None, **fields) -> "tuple[LlmHandlerServer, _FakeClient]":
     fields.setdefault("model", "gpt-test")
-    server = LlmHandlerServer(_cfg(**fields))
+    server = LlmHandlerServer(_cfg(**fields), _FakeDataCollector())
     client = _FakeClient(create_fn)
     server._backend.make_client = lambda timeout: client
     return server, client
@@ -294,6 +302,7 @@ def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tm
         with agprof.span("engine-run"):
             server = LlmHandlerServer(
                 _cfg(model="gpt-test"),
+                _FakeDataCollector(),
                 parent_context=agprof.current_span_context(),
             )
             client = _FakeClient(create)
@@ -498,7 +507,7 @@ def test_stop_cancels_and_joins_all_handles():
             super().close()
             keep_going.set()
 
-    server = LlmHandlerServer(_cfg(model="gpt-test"))
+    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataCollector())
     client = _ClosingClient(lambda **kw: gen())
     server._backend.make_client = lambda timeout: client
 

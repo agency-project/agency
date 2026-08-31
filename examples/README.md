@@ -79,23 +79,6 @@ LLM_MODEL=google/gemma-4-E2B-it python examples/image_processing.py before.jpg a
 
 ---
 
-## human_in_the_loop.py
-
-**What it shows:** Driving approval loops entirely from Python so `ask_human` is *guaranteed* to be called — the LLM never decides on its own whether to stop and ask.
-
-1. Python asks the human what scene to write next (`ask_human`, no timeout).
-2. A planner skill drafts a paragraph-by-paragraph scene plan.
-3. Python shows the plan and asks for approval; on rejection it loops back into the planner with the human's feedback until approved.
-4. A writer skill generates the full scene prose from the approved plan.
-5. Python shows the prose and asks for approval; on rejection it loops (re-plan → re-write) until approved.
-6. Approved output is appended to `plans.md` / `story.txt` in the run directory, and the loop advances to the next scene.
-
-```bash
-python examples/human_in_the_loop.py
-```
-
----
-
 ## sandbox_handoff.py
 
 **What it shows:** Reading and driving an agent's `agSandbox` directly from the host, and handing one sandbox off between two agents — the sandbox is a plain `agent.sandbox` attribute, not something you have to go through a skill to touch.

@@ -1,11 +1,9 @@
 from __future__ import annotations
-import copy
 import io
 import json
 import os
 import queue
 import tarfile
-import threading
 import uuid as _uuid_mod
 import weakref
 from datetime import datetime
@@ -36,9 +34,7 @@ def _llm_config_snapshot(agconfig: "agConfig") -> dict:
 
 from .agdata import agdata
 from .agcontext import agcontext
-from .agDataCollector import agDataCollector, agDataCollectorConfigs
-from .aglog import aglog, _ts
-from .agterm import agterm
+from .agDataCollector import agDataCollector, agDataCollectorConfigs, _ts
 from .sandbox.agsandbox import agSandbox, agSandboxConfig
 from .sandbox import agSandboxBackendConfig
 from .agresources import agResourcePool
@@ -94,74 +90,6 @@ def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_defau
 
 
 # [REFACTOR] Check how it works
-# States that mean "this agent's worker thread will not make forward
-# progress until something external (a resume, or an upstream producer)
-# unblocks it". Used by agent.is_settled() -- the wait_all_* helpers in
-# agpause.py never check it directly, they call is_settled() on each agent.
-_SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
-
-
-class agent_state:
-    """Single owner of one agent's live status: the display fields a human or
-    the webui sees (state/skill/tool), blocked_on for is_settled()'s
-    dependency-chain recursion, and the lock that makes every transition
-    atomic. One instance lives on agent._state.
-
-    update_state() is the only way to change the display fields — called by
-    HostInteractionServer.update_state() as the harness manager reports
-    its own execution state, or by agpause.py's _BlockCtx for the
-    blocked_on_dependency transition.
-    """
-
-    def __init__(self, agname: str) -> None:
-        self.agname = agname
-        self.state: str = "inactive"  # [REFACTOR] Should be an enum, not a string
-        self.skill: "str | None" = None
-        self.tool: "str | None" = None  # [REFACTOR] Shouldn't the skill have the tools?
-        # While this agent's worker thread is blocked resolving another
-        # agent's pending future, points at that upstream agent so
-        # is_settled() can recurse through the dependency chain.
-        self.blocked_on: "agent | None" = None
-        self._lock = threading.RLock()
-
-    def snapshot(self) -> "tuple[str, str | None, str | None]":
-        """Atomically read (state, skill, tool) together — reading the three
-        fields one at a time would let a concurrent update_state() call
-        interleave between them and hand back a mismatched combination."""
-        with self._lock:
-            return self.state, self.skill, self.tool
-
-    def update_state(
-        self, new_state: str, skill: "str | None" = None, tool: "str | None" = None
-    ) -> None:
-        """Atomically apply (new_state, skill, tool). Emits to the webui
-        outside the lock."""
-        with self._lock:
-            self.state, self.skill, self.tool = new_state, skill, tool
-        self._emit()
-
-    def _emit(self) -> None:  # [REFACTOR] "PUSH" to agwebui?
-        # DATACOLLECTOR: latest, keyed by agname -- current (state, skill, tool) only, no
-        # history needed.
-        try:
-            from . import agwebui as _agwebui
-
-            if _agwebui._active is not None:
-                from .agterm import agterm as _agterm
-                from .agwebui.emitter import ansi_to_hex as _ansi_to_hex
-                from ._context import _active_team as _at
-
-                _ansi = _agterm._agname_colors.get(self.agname)
-                _color = _ansi_to_hex(_ansi) if _ansi else None
-                _team = _at.get(None)
-                _team_name = _team.team_name if _team is not None else None
-                _agwebui._active.emitter.agent_state(
-                    self.agname, self.state, self.skill, self.tool, color=_color, team=_team_name
-                )
-        except Exception as _e:
-            print(f"[agent] WARNING: agent_state push failed for {self.agname}: {_e}")
-
-
 class agent:
     """Orchestrator that maintains shared history and delegates to named agskills.
 
@@ -265,12 +193,6 @@ class agent:
 
         _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        log_path = log_dir / f"{self.agname}_timeline.jsonl"
-        self.log = aglog(path=log_path, agconfig=self.agconfig)
-        self._full_history: list[dict] = []
-        self._full_history_path: Path = log_dir / f"{self.agname}_history.jsonl"
-        self._full_history_path.parent.mkdir(parents=True, exist_ok=True)
-        self.terminal = agterm(self.agname)
 
         data_collector_configs = self.agconfig.__dict__.get("agDataCollectorConfigs")
         if data_collector_configs is None:
@@ -281,9 +203,7 @@ class agent:
         self.data_collector = agDataCollector(self.agconfig)
         self.data_collector.start()
 
-        self._snapshot_messages: list[dict] = []
         self.inbox: queue.Queue[str] = queue.Queue()
-        self._state = agent_state(str(self.agname))
 
         _live_agents.add(self)
 
@@ -299,33 +219,46 @@ class agent:
         _context_limit = _llm_config.get("context_limit")
         ctx = f"  context={_context_limit}" if _context_limit else "  context=unknown"
         team_tag = f"  team={team_name}" if team_name else ""
-        self.terminal.log("CREATED  ", f"model={_llm_config.get('model') or '?'}{ctx}{team_tag}")
-        # DATACOLLECTOR: append -- one-shot lifecycle event, correlate by agname.
-        self.log._lifecycle(
-            "created",
-            agname=self.agname,
-            team=team_name,
-            llm_config=_llm_config,
-            context_limit=_context_limit,
+        self.data_collector.record_event(
+            type="agent_created",
+            payload={
+                "agname": self.agname,
+                "team": team_name,
+                "llm_config": _llm_config,
+                "context_limit": _context_limit,
+            },
+            term_message=(
+                f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}{ctx}{team_tag}"
+            ),
         )
-        self._emit_config()  # [REFACTOR] Maybe refactor into a separate agent_logging.py
+        self.data_collector.record_event(
+            type="agent_state",
+            payload={"state": "agent_idle"},
+            do_update=True,
+            flush=True,
+        )
+        self.change_config(self.agconfig)
 
     def change_config(self, agconfig: "agConfig") -> None:
         """Replace this agent's agconfig with a clone of the given one, and
         push that same clone down to every sub-object that holds its own
-        independent copy (``self.log``, ``self.data_collector``,
-        ``self.sandbox`` if one has been created, and ``self.engine``).
-        Reassigning
-        ``self.agconfig`` alone does not reach those clones, so this is the
-        supported way to change live config (e.g. ``max_completion_tokens``)
-        after construction."""
+        independent copy (``self.data_collector``, ``self.sandbox`` if one
+        has been created, and ``self.engine``). Reassigning ``self.agconfig``
+        alone does not reach those clones, so this is the supported way to
+        change live config (e.g. ``max_completion_tokens``) after
+        construction -- also called by __init__/fork/load themselves, once
+        their sub-objects exist, so config-snapshot recording lives in one
+        place."""
         self.agconfig = agconfig.clone()
-        self.log.change_config(self.agconfig)
         self.data_collector.set_config(self.agconfig)
         if self.sandbox is not None:
             self.sandbox.change_config(self.agconfig)
         self.engine.set_config(self.agconfig)
-        self._emit_config()
+        self.data_collector.record_event(
+            type="agent_config",
+            payload=self.agconfig.dynamic_snapshot(),
+            do_update=True,
+        )
 
     def get_config_copy(self) -> "agConfig | None":
         """Return a clone of this agent's agconfig, or None if it has none."""
@@ -358,66 +291,9 @@ class agent:
     def history(self, value: agdata) -> None:
         self.ctx.set_transcript(value._data.get("messages", []))
 
-    @property
-    def full_history(self) -> list[dict]:
-        """Append-only transcript: every message ever sent/received."""
-        return list(self._full_history)
-
-    def set_full_history(self, history: list[dict]) -> None:
-        self._full_history = copy.deepcopy(history)
-
-    def reset_full_history(self) -> None:
-        self._full_history = []
-
     # ------------------------------------------------------------------
     # UI / history helpers — called by agskill during execution
     # ------------------------------------------------------------------
-
-    def _append_full_history(
-        self, msg: dict
-    ) -> None:  # [REFACTOR] File-write method? Maybe rename?
-        """Append one message to the append-only full history (thread-safe write)."""
-        # DATACOLLECTOR: append -- full per-agent transcript; non-message entries also
-        # trigger the latest-snapshot push below.
-        self._full_history.append(msg)
-        with self._full_history_path.open("a") as f:
-            f.write(json.dumps(msg) + "\n")
-        if "role" not in msg:
-            self._push_live_messages(self._snapshot_messages)
-
-    def _set_ui_state(self, state: str, skill: str | None = None, tool: str | None = None) -> None:
-        self._state.update_state(state, skill, tool)
-
-    def _emit_config(self) -> None:  # [REFACTOR] Why not a single emission point to logger/webui?
-        """Push this agent's current dynamic-config snapshot to the webui,
-        so its config editor can show/edit it without a round trip into this
-        (isolated) execution process. Called on construction and after every
-        change_config()."""
-        # DATACOLLECTOR: latest, keyed by agname -- current dynamic-config snapshot only.
-        if self.agconfig is None:
-            return
-        try:
-            from . import agwebui as _agwebui
-
-            if _agwebui._active is not None:
-                _agwebui._active.emitter.agent_config(self.agname, self.agconfig.dynamic_snapshot())
-        except Exception as _e:
-            print(f"[agent] WARNING: agent_config push failed for {self.agname}: {_e}")
-
-    def _push_live_messages(self, messages: list) -> None:
-        # DATACOLLECTOR: append+latest -- ships the full current message list wholesale
-        # each call (snapshot, not delta); consumer needs both "current messages" (latest)
-        # and a history scrubber (append). Candidate for collapse if called at streaming
-        # frequency.
-        self._snapshot_messages = list(messages)
-        try:
-            from . import agwebui as _agwebui
-
-            if _agwebui._active is not None:
-                event_entries = [e for e in getattr(self, "_full_history", []) if "role" not in e]
-                _agwebui._active.emitter.push_messages(self.agname, list(messages) + event_entries)
-        except Exception as _e:
-            print(f"[agent] WARNING: push_messages failed for {self.agname}: {_e}")
 
     def _next_inbox_msg(self) -> "dict | None":
         """Return the next typed inbox entry, or None if empty."""
@@ -446,46 +322,21 @@ class agent:
         checkpoint. Non-blocking — delivered as an inbox entry the harness
         manager drains via check_inbox()."""
         self.inbox.put({"type": "pause"})
-        # DATACOLLECTOR: append -- currently terminal-only; no structured event exists for
-        # pause/resume requests today.
-        self.terminal.log("PAUSE ▶  ", "requested")
+        self.data_collector.record_event(
+            type="agent_pause_requested",
+            payload={"agname": self.agname},
+            term_message=f"[{self.agname}] PAUSE ▶  requested",
+        )
 
     def resume(self) -> None:
         """Clear a pause request. Non-blocking — delivered as an inbox entry
         the harness manager drains via check_inbox()."""
         self.inbox.put({"type": "resume"})
-        # DATACOLLECTOR: append -- same gap as pause() above.
-        self.terminal.log("PAUSE ✓  ", "resumed")
-
-    def is_paused(self) -> bool:
-        """True once the harness manager has reported this agent as actually
-        paused (see update_state(), called from HostInteractionServer)."""
-        return self._state.state == "paused"
-
-    def is_settled(
-        self, _seen: "set[str] | None" = None
-    ) -> bool:  # [REFACTOR] Why do we need this?
-        """True if this agent is not making forward progress right now:
-        either it's paused/inactive/finished/errored, or its worker thread is
-        transitively blocked waiting on an upstream agent that is itself
-        settled. The recursive case lets a caller confirm a whole dependency
-        chain has stopped instead of deadlocking on an agent that will never
-        reach its own checkpoint because an upstream producer it's waiting on
-        is paused first.
-
-        Checks _state.blocked_on first, ahead of the display state string: a
-        pause() request can legitimately relabel the display state (e.g. to
-        "pausing") while the agent is still parked inside a blocking
-        future.result() call — blocked_on is the reliable signal for that,
-        independent of whatever cosmetic label the state string carries."""
-        producer = self._state.blocked_on
-        if producer is not None:
-            _seen = _seen if _seen is not None else set()
-            if producer.agname in _seen:
-                return True  # cycle guard — shouldn't happen, but never hang on one
-            _seen.add(self.agname)
-            return producer.is_settled(_seen)
-        return self._state.state in _SETTLED_LEAF_STATES
+        self.data_collector.record_event(
+            type="agent_resumed",
+            payload={"agname": self.agname},
+            term_message=f"[{self.agname}] PAUSE ✓  resumed",
+        )
 
     # ------------------------------------------------------------------
     # Execution — delegates to agskill
@@ -531,15 +382,23 @@ class agent:
     # Destructor
     # ------------------------------------------------------------------
 
-    # [REFACTOR] No cleanup? No state checks?
     def __del__(self) -> None:
         """Best-effort: log destruction. The sandbox (if any) cleans itself up
         via agSandbox.__del__ once this agent's reference to it is gone."""
         _live_agents.discard(self)
         try:
-            self.terminal.log("DESTROYED", "")
-            # DATACOLLECTOR: append -- one-shot lifecycle event.
-            self.log._lifecycle("destroyed", agname=self.agname)
+            self.data_collector.record_event(
+                type="agent_state",
+                payload={"state": "agent_exit"},
+                do_update=True,
+                flush=True,
+            )
+            self.data_collector.record_event(
+                type="agent_destroyed",
+                payload={"agname": self.agname},
+                term_message=f"[{self.agname}] DESTROYED",
+                flush=True,
+            )
         except Exception as _e:
             print(f"[agent] WARNING: __del__ log failed for {getattr(self, 'agname', '?')}: {_e}")
 
@@ -571,15 +430,16 @@ class agent:
         )
         _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", cls.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        log_path = log_dir / f"{ag.agname}_timeline.jsonl"
-        ag.log = aglog(path=log_path, agconfig=ag.agconfig)
-        ag._full_history = []
-        ag._full_history_path = log_dir / f"{ag.agname}_history.jsonl"
-        ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
-        ag.terminal = agterm(ag.agname)
-        ag._snapshot_messages = []
+        # Always a fresh path scoped to the fork's own agname -- ag.agconfig was cloned
+        # from src.agconfig, which already carries src's OWN agDataCollectorConfigs, so
+        # this must be overwritten rather than reused (see agDataCollectorConfigs on
+        # agDataCollector.__init__'s docstring for why "already set" can't be trusted here).
+        ag.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
+            db_path=str(log_dir / f"{ag.agname}_data.sqlite3")
+        )
+        ag.data_collector = agDataCollector(ag.agconfig)
+        ag.data_collector.start()
         ag.inbox = queue.Queue()
-        ag._state = agent_state(str(ag.agname))
         _live_agents.add(ag)
 
         from ._context import _active_team
@@ -589,17 +449,23 @@ class agent:
             _team._agents.add(ag)
         team_name = _team.team_name if _team is not None else None
 
-        ag.terminal.log("FORKED   ", f"from {src.agname}")
-        # DATACOLLECTOR: append, correlate (parent_agname) -- lifecycle event linking the
-        # fork to its source agent.
-        ag.log._lifecycle(
-            "forked",
-            agname=ag.agname,
-            parent_agname=src.agname,
-            team=team_name,
-            llm_config=_llm_config_snapshot(ag.agconfig),
+        ag.data_collector.record_event(
+            type="agent_forked",
+            payload={
+                "agname": ag.agname,
+                "parent_agname": src.agname,
+                "team": team_name,
+                "llm_config": _llm_config_snapshot(ag.agconfig),
+            },
+            term_message=f"[{ag.agname}] FORKED   from {src.agname}",
         )
-        ag._emit_config()
+        ag.data_collector.record_event(
+            type="agent_state",
+            payload={"state": "agent_idle"},
+            do_update=True,
+            flush=True,
+        )
+        ag.change_config(ag.agconfig)
         return ag
 
     # ------------------------------------------------------------------
@@ -638,8 +504,12 @@ class agent:
 
             if agname in live_names:
                 existing = live_names[agname]
-                existing.terminal.log(
-                    "CKPT     ", f"load_all: {agname} already live, skipping {ckpt.name}"
+                existing.data_collector.record_event(
+                    type="agent_load_skipped",
+                    payload={"agname": agname, "ckpt": ckpt.name},
+                    term_message=(
+                        f"[{agname}] CKPT     load_all: already live, skipping {ckpt.name}"
+                    ),
                 )
                 restored.append(existing)
             else:
@@ -658,7 +528,11 @@ class agent:
         image_tag = f"agency/ckpt-{self.agname}"
 
         if self.ctx.is_pending():
-            self.terminal.log("CKPT ⏳  ", "waiting for in-flight task to complete...")
+            self.data_collector.record_event(
+                type="agent_checkpoint_waiting",
+                payload={"agname": self.agname},
+                term_message=f"[{self.agname}] CKPT ⏳  waiting for in-flight task to complete...",
+            )
         self.ctx.resolve_prev_dependencies()
 
         state = {
@@ -712,9 +586,11 @@ class agent:
                 tar.addfile(info, io.BytesIO(state_bytes))
 
         size_kb = path.stat().st_size // 1024
-        self.terminal.log("CKPT ✓   ", f"saved → {path}  ({size_kb} KB)")
-        # DATACOLLECTOR: append -- one-shot lifecycle event.
-        self.log._lifecycle("saved", agname=self.agname, path=str(path), size_kb=size_kb)
+        self.data_collector.record_event(
+            type="agent_saved",
+            payload={"agname": self.agname, "path": str(path), "size_kb": size_kb},
+            term_message=f"[{self.agname}] CKPT ✓   saved → {path}  ({size_kb} KB)",
+        )
 
     @classmethod
     def load(
@@ -798,23 +674,34 @@ class agent:
 
         _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        ag.log = aglog(path=log_dir / f"{ag.agname}_timeline.jsonl", agconfig=ag.agconfig)
-        ag._full_history: list[dict] = []
-        ag._full_history_path: Path = log_dir / f"{ag.agname}_history.jsonl"
-        ag._full_history_path.parent.mkdir(parents=True, exist_ok=True)
-        ag.terminal = agterm(ag.agname)
-        ag._snapshot_messages: list[dict] = []
+        # Always a fresh path scoped to the restored agent's own agname -- see the
+        # matching comment in fork() for why an inherited agDataCollectorConfigs can't
+        # be trusted here.
+        ag.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
+            db_path=str(log_dir / f"{ag.agname}_data.sqlite3")
+        )
+        ag.data_collector = agDataCollector(ag.agconfig)
+        ag.data_collector.start()
         ag.inbox: queue.Queue = queue.Queue()
-        ag._state = agent_state(str(ag.agname))
 
         _live_agents.add(ag)
 
-        ag.terminal.log("LOADED   ", f"from {path}")
-        # DATACOLLECTOR: append -- one-shot lifecycle event.
-        ag.log._lifecycle(
-            "loaded", agname=ag.agname, source=str(path), checkpoint_ts=state.get("ts")
+        ag.data_collector.record_event(
+            type="agent_loaded",
+            payload={
+                "agname": ag.agname,
+                "source": str(path),
+                "checkpoint_ts": state.get("ts"),
+            },
+            term_message=f"[{ag.agname}] LOADED   from {path}",
         )
-        ag._emit_config()
+        ag.data_collector.record_event(
+            type="agent_state",
+            payload={"state": "agent_idle"},
+            do_update=True,
+            flush=True,
+        )
+        ag.change_config(ag.agconfig)
 
         return ag
 

@@ -11,13 +11,11 @@ from ...harness._syscall_event import agsyscallevent
 
 if TYPE_CHECKING:
     from ...agDataCollector import agDataCollector
-    from ...agent import agent
     from ...agskill import agskill
 
 
 class HostInteractionServer:
-    def __init__(self, agent: "agent", skill: "agskill", data_collector: "agDataCollector") -> None:
-        self._agent = agent
+    def __init__(self, skill: "agskill", data_collector: "agDataCollector") -> None:
         self._policy = skill.policy
         self._data_collector = data_collector
 
@@ -41,15 +39,23 @@ class HostInteractionServer:
             return (False, f"hook raised: {exc}")
         return result if isinstance(result, tuple) else (result, None)
 
-    def update_state(
-        self, new_state: str, skill: "str | None" = None, tool: "str | None" = None
-    ) -> None:
-        self._agent._state.update_state(new_state, skill, tool)
-
     def record_event(
-        self, type: str, payload: dict, call_label: "str | None" = None, do_update: bool = False
+        self,
+        type: str,
+        payload: dict,
+        call_label: "str | None" = None,
+        do_update: bool = False,
+        term_message: "str | None" = None,
+        flush: bool = False,
     ) -> None:
-        self._data_collector.record_event(type, payload, call_label=call_label, do_update=do_update)
+        self._data_collector.record_event(
+            type,
+            payload,
+            call_label=call_label,
+            do_update=do_update,
+            term_message=term_message,
+            flush=flush,
+        )
 
     def record_span(
         self,
@@ -88,11 +94,6 @@ class HostInteractionServer:
             allowed, reason = self.check_syscall(agsyscallevent(**request))
             return JSONResponse({"allowed": allowed, "reason": reason})
 
-        @app.post("/update_state")
-        def _update_state(request: dict) -> JSONResponse:
-            self.update_state(request["state"], request.get("skill"), request.get("tool"))
-            return JSONResponse({"ok": True})
-
         @app.post("/record_event")
         def _record_event(request: dict) -> JSONResponse:
             self.record_event(
@@ -100,6 +101,8 @@ class HostInteractionServer:
                 request["payload"],
                 call_label=request.get("call_label"),
                 do_update=request.get("do_update", False),
+                term_message=request.get("term_message"),
+                flush=request.get("flush", False),
             )
             return JSONResponse({"ok": True})
 

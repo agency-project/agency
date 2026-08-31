@@ -1,14 +1,10 @@
 from __future__ import annotations
 import inspect
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 from .agdata import agdata, agerror
 from .agutil import format_exception
 from .agconfig import DynamicConfigParam, _AgConfigViewBase
-
-if TYPE_CHECKING:
-    from .aglog import aglog
-    from .agterm import agterm
 
 
 # Exists only to register agtool's config fields (via __set_name__ at import
@@ -54,10 +50,8 @@ class agtool:
 
     Logging
     -------
-    Call ``attach_logger(term, log)`` after construction (done automatically by
-    ``agent.__init__``) to wire up terminal and file logging.  Every invocation
-    then calls ``self.log(arg, result, elapsed_ms)``, which can be overridden
-    per-tool by passing a custom *log_fn* to the constructor.
+    Every invocation calls ``self.log(arg, result, elapsed_ms)``, which can
+    be overridden per-tool by passing a custom *log_fn* to the constructor.
     """
 
     def __init__(
@@ -77,13 +71,11 @@ class agtool:
         self._log_fn = log_fn
         self.run_in_subprocess = run_in_subprocess
         self.persistent_vars = persistent_vars or {}
-        self._term: "agterm | None" = None
-        self._aglog: "aglog  | None" = None
 
     # ------------------------------------------------------------------
-    # Pickle support — exclude loggers; they hold locks/file handles that
-    # don't survive serialization (needed if a caller ever ships an agtool
-    # elsewhere, e.g. cloudpickle-ing `fn` into a container process).
+    # Pickle support — a custom log_fn may hold state that doesn't survive
+    # serialization (needed if a caller ever ships an agtool elsewhere,
+    # e.g. cloudpickle-ing `fn` into a container process).
     # ------------------------------------------------------------------
 
     def __getstate__(self) -> dict:
@@ -99,42 +91,16 @@ class agtool:
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self.run_in_subprocess = state.get("run_in_subprocess", True)
-        self._term = None
-        self._aglog = None
-
-    # ------------------------------------------------------------------
-    # Logger attachment
-    # ------------------------------------------------------------------
-
-    def attach_logger(self, term: "agterm", aglog: "aglog") -> None:
-        """Wire up terminal and structured file logging for this tool."""
-        self._term = term
-        self._aglog = aglog
 
     # ------------------------------------------------------------------
     # Logging — override by supplying log_fn to __init__
     # ------------------------------------------------------------------
 
-    def log_start(self, arg: agdata) -> None:
-        """Called immediately before invocation."""
-        if self._term is not None:
-            in_keys = list(arg._data.keys())
-            self._term.log("TOOL ▶   ", f"{self.name}  in={in_keys}")
-
     def log(self, arg: agdata, result: agdata, elapsed_ms: int) -> None:
-        """Called after every invocation.  Default: log input/output key names."""
+        """Called after every invocation. Only does something if a custom
+        log_fn was supplied to __init__."""
         if self._log_fn is not None:
             self._log_fn(self, arg, result, elapsed_ms)
-            return
-        if self._term is not None:
-            in_keys = list(arg._data.keys())
-            out_keys = list(result._data.keys())
-            self._term.log(
-                "TOOL ✓   ",
-                f"{self.name}  in={in_keys}  out={out_keys}  ({elapsed_ms}ms)",
-            )
-        if self._aglog is not None:
-            self._aglog._tool_call(self.name, arg.to_dict(), result.to_dict(), elapsed_ms)
 
     # ------------------------------------------------------------------
     # Invocation
@@ -149,7 +115,6 @@ class agtool:
         # but not enforced -- there is no separate process/thread to bound
         # without reintroducing the isolation this deliberately avoids;
         # the caller controls blocking behavior instead (e.g. ask_human).
-        self.log_start(arg)
         t0 = time.monotonic()
         try:
             wanted = self._wanted_context(context)

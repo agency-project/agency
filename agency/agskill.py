@@ -1,18 +1,19 @@
 from __future__ import annotations
+import functools
 import json
+import sys
 from concurrent.futures import Future
 from typing import TYPE_CHECKING
 from .agdata import agdata, agerror
 from .agpolicy import agpolicy
 from .agtype import agtype
-from . import agpause
 from .profiler import agprof
 from .agschema import agschema
 from .agcontext import agcontext
 from .agtool import agtool
 from .agconfig import DynamicConfigParam, _AgConfigViewBase
 from .agutil import format_exception
-from .aglog import _ts
+from .agDataCollector import _ts
 
 
 # Exists only to register agskill's config fields (via __set_name__ at import
@@ -55,12 +56,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-def _memory_mb_to_docker_str(memory_mb: "float | None") -> "str | None":
-    if memory_mb is None:
-        return None
-    return f"{int(memory_mb)}m"
-
-
 def _reserve_resource(arg: agdata, sandbox, resource_pool) -> agdata:
     cpus = arg._data.get("cpus")
     memory_mb = arg._data.get("memory_mb")
@@ -78,18 +73,13 @@ def _reserve_resource(arg: agdata, sandbox, resource_pool) -> agdata:
         return agerror(f"requested {gpu} gpus but pool only has {len(resource_pool.gpus)}")
 
     if cpus is not None or memory_mb is not None:
-        sandbox.update_limits(cpus=cpus, memory=_memory_mb_to_docker_str(memory_mb))
-        if cpus is not None:
-            sandbox._cpu_acquired += cpus
-        if memory_mb is not None:
-            sandbox._memory_acquired_mb += memory_mb
-        resource_pool.notify_cpu_acquired(cpus or 0.0, memory_mb or 0)
+        resource_pool.acquire_cpu_mem(sandbox, cpus=cpus, memory_mb=memory_mb)
         messages.append(f"cpus={cpus}, memory_mb={memory_mb}")
 
     if gpu:
         sandbox._gpu_count_requested = gpu
-        sandbox._gpu_acquire_fn = resource_pool.acquire_gpus
-        sandbox._gpu_release_fn = resource_pool.release_gpus
+        sandbox._gpu_acquire_fn = functools.partial(resource_pool.acquire_gpus, sandbox)
+        sandbox._gpu_release_fn = functools.partial(resource_pool.release_gpus, sandbox)
         result["gpu_count_requested"] = gpu
         messages.append(f"gpu reservation set to {gpu} (granted lazily on next exec)")
 
@@ -106,25 +96,14 @@ def _release_resource(arg: agdata, sandbox, resource_pool) -> agdata:
     messages = []
 
     if cpu or memory:
-        held_cpus = sandbox._cpu_acquired if cpu else 0.0
-        held_mb = sandbox._memory_acquired_mb if memory else 0
-        sandbox.update_limits(
-            cpus=resource_pool.idle_cpus if cpu else None,
-            memory=resource_pool.idle_memory if memory else None,
-        )
-        if cpu:
-            sandbox._cpu_acquired = 0.0
-        if memory:
-            sandbox._memory_acquired_mb = 0
-        resource_pool.notify_cpu_released(held_cpus, held_mb)
+        resource_pool.release_cpu_mem(sandbox, cpu=cpu, memory=memory)
         messages.append(f"cpu={cpu}, memory={memory} reset to idle")
 
     if gpu:
         if sandbox._gpu_count_requested > 0:
             if sandbox._gpu_ids:
-                resource_pool.release_gpus(sandbox._gpu_ids)
+                resource_pool.release_gpus(sandbox, sandbox._gpu_ids)
             messages.append(f"gpu reservation ({sandbox._gpu_count_requested}) released")
-            sandbox._gpu_ids = []
             sandbox._gpu_count_requested = 0
             sandbox._gpu_acquire_fn = None
             sandbox._gpu_release_fn = None
@@ -419,8 +398,6 @@ class agskill:
         prev_ctx = ag.ctx
         result_future: Future[agdata] = Future()
         ctx_future: Future[agcontext] = Future()
-        agpause.tag_producer(result_future, ag)
-        agpause.tag_producer(ctx_future, ag)
         ts_start = _ts()
 
         def _task() -> None:  # [REFACTOR] Why wrap in task?
@@ -429,11 +406,16 @@ class agskill:
             # Fallback for the final logging step below if an exception hits
             # before the defensive copy further down is made.
             local_skill_input = skill_input
-            agpause.set_current_worker_agent(ag)
 
             try:
                 # ── 1. Unblock: wait for any in-flight predecessor to finish,
                 #    then resolve any lazy input futures passed by the caller.
+                ag.data_collector.record_event(
+                    type="agent_state",
+                    payload={"state": "waiting_on_dependency"},
+                    do_update=True,
+                    flush=True,
+                )
                 with agprof.span("resolve"):
                     prev_ctx.resolve_prev_dependencies()
                     skill_input.resolve_input_dependencies()
@@ -453,13 +435,21 @@ class agskill:
 
                 history_before = list(prev_ctx.recent_transcript)
 
-                ag.terminal.log(
-                    "SKILL ▶  ", f"{self.name}  input={list(local_skill_input._data.keys())}"
+                ag.data_collector.record_event(
+                    type="agent_state",
+                    payload={"state": "running_skill", "skill": self.name},
+                    do_update=True,
+                    flush=True,
                 )
-                ag._set_ui_state("skill", skill=self.name)
-                # DATACOLLECTOR: append, correlate -- start half of the skill_start/skill_error
-                # pair; could be modeled as a span (start here, end/error below).
-                ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
+                ag.data_collector.record_event(
+                    type="skill_start",
+                    payload={"skill": self.name, "ts": ts_start},
+                    term_message=(
+                        f"[{ag.agname}] SKILL ▶  {self.name}  "
+                        f"input={list(local_skill_input._data.keys())}"
+                    ),
+                    flush=True,
+                )
 
                 # ── 2. Delegate actual execution to the Agent Engine.
                 outer_result = ag.engine.execute(
@@ -474,11 +464,13 @@ class agskill:
             except Exception as exc:
                 outer_result = agerror(format_exception(exc))
                 history_before = list(prev_ctx.recent_transcript)
-                ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
-            finally:
-                _had_error = outer_result is not None and bool(outer_result._data.get("error"))
-                ag._set_ui_state("error" if _had_error else "finished")
-                agpause.set_current_worker_agent(None)  # [REFACTOR] What does this do?
+
+            ag.data_collector.record_event(
+                type="agent_state",
+                payload={"state": "agent_idle"},
+                do_update=True,
+                flush=True,
+            )
 
             # ── 3. Log result.
             ts_end = _ts()
@@ -486,50 +478,54 @@ class agskill:
             input_dict = local_skill_input.to_dict()
             result_dict = outer_result.to_dict()
             if result_dict.get("error"):
-                _error_log_truncate = (
-                    _AgSkillFields(ag.agconfig).error_log_truncate
-                )  # [REFACTOR] What is this? Why do we get it through ag.agconfig?
-                ag.terminal.log(
-                    "SKILL ✗  ",
-                    f"{self.name}  error={str(result_dict['error'])[:_error_log_truncate]}",
-                )
-                # DATACOLLECTOR: append, correlate -- end half of the skill_start/skill_error
-                # pair; note the success path has no matching "skill_end" entry today.
-                ag._append_full_history(
-                    {"type": "skill_error", "skill": self.name, "error": str(result_dict["error"])}
+                _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate
+                ag.data_collector.record_event(
+                    type="skill_error",
+                    payload={"skill": self.name, "error": str(result_dict["error"])},
+                    term_message=(
+                        f"[{ag.agname}] SKILL ✗  {self.name}  "
+                        f"error={str(result_dict['error'])[:_error_log_truncate]}"
+                    ),
                 )
             else:
-                ag.terminal.log("SKILL ✓  ", f"{self.name}  output={list(result_dict.keys())}")
+                ag.data_collector.record_event(
+                    type="skill_success",
+                    payload={"skill": self.name, "output_fields": list(result_dict.keys())},
+                    term_message=(
+                        f"[{ag.agname}] SKILL ✓  {self.name}  output={list(result_dict.keys())}"
+                    ),
+                )
             try:
-                # DATACOLLECTOR: append -- one entry per skill completion; payload embeds the
-                # full history_before/history_delta message list (large -- decide truncation
-                # or collapse policy before this goes through the common channel).
-                ag.log._record(
-                    self.name,
-                    ts_start,
-                    ts_end,
-                    input_dict,
-                    result_dict,
-                    len(prev_ctx.recent_transcript),
-                    history_before=history_before,
-                    history_delta=prev_ctx.recent_transcript,
+                ag.data_collector.record_event(
+                    type="skill_call",
+                    payload={
+                        "skill": self.name,
+                        "ts_start": ts_start,
+                        "ts_end": ts_end,
+                        "input": input_dict,
+                        "output": result_dict,
+                        "history_len": len(prev_ctx.recent_transcript),
+                        "history_before": history_before,
+                        "history_delta": prev_ctx.recent_transcript,
+                    },
                 )
             except Exception as log_exc:
-                ag.terminal.log("SKILL ✗  ", f"[log error] {log_exc}")
+                print(
+                    f"[agskill] WARNING: record_event(skill_call) failed for {self.name}: {log_exc}",
+                    file=sys.stderr,
+                )
 
             # ── 6. Resolve result future — unblocks the caller immediately.
-            ag._snapshot_messages = list(prev_ctx.recent_transcript)
+            ag.data_collector.record_event(
+                type="live_messages",
+                payload={"messages": prev_ctx.recent_transcript},
+                do_update=True,
+                flush=True,
+            )
             result_future.set_result(outer_result)
 
             # ── 7. Resolve ctx future for the next chained call.
             ctx_future.set_result(prev_ctx)
-
-        # Set synchronously, before the thread even starts, so there is no
-        # window where a run is genuinely in flight but ui_state still reads
-        # "inactive".
-        ag._set_ui_state(
-            "skill", skill=self.name
-        )  # [REFACTOR] Why not at the start of the run() function?
 
         def _traced_task() -> None:  # [REFACTOR] Maybe inline
             run_id = f"run{agprof.next_index()}"

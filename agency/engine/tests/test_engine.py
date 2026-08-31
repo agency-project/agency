@@ -67,6 +67,14 @@ class _FakeSandbox:
         self.events.append("stop")
 
 
+class _FakeDataCollector:
+    def __init__(self):
+        self.events = []
+
+    def record_event(self, type, payload, call_label=None, do_update=False, **_kw):
+        self.events.append((type, payload, call_label, do_update))
+
+
 class _FakeAgent:
     output_dir = None
 
@@ -77,6 +85,7 @@ class _FakeAgent:
         self.agname = "test-agent"
         self.change_config_calls = []
         self.inbox = queue.Queue()
+        self.data_collector = _FakeDataCollector()
 
     def change_config(self, agconfig):
         self.change_config_calls.append(agconfig)
@@ -601,7 +610,7 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     seen = {}
     expected = agdata(result="done")
 
-    def fake_build_result(context, skill, got_attempt, sandbox):
+    def fake_build_result(context, skill, got_attempt, sandbox, initial_prompt):
         seen["context"], seen["skill"], seen["attempt"] = context, skill, got_attempt
         seen["sandbox"] = sandbox
         return expected
@@ -664,7 +673,6 @@ def _fake_host_server_manager_with_transcript(transcript, *, collected_output=No
 
 def test_build_execution_result_populates_recent_transcript_from_llm_handler_server():
     engine = AgentEngine(_FakeAgent())
-    engine._execution_prompt = PromptPayload("system", "do the work")
     transcript = [
         {"role": "user", "content": "do the work"},
         {"role": "assistant", "content": "done"},
@@ -678,6 +686,7 @@ def test_build_execution_result_populates_recent_transcript_from_llm_handler_ser
         skill,
         HarnessAttemptResult(ok=True, final_text="done", input_tokens=4, output_tokens=2),
         engine._agent.sandbox,
+        PromptPayload("system", "do the work"),
     )
 
     assert result == agdata(result="done")
@@ -700,6 +709,7 @@ def test_build_execution_result_uses_collected_structured_output():
         skill,
         HarnessAttemptResult(ok=True, final_text="ignored"),
         engine._agent.sandbox,
+        None,
     )
 
     assert result == agdata(summary="finished", count=2)
@@ -718,6 +728,7 @@ def test_build_execution_result_accepts_valid_structured_json_without_mcp_calls(
         skill,
         HarnessAttemptResult(ok=True, final_text='{"summary": "finished", "count": 2}'),
         engine._agent.sandbox,
+        None,
     )
 
     assert result == agdata(summary="finished", count=2)
@@ -738,6 +749,7 @@ def test_build_execution_result_reports_incomplete_structured_output():
         skill,
         HarnessAttemptResult(ok=True, final_text="done"),
         engine._agent.sandbox,
+        None,
     )
 
     assert isinstance(result, agerror)
@@ -754,8 +766,9 @@ def test_build_execution_result_converts_failed_or_missing_attempt_to_error():
         skill,
         HarnessAttemptResult(ok=False, error_message="daemon failed"),
         engine._agent.sandbox,
+        None,
     )
-    missing = engine._build_execution_result(agcontext(), skill, None, engine._agent.sandbox)
+    missing = engine._build_execution_result(agcontext(), skill, None, engine._agent.sandbox, None)
 
     assert isinstance(failed, agerror)
     assert failed.error == "daemon failed"

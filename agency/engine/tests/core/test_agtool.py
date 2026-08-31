@@ -1,7 +1,6 @@
 """Tests for the agtool class."""
 
 import os
-from unittest.mock import MagicMock
 from agency.agdata import agdata
 from agency.agtool import agtool
 
@@ -67,29 +66,21 @@ def test_default_params():
 
 
 # ---------------------------------------------------------------------------
-# Pickle / serialisation — loggers must be excluded
+# Pickle / serialisation
 # ---------------------------------------------------------------------------
 
 
-def test_getstate_excludes_loggers():
+def test_getstate_excludes_run_in_subprocess_extras():
     t = make_tool()
-    mock_term = MagicMock()
-    mock_log = MagicMock()
-    t.attach_logger(mock_term, mock_log)
-
     state = t.__getstate__()
-    assert "_term" not in state
-    assert "_aglog" not in state
     assert state["name"] == "echo"
     assert state["fn"] is _echo
 
 
-def test_setstate_restores_none_loggers():
+def test_setstate_restores_tool():
     t = make_tool()
     t2 = agtool.__new__(agtool)
     t2.__setstate__(t.__getstate__())
-    assert t2._term is None
-    assert t2._aglog is None
     assert t2.name == "echo"
 
 

@@ -48,7 +48,7 @@ from ._layer_squash import merge_layer_tars, overlay_diff_to_tar, sha256_file, b
 
 # _RUN_ID is never read within this module itself -- it's defined here and
 # imported by sandbox/__init__.py (which re-exports it for
-# agsandbox.py's container-naming and a battery of tests/test_agterm.py
+# agsandbox.py's container-naming and a battery of tests/test_sandbox_naming.py
 # cases). Declared here explicitly so static analysis recognizes it as an
 # intentional export rather than a dead global.
 __all__ = ["_RUN_ID"]

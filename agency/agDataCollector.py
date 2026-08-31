@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,10 +14,14 @@ if TYPE_CHECKING:
     from .agconfig import agConfig
 
 
+def _ts() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
 @dataclass
 class agDataCollectorConfigs:
     db_path: str
-    flush_batch_size: int = 500
+    flush_batch_size: int = 20
     flush_interval_s: float = 1.0
 
 
@@ -67,15 +73,24 @@ class agDataCollector:
         *,
         call_label: "str | None" = None,
         do_update: bool = False,
+        term_message: "str | None" = None,
+        flush: bool = False,
     ) -> None:
         timestamp = time.time()
         payload_json = json.dumps(payload)
+        if term_message is not None:
+            print(term_message, file=sys.stderr)
         with self._lock:
-            self._event_rows.append((type, timestamp, call_label, payload_json))
+            self._event_rows.append((type, timestamp, call_label, payload_json, term_message))
             if do_update:
-                self._latest_value_rows.append((type, timestamp, call_label, payload_json))
+                self._latest_value_rows.append(
+                    (type, timestamp, call_label, payload_json, term_message)
+                )
             self._pending_count += 1
-            self._maybe_flush_locked()
+            if flush:
+                self._flush_locked()
+            else:
+                self._maybe_flush_locked()
 
     def record_span(
         self,
@@ -89,7 +104,11 @@ class agDataCollector:
         blocked_ms: "float | None" = None,
         parent: "str | None" = None,
         call_label: "str | None" = None,
+        term_message: "str | None" = None,
+        flush: bool = False,
     ) -> None:
+        if term_message is not None:
+            print(term_message, file=sys.stderr)
         row = (
             name,
             start_ts,
@@ -100,11 +119,15 @@ class agDataCollector:
             parent,
             call_label,
             json.dumps(attributes),
+            term_message,
         )
         with self._lock:
             self._span_rows.append(row)
             self._pending_count += 1
-            self._maybe_flush_locked()
+            if flush:
+                self._flush_locked()
+            else:
+                self._maybe_flush_locked()
 
     def _ensure_schema(self) -> None:
         assert self._conn is not None
@@ -115,7 +138,8 @@ class agDataCollector:
                 type TEXT NOT NULL,
                 timestamp REAL NOT NULL,
                 call_label TEXT,
-                payload TEXT NOT NULL
+                payload TEXT NOT NULL,
+                term_message TEXT
             )
             """
         )
@@ -131,7 +155,8 @@ class agDataCollector:
                 blocked_ms REAL,
                 parent TEXT,
                 call_label TEXT,
-                attributes TEXT NOT NULL
+                attributes TEXT NOT NULL,
+                term_message TEXT
             )
             """
         )
@@ -141,7 +166,8 @@ class agDataCollector:
                 type TEXT PRIMARY KEY,
                 timestamp REAL NOT NULL,
                 call_label TEXT,
-                payload TEXT NOT NULL
+                payload TEXT NOT NULL,
+                term_message TEXT
             )
             """
         )
@@ -164,21 +190,25 @@ class agDataCollector:
         with self._conn:
             if self._event_rows:
                 self._conn.executemany(
-                    "INSERT INTO events (type, timestamp, call_label, payload) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO events (type, timestamp, call_label, payload, term_message) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     self._event_rows,
                 )
             if self._span_rows:
                 self._conn.executemany(
                     "INSERT INTO spans "
-                    "(name, start_ts, end_ts, cpu_ms, runqueue_ms, blocked_ms, parent, call_label, attributes) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(name, start_ts, end_ts, cpu_ms, runqueue_ms, blocked_ms, parent, call_label, "
+                    "attributes, term_message) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     self._span_rows,
                 )
             if self._latest_value_rows:
                 self._conn.executemany(
-                    "INSERT INTO latest_values (type, timestamp, call_label, payload) VALUES (?, ?, ?, ?) "
+                    "INSERT INTO latest_values (type, timestamp, call_label, payload, term_message) "
+                    "VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(type) DO UPDATE SET "
-                    "timestamp=excluded.timestamp, call_label=excluded.call_label, payload=excluded.payload",
+                    "timestamp=excluded.timestamp, call_label=excluded.call_label, "
+                    "payload=excluded.payload, term_message=excluded.term_message",
                     self._latest_value_rows,
                 )
         self._event_rows.clear()

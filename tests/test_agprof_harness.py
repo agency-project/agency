@@ -56,7 +56,6 @@ _BARE_THREAD_ALLOWLIST = {
     ("agency/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
     ("agency/agwebui/emitter.py", "agwebui_emitter.emit"): (1, "event pruning"),
     ("agency/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),
-    ("agency/tools/human.py", "ask_human_and_wait"): (1, "stdin reader"),
 }
 
 

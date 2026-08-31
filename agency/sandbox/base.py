@@ -831,17 +831,12 @@ class agsandbox_backend(AgSandboxBackendFields):
         self._gpu_count_requested = 0
         if self._gpu_ids:
             if pool is not None:
-                pool.release_gpus(self._gpu_ids)
+                pool.release_gpus(self, self._gpu_ids)
             elif self._gpu_release_fn is not None:
                 self._gpu_release_fn(self._gpu_ids)
-            self._gpu_ids = []
-        if pool is not None and (self._cpu_acquired or self._memory_acquired_mb):
-            pool.notify_cpu_released(self._cpu_acquired, self._memory_acquired_mb)
-            self._cpu_acquired = 0.0
-            self._memory_acquired_mb = 0
         if pool is not None:
             try:
-                self.update_limits(cpus=pool.idle_cpus, memory=pool.idle_memory)
+                pool.release_cpu_mem(self, cpu=True, memory=True)
             except Exception as _e:
                 # DATACOLLECTOR: append, agname=self._name -- best-effort failure, low priority.
                 print(f"[agsandbox_backend] WARNING: update_limits failed for {self._name}: {_e}")

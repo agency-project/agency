@@ -1678,6 +1678,7 @@ class TestCvdOverrideProtectionIntegration:
     """
 
     def _check(self, backend: str) -> None:
+        import functools
         import uuid
 
         from agency.agconfig import agConfig
@@ -1693,8 +1694,8 @@ class TestCvdOverrideProtectionIntegration:
             # Mirrors agskill._reserve_resource's own body: a virtual-only
             # reservation, no physical GPU claimed until exec().
             sb._gpu_count_requested = 1
-            sb._gpu_acquire_fn = pool.acquire_gpus
-            sb._gpu_release_fn = pool.release_gpus
+            sb._gpu_acquire_fn = functools.partial(pool.acquire_gpus, sb)
+            sb._gpu_release_fn = functools.partial(pool.release_gpus, sb)
 
             leased_out, rc = sb.exec("echo $CUDA_VISIBLE_DEVICES")
             assert rc == 0

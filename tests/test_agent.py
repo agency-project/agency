@@ -677,6 +677,14 @@ class _GCSandbox:
     def __del__(self):
         self.destroy()
 
+    # Every agency class object exposes change_config/set_config -- a dummy
+    # no-op here is enough for this GC-lifetime stand-in.
+    def set_config(self, agconfig):
+        pass
+
+    def change_config(self, agconfig):
+        pass
+
 
 def test_agent_internal_sandbox_destroyed_only_after_agent_is_gone():
     """A sandbox the agent owns outright must not be destroyed while the
@@ -773,8 +781,13 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     assert len(ag2.ctx.recent_transcript) > 0
     assert ag2 in agent.all()
 
-    events = ag2.log.events
-    assert any(e.get("event") == "loaded" for e in events)
+    import sqlite3
+
+    ag2.data_collector.flush()
+    con = sqlite3.connect(ag2.data_collector._configs.db_path)
+    types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
+    con.close()
+    assert "agent_loaded" in types
     del ag2
     _agname._allocated.discard(saved_agname)
 
@@ -1038,12 +1051,22 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# UI state transitions
+# Skill outcome events
 # ---------------------------------------------------------------------------
 
 
-def test_ui_state_error_when_skill_returns_error():
-    """_ui_state is set to 'error' when the skill returns agerror(...)."""
+def _recorded_event_types(ag) -> list:
+    import sqlite3
+
+    ag.data_collector.flush()
+    con = sqlite3.connect(ag.data_collector._configs.db_path)
+    types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
+    con.close()
+    return types
+
+
+def test_skill_error_recorded_when_skill_returns_error():
+    """skill_error is recorded when the skill returns agerror(...)."""
     skill = agskill(name="s", system_prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
@@ -1053,11 +1076,11 @@ def test_ui_state_error_when_skill_returns_error():
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.error  # resolve
-    assert ag._state.state == "error"
+    assert "skill_error" in _recorded_event_types(ag)
 
 
-def test_ui_state_finished_on_success():
-    """_ui_state is set to 'finished' when the skill returns without error."""
+def test_skill_success_recorded_on_success():
+    """skill_success is recorded when the skill returns without error."""
     skill = agskill(name="s", system_prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
@@ -1067,11 +1090,11 @@ def test_ui_state_finished_on_success():
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.answer  # resolve
-    assert ag._state.state == "finished"
+    assert "skill_success" in _recorded_event_types(ag)
 
 
-def test_ui_state_error_on_skill_exception():
-    """_ui_state is set to 'error' when the skill raises an unexpected exception."""
+def test_skill_error_recorded_on_skill_exception():
+    """skill_error is recorded when the skill raises an unexpected exception."""
     skill = agskill(name="s", system_prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
@@ -1081,7 +1104,7 @@ def test_ui_state_error_on_skill_exception():
     ag = make_agent()
     result = ag.run(skill, agdata())
     _ = result.error  # resolve (will contain the formatted exception)
-    assert ag._state.state == "error"
+    assert "skill_error" in _recorded_event_types(ag)
 
 
 # ---------------------------------------------------------------------------

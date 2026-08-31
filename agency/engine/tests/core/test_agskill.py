@@ -10,7 +10,7 @@ from agency.agschema import agschema
 from agency.agskill import agskill
 from agency.llm.agllm import _AgLLMFields
 from agency.agtool import agtool
-from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
+from agency.agent import agent as _agent_cls
 
 LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
 LLM_IDLE_TIMEOUT = _AgLLMFields.idle_timeout.default
@@ -52,13 +52,8 @@ def make_mock_agent(sandbox=None, ping_interval_s=300, poll_interval_s=5):
         # it truthy too (see agtool.py's `not sandbox.persistent and ...`).
         ag.sandbox._has_pending_background_work.return_value = False
         ag.sandbox.persistent = False
-    ag.terminal = MagicMock()
-    ag._state = _agent_state_cls("test")
-    ag.log = MagicMock()
+    ag.data_collector = MagicMock()
     ag.agname = "test"
-    ag._set_ui_state = MagicMock()
-    ag._push_live_messages = MagicMock()
-    ag._append_full_history = MagicMock()
     ag._next_inbox_msg = MagicMock(return_value=None)
     return ag
 
@@ -449,7 +444,7 @@ def _make_real_sandbox(watched_pids=None):
 
 def test_wait_for_processes_clean_sandbox_returns_none():
     sb = _make_real_sandbox()
-    assert agSandbox.wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
+    assert agSandbox.wait_for_processes(sb, "skill", "", 300, 5) is None
 
 
 def test_wait_for_processes_no_watched_pids_attr_returns_none():
@@ -457,7 +452,7 @@ def test_wait_for_processes_no_watched_pids_attr_returns_none():
         def _has_pending_background_work(self):
             return False
 
-    assert agSandbox.wait_for_processes(NoPids(), "skill", None, None, "", 300, 5) is None
+    assert agSandbox.wait_for_processes(NoPids(), "skill", "", 300, 5) is None
 
 
 def test_wait_for_processes_mock_sandbox_returns_none():
@@ -465,7 +460,7 @@ def test_wait_for_processes_mock_sandbox_returns_none():
 
     sb = MagicMock()
     sb._has_pending_background_work.return_value = False
-    assert agSandbox.wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
+    assert agSandbox.wait_for_processes(sb, "skill", "", 300, 5) is None
 
 
 def test_wait_for_processes_completes_quickly_returns_completed_msg():
@@ -490,9 +485,7 @@ def test_wait_for_processes_completes_quickly_returns_completed_msg():
             return "PID 1234"
 
     sb = _FakeSandbox()
-    result = agSandbox.wait_for_processes(
-        sb, "skill", None, None, "", ping_interval_s=30, poll_interval_s=0.01
-    )
+    result = agSandbox.wait_for_processes(sb, "skill", "", ping_interval_s=30, poll_interval_s=0.01)
     assert result is not None
     assert "completed" in result.lower() or "Background processes have completed" in result
 
@@ -513,7 +506,7 @@ def test_wait_for_processes_still_running_returns_update_msg():
 
     sb = _FakeSandbox()
     result = agSandbox.wait_for_processes(
-        sb, "skill", None, None, "", ping_interval_s=0.02, poll_interval_s=0.01
+        sb, "skill", "", ping_interval_s=0.02, poll_interval_s=0.01
     )
     assert result is not None
     assert "still running" in result.lower() or "Background processes are still running" in result
@@ -543,8 +536,6 @@ def test_wait_for_processes_calls_state_fn():
     agSandbox.wait_for_processes(
         _FakeSandbox(),
         "myskill",
-        None,
-        None,
         "",
         30,
         0.01,

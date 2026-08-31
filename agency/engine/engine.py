@@ -25,7 +25,6 @@ class AgentEngine:
         self._agent = agent
         self._host_server_manager: "HostServerManager | None" = None
         self._sandbox_interaction_client: "SandboxInteractionClient | None" = None
-        self._execution_prompt: "PromptPayload | None" = None
 
     def set_config(self, agconfig: "agConfig") -> None:
         if self._host_server_manager is not None:
@@ -97,6 +96,13 @@ class AgentEngine:
     ) -> "agdata":
         """Run host services and the sandbox-side harness while locked."""
 
+        self._agent.data_collector.record_event(
+            type="agent_state",
+            payload={"state": "running_harness"},
+            do_update=True,
+            flush=True,
+        )
+
         # Start connections
         self._host_server_manager = HostServerManager(self._agent, sandbox, skill, resource_pool)
         try:
@@ -118,7 +124,9 @@ class AgentEngine:
 
             # build the prompt
             prompt = self._build_prompt_payload(skill, skill_input)
-            self._execution_prompt = prompt
+            # Captured before the loop may reassign `prompt` to a retry prompt --
+            # the needle must stay the original user turn, not a retry prompt.
+            initial_prompt = prompt
             retries_left = skill.max_output_schema_retries
             attempt: "HarnessAttemptResult | None" = None
             prior_session = context.harness_sessions.get(self._agent.harness)
@@ -151,7 +159,7 @@ class AgentEngine:
                 prompt = self._build_retry_prompt(
                     missing, system_instruction=prompt.system_instruction
                 )
-            return self._build_execution_result(context, skill, attempt, sandbox)
+            return self._build_execution_result(context, skill, attempt, sandbox, initial_prompt)
         finally:
             if self._sandbox_interaction_client is not None:
                 self._sandbox_interaction_client.close()
@@ -238,10 +246,11 @@ class AgentEngine:
         skill: "agskill",
         attempt: "HarnessAttemptResult | None",
         sandbox: agSandbox,
+        initial_prompt: "PromptPayload | None",
     ) -> "agdata":
         from ..agdata import agdata, agerror
 
-        needle = self._execution_prompt.user_content if self._execution_prompt is not None else None
+        needle = initial_prompt.user_content if initial_prompt is not None else None
         context.recent_transcript = (
             self._host_server_manager.llm_handler_server.get_main_transcript(needle)
         )

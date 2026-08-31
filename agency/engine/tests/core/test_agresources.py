@@ -19,6 +19,15 @@ from agency.agresources import (
 )
 
 
+def _sandbox(name="test-sandbox"):
+    sb = MagicMock()
+    sb._name = name
+    sb._gpu_ids = []
+    sb._cpu_acquired = 0.0
+    sb._memory_acquired_mb = 0
+    return sb
+
+
 # ---------------------------------------------------------------------------
 # _cvd_filter
 # ---------------------------------------------------------------------------
@@ -379,54 +388,60 @@ def test_pool_repr():
 
 def test_single_gpu_acquire_release():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    gpu_ids = pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    gpu_ids = pool.acquire_gpus(sandbox, 1)
     assert gpu_ids == [0]
     assert pool._gpus_acquired == 1
-    pool.release_gpus(gpu_ids)
+    assert sandbox._gpu_ids == [0]
+    pool.release_gpus(sandbox, gpu_ids)
     assert pool._gpus_acquired == 0
+    assert sandbox._gpu_ids == []
 
 
 def test_acquire_returns_any_free_gpus():
     pool = agResourcePool(gpus=[0, 1], total_cpus=4, total_memory_mb=8192)
-    g1 = pool.acquire_gpus(1)
-    g2 = pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    g1 = pool.acquire_gpus(sandbox, 1)
+    g2 = pool.acquire_gpus(sandbox, 1)
     assert set(g1) | set(g2) == {0, 1}
-    pool.release_gpus(g1)
-    pool.release_gpus(g2)
+    pool.release_gpus(sandbox, g1)
+    pool.release_gpus(sandbox, g2)
 
 
 def test_acquire_multiple_at_once():
     pool = agResourcePool(gpus=[0, 1, 2], total_cpus=4, total_memory_mb=8192)
-    ids = pool.acquire_gpus(2)
+    sandbox = _sandbox()
+    ids = pool.acquire_gpus(sandbox, 2)
     assert len(ids) == 2
     assert set(ids) <= {0, 1, 2}
     assert pool._gpus_acquired == 2
-    pool.release_gpus(ids)
+    pool.release_gpus(sandbox, ids)
     assert pool._gpus_acquired == 0
 
 
 def test_acquire_more_than_pool_size_raises_value_error():
     pool = agResourcePool(gpus=[0, 1], total_cpus=4, total_memory_mb=8192)
     with pytest.raises(ValueError):
-        pool.acquire_gpus(3)
+        pool.acquire_gpus(_sandbox(), 3)
     assert pool._gpu_queue == []
     assert pool._gpus_acquired == 0
 
 
 def test_acquire_zero_returns_empty_list_immediately():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    assert pool.acquire_gpus(0) == []
+    assert pool.acquire_gpus(_sandbox(), 0) == []
     assert pool._gpus_acquired == 0
 
 
 def test_acquire_blocks_until_release():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
 
     acquired_after = threading.Event()
 
     def waiter():
-        pool.acquire_gpus(1, timeout=5.0)
+        pool.acquire_gpus(_sandbox(), 1, timeout=5.0)
         acquired_after.set()
 
     t = threading.Thread(target=waiter, daemon=True)
@@ -434,7 +449,7 @@ def test_acquire_blocks_until_release():
 
     time.sleep(0.05)
     assert not acquired_after.is_set()
-    pool.release_gpus([0])
+    pool.release_gpus(sandbox, [0])
     acquired_after.wait(timeout=5.0)
     assert acquired_after.is_set()
     t.join(timeout=5.0)
@@ -442,19 +457,21 @@ def test_acquire_blocks_until_release():
 
 def test_acquire_timeout_raises():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
     with pytest.raises(TimeoutError):
-        pool.acquire_gpus(1, timeout=0.1)
-    pool.release_gpus([0])
+        pool.acquire_gpus(_sandbox(), 1, timeout=0.1)
+    pool.release_gpus(sandbox, [0])
 
 
 def test_acquire_timeout_removes_request_from_queue():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
     with pytest.raises(TimeoutError):
-        pool.acquire_gpus(1, timeout=0.1)
+        pool.acquire_gpus(_sandbox(), 1, timeout=0.1)
     assert pool._gpu_queue == []
-    pool.release_gpus([0])
+    pool.release_gpus(sandbox, [0])
 
 
 def test_acquire_does_not_poll_via_sleep(monkeypatch):
@@ -466,7 +483,8 @@ def test_acquire_does_not_poll_via_sleep(monkeypatch):
     patches it everywhere in this process, including a time.sleep() call
     made directly from this test."""
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
 
     slept = []
     monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
@@ -475,12 +493,12 @@ def test_acquire_does_not_poll_via_sleep(monkeypatch):
 
     def waiter():
         started.set()
-        pool.acquire_gpus(1, timeout=2.0)
+        pool.acquire_gpus(_sandbox(), 1, timeout=2.0)
 
     t = threading.Thread(target=waiter, daemon=True)
     t.start()
     started.wait(timeout=5.0)
-    pool.release_gpus([0])
+    pool.release_gpus(sandbox, [0])
     t.join(timeout=5.0)
     assert not t.is_alive()
     assert slept == []
@@ -492,19 +510,20 @@ def test_release_wakes_a_waiter_promptly():
     the wakeup should land in well under what a 0.25s poll interval would
     have cost."""
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
 
     woke_at = []
 
     def waiter():
-        pool.acquire_gpus(1, timeout=5.0)
+        pool.acquire_gpus(_sandbox(), 1, timeout=5.0)
         woke_at.append(time.monotonic())
 
     t = threading.Thread(target=waiter, daemon=True)
     t.start()
     time.sleep(0.05)  # ensure the waiter is parked in wait() before releasing
     released_at = time.monotonic()
-    pool.release_gpus([0])
+    pool.release_gpus(sandbox, [0])
     t.join(timeout=5.0)
     assert woke_at, "waiter never acquired the released GPU"
     assert woke_at[0] - released_at < 0.05
@@ -516,15 +535,16 @@ def test_multiple_waiters_each_get_woken_exactly_once():
     dispatched waiter per released id proceed, never zero (a waiter stuck
     forever) or more than one racing for the same freed id."""
     pool = agResourcePool(gpus=[0, 1], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
-    pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
+    pool.acquire_gpus(sandbox, 1)
 
     results = []
     lock = threading.Lock()
 
     def waiter():
         try:
-            gpu_ids = pool.acquire_gpus(1, timeout=5.0)
+            gpu_ids = pool.acquire_gpus(_sandbox(), 1, timeout=5.0)
             with lock:
                 results.append(gpu_ids[0])
         except TimeoutError:
@@ -534,8 +554,8 @@ def test_multiple_waiters_each_get_woken_exactly_once():
     for t in threads:
         t.start()
     time.sleep(0.05)
-    pool.release_gpus([0])
-    pool.release_gpus([1])
+    pool.release_gpus(sandbox, [0])
+    pool.release_gpus(sandbox, [1])
     for t in threads:
         t.join(timeout=5.0)
 
@@ -547,14 +567,15 @@ def test_smallest_pending_request_served_first():
     soon as 1 GPU is free, without waiting for enough to satisfy the 3 --
     _dispatch_gpu_queue_locked() walks the queue smallest-count-first."""
     pool = agResourcePool(gpus=[0, 1, 2, 3], total_cpus=4, total_memory_mb=8192)
-    held = pool.acquire_gpus(4)
+    sandbox = _sandbox()
+    held = pool.acquire_gpus(sandbox, 4)
 
     order = []
     results = {}
     lock = threading.Lock()
 
     def request(name, count):
-        ids = pool.acquire_gpus(count, timeout=5.0)
+        ids = pool.acquire_gpus(_sandbox(), count, timeout=5.0)
         with lock:
             order.append(name)
             results[name] = ids
@@ -566,12 +587,12 @@ def test_smallest_pending_request_served_first():
     t_small.start()
     time.sleep(0.05)
 
-    pool.release_gpus([held[0]])
+    pool.release_gpus(sandbox, [held[0]])
     t_small.join(timeout=5.0)
     assert order == ["small1"]
     assert t_big.is_alive(), "big3 should still be blocked -- only 1 free, needs 3"
 
-    pool.release_gpus(held[1:])
+    pool.release_gpus(sandbox, held[1:])
     t_big.join(timeout=5.0)
     assert order == ["small1", "big3"]
     assert len(results["big3"]) == 3
@@ -579,14 +600,15 @@ def test_smallest_pending_request_served_first():
 
 def test_release_unknown_gpu_is_safe():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.release_gpus([99])  # must not raise
+    pool.release_gpus(_sandbox(), [99])  # must not raise
 
 
 def test_release_double_release_warns(capsys):
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
-    pool.release_gpus([0])
-    pool.release_gpus([0])  # double-release — warns, does not raise
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
+    pool.release_gpus(sandbox, [0])
+    pool.release_gpus(sandbox, [0])  # double-release — warns, does not raise
     captured = capsys.readouterr()
     assert "WARNING" in captured.out
 
@@ -599,49 +621,75 @@ def test_release_gpus_is_immediate_no_polling(monkeypatch):
     exited -- see agresources.release_gpus()'s docstring. Release must be
     immediate, with no sleep/poll loop of its own."""
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
 
     slept = []
     monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
 
-    pool.release_gpus([0])
+    pool.release_gpus(sandbox, [0])
     assert slept == []
     assert pool._gpus_acquired == 0
 
 
 def test_release_empty_list_is_a_noop():
     pool = agResourcePool(gpus=[0], total_cpus=4, total_memory_mb=8192)
-    pool.acquire_gpus(1)
-    pool.release_gpus([])
+    sandbox = _sandbox()
+    pool.acquire_gpus(sandbox, 1)
+    pool.release_gpus(sandbox, [])
     assert pool._gpus_acquired == 1
-    pool.release_gpus([0])
+    pool.release_gpus(sandbox, [0])
 
 
 # ---------------------------------------------------------------------------
-# CPU / memory notify
+# CPU / memory acquire / release
 # ---------------------------------------------------------------------------
 
 
-def test_notify_cpu_acquired_adds():
+def test_acquire_cpu_mem_adds():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=16384)
-    pool.notify_cpu_acquired(cpus=2.0, memory_mb=1024)
+    sandbox = _sandbox()
+    pool.acquire_cpu_mem(sandbox, cpus=2.0, memory_mb=1024)
     assert pool.cpus_acquired == 2.0
     assert pool.memory_acquired_mb == 1024
+    assert sandbox._cpu_acquired == 2.0
+    assert sandbox._memory_acquired_mb == 1024
 
 
-def test_notify_cpu_released_subtracts():
+def test_release_cpu_mem_resets_to_zero():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=16384)
-    pool.notify_cpu_acquired(cpus=4.0, memory_mb=2048)
-    pool.notify_cpu_released(cpus=2.0, memory_mb=1024)
-    assert pool.cpus_acquired == 2.0
-    assert pool.memory_acquired_mb == 1024
-
-
-def test_notify_cpu_released_floors_at_zero():
-    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=16384)
-    pool.notify_cpu_released(cpus=99.0, memory_mb=999999)
+    sandbox = _sandbox()
+    pool.acquire_cpu_mem(sandbox, cpus=4.0, memory_mb=2048)
+    pool.release_cpu_mem(sandbox, cpu=True, memory=True)
     assert pool.cpus_acquired == 0.0
     assert pool.memory_acquired_mb == 0
+    assert sandbox._cpu_acquired == 0.0
+    assert sandbox._memory_acquired_mb == 0
+
+
+def test_release_cpu_mem_floors_pool_total_at_zero():
+    """Releasing more than the pool's own running total (e.g. two sandboxes
+    releasing after the pool total was already reset elsewhere) must not
+    drive the aggregate negative."""
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=16384)
+    sandbox = _sandbox()
+    sandbox._cpu_acquired = 99.0
+    sandbox._memory_acquired_mb = 999999
+    pool.release_cpu_mem(sandbox, cpu=True, memory=True)
+    assert pool.cpus_acquired == 0.0
+    assert pool.memory_acquired_mb == 0
+
+
+def test_acquire_cpu_mem_floors_below_minimum():
+    """A request below min_cpus/min_memory_mb is raised to the floor before
+    being applied to the sandbox -- a running container can't be throttled
+    to (near) 0 cpu/memory without risking it stalling."""
+    pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=16384)
+    sandbox = _sandbox()
+    pool.acquire_cpu_mem(sandbox, cpus=0.1, memory_mb=10)
+    sandbox.update_limits.assert_called_once_with(cpus=pool.min_cpus, memory="1024m")
+    assert sandbox._cpu_acquired == pool.min_cpus
+    assert sandbox._memory_acquired_mb == pool.min_memory_mb
 
 
 def test_notify_thread_safe():
@@ -649,10 +697,11 @@ def test_notify_thread_safe():
     errors = []
 
     def worker():
+        sandbox = _sandbox()
         try:
             for _ in range(50):
-                pool.notify_cpu_acquired(1.0, 100)
-                pool.notify_cpu_released(1.0, 100)
+                pool.acquire_cpu_mem(sandbox, 1.0, 100)
+                pool.release_cpu_mem(sandbox, cpu=True, memory=True)
         except Exception as e:
             errors.append(e)
 

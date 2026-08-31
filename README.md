@@ -138,7 +138,6 @@ Pass `api_key="bedrock-api-key-..."` to `agBedrockBackendConfig(...)` to use a s
 | [`parallel_exec.py`](examples/parallel_exec.py) | The two natural parallelism patterns: sequential chaining on one agent, and fork fan-out across multiple agents/containers. |
 | [`custom_tools.py`](examples/custom_tools.py) | A multi-step, multi-agent research pipeline combining a custom host-side tool, parallel summarisation forks, and a shared output directory. |
 | [`image_processing.py`](examples/image_processing.py) | `agimage`, the multimodal image input field type, across single-image, multi-image, and URL-image forms. |
-| [`human_in_the_loop.py`](examples/human_in_the_loop.py) | Driving approval loops from Python so `ask_human` is guaranteed to be called, with re-plan/re-write cycles on rejection. |
 | [`sandbox_handoff.py`](examples/sandbox_handoff.py) | Reading and driving an agent's `agSandbox` directly from the host, and handing one sandbox off between two agents. |
 | [`dynamic_config_example.py`](examples/dynamic_config_example.py) | Composing an `agConfig` from two owners' fields, then updating a `DynamicConfigParam` field on the same config between two skill calls. |
 

@@ -4,8 +4,7 @@ from .agtype import agtype, agfile, agbinary, agimage, agrawstring, agpath
 from .agschema import agschema
 from .agskill import agskill
 from .agtool import agtool
-from .aglog import aglog
-from .agterm import agterm
+from .agDataCollector import agDataCollector, agDataCollectorConfigs
 from .agent import agent
 from .agmap import agmap, agtask
 from .agteam import agteam
@@ -29,8 +28,8 @@ __all__ = [
     "AgError",
     "agskill",
     "agtool",
-    "aglog",
-    "agterm",
+    "agDataCollector",
+    "agDataCollectorConfigs",
     "agent",
     "agmap",
     "agtask",

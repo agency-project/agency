@@ -6,6 +6,7 @@ and skipped automatically when Docker/Podman is unavailable.
 
 from __future__ import annotations
 
+import functools
 import os
 import subprocess
 import sys
@@ -363,51 +364,63 @@ class TestPoolAutoDetect:
 # ---------------------------------------------------------------------------
 
 
+def _resource_sandbox(name="test-sandbox"):
+    sb = MagicMock()
+    sb._name = name
+    sb._gpu_ids = []
+    sb._cpu_acquired = 0.0
+    sb._memory_acquired_mb = 0
+    return sb
+
+
 class TestAgResourcePool:
     def test_single_gpu_acquire_release(self):
         pool = agResourcePool(gpus=[0])
-        gids = pool.acquire_gpus(1)
+        sandbox = _resource_sandbox()
+        gids = pool.acquire_gpus(sandbox, 1)
         assert gids == [0]
-        pool.release_gpus(gids)
+        pool.release_gpus(sandbox, gids)
 
     def test_two_gpus_both_acquired(self):
         pool = agResourcePool(gpus=[0, 1])
-        g1 = pool.acquire_gpus(1)
-        g2 = pool.acquire_gpus(1)
+        sandbox = _resource_sandbox()
+        g1 = pool.acquire_gpus(sandbox, 1)
+        g2 = pool.acquire_gpus(sandbox, 1)
         assert set(g1) | set(g2) == {0, 1}
-        pool.release_gpus(g1)
-        pool.release_gpus(g2)
+        pool.release_gpus(sandbox, g1)
+        pool.release_gpus(sandbox, g2)
 
     def test_acquire_blocks_until_released(self):
         pool = agResourcePool(gpus=[0])
-        pool.acquire_gpus(1)  # hold the only GPU
+        sandbox = _resource_sandbox()
+        pool.acquire_gpus(sandbox, 1)  # hold the only GPU
 
         acquired: list[int] = []
 
         def _waiter():
-            acquired.extend(pool.acquire_gpus(1))
+            acquired.extend(pool.acquire_gpus(_resource_sandbox(), 1))
 
         t = threading.Thread(target=_waiter)
         t.start()
         time.sleep(0.1)
         assert acquired == []  # still blocked
-        pool.release_gpus([0])
+        pool.release_gpus(sandbox, [0])
         t.join(timeout=2)
         assert acquired == [0]
 
     def test_acquire_timeout_raises(self):
         pool = agResourcePool(gpus=[0])
-        pool.acquire_gpus(1)  # exhaust pool
+        pool.acquire_gpus(_resource_sandbox(), 1)  # exhaust pool
         with pytest.raises(TimeoutError):
-            pool.acquire_gpus(1, timeout=0.2)
+            pool.acquire_gpus(_resource_sandbox(), 1, timeout=0.2)
 
     def test_release_unowned_gpu_is_safe(self):
         pool = agResourcePool(gpus=[0])
-        pool.release_gpus([0])  # never acquired — should not raise
+        pool.release_gpus(_resource_sandbox(), [0])  # never acquired — should not raise
 
     def test_release_unknown_gpu_is_safe(self):
         pool = agResourcePool(gpus=[0])
-        pool.release_gpus([99])  # not in pool — should not raise
+        pool.release_gpus(_resource_sandbox(), [99])  # not in pool — should not raise
 
     def test_repr(self):
         pool = agResourcePool(gpus=[0, 1], idle_cpus=1.0, idle_memory="1g")
@@ -2078,10 +2091,8 @@ class TestAgSandboxResourceLimits:
 
     def test_release_resources_clears_gpu(self):
         pool = agResourcePool(gpus=[0])
-        gpu_ids = pool.acquire_gpus(1)
-        self.sb._gpu_ids = gpu_ids
+        pool.acquire_gpus(self.sb, 1)
         self.sb._gpu_count_requested = 1
-        self.sb._gpu_release_fn = pool.release_gpus
         self.sb.release_resources(pool)
         assert self.sb._gpu_ids == []
         assert self.sb._gpu_count_requested == 0
@@ -2120,8 +2131,8 @@ class TestResourceTools:
         """Mirrors agskill._reserve_resource's own body: a virtual-only
         reservation, no physical GPU claimed yet."""
         self.sb._gpu_count_requested = count
-        self.sb._gpu_acquire_fn = self.pool.acquire_gpus
-        self.sb._gpu_release_fn = self.pool.release_gpus
+        self.sb._gpu_acquire_fn = functools.partial(self.pool.acquire_gpus, self.sb)
+        self.sb._gpu_release_fn = functools.partial(self.pool.release_gpus, self.sb)
 
     # ── physical GPU acquisition on bash exec ──────────────────────────────
 
@@ -2231,12 +2242,13 @@ class TestResourceTools:
     def test_exec_blocks_until_pool_gpu_is_freed(self):
         """exec() waits indefinitely for a physical GPU and unblocks once one is released."""
         pool1 = agResourcePool(gpus=[0])
-        pool1.acquire_gpus(1)  # exhaust the only GPU
+        holder = _resource_sandbox()
+        pool1.acquire_gpus(holder, 1)  # exhaust the only GPU
 
         sb2 = _make_sandbox()
         sb2._gpu_count_requested = 1
-        sb2._gpu_acquire_fn = pool1.acquire_gpus
-        sb2._gpu_release_fn = pool1.release_gpus
+        sb2._gpu_acquire_fn = functools.partial(pool1.acquire_gpus, sb2)
+        sb2._gpu_release_fn = functools.partial(pool1.release_gpus, sb2)
 
         exec_started = threading.Event()
         exec_done = threading.Event()
@@ -2251,7 +2263,7 @@ class TestResourceTools:
         exec_started.wait()
         time.sleep(0.2)
         assert not exec_done.is_set()  # still waiting
-        pool1.release_gpus([0])  # free the GPU
+        pool1.release_gpus(holder, [0])  # free the GPU
         exec_done.wait(timeout=60)  # container startup (docker run) can take >5 s
         assert exec_done.is_set()
         sb2.destroy()
@@ -2279,19 +2291,8 @@ class TestResourceTools:
     # ── reserve_cpu / cpu_release ─────────────────────────────────────────
 
     def test_reserve_cpu_applies_limits(self):
-        self.sb.update_limits(cpus=2.0, memory="256m")
-        self.sb._cpu_acquired += 2.0
-        self.sb._memory_acquired_mb += 256
-        self.pool.notify_cpu_acquired(2.0, 256)
+        self.pool.acquire_cpu_mem(self.sb, 2.0, 256)
 
     def test_cpu_release_resets_to_idle(self):
-        self.sb.update_limits(cpus=4.0, memory="2g")
-        self.sb._cpu_acquired = 4.0
-        self.sb._memory_acquired_mb = 2048
-        self.pool.notify_cpu_acquired(4.0, 2048)
-
-        self.sb.update_limits(cpus=self.pool.idle_cpus, memory=self.pool.idle_memory)
-        held_cpus, held_mb = self.sb._cpu_acquired, self.sb._memory_acquired_mb
-        self.sb._cpu_acquired = 0.0
-        self.sb._memory_acquired_mb = 0
-        self.pool.notify_cpu_released(held_cpus, held_mb)
+        self.pool.acquire_cpu_mem(self.sb, 4.0, 2048)
+        self.pool.release_cpu_mem(self.sb, cpu=True, memory=True)

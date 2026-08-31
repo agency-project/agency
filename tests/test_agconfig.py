@@ -40,7 +40,6 @@ from agency.agtool import _AgToolFields, agToolConfig
 from agency.agresources import _AgResourcePoolFields, agResourcePoolConfig
 from agency.agschema import _AgSchemaFields, agSchemaConfig
 from agency.agutil import _AgUtilFields, agUtilConfig
-from agency.aglog import agLogConfig
 from agency.agent import agAgentConfig
 from agency.agskill import agSkillConfig
 
@@ -966,7 +965,6 @@ class TestProviderBackendConfigClasses:
 # ---------------------------------------------------------------------------
 
 _DYNAMIC_OWNER_CASES = [
-    (agLogConfig, "aglog", "dump_content_truncate_len", 999),
     (agAgentConfig, "agent", "checkpoint_save_timeout_s", 111),
     (agSkillConfig, "agskill", "react_max_steps", 7),
     (agLLMConfig, "agllm", "max_retries", 1),

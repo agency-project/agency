@@ -157,6 +157,18 @@ class agConfig:
         without touching what other in-flight objects already consumed."""
         return agConfig(self.data)
 
+    def set_config(self, agconfig: "agConfig") -> None:
+        """Merge agconfig's data into this instance in place -- same
+        later-wins semantics as __init__'s merge."""
+        for owner, fields in agconfig.data.items():
+            self.data.setdefault(owner, {}).update(fields)
+
+    def change_config(self, agconfig: "agConfig") -> None:
+        """Replace this instance's data with a fresh clone of agconfig's,
+        dropping any static-field lock history -- same as clone()."""
+        self.data = agConfig(agconfig).data
+        self._locked_keys = set()
+
     def __getattr__(self, name: str) -> "_OwnerView":
         owners = {owner for owner, _n in agConfig.FIELD_REGISTRY}
         if name in owners:

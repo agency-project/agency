@@ -8,9 +8,13 @@ import re
 import subprocess
 import threading
 import time
+from typing import TYPE_CHECKING
 
 from .profiler import agprof
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
+
+if TYPE_CHECKING:
+    from .agDataCollector import agDataCollector
 
 
 # Exists to register agResourcePool's config fields (via __set_name__ at
@@ -46,6 +50,14 @@ class _AgResourcePoolFields:
     # indefinitely, so there's no multi-tenant idle container to bound.
     idle_cpus = DynamicConfigParam("agResourcePool", default=8.0)
     idle_memory = DynamicConfigParam("agResourcePool", default=None)
+
+    # Floors applied to any cpu/memory limit before it's ever applied to a
+    # running sandbox (acquire_cpu_mem/release_cpu_mem) -- a running
+    # container throttled to 0 cpu shares or 0 memory can't make forward
+    # progress, so neither an LLM-requested value nor a misconfigured
+    # idle_cpus/idle_memory is ever allowed below this.
+    min_cpus = GlobalConfigParam("agResourcePool", default=1.0)
+    min_memory_mb = GlobalConfigParam("agResourcePool", default=1024)
 
     def __init__(self, agconfig=None) -> None:
         self._agconfig = agconfig
@@ -343,6 +355,18 @@ def detect_memory_mb() -> int:
     return _AgResourcePoolFields().memory_detect_fallback_mb
 
 
+def _memory_mb_to_docker_str(memory_mb: "float | None") -> "str | None":
+    if memory_mb is None:
+        return None
+    return f"{int(memory_mb)}m"
+
+
+def _floor(value: "float | None", minimum: float) -> "float | None":
+    """None (no cap) passes through unchanged; a real value is never let
+    below *minimum*."""
+    return None if value is None else max(value, minimum)
+
+
 class _GpuRequest:
     __slots__ = ("count", "granted_ids")
 
@@ -421,6 +445,14 @@ class agResourcePool(_AgResourcePoolFields):
         self._cpu_mem_cond = threading.Condition()
         self.cpus_acquired: float = 0.0
         self.memory_acquired_mb: int = 0
+        # Lazy: agResourcePool is constructed as a class-level singleton at
+        # `agent` class-body-evaluation time (agent.py's own module import),
+        # so eagerly importing `.agent` here for its log dir would be a
+        # circular import. Deferring construction to first actual use (see
+        # _ensure_data_collector()) means that import only ever happens well
+        # after `agency.agent` has finished loading.
+        self._data_collector: "agDataCollector | None" = None
+        self._data_collector_lock = threading.Lock()
         if mark_gpus and self.gpus:
             import multiprocessing
 
@@ -435,8 +467,9 @@ class agResourcePool(_AgResourcePoolFields):
         """Return a clone of this pool's agconfig."""
         return self._agconfig.clone()
 
-    def acquire_gpus(self, count: int, timeout: "float | None" = None) -> "list[int]":
-        """Block until *count* GPUs are free; return their ids.
+    def acquire_gpus(self, sandbox, count: int, timeout: "float | None" = None) -> "list[int]":
+        """Block until *count* GPUs are free; grant them to *sandbox* (setting
+        its `_gpu_ids`) and return their ids.
 
         Queued (not just waited-on) so multiple concurrent requests for
         different counts get served smallest-count-first rather than
@@ -474,7 +507,10 @@ class agResourcePool(_AgResourcePoolFields):
                     )
         for gpu_id in request.granted_ids:
             agprof.gpu_lease_begin(gpu_id)
-        self._emit_resource()
+        sandbox._gpu_ids = request.granted_ids
+        self._update_resource_log(
+            who=sandbox._name, action="acquire_gpu", count=count, gpu_ids=request.granted_ids
+        )
         return request.granted_ids
 
     def _dequeue_gpu_request_locked(self, request: "_GpuRequest") -> None:
@@ -496,8 +532,9 @@ class agResourcePool(_AgResourcePoolFields):
         if granted_any:
             self._gpu_cond.notify_all()
 
-    def release_gpus(self, gpu_ids: "list[int]") -> None:
-        """Release *gpu_ids* back to the pool.
+    def release_gpus(self, sandbox, gpu_ids: "list[int]") -> None:
+        """Release *gpu_ids* (held by *sandbox*) back to the pool, clearing
+        *sandbox*'s own `_gpu_ids`.
 
         No separate "is this actually idle yet" wait: callers (backend
         `stop()`/`destroy()`) already run their own teardown -- kill
@@ -537,56 +574,113 @@ class agResourcePool(_AgResourcePoolFields):
             self._dispatch_gpu_queue_locked()
         for gpu_id in gpu_ids:
             agprof.gpu_lease_end(gpu_id)
-        self._emit_resource()
+        sandbox._gpu_ids = []
+        self._update_resource_log(who=sandbox._name, action="release_gpu", gpu_ids=list(gpu_ids))
 
-    def notify_cpu_acquired(self, cpus: float, memory_mb: int) -> None:
-        """Record that a sandbox boosted its CPU/memory limits."""
-        with self._cpu_mem_cond:
-            self.cpus_acquired += cpus
-            self.memory_acquired_mb += memory_mb
-        self._emit_resource()
+    def acquire_cpu_mem(
+        self, sandbox, cpus: "float | None" = None, memory_mb: "float | None" = None
+    ) -> None:
+        """Boost *sandbox*'s CPU/memory limits (applying the min_cpus/
+        min_memory_mb floor), update its `_cpu_acquired`/
+        `_memory_acquired_mb` bookkeeping, and record the acquisition.
 
-    def notify_cpu_released(self, cpus: float, memory_mb: int) -> None:
-        """Record that a sandbox reset its CPU/memory limits to idle."""
-        with self._cpu_mem_cond:
-            self.cpus_acquired = max(0.0, self.cpus_acquired - cpus)
-            self.memory_acquired_mb = max(0, self.memory_acquired_mb - memory_mb)
-        self._emit_resource()
-
-    def _emit_resource(self) -> None:
-        """Push a resource_update to the webui dashboard, if active.
-
-        Reads _gpus_acquired/cpus_acquired/memory_acquired_mb directly, with
-        no lock -- this is a live status gauge for a dashboard badge, not a
-        value anything computes with, so there's no invariant here worth
-        guarding: a plain int/float attribute read is already atomic under
-        the GIL (no torn reads), and the value is stale the instant it
-        crosses into the emitter/websocket/browser regardless of whether a
-        lock momentarily delayed a concurrent writer. Locking here would
-        narrow that inevitable staleness window by nothing -- it would just
-        relocate where the race happens, not remove it. (Contrast
-        _free_gpus in acquire_gpu()/release_gpu(), which DOES need locking:
-        two threads racing there can make two sandboxes believe they hold
-        the same physical GPU -- an actual invariant, not a status number.)
+        A running container throttled to 0 cpu shares or 0 memory can't
+        make forward progress, so a requested value is never let below the
+        floor -- silently raised rather than rejected, since a too-small
+        request is a caller mistake to correct for, not a real capacity
+        constraint (see the total_cpus/total_memory_mb ceiling check, which
+        IS a real rejection, in agskill.py's _reserve_resource).
         """
-        # DATACOLLECTOR: latest (singleton) + collapse -- one shared resource_state row,
-        # called on every acquire/release; high-frequency callers may need bucketed
-        # downsampling like agwebui's own _PRUNE_* mechanism.
-        try:
-            from . import agwebui as _agwebui
+        if cpus is None and memory_mb is None:
+            return
+        applied_cpus = _floor(cpus, self.min_cpus)
+        applied_memory_mb = _floor(memory_mb, self.min_memory_mb)
+        sandbox.update_limits(cpus=applied_cpus, memory=_memory_mb_to_docker_str(applied_memory_mb))
+        if applied_cpus is not None:
+            sandbox._cpu_acquired += applied_cpus
+        if applied_memory_mb is not None:
+            sandbox._memory_acquired_mb += applied_memory_mb
+        with self._cpu_mem_cond:
+            self.cpus_acquired += applied_cpus or 0.0
+            self.memory_acquired_mb += applied_memory_mb or 0
+        self._update_resource_log(
+            who=sandbox._name,
+            action="acquire_cpu_mem",
+            cpus=applied_cpus,
+            memory_mb=applied_memory_mb,
+        )
 
-            if _agwebui._active is not None:
-                _agwebui._active.emitter.resource_update(
-                    gpus_acquired=self._gpus_acquired,
-                    gpus_total=len(self.gpus),
-                    cpus_acquired=self.cpus_acquired,
-                    cpus_total=self.total_cpus,
-                    memory_acquired_mb=self.memory_acquired_mb,
-                    memory_total_mb=self.total_memory_mb,
+    def release_cpu_mem(self, sandbox, cpu: bool = False, memory: bool = False) -> None:
+        """Reset *sandbox*'s CPU and/or memory limits to idle (flooring
+        idle_cpus at min_cpus), update its `_cpu_acquired`/
+        `_memory_acquired_mb` bookkeeping, and record the release.
+
+        idle_memory is a pre-formatted docker string (e.g. "1g") or None
+        (unlimited) -- unlike memory_mb on the acquire side, it's not a raw
+        MB number, so it's passed straight through rather than floored."""
+        if not (cpu or memory):
+            return
+        held_cpus = sandbox._cpu_acquired if cpu else 0.0
+        held_mb = sandbox._memory_acquired_mb if memory else 0
+        sandbox.update_limits(
+            cpus=_floor(self.idle_cpus, self.min_cpus) if cpu else None,
+            memory=self.idle_memory if memory else None,
+        )
+        if cpu:
+            sandbox._cpu_acquired = 0.0
+        if memory:
+            sandbox._memory_acquired_mb = 0
+        with self._cpu_mem_cond:
+            self.cpus_acquired = max(0.0, self.cpus_acquired - held_cpus)
+            self.memory_acquired_mb = max(0, self.memory_acquired_mb - held_mb)
+        self._update_resource_log(
+            who=sandbox._name, action="release_cpu_mem", cpus=held_cpus, memory_mb=held_mb
+        )
+
+    def _ensure_data_collector(self) -> "agDataCollector":
+        """Lazily construct this pool's own agDataCollector, scoped to the
+        pool (a process-wide singleton), not to any individual agent."""
+        if self._data_collector is not None:
+            return self._data_collector
+        with self._data_collector_lock:
+            if self._data_collector is None:
+                from pathlib import Path
+
+                from .agent import agent as _Agent, _DEFAULT_LOG_DIR
+                from .agDataCollector import agDataCollector, agDataCollectorConfigs
+
+                log_dir = Path(_Agent.log_dir) if _Agent.log_dir is not None else _DEFAULT_LOG_DIR
+                dc_agconfig = agConfig()
+                dc_agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
+                    db_path=str(log_dir / "resources_data.sqlite3")
                 )
-        except Exception as _e:
-            # DATACOLLECTOR: append -- fallback path of the latest+collapse emission tagged above.
-            print(f"[agresources] WARNING: resource_update push failed: {_e}")
+                dc = agDataCollector(dc_agconfig)
+                dc.start()
+                self._data_collector = dc
+        return self._data_collector
+
+    def _update_resource_log(
+        self, *, who: "str | None" = None, action: "str | None" = None, **request
+    ) -> None:
+        dc = self._ensure_data_collector()
+        dc.record_event(
+            type="resource_update",
+            payload={
+                "gpus_acquired": self._gpus_acquired,
+                "gpus_total": len(self.gpus),
+                "cpus_acquired": self.cpus_acquired,
+                "cpus_total": self.total_cpus,
+                "memory_acquired_mb": self.memory_acquired_mb,
+                "memory_total_mb": self.total_memory_mb,
+            },
+            do_update=True,
+        )
+        dc.record_event(
+            type="resource_request",
+            payload={"who": who, "action": action, "request": request or None},
+            do_update=False,
+            flush=True,
+        )
 
     def __repr__(self) -> str:
         return (

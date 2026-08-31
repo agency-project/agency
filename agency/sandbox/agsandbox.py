@@ -14,8 +14,6 @@ from .container import _RUN_ID
 
 if TYPE_CHECKING:
     from ..agresources import agResourcePool
-    from ..agterm import agterm
-    from ..aglog import aglog
 
 
 # Exists to register agSandbox's config fields (via __set_name__ at import
@@ -498,8 +496,6 @@ class agSandbox(_AgSandboxFields):
     def wait_for_processes(
         self,
         skill_name: str,
-        term: "agterm | None",
-        log: "aglog | None" = None,
         agname: str = "",
         ping_interval_s: float = agsandbox_backend.WAIT_PING_INTERVAL_S,
         poll_interval_s: float = agsandbox_backend.WAIT_POLL_INTERVAL_S,
@@ -512,30 +508,16 @@ class agSandbox(_AgSandboxFields):
         returns a user-facing message to inject into the conversation so the
         LLM can act on the outcome.
         """
-        _term = term
-        _log = log
-        _agname = agname
         _ping_interval_s = ping_interval_s
         _poll_interval_s = poll_interval_s
         _state = state_fn
 
         if self is None or not self._has_pending_background_work():
             return None
-        get_live = self.get_live_pids
 
         summary = self.pid_status_summary()
         if _state:
             _state("proc_wait", skill=skill_name)
-        if _term:
-            _term.log("PROCS ▶  ", f"{skill_name}  monitoring: {summary}")
-        if _log:
-            _log._lifecycle(
-                "procs_started",
-                agname=_agname,
-                skill=skill_name,
-                pids=list(get_live()),
-                summary=summary,
-            )
 
         import time
 
@@ -552,22 +534,10 @@ class agSandbox(_AgSandboxFields):
             if not self._has_pending_background_work():
                 break
 
-        live_now = get_live()
-
         if not self._has_pending_background_work():
-            if _term:
-                _term.log("PROCS ✓  ", f"{skill_name}  all processes completed, re-entering agent")
-            if _log:
-                _log._lifecycle("procs_completed", agname=_agname, skill=skill_name)
             return "Background processes have completed. Read their output and act on the results."
 
         summary = self.pid_status_summary()
-        if _term:
-            _term.log("PROCS ⏳  ", f"{skill_name}  still running: {summary}")
-        if _log:
-            _log._lifecycle(
-                "procs_ping", agname=_agname, skill=skill_name, pids=list(live_now), summary=summary
-            )
         return (
             f"Background processes are still running: {summary}. "
             f"You may check their output, wait, or proceed if appropriate. "
