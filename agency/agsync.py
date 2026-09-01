@@ -75,12 +75,7 @@ def _agsync_impl(*targets) -> None:
     # Snapshot WeakSet now; dead entries are skipped automatically.
     team_agents = [ag for team in teams for ag in team._agents]
 
-    from .orchestrator import peek_orchestrator
-
-    orchestrator = peek_orchestrator()
     for ag in solo_agents + team_agents:
-        if orchestrator is not None:
-            orchestrator.wait_for_agent(ag)
         ag.ctx.resolve_prev_dependencies()
 
     # Join any agmap tasks passed as targets. Task errors resolve to agerror

@@ -1,9 +1,7 @@
 """Standalone web server for agwebui.
 
 No agency imports — this process is completely isolated from the execution
-process. It polls the Web UI projection tables in the global database and
-pushes events to browsers over WebSocket. Before the global collector starts,
-it falls back to the legacy ``ui_events.db`` location.
+process.  It polls ui_events.db and pushes events to browsers over WebSocket.
 Run via:
 
     python -m agency.agwebui.server --run-dir <path> --port 7860
@@ -84,14 +82,6 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _db_path() -> Path:
-    pointer = _run_dir / "global_data_path.txt"
-    if pointer.exists():
-        try:
-            configured = pointer.read_text(encoding="utf-8").strip()
-            if configured:
-                return Path(configured)
-        except OSError:
-            pass
     return _run_dir / "ui_events.db"
 
 

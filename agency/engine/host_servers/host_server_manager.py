@@ -37,14 +37,11 @@ class HostServerManager:
         sandbox: "agSandbox",
         skill: "agskill",
         resource_pool: "agResourcePool",
-        data_collector=None,
     ) -> None:
         from ...profiler import agprof
 
         self._ensure_runtime_configs(agent.agconfig)
-        self._data_collector = (
-            data_collector if data_collector is not None else agent.data_collector
-        )
+        self._data_collector = agent.data_collector
         self._llm_handler_server = LlmHandlerServer(
             agent.agconfig, self._data_collector, parent_context=agprof.current_span_context()
         )
@@ -70,7 +67,6 @@ class HostServerManager:
     def set_config(self, agconfig: "agConfig") -> None:
         self._ensure_runtime_configs(agconfig)
         self._configs = agconfig.HostServerManagerConfigs
-        self._data_collector.set_config(agconfig)
         self._llm_handler_server.set_config(agconfig)
 
     def _ensure_runtime_configs(self, agconfig: "agConfig") -> None:

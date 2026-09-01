@@ -21,7 +21,7 @@ def _ts() -> str:
 @dataclass
 class agDataCollectorConfigs:
     db_path: str
-    flush_batch_size: int = 500
+    flush_batch_size: int = 20
     flush_interval_s: float = 1.0
 
 

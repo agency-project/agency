@@ -254,8 +254,6 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .dot-finished  { color: var(--green); opacity: 0.6; }
 .dot-paused    { color: var(--red); }
 .status-llm    { color: var(--cyan); }
-.status-queued { color: var(--yellow); }
-.status-blocked { color: var(--fg-dim); }
 .status-tool   { color: var(--yellow); }
 .status-human  { color: var(--yellow); }
 .status-finished { color: var(--green); opacity: 0.6; }

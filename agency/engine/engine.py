@@ -58,6 +58,7 @@ class AgentEngine:
                     context, skill, skill_input, resource_pool, sandbox, max_steps=max_steps
                 )
                 if not isinstance(output, agerror):
+                    failed = False
                     with agprof.span("teardown:commit"):
                         try:
                             sandbox.commit()
@@ -71,7 +72,6 @@ class AgentEngine:
                                         f"[engine] WARNING: post-commit hibernate failed "
                                         f"for {self._agent.agname}: {exc}"
                                     )
-                    failed = False
                 return output
             finally:
                 if failed:
@@ -96,10 +96,7 @@ class AgentEngine:
     ) -> "agdata":
         """Run host services and the sandbox-side harness while locked."""
 
-        collector = getattr(
-            self, "_scoped_data_collector", self._agent.data_collector
-        )
-        collector.record_event(
+        self._agent.data_collector.record_event(
             type="agent_state",
             payload={"state": "running_harness"},
             do_update=True,
@@ -107,16 +104,7 @@ class AgentEngine:
         )
 
         # Start connections
-        manager_kwargs = {}
-        if hasattr(self, "_scoped_data_collector"):
-            manager_kwargs["data_collector"] = self._scoped_data_collector
-        self._host_server_manager = HostServerManager(
-            self._agent,
-            sandbox,
-            skill,
-            resource_pool,
-            **manager_kwargs,
-        )
+        self._host_server_manager = HostServerManager(self._agent, sandbox, skill, resource_pool)
         try:
             host_uds_path = self._host_server_manager.start()
             # start harness manager daemon
