@@ -596,6 +596,8 @@ class LlmHandlerServer:
 
     @staticmethod
     def _spawn_http_worker(target, /, *args, **kwargs) -> "tuple[threading.Thread, Future]":
+        from ...profiler import agprof
+
         result: Future = Future()
 
         def run() -> None:
@@ -604,7 +606,8 @@ class LlmHandlerServer:
             except BaseException as error:
                 result.set_exception(error)
 
-        thread = threading.Thread(target=run, daemon=True, name="llm-http-dispatch")
+        thread = agprof.spawn_traced(run, daemon=True)
+        thread.name = "llm-http-dispatch"
         thread.start()
         return thread, result
 

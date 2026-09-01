@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import sqlite3
+import sys
 import threading
+from contextlib import nullcontext
 from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -13,6 +16,7 @@ from agency.agdata import agdata, agerror
 from agency.agent import agent
 from agency.orchestrator import agOrchestratorConfig, get_orchestrator
 from agency.orchestrator.scheduler import ExecutionScheduler
+from agency.profiler import agprof
 from agency.agskill import agskill
 from agency.engine import AgentEngine
 
@@ -37,6 +41,7 @@ def test_orchestrator_package_layout(tmp_path):
     orchestrator = get_orchestrator(ag.agconfig)
 
     assert isinstance(orchestrator.scheduler, ExecutionScheduler)
+    assert orchestrator._execution_workers._max_workers == sys.maxsize
 
 
 def test_unresolved_dependency_uses_no_engine_thread_or_slot(monkeypatch, tmp_path):
@@ -57,11 +62,35 @@ def test_unresolved_dependency_uses_no_engine_thread_or_slot(monkeypatch, tmp_pa
     assert snapshot.running_count == 0
     assert ag._current_state == "waiting_on_dependency"
     assert ag.engine is None
+    assert not get_orchestrator()._execution_workers._threads
 
     upstream.set_result(agdata(value=42))
     assert pending.ok is True
     assert called.is_set()
     assert isinstance(ag.engine, AgentEngine)
+
+
+def test_prepared_request_creates_no_execution_worker_until_started(monkeypatch, tmp_path):
+    called = threading.Event()
+
+    def execute(self, *, context, **_kwargs):
+        called.set()
+        return _result(context, ok=True)
+
+    monkeypatch.setattr(AgentEngine, "execute", execute)
+    ag = _agent(tmp_path, max_engines=1)
+    prepared = ag.prepare(agskill("prepared", ""), agdata())
+    orchestrator = get_orchestrator()
+
+    assert prepared.state == "PREPARED"
+    assert ag.engine is None
+    assert not orchestrator._execution_workers._threads
+    assert not called.is_set()
+
+    prepared.start()
+    assert prepared.wait(timeout=2).ok is True
+    assert called.is_set()
+    assert len(orchestrator._execution_workers._threads) == 1
 
 
 def test_optional_global_capacity_refills_on_completion_notification(monkeypatch, tmp_path):
@@ -263,15 +292,17 @@ def test_default_capacity_allows_different_agents_to_run_concurrently(monkeypatc
     assert second.ok is True
 
 
-def test_each_dispatched_request_gets_a_fresh_engine(monkeypatch, tmp_path):
+def test_each_dispatched_request_gets_a_fresh_engine_on_a_reused_worker(monkeypatch, tmp_path):
     engines = []
+    workers = []
 
     def execute(self, *, context, **_kwargs):
         engines.append(self)
+        workers.append(threading.current_thread())
         return _result(context, run=len(engines))
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
-    ag = _agent(tmp_path)
+    ag = _agent(tmp_path, max_engines=1)
     skill = agskill("s", "")
 
     first = ag.run(skill, agdata())
@@ -284,6 +315,44 @@ def test_each_dispatched_request_gets_a_fresh_engine(monkeypatch, tmp_path):
     assert engines[0] is first_engine
     assert engines[1] is ag.engine
     assert engines[0] is not engines[1]
+    assert workers[0] is workers[1]
+    assert get_orchestrator()._execution_workers._max_workers == 1
+
+
+def test_reused_worker_gets_fresh_context_and_exact_profile_parent(monkeypatch, tmp_path):
+    worker_local = contextvars.ContextVar("orchestrator_worker_local", default="clean")
+    observed_values = []
+    workers = []
+    observed_parents = []
+    parents = [object(), object()]
+    active_parent = [parents[0]]
+
+    def execute(self, *, context, skill_input, **_kwargs):
+        workers.append(threading.current_thread())
+        observed_values.append(worker_local.get())
+        worker_local.set(skill_input.label)
+        return _result(context, label=skill_input.label)
+
+    def tracked_span(name, *, parent_context=None):
+        if name == "engine:execute":
+            observed_parents.append(parent_context)
+        return nullcontext()
+
+    monkeypatch.setattr(AgentEngine, "execute", execute)
+    ag = _agent(tmp_path, max_engines=1)
+    monkeypatch.setattr(agprof, "current_span_context", lambda: active_parent[0])
+    monkeypatch.setattr(agprof, "span", tracked_span)
+    skill = agskill("isolated", "")
+
+    first = ag.run(skill, agdata(label="first"))
+    assert first.wait(timeout=2).label == "first"
+    active_parent[0] = parents[1]
+    second = ag.run(skill, agdata(label="second"))
+    assert second.wait(timeout=2).label == "second"
+
+    assert workers[0] is workers[1]
+    assert observed_values == ["clean", "clean"]
+    assert observed_parents == parents
 
 
 def test_engine_exception_preserves_context_and_releases_agent_slot(monkeypatch, tmp_path):
@@ -359,22 +428,34 @@ def test_completion_callback_can_read_committed_history(monkeypatch, tmp_path):
 def test_thread_start_failure_resolves_request_and_releases_capacity(monkeypatch, tmp_path):
     ag = _agent(tmp_path, max_engines=1)
     orchestrator = get_orchestrator(ag.agconfig)
+    executed = []
 
-    class BrokenThread:
-        name = "broken"
+    def execute(self, *, context, skill_input, **_kwargs):
+        executed.append(skill_input.label)
+        return _result(context, label=skill_input.label)
 
-        def start(self):
+    real_start = threading.Thread.start
+
+    def fail_execution_worker_start(thread):
+        if thread.name.startswith("agency-execution"):
             raise RuntimeError("cannot start thread")
+        real_start(thread)
 
-    monkeypatch.setattr(
-        "agency.orchestrator.orchestrator.agprof.spawn_traced",
-        lambda *_args, **_kwargs: BrokenThread(),
-    )
-    result = ag.run(agskill("s", ""), agdata())
+    monkeypatch.setattr(AgentEngine, "execute", execute)
+    skill = agskill("s", "")
+    with monkeypatch.context() as start_failure:
+        start_failure.setattr(threading.Thread, "start", fail_execution_worker_start)
+        result = ag.run(skill, agdata(label="rejected"))
+        assert "cannot start thread" in result.wait(timeout=2).error
 
-    assert "cannot start thread" in result.error
+    assert executed == []
     assert orchestrator.snapshot().running_count == 0
     assert orchestrator.snapshot().failed_total == 1
+
+    recovered = ag.run(skill, agdata(label="recovered"))
+    assert recovered.wait(timeout=2).label == "recovered"
+    assert executed == ["recovered"]
+    assert orchestrator.snapshot().running_count == 0
 
 
 def test_managed_dependency_cycle_fails_all_members(monkeypatch, tmp_path):
@@ -395,7 +476,10 @@ def test_managed_dependency_cycle_fails_all_members(monkeypatch, tmp_path):
 
 
 def test_shutdown_rejects_new_submissions(monkeypatch, tmp_path):
+    workers = []
+
     def execute(self, *, context, **_kwargs):
+        workers.append(threading.current_thread())
         return _result(context, ok=True)
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
@@ -403,8 +487,12 @@ def test_shutdown_rejects_new_submissions(monkeypatch, tmp_path):
     assert ag.run(agskill("s", ""), agdata()).ok is True
     orchestrator = get_orchestrator()
     orchestrator.shutdown(timeout_s=2)
+    orchestrator.shutdown(timeout_s=2)
 
     assert orchestrator.snapshot().state == "stopped"
+    assert not orchestrator._scheduler_thread.is_alive()
+    assert len(workers) == 1
+    assert not workers[0].is_alive()
     try:
         ag.run(agskill("later", ""), agdata())
     except RuntimeError as exc:

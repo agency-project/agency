@@ -37,7 +37,6 @@ def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code")
     agent = SimpleNamespace(
         agconfig=agconfig,
         harness=harness,
-        inbox=object(),
         data_collector=agDataCollector(agconfig),
     )
     sandbox = SimpleNamespace()
@@ -389,9 +388,7 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
     agconfig.HostServerManagerConfigs = configs
     agconfig.agDataCollectorConfigs = data_collector_configs
-    agent = SimpleNamespace(
-        agconfig=agconfig, inbox=object(), data_collector=agDataCollector(agconfig)
-    )
+    agent = SimpleNamespace(agconfig=agconfig, data_collector=agDataCollector(agconfig))
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())
     resource_pool = SimpleNamespace()

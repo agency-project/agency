@@ -8,7 +8,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency import AgentDestroyedError, CloseHandle, agdata, agerror, agent, agskill
+from agency import (
+    AgentDestroyedError,
+    CloseHandle,
+    MessageSubmission,
+    agdata,
+    agerror,
+    agent,
+    agskill,
+)
 from agency.agconfig import agConfig
 from agency.agcontext import agcontext
 from agency.engine import AgentEngine
@@ -329,17 +337,21 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
         agskill("blocked", ""),
         agdata(label="blocked", dependency=agdata(_future=unresolved)),
     )
+    message = active_agent.send("must be discarded by destruction")
     ready = ready_agent.run(agskill("ready", ""), agdata(label="ready"))
 
     assert _request_state(active) == "running"
     assert _request_state(prepared) == "prepared"
     assert _request_state(blocked) == "blocked"
+    assert isinstance(message, MessageSubmission)
+    assert _request_state(message) == "blocked"
     assert _request_state(ready) == "ready"
 
     invocations = {
         "active": active,
         "prepared": prepared,
         "blocked": blocked,
+        "message": message,
         "ready": ready,
     }
     callback_finished = {name: threading.Event() for name in invocations}
@@ -352,11 +364,11 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
         invocation._result_future.add_done_callback(observe_context)
 
     def read_settled_tail_history(_future) -> None:
-        assert blocked._context_future.done()
+        assert message._context_future.done()
         assert active_agent.history.messages == seed
         tail_history_read.set()
 
-    blocked._result_future.add_done_callback(read_settled_tail_history)
+    message._result_future.add_done_callback(read_settled_tail_history)
 
     active_close = active_agent.destroy()
     ready_close = ready_agent.destroy()
@@ -367,6 +379,8 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
         active_agent.run(agskill("rejected", ""), agdata())
     with pytest.raises(AgentDestroyedError):
         active_agent.prepare(agskill("rejected", ""), agdata())
+    with pytest.raises(AgentDestroyedError):
+        active_agent.send("rejected")
 
     assert boundary_released_by_destroy.wait(timeout=2)
     assert active._result_future.done() is False
@@ -382,6 +396,8 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
     assert callback_context_done == {name: True for name in invocations}
     assert active._context_future.result().retained_messages == []
     assert blocked._context_future.result().retained_messages == []
+    assert message._context_future.result().retained_messages == []
+    assert message._context_future.result().recent_transcript == seed
     assert unresolved.done() is False
     assert executed == ["active"]
     assert constructed_for == [active_agent]

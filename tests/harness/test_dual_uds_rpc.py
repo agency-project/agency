@@ -43,7 +43,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
     config = agConfig({"agllm_backend": {"model": "test-model"}})
     config.HostServerManagerConfigs = HostServerManagerConfigs(uds_path=str(host_socket))
     config.agDataCollectorConfigs = agDataCollectorConfigs(db_path=str(database))
-    agent = SimpleNamespace(agconfig=config, inbox=object(), data_collector=agDataCollector(config))
+    agent = SimpleNamespace(agconfig=config, data_collector=agDataCollector(config))
     skill = agskill(
         name="mock-attempt",
         system_prompt="mock",

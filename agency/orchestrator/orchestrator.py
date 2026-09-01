@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import atexit
+import contextvars
 import heapq
 import itertools
+import sys
 import threading
 import time
-from concurrent.futures import Future, InvalidStateError
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -130,6 +132,15 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._scheduler_failure: "BaseException | None" = None
         self._shutdown_ack: "Future[None] | None" = None
         self._stop_loop = False
+        # The scheduler remains the sole authority for admission/capacity.  A
+        # very large ceiling preserves the public ``None`` (unlimited) setting
+        # without imposing ThreadPoolExecutor's much smaller implicit default;
+        # workers are still created lazily and reused after a request finishes.
+        execution_worker_limit = self.max_concurrent_engines or sys.maxsize
+        self._execution_workers = ThreadPoolExecutor(
+            max_workers=execution_worker_limit,
+            thread_name_prefix="agency-execution",
+        )
         self.scheduler = ExecutionScheduler(self)
         self._scheduler_thread = agprof.spawn_traced(self._scheduler_main, daemon=True)
         self._scheduler_thread.name = "agency-global-scheduler"
@@ -303,9 +314,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
 
     def shutdown(self, wait: bool = True, timeout_s: "float | None" = None) -> None:
         with self._event_cond:
-            if self._state == "stopped":
-                return
-            if self._shutdown_ack is None:
+            if self._state != "stopped" and self._shutdown_ack is None:
                 self._shutdown_ack = Future()
                 self._accepting = False
                 self._post_locked("shutdown", self._shutdown_ack)
@@ -317,8 +326,13 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             wait = False
         if not wait:
             return
-        ack.result(timeout=timeout_s)
+        if ack is not None:
+            ack.result(timeout=timeout_s)
         self._scheduler_thread.join(timeout=timeout_s)
+        # The scheduler reaches ``stopped`` only after every accepted engine
+        # request has completed.  This join therefore only reaps idle reusable
+        # workers (and any rejected work item left by a failed thread start).
+        self._execution_workers.shutdown(wait=True, cancel_futures=True)
 
     # ------------------------------------------------------------------
     # Scheduler loop and transitions
@@ -362,49 +376,59 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             )
 
     def _scheduler_main(self) -> None:
-        while True:
-            finalize_shutdown = False
-            with self._event_cond:
-                while not self._events and not self._stop_loop:
-                    self._event_cond.wait()
-                if self._stop_loop:
-                    break
-                _seq, kind, value = heapq.heappop(self._events)
-                cycle_ack: "Future[None] | None" = None
-                try:
-                    if kind == "dependency_done":
-                        # The event is only a wakeup. execute() resolves the
-                        # complete wait pool before it schedules anything.
-                        pass
-                    elif kind in {"schedule", "control_changed"}:
-                        # Registration/control methods already changed the
-                        # authoritative state while holding this condition.
-                        if kind == "schedule" and isinstance(value, tuple):
-                            _request_id, cycle_ack = value
-                    elif kind == "engine_done":
-                        self._handle_engine_done_locked(value)
-                    elif kind == "pass_through_done":
-                        self._handle_pass_through_done_locked(value)
-                    elif kind == "shutdown":
-                        if self._scheduler_failure is None:
-                            self._state = "stopping"
-                    # A fatal transition closes scheduling permanently, but
-                    # the event loop remains alive to drain engine and context
-                    # completion events that were already in flight.
-                    if self._scheduler_failure is None:
-                        self.scheduler.execute()
-                except BaseException as exc:
-                    self._enter_scheduler_failure_locked(exc, cycle_ack)
-                else:
-                    if cycle_ack is not None:
-                        self._settle_future(cycle_ack, None, "schedule acknowledgement")
-                finalize_shutdown = self._finish_shutdown_if_possible_locked()
-            if finalize_shutdown:
+        try:
+            while True:
+                finalize_shutdown = False
                 with self._event_cond:
-                    if self._shutdown_ack is not None:
-                        self._settle_future(self._shutdown_ack, None, "shutdown acknowledgement")
-                    self._stop_loop = True
-                    self._event_cond.notify_all()
+                    while not self._events and not self._stop_loop:
+                        self._event_cond.wait()
+                    if self._stop_loop:
+                        break
+                    _seq, kind, value = heapq.heappop(self._events)
+                    cycle_ack: "Future[None] | None" = None
+                    try:
+                        if kind == "dependency_done":
+                            # The event is only a wakeup. execute() resolves the
+                            # complete wait pool before it schedules anything.
+                            pass
+                        elif kind in {"schedule", "control_changed"}:
+                            # Registration/control methods already changed the
+                            # authoritative state while holding this condition.
+                            if kind == "schedule" and isinstance(value, tuple):
+                                _request_id, cycle_ack = value
+                        elif kind == "engine_done":
+                            self._handle_engine_done_locked(value)
+                        elif kind == "pass_through_done":
+                            self._handle_pass_through_done_locked(value)
+                        elif kind == "shutdown":
+                            if self._scheduler_failure is None:
+                                self._state = "stopping"
+                        # A fatal transition closes scheduling permanently, but
+                        # the event loop remains alive to drain engine and context
+                        # completion events that were already in flight.
+                        if self._scheduler_failure is None:
+                            self.scheduler.execute()
+                    except BaseException as exc:
+                        self._enter_scheduler_failure_locked(exc, cycle_ack)
+                    else:
+                        if cycle_ack is not None:
+                            self._settle_future(cycle_ack, None, "schedule acknowledgement")
+                    finalize_shutdown = self._finish_shutdown_if_possible_locked()
+                if finalize_shutdown:
+                    with self._event_cond:
+                        if self._shutdown_ack is not None:
+                            self._settle_future(
+                                self._shutdown_ack,
+                                None,
+                                "shutdown acknowledgement",
+                            )
+                        self._stop_loop = True
+                        self._event_cond.notify_all()
+        finally:
+            # A callback running on the scheduler thread cannot synchronously
+            # join that same thread.  Closing here guarantees its non-blocking
+            # shutdown request still retires the reusable workers once drained.
+            self._execution_workers.shutdown(wait=False, cancel_futures=True)
 
     def _enter_scheduler_failure_locked(
         self,
@@ -536,9 +560,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             # retains a compatibility/inspection reference to the latest one.
             request.engine = AgentEngine(request.agent)
             request.agent.engine = request.engine
-            thread = agprof.spawn_traced(self._engine_worker, request)
-            thread.name = f"agency-engine-{request.request_id}-{request.agent.agname}"
-            thread.start()
+            self._submit_engine_worker(request)
         except BaseException as exc:
             self._post_locked(
                 "engine_done",
@@ -552,6 +574,34 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     ),
                 ),
             )
+
+    def _submit_engine_worker(self, request: _ExecutionRequest) -> None:
+        """Dispatch one request without allowing a rejected item to run later.
+
+        ``ThreadPoolExecutor.submit`` puts its work item on the queue before it
+        tries to start a new worker.  If ``Thread.start`` then fails, submit
+        raises but that queued item remains.  Hold the item behind this gate so
+        a later healthy worker drains it as a no-op instead of executing a
+        request which the scheduler has already failed and released.
+        """
+        admission = threading.Event()
+        accepted = False
+
+        def run_if_accepted() -> None:
+            admission.wait()
+            if accepted:
+                # Reused threads must not carry ContextVar/OTel state from one
+                # invocation into the next.  The durable profiling parent is
+                # supplied explicitly by _engine_worker from the request.
+                contextvars.Context().run(self._engine_worker, request)
+
+        try:
+            self._execution_workers.submit(run_if_accepted)
+        except BaseException:
+            admission.set()
+            raise
+        accepted = True
+        admission.set()
 
     def _has_capacity_locked(self) -> bool:
         limit = self.max_concurrent_engines

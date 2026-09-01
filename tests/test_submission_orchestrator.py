@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import importlib
 import threading
 from concurrent.futures import Future
 from unittest.mock import MagicMock
 
-from agency import Invocation, agdata, agent, agskill
+from agency import Invocation, MessageSubmission, agdata, agent, agskill
 from agency.agconfig import agConfig
 from agency.engine import AgentEngine
 from agency.orchestrator import agOrchestratorConfig, get_orchestrator
@@ -102,9 +103,12 @@ def test_direct_and_nested_invocation_dependencies_materialize(monkeypatch, tmp_
 
 def test_prepared_head_blocks_later_run_without_creating_an_engine(monkeypatch, tmp_path):
     constructed: list[AgentEngine] = []
+    sandbox_creations: list[tuple[tuple, dict]] = []
     execution_started = threading.Event()
     order: list[str] = []
     original_init = AgentEngine.__init__
+
+    agent_module = importlib.import_module("agency.agent")
 
     def tracked_init(self, *args, **kwargs):
         constructed.append(self)
@@ -115,19 +119,38 @@ def test_prepared_head_blocks_later_run_without_creating_an_engine(monkeypatch, 
         execution_started.set()
         return agdata(label=skill_input.label)
 
+    fake_sandbox = MagicMock()
+    fake_sandbox._lock = threading.RLock()
+    fake_sandbox._checkpoint_image = None
+
+    def tracked_sandbox(*args, **kwargs):
+        sandbox_creations.append((args, kwargs))
+        return fake_sandbox
+
     monkeypatch.setattr(AgentEngine, "__init__", tracked_init)
     monkeypatch.setattr(AgentEngine, "execute", execute)
-    ag = _agent(tmp_path)
+    config = agConfig(
+        agOrchestratorConfig(max_concurrent_engines=1),
+        {"agent": {"log_dir": str(tmp_path)}},
+        {"agllm_backend": {"api_key": "test", "model": ""}},
+    )
+    ag = agent(agconfig=config)
+    orchestrator = get_orchestrator(ag.agconfig)
+    assert ag.sandbox is None
+    monkeypatch.setattr(agent_module, "agSandbox", tracked_sandbox)
     skill = agskill("ordered", "")
 
     prepared = ag.prepare(skill, agdata(label="prepared"))
     later = ag.run(skill, agdata(label="later"))
 
     assert prepared.state == "PREPARED"
-    assert not execution_started.wait(timeout=0.1)
+    assert not execution_started.is_set()
     assert constructed == []
+    assert sandbox_creations == []
+    assert not orchestrator._execution_workers._threads
+    assert ag.sandbox is None
     assert ag.engine is None
-    assert get_orchestrator().snapshot().running_count == 0
+    assert orchestrator.snapshot().running_count == 0
 
     prepared.start()
     assert prepared.wait(timeout=2).label == "prepared"
@@ -135,6 +158,8 @@ def test_prepared_head_blocks_later_run_without_creating_an_engine(monkeypatch, 
     assert order == ["prepared", "later"]
     assert len(constructed) == 2
     assert constructed[0] is not constructed[1]
+    assert len(sandbox_creations) == 1
+    assert len(orchestrator._execution_workers._threads) == 1
 
 
 def test_invocation_start_never_bypasses_an_earlier_prepared_head(monkeypatch, tmp_path):
@@ -157,7 +182,7 @@ def test_invocation_start_never_bypasses_an_earlier_prepared_head(monkeypatch, t
     second.start()
     assert second.state == "QUEUED"
     assert first.state == "PREPARED"
-    assert not execution_started.wait(timeout=0.1)
+    assert not execution_started.is_set()
 
     first.start()
     assert first.wait(timeout=2).label == "first"
@@ -236,7 +261,7 @@ def test_prepared_agent_uses_no_capacity_while_another_agent_progresses(monkeypa
     assert order == ["other", "prepared", "behind"]
 
 
-def test_concurrent_run_and_prepare_publish_and_register_in_one_order(monkeypatch, tmp_path):
+def test_concurrent_run_prepare_and_send_publish_and_register_in_one_order(monkeypatch, tmp_path):
     execution_started = threading.Event()
     execution_order: list[str] = []
 
@@ -249,8 +274,8 @@ def test_concurrent_run_and_prepare_publish_and_register_in_one_order(monkeypatc
     ag = _agent(tmp_path)
     skill = agskill("concurrent", "")
     gate = ag.prepare(skill, agdata(label="gate"))
-    barrier = threading.Barrier(3)
-    submissions: dict[str, Invocation] = {}
+    barrier = threading.Barrier(4)
+    submissions: dict[str, Invocation | MessageSubmission] = {}
     failures: list[BaseException] = []
 
     def submit_run() -> None:
@@ -267,7 +292,18 @@ def test_concurrent_run_and_prepare_publish_and_register_in_one_order(monkeypatc
         except BaseException as exc:  # surface caller-thread failures in the test
             failures.append(exc)
 
-    callers = [threading.Thread(target=submit_run), threading.Thread(target=submit_prepared)]
+    def submit_message() -> None:
+        try:
+            barrier.wait(timeout=2)
+            submissions["message"] = ag.send("concurrent message")
+        except BaseException as exc:  # surface caller-thread failures in the test
+            failures.append(exc)
+
+    callers = [
+        threading.Thread(target=submit_run),
+        threading.Thread(target=submit_prepared),
+        threading.Thread(target=submit_message),
+    ]
     for caller in callers:
         caller.start()
     barrier.wait(timeout=2)
@@ -278,26 +314,41 @@ def test_concurrent_run_and_prepare_publish_and_register_in_one_order(monkeypatc
     assert failures == []
     run = submissions["run"]
     prepared = submissions["prepared"]
-    assert {run.ordering_id, prepared.ordering_id} == {2, 3}
-    earlier, later = sorted((run, prepared), key=lambda item: item.ordering_id)
-    assert later.predecessor_context is earlier.output_context
-    assert ag.context is later.output_context
-    assert not execution_started.wait(timeout=0.1)
+    message = submissions["message"]
+    assert isinstance(run, Invocation)
+    assert isinstance(prepared, Invocation)
+    assert isinstance(message, MessageSubmission)
+    assert {run.ordering_id, prepared.ordering_id, message.ordering_id} == {2, 3, 4}
+    ordered = sorted((run, prepared, message), key=lambda item: item.ordering_id)
+    predecessor = gate.output_context
+    for submission in ordered:
+        assert submission.predecessor_context is predecessor
+        predecessor = submission.output_context
+    assert ag.context is ordered[-1].output_context
+    assert not execution_started.is_set()
 
     orchestrator = get_orchestrator()
     with orchestrator._event_cond:
-        earlier_request = orchestrator._requests[earlier._request_id]
-        later_request = orchestrator._requests[later._request_id]
-        assert earlier_request.submission is earlier
-        assert later_request.submission is later
-        assert earlier_request.sequence < later_request.sequence
+        requests = [orchestrator._requests[submission._request_id] for submission in ordered]
+        assert [request.submission for request in requests] == ordered
+        assert [request.sequence for request in requests] == sorted(
+            request.sequence for request in requests
+        )
+        assert [request.kind for request in requests] == [
+            "message" if isinstance(submission, MessageSubmission) else "skill"
+            for submission in ordered
+        ]
 
     prepared.start()
     gate.start()
     assert gate.wait(timeout=2).label == "gate"
     assert run.wait(timeout=2).label == "run"
     assert prepared.wait(timeout=2).label == "prepared"
-    expected = ["gate", *[item.result.label for item in (earlier, later)]]
+    assert message.wait(timeout=2).to_dict() == {}
+    expected = [
+        "gate",
+        *[submission.result.label for submission in ordered if isinstance(submission, Invocation)],
+    ]
     assert execution_order == expected
 
 
