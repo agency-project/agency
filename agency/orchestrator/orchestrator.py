@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from ..agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
 from ..agcontext import agcontext
 from ..agdata import agdata, agerror
-from .._submission import Invocation, Submission
+from .._submission import Invocation, MessageSubmission, Submission
 from ..engine import AgentEngine
 from ..agdatacollector import agDataCollector, agDataCollectorConfigs, _ts
 from ..utils.agutil import _DEFAULT_LOG_DIR, format_exception
@@ -198,6 +198,41 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         if cycle_ack is not None:
             cycle_ack.result()
         return invocation
+
+    def submit_message(self, ag: "agent", message: str) -> MessageSubmission:
+        """Atomically publish one orchestrator-owned host-only context request."""
+        cycle_ack: Future[None] | None = None
+        with self._event_cond:
+            if not self._accepting:
+                raise RuntimeError("global agent orchestrator is shut down")
+            with ag._submission_lock:
+                ag._control.assert_alive("send a message")
+                submission = MessageSubmission(ag, message)
+                predecessor = ag.context
+                ordering_id = ag._next_submission_id
+                ag._next_submission_id += 1
+                submission._bind(ordering_id, predecessor)
+                ag.context = submission.output_context
+                ag._submissions.add(submission)
+                try:
+                    self._register_submission_locked(
+                        submission,
+                        kind="message",
+                        skill=None,
+                        skill_input=None,
+                        max_steps=None,
+                    )
+                except BaseException:
+                    ag._submissions.discard(submission)
+                    if ag.context is submission.output_context:
+                        ag.context = predecessor
+                    raise
+            if threading.current_thread() is not self._scheduler_thread:
+                cycle_ack = Future()
+            self._post_locked("schedule", (submission._request_id, cycle_ack))
+        if cycle_ack is not None:
+            cycle_ack.result()
+        return submission
 
     def start_invocation(self, invocation: Invocation) -> bool:
         """Open one PREPARED gate and wake the event-driven scheduler."""
@@ -562,6 +597,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         local_skill_input = request.skill_input
         history_before = list(committed_context.recent_transcript)
         collector = ag.data_collector
+        execution_started = False
         invocation = request.submission
         if not isinstance(invocation, Invocation):
             raise RuntimeError("skill execution is not bound to an Invocation")
@@ -591,6 +627,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             engine = request.engine
             if engine is None:
                 raise RuntimeError("dispatched request has no AgentEngine")
+            execution_started = True
             outer_result = engine.execute(
                 context=working_context,
                 skill=skill,
@@ -623,6 +660,14 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 committed_context,
                 invocation.is_destroyed(),
             )
+
+        if execution_started and isinstance(outer_result, agerror):
+            # Preserve exactly the canonical rollback notice on a clean copy;
+            # every other mutation made by the failed working transaction is
+            # intentionally discarded.  Controlled cancellation/destruction
+            # returned above and therefore never receives this notice.
+            updated_context = committed_context.copy()
+            ag._record_context_notice(updated_context)
 
         self._finish_execution_log(
             request,
@@ -770,6 +815,65 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._settle_future(request.result_future, completion.output, "invocation result")
         request.agent._submission_finished(request.submission)
 
+    def _complete_message_locked(self, request: _ExecutionRequest) -> None:
+        """Commit one ready host-only message on the scheduler event loop.
+
+        The event condition is the outer publication/destruction lock.  Taking
+        the agent submission lock beneath it makes the message commit claim
+        atomic with destroy(), while keeping the operation entirely free of
+        engine, sandbox, harness, and capacity ownership.
+        """
+        submission = request.submission
+        if request.kind != "message" or not isinstance(submission, MessageSubmission):
+            raise RuntimeError("context-only completion requires a MessageSubmission")
+        if request.state not in {"submitted", "blocked"}:
+            return
+
+        try:
+            output_context = request.context_dependency.copy()
+            with request.agent._submission_lock:
+                if submission._destroy_requested or request.agent._control.is_destroyed():
+                    self._destroy_request_locked(request)
+                    return
+                submission._commit_claimed = True
+                submission._state = "COMPLETING"
+                last_retained_sequence = max(
+                    (
+                        int(entry.get("sequence", 0))
+                        for entry in output_context.retained_messages
+                        if isinstance(entry, dict)
+                    ),
+                    default=0,
+                )
+                request.agent._control.ensure_sequence_at_least(last_retained_sequence)
+                sequence = request.agent._control.next_sequence()
+            output_context.append_retained_message(
+                {
+                    "sequence": sequence,
+                    "type": "message",
+                    "role": "user",
+                    "content": submission.message,
+                    "source": "send",
+                }
+            )
+        except BaseException as exc:
+            self._fail_request_locked(request, format_exception(exc))
+            return
+
+        result = agdata()
+        request.state = "completed"
+        self._end_phase_span_locked(request)
+        self._settle_future(request.context_future, output_context, "message output-context")
+        with request.agent._submission_lock:
+            submission._state = "SUCCEEDED"
+        self._completed_total += 1
+        self._end_run_span_locked(request, False, outcome="succeeded")
+        self._publish_request_locked("request_completed", request, {})
+        self._finish_request_locked(request)
+        self._update_agent_display_locked(request.agent)
+        self._settle_future(request.result_future, result, "message result")
+        request.agent._submission_finished(submission)
+
     def _finish_request_locked(self, request: _ExecutionRequest) -> None:
         outstanding = self._outstanding_by_agent.get(request.agent)
         if outstanding is not None:
@@ -892,6 +996,11 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             else:
                 submission._close_without_activation()
             submission._mark_terminal(output)
+        elif isinstance(submission, MessageSubmission):
+            with request.agent._submission_lock:
+                submission._state = (
+                    "DESTROYED" if request.terminal_state == "destroyed" else "FAILED"
+                )
         request.state = request.terminal_state
         self._finish_request_locked(request)
         self._update_agent_display_locked(request.agent)
@@ -916,7 +1025,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             (r for r in outstanding if r.state == "ready"), key=lambda r: r.sequence, default=None
         )
         if ready is not None:
-            ag.record_state("queued", skill=ready.skill.name)
+            ag.record_state("queued", skill=self._request_label(ready))
             return
         blocked = min(
             (r for r in outstanding if r.state == "blocked"),
@@ -1008,7 +1117,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 end_ts,
                 {
                     "request_id": request.request_id,
-                    "skill": request.skill.name,
+                    "skill": self._request_label(request),
+                    "request_kind": request.kind,
                     **attributes,
                 },
             )
@@ -1023,7 +1133,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 event_type,
                 {
                     "request_id": request.request_id,
-                    "skill": request.skill.name,
+                    "skill": self._request_label(request),
+                    "request_kind": request.kind,
                     "state": request.state,
                     "submission_sequence": request.sequence,
                     **payload,
@@ -1032,6 +1143,10 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             )
         except Exception as exc:
             print(f"[agorchestrator] WARNING: per-agent event recording failed: {exc}")
+
+    @staticmethod
+    def _request_label(request: _ExecutionRequest) -> str:
+        return request.skill.name if request.skill is not None else request.kind
 
     def _snapshot_dict_locked(self) -> dict:
         requests = list(self._requests.values())

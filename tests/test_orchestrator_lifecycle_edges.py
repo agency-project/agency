@@ -41,6 +41,15 @@ def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch,
     ag.context = agcontext(
         recent_transcript=seed,
         harness_sessions={"stable": {"session_id": "committed"}},
+        retained_messages=[
+            {
+                "sequence": 7,
+                "type": "message",
+                "role": "user",
+                "content": "stable retained context",
+                "source": "test",
+            }
+        ],
     )
 
     invocation = ag.run(agskill("fails", ""), agdata())
@@ -49,6 +58,26 @@ def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch,
     output_context = invocation._context_future.result(timeout=2)
     assert output_context.recent_transcript == seed
     assert output_context.harness_sessions == {"stable": {"session_id": "committed"}}
+    assert output_context.retained_messages == [
+        {
+            "sequence": 7,
+            "type": "message",
+            "role": "user",
+            "content": "stable retained context",
+            "source": "test",
+        },
+        {
+            "sequence": 8,
+            "type": "message",
+            "role": "system",
+            "content": (
+                "Note: the previous skill call failed. Its sandbox workspace changes "
+                "have been discarded and the workspace has been reverted to the last "
+                "successful checkpoint."
+            ),
+            "source": "context_notice",
+        },
+    ]
     assert ag.history.messages == seed
 
 

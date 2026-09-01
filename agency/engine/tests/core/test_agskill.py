@@ -10,7 +10,6 @@ from agency.agschema import agschema
 from agency.agskill import agskill
 from agency.llm.agllm import _AgLLMFields
 from agency.agtool import agtool
-from agency.agent import agent as _agent_cls
 
 LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
 LLM_IDLE_TIMEOUT = _AgLLMFields.idle_timeout.default
@@ -37,7 +36,6 @@ def make_mock_agent(sandbox=None, ping_interval_s=300, poll_interval_s=5):
         ping_interval_s = _ping
         poll_interval_s = _poll
         agconfig = None
-        _drain_inbox = _agent_cls._drain_inbox
 
     ag = _MockAgent()
     if sandbox is not None:
@@ -54,7 +52,6 @@ def make_mock_agent(sandbox=None, ping_interval_s=300, poll_interval_s=5):
         ag.sandbox.persistent = False
     ag.data_collector = MagicMock()
     ag.agname = "test"
-    ag._next_inbox_msg = MagicMock(return_value=None)
     return ag
 
 
@@ -380,40 +377,6 @@ def test_build_llm_kwargs_tools_included_when_provided():
 def test_build_llm_kwargs_no_tools_key_when_none():
     kw = build_llm_kwargs(_llm_cfg(model="m"), [], None)
     assert "tools" not in kw
-
-
-# ---------------------------------------------------------------------------
-# _drain_inbox
-# ---------------------------------------------------------------------------
-
-
-def test_drain_inbox_empty_queue_returns_false():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(return_value=None)
-    messages = []
-    assert ag._drain_inbox(messages) is False
-    assert messages == []
-
-
-def test_drain_inbox_single_message_appended():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=[{"type": "message", "content": "hello"}, None])
-    messages = [{"role": "system", "content": "sys"}]
-    had = ag._drain_inbox(messages)
-    assert had is True
-    assert messages[-1] == {"type": "message", "content": "hello"}
-
-
-def test_drain_inbox_multiple_messages_all_appended():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(
-        side_effect=[{"type": "message", "content": "msg1"}, {"type": "pause"}, None]
-    )
-    messages = []
-    ag._drain_inbox(messages)
-    assert len(messages) == 2
-    assert messages[0] == {"type": "message", "content": "msg1"}
-    assert messages[1] == {"type": "pause"}
 
 
 # ---------------------------------------------------------------------------

@@ -27,14 +27,19 @@ class ExecutionScheduler:
         owner = self._orchestrator
         for request in list(owner._requests.values()):
             submission = request.submission
-            if getattr(submission, "is_destroyed", lambda: False)():
-                if request.state != "running":
+            if request.kind == "message":
+                if submission._destroy_requested or request.agent._control.is_destroyed():
                     owner._destroy_request_locked(request)
-                continue
-            if getattr(submission, "is_cancelled", lambda: False)():
-                if request.state != "running":
-                    owner._cancel_request_locked(request)
-                continue
+                    continue
+            else:
+                if submission.is_destroyed():
+                    if request.state != "running":
+                        owner._destroy_request_locked(request)
+                    continue
+                if submission.is_cancelled():
+                    if request.state != "running":
+                        owner._cancel_request_locked(request)
+                    continue
             if request.state == "prepared" and getattr(request.submission, "_ready", False):
                 request.state = "submitted"
         resolved: list[_ExecutionRequest] = []
@@ -103,7 +108,10 @@ class ExecutionScheduler:
     def set_agent_blocked(self, pending_exec: "_ExecutionRequest") -> None:
         owner = self._orchestrator
         if pending_exec.agent not in owner._active_by_agent:
-            pending_exec.agent.record_state("waiting_on_dependency", skill=pending_exec.skill.name)
+            pending_exec.agent.record_state(
+                "waiting_on_dependency",
+                skill=owner._request_label(pending_exec),
+            )
 
     def _promote_resolved(self, resolved: "list[_ExecutionRequest]") -> None:
         owner = self._orchestrator
@@ -113,11 +121,17 @@ class ExecutionScheduler:
                 "blocked",
             ):
                 continue
+            if pending_exec.kind == "message":
+                owner._complete_message_locked(pending_exec)
+                continue
             owner._start_phase_span_locked(pending_exec, "sync:scheduler_queue")
             pending_exec.state = "ready"
             heapq.heappush(self._ready, (pending_exec.sequence, pending_exec.request_id))
             if pending_exec.agent not in owner._active_by_agent:
-                pending_exec.agent.record_state("queued", skill=pending_exec.skill.name)
+                pending_exec.agent.record_state(
+                    "queued",
+                    skill=owner._request_label(pending_exec),
+                )
             owner._publish_request_locked("request_ready", pending_exec, {})
 
     def default_schedule(self) -> None:

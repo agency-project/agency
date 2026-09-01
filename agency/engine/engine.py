@@ -80,11 +80,6 @@ class AgentEngine:
                 if failed:
                     with agprof.span("teardown:discard"):
                         sandbox.rm_container()
-                    self._agent.inbox.put(
-                        "Note: the previous skill call failed. Its sandbox workspace "
-                        "changes have been discarded and the workspace has been reverted "
-                        "to the last successful checkpoint."
-                    )
         finally:
             sandbox_lock.release()
 
@@ -125,8 +120,23 @@ class AgentEngine:
             # Obtain Host -> Sandbox handle
             self._sandbox_interaction_client = handle.client()
 
-            # build the prompt
-            prompt = self._build_prompt_payload(skill, skill_input)
+            # Prefix retained host-only context that this harness session has
+            # not incorporated yet.  Stateless harnesses have no advancing
+            # cursor, so the same retained context remains available on later
+            # calls by design.
+            pending_retained = getattr(context, "pending_retained_messages", None)
+            retained_messages = (
+                pending_retained(self._agent.harness) if callable(pending_retained) else []
+            )
+            prompt = (
+                self._build_prompt_payload(
+                    skill,
+                    skill_input,
+                    retained_messages=retained_messages,
+                )
+                if retained_messages
+                else self._build_prompt_payload(skill, skill_input)
+            )
             # Captured before the loop may reassign `prompt` to a retry prompt --
             # the needle must stay the original user turn, not a retry prompt.
             initial_prompt = prompt
@@ -173,14 +183,35 @@ class AgentEngine:
     # internal
     # ------------------------------------------------------------------
 
-    def _build_prompt_payload(self, skill: "agskill", skill_input: "agdata") -> PromptPayload:
+    def _build_prompt_payload(
+        self,
+        skill: "agskill",
+        skill_input: "agdata",
+        *,
+        retained_messages: "list[dict] | None" = None,
+    ) -> PromptPayload:
         from ..harness import agharness
 
+        user_content = agharness.build_user_turn_prompt(skill, skill_input)
+        if retained_messages:
+            retained = self._render_retained_messages(retained_messages)
+            if isinstance(user_content, str):
+                user_content = f"{retained}\n\n{user_content}"
+            else:
+                user_content = [{"type": "text", "text": retained}, *user_content]
         return PromptPayload(
             system_instruction=skill._build_system_prompt(),
-            user_content=agharness.build_user_turn_prompt(skill, skill_input),
+            user_content=user_content,
             output_instruction=agharness.build_output_format_instruction(skill),
         )
+
+    @staticmethod
+    def _render_retained_messages(messages: "list[dict]") -> str:
+        parts = ["[AGENCY RETAINED CONTEXT]"]
+        for message in messages:
+            role = str(message.get("role", "user")).upper()
+            parts.append(f"[{role}]\n{message.get('content', '')}")
+        return "\n\n".join(parts)
 
     def _build_retry_prompt(
         self, missing: "list[str]", *, system_instruction: str = ""

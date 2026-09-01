@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import queue
 from types import SimpleNamespace
 
 import pytest
@@ -84,15 +83,10 @@ class _FakeAgent:
         self.harness = "claude_code"
         self.agname = "test-agent"
         self.change_config_calls = []
-        self.inbox = queue.Queue()
         self.data_collector = _FakeDataCollector()
 
     def change_config(self, agconfig):
         self.change_config_calls.append(agconfig)
-
-    def _drain_inbox(self, messages):
-        while not self.inbox.empty():
-            messages.append(self.inbox.get_nowait())
 
 
 def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=None):
@@ -219,6 +213,51 @@ def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
     )
 
 
+def test_build_prompt_payload_prefixes_typed_retained_context(monkeypatch):
+    from agency.harness import agharness
+
+    monkeypatch.setattr(
+        agharness, "build_user_turn_prompt", lambda skill, skill_input: "current request"
+    )
+    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda skill: None)
+    engine = AgentEngine(_FakeAgent())
+    skill = SimpleNamespace(_build_system_prompt=lambda: "system")
+
+    payload = engine._build_prompt_payload(
+        skill,
+        SimpleNamespace(),
+        retained_messages=[
+            {"role": "user", "content": "remember me"},
+            {"role": "system", "content": "workspace reverted"},
+        ],
+    )
+
+    assert payload.user_content.startswith("[AGENCY RETAINED CONTEXT]")
+    assert "[USER]\nremember me" in payload.user_content
+    assert "[SYSTEM]\nworkspace reverted" in payload.user_content
+    assert payload.user_content.endswith("current request")
+
+
+def test_build_prompt_payload_prefixes_retained_context_to_multimodal_content(monkeypatch):
+    from agency.harness import agharness
+
+    current = [{"type": "text", "text": "current request"}]
+    monkeypatch.setattr(agharness, "build_user_turn_prompt", lambda *_args: current)
+    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda _skill: None)
+    engine = AgentEngine(_FakeAgent())
+    skill = SimpleNamespace(_build_system_prompt=lambda: "system")
+
+    payload = engine._build_prompt_payload(
+        skill,
+        SimpleNamespace(),
+        retained_messages=[{"role": "user", "content": "remember me"}],
+    )
+
+    assert payload.user_content[0]["type"] == "text"
+    assert "[AGENCY RETAINED CONTEXT]" in payload.user_content[0]["text"]
+    assert payload.user_content[1:] == current
+
+
 def test_build_retry_prompt_mentions_missing_fields():
     engine = AgentEngine(_FakeAgent())
     payload = engine._build_retry_prompt(["a", "b"], system_instruction="the-system")
@@ -339,7 +378,6 @@ def test_execute_discards_failed_result_before_releasing_lock(monkeypatch):
 
     assert result is execution
     assert agent.sandbox.events == ["acquire", "execute", "discard", "release"]
-    assert "previous skill call failed" in agent.inbox.get_nowait()
 
 
 def test_execute_discards_raised_exception_and_releases_lock(monkeypatch):
@@ -474,6 +512,41 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     assert manager.started is True
     assert manager.stopped is True
     assert result is execution
+
+
+def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeypatch):
+    holder = _install_fake_host_server_manager(
+        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
+    )
+    engine = AgentEngine(_FakeAgent())
+    captured = {}
+
+    def build_prompt(_skill, _skill_input, *, retained_messages=None):
+        captured["retained"] = retained_messages
+        return "prompt"
+
+    monkeypatch.setattr(engine, "_build_prompt_payload", build_prompt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(ok=True))
+    context = agcontext(
+        retained_messages=[
+            {"sequence": 1, "type": "message", "role": "user", "content": "old"},
+            {"sequence": 2, "type": "message", "role": "user", "content": "new"},
+        ],
+        harness_message_cursors={"claude_code": 1},
+    )
+    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
+
+    result = engine.execute(
+        context,
+        skill,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        engine._agent.sandbox,
+    )
+
+    assert result.ok is True
+    assert [entry["content"] for entry in captured["retained"]] == ["new"]
+    assert holder["requests"][0].prompt == "prompt"
 
 
 def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypatch):

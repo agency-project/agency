@@ -2,7 +2,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import queue
 import tarfile
 import threading
 import uuid as _uuid_mod
@@ -36,7 +35,7 @@ from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .profiler import agprof
 from ._agent_control import AgentControl
-from ._submission import CloseHandle, Invocation, Submission
+from ._submission import CloseHandle, Invocation, MessageSubmission, Submission
 
 if TYPE_CHECKING:
     from .engine import AgentEngine
@@ -245,7 +244,15 @@ class agent:
         self.data_collector.start()
         self._orchestrator = get_orchestrator(self.agconfig)
         self._submission_lock = threading.RLock()
-        self._control = AgentControl()
+        initial_sequence = max(
+            (
+                int(entry.get("sequence", 0))
+                for entry in self.context.retained_messages
+                if isinstance(entry, dict)
+            ),
+            default=0,
+        )
+        self._control = AgentControl(initial_sequence=initial_sequence)
         self._submissions: set[Submission] = set()
         self._next_submission_id = 1
         self._active_operations = 0
@@ -254,7 +261,6 @@ class agent:
         self._cleanup_done = False
         self._close_handle = CloseHandle()
         self._current_state = "agent_idle"
-        self.inbox: queue.Queue[str] = queue.Queue()
         _live_agents.add(self)
 
         self.data_collector.record_event(
@@ -410,28 +416,6 @@ class agent:
         )
 
     # ------------------------------------------------------------------
-    # UI / history helpers — called by agskill during execution
-    # ------------------------------------------------------------------
-
-    def _next_inbox_msg(self) -> "dict | None":
-        """Return the next typed inbox entry, or None if empty."""
-        try:
-            return self.inbox.get_nowait()
-        except queue.Empty:
-            return None
-
-    def _drain_inbox(self, messages: list) -> bool:
-        """Drain pending typed inbox entries. Returns True if any were appended."""
-        had_inbox = False
-        while True:
-            msg = self._next_inbox_msg()
-            if msg is None:
-                break
-            messages.append(msg)
-            had_inbox = True
-        return had_inbox
-
-    # ------------------------------------------------------------------
     # Pause / resume
     # ------------------------------------------------------------------
 
@@ -440,6 +424,31 @@ class agent:
 
     def _notify_invocation_control(self, invocation: Invocation) -> None:
         self._orchestrator.notify_invocation_control(invocation)
+
+    def _record_context_notice(self, context: agcontext) -> int:
+        """Append the typed rollback notice retained after an ordinary failure."""
+        last_retained_sequence = max(
+            (
+                int(entry.get("sequence", 0))
+                for entry in context.retained_messages
+                if isinstance(entry, dict)
+            ),
+            default=0,
+        )
+        self._control.ensure_sequence_at_least(last_retained_sequence)
+        sequence = self._control.next_sequence(allow_destroyed=True)
+        context.append_retained_message(
+            {
+                "sequence": sequence,
+                "type": "message",
+                "role": "system",
+                "content": "Note: the previous skill call failed. Its sandbox workspace "
+                "changes have been discarded and the workspace has been reverted "
+                "to the last successful checkpoint.",
+                "source": "context_notice",
+            }
+        )
+        return sequence
 
     def start(self) -> None:
         """Release the snapshot of invocations currently in ``PREPARED``."""
@@ -531,6 +540,14 @@ class agent:
         self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
         return self.sandbox
 
+    def send(self, message: str) -> MessageSubmission:
+        """Append one ordered retained message without starting infrastructure."""
+        if not isinstance(message, str):
+            raise TypeError("message must be a string")
+        if not message.strip():
+            raise ValueError("message must be a non-empty string")
+        return self._orchestrator.submit_message(self, message)
+
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> Invocation:
         """Submit ready work and immediately return its exact Invocation."""
         if max_steps is None:
@@ -605,8 +622,13 @@ class agent:
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.harness = src.harness
         ag.engine = None
-        src.context.resolve_prev_dependencies()
-        ag.context = src.context.copy()
+        with src._orchestrator._event_cond:
+            with src._submission_lock:
+                source_context = src.context
+        source_context.resolve_prev_dependencies()
+        with src._orchestrator._event_cond:
+            with src._submission_lock:
+                ag.context = source_context.copy()
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
@@ -701,20 +723,27 @@ class agent:
         path = Path(path)
         image_tag = f"agency/ckpt-{self.agname}"
 
-        if self.context.is_pending():
+        with self._orchestrator._event_cond:
+            with self._submission_lock:
+                checkpoint_context = self.context
+
+        if checkpoint_context.is_pending():
             self.data_collector.record_event(
                 type="agent_checkpoint_waiting",
                 payload={"agname": self.agname},
                 term_message=f"[{self.agname}] CKPT ⏳  waiting for in-flight task to complete...",
             )
-        self.context.resolve_prev_dependencies()
+        checkpoint_context.resolve_prev_dependencies()
+        with self._orchestrator._event_cond:
+            with self._submission_lock:
+                checkpoint_context = checkpoint_context.copy()
 
         state = {
             "agname": self.agname,
             "parent_agent_id": self._parent_agent_id,
             "harness": self.harness,
             "llm_config": _llm_config_snapshot(self.agconfig),
-            "history": self.context.recent_transcript,
+            "history": checkpoint_context.recent_transcript,
             "ts": _ts(),
         }
         if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
@@ -722,12 +751,16 @@ class agent:
             # container.tar is in -- a chroot snapshot directory and a
             # docker/podman image tag are unrelated formats.
             state["sandbox_image_kind"] = self.sandbox.image_kind
-        if self.context.harness_sessions:
+        if checkpoint_context.harness_sessions:
             # See docs/Design_harness_history.md -- travels with the
             # agent's own checkpoint, not with container.tar, so it's
             # available regardless of which sandbox this checkpoint is
             # later restored onto.
-            state["harness_sessions"] = self.context.harness_sessions
+            state["harness_sessions"] = checkpoint_context.harness_sessions
+        if checkpoint_context.retained_messages:
+            state["retained_messages"] = checkpoint_context.retained_messages
+        if checkpoint_context.harness_message_cursors:
+            state["harness_message_cursors"] = checkpoint_context.harness_message_cursors
         state_bytes = json.dumps(state, indent=2).encode()
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -824,6 +857,8 @@ class agent:
         ag.context = agcontext(
             recent_transcript=list(state.get("history", [])),
             harness_sessions=state.get("harness_sessions", {}),
+            retained_messages=state.get("retained_messages", []),
+            harness_message_cursors=state.get("harness_message_cursors", {}),
         )
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None

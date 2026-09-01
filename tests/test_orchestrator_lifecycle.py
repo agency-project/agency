@@ -183,6 +183,7 @@ def test_running_invocation_cancel_is_observed_by_its_exact_safe_boundary(monkey
     assert seen["decision"].cancelled is True
     assert invocation.state == "CANCELLED"
     assert invocation._context_future.result().recent_transcript == seed
+    assert invocation._context_future.result().retained_messages == []
     assert ag.history.messages == seed
 
 
@@ -379,6 +380,8 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
     for finished in callback_finished.values():
         assert finished.wait(timeout=2)
     assert callback_context_done == {name: True for name in invocations}
+    assert active._context_future.result().retained_messages == []
+    assert blocked._context_future.result().retained_messages == []
     assert unresolved.done() is False
     assert executed == ["active"]
     assert constructed_for == [active_agent]
