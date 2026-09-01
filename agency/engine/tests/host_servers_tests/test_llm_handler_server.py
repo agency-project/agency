@@ -86,9 +86,18 @@ class _FakeClient:
 class _FakeDataCollector:
     def __init__(self):
         self.events = []
+        self.stream_deltas = []
+        self.finalized = []
 
     def record_event(self, type, payload, call_label=None, do_update=False, **_kw):
         self.events.append((type, payload, call_label, do_update))
+
+    def record_stream_delta(self, type, payload, call_label=None, flush=False):
+        self.stream_deltas.append((type, payload, call_label))
+
+    def finalize_stream(self, call_label, type, payloads, term_message=None):
+        self.stream_deltas = [d for d in self.stream_deltas if d[2] != call_label]
+        self.finalized.append((call_label, type, payloads))
 
 
 def _cfg(**fields) -> agConfig:

@@ -6,6 +6,7 @@ import queue
 import ssl
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 import httpx
@@ -47,9 +48,12 @@ class _DispatchError(Exception):
 
 
 class _StreamHandle:
-    def __init__(self, q: "queue.Queue[dict]", cancel_event: threading.Event) -> None:
+    def __init__(
+        self, q: "queue.Queue[dict]", cancel_event: threading.Event, call_label: "str | None" = None
+    ) -> None:
         self._queue = q
         self._cancel_event = cancel_event
+        self.call_label = call_label
         self._thread: "threading.Thread | None" = None
         self._stream_ref_lock = threading.Lock()
         self._stream_ref = None
@@ -189,11 +193,13 @@ class LlmHandlerServer:
     def dispatch(self, request: dict) -> dict:
         from ...profiler import agprof
 
+        call_label = uuid.uuid4().hex[:12]
         self._data_collector.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
             do_update=True,
             flush=True,
+            call_label=call_label,
         )
         with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
             _annotate(
@@ -218,20 +224,25 @@ class LlmHandlerServer:
                 output_tokens=(usage or {}).get("completion_tokens", 0),
             )
             self._record_exchange(request, result["message"], usage, result["stop_reason"])
+            self._data_collector.finalize_stream(
+                call_label, type="llm_block", payloads=result["message"]["blocks"]
+            )
             return result
 
     def start_stream(self, request: dict) -> "_StreamHandle":
         from ...profiler import agprof
 
+        call_label = uuid.uuid4().hex[:12]
         self._data_collector.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
             do_update=True,
             flush=True,
+            call_label=call_label,
         )
         q: "queue.Queue[dict]" = queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
         cancel_event = threading.Event()
-        handle = _StreamHandle(q, cancel_event)
+        handle = _StreamHandle(q, cancel_event, call_label)
         thread = agprof.spawn_traced(self._run_stream_producer, request, handle, daemon=True)
         handle._thread = thread
         with self._handles_lock:
@@ -318,6 +329,9 @@ class LlmHandlerServer:
                         response=empty_message,
                         streaming=False,
                     )
+                    self._data_collector.finalize_stream(
+                        handle.call_label, type="llm_block", payloads=[]
+                    )
                     return
                 except BAD_REQUEST_EXCS as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
@@ -343,6 +357,11 @@ class LlmHandlerServer:
                     for stream_item in itertools.chain([first_item], stream_iter):
                         if handle._cancel_event.is_set():
                             break
+                        self._data_collector.record_stream_delta(
+                            type="llm_stream_delta",
+                            payload=stream_item,
+                            call_label=handle.call_label,
+                        )
                         if stream_item["type"] == "usage":
                             if stream_item.get("usage") is not None:
                                 usage = stream_item["usage"]
@@ -408,9 +427,19 @@ class LlmHandlerServer:
                     handle.register_stream_exchange(
                         error_item, streaming=False, error=f"{type(e).__name__}: {e}"
                     )
+                    self._data_collector.finalize_stream(
+                        handle.call_label,
+                        type="llm_stream_error",
+                        payloads=[{"error": f"{type(e).__name__}: {e}"}],
+                    )
                     return
 
                 if handle._cancel_event.is_set():
+                    self._data_collector.finalize_stream(
+                        handle.call_label,
+                        type="llm_stream_cancelled",
+                        payloads=[{"cancelled": True}],
+                    )
                     return
                 _annotate(
                     attempt_span,
@@ -430,6 +459,9 @@ class LlmHandlerServer:
                     usage=usage,
                     finish_reason=stop_reason,
                     streaming=False,
+                )
+                self._data_collector.finalize_stream(
+                    handle.call_label, type="llm_block", payloads=message["blocks"]
                 )
         finally:
             handle._close_stream()

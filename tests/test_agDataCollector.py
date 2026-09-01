@@ -44,7 +44,7 @@ def _select_all(db_path, table):
 
 def test_configs_defaults():
     configs = agDataCollectorConfigs(db_path="/tmp/does-not-matter.db")
-    assert configs.flush_batch_size == 500
+    assert configs.flush_batch_size == 20
     assert configs.flush_interval_s == 1.0
 
 
@@ -148,7 +148,7 @@ def test_start_creates_schema_tables(tmp_path):
         tables = {
             r[0] for r in dc._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-        assert {"events", "spans", "latest_values"} <= tables
+        assert {"events", "spans", "latest_values", "stream_deltas"} <= tables
     finally:
         dc.stop()
 
@@ -382,6 +382,94 @@ def test_record_span_does_not_touch_latest_values(tmp_path):
     dc.record_span("op", 0.0, 1.0, {})
     dc.flush()
     assert _select_all(db_path, "latest_values") == []
+    dc.stop()
+
+
+# ---------------------------------------------------------------------------
+# record_stream_delta() / finalize_stream()
+# ---------------------------------------------------------------------------
+
+
+def test_record_stream_delta_only_touches_stream_deltas(tmp_path):
+    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc.start()
+    dc.record_stream_delta("llm_stream_delta", {"text": "hi"}, call_label="c1")
+    dc.flush()
+
+    rows = _select_all(db_path, "stream_deltas")
+    assert len(rows) == 1
+    assert rows[0]["call_label"] == "c1"
+    assert json.loads(rows[0]["payload"]) == {"text": "hi"}
+    assert _select_all(db_path, "events") == []
+    assert _select_all(db_path, "latest_values") == []
+    dc.stop()
+
+
+def test_finalize_stream_deletes_flushed_deltas_and_appends_events(tmp_path):
+    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc.start()
+    dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
+    dc.record_stream_delta("llm_stream_delta", {"text": "i"}, call_label="c1")
+    dc.flush()
+    assert len(_select_all(db_path, "stream_deltas")) == 2
+
+    dc.finalize_stream("c1", type="llm_block", payloads=[{"type": "text", "text": "hi"}])
+
+    assert _select_all(db_path, "stream_deltas") == []
+    events = _select_all(db_path, "events")
+    assert len(events) == 1
+    assert events[0]["type"] == "llm_block"
+    assert events[0]["call_label"] == "c1"
+    assert json.loads(events[0]["payload"]) == {"type": "text", "text": "hi"}
+    dc.stop()
+
+
+def test_finalize_stream_clears_not_yet_flushed_pending_deltas(tmp_path):
+    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc.start()
+    dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
+    assert len(dc._stream_delta_rows) == 1
+
+    dc.finalize_stream("c1", type="llm_block", payloads=[])
+
+    assert dc._stream_delta_rows == []
+    assert _select_all(db_path, "stream_deltas") == []
+    dc.stop()
+
+
+def test_finalize_stream_only_clears_matching_call_label(tmp_path):
+    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc.start()
+    dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
+    dc.record_stream_delta("llm_stream_delta", {"text": "x"}, call_label="c2")
+    dc.flush()
+
+    dc.finalize_stream("c1", type="llm_block", payloads=[{"text": "h"}])
+
+    remaining = _select_all(db_path, "stream_deltas")
+    assert len(remaining) == 1
+    assert remaining[0]["call_label"] == "c2"
+    dc.stop()
+
+
+def test_finalize_stream_writes_one_event_row_per_payload(tmp_path):
+    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc.start()
+    dc.finalize_stream(
+        "c1", type="llm_block", payloads=[{"type": "thinking"}, {"type": "text", "text": "hi"}]
+    )
+    events = _select_all(db_path, "events")
+    assert len(events) == 2
+    assert [json.loads(e["payload"])["type"] for e in events] == ["thinking", "text"]
+    assert all(e["call_label"] == "c1" for e in events)
+    dc.stop()
+
+
+def test_finalize_stream_safe_with_no_prior_deltas(tmp_path):
+    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc.start()
+    dc.finalize_stream("c1", type="llm_block", payloads=[{"type": "text", "text": "hi"}])
+    assert len(_select_all(db_path, "events")) == 1
     dc.stop()
 
 

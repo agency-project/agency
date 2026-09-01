@@ -34,6 +34,7 @@ class agDataCollector:
         self._event_rows: list[tuple] = []
         self._span_rows: list[tuple] = []
         self._latest_value_rows: list[tuple] = []
+        self._stream_delta_rows: list[tuple] = []
         self._pending_count = 0
         self._last_flush_ts = 0.0
 
@@ -91,6 +92,52 @@ class agDataCollector:
                 self._flush_locked()
             else:
                 self._maybe_flush_locked()
+
+    def record_stream_delta(
+        self,
+        type: str,
+        payload: dict,
+        *,
+        call_label: "str | None" = None,
+        flush: bool = False,
+    ) -> None:
+        """Append one raw streaming fragment to the transient `stream_deltas`
+        table (never `events`, never `latest_values`)"""
+        timestamp = time.time()
+        payload_json = json.dumps(payload)
+        with self._lock:
+            self._stream_delta_rows.append((type, timestamp, call_label, payload_json, None))
+            self._pending_count += 1
+            if flush:
+                self._flush_locked()
+            else:
+                self._maybe_flush_locked()
+
+    def finalize_stream(
+        self,
+        call_label: str,
+        type: str,
+        payloads: "list[dict]",
+        *,
+        term_message: "str | None" = None,
+    ) -> None:
+        """Atomically clear every `stream_deltas` row for *call_label* (both
+        already-flushed and still-pending) and append each of *payloads* as
+        its own permanent row in `events`."""
+        timestamp = time.time()
+        if term_message is not None:
+            print(term_message, file=sys.stderr)
+        with self._lock:
+            self._stream_delta_rows = [
+                row for row in self._stream_delta_rows if row[2] != call_label
+            ]
+            for payload in payloads:
+                self._event_rows.append((type, timestamp, call_label, json.dumps(payload), None))
+                self._pending_count += 1
+            self._flush_locked()
+            if self._conn is not None:
+                self._conn.execute("DELETE FROM stream_deltas WHERE call_label = ?", (call_label,))
+                self._conn.commit()
 
     def record_span(
         self,
@@ -171,6 +218,21 @@ class agDataCollector:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stream_deltas (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                call_label TEXT,
+                payload TEXT NOT NULL,
+                term_message TEXT
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stream_deltas_call_label ON stream_deltas(call_label)"
+        )
         self._conn.commit()
 
     def _maybe_flush_locked(self) -> None:
@@ -184,7 +246,12 @@ class agDataCollector:
     def _flush_locked(self) -> None:
         if self._conn is None:
             return
-        if not self._event_rows and not self._span_rows and not self._latest_value_rows:
+        if (
+            not self._event_rows
+            and not self._span_rows
+            and not self._latest_value_rows
+            and not self._stream_delta_rows
+        ):
             self._last_flush_ts = time.time()
             return
         with self._conn:
@@ -211,8 +278,15 @@ class agDataCollector:
                     "payload=excluded.payload, term_message=excluded.term_message",
                     self._latest_value_rows,
                 )
+            if self._stream_delta_rows:
+                self._conn.executemany(
+                    "INSERT INTO stream_deltas (type, timestamp, call_label, payload, term_message) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    self._stream_delta_rows,
+                )
         self._event_rows.clear()
         self._span_rows.clear()
         self._latest_value_rows.clear()
+        self._stream_delta_rows.clear()
         self._pending_count = 0
         self._last_flush_ts = time.time()

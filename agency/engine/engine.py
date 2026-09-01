@@ -58,7 +58,6 @@ class AgentEngine:
                     context, skill, skill_input, resource_pool, sandbox, max_steps=max_steps
                 )
                 if not isinstance(output, agerror):
-                    failed = False
                     with agprof.span("teardown:commit"):
                         try:
                             sandbox.commit()
@@ -72,6 +71,7 @@ class AgentEngine:
                                         f"[engine] WARNING: post-commit hibernate failed "
                                         f"for {self._agent.agname}: {exc}"
                                     )
+                failed = False
                 return output
             finally:
                 if failed:
