@@ -136,6 +136,11 @@ class InvocationHandle:
     def _claim_completion(self) -> bool:
         """Atomically win the cancellation/destruction-versus-commit race."""
         with self._control._condition:
+            # The claim is a monotonic race result.  Once this invocation wins,
+            # later lifecycle transitions cannot retroactively change that
+            # answer for another completion-fence check.
+            if self._completion_claimed:
+                return True
             if self._cancelled or self._destroyed or self._control._is_closing_unlocked():
                 return False
             self._completion_claimed = True

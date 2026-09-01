@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from ..harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
@@ -19,6 +20,36 @@ if TYPE_CHECKING:
     from .clients import SandboxInteractionClient
 
 
+class _NoopDecision:
+    cancelled = False
+    destroyed = False
+    steering: tuple = ()
+
+
+class _NoopInvocation:
+    """Lifecycle compatibility for direct ``AgentEngine.execute`` callers."""
+
+    @staticmethod
+    def _checkpoint(_boundary_id: str, *, allow_steering: bool, phase: str) -> _NoopDecision:
+        del allow_steering, phase
+        return _NoopDecision()
+
+    @staticmethod
+    def _claim_completion() -> bool:
+        return True
+
+    @staticmethod
+    def is_cancelled() -> bool:
+        return False
+
+    @staticmethod
+    def is_destroyed() -> bool:
+        return False
+
+
+_NOOP_INVOCATION = _NoopInvocation()
+
+
 class AgentEngine:
     """Host-side execution owner for one agent."""
 
@@ -26,10 +57,47 @@ class AgentEngine:
         self._agent = agent
         self._host_server_manager: "HostServerManager | None" = None
         self._sandbox_interaction_client: "SandboxInteractionClient | None" = None
+        self._services_lock = threading.RLock()
+        self._services_closed = True
+        self._pending_session_update: "tuple[agcontext, str, str, str, int | None] | None" = None
 
     def set_config(self, agconfig: "agConfig") -> None:
         if self._host_server_manager is not None:
             self._host_server_manager.set_config(agconfig)
+
+    def close(self) -> None:
+        """Idempotently stop host services owned by this fresh engine."""
+        with self._services_lock:
+            if self._services_closed:
+                return
+            client = self._sandbox_interaction_client
+            manager = self._host_server_manager
+            client_error: "BaseException | None" = None
+            manager_error: "BaseException | None" = None
+            if client is not None:
+                try:
+                    client.close()
+                except BaseException as exc:
+                    # The LLM server must still stop so streamed deltas are
+                    # finalized even when closing the sandbox RPC client fails.
+                    client_error = exc
+                else:
+                    self._sandbox_interaction_client = None
+            if manager is not None:
+                try:
+                    manager.stop()
+                except BaseException as exc:
+                    manager_error = exc
+                else:
+                    self._host_server_manager = None
+            self._services_closed = (
+                self._sandbox_interaction_client is None and self._host_server_manager is None
+            )
+
+        if client_error is not None:
+            raise client_error
+        if manager_error is not None:
+            raise manager_error
 
     @property
     def host_server_manager(self) -> "HostServerManager":
@@ -51,16 +119,38 @@ class AgentEngine:
 
         from ..agdata import agerror
 
+        active_invocation = invocation if invocation is not None else _NOOP_INVOCATION
         sandbox_lock = sandbox._lock
         sandbox_lock.acquire()
         try:
             failed = True
+            self._pending_session_update = None
             try:
+                admission = active_invocation._checkpoint(
+                    "engine:before-harness",
+                    allow_steering=False,
+                    phase="infrastructure",
+                )
+                if admission.destroyed or admission.cancelled:
+                    return self._controlled_error(active_invocation, admission.destroyed)
+
                 output = self._execute_harness(
                     context, skill, skill_input, resource_pool, sandbox, max_steps=max_steps
                 )
+                completion = active_invocation._checkpoint(
+                    "engine:before-commit",
+                    allow_steering=False,
+                    phase="boundary",
+                )
+                if completion.destroyed or completion.cancelled:
+                    return self._controlled_error(active_invocation, completion.destroyed)
                 if isinstance(output, agerror):
                     return output
+                if not active_invocation._claim_completion():
+                    return self._controlled_error(
+                        active_invocation,
+                        active_invocation.is_destroyed(),
+                    )
                 with agprof.span("teardown:commit"):
                     try:
                         sandbox.commit()
@@ -74,14 +164,30 @@ class AgentEngine:
                                     f"[engine] WARNING: post-commit hibernate failed "
                                     f"for {self._agent.agname}: {exc}"
                                 )
+                self._commit_pending_session_update()
                 failed = False
                 return output
             finally:
                 if failed:
+                    self._pending_session_update = None
                     with agprof.span("teardown:discard"):
                         sandbox.rm_container()
         finally:
-            sandbox_lock.release()
+            try:
+                sandbox_lock.release()
+            finally:
+                # _execute_harness() closes services before commit.  This
+                # outer idempotent pass retries only a component whose first
+                # close/stop raised, while successful components stay detached.
+                self.close()
+
+    @staticmethod
+    def _controlled_error(invocation, destroyed: bool) -> "agdata":
+        from ..agdata import agerror
+
+        if destroyed or invocation.is_destroyed():
+            return agerror("agent destroyed")
+        return agerror("agent invocation cancelled")
 
     def _execute_harness(
         self,
@@ -102,9 +208,12 @@ class AgentEngine:
         )
 
         # Start connections
-        self._host_server_manager = HostServerManager(self._agent, sandbox, skill, resource_pool)
+        manager = HostServerManager(self._agent, sandbox, skill, resource_pool)
+        with self._services_lock:
+            self._host_server_manager = manager
+            self._services_closed = False
         try:
-            host_uds_path = self._host_server_manager.start()
+            host_uds_path = manager.start()
             # start harness manager daemon
             engine_name = str(
                 getattr(self._agent, "agname", getattr(self._agent, "harness", "agent"))
@@ -118,7 +227,8 @@ class AgentEngine:
             )
 
             # Obtain Host -> Sandbox handle
-            self._sandbox_interaction_client = handle.client()
+            with self._services_lock:
+                self._sandbox_interaction_client = handle.client()
 
             # Prefix retained host-only context that this harness session has
             # not incorporated yet.  Stateless harnesses have no advancing
@@ -158,11 +268,6 @@ class AgentEngine:
                 if attempt.session_id:
                     resume_session_id = attempt.session_id
                     prior_session_blob_b64 = attempt.session_blob_b64
-                    if attempt.session_blob_b64 is not None:
-                        context.harness_sessions[self._agent.harness] = {
-                            "session_id": attempt.session_id,
-                            "blob_b64": attempt.session_blob_b64,
-                        }
                 if self._recover_structured_output(skill, attempt, sandbox) is not None:
                     break
                 missing = self._missing_output_fields(skill)
@@ -172,12 +277,37 @@ class AgentEngine:
                 prompt = self._build_retry_prompt(
                     missing, system_instruction=prompt.system_instruction
                 )
-            return self._build_execution_result(context, skill, attempt, sandbox, initial_prompt)
+            result = self._build_execution_result(
+                context,
+                skill,
+                attempt,
+                sandbox,
+                initial_prompt,
+            )
+            from ..agdata import agerror
+
+            if (
+                not isinstance(result, agerror)
+                and attempt is not None
+                and attempt.ok
+                and attempt.session_id
+                and attempt.session_blob_b64 is not None
+            ):
+                retained_sequence = (
+                    max(int(entry["sequence"]) for entry in retained_messages)
+                    if retained_messages
+                    else None
+                )
+                self._pending_session_update = (
+                    context,
+                    str(self._agent.harness),
+                    attempt.session_id,
+                    attempt.session_blob_b64,
+                    retained_sequence,
+                )
+            return result
         finally:
-            if self._sandbox_interaction_client is not None:
-                self._sandbox_interaction_client.close()
-                self._sandbox_interaction_client = None
-            self._host_server_manager.stop()
+            self.close()
 
     # ------------------------------------------------------------------
     # internal
@@ -212,6 +342,20 @@ class AgentEngine:
             role = str(message.get("role", "user")).upper()
             parts.append(f"[{role}]\n{message.get('content', '')}")
         return "\n\n".join(parts)
+
+    def _commit_pending_session_update(self) -> None:
+        """Publish a restorable session only after its sandbox checkpoint."""
+        update = self._pending_session_update
+        self._pending_session_update = None
+        if update is None:
+            return
+        context, harness, session_id, blob_b64, retained_sequence = update
+        context.harness_sessions[harness] = {
+            "session_id": session_id,
+            "blob_b64": blob_b64,
+        }
+        if retained_sequence is not None:
+            context.advance_retained_cursor(harness, retained_sequence)
 
     def _build_retry_prompt(
         self, missing: "list[str]", *, system_instruction: str = ""

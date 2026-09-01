@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
+from agency._agent_control import AgentControl
 from agency.agdata import agdata
 from agency.agcontext import agcontext
 from agency.agschema import agschema
@@ -43,10 +45,13 @@ class _FakeSandbox:
         self.background_work_pending = False
         self.commit_error = None
         self.discard_error = None
+        self.commit_callback = None
 
     def commit(self):
         assert self._lock.held
         self.events.append("commit")
+        if self.commit_callback is not None:
+            self.commit_callback()
         if self.commit_error is not None:
             raise self.commit_error
 
@@ -473,6 +478,154 @@ def test_execute_defers_stop_while_background_work_is_pending(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("control_action", "expected_error"),
+    [("cancel", "agent invocation cancelled"), ("destroy", "agent destroyed")],
+)
+def test_execute_control_wins_after_harness_and_before_commit(
+    monkeypatch,
+    control_action,
+    expected_error,
+):
+    agent = _FakeAgent()
+    engine = AgentEngine(agent)
+    control = AgentControl()
+    invocation = control.begin_invocation("controlled")
+
+    def execute_harness(*_args, **_kwargs):
+        agent.sandbox.events.append("execute")
+        invocation.cancel() if control_action == "cancel" else control.destroy()
+        return agdata(done=True)
+
+    monkeypatch.setattr(engine, "_execute_harness", execute_harness)
+
+    result = engine.execute(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        agent.sandbox,
+        invocation=invocation,
+    )
+
+    assert result.error == expected_error
+    assert invocation._completion_claimed is False
+    assert agent.sandbox.events == ["acquire", "execute", "discard", "release"]
+
+
+def test_execute_observes_destroy_before_harness_without_starting_it(monkeypatch):
+    agent = _FakeAgent()
+    engine = AgentEngine(agent)
+    control = AgentControl()
+    invocation = control.begin_invocation("controlled")
+    control.destroy()
+    execute_harness = MagicMock()
+    monkeypatch.setattr(engine, "_execute_harness", execute_harness)
+
+    result = engine.execute(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        agent.sandbox,
+        invocation=invocation,
+    )
+
+    assert result.error == "agent destroyed"
+    execute_harness.assert_not_called()
+    assert agent.sandbox.events == ["acquire", "discard", "release"]
+
+
+def test_execute_claims_completion_before_commit_and_fences_late_cancel(monkeypatch):
+    agent = _FakeAgent()
+    engine = AgentEngine(agent)
+    control = AgentControl()
+    invocation = control.begin_invocation("controlled")
+    execution = agdata(done=True)
+    monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
+
+    def during_commit():
+        assert invocation._completion_claimed is True
+        invocation.cancel()
+
+    agent.sandbox.commit_callback = during_commit
+
+    result = engine.execute(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        agent.sandbox,
+        invocation=invocation,
+    )
+
+    assert result is execution
+    assert invocation.is_cancelled() is False
+    assert agent.sandbox.events == [
+        "acquire",
+        "commit",
+        "check_background_work",
+        "stop",
+        "release",
+    ]
+
+
+def test_close_always_stops_manager_and_is_idempotent_when_client_close_fails():
+    engine = AgentEngine(_FakeAgent())
+    events = []
+    first_client_close = True
+
+    class Client:
+        def close(self):
+            nonlocal first_client_close
+            events.append("client.close")
+            if first_client_close:
+                first_client_close = False
+                raise RuntimeError("client close failed")
+
+    class Manager:
+        def stop(self):
+            events.append("manager.stop")
+
+    engine._sandbox_interaction_client = Client()
+    engine._host_server_manager = Manager()
+    engine._services_closed = False
+
+    with pytest.raises(RuntimeError, match="client close failed"):
+        engine.close()
+    engine.close()
+
+    assert events == ["client.close", "manager.stop", "client.close"]
+
+
+def test_close_retries_only_the_manager_when_its_first_stop_fails():
+    engine = AgentEngine(_FakeAgent())
+    events = []
+    first_manager_stop = True
+
+    class Client:
+        def close(self):
+            events.append("client.close")
+
+    class Manager:
+        def stop(self):
+            nonlocal first_manager_stop
+            events.append("manager.stop")
+            if first_manager_stop:
+                first_manager_stop = False
+                raise RuntimeError("manager stop failed")
+
+    engine._sandbox_interaction_client = Client()
+    engine._host_server_manager = Manager()
+    engine._services_closed = False
+
+    with pytest.raises(RuntimeError, match="manager stop failed"):
+        engine.close()
+    engine.close()
+
+    assert events == ["client.close", "manager.stop", "manager.stop"]
+
+
 def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypatch):
     holder = _install_fake_host_server_manager(monkeypatch, results=[])
     monkeypatch.setattr(
@@ -516,7 +669,15 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
 
 def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeypatch):
     holder = _install_fake_host_server_manager(
-        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
+        monkeypatch,
+        results=[
+            HarnessAttemptResult(
+                ok=True,
+                final_text="done",
+                session_id="session-without-final-blob",
+                session_blob_b64=None,
+            )
+        ],
     )
     engine = AgentEngine(_FakeAgent())
     captured = {}
@@ -533,6 +694,7 @@ def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeyp
             {"sequence": 2, "type": "message", "role": "user", "content": "new"},
         ],
         harness_message_cursors={"claude_code": 1},
+        harness_sessions={"claude_code": {"session_id": "prior", "blob_b64": "cHJpb3I="}},
     )
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
 
@@ -547,6 +709,14 @@ def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeyp
     assert result.ok is True
     assert [entry["content"] for entry in captured["retained"]] == ["new"]
     assert holder["requests"][0].prompt == "prompt"
+    assert (
+        holder["requests"][0].resume_session_id,
+        holder["requests"][0].prior_session_blob_b64,
+    ) == ("prior", "cHJpb3I=")
+    assert context.harness_message_cursors == {"claude_code": 1}
+    assert context.harness_sessions == {
+        "claude_code": {"session_id": "prior", "blob_b64": "cHJpb3I="}
+    }
 
 
 def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypatch):
@@ -619,15 +789,29 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
     )
     agent = _FakeAgent()
     context = agcontext(
-        harness_sessions={"claude_code": {"session_id": "session-1", "blob_b64": "cHJpb3I="}}
+        harness_sessions={"claude_code": {"session_id": "session-1", "blob_b64": "cHJpb3I="}},
+        retained_messages=[
+            {"sequence": 1, "type": "message", "role": "user", "content": "old"},
+            {"sequence": 3, "type": "message", "role": "user", "content": "new"},
+        ],
+        harness_message_cursors={"claude_code": 1},
     )
     engine = AgentEngine(agent)
     execution = agdata(result="second")
     prompt = PromptPayload("system", "prompt")
-    monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: prompt)
+    monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args, **_kwargs: prompt)
     monkeypatch.setattr(engine, "_build_retry_prompt", lambda *_args, **_kwargs: prompt)
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=1)
+
+    def observe_commit_boundary():
+        assert context.harness_sessions["claude_code"] == {
+            "session_id": "session-1",
+            "blob_b64": "cHJpb3I=",
+        }
+        assert context.harness_message_cursors == {"claude_code": 1}
+
+    agent.sandbox.commit_callback = observe_commit_boundary
 
     result = engine.execute(context, skill, SimpleNamespace(), SimpleNamespace(), agent.sandbox)
 
@@ -644,7 +828,108 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
         "session_id": "session-2",
         "blob_b64": "ZmluYWw=",
     }
+    assert context.harness_message_cursors == {"claude_code": 3}
     assert result is execution
+
+
+def test_commit_failure_discards_staged_session_and_still_tears_down_services(monkeypatch):
+    holder = _install_fake_host_server_manager(
+        monkeypatch,
+        results=[
+            HarnessAttemptResult(
+                ok=True,
+                final_text="done",
+                session_id="session-2",
+                session_blob_b64="bmV3",
+            )
+        ],
+    )
+    agent = _FakeAgent()
+    agent.sandbox.commit_error = RuntimeError("commit failed")
+    context = agcontext(
+        harness_sessions={"claude_code": {"session_id": "session-1", "blob_b64": "b2xk"}},
+        retained_messages=[{"sequence": 4, "type": "message", "role": "user", "content": "retain"}],
+    )
+    engine = AgentEngine(agent)
+    monkeypatch.setattr(
+        engine,
+        "_build_prompt_payload",
+        lambda *_args, **_kwargs: PromptPayload("system", "prompt"),
+    )
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(done=True))
+    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        engine.execute(context, skill, SimpleNamespace(), SimpleNamespace(), agent.sandbox)
+
+    assert context.harness_sessions == {
+        "claude_code": {"session_id": "session-1", "blob_b64": "b2xk"}
+    }
+    assert context.harness_message_cursors == {}
+    assert engine._pending_session_update is None
+    assert holder["client"].closed is True
+    assert holder["manager"].stopped is True
+    assert agent.sandbox.events == [
+        "acquire",
+        "commit",
+        "check_background_work",
+        "stop",
+        "discard",
+        "release",
+    ]
+
+
+def test_cancelled_transaction_never_publishes_its_staged_session_or_cursor(monkeypatch):
+    holder = _install_fake_host_server_manager(
+        monkeypatch,
+        results=[
+            HarnessAttemptResult(
+                ok=True,
+                final_text="done",
+                session_id="session-2",
+                session_blob_b64="bmV3",
+            )
+        ],
+    )
+    agent = _FakeAgent()
+    context = agcontext(
+        harness_sessions={"claude_code": {"session_id": "session-1", "blob_b64": "b2xk"}},
+        retained_messages=[{"sequence": 2, "type": "message", "role": "user", "content": "retain"}],
+    )
+    control = AgentControl()
+    invocation = control.begin_invocation("controlled")
+    engine = AgentEngine(agent)
+    monkeypatch.setattr(
+        engine,
+        "_build_prompt_payload",
+        lambda *_args, **_kwargs: PromptPayload("system", "prompt"),
+    )
+
+    def cancel_with_result(*_args):
+        invocation.cancel()
+        return agdata(done=True)
+
+    monkeypatch.setattr(engine, "_build_execution_result", cancel_with_result)
+    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
+
+    result = engine.execute(
+        context,
+        skill,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        agent.sandbox,
+        invocation=invocation,
+    )
+
+    assert result.error == "agent invocation cancelled"
+    assert context.harness_sessions == {
+        "claude_code": {"session_id": "session-1", "blob_b64": "b2xk"}
+    }
+    assert context.harness_message_cursors == {}
+    assert engine._pending_session_update is None
+    assert holder["client"].closed is True
+    assert holder["manager"].stopped is True
+    assert agent.sandbox.events == ["acquire", "discard", "release"]
 
 
 def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):

@@ -107,6 +107,32 @@ def test_steering_is_fifo_replayed_per_boundary_and_rejected_after_final_answer(
         invocation.steer("too late")
 
 
+def test_completion_claim_remains_won_after_agent_and_invocation_close():
+    control = AgentControl()
+    invocation = control.begin_invocation("commit")
+
+    assert invocation._claim_completion() is True
+    assert control.destroy() is True
+    assert invocation._claim_completion() is True
+
+    control.finish_invocation(invocation)
+    assert invocation._claim_completion() is True
+
+
+@pytest.mark.parametrize("losing_transition", ["cancel", "destroy"])
+def test_completion_claim_stays_lost_when_control_wins_first(losing_transition):
+    control = AgentControl()
+    invocation = control.begin_invocation("rollback")
+
+    if losing_transition == "cancel":
+        invocation.cancel()
+    else:
+        control.destroy()
+
+    assert invocation._claim_completion() is False
+    assert invocation._claim_completion() is False
+
+
 def test_message_submission_is_pending_data_without_skill_controls():
     owner = _FakeAgent()
     receipt = MessageSubmission(owner, "remember")
