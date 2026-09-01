@@ -155,8 +155,8 @@ class agSandbox(_AgSandboxFields):
         # sandbox._agconfig (or one of its owner views) directly.
         self._agconfig: "agConfig | None" = agconfig.clone() if agconfig is not None else None
 
-        # Container name is fixed at creation time using the main-process PID
-        # prefix so that worker processes (with different PIDs) use the correct name.
+        # Container name is fixed at creation time so any explicitly serialized
+        # or cross-process view still uses the same sandbox identity.
         self._name = f"sandbox-{_RUN_ID}-{self._agname}"
 
         # Resolve image/mounts once, here, rather than lazily -- a running
@@ -318,9 +318,8 @@ class agSandbox(_AgSandboxFields):
         return self._agconfig.clone() if self._agconfig is not None else None
 
     def __getstate__(self) -> dict:
-        # threading.RLock isn't picklable — custom tools with run_in_subprocess=True
-        # (the default) get cloudpickled to a worker process, so this must not crash.
-        # A lock is process-local anyway, so there's nothing meaningful to carry over.
+        # threading.RLock is not picklable. A lock is process-local, so there is
+        # nothing meaningful to carry if a caller explicitly serializes a sandbox.
         state = self.__dict__.copy()
         del state["_lock"]
         return state

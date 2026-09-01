@@ -323,9 +323,8 @@ class TestDanglingImageEagerCleanup:
         container remove+recreate into the same call, so this check had to
         run AFTER that internal removal (otherwise it always found THIS
         SAME container as a false-positive "still in use" match) -- a real,
-        pre-existing bug confirmed live against a real docker daemon (see
-        docs/sandbox/container.md's "Layer-depth squashing"
-        section). Under the NEW design, commit() never removes the
+        pre-existing bug confirmed live against a real docker daemon. Under
+        the NEW design, commit() never removes the
         container at all (see its docstring: "it keeps running (or stays
         hibernating)"), so there is no `rm` call here to order against any
         more -- the container's own `run`-time ancestor is whatever
@@ -558,8 +557,7 @@ class TestDanglingImageEagerCleanup:
 # Layer-depth squashing -- stop(commit=True) periodically flattens the
 # checkpoint chain (export/import) instead of always stacking a diff on top
 # of it, to stay under the container runtime's hard layer-depth cap. See
-# container.py's _squash_commit() and docs/sandbox/container.md's
-# "Layer-depth squashing" section.
+# container.py's _squash_commit().
 # ---------------------------------------------------------------------------
 
 
@@ -590,9 +588,8 @@ class TestCheckpointSquash:
         when the fallback then succeeds -- previously this was completely
         silent (only a failure of BOTH paths ever printed anything), which
         is exactly what made a real production squash fallback
-        undiagnosable without live forensics on the running process (see
-        docs/sandbox/container.md's "Fast incremental
-        squashing" section). checkpoint_squash_max_depth is patched down to
+        undiagnosable without live forensics on the running process.
+        checkpoint_squash_max_depth is patched down to
         1 to force this cycle to squash."""
         import agency.sandbox.docker as _mod
 
@@ -754,9 +751,8 @@ class TestCheckpointSquash:
         """After a successful export/import fallback, _squash_base_diff_ids
         must be set to the freshly-flattened image's OWN chain -- this is
         what lets the NEXT squash use the fast path again instead of
-        being permanently stuck re-paying export/import forever (see
-        docs/sandbox/container.md's "Re-baselining after a
-        fallback" section). The single fixed chain value returned below
+        being permanently stuck re-paying export/import forever. The single
+        fixed chain value returned below
         both triggers this cycle's squash (via the patched-down
         checkpoint_squash_max_depth) and is what the post-import rebaseline
         lookup reads back."""
@@ -986,9 +982,7 @@ class TestCheckpointSquash:
 # plain commit by reading that commit's own on-disk overlay2 diff directory
 # directly (see container.py's _build_accumulator_for_squash() and
 # docker.py's _locate_layer_diff_dir()), letting squash time skip `docker
-# save`/`docker diff` on the whole chain entirely. See
-# docs/sandbox/container.md's "Fast incremental squashing"
-# section for the full design and the real-world numbers that motivated it.
+# save`/`docker diff` on the whole chain entirely.
 # ---------------------------------------------------------------------------
 
 
@@ -1040,7 +1034,7 @@ class TestLocateLayerDiffDir:
         """No warning silence: a fast-path lookup miss must be visible in
         the logs, not just an unexplained fallback discovered later (this
         exact silence cost real debugging time diagnosing a production
-        squash fallback -- see docs/sandbox/container.md)."""
+        squash fallback."""
         import agency.sandbox.docker as _mod
 
         sb = self._sb()
@@ -1557,9 +1551,7 @@ class TestCheckpointAccumulator:
     def test_build_accumulator_raises_when_diff_dir_not_found(self):
         """Must raise (so commit() falls back visibly) -- a silent miss
         here is exactly what made a real production squash fallback
-        undiagnosable without live forensics (see
-        docs/sandbox/container.md's "Fast incremental
-        squashing" section)."""
+        undiagnosable without live forensics."""
         import agency.sandbox.docker as _mod
 
         sb = self._sb()

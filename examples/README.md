@@ -36,7 +36,7 @@ python examples/base_example.py
 
 **Pattern 1 — Sequential chain:** Two `ag.run()` calls on the same agent. The second call automatically waits for the first because they chain through the history future. The agent sees both turns in order.
 
-**Pattern 2 — Fork fan-out:** `agent(parent)` deep-copies the history and copies the parent's checkpoint image via `docker tag`; each fork's `run()` fires immediately and returns a pending `agdata`. All three forks run concurrently in separate containers. Accessing `.summary` on each result blocks until that fork is done.
+**Pattern 2 — Fork fan-out:** `agent.fork(parent)` deep-copies the context and copies the parent's checkpoint image; each fork's `run()` fires immediately and returns an `Invocation`. All three forks run concurrently in separate containers. Accessing `.summary` on each invocation blocks until that fork is done.
 
 ```bash
 python examples/parallel_exec.py
@@ -49,7 +49,7 @@ python examples/parallel_exec.py
 **What it shows:** A multi-step, multi-agent research pipeline combining a custom host-side tool, parallel summarisation forks, and the shared output directory.
 
 1. **`find_papers`** — calls a custom `search_papers` tool (HTTP request to the arXiv API, runs on the host) and returns a list of papers.
-2. **Parallel summarisation** — one `agent(main_agent)` fork per paper; all `run(summarise_paper, ...)` calls fire concurrently. Each fork runs in its own sandbox container.
+2. **Parallel summarisation** — one `agent.fork(main_agent)` per paper; all `run(summarise_paper, ...)` calls fire concurrently. Each fork runs in its own sandbox container.
 3. **`compile_report`** — waits for all pending summaries (resolved automatically when passed as input), then uses the sandboxed `write` tool to save a markdown report to `/agent_output/<agname>/report.md`.
 
 The report appears on the host at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.md`.

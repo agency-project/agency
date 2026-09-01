@@ -74,8 +74,7 @@ def test_init_multiple_kwargs_all_become_attributes():
 def test_init_agconfig_instance_override_does_not_affect_class(llm_cfg):
     cfg = _llm_agconfig(llm_cfg)
     team = _EchoTeam(agconfig=cfg)
-    # team.agconfig is its own clone of cfg, not cfg itself -- see
-    # docs/Design_configuration.md ("Changing a Dynamic field live").
+    # team.agconfig is its own clone of cfg, not cfg itself.
     assert team.agconfig is not cfg
     assert team.agconfig.data.get("agllm_backend") == llm_cfg
     assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM

@@ -375,7 +375,7 @@ class agskill:
         return content
 
     # ------------------------------------------------------------------
-    # Scheduling wrapper — non-blocking, returns pending agdata
+    # Scheduling wrapper — non-blocking, returns the exact Invocation
     # ------------------------------------------------------------------
 
     def run(

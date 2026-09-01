@@ -99,7 +99,7 @@ def main():
         print(f"Content : {r1.content!r}\n")
         print("Execution succeeded.\n")
     except Exception as e:
-        # Accessing a field on a pending agdata blocks until the task
+        # Accessing an output field on the Invocation blocks until the task
         # finishes; if the ReAct loop exhausted max_steps without a complete
         # tool call, or the truncated JSON never parsed, that access raises.
         print(f"Failed as expected: {e}\n")

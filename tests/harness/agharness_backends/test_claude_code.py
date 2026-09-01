@@ -364,8 +364,8 @@ def test_real_claude_structured_output_end_to_end():
 
 @real_claude
 def test_real_claude_history_continues_across_a_fresh_sandbox():
-    """Session continuity (docs/Design_harness_history.md) travels with the
-    AGENT (`ag.context.harness_sessions`), not with any particular container:
+    """Session continuity travels with the AGENT
+    (`ag.context.harness_sessions`), not with any particular container:
     call 1 tells the agent a fact, then `ag.sandbox` is swapped for a
     brand-new sandbox (a different container instance) before call 2 asks
     the agent to recall that fact via `--resume` against the captured

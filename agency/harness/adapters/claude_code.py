@@ -67,7 +67,7 @@ def _resolve_binary_in_container(sandbox, binary: str) -> "str | None":
     return cached_path if rc == 0 else None
 
 
-# -- Native session continuity (see docs/Design_harness_history.md) ---------
+# -- Native session continuity ----------------------------------------------
 #
 # Claude Code's own conversation transcript, stored as
 # `<config_home>/projects/<slug>/<session_id>.jsonl` where <slug> is the
@@ -251,8 +251,7 @@ class _ClaudeCodeBackend(agharness_backend):
         from ..ptrace.supervisor import agProxyPtrace
 
         binary = self.binary_path or self._DEFAULT_BINARY
-        # See docs/Design_harness_integration.md's Prerequisites: a
-        # docker/podman-backed sandbox runs the harness INSIDE the
+        # A docker/podman-backed sandbox runs the harness INSIDE the
         # container (its own PID namespace, so its filesystem writes land
         # in the same workspace the rest of that agent's tools see), a
         # chroot-backed (or no) sandbox keeps the existing bare-host launch
@@ -366,7 +365,6 @@ class _ClaudeCodeBackend(agharness_backend):
                 # file lands under whatever HOME resolves to, not
                 # config_home, so it's invisible to the restore/capture
                 # logic and never cleaned up by cleanup_config_home either.
-                # See docs/Design_harness_history.md.
                 "CLAUDE_CONFIG_DIR": str(config_home),
             }
             if profile_hook_events:

@@ -542,8 +542,7 @@ class TestDanglingImageEagerCleanup:
 
 # ---------------------------------------------------------------------------
 # Layer-depth squashing -- mirrors test_docker.py's TestCheckpointSquash
-# against _PodmanBackend instead. See container.py's _squash_commit() and
-# docs/sandbox/container.md's "Layer-depth squashing" section.
+# against _PodmanBackend instead. See container.py's _squash_commit().
 # ---------------------------------------------------------------------------
 
 
@@ -754,9 +753,8 @@ class TestCheckpointSquash:
 # ---------------------------------------------------------------------------
 # Fast incremental squashing -- mirrors test_docker.py's
 # TestLocateLayerDiffDir / TestHostToContainerId / end-to-end accumulator
-# coverage against _PodmanBackend's containers/storage overlay layout.
-# See docs/sandbox/container.md's "Fast incremental squashing"
-# section and podman.py's module docstring.
+# coverage against _PodmanBackend's containers/storage overlay layout. See
+# podman.py's module docstring.
 # ---------------------------------------------------------------------------
 
 

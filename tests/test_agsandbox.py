@@ -1948,8 +1948,8 @@ class TestAgSandboxPIDTracking:
 @docker
 class TestAgSandboxIngestPtracePids:
     """`ingest_ptrace_pids()` is the alternate _watched_pids population path
-    fed by agproxy_ptrace's fork/exit events for harness-driven agents (see
-    docs/agproxy_ptrace.md). Real-container tests here don't require the
+    fed by agproxy_ptrace's fork/exit events for harness-driven agents.
+    Real-container tests here don't require the
     pids to actually exist inside the container's own PID namespace --
     ingest_ptrace_pids()-fed pids are trusted regardless of what the
     container's own /proc scan shows (see get_live_pids()'s docstring-level

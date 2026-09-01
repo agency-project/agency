@@ -11,8 +11,7 @@ before it runs.
 This requires no cooperation from the traced binary -- unlike each coding
 harness's own hook system (Claude Code's `PreToolUse`, opencode's
 `tool.execute.before`, ...), which only fires for calls the harness's own
-tool-dispatch code chooses to report. See docs/Design_harness_integration.md
-("Component 3") for the full design rationale.
+tool-dispatch code chooses to report.
 
 x86_64 Linux only (see ptrace/_ctypes_defs.py's
 `_arch_guard()`) -- `seccomp`+`PTRACE_EVENT_SECCOMP` has no macOS/BSD
@@ -343,9 +342,7 @@ def _isolated_profiler_callback(callback: Callable) -> Callable:
 
 
 class _AgPtraceFields:
-    """Every agproxy_ptrace tunable, as config descriptors -- see
-    docs/agconfig.md for the tier-1 (GlobalConfigParam) vs. tier-3
-    (DynamicConfigParam) distinction."""
+    """Every agproxy_ptrace tunable, expressed as config descriptors."""
 
     syscalls = DynamicConfigParam(
         "agproxy_ptrace", default=("execve", "execveat")

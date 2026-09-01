@@ -1,8 +1,8 @@
 # Agency
 
-A multi-agent framework with sandboxed execution, isolated filesystems, GPU access control, and automatic background-process tracking. Containers are created lazily — only when a task actually calls a sandboxed tool (bash, file I/O, etc.). Tasks that complete using only host-side tools (web fetch, paper search, …) never start a container at all. When a container is started, it is committed to a checkpoint image at the end of the task and destroyed, so containers exist only while sandboxed work is actively running.
+A multi-agent framework with sandboxed execution, isolated filesystems, GPU access control, and automatic background-process tracking. Submission is lazy: PREPARED, dependency-blocked, suspension-gated, and host-only message requests create no engine or sandbox infrastructure before dispatch. A sandbox is created only after an engine-backed invocation is admitted, then its transaction is committed or discarded before output context and results are published.
 
-Agents are non-blocking by default. `agent.run()` returns a pending `agdata` immediately; reading any field on it blocks until the result is ready. A process-wide, event-driven orchestrator holds dependency-blocked requests without creating threads and launches a fresh engine thread whenever an eligible request leaves the ready queue. Concurrency is unlimited by default and can be capped globally. Tool calls are offloaded to a process pool so CPU-bound work never blocks the main interpreter.
+Agents are non-blocking by default. `agent.run()` returns an `Invocation` immediately. The invocation is both the exact lifecycle handle controlled by the global orchestrator and an agdata-compatible pending result: it can be awaited, passed into another skill, or read through attribute access. A process-wide, event-driven orchestrator holds PREPARED and dependency-blocked work without occupying a worker or execution slot, then dispatches eligible work onto a reusable worker pool. Every dispatch still receives a fresh `AgentEngine`. Concurrency is unlimited by default and can be capped globally.
 
 ## Requirements
 
@@ -30,7 +30,7 @@ uv pip install -e ".[dev]"   # dev dependencies (pytest, ruff, pre-commit) + the
 pre-commit install   # one-time; runs ruff (lint + format) and hygiene checks on every commit
 ```
 
-The sandbox image comes with `torch torchvision transformers datasets accelerate numpy scipy matplotlib` pre-installed, and the `Qwen/Qwen3.5-4B` model weights and `wikitext-2-raw-v1` dataset pre-cached. Run `python /opt/model_smoke.py` inside any container to verify the setup.
+The sandbox image installs `torch torchvision transformers datasets accelerate numpy scipy matplotlib`. The build script selects the NVIDIA, AMD, or CPU path automatically and runs an inline PyTorch smoke check.
 
 ## Quick start
 
@@ -41,7 +41,7 @@ cfg = agConfig(agVLLMBackendConfig(model="...", api_key="..."))
 ag = agent(agconfig=cfg)
 ```
 
-Pick the config class for your backend — `agVLLMBackendConfig`, `agOpenAIBackendConfig`, `agAnthropicBackendConfig`, or `agBedrockBackendConfig` — and it only accepts the fields that backend actually uses, catching typos and unsupported options immediately. Need config for more than one thing (an LLM backend and a sandbox mount, say)? Pass several to the same `agConfig(...)` call. See [`agconfig.md`](docs/agconfig.md) and [`Design_configuration.md`](docs/Design_configuration.md) for the full picture, and [`agllm.md`](docs/agllm.md) for the complete LLM field reference.
+Pick the config class for your backend — `agVLLMBackendConfig`, `agOpenAIBackendConfig`, `agAnthropicBackendConfig`, or `agBedrockBackendConfig` — and it only accepts the fields that backend actually uses, catching typos and unsupported options immediately. Need config for more than one thing, such as an LLM backend and a sandbox mount? Pass several config views to the same `agConfig(...)` call.
 
 **OpenAI-compatible serving endpoint (vLLM, local, etc.)**
 
@@ -67,9 +67,34 @@ cfg = agConfig(
 
 ag = agent(agconfig=cfg)
 
-result = ag.run(continuation, agdata(text="Fly me to the moon and let me "))
-print(result.summary)   # blocks until done
+invocation = ag.run(continuation, agdata(text="Fly me to the moon and let me "))
+print(invocation.summary)   # blocks until the invocation succeeds or fails
 ```
+
+## Submissions and lifecycle
+
+All submissions reserve one position in the agent's authoritative context chain. Later work from the same agent cannot overtake that position.
+
+```python
+first = ag.run(skill, agdata(topic="one"))
+second = ag.run(other_skill, first)  # Invocation is a pending data dependency
+
+held = ag.prepare(skill, agdata(topic="three"))
+message = ag.send("Keep citations next to the claims they support")
+
+# `held` intentionally blocks the later message until its original position opens.
+held.start()       # starts only this prepared invocation
+# ag.start()       # alternatively starts a snapshot of all currently prepared work
+
+close = ag.destroy()  # rejects new submissions immediately
+close.wait()          # waits for asynchronous cleanup; repeated destroy() returns this handle
+```
+
+While an invocation is active, `inv.steer(...)`, `inv.pause()`, `inv.resume()`, and `inv.cancel()` control only that invocation. They are observed at safe boundaries, never halfway through a model request or tool call. Steering closes at the final-answer fence, so callers should handle `RuntimeError` if execution has already crossed it.
+
+`ag.suspend()` is the independent agent-wide gate: it prevents new engine-backed dispatch and parks active work at its next safe boundary if it has not crossed the closing/completion fence. Queued work held by the gate occupies no worker or global slot; an already-running invocation retains its slot while parked. `ag.resume()` clears only that gate. It neither starts PREPARED work nor clears an invocation-specific pause. `ag.pause()` remains a compatibility alias for `ag.suspend()`.
+
+`ag.send()` returns a `MessageSubmission`. It copies its predecessor context and appends retained host-only context without creating an engine, sandbox, harness, or model request. See [Invocation API](docs/Invocation_API.md) for result compatibility and lifecycle details.
 
 **OpenAI**
 
@@ -145,77 +170,44 @@ See [`examples/README.md`](examples/README.md) for more details on each example.
 
 ## Core concepts
 
-**`agent`** — a state container with LLM config, sandboxed tools, conversation context (`agcontext`), and a name. `agent.run(skill, input)` is a non-blocking submission call and returns a pending `agdata`. Every dispatched request gets a fresh `AgentEngine` and execution thread; the global orchestrator guarantees at most one active engine thread per agent and commits context in actual execution order. Between tasks `ag.sandbox` is `None`; containers exist only while a task is executing. Forking via `agent(parent)` waits for the source agent's orchestrator barrier, deep-copies its committed context, and copies the parent's checkpoint image (via `docker tag`, or a directory copy for a chroot-backed sandbox — see [agsandbox.md](docs/agsandbox.md)); the fork's container/jail is created lazily on its first run.
+**`agent` / `Agent`** — a state container with LLM config, sandboxed tools, one authoritative conversation-context chain (`agcontext`), and a name. `run()`, `prepare()`, and `send()` atomically reserve positions in that chain. Engine-backed requests receive a fresh `AgentEngine` only when the global orchestrator dispatches them; reusable orchestrator workers provide cross-agent concurrency while preserving one active engine-backed request per agent. Sandboxes and harness services are created lazily. `Agent` is the public alias of `agent`.
 
-**`agskill`** — a named skill with its own system prompt, optional input/output schemas, and an optional tool list. `agskill.run()` is the compatibility submission wrapper for the global orchestrator; it does not create or park a worker thread. The actual synchronous ReAct loop is `agskill.execute_react()`. The LLM calls tools, inspects results, and iterates until it has registered all required output fields. Output is collected via per-field tools (`return_summary`, `return_score`, etc.) generated dynamically from the output schema — each with a typed `value` parameter — rather than a single JSON blob. Each field is validated immediately on registration; missing fields trigger a targeted reprompt.
+**`agskill`** — a named skill with its own system prompt, optional input/output schemas, and an optional tool list. `agskill.run(agent, input)` uses the same orchestrator path and returns the same `Invocation` shape as `agent.run()`. Harness execution begins only after scheduler admission.
 
-**`GlobalAgentOrchestrator`** — the lazy process-wide scheduler, dependency resolver, wait pool, and ready queue. Submission, dependency completion, and engine completion push events to its scheduler thread; each event runs a complete resolve-all-waiting → promote-all-ready → schedule-ready cycle, with no completion polling. Configure its optional process-wide capacity with `agOrchestratorConfig(max_concurrent_engines=...)`, and inspect or stop it through `get_orchestrator().snapshot()` and `.shutdown()`.
+**`GlobalAgentOrchestrator`** — the process-wide scheduler, dependency resolver, context-only message executor, ready queue, and reusable execution-worker owner. Submission, control changes, dependency completion, engine completion, and shutdown push events to one condition-backed scheduler thread; there is no completion polling. Configure active engine capacity with `agOrchestratorConfig(max_concurrent_engines=...)`, and inspect or stop it through `get_orchestrator().snapshot()` and `.shutdown()`.
 
-**`agtool`** — a named callable an LLM can invoke via function calling. Every tool call is offloaded to a `ProcessPoolExecutor` worker so CPU-bound tools don't block other agents. Tools are serialised with `cloudpickle`, so bound methods work without any extra machinery. Before each sandboxed tool call the container is checkpointed; on tool failure the sandbox is automatically rolled back to that checkpoint and the LLM is told the workspace was reverted. Agents can pass `"timeout": <seconds>` in any tool call's arguments to override the default 30 s watchdog.
+**`agtool`** — a named callable an LLM can invoke via function calling. It exposes an OpenAI-compatible tool schema and calls its function directly in the execution-owning process and thread, preserving closures over live host state. The optional timeout argument is retained for call-site compatibility but is not enforced by `agtool` itself. Sandbox commit or rollback belongs to the enclosing invocation transaction.
 
-**`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. Fields are accessed as attributes (`result.summary`). Supports JSON serialisation and schema validation.
+**`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. An `Invocation` exposes its pending output through `inv.result`, proxies unknown attributes to that output, and can be passed anywhere pending agdata is accepted. Supports JSON serialisation and schema validation.
 
 **`agtype`** — base class for typed agdata field values. Subclass to control how a schema field is serialised, transferred to/from the sandbox filesystem, represented in the system prompt, and cleaned up. `agfile` is the built-in subclass for file-backed fields. `agimage` is the built-in subclass for multimodal image inputs — local files are base64-encoded automatically; the image is injected into the message content array so the model sees it visually. `agrawstring` bypasses JSON formatting entirely — the input string is sent as raw text and the model's full response is captured as-is, skipping JSON parsing and the retry loop.
 
 **`agteam`** — coordinates multiple agents or tasks. Subclass, define `setup()` to wire up agents and skills, override `run()` with your workflow. Each `run()` call executes in its own daemon thread.
 
-**`agwebui`** — a browser-based dashboard that runs in a separate process. Writes structured events to a JSONL file; a standalone FastAPI server tails it and pushes updates to connected browsers over WebSocket. See [docs/agwebui.md](docs/agwebui.md).
+**`agwebui`** — a browser-based dashboard whose FastAPI server runs in a separate process. Its execution-side emitter writes structured events to `ui_events.db`; the standalone server polls that SQLite database and pushes updates to browsers over WebSocket.
 
 **GPU support** — NVIDIA and AMD (ROCm) GPUs are both supported. `agResourcePool` auto-detects GPUs via `nvidia-smi` (NVIDIA) or `rocm-smi` (AMD) and issues leases to prevent two agents from sharing a device. The sandbox container receives `--gpus all` (NVIDIA) or `--device /dev/kfd --device /dev/dri` (AMD) at startup. GPU access uses *lazy physical allocation*: `reserve_gpu` sets a virtual flag with no physical cost; a physical GPU is claimed from the pool only when a bash command actually runs, and returned as soon as the command's processes finish. Between bash calls the GPU is free for other agents. `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES` are set to the assigned device ID for the duration of each bash execution.
 
 ## Running tests
 
 ```bash
-pytest
+uv run pytest
 ```
 
-Most tests mock the OpenAI client and run entirely in-process (no container needed). Tests that require a live container are marked and skipped if Docker/Podman is unavailable. Tool calls run through the real process pool in all tests — the same code path as production.
+Most tests mock the model client and run entirely in-process without a container. Tests that require a live container are marked and skipped when Docker or Podman is unavailable. Tool tests use the same direct-call path as production.
 
 ## Linting
 
 ```bash
-pre-commit run --all-files
+uv run pre-commit run --all-files
 ```
 
 Runs the same checks as the `pre-commit` git hook and the CI `pre-commit` job: `ruff check --fix` (unused imports/variables, undefined names), `ruff format`, and hygiene hooks (trailing whitespace, end-of-file, YAML/TOML syntax, merge-conflict markers). Config lives in `.pre-commit-config.yaml` and `pyproject.toml`'s `[tool.ruff]`.
 
 ## Docs
 
-### Design
-
 | File | Topic |
 |---|---|
-| [Design_execution_loop.md](docs/Design_execution_loop.md) | Outer monitoring loop, inner ReAct loop, inbox drain, compaction |
-| [Design_sandbox_lifecycle.md](docs/Design_sandbox_lifecycle.md) | Trace: background job, foreground job, daemon |
-| [Design_compaction.md](docs/Design_compaction.md) | Auto-compaction — trigger, algorithm, incremental summaries |
-| [Design_deadlock.md](docs/Design_deadlock.md) | Deadlock patterns — shared agents across parallel threads, diagnosis, and fixes |
-| [Design_parallelization.md](docs/Design_parallelization.md) | Parallelism model — threads, GIL, process pool, LLM streaming |
-| [Design_orchestrator.md](docs/Design_orchestrator.md) | Global scheduler, dependency futures, queue policy, and shutdown |
-| [Design_resource_control.md](docs/Design_resource_control.md) | All semaphores and locks — what each guards and how it is acquired |
-| [Design_error_handling.md](docs/Design_error_handling.md) | All try/except blocks, retry loops, error emissions, and propagation paths |
-| [Design_configuration.md](docs/Design_configuration.md) | Configuring agents/teams, the tiered parameter system, adding custom config params |
-
-
-### Implementation
-
-| File | Topic |
-|---|---|
-| [agent.md](docs/agent.md) | Agent construction, `run()`, forking, context, UI callbacks |
-| [agconfig.md](docs/agconfig.md) | `agConfig` storage model, `ConfigParam` tiers, `FIELD_REGISTRY`, `_AgConfigViewBase`, `_ALLOWED_FIELDS` |
-| [agcontext.md](docs/agcontext.md) | Persistent conversation state — message history, token counts, compaction summary |
-| [agdata.md](docs/agdata.md) | Data container — pending results, schema types, serialization, error handling |
-| [agllm.md](docs/agllm.md) | LLM wrapper — streaming calls, message construction, compaction, Bedrock support |
-| [agskill.md](docs/agskill.md) | `run()` scheduling wrapper, `execute_react()` ReAct loop, schemas, `agtype`/`agfile` typed fields, input offloading, validation, retries |
-| [agtype.md](docs/agtype.md) | `agtype` interface — typed field values, `agfile`, `agimage` (multimodal), `agrawstring` (raw bypass), custom subclasses |
-| [agtools.md](docs/agtools.md) | Built-in tools, process offloading, sandboxed factories, `ask_human` |
-| [agteam.md](docs/agteam.md) | Team coordination, `setup()` / `run()`, `agsync` |
-| [agsandbox.md](docs/agsandbox.md) | Backend selection (docker/podman/chroot), sandbox lifecycle, GPU access, exec wrapper, PID tracking |
-| [agresources.md](docs/agresources.md) | GPU/CPU/memory resource pool |
-| [aglog.md](docs/aglog.md) | Structured JSONL log — skills, tools, lifecycle, compaction |
-| [agterm.md](docs/agterm.md) | Color-coded terminal logger — event labels, color palette, webui routing |
-| [agwebui.md](docs/agwebui.md) | Web UI — browser dashboard, event stream, WebSocket, ask_human path |
-| [agsync.md](docs/agsync.md) | `agsync` — block until all pending agent results resolve |
-| [agmap.md](docs/agmap.md) | `agmap` — run non-agent functions over items concurrently, sync or async |
-| [agname.md](docs/agname.md) | Agent naming — auto-generated unique names for agents and run directories |
-| [agutil.md](docs/agutil.md) | Shared utilities — helpers used across the framework |
-| [agschema.md](docs/agschema.md) | Schema validation — output field validation, type error fixes, field handler construction |
+| [Invocation_API.md](docs/Invocation_API.md) | `Invocation`, PREPARED work, ordered messages, controls, and destruction |
+| [Design_orchestrator.md](docs/Design_orchestrator.md) | Atomic context-chain publication, event scheduling, reusable workers, and shutdown |
+| [Design_execution_loop.md](docs/Design_execution_loop.md) | Safe-boundary control delivery, transactions, attempt isolation, and retained cursors |

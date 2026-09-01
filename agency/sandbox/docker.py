@@ -11,8 +11,7 @@ storage hooks; see `.podman._PodmanBackend` for Podman's equivalents
 
 The substantial override here is `_locate_layer_diff_dir()`, feeding
 `_ContainerBackendBase._build_accumulator_for_squash()`'s lazy fast
-squashing path (see docs/sandbox/container.md's "Fast
-incremental squashing" section). It supports two Docker storage backends,
+squashing path. It supports two Docker storage backends,
 both confirmed empirically:
 
 - Classic moby **overlay2** graphdriver: `<DockerRootDir>/image/overlay2/layerdb`

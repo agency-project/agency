@@ -9,8 +9,7 @@ third-party CLI harness on identical work.
 
 Native is the profiler's best case: it is the one engine that emits turn and
 tool boundaries from *inside* the sandbox (Tier 3, exact), so ``turn{i}`` and
-``tool:{name}`` spans here are measured, not inferred. See
-``docs/Design_profiler_harness_integration.md`` §5.7 for the per-engine table.
+``tool:{name}`` spans here are measured, not inferred.
 
 
 What this exercises
@@ -395,7 +394,7 @@ def _workload() -> None:
             for i, (fork, note) in enumerate(zip(forks, notes))
         ]
         for i, result in enumerate(pending):
-            # Touching a field on a pending agdata blocks -- that wait is the
+            # Touching an output field on an Invocation blocks -- that wait is the
             # `sync:result_wait` span.
             print(f"        fork {i}: status={result.status!r} path={result.path!r}")
         agsync(ag)

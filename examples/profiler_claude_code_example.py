@@ -70,8 +70,7 @@ native run:
     is host truth and is what a benchmark should quote; there is no
     ``llm:compact`` span on this engine, and its absence is not a zero.
 
-See ``docs/Design_profiler_harness_integration.md`` §5.7 for the full
-per-engine table.
+The exact span set depends on which operations this harness performs.
 
 
 The network dimension
@@ -432,7 +431,7 @@ def _workload() -> None:
             for i, (fork, note) in enumerate(zip(forks, notes))
         ]
         for i, result in enumerate(pending):
-            # Touching a field on a pending agdata blocks -- that wait is the
+            # Touching an output field on an Invocation blocks -- that wait is the
             # `sync:result_wait` span.
             print(f"        fork {i}: status={result.status!r} path={result.path!r}")
         agsync(ag)

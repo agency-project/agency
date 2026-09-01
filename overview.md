@@ -228,4 +228,3 @@ idle threshold.
 whether `dispatch_tools()` (deleted in the Phase 0 retirement) hibernates between tool calls —
 that docstring looks stale now that `dispatch_tools()` no longer exists; worth checking whether
 `persistent` still does anything for native at all.
-

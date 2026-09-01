@@ -13,7 +13,7 @@ def _agsync_impl(*targets) -> None:
       (e.g. the list returned by ``agmap(..., is_asynchronous=True)``)
 
     For an ``agteam``, every agent tracked by the team is included — both
-    agents created in ``setup()`` and any fork agents (``agent(parent)``)
+    agents created in ``setup()`` and any agents created with ``agent.fork(parent)``
     created dynamically during ``run()``.  The team's background thread
     (started by ``run()``) is also joined.
 

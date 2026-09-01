@@ -1,6 +1,5 @@
 """opencode backend -- the reference concrete `agharness_backend`
-implementation, and the smallest real end-to-end harness slice per
-docs/Design_harness_integration.md's build order: opencode's
+implementation and the smallest real end-to-end harness slice: opencode's
 `@ai-sdk/openai-compatible` provider already speaks plain OpenAI
 chat-completions, matching `agproxy_llm`'s passthrough route with zero
 translation, and `opencode run --format json` is a simple headless

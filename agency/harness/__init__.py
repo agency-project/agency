@@ -5,5 +5,5 @@ host/harness-side managers each backend actually dispatches through live
 in `agency/manager/` (`agmanager_host`/`agmanager_harness`), not here.
 Nothing in here is part of the public API; `agharness.py` (this package's
 own thin, engine-agnostic glue module) and `agent`/`agskill`'s `harness=`
-seam are the intended entry points -- see docs/agharness.md.
+seam are the intended entry points.
 """

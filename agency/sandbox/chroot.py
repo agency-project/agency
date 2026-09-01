@@ -130,13 +130,9 @@ containment + independent per-agent installs, not adversarial isolation),
 same as the broader "no persistent daemon" limitation above.
 
 KNOWN, SEPARATE LIMITATION -- `_invocation_pgids` is a plain in-memory
-attribute, so it does NOT survive across the cloudpickle/worker-process
-boundary tool calls with `run_in_subprocess=True` (the default) create:
-a worker's own copy of this backend records a real PGID in ITS OWN
-`_invocation_pgids`, which is discarded when that worker process exits.
-`agSandbox.wait_for_processes()` is always called from the orchestrating
-process (see agskill.py), whose OWN copy never independently ran `exec()`
--- confirmed empirically: a worker-spawned background job is invisible to
+attribute, so it does not survive if a caller explicitly serializes the
+backend and executes it in another process. A background job spawned through
+that detached copy is invisible to
 `_has_pending_background_work()` when checked from the orchestrator's
 copy, exactly the scenario `_ensure_started()`'s own docstring already
 documents needing disk-based (not in-memory) ground truth for. Not yet
@@ -673,11 +669,9 @@ class _ChrootBackend(agsandbox_backend):
         from ``_checkpoint_image`` if one was given at construction time.
 
         Ground truth is always the workspace directory's existence on disk
-        -- there is no ``self._started`` cache. Tool calls with
-        ``run_in_subprocess=True`` (the default) get a fresh cloudpickled
-        copy of this backend per call, so a per-process flag would be
-        unreliable — exactly the problem ``_ContainerBackendBase``'s
-        equivalent method documents and solves by querying the docker daemon
+        -- there is no ``self._started`` cache. A per-instance flag would be
+        unreliable if multiple backend views share the workspace, exactly the
+        problem ``_ContainerBackendBase`` solves by querying the container runtime
         (``_container_running()``) rather than trusting a flag. There's no
         daemon here, so the workspace directory itself is the cross-process
         source of truth: materializing from a checkpoint every time some
@@ -972,10 +966,8 @@ class _ChrootBackend(agsandbox_backend):
         container. Returns False if the jail was never started (nothing to
         snapshot).
 
-        Checks the workspace directory's existence on disk directly -- this
-        may be called from the orchestrating process on a sandbox whose
-        actual workspace was written to entirely by worker-process tool
-        calls (see _ensure_started()'s docstring).
+        Checks the workspace directory's existence on disk directly so it
+        remains correct when another backend view created the workspace.
         """
         if not self._workspace.is_dir():
             return False

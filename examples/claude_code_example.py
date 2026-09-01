@@ -4,7 +4,7 @@ Example: same agent/skills as base_example.py, but driven by the real
 
 Set harness="claude_code" on the agent and Claude Code's own LLM traffic is
 transparently routed through agproxy_llm to whatever agllm backend is
-configured below (see docs/agharness.md) -- Claude Code keeps its own
+configured below -- Claude Code keeps its own
 system prompt/scaffolding/tools; agency only occupies the LLM endpoint and
 the syscall boundary of its process tree.
 

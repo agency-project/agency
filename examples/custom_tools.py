@@ -4,10 +4,10 @@ custom_tools.py — Research paper crawler with parallel summarisation.
 Workflow:
   1. find_papers skill  — agent searches arxiv for the topic; returns a list of
                           {title, url, abstract} dicts as agdata.
-  2. agent(main_agent)  — one local copy per paper; each copy's run() fires
-                          immediately and returns a pending agdata.  All summaries
+  2. agent.fork(main_agent) — one local copy per paper; each copy's run() fires
+                          immediately and returns an Invocation.  All summaries
                           run concurrently with no explicit thread management.
-  3. compile_report     — the list of pending agdata is passed directly to the
+  3. compile_report     — the list of pending Invocations is passed directly to the
                           original agent; each is resolved automatically before
                           the skill starts.  The skill returns the report as an
                           agfile — the framework reads it back from the sandbox

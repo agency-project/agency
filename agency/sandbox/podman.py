@@ -14,9 +14,8 @@ incremental-squashing hooks:
 overlay layout -- confirmed empirically, not from a single published
 "how to find a layer's diff dir" doc -- feeding
 `_ContainerBackendBase._build_accumulator_for_squash()` the same way
-`.docker._DockerBackend` feeds it from Docker's overlay2 graphdriver
-(see docs/sandbox/container.md's "Fast incremental squashing"
-section). The correlation is: `podman info`'s `store.graphRoot` +
+`.docker._DockerBackend` feeds it from Docker's overlay2 graphdriver.
+The correlation is: `podman info`'s `store.graphRoot` +
 `store.graphDriverName` → `<graphRoot>/overlay-layers/layers.json`
 maps a layer's `diff-digest` (exactly what `podman inspect` reports in
 `RootFS.Layers`) to a storage layer `id` →
@@ -199,9 +198,7 @@ class _PodmanBackend(_ContainerBackendBase):
     ) -> "Path | None":
         """Find the raw overlay diff directory backing *diff_id* directly
         on disk (`<graphRoot>/overlay/<layer-id>/diff/`), bypassing
-        `podman diff`/`podman save` entirely -- see
-        docs/sandbox/container.md's "Fast incremental
-        squashing" section for the full rationale. Correlates via
+        `podman diff`/`podman save` entirely. Correlates via
         `<graphRoot>/overlay-layers/layers.json`: each entry's
         `diff-digest` matches what `podman inspect` reports in
         `RootFS.Layers`, and its `id` is the directory name under

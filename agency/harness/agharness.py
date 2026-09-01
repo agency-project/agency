@@ -9,8 +9,7 @@ token/base_url, and a run leaves no trace in the user's own `~/.claude`/
 `~/.codex`/`~/.config/opencode`), and prompt construction that reuses
 agskill's own existing code rather than re-implementing it -- the skill's
 task is delivered to the harness as a plain user-turn prompt, never
-injected as the harness's own system prompt or as a tool (see
-docs/Design_harness_integration.md).
+injected as the harness's own system prompt or as a tool.
 """
 
 from __future__ import annotations
@@ -45,9 +44,8 @@ def cleanup_config_home(path: Path) -> None:
 
 def is_container_backed(sandbox) -> bool:
     """True for a docker/podman-backed sandbox (`IMAGE_KIND == "container"`),
-    False for chroot or no sandbox at all. See
-    docs/Design_harness_integration.md's "Prerequisites": a container-backed
-    harness launch needs the in-container ptrace bridge and in-container
+    False for chroot or no sandbox at all. A container-backed harness launch
+    needs the in-container ptrace bridge and in-container
     config-home materialization below; chroot's harness launch already runs
     on the bare host (the jail IS a real host directory) and needs neither."""
     return sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"

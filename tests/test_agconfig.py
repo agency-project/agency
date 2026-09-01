@@ -647,7 +647,7 @@ class TestAgLLMBackendFieldDescriptors:
 
 class TestAgLLMBackendConfig:
     """The canonical construction form is always agConfig(agLLMBackendConfig(...)),
-    never agLLMBackendConfig(...).agconfig directly -- see docs/agconfig.md."""
+    never agLLMBackendConfig(...).agconfig directly."""
 
     def test_agconfig_property_returns_agconfig_instance(self):
         cfg = agConfig(agLLMBackendConfig(model="m"))
@@ -1058,8 +1058,8 @@ class TestGlobalFieldSweepAcrossOwners:
 
 # ---------------------------------------------------------------------------
 # Constant-inlining changes: fields that used to freeze a plain class
-# constant into their `default=` (a no-op-on-reassignment trap -- see
-# docs/agconfig.md's "The three tiers") now inline the literal directly.
+# constant into their `default=` (a no-op-on-reassignment trap) now inline
+# the literal directly.
 # Other code needing the same value reads it off the descriptor's `.default`
 # instead of a separate constant -- verify that accessor still resolves to
 # the expected value for every field this session's refactor touched.

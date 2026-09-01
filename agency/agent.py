@@ -92,8 +92,8 @@ class agent:
     logging infrastructure) and delegates execution to agskill objects.
 
     agent.run(skill, input)
-        Always non-blocking.  Returns a pending agdata immediately.  Calls on
-        the same agent are serialized through the history chain.  Calls on
+        Always non-blocking.  Returns an Invocation immediately.  Calls on the
+        same agent are serialized through the context chain.  Calls on
         different agents (forks) run concurrently.
 
     agent.fork(existing_agent)
@@ -752,10 +752,9 @@ class agent:
             # docker/podman image tag are unrelated formats.
             state["sandbox_image_kind"] = self.sandbox.image_kind
         if checkpoint_context.harness_sessions:
-            # See docs/Design_harness_history.md -- travels with the
-            # agent's own checkpoint, not with container.tar, so it's
-            # available regardless of which sandbox this checkpoint is
-            # later restored onto.
+            # Session continuity travels with the agent's own checkpoint, not
+            # with container.tar, so it remains available regardless of which
+            # sandbox this checkpoint is later restored onto.
             state["harness_sessions"] = checkpoint_context.harness_sessions
         if checkpoint_context.retained_messages:
             state["retained_messages"] = checkpoint_context.retained_messages

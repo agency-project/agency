@@ -11,7 +11,7 @@ the second backend (after opencode) that routes its LLM traffic through
 CAVEAT: no `grok` binary was installed in the environment this was
 developed in (installing it requires running xAI's `curl | bash` install
 script, a real download-and-execute-from-the-internet action deliberately
-not taken without being asked first -- see docs/agharness.md) -- this
+not taken without being asked first) -- this
 backend's orchestration logic (config-home isolation, agproxy_ptrace
 launch, agproxy_llm token registration, output-schema recovery) follows
 the exact same tested shape as `opencode.py`/`claude_code.py`, but the

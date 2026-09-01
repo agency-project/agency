@@ -642,8 +642,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         shares the host namespace, would see them there too). Bridging that
         gap for the docker/podman backends -- running the supervisor inside
         the container plus an IPC channel back to the caller's `agpolicy` --
-        is an open item; see docs/Design_harness_integration.md's "Design
-        Tensions" section.
+        is an open item.
         """
         now = time.monotonic()
         baseline_pids = self._baseline_pids or ()

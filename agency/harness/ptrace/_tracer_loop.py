@@ -9,8 +9,8 @@ thread for the lifetime of a launch.
 Uses `waitpid(pid, WNOHANG)` polled per known pid, NOT `waitpid(-1, ...)`.
 `waitpid(-1, ...)` reaps exit status for ANY child of the calling process,
 not just ones this loop is tracing -- in a process that also spawns
-subprocesses elsewhere (ProcessPoolExecutor workers, `docker`/`podman` via
-subprocess.run, ...), that would race with and could steal the exit status
+subprocesses elsewhere (`docker`/`podman` via subprocess.run, harnesses, ...),
+that would race with and could steal the exit status
 those other call sites are waiting on. Polling WNOHANG per known pid avoids
 this at the cost of a small, bounded poll latency -- verified during
 development against a concurrent unrelated `subprocess.Popen` child (it gets

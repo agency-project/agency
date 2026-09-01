@@ -1,6 +1,4 @@
-"""Harness-native hook fallback -- lower priority per
-docs/Design_harness_integration.md's build order ("reduced-coverage
-fallback, don't over-invest here"): `agproxy_ptrace` is the default
+"""Harness-native hook fallback with reduced coverage: `agproxy_ptrace` is the default
 mediation path everywhere it's usable (Linux with a working ptrace), and
 this module exists only for the case it explicitly isn't (non-Linux, or a
 sandboxed environment where `ptrace_available()` genuinely returns False).

@@ -232,8 +232,7 @@ def test_repr():
 
 
 # ---------------------------------------------------------------------------
-# harness -- the seam between the native ReAct loop and an off-the-shelf
-# harness (see docs/Design_harness_integration.md)
+# harness -- the seam between the native ReAct loop and an off-the-shelf harness
 # ---------------------------------------------------------------------------
 
 

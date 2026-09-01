@@ -519,9 +519,8 @@ def _gpu_flags(runtime: str) -> list[str]:
 # podman share this one cap, not one each -- see this module's docstring for
 # why they're both subject to the same kernel session-keyring quota).
 # multiprocessing.Semaphore is backed by a POSIX IPC semaphore so the limit
-# is enforced across all worker processes (which run _ensure_started) and
-# the main process (which calls stop/destroy), not just threads within one
-# process.
+# remains process-wide if multiple processes use the backend, rather than
+# applying independently to threads in each process.
 def _keyring_container_limit() -> int:
     """Return the concurrent-container cap derived from the kernel keyring quota."""
     _fields = AgSandboxBackendFields()
@@ -672,12 +671,9 @@ class _ContainerBackendBase(agsandbox_backend):
     ) -> None:
         reap_orphaned_containers()
         # Captured here, at construction time, rather than read fresh from
-        # os.getpid() inside _ensure_started() -- tool calls with
-        # run_in_subprocess=True (the default) cloudpickle this backend to a
-        # ProcessPoolExecutor worker, so _ensure_started() (and the `docker
-        # run` it issues) can run in a short-lived *worker* process distinct
-        # from -- and which can exit independently of -- the main process
-        # that actually owns this sandbox for its whole lifetime. Labeling
+        # os.getpid() inside _ensure_started(). This preserves stable sandbox
+        # ownership even if a backend object is explicitly serialized or used
+        # from another process. Labeling
         # the container with a fresh os.getpid() there would tag it with
         # whichever worker happened to create it; once that worker exits
         # (routine pool recycling, not a crash) while the container and its
@@ -857,8 +853,7 @@ class _ContainerBackendBase(agsandbox_backend):
         self._started cache. Every call pays one lifecycle-state inspect via
         _inspect_container_state(); an active profiler adds an ID/PID inspect
         on first registration to resolve and validate the kernel cgroup. That's the price of never
-        trusting a per-process flag that a different worker-process copy of
-        this backend could have made stale.
+        trusting a per-instance flag that another backend view could have made stale.
 
         _baseline_pids is captured exactly once (None means "not yet") and
         never refreshed after that, even though this method itself now runs
@@ -1376,9 +1371,7 @@ class _ContainerBackendBase(agsandbox_backend):
         costing ~9s on a real ~24GB/many-file image regardless of how
         much actually changed) or `docker save` (cost proportional to the
         whole image). See `_build_accumulator_for_squash()`'s docstring
-        for how this feeds the fast squash path, and
-        docs/sandbox/container.md's "Fast incremental
-        squashing" section for the full rationale.
+        for how this feeds the fast squash path.
 
         *diff_ids*, when provided, is the image's full RootFS.Layers list
         (most-base-first) ending at *diff_id*. Some storage backends

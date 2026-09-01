@@ -7,10 +7,9 @@ function-local imports of the concrete backends (avoids a circular import,
 same reasoning as llm).
 
 Selection dispatches on the `harness` string itself (e.g. `ag.harness ==
-"claude_code"`, set via `agent(harness=...)` -- see docs/agent.md's harness
-seam) rather than a separate `provider` config field: `ag.harness` is
-already the authoritative "which harness" signal (Component 4 of
-docs/Design_harness_integration.md), so there is no second place a user
+"claude_code"`, set via `agent(harness=...)`) rather than a separate
+`provider` config field: `ag.harness` is already the authoritative "which
+harness" signal, so there is no second place a user
 would need to keep in sync with it.
 
 Every concrete backend implements the sandbox-daemon

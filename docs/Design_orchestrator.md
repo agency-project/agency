@@ -1,123 +1,93 @@
-# Global Agent Orchestrator
+# Global orchestrator design
 
-`GlobalAgentOrchestrator` is the process-wide host-side scheduler for every
-`agent.run()` submission. It owns dependency admission, ready ordering,
-per-agent exclusion and the optional global engine limit. `agskill.run()` remains the public compatibility wrapper, but it no
-longer creates a worker thread itself.
+`GlobalAgentOrchestrator` is the process-wide authority for skill invocations and host-only messages. Public handles do not run their own schedulers and do not mirror lifecycle state: each `Invocation` or `MessageSubmission` is the exact submission referenced by its internal orchestrator request.
 
 The implementation is split by ownership:
 
-- `agency/orchestrator/orchestrator.py` contains `GlobalAgentOrchestrator`,
-  request and engine lifecycle, the event thread, profiling, and singleton
-  lifecycle.
-- `agency/orchestrator/scheduler.py` contains `ExecutionScheduler`, the wait
-  pool dependency resolver, ready heap, cycle detection, dependency
-  materialization, and scheduling policy.
-The main object exposes its scheduling component as `orchestrator.scheduler`.
+- `agency/orchestrator/orchestrator.py` owns atomic submission, request lifecycle, context settlement, the scheduler event thread, reusable execution workers, telemetry, and singleton shutdown.
+- `agency/orchestrator/scheduler.py` owns dependency discovery, the wait pool, managed-cycle detection, the ready heap, message routing, and dispatch policy. The orchestrator performs message settlement.
+- `agency/orchestrator/agresources.py` remains the process-wide CPU, memory, and GPU resource authority.
 
-## Request lifecycle
+## One authoritative context chain
 
-Each submission becomes an internal execution request with a stable request
-ID, monotonically increasing submission sequence, agent, skill, input,
-dependency set, captured profiler context, result future, and lifecycle state:
+Every agent has one context head. A call to `run()`, `prepare()`, or `send()` takes the orchestrator condition and then the agent submission lock and performs one atomic publication:
 
-```text
-submitted ──┬── no unresolved inputs ──> ready ──> running ──> completed
-            └── pending inputs ────────> blocked ─┘              └─> failed
-```
+1. Verify that the orchestrator and agent still accept work.
+2. Allocate the agent's next monotonic ordering ID.
+3. Capture the current context head as the predecessor.
+4. Create the submission's unresolved output-context placeholder.
+5. Publish that placeholder as the new head.
+6. Register an orchestrator request that references the exact public submission.
 
-The scheduler has one dedicated thread blocked on a condition-backed event
-queue. Submissions, dependency callbacks, engine completion, and shutdown push
-events into that queue. There is no completion polling interval.
+Registration and chain publication therefore have the same linearization point. The predecessor context is an implicit dependency, so same-agent submissions cannot overtake one another. A PREPARED node intentionally blocks everything behind it until it is started or becomes terminal.
 
-Pending inputs are discovered recursively through `agdata`, dictionaries,
-lists, and tuples. A blocked request has no engine thread and consumes no
-engine-capacity slot. A future callback only posts a dependency event; the
-scheduler owns all lifecycle transitions.
+Pre-execution failures and controlled terminal paths that did not commit new context pass their predecessor through without adding context, using an event-driven continuation only when that predecessor remains unresolved. An ordinary executed skill failure instead copies its predecessor and appends the canonical rollback notice. Context is always settled before the public result, so result callbacks see the submission's context as complete.
 
-## Event-driven scheduling cycle
+## Requests and event scheduling
 
-Every submission, dependency completion, engine completion, and shutdown event
-causes one `orchestrator.scheduler.execute()` cycle under the scheduler lock:
+The scheduler thread blocks on a condition-backed event queue. Submission, control changes, dependency callbacks, engine completion, context pass-through completion, and shutdown post events. There is no scheduler polling interval and no dependency-wait thread per request.
+
+The important internal states are:
 
 ```text
-apply scheduler event
-        │
+PREPARED gate closed
+        │ start()
         ▼
-resolve_dependency(request) for every submitted/blocked request
-        │
-        ▼
-move every newly resolved request to the ready heap
-        │
-        ▼
-schedule() → default_schedule()
-        │
-        ▼
-launch every eligible ready request
+submitted ── unresolved predecessor/input ──> blocked
+        │                                      │ dependency event
+        └──────────── dependencies ready ◀─────┘
+                              │
+                              ├─ message ──> context-only completion
+                              │
+                              ▼
+                            ready ──> running ──> terminal
 ```
 
-Dependency-completion events are wakeups rather than targeted transition
-commands. Scanning the complete wait pool before scheduling means an engine
-completion can promote all requests it unblocked before the newly available
-capacity is assigned. `schedule` is wired to `default_schedule` as the policy
-seam; the default drains all eligible ready work subject to the global capacity
-and one-active-engine-per-agent constraints.
+Each event runs a complete cycle: resolve every waiting request, detect managed dependency cycles, promote all newly ready requests, then dispatch eligible ready work. Recursive dependency discovery and materialization understand agdata-compatible pending handles, including `Invocation` and `MessageSubmission`, along with dictionaries, lists, tuples, dataclasses, and supported model objects.
 
-## Admission and ordering
+Dispatch requires all of the following:
 
-Ready requests are ordered by submission sequence. The scheduler chooses the
-oldest request whose agent is not already running and for which global capacity
-is available. A dependency-blocked request is not in the ready heap, so a
-later ready request—including one for the same agent—can run first. This is the
-ready-first rule that prevents the old registration-order history-chain
-deadlock.
+- the invocation readiness gate is open;
+- predecessor and explicit input dependencies are resolved;
+- the agent is not suspended;
+- the invocation is not terminal or specifically paused;
+- no other engine-backed request is active for that agent;
+- global engine capacity is available.
 
-Dispatch is atomic under the scheduler lock: the request leaves the ready
-queue, capacity is reserved, its agent is marked active, and a fresh daemon
-thread and fresh request-owned `AgentEngine` are created. At most one engine
-thread is active per agent. When it completes, the scheduler commits the
-returned context before resolving the public result and releasing the agent
-slot. Consequently, history reflects actual execution order.
+`max_concurrent_engines=None` preserves effectively unlimited cross-agent concurrency. A positive integer caps active engine-backed requests across the process. PREPARED, dependency-blocked, message, and queued requests held behind agent suspension consume no engine capacity. An invocation that was already running when it parked at a suspension boundary remains active and retains its slot.
 
-`max_concurrent_engines=None` preserves unlimited cross-agent concurrency. A
-positive integer caps active engine threads across the process. Resource-aware
-admission remains the responsibility of `agResourcePool` because requests do
-not declare their resource needs before execution.
+## Reusable workers, fresh engines
 
-## Dependency failures and cycles
+The orchestrator owns one lazily populated execution-worker pool. It does not create one thread per invocation. Sequential requests can reuse a worker thread, but every dispatched request receives a new `AgentEngine` bound to that request's exact `Invocation`.
 
-Cancelled futures, future exceptions, and futures resolving to `agerror` fail
-their consumer without launching its engine or changing its agent context.
-Futures produced by this orchestrator are tagged with producer request IDs.
-The scheduler runs strongly connected component detection over that known
-producer graph and fails every member of a cycle. External futures are opaque:
-their completion still wakes the scheduler, but an external future that never
-settles waits until explicit shutdown.
+Every worker job runs in a fresh `contextvars.Context`, while the profiler parent captured at submission is passed explicitly to the execution span. Reuse therefore cannot leak invocation-local context or tracing state.
 
-`agteam` and `agmap` keep their existing thread models. Their pending `agdata`
-objects participate as ordinary external dependencies.
+Submission to the pool is admission-gated. `ThreadPoolExecutor` queues a work item before it may attempt to start a worker; if thread startup fails, the gate marks that queued item rejected. A later healthy worker drains it as a no-op while the scheduler settles the already-failed request exactly once.
 
-## Per-agent data collection boundary
+Engine completion is posted back to the scheduler. The worker never publishes public futures or releases scheduler capacity directly.
 
-The orchestrator does not own a global database or writer. Each agent retains
-its existing data collector and separate SQLite file. Request lifecycle events
-and scheduler-derived spans that belong to a request are recorded through that
-request's agent collector with request and skill identifiers for correlation.
-The orchestrator snapshot is maintained in memory and contains only current
-scheduler counts, capacity, request ownership, and aggregate totals.
+## Host-only messages
 
-Process-wide collection is intentionally outside this commit. A future global
-collector can subscribe to orchestration transitions without taking ownership
-of detailed agent, harness, token, or message records.
+`send()` registers a request with kind `message`. Once its predecessor resolves, the scheduler copies that context, appends the validated retained message, settles the output context, then settles the empty result. This path does not create an `AgentEngine`, sandbox, daemon, host server, harness, or model request, and it does not use an execution worker or global engine slot.
 
-## Configuration and lifecycle
+Agent suspension is not a dispatch gate for a ready message. Any unresolved predecessor still blocks it through the ordinary context chain, including a PREPARED request or a running invocation parked by suspension.
 
-The only orchestrator configuration in this commit is
-max_concurrent_engines. None preserves unlimited cross-agent concurrency; a
-positive integer caps active engine threads across the process. Configuration
-freezes when the singleton is first created.
+## Controls and terminal settlement
 
-Explicit shutdown rejects new submissions, finishes running and ready work,
-fails requests that remain dependency-blocked once no runnable producer can
-progress, and joins the scheduler thread. A best-effort process-exit hook
-initiates the same shutdown path.
+Prepared cancellation, dependency failure, scheduler rejection, and destruction are handled on the scheduler thread without creating execution infrastructure. Running cancellation and destruction are observed by the exact `Invocation` at safe boundaries; the completion claim in the engine transaction prevents a late successful commit from winning after a terminal control.
+
+Ordinary skill failure discards its working context and appends the canonical retained rollback notice. Cancellation and destruction pass through committed predecessor context without that notice.
+
+For every terminal path the scheduler:
+
+1. settles or arranges pass-through of the output context;
+2. marks the public submission terminal;
+3. releases request, agent, dependency, and capacity bookkeeping;
+4. settles the public result;
+5. permits result callbacks to run against settled context.
+
+## Telemetry and shutdown
+
+Request events and spans go to the request agent's lowercase `agdatacollector.py` SQLite collector. Scheduling snapshots and request lifecycle state remain in memory; the process-wide resource pool also uses its own SQLite collector for resource telemetry. LLM stream deltas remain temporary collector records and are finalized into durable events by the LLM server.
+
+Explicit shutdown closes admission, drains active work and context continuations, fails requests that cannot run, joins the scheduler, and retires the reusable workers. Shutdown is idempotent. A callback executing on the scheduler thread may request non-blocking shutdown; scheduler teardown closes the worker pool after the event loop drains.

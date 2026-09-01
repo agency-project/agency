@@ -4,10 +4,10 @@ Parallel execution example.
 Demonstrates the two natural parallelism patterns enabled by a single run() method:
 
   1. SequentialChainTeam  — sequential calls on one agent are automatically ordered
-                            through the history chain; results are pending agdata.
+                            through the context chain; results are Invocations.
 
-  2. ForkFanoutTeam       — agent(parent) creates a local copy; each copy's run()
-                            fires immediately and returns a pending agdata.  Multiple
+  2. ForkFanoutTeam       — agent.fork(parent) creates a local copy; each copy's run()
+                            fires immediately and returns an Invocation.  Multiple
                             forks run concurrently without any explicit thread management.
 
 Run:
@@ -121,7 +121,7 @@ class ForkFanoutTeam(agteam):
 
     def run(self) -> None:
         print("=" * 60)
-        print("Pattern 2: fork fan-out — agent(parent).run() per input")
+        print("Pattern 2: fork fan-out — agent.fork(parent).run() per input")
         print("=" * 60)
 
         texts = getattr(self, "texts", self._default_texts)
