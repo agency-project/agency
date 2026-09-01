@@ -42,6 +42,7 @@ class agSkillConfig(_AgConfigViewBase):
 
 
 if TYPE_CHECKING:
+    from ._submission import Invocation
     from .agent import agent
 
 
@@ -382,12 +383,12 @@ class agskill:
         ag: "agent",
         skill_input: agdata,
         max_steps: "int | None" = None,
-    ) -> agdata:
-        """Submit through the process-wide event-driven orchestrator."""
+    ) -> "Invocation":
+        """Submit through the global orchestrator and return its Invocation."""
         from .orchestrator import get_orchestrator
 
         orchestrator = get_orchestrator(ag.agconfig)
-        return orchestrator.submit(ag, self, skill_input, max_steps=max_steps)
+        return orchestrator.submit(ag, self, skill_input, max_steps=max_steps, ready=True)
 
     async def asyncio_run(
         self,
@@ -395,13 +396,8 @@ class agskill:
         skill_input: agdata,
         max_steps: "int | None" = None,
     ) -> agdata:
-        """Async wrapper around run() for use in asyncio event loops."""
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        pending = self.run(ag, skill_input, max_steps)
-        await loop.run_in_executor(None, pending._resolve)
-        return pending
+        """Async wrapper returning the resolved invocation output."""
+        return await self.run(ag, skill_input, max_steps)
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

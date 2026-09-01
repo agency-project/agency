@@ -8,6 +8,7 @@ from agency.agcontext import agcontext
 from agency.agskill import agskill
 from agency.agtool import agtool
 from agency.agent import agent
+from agency._submission import Invocation
 from agency.agname import agname as _agname
 from agency.agconfig import agConfig
 from agency.engine import AgentEngine
@@ -128,8 +129,8 @@ def make_agent() -> agent:
 # ---------------------------------------------------------------------------
 
 
-def test_run_returns_pending_agdata():
-    """run() is non-blocking — result fields resolve lazily."""
+def test_run_returns_pending_invocation():
+    """run() is non-blocking and exposes pending output through Invocation.result."""
     skill = agskill(name="s", system_prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
@@ -139,7 +140,8 @@ def test_run_returns_pending_agdata():
 
     ag = make_agent()
     result = ag.run(skill, agdata())
-    assert isinstance(result, agdata)
+    assert isinstance(result, Invocation)
+    assert isinstance(result.result, agdata)
     assert result.done is True  # field access blocks until task finishes
 
 
@@ -384,8 +386,8 @@ def test_run_returns_direct_answer_from_engine():
         [],
     )
     ag = make_agent()
-    result = ag.run(skill, agdata(question="Capital of France?"))
-    assert result.result == '{"answer": "Paris"}'
+    invocation = ag.run(skill, agdata(question="Capital of France?"))
+    assert invocation.result.result == '{"answer": "Paris"}'
 
 
 # test_end_to_end_with_tool was retired here along with execute_react()

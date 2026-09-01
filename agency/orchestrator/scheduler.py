@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 from concurrent.futures import Future
+from dataclasses import fields, is_dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
 from ..agdata import agdata, agerror
@@ -24,6 +25,9 @@ class ExecutionScheduler:
     def execute(self) -> None:
         """Run one complete dependency-resolution and scheduling cycle."""
         owner = self._orchestrator
+        for request in owner._requests.values():
+            if request.state == "prepared" and getattr(request.submission, "_ready", False):
+                request.state = "submitted"
         resolved: list[_ExecutionRequest] = []
         wait_pool = sorted(
             (
@@ -134,6 +138,10 @@ class ExecutionScheduler:
         seen: set[int] = set()
 
         def materialize(current: object) -> object:
+            if not isinstance(current, agdata):
+                as_pending = getattr(current, "_as_pending_agdata", None)
+                if callable(as_pending):
+                    current = as_pending()
             if isinstance(current, agdata):
                 marker = id(current)
                 if marker in seen:
@@ -146,6 +154,14 @@ class ExecutionScheduler:
                             "scheduler dispatched a request with an unresolved dependency"
                         )
                     resolved = future.result()
+                    if not isinstance(resolved, agdata):
+                        as_pending = getattr(resolved, "_as_pending_agdata", None)
+                        if not callable(as_pending):
+                            raise TypeError(
+                                "dependency future resolved to an incompatible value: "
+                                f"{type(resolved).__name__}"
+                            )
+                        resolved = as_pending()
                     if isinstance(resolved, agerror):
                         raise RuntimeError(resolved.error)
                     resolved = materialize(resolved)
@@ -169,6 +185,18 @@ class ExecutionScheduler:
                 return current
             if isinstance(current, tuple):
                 return tuple(materialize(nested) for nested in current)
+            if is_dataclass(current) and not isinstance(current, type):
+                updates = {
+                    field.name: materialize(getattr(current, field.name))
+                    for field in fields(current)
+                }
+                return replace(current, **updates)
+            model_fields = getattr(type(current), "model_fields", None)
+            model_copy = getattr(current, "model_copy", None)
+            if isinstance(model_fields, dict) and callable(model_copy):
+                return model_copy(
+                    update={name: materialize(getattr(current, name)) for name in model_fields}
+                )
             return current
 
         return materialize(value)
@@ -177,6 +205,10 @@ class ExecutionScheduler:
         seen: set[int] = set()
 
         def visit(current: object, *, from_future: bool = False) -> "str | None":
+            if not isinstance(current, agdata):
+                as_pending = getattr(current, "_as_pending_agdata", None)
+                if callable(as_pending):
+                    current = as_pending()
             if isinstance(current, agerror):
                 return current.error if from_future else None
             if isinstance(current, agdata):
@@ -205,6 +237,10 @@ class ExecutionScheduler:
                 values = current.values()
             elif isinstance(current, (list, tuple)):
                 values = current
+            elif is_dataclass(current) and not isinstance(current, type):
+                values = (getattr(current, field.name) for field in fields(current))
+            elif isinstance(getattr(type(current), "model_fields", None), dict):
+                values = (getattr(current, name) for name in getattr(type(current), "model_fields"))
             else:
                 return None
             marker = id(current)

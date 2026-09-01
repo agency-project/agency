@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import tarfile
+import threading
 import uuid as _uuid_mod
 import weakref
 from pathlib import Path
@@ -33,6 +34,8 @@ from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .profiler import agprof
+from ._agent_control import AgentControl
+from ._submission import Invocation, Submission
 
 if TYPE_CHECKING:
     from .engine import AgentEngine
@@ -187,7 +190,7 @@ class agent:
         self.engine: "AgentEngine | None" = None
 
         # Eagerly construct the process-wide orchestrator
-        get_orchestrator(self.agconfig)
+        self._orchestrator = get_orchestrator(self.agconfig)
 
         from .agteam import _active_team
 
@@ -238,6 +241,11 @@ class agent:
             )
         self.data_collector = agDataCollector(self.agconfig)
         self.data_collector.start()
+        self._orchestrator = get_orchestrator(self.agconfig)
+        self._submission_lock = threading.RLock()
+        self._control = AgentControl()
+        self._submissions: set[Submission] = set()
+        self._next_submission_id = 1
         self._current_state = "agent_idle"
         self.inbox: queue.Queue[str] = queue.Queue()
         _live_agents.add(self)
@@ -268,6 +276,15 @@ class agent:
     # ------------------------------------------------------------------
     # Properties # [REFACTOR] Why as properties?
     # ------------------------------------------------------------------
+
+    @property
+    def ctx(self) -> agcontext:
+        """Compatibility alias for the one authoritative ``context`` chain."""
+        return self.context
+
+    @ctx.setter
+    def ctx(self, value: agcontext) -> None:
+        self.context = value
 
     @property
     def output_path(self) -> Path | None:
@@ -330,6 +347,16 @@ class agent:
     # Pause / resume
     # ------------------------------------------------------------------
 
+    def _start_invocation(self, invocation: Invocation) -> None:
+        self._orchestrator.start_invocation(invocation)
+
+    def _notify_invocation_control(self, invocation: Invocation) -> None:
+        self._orchestrator.notify_invocation_control(invocation)
+
+    def start(self) -> None:
+        """Release the snapshot of invocations currently in ``PREPARED``."""
+        self._orchestrator.start_prepared(self)
+
     def pause(self) -> None:
         """Request that this agent's harness manager stop at its next safe
         checkpoint. Non-blocking — delivered as an inbox entry the harness
@@ -369,11 +396,26 @@ class agent:
         self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
         return self.sandbox
 
-    def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
-        """Submit a request; admission creates its fresh engine and thread."""
+    def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> Invocation:
+        """Submit ready work and immediately return its exact Invocation."""
         if max_steps is None:
             return skill.run(self, skill_input)
         return skill.run(self, skill_input, max_steps=max_steps)
+
+    def prepare(
+        self,
+        skill,
+        skill_input: agdata,
+        max_steps: "int | None" = None,
+    ) -> Invocation:
+        """Reserve ordered work with a closed scheduler readiness gate."""
+        return self._orchestrator.submit(
+            self,
+            skill,
+            skill_input,
+            max_steps=max_steps,
+            ready=False,
+        )
 
     async def asyncio_run(
         self,
@@ -381,13 +423,8 @@ class agent:
         skill_input: "agdata",
         max_steps: "int | None" = None,
     ) -> "agdata":
-        """Async wrapper around run() for use in asyncio event loops."""
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        pending = self.run(skill, skill_input, max_steps)
-        await loop.run_in_executor(None, pending._resolve)
-        return pending
+        """Async wrapper returning the resolved invocation output."""
+        return await self.run(skill, skill_input, max_steps)
 
     # ------------------------------------------------------------------
     # Destructor
@@ -665,7 +702,7 @@ class agent:
         # load() can be the very first agent constructed in a process (no
         # prior agent to have already triggered this), so it needs its own
         # eager trigger too.
-        get_orchestrator(ag.agconfig)
+        ag._orchestrator = get_orchestrator(ag.agconfig)
 
         ag._finish_construction(
             event_type="agent_loaded",

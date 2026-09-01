@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from ..agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
 from ..agcontext import agcontext
 from ..agdata import agdata, agerror
+from .._submission import Invocation, Submission
 from ..engine import AgentEngine
 from ..agdatacollector import agDataCollector, agDataCollectorConfigs, _ts
 from ..utils.agutil import _DEFAULT_LOG_DIR, format_exception
@@ -54,9 +55,11 @@ class OrchestratorSnapshot:
 class _ExecutionRequest:
     request_id: str
     sequence: int
+    kind: str
+    submission: Submission
     agent: "agent"
-    skill: "agskill"
-    skill_input: agdata
+    skill: "agskill | None"
+    skill_input: "agdata | None"
     max_steps: "int | None"
     result_future: "Future[agdata]"
     context_future: "Future[agcontext]"
@@ -74,6 +77,8 @@ class _ExecutionRequest:
     phase_name: "str | None" = None
     phase_started_wall: "float | None" = None
     engine_started_wall: "float | None" = None
+    terminal_output: "agdata | None" = None
+    terminal_error: str = ""
 
 
 @dataclass
@@ -130,39 +135,95 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self,
         ag: "agent",
         skill: "agskill",
-        skill_input: agdata,
+        skill_input: object,
         max_steps: "int | None" = None,
-    ) -> agdata:
-        result_future: Future[agdata] = Future()
-        accepted: Future[None] = Future()
-        context_dependency = ag.context
-        context_future: "Future[agcontext]" = Future()
-        ag.context = agcontext(_future=context_future)
-        called_from_scheduler = threading.current_thread() is self._scheduler_thread
+        *,
+        ready: bool = True,
+    ) -> Invocation:
+        """Atomically publish and register one exact public Invocation.
+
+        The orchestrator condition is acquired before the per-agent submission
+        lock everywhere these two locks are needed.  Publication into the
+        authoritative context chain and scheduler registration therefore have
+        one linearization point and cannot be observed in different orders.
+        """
+        if not isinstance(skill_input, agdata):
+            as_pending = getattr(skill_input, "_as_pending_agdata", None)
+            if not callable(as_pending):
+                raise TypeError("skill_input must be an agdata or pending result handle")
+            skill_input = as_pending()
+
+        cycle_ack: Future[None] | None = None
         with self._event_cond:
             if not self._accepting:
                 raise RuntimeError("global agent orchestrator is shut down")
-            self._post_locked(
-                "submit",
-                (
+            with ag._submission_lock:
+                ag._control.assert_alive("submit a skill")
+                invocation = Invocation(
                     ag,
-                    skill,
-                    skill_input,
-                    max_steps,
-                    result_future,
-                    context_future,
-                    context_dependency,
-                    agprof.current_span_context(),
-                    time.perf_counter_ns(),
-                    time.time_ns(),
-                    accepted,
-                ),
-            )
-        # This waits only for registration on the scheduler thread, never for
-        # dependencies, an engine slot, or execution itself.
-        if not called_from_scheduler:
-            accepted.result()
-        return agdata(_future=result_future)
+                    ag._control.allocate_invocation_id(),
+                    skill.name,
+                    ready=ready,
+                )
+                predecessor = ag.context
+                ordering_id = ag._next_submission_id
+                ag._next_submission_id += 1
+                invocation._bind(ordering_id, predecessor)
+                ag.context = invocation.output_context
+                ag._submissions.add(invocation)
+                try:
+                    self._register_submission_locked(
+                        invocation,
+                        kind="skill",
+                        skill=skill,
+                        skill_input=skill_input,
+                        max_steps=max_steps,
+                    )
+                except BaseException:
+                    ag._submissions.discard(invocation)
+                    if ag.context is invocation.output_context:
+                        ag.context = predecessor
+                    raise
+            if threading.current_thread() is not self._scheduler_thread:
+                cycle_ack = Future()
+            self._post_locked("schedule", (invocation._request_id, cycle_ack))
+        if cycle_ack is not None:
+            cycle_ack.result()
+        return invocation
+
+    def start_invocation(self, invocation: Invocation) -> bool:
+        """Open one PREPARED gate and wake the event-driven scheduler."""
+        ag = invocation._agent
+        with self._event_cond:
+            with ag._submission_lock:
+                ag._control.assert_alive("start an invocation")
+                released = invocation in ag._submissions and invocation._release()
+            if released:
+                self._post_locked("control_changed", invocation._request_id)
+        return released
+
+    def start_prepared(self, ag: "agent") -> tuple[Invocation, ...]:
+        """Release the snapshot of invocations prepared at this instant."""
+        with self._event_cond:
+            with ag._submission_lock:
+                ag._control.assert_alive("start prepared invocations")
+                prepared = tuple(
+                    submission
+                    for submission in ag._submissions
+                    if isinstance(submission, Invocation) and submission.state == "PREPARED"
+                )
+                for invocation in prepared:
+                    invocation._release()
+            if prepared:
+                self._post_locked(
+                    "control_changed", tuple(invocation._request_id for invocation in prepared)
+                )
+        return prepared
+
+    def notify_invocation_control(self, invocation: Invocation) -> None:
+        with self._event_cond:
+            if invocation._request_id in self._requests:
+                self._post_locked("control_changed", invocation._request_id)
 
     def snapshot(self) -> OrchestratorSnapshot:
         with self._event_cond:
@@ -195,6 +256,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._event_cond.notify_all()
 
     def _scheduler_main(self) -> None:
+        cycle_ack: "Future[None] | None" = None
         try:
             while True:
                 with self._event_cond:
@@ -203,17 +265,25 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     if self._stop_loop:
                         break
                     _seq, kind, value = heapq.heappop(self._events)
-                    if kind == "submit":
-                        self._handle_submit_locked(value)
-                    elif kind == "dependency_done":
+                    cycle_ack = None
+                    if kind == "dependency_done":
                         # The event is only a wakeup. execute() resolves the
                         # complete wait pool before it schedules anything.
                         pass
+                    elif kind in {"schedule", "control_changed"}:
+                        # Registration/control methods already changed the
+                        # authoritative state while holding this condition.
+                        if kind == "schedule" and isinstance(value, tuple):
+                            _request_id, cycle_ack = value
                     elif kind == "engine_done":
                         self._handle_engine_done_locked(value)
+                    elif kind == "pass_through_done":
+                        self._handle_pass_through_done_locked(value)
                     elif kind == "shutdown":
                         self._state = "stopping"
                     self.scheduler.execute()
+                    if cycle_ack is not None and not cycle_ack.done():
+                        cycle_ack.set_result(None)
                     finalize_shutdown = self._finish_shutdown_if_possible_locked()
                 if finalize_shutdown:
                     with self._event_cond:
@@ -224,6 +294,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         except BaseException as exc:
             print(f"[agorchestrator] FATAL scheduler failure: {format_exception(exc)}")
             with self._event_cond:
+                if cycle_ack is not None and not cycle_ack.done():
+                    cycle_ack.set_exception(exc)
                 for request in list(self._requests.values()):
                     if request.state != "running":
                         self._fail_request_locked(
@@ -232,39 +304,49 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 if self._shutdown_ack is not None and not self._shutdown_ack.done():
                     self._shutdown_ack.set_exception(exc)
 
-    def _handle_submit_locked(self, value: object) -> None:
-        (
-            ag,
-            skill,
-            skill_input,
-            max_steps,
-            result_future,
-            context_future,
-            context_dependency,
-            parent_context,
-            submitted_perf_ns,
-            submitted_wall_ns,
-            accepted,
-        ) = value
+    def _register_submission_locked(
+        self,
+        submission: Submission,
+        *,
+        kind: str,
+        skill: "agskill | None",
+        skill_input: "agdata | None",
+        max_steps: "int | None",
+    ) -> _ExecutionRequest:
+        ag = submission._agent
+        context_dependency = submission.predecessor_context
+        if context_dependency is None:
+            raise RuntimeError("submission was not bound to a predecessor context")
+        parent_context = agprof.current_span_context()
+        submitted_perf_ns = time.perf_counter_ns()
+        submitted_wall_ns = time.time_ns()
         sequence = next(self._request_sequence)
         request_id = f"run{sequence}"
         request = _ExecutionRequest(
             request_id=request_id,
             sequence=sequence,
+            kind=kind,
+            submission=submission,
             agent=ag,
             skill=skill,
             skill_input=skill_input,
             max_steps=max_steps,
-            result_future=result_future,
-            context_future=context_future,
+            result_future=submission._result_future,
+            context_future=submission._context_future,
             parent_context=parent_context,
             ts_start=_ts(),
             submitted_perf_ns=submitted_perf_ns,
             submitted_wall_ns=submitted_wall_ns,
             context_dependency=context_dependency,
+            state=(
+                "prepared"
+                if isinstance(submission, Invocation) and submission.state == "PREPARED"
+                else "submitted"
+            ),
         )
+        skill_name = skill.name if skill is not None else kind
         request.run_span = agprof.start_external_span(
-            f"{request_id}:{skill.name}:{ag.agname}",
+            f"{request_id}:{skill_name}:{ag.agname}",
             start_perf_ns=submitted_perf_ns,
             start_wall_ns=submitted_wall_ns,
             metadata={
@@ -274,17 +356,25 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             },
             parent_context=parent_context,
         )
+        submission._bind_request(request_id)
         self._requests[request_id] = request
-        self._future_producers[result_future] = request_id
-        self._future_producers[context_future] = request_id
+        self._future_producers[request.result_future] = request_id
+        self._future_producers[request.context_future] = request_id
         self._outstanding_by_agent.setdefault(ag, set()).add(request_id)
         self._submitted_total += 1
         self._publish_request_locked("request_submitted", request, {})
-        accepted.set_result(None)
+        return request
 
     def _launch_request_locked(self, request: _ExecutionRequest) -> None:
+        invocation = request.submission
+        if not isinstance(invocation, Invocation):
+            raise RuntimeError("only skill invocations can launch an engine")
+        if request.skill is None:
+            raise RuntimeError("skill request has no skill")
         request.state = "running"
         self._end_phase_span_locked(request)
+        request.agent._control.activate_invocation(invocation)
+        invocation._mark_running()
         self._active_by_agent[request.agent] = request.request_id
         request.engine_started_wall = time.time()
         request.agent.record_state("running_skill", skill=request.skill.name)
@@ -316,6 +406,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         return limit is None or len(self._active_by_agent) < limit
 
     def _engine_worker(self, request: _ExecutionRequest) -> None:
+        if request.skill is None:
+            raise RuntimeError("engine worker received a request without a skill")
         label = f"{request.request_id}:{request.skill.name}:{request.agent.agname}"
         agprof.thread_name(label)
         try:
@@ -346,6 +438,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
     def _perform_execution(self, request: _ExecutionRequest) -> _RunCompletion:
         ag = request.agent
         skill = request.skill
+        if skill is None or request.skill_input is None:
+            raise RuntimeError("skill execution request is incomplete")
         committed_context = request.context_dependency.copy()
         working_context = committed_context.copy()
         local_skill_input = request.skill_input
@@ -471,6 +565,13 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             )
         if not request.context_future.done():
             request.context_future.set_result(completion.context)
+        invocation = request.submission
+        if isinstance(invocation, Invocation):
+            if request.agent._control.active_invocation() is invocation:
+                request.agent._control.finish_invocation(invocation)
+            else:
+                invocation._close_without_activation()
+            invocation._mark_terminal(completion.output)
         request.state = "failed" if completion.failed else "completed"
         self._completed_total += 1
         if completion.failed:
@@ -488,6 +589,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._update_agent_display_locked(request.agent)
 
     def _finish_request_locked(self, request: _ExecutionRequest) -> None:
+        with request.agent._submission_lock:
+            request.agent._submissions.discard(request.submission)
         outstanding = self._outstanding_by_agent.get(request.agent)
         if outstanding is not None:
             outstanding.discard(request.request_id)
@@ -498,40 +601,66 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._requests.pop(request.request_id, None)
         self._event_cond.notify_all()
 
-    def _pass_through_context_future(self, request: _ExecutionRequest) -> None:
+    def _pass_through_context_future(self, request: _ExecutionRequest) -> bool:
+        """Set pass-through context now, or arrange an event-driven continuation."""
         if request.context_future.done():
-            return
+            return True
         predecessor = request.context_dependency
         predecessor_future = predecessor._future
         if predecessor_future is None or predecessor_future.done():
-            request.context_future.set_result(predecessor.copy())
-            return
-
-        def _propagate(finished: "Future[agcontext]", req: _ExecutionRequest = request) -> None:
-            if req.context_future.done():
-                return
             try:
-                result = finished.result().copy()
+                context = predecessor.copy()
             except BaseException:
-                result = agcontext()
-            req.context_future.set_result(result)
+                context = agcontext()
+            request.context_future.set_result(context)
+            return True
+
+        def _propagate(finished: "Future[agcontext]", request_id: str = request.request_id) -> None:
+            self._post("pass_through_done", (request_id, finished))
 
         predecessor_future.add_done_callback(_propagate)
+        return False
+
+    def _handle_pass_through_done_locked(self, value: object) -> None:
+        request_id, finished = value
+        request = self._requests.get(request_id)
+        if request is None or request.state != "settling_failed":
+            return
+        if not request.context_future.done():
+            try:
+                context = finished.result().copy()
+            except BaseException:
+                context = agcontext()
+            request.context_future.set_result(context)
+        self._finish_failed_request_locked(request)
 
     def _fail_request_locked(self, request: _ExecutionRequest, message: str) -> None:
-        if request.state in ("completed", "failed", "running"):
+        if request.state in ("completed", "failed", "settling_failed", "running"):
             return
-        request.state = "failed"
+        request.state = "settling_failed"
         self._completed_total += 1
         self._failed_total += 1
-        output = agerror(message)
-        if not request.result_future.done():
-            request.result_future.set_result(output)
-        self._pass_through_context_future(request)
+        request.terminal_output = agerror(message)
+        request.terminal_error = message
         self._end_phase_span_locked(request)
         self._end_run_span_locked(request, True, message)
-        self._finish_request_locked(request)
         self._publish_request_locked("request_failed", request, {"error": message})
+        if self._pass_through_context_future(request):
+            self._finish_failed_request_locked(request)
+
+    def _finish_failed_request_locked(self, request: _ExecutionRequest) -> None:
+        output = request.terminal_output or agerror(request.terminal_error or "request failed")
+        submission = request.submission
+        if isinstance(submission, Invocation):
+            if request.agent._control.active_invocation() is submission:
+                request.agent._control.finish_invocation(submission)
+            else:
+                submission._close_without_activation()
+            submission._mark_terminal(output)
+        request.state = "failed"
+        self._finish_request_locked(request)
+        if not request.result_future.done():
+            request.result_future.set_result(output)
         self._update_agent_display_locked(request.agent)
 
     def _update_agent_display_locked(self, ag: "agent") -> None:
@@ -686,12 +815,18 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             return False
         if any(kind == "dependency_done" for _seq, kind, _value in self._events):
             return False
-        blocked = [r for r in self._requests.values() if r.state == "blocked"]
-        for request in blocked:
+        pending = [
+            request
+            for request in self._requests.values()
+            if request.state in {"prepared", "submitted", "blocked"}
+        ]
+        for request in pending:
             self._fail_request_locked(
                 request,
                 "orchestrator shut down before the request's dependencies resolved",
             )
+        if self._requests:
+            return False
         self._state = "stopped"
         return True
 
