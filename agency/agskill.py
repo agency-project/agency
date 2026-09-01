@@ -1,19 +1,13 @@
 from __future__ import annotations
 import functools
 import json
-import sys
-from concurrent.futures import Future
 from typing import TYPE_CHECKING
 from .agdata import agdata, agerror
 from .agpolicy import agpolicy
 from .agtype import agtype
-from .profiler import agprof
 from .agschema import agschema
-from .agcontext import agcontext
 from .agtool import agtool
 from .agconfig import DynamicConfigParam, _AgConfigViewBase
-from .agutil import format_exception
-from .agDataCollector import _ts
 
 
 # Exists only to register agskill's config fields (via __set_name__ at import
@@ -389,169 +383,11 @@ class agskill:
         skill_input: agdata,
         max_steps: "int | None" = None,
     ) -> agdata:
-        """Submit a skill run on *ag* and return a pending agdata immediately.
+        """Submit through the process-wide event-driven orchestrator."""
+        from .orchestrator import get_orchestrator
 
-        Spawns a daemon thread that delegates execution to the agent's driver
-        engine and resolves futures when done. Same-agent calls are serialized
-        via the context future chain.
-        """
-        prev_ctx = ag.ctx
-        result_future: Future[agdata] = Future()
-        ctx_future: Future[agcontext] = Future()
-        ts_start = _ts()
-
-        def _task() -> None:  # [REFACTOR] Why wrap in task?
-            outer_result: agdata | None = None
-            history_before: list[dict] = []
-            # Fallback for the final logging step below if an exception hits
-            # before the defensive copy further down is made.
-            local_skill_input = skill_input
-
-            try:
-                # ── 1. Unblock: wait for any in-flight predecessor to finish,
-                #    then resolve any lazy input futures passed by the caller.
-                ag.data_collector.record_event(
-                    type="agent_state",
-                    payload={"state": "waiting_on_dependency"},
-                    do_update=True,
-                    flush=True,
-                )
-                with agprof.span("resolve"):
-                    prev_ctx.resolve_prev_dependencies()
-                    skill_input.resolve_input_dependencies()
-
-                # Defensive shallow copy: prepare_inputs_in_sandbox() in the
-                # engine mutates its skill_input argument
-                # in place (offloading oversized/agtype fields to sandbox
-                # paths). If a caller hands the same agdata object to more
-                # than one concurrent run() call (e.g. one shared input
-                # fanned out to several agents), each run must mutate its
-                # own private copy from here on rather than racing the
-                # others on a shared one. A shallow copy is enough --
-                # prepare_inputs_in_sandbox only ever reassigns top-level
-                # keys on the object it's given, never mutates a nested
-                # value's own contents in place.
-                local_skill_input = agdata(**dict(skill_input._data))
-
-                history_before = list(prev_ctx.recent_transcript)
-
-                ag.data_collector.record_event(
-                    type="agent_state",
-                    payload={"state": "running_skill", "skill": self.name},
-                    do_update=True,
-                    flush=True,
-                )
-                ag.data_collector.record_event(
-                    type="skill_start",
-                    payload={"skill": self.name, "ts": ts_start},
-                    term_message=(
-                        f"[{ag.agname}] SKILL ▶  {self.name}  "
-                        f"input={list(local_skill_input._data.keys())}"
-                    ),
-                    flush=True,
-                )
-
-                # ── 2. Delegate actual execution to the Agent Engine.
-                outer_result = ag.engine.execute(
-                    context=prev_ctx,
-                    skill=self,
-                    skill_input=local_skill_input,
-                    resource_pool=type(ag).agresource_pool,
-                    sandbox=ag.sandbox,
-                    max_steps=max_steps,
-                )
-
-            except Exception as exc:
-                outer_result = agerror(format_exception(exc))
-                history_before = list(prev_ctx.recent_transcript)
-
-            ag.data_collector.record_event(
-                type="agent_state",
-                payload={"state": "agent_idle"},
-                do_update=True,
-                flush=True,
-            )
-
-            # ── 3. Log result.
-            ts_end = _ts()
-            assert outer_result is not None
-            input_dict = local_skill_input.to_dict()
-            result_dict = outer_result.to_dict()
-            if result_dict.get("error"):
-                _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate
-                ag.data_collector.record_event(
-                    type="skill_error",
-                    payload={"skill": self.name, "error": str(result_dict["error"])},
-                    term_message=(
-                        f"[{ag.agname}] SKILL ✗  {self.name}  "
-                        f"error={str(result_dict['error'])[:_error_log_truncate]}"
-                    ),
-                )
-            else:
-                ag.data_collector.record_event(
-                    type="skill_success",
-                    payload={"skill": self.name, "output_fields": list(result_dict.keys())},
-                    term_message=(
-                        f"[{ag.agname}] SKILL ✓  {self.name}  output={list(result_dict.keys())}"
-                    ),
-                )
-            try:
-                ag.data_collector.record_event(
-                    type="skill_call",
-                    payload={
-                        "skill": self.name,
-                        "ts_start": ts_start,
-                        "ts_end": ts_end,
-                        "input": input_dict,
-                        "output": result_dict,
-                        "history_len": len(prev_ctx.recent_transcript),
-                        "history_before": history_before,
-                        "history_delta": prev_ctx.recent_transcript,
-                    },
-                )
-            except Exception as log_exc:
-                print(
-                    f"[agskill] WARNING: record_event(skill_call) failed for {self.name}: {log_exc}",
-                    file=sys.stderr,
-                )
-
-            # ── 6. Resolve result future — unblocks the caller immediately.
-            ag.data_collector.record_event(
-                type="live_messages",
-                payload={"messages": prev_ctx.recent_transcript},
-                do_update=True,
-                flush=True,
-            )
-            result_future.set_result(outer_result)
-
-            # ── 7. Resolve ctx future for the next chained call.
-            ctx_future.set_result(prev_ctx)
-
-        def _traced_task() -> None:  # [REFACTOR] Maybe inline
-            run_id = f"run{agprof.next_index()}"
-            label = f"{run_id}:{self.name}:{ag.agname}"
-            agprof.thread_name(label)
-            with agprof.span(label):
-                agprof.annotate(
-                    **{
-                        "agency.run_id": run_id,
-                        "agency.agent_id": str(ag.agname),
-                        "agency.parent_agent_id": getattr(
-                            ag, "_parent_agent_id", None
-                        ),  # [REFACTOR] Why do we need to track this?
-                    }
-                )
-                _task()
-                profile_result = result_future.result()
-                profile_error = profile_result._data.get("error")
-                agprof.annotate(
-                    outcome="failure" if profile_error else "success",
-                    error_type="skill_error" if profile_error else None,
-                )
-
-        agprof.spawn_traced(_traced_task).start()  # [REFACTOR] Why through "spawn_traced"?
-        ag.ctx = agcontext(_future=ctx_future)
-        return agdata(_future=result_future)
+        orchestrator = get_orchestrator(ag.agconfig)
+        return orchestrator.submit(ag, self, skill_input, max_steps=max_steps)
 
     async def asyncio_run(
         self,
