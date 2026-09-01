@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from agency.agutil import _strip_thinking, _extract_thinking, sigterm_as_exit
+from agency.utils.agutil import _strip_thinking, _extract_thinking, sigterm_as_exit
 
 
 def test_strip_thinking_removes_think_tag():
@@ -105,8 +105,8 @@ class TestSigtermAsExit:
 import socket as _socket
 import subprocess
 
-from agency import agutil as _agutil
-from agency.agutil import (
+from agency.utils import agutil as _agutil
+from agency.utils.agutil import (
     UDS_SUN_PATH_MAX,
     agency_run_id,
     agharness_llm_gateway_dir,

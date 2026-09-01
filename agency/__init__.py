@@ -4,13 +4,13 @@ from .agtype import agtype, agfile, agbinary, agimage, agrawstring, agpath
 from .agschema import agschema
 from .agskill import agskill
 from .agtool import agtool
-from .agDataCollector import agDataCollector, agDataCollectorConfigs
+from .agdatacollector import agDataCollector, agDataCollectorConfigs
 from .agent import agent
-from .agmap import agmap, agtask
+from .utils.agmap import agmap, agtask
 from .agteam import agteam
-from .agsync import agsync
+from .utils.agsync import agsync
 from .sandbox.agsandbox import agSandbox, get_container_runtime
-from .agresources import agResourcePool
+from .orchestrator.agresources import agResourcePool
 from .orchestrator import (
     ExecutionScheduler,
     GlobalAgentOrchestrator,
@@ -18,7 +18,7 @@ from .orchestrator import (
     agOrchestratorConfig,
     get_orchestrator,
 )
-from .agutil import sigterm_as_exit
+from .utils.agutil import sigterm_as_exit
 from .profiler import agprof
 
 __all__ = [

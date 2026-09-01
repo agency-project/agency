@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Callable
 from ..agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
 
 if TYPE_CHECKING:
-    from ..agresources import agResourcePool
+    from ..orchestrator.agresources import agResourcePool
 
 
 # ---------------------------------------------------------------------------

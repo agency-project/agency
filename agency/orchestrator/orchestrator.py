@@ -9,17 +9,17 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from ..agconfig import StaticConfigParam, _AgConfigViewBase
+from ..agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
 from ..agcontext import agcontext
 from ..agdata import agdata, agerror
 from ..engine import AgentEngine
-from ..agDataCollector import _ts
-from ..agutil import format_exception
+from ..agdatacollector import agDataCollector, agDataCollectorConfigs, _ts
+from ..utils.agutil import _DEFAULT_LOG_DIR, format_exception
 from ..profiler import agprof
+from .agresources import agResourcePool
 from .scheduler import ExecutionScheduler
 
 if TYPE_CHECKING:
-    from ..agconfig import agConfig
     from ..agent import agent
     from ..agskill import agskill
 
@@ -59,6 +59,8 @@ class _ExecutionRequest:
     skill_input: agdata
     max_steps: "int | None"
     result_future: "Future[agdata]"
+    context_future: "Future[agcontext]"
+    context_dependency: agcontext
     parent_context: object
     ts_start: str
     submitted_perf_ns: int
@@ -93,6 +95,13 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             or self.max_concurrent_engines <= 0
         ):
             raise ValueError("max_concurrent_engines must be a positive integer or None")
+        dc_agconfig = agConfig()
+        dc_agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
+            db_path=str(_DEFAULT_LOG_DIR / "resources_data.sqlite3")
+        )
+        self.data_collector = agDataCollector(dc_agconfig)
+        self.data_collector.start()
+        self.agresource_pool = agResourcePool(mark_gpus=False, data_collector=self.data_collector)
         self._events: "list[tuple[int, str, object]]" = []
         self._event_cond = threading.Condition(threading.RLock())
         self._event_sequence = itertools.count()
@@ -109,11 +118,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._shutdown_ack: "Future[None] | None" = None
         self._stop_loop = False
         self.scheduler = ExecutionScheduler(self)
-        self._scheduler_thread = threading.Thread(
-            target=self._scheduler_main,
-            daemon=True,
-            name="agency-global-scheduler",
-        )
+        self._scheduler_thread = agprof.spawn_traced(self._scheduler_main, daemon=True)
+        self._scheduler_thread.name = "agency-global-scheduler"
         self._scheduler_thread.start()
 
     # ------------------------------------------------------------------
@@ -129,6 +135,9 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
     ) -> agdata:
         result_future: Future[agdata] = Future()
         accepted: Future[None] = Future()
+        context_dependency = ag.context
+        context_future: "Future[agcontext]" = Future()
+        ag.context = agcontext(_future=context_future)
         called_from_scheduler = threading.current_thread() is self._scheduler_thread
         with self._event_cond:
             if not self._accepting:
@@ -141,6 +150,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     skill_input,
                     max_steps,
                     result_future,
+                    context_future,
+                    context_dependency,
                     agprof.current_span_context(),
                     time.perf_counter_ns(),
                     time.time_ns(),
@@ -156,30 +167,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
     def snapshot(self) -> OrchestratorSnapshot:
         with self._event_cond:
             return OrchestratorSnapshot(**self._snapshot_dict_locked())
-
-    def wait_for_agent(self, ag: "agent", timeout_s: "float | None" = None) -> None:
-        deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        with self._event_cond:
-            while self._outstanding_by_agent.get(ag):
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if remaining is not None and remaining <= 0:
-                    raise TimeoutError(f"agent {ag.agname} did not become idle within {timeout_s}s")
-                self._event_cond.wait(timeout=remaining)
-
-    def is_agent_idle(self, ag: "agent") -> bool:
-        with self._event_cond:
-            return not self._outstanding_by_agent.get(ag)
-
-    def is_agent_settled(self, ag: "agent") -> bool:
-        with self._event_cond:
-            outstanding = self._outstanding_by_agent.get(ag, set())
-            if not outstanding:
-                return True
-            for request_id in outstanding:
-                request = self._requests.get(request_id)
-                if request is not None and request.state in ("ready", "running"):
-                    return False
-            return True
 
     def shutdown(self, wait: bool = True, timeout_s: "float | None" = None) -> None:
         with self._event_cond:
@@ -252,6 +239,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             skill_input,
             max_steps,
             result_future,
+            context_future,
+            context_dependency,
             parent_context,
             submitted_perf_ns,
             submitted_wall_ns,
@@ -267,10 +256,12 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             skill_input=skill_input,
             max_steps=max_steps,
             result_future=result_future,
+            context_future=context_future,
             parent_context=parent_context,
             ts_start=_ts(),
             submitted_perf_ns=submitted_perf_ns,
             submitted_wall_ns=submitted_wall_ns,
+            context_dependency=context_dependency,
         )
         request.run_span = agprof.start_external_span(
             f"{request_id}:{skill.name}:{ag.agname}",
@@ -285,6 +276,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         )
         self._requests[request_id] = request
         self._future_producers[result_future] = request_id
+        self._future_producers[context_future] = request_id
         self._outstanding_by_agent.setdefault(ag, set()).add(request_id)
         self._submitted_total += 1
         self._publish_request_locked("request_submitted", request, {})
@@ -293,10 +285,9 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
     def _launch_request_locked(self, request: _ExecutionRequest) -> None:
         request.state = "running"
         self._end_phase_span_locked(request)
-        request.agent._state.blocked_on = None
         self._active_by_agent[request.agent] = request.request_id
         request.engine_started_wall = time.time()
-        request.agent._set_ui_state("skill", skill=request.skill.name)
+        request.agent.record_state("running_skill", skill=request.skill.name)
         self._publish_request_locked("request_started", request, {})
         try:
             # An engine belongs to exactly one dispatched request.  The agent
@@ -313,7 +304,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     request.request_id,
                     _RunCompletion(
                         output=agerror(format_exception(exc)),
-                        context=request.agent.ctx,
+                        context=request.context_dependency.copy(),
                         failed=True,
                         error_message=format_exception(exc),
                     ),
@@ -345,7 +336,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             message = format_exception(exc)
             completion = _RunCompletion(
                 output=agerror(message),
-                context=request.agent.ctx,
+                context=request.context_dependency.copy(),
                 failed=True,
                 error_message=message,
             )
@@ -355,10 +346,10 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
     def _perform_execution(self, request: _ExecutionRequest) -> _RunCompletion:
         ag = request.agent
         skill = request.skill
-        committed_ctx = ag.ctx.copy()
-        working_ctx = committed_ctx.copy()
+        committed_context = request.context_dependency.copy()
+        working_context = committed_context.copy()
         local_skill_input = request.skill_input
-        history_before = list(committed_ctx.recent_transcript)
+        history_before = list(committed_context.recent_transcript)
         collector = ag.data_collector
 
         try:
@@ -372,35 +363,36 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     f"[{ag.agname}] SKILL ▶  {skill.name}  "
                     f"input={list(local_skill_input._data.keys())}"
                 ),
+                flush=True,
             )
             sandbox = ag._ensure_sandbox()
             engine = request.engine
             if engine is None:
                 raise RuntimeError("dispatched request has no AgentEngine")
             outer_result = engine.execute(
-                context=working_ctx,
+                context=working_context,
                 skill=skill,
                 skill_input=local_skill_input,
-                resource_pool=type(ag).agresource_pool,
+                resource_pool=self.agresource_pool,
                 sandbox=sandbox,
                 max_steps=request.max_steps,
             )
-            updated_ctx = working_ctx
+            updated_context = working_context
         except Exception as exc:
             outer_result = agerror(format_exception(exc))
-            updated_ctx = committed_ctx
+            updated_context = committed_context
 
         self._finish_execution_log(
             request,
             local_skill_input,
             outer_result,
-            updated_ctx,
+            updated_context,
             history_before,
         )
         failed = bool(outer_result._data.get("error"))
         return _RunCompletion(
             output=outer_result,
-            context=updated_ctx,
+            context=updated_context,
             failed=failed,
             error_message=str(outer_result._data.get("error", "")),
         )
@@ -410,7 +402,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         request: _ExecutionRequest,
         local_skill_input: agdata,
         result: agdata,
-        updated_ctx: agcontext,
+        updated_context: agcontext,
         history_before: list[dict],
     ) -> None:
         from ..agskill import _AgSkillFields
@@ -437,11 +429,10 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     type="skill_success",
                     payload={"skill": skill.name, "output_fields": list(result_dict)},
                     term_message=(
-                        f"[{ag.agname}] SKILL ✓  {skill.name}  "
-                        f"output={list(result_dict)}"
+                        f"[{ag.agname}] SKILL ✓  {skill.name}  output={list(result_dict)}"
                     ),
                 )
-            transcript = list(updated_ctx.recent_transcript)
+            transcript = list(updated_context.recent_transcript)
             collector.record_event(
                 type="skill_call",
                 payload={
@@ -458,15 +449,9 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             collector.record_event(
                 type="live_messages",
                 payload={"messages": transcript},
-                do_update=True,
+                overwrite=True,
+                flush=True,
             )
-            try:
-                from .. import agwebui as _agwebui
-
-                if _agwebui._active is not None:
-                    _agwebui._active.emitter.push_messages(ag.agname, transcript)
-            except Exception as exc:
-                print(f"[agorchestrator] WARNING: message UI update failed: {exc}")
         except Exception as exc:
             print(f"[agorchestrator] WARNING: execution logging failed: {exc}")
 
@@ -484,12 +469,8 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 completed_wall,
                 {"outcome": "failure" if completion.failed else "success"},
             )
-        # Commit execution-ordered context and clear the agent-idle barrier
-        # before resolving the public future. Future callbacks may inspect
-        # history synchronously on this scheduler thread. Keep the active slot
-        # reserved until those callbacks return so no replacement run launches
-        # before completion publication finishes.
-        request.agent.ctx = completion.context
+        if not request.context_future.done():
+            request.context_future.set_result(completion.context)
         request.state = "failed" if completion.failed else "completed"
         self._completed_total += 1
         if completion.failed:
@@ -504,7 +485,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         if not request.result_future.done():
             request.result_future.set_result(completion.output)
         self._active_by_agent.pop(request.agent, None)
-        self._update_agent_display_locked(request.agent, completion.failed)
+        self._update_agent_display_locked(request.agent)
 
     def _finish_request_locked(self, request: _ExecutionRequest) -> None:
         outstanding = self._outstanding_by_agent.get(request.agent)
@@ -513,8 +494,29 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             if not outstanding:
                 self._outstanding_by_agent.pop(request.agent, None)
         self._future_producers.pop(request.result_future, None)
+        self._future_producers.pop(request.context_future, None)
         self._requests.pop(request.request_id, None)
         self._event_cond.notify_all()
+
+    def _pass_through_context_future(self, request: _ExecutionRequest) -> None:
+        if request.context_future.done():
+            return
+        predecessor = request.context_dependency
+        predecessor_future = predecessor._future
+        if predecessor_future is None or predecessor_future.done():
+            request.context_future.set_result(predecessor.copy())
+            return
+
+        def _propagate(finished: "Future[agcontext]", req: _ExecutionRequest = request) -> None:
+            if req.context_future.done():
+                return
+            try:
+                result = finished.result().copy()
+            except BaseException:
+                result = agcontext()
+            req.context_future.set_result(result)
+
+        predecessor_future.add_done_callback(_propagate)
 
     def _fail_request_locked(self, request: _ExecutionRequest, message: str) -> None:
         if request.state in ("completed", "failed", "running"):
@@ -525,13 +527,14 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         output = agerror(message)
         if not request.result_future.done():
             request.result_future.set_result(output)
+        self._pass_through_context_future(request)
         self._end_phase_span_locked(request)
         self._end_run_span_locked(request, True, message)
         self._finish_request_locked(request)
         self._publish_request_locked("request_failed", request, {"error": message})
-        self._update_agent_display_locked(request.agent, True)
+        self._update_agent_display_locked(request.agent)
 
-    def _update_agent_display_locked(self, ag: "agent", last_failed: bool) -> None:
+    def _update_agent_display_locked(self, ag: "agent") -> None:
         outstanding = [
             self._requests[rid]
             for rid in self._outstanding_by_agent.get(ag, ())
@@ -543,8 +546,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             (r for r in outstanding if r.state == "ready"), key=lambda r: r.sequence, default=None
         )
         if ready is not None:
-            ag._state.blocked_on = None
-            ag._set_ui_state("queued", skill=ready.skill.name)
+            ag.record_state("queued", skill=ready.skill.name)
             return
         blocked = min(
             (r for r in outstanding if r.state == "blocked"),
@@ -554,8 +556,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         if blocked is not None:
             self.scheduler.set_agent_blocked(blocked)
             return
-        ag._state.blocked_on = None
-        ag._set_ui_state("error" if last_failed else "finished")
+        ag.record_state("agent_idle")
 
     # ------------------------------------------------------------------
     # State, data collection, and shutdown
@@ -587,9 +588,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         if span is not None:
             span.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
         if phase_name is not None and phase_started_wall is not None:
-            self._record_agent_span(
-                request, phase_name, phase_started_wall, ended_wall, {}
-            )
+            self._record_agent_span(request, phase_name, phase_started_wall, ended_wall, {})
 
     def _end_run_span_locked(
         self, request: _ExecutionRequest, failed: bool, error_message: str = ""
@@ -652,7 +651,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     "submission_sequence": request.sequence,
                     **payload,
                 },
-                do_update=True,
+                overwrite=True,
             )
         except Exception as exc:
             print(f"[agorchestrator] WARNING: per-agent event recording failed: {exc}")

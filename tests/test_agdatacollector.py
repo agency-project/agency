@@ -1,4 +1,4 @@
-"""Tests for agDataCollector.py -- the per-agent, write-side event/span store."""
+"""Tests for agdatacollector.py -- the per-agent, write-side event/span store."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from agency.agDataCollector import agDataCollector, agDataCollectorConfigs
+from agency.agdatacollector import agDataCollector, agDataCollectorConfigs
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +275,7 @@ def test_record_event_timestamps_itself(tmp_path):
 def test_record_event_do_update_false_does_not_touch_latest_values(tmp_path):
     dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, do_update=False)
+    dc.record_event("agent_state", {"s": "running"}, overwrite=False)
     dc.flush()
     assert _select_all(db_path, "latest_values") == []
     dc.stop()
@@ -284,7 +284,7 @@ def test_record_event_do_update_false_does_not_touch_latest_values(tmp_path):
 def test_record_event_do_update_true_upserts_latest_values(tmp_path):
     dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, call_label="c1", do_update=True)
+    dc.record_event("agent_state", {"s": "running"}, call_label="c1", overwrite=True)
     dc.flush()
 
     rows = _select_all(db_path, "latest_values")
@@ -292,7 +292,7 @@ def test_record_event_do_update_true_upserts_latest_values(tmp_path):
     assert rows[0]["type"] == "agent_state"
     assert rows[0]["call_label"] == "c1"
     assert json.loads(rows[0]["payload"]) == {"s": "running"}
-    # do_update doesn't replace the append-only record -- it's in addition to it.
+    # overwrite doesn't replace the append-only record -- it's in addition to it.
     assert len(_select_all(db_path, "events")) == 1
     dc.stop()
 
@@ -300,9 +300,9 @@ def test_record_event_do_update_true_upserts_latest_values(tmp_path):
 def test_record_event_do_update_overwrites_same_type(tmp_path):
     dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, do_update=True)
+    dc.record_event("agent_state", {"s": "running"}, overwrite=True)
     dc.flush()
-    dc.record_event("agent_state", {"s": "done"}, do_update=True)
+    dc.record_event("agent_state", {"s": "done"}, overwrite=True)
     dc.flush()
 
     rows = _select_all(db_path, "latest_values")
@@ -316,8 +316,8 @@ def test_record_event_do_update_overwrites_same_type(tmp_path):
 def test_record_event_do_update_different_types_get_separate_slots(tmp_path):
     dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, do_update=True)
-    dc.record_event("token_update", {"t": 10}, do_update=True)
+    dc.record_event("agent_state", {"s": "running"}, overwrite=True)
+    dc.record_event("token_update", {"t": 10}, overwrite=True)
     dc.flush()
 
     types = {r["type"] for r in _select_all(db_path, "latest_values")}

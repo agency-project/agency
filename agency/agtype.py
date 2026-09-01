@@ -4,7 +4,7 @@ import mimetypes
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, get_args, get_origin
-from .agutil import _looks_like_path
+from .utils.agutil import _looks_like_path
 
 if TYPE_CHECKING:
     from .sandbox.agsandbox import agSandbox

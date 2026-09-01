@@ -1,7 +1,7 @@
 """Reset mutable agent class-level and module-level state between tests."""
 
 import pytest
-import agency.agutil as _agutil_module
+import agency.utils.agutil as _agutil_module
 from agency.agent import agent
 from agency.agname import agname as _agname
 

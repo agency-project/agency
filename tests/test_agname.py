@@ -4,7 +4,7 @@ import threading
 import pytest
 
 from agency.agname import agname, _NOUNS
-from agency.agutil import _b36_suffix
+from agency.utils.agutil import _b36_suffix
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,7 @@ import httpx
 from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
 from agency.agconfig import agConfig
 from agency.llm import agVLLMBackendConfig
-from agency.agutil import format_exception as _fmt_exc
+from agency.utils.agutil import format_exception as _fmt_exc
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agConfig(

@@ -89,8 +89,8 @@ class _FakeDataCollector:
         self.stream_deltas = []
         self.finalized = []
 
-    def record_event(self, type, payload, call_label=None, do_update=False, **_kw):
-        self.events.append((type, payload, call_label, do_update))
+    def record_event(self, type, payload, call_label=None, overwrite=False, **_kw):
+        self.events.append((type, payload, call_label, overwrite))
 
     def record_stream_delta(self, type, payload, call_label=None, flush=False):
         self.stream_deltas.append((type, payload, call_label))

@@ -300,7 +300,7 @@ def test_real_claude_raw_text_end_to_end():
 
 @real_claude
 def test_real_claude_tool_call_history_is_not_flattened():
-    """Phase 5: a real run that uses a tool must produce a `ctx.messages`
+    """Phase 5: a real run that uses a tool must produce a `context.messages`
     with the actual tool-call/tool-result turns in it -- not the old
     2-message [user, final-assistant-text] collapse, which would silently
     discard exactly this kind of turn."""
@@ -322,11 +322,11 @@ def test_real_claude_tool_call_history_is_not_flattened():
 
     assert "error" not in raw, raw
     assert "agency-history-marker" in raw.get("result", "")
-    # ag.ctx is a future-backed placeholder until resolved -- reading
+    # ag.context is a future-backed placeholder until resolved -- reading
     # .messages directly would just see the unresolved default `[]`.
-    messages = ag.ctx.get_resolved_messages()
+    messages = ag.context.get_resolved_messages()
     assert any(m.get("role") == "tool" for m in messages), (
-        "no tool-role message in ctx.messages -- history fell back to the "
+        "no tool-role message in context.messages -- history fell back to the "
         f"flattened 2-message shape instead of the real transcript: {messages}"
     )
     assert len(messages) > 2, "transcript should have more than [user, assistant]"
@@ -365,7 +365,7 @@ def test_real_claude_structured_output_end_to_end():
 @real_claude
 def test_real_claude_history_continues_across_a_fresh_sandbox():
     """Session continuity (docs/Design_harness_history.md) travels with the
-    AGENT (`ag.ctx.harness_sessions`), not with any particular container:
+    AGENT (`ag.context.harness_sessions`), not with any particular container:
     call 1 tells the agent a fact, then `ag.sandbox` is swapped for a
     brand-new sandbox (a different container instance) before call 2 asks
     the agent to recall that fact via `--resume` against the captured
@@ -393,7 +393,7 @@ def test_real_claude_history_continues_across_a_fresh_sandbox():
         raw1 = r1.to_dict()
         assert "error" not in raw1, raw1
 
-        stored = ag.ctx.harness_sessions.get("claude_code")
+        stored = ag.context.harness_sessions.get("claude_code")
         assert stored and stored.get("session_id"), "no session captured after call 1"
     finally:
         ag.sandbox.rm_container()

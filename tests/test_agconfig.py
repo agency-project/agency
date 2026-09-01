@@ -37,9 +37,9 @@ from agency.sandbox.agsandbox import _AgSandboxFields, agSandboxConfig
 from agency.sandbox import AgSandboxBackendFields
 from agency.llm.agllm import _AgLLMFields, agLLMConfig
 from agency.agtool import _AgToolFields, agToolConfig
-from agency.agresources import _AgResourcePoolFields, agResourcePoolConfig
+from agency.orchestrator.agresources import agResourcePoolConfig
 from agency.agschema import _AgSchemaFields, agSchemaConfig
-from agency.agutil import _AgUtilFields, agUtilConfig
+from agency.utils.agutil import _AgResourcePoolFields, _AgUtilFields, agUtilConfig
 from agency.agent import agAgentConfig
 from agency.agskill import agSkillConfig
 

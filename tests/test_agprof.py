@@ -1120,7 +1120,7 @@ def test_agmap_tasks_are_traced_children_of_the_enclosing_span(monkeypatch, tmp_
     (silently -- a disconnected root is a valid trace). Each task span must
     instead parent to whatever ran the map, and must stay a *task* label so
     run_metrics keeps counting only agent runs."""
-    from agency.agmap import agmap
+    from agency.utils.agmap import agmap
 
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
 
@@ -1144,7 +1144,7 @@ def test_agmap_task_error_is_annotated_as_a_failure(monkeypatch, tmp_path):
     """A mapped task's exception becomes an agerror rather than propagating,
     so the span cannot see it as a raised exception -- the outcome has to be
     annotated explicitly or a failed fan-out reads as all-success."""
-    from agency.agmap import agmap
+    from agency.utils.agmap import agmap
 
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
 

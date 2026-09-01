@@ -73,7 +73,7 @@ class agDataCollector:
         payload: dict,
         *,
         call_label: "str | None" = None,
-        do_update: bool = False,
+        overwrite: bool = False,
         term_message: "str | None" = None,
         flush: bool = False,
     ) -> None:
@@ -83,7 +83,7 @@ class agDataCollector:
             print(term_message, file=sys.stderr)
         with self._lock:
             self._event_rows.append((type, timestamp, call_label, payload_json, term_message))
-            if do_update:
+            if overwrite:
                 self._latest_value_rows.append(
                     (type, timestamp, call_label, payload_json, term_message)
                 )

@@ -5,7 +5,7 @@ from concurrent.futures import Future
 from typing import TYPE_CHECKING, Callable
 
 from ..agdata import agdata, agerror
-from ..agutil import format_exception
+from ..utils.agutil import format_exception
 
 if TYPE_CHECKING:
     from .orchestrator import GlobalAgentOrchestrator, _ExecutionRequest
@@ -45,6 +45,9 @@ class ExecutionScheduler:
         """Return true when one wait-pool request is ready for promotion."""
         owner = self._orchestrator
         dependencies: set[Future] = set()
+        predecessor_future = pending_exec.context_dependency._future
+        if predecessor_future is not None and not predecessor_future.done():
+            dependencies.add(predecessor_future)
         failure = self._discover_dependencies(pending_exec.skill_input, dependencies)
         if failure is not None:
             owner._fail_request_locked(pending_exec, failure)
@@ -86,15 +89,8 @@ class ExecutionScheduler:
 
     def set_agent_blocked(self, pending_exec: "_ExecutionRequest") -> None:
         owner = self._orchestrator
-        producer_agent = None
-        for producer_id in pending_exec.producer_ids:
-            producer = owner._requests.get(producer_id)
-            if producer is not None:
-                producer_agent = producer.agent
-                break
-        pending_exec.agent._state.blocked_on = producer_agent
         if pending_exec.agent not in owner._active_by_agent:
-            pending_exec.agent._set_ui_state("blocked_on_dependency", skill=pending_exec.skill.name)
+            pending_exec.agent.record_state("waiting_on_dependency", skill=pending_exec.skill.name)
 
     def _promote_resolved(self, resolved: "list[_ExecutionRequest]") -> None:
         owner = self._orchestrator
@@ -106,10 +102,9 @@ class ExecutionScheduler:
                 continue
             owner._start_phase_span_locked(pending_exec, "sync:scheduler_queue")
             pending_exec.state = "ready"
-            pending_exec.agent._state.blocked_on = None
             heapq.heappush(self._ready, (pending_exec.sequence, pending_exec.request_id))
             if pending_exec.agent not in owner._active_by_agent:
-                pending_exec.agent._set_ui_state("queued", skill=pending_exec.skill.name)
+                pending_exec.agent.record_state("queued", skill=pending_exec.skill.name)
             owner._publish_request_locked("request_ready", pending_exec, {})
 
     def default_schedule(self) -> None:

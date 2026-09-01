@@ -2,11 +2,11 @@
 
 import time
 import pytest
-from agency.agsync import agsync
+from agency.utils.agsync import agsync
 from agency.agteam import agteam
 from agency.agdata import agdata
 from agency.agent import agent
-from agency._context import _active_team
+from agency.agteam import _active_team
 from agency.agconfig import agConfig
 
 

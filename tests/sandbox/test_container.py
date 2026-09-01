@@ -1682,7 +1682,7 @@ class TestCvdOverrideProtectionIntegration:
         import uuid
 
         from agency.agconfig import agConfig
-        from agency.agresources import agResourcePool
+        from agency.orchestrator.agresources import agResourcePool
         from agency.sandbox.agsandbox import agSandbox
         from agency.sandbox import agSandboxBackendConfig
 

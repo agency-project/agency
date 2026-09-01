@@ -55,7 +55,7 @@ def test_unresolved_dependency_uses_no_engine_thread_or_slot(monkeypatch, tmp_pa
     snapshot = get_orchestrator().snapshot()
     assert snapshot.blocked_count == 1
     assert snapshot.running_count == 0
-    assert ag._state.state == "blocked_on_dependency"
+    assert ag._current_state == "waiting_on_dependency"
     assert ag.engine is None
 
     upstream.set_result(agdata(value=42))
@@ -94,7 +94,7 @@ def test_optional_global_capacity_refills_on_completion_notification(monkeypatch
     assert not second_started.wait(0.1)
     snapshot = get_orchestrator().snapshot()
     assert (snapshot.running_count, snapshot.ready_count) == (1, 1)
-    assert second_agent._state.state == "queued"
+    assert second_agent._current_state == "queued"
     assert second_agent.engine is None
 
     release_first.set()
@@ -139,12 +139,21 @@ def test_completion_cycle_promotes_dependencies_before_scheduling(monkeypatch, t
     assert order == ["producer", "dependent", "independent"]
 
 
-def test_later_ready_request_bypasses_blocked_request_on_same_agent(monkeypatch, tmp_path):
+def test_same_agent_requests_never_reorder_even_when_earlier_is_blocked(monkeypatch, tmp_path):
+    """A later, dependency-free request for the same agent must wait behind
+    an earlier request that's still blocked on an external dependency --
+    agent context (conversation history) is an implicit dependency between
+    consecutive same-agent calls, so same-agent submission order is never
+    reordered (only cross-agent ready work may run ahead of a blocked
+    request)."""
     order: list[str] = []
+    ready_started = threading.Event()
 
     def execute(self, *, context, skill_input, **_kwargs):
         label = skill_input.label
         order.append(label)
+        if label == "ready":
+            ready_started.set()
         context.recent_transcript = [
             *context.recent_transcript,
             {"role": "user", "content": label},
@@ -162,11 +171,13 @@ def test_later_ready_request_bypasses_blocked_request_on_same_agent(monkeypatch,
     )
     ready = ag.run(skill, agdata(label="ready"))
 
-    assert ready.label == "ready"
+    assert not ready_started.wait(0.2)
+
     dependency.set_result(agdata(value=1))
     assert blocked.label == "blocked"
-    assert order == ["ready", "blocked"]
-    assert [message["content"] for message in ag.history.messages] == ["ready", "blocked"]
+    assert ready.label == "ready"
+    assert order == ["blocked", "ready"]
+    assert [message["content"] for message in ag.history.messages] == ["blocked", "ready"]
 
 
 def test_dependency_error_fails_without_launching_engine(monkeypatch, tmp_path):
@@ -277,7 +288,7 @@ def test_each_dispatched_request_gets_a_fresh_engine(monkeypatch, tmp_path):
 
 def test_engine_exception_preserves_context_and_releases_agent_slot(monkeypatch, tmp_path):
     ag = _agent(tmp_path)
-    ag.ctx = agcontext(recent_transcript=[{"role": "user", "content": "committed"}])
+    ag.context = agcontext(recent_transcript=[{"role": "user", "content": "committed"}])
 
     def fail(self, **_kwargs):
         raise RuntimeError("engine exploded")

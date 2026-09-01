@@ -8,8 +8,8 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from agency.agconfig import agConfig
-from agency.agresources import (
-    agResourcePool,
+from agency.orchestrator.agresources import agResourcePool
+from agency.utils.agutil import (
     amd_render_node_paths_by_pci_bus,
     detect_cpus,
     detect_gpus,
@@ -103,7 +103,7 @@ def test_detect_gpus_returns_list():
 
 def test_detect_gpus_nvidia_smi_unavailable_returns_empty(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    with patch("agency.agresources.subprocess.run", side_effect=FileNotFoundError):
+    with patch("agency.utils.agutil.subprocess.run", side_effect=FileNotFoundError):
         assert detect_gpus() == []
 
 
@@ -111,7 +111,7 @@ def test_detect_gpus_nvidia_smi_nonzero_exit_returns_empty(monkeypatch):
     mock = MagicMock()
     mock.returncode = 1
     mock.stdout = ""
-    with patch("agency.agresources.subprocess.run", return_value=mock):
+    with patch("agency.utils.agutil.subprocess.run", return_value=mock):
         assert detect_gpus() == []
 
 
@@ -120,7 +120,7 @@ def test_detect_gpus_parses_nvidia_smi_output(monkeypatch):
     mock = MagicMock()
     mock.returncode = 0
     mock.stdout = "0\n1\n2\n"
-    with patch("agency.agresources.subprocess.run", return_value=mock):
+    with patch("agency.utils.agutil.subprocess.run", return_value=mock):
         assert detect_gpus() == [0, 1, 2]
 
 
@@ -129,7 +129,7 @@ def test_detect_gpus_cvd_filters_nvidia_output(monkeypatch):
     mock = MagicMock()
     mock.returncode = 0
     mock.stdout = "0\n1\n2\n"
-    with patch("agency.agresources.subprocess.run", return_value=mock):
+    with patch("agency.utils.agutil.subprocess.run", return_value=mock):
         assert detect_gpus() == [0, 2]
 
 
@@ -155,7 +155,7 @@ def test_detect_gpus_falls_back_to_rocm_smi_when_nvidia_smi_missing(monkeypatch)
     monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
     stdout = "device,Device Name\ncard0,AMD Instinct MI350X\ncard1,AMD Instinct MI350X\n"
     with patch(
-        "agency.agresources.subprocess.run",
+        "agency.utils.agutil.subprocess.run",
         side_effect=_run_nvidia_fails_rocm_succeeds(stdout),
     ):
         assert detect_gpus() == [0, 1]
@@ -166,7 +166,7 @@ def test_detect_gpus_rocm_smi_cvd_filters_via_hip_visible_devices(monkeypatch):
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
     stdout = "device,Device Name\ncard0,AMD Instinct MI350X\ncard1,AMD Instinct MI350X\n"
     with patch(
-        "agency.agresources.subprocess.run",
+        "agency.utils.agutil.subprocess.run",
         side_effect=_run_nvidia_fails_rocm_succeeds(stdout),
     ):
         assert detect_gpus() == [1]
@@ -212,7 +212,7 @@ def _realpath_stub(bus_by_render_name):
 
 
 def test_amd_render_node_paths_by_pci_bus_returns_none_when_rocm_smi_missing():
-    with patch("agency.agresources.subprocess.run", side_effect=FileNotFoundError):
+    with patch("agency.utils.agutil.subprocess.run", side_effect=FileNotFoundError):
         assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
 
 
@@ -220,7 +220,7 @@ def test_amd_render_node_paths_by_pci_bus_returns_none_on_nonzero_exit():
     mock = MagicMock()
     mock.returncode = 1
     mock.stdout = ""
-    with patch("agency.agresources.subprocess.run", return_value=mock):
+    with patch("agency.utils.agutil.subprocess.run", return_value=mock):
         assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
 
 
@@ -231,9 +231,9 @@ def test_amd_render_node_paths_by_pci_bus_returns_none_when_a_gpu_bus_is_unmatch
     mock = MagicMock()
     mock.returncode = 0
     mock.stdout = _showbus_stdout({0: "0000:05:00.0", 1: "0000:15:00.0"})
-    with patch("agency.agresources.subprocess.run", return_value=mock):
+    with patch("agency.utils.agutil.subprocess.run", return_value=mock):
         with patch(
-            "agency.agresources.os.path.realpath",
+            "agency.utils.agutil.os.path.realpath",
             side_effect=_realpath_stub({"renderD128": "0000:05:00.0"}),
         ):
             assert amd_render_node_paths_by_pci_bus(["/dev/dri/renderD128"]) is None
@@ -247,9 +247,9 @@ def test_amd_render_node_paths_by_pci_bus_reorders_to_match_gpu_index():
     mock = MagicMock()
     mock.returncode = 0
     mock.stdout = _showbus_stdout({0: "0000:75:00.0", 1: "0000:05:00.0"})
-    with patch("agency.agresources.subprocess.run", return_value=mock):
+    with patch("agency.utils.agutil.subprocess.run", return_value=mock):
         with patch(
-            "agency.agresources.os.path.realpath",
+            "agency.utils.agutil.os.path.realpath",
             side_effect=_realpath_stub(
                 {"renderD128": "0000:05:00.0", "renderD129": "0000:75:00.0"}
             ),
@@ -268,9 +268,9 @@ def test_amd_render_node_paths_by_pci_bus_ignores_non_pci_xcp_sibling_nodes():
     mock = MagicMock()
     mock.returncode = 0
     mock.stdout = _showbus_stdout({0: "0000:05:00.0", 1: "0000:15:00.0"})
-    with patch("agency.agresources.subprocess.run", return_value=mock):
+    with patch("agency.utils.agutil.subprocess.run", return_value=mock):
         with patch(
-            "agency.agresources.os.path.realpath",
+            "agency.utils.agutil.os.path.realpath",
             side_effect=_realpath_stub(
                 {
                     "renderD128": "0000:05:00.0",
@@ -316,7 +316,7 @@ def test_detect_memory_mb_fallback_when_proc_missing(monkeypatch, tmp_path):
     fake = tmp_path / "meminfo"
     fake.write_text("Garbage: 0\n")
     with patch("builtins.open", side_effect=FileNotFoundError):
-        with patch("agency.agresources.subprocess.run", side_effect=FileNotFoundError):
+        with patch("agency.utils.agutil.subprocess.run", side_effect=FileNotFoundError):
             assert detect_memory_mb() == _AgResourcePoolFields.memory_detect_fallback_mb.default
 
 
@@ -487,7 +487,7 @@ def test_acquire_does_not_poll_via_sleep(monkeypatch):
     pool.acquire_gpus(sandbox, 1)
 
     slept = []
-    monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
+    monkeypatch.setattr("agency.orchestrator.agresources.time.sleep", lambda s: slept.append(s))
 
     started = threading.Event()
 
@@ -625,7 +625,7 @@ def test_release_gpus_is_immediate_no_polling(monkeypatch):
     pool.acquire_gpus(sandbox, 1)
 
     slept = []
-    monkeypatch.setattr("agency.agresources.time.sleep", lambda s: slept.append(s))
+    monkeypatch.setattr("agency.orchestrator.agresources.time.sleep", lambda s: slept.append(s))
 
     pool.release_gpus(sandbox, [0])
     assert slept == []

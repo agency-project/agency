@@ -2,15 +2,19 @@ from __future__ import annotations
 import functools
 import weakref
 from concurrent.futures import Future
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ._context import _active_team
 from .agconfig import agConfig
 from .profiler import agprof
 
 if TYPE_CHECKING:
     from .agent import agent as _Agent
+
+# Set to the active agteam instance while its run() method is executing.
+# Used by agent.__init__ to auto-register fork agents with the enclosing team.
+_active_team: ContextVar = ContextVar("_active_team", default=None)
 
 
 class agteam:
@@ -92,9 +96,10 @@ class agteam:
         parent = _active_team.get(None)
         self._parent_team: "agteam | None" = parent
 
-        from .agent import agent as _Agent, _DEFAULT_LOG_DIR
+        from .agent import agent as _Agent
+        from .utils.agutil import _DEFAULT_LOG_DIR
         from .agname import agname as _agname
-        from .agDataCollector import agDataCollector, agDataCollectorConfigs
+        from .agdatacollector import agDataCollector, agDataCollectorConfigs
 
         _base = config.get("name") or f"{type(self).__name__}"
         self.team_name: str = _agname.allocate_agname(_base)
@@ -125,7 +130,7 @@ class agteam:
         self.data_collector.record_event(
             type="team_registered",
             payload={"team": self.team_name, "agents": [a.agname for a in self._agents]},
-            do_update=True,
+            overwrite=True,
         )
 
     # ------------------------------------------------------------------

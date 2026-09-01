@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agency.agconfig import agConfig
-from agency.agDataCollector import agDataCollector, agDataCollectorConfigs
+from agency.agdatacollector import agDataCollector, agDataCollectorConfigs
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.host_servers.host_server_manager import (

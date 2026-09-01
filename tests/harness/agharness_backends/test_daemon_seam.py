@@ -121,7 +121,7 @@ class _NativeSandbox:
 def test_native_adapter_launches_through_typed_runtime(monkeypatch):
     sandbox = _NativeSandbox()
     monkeypatch.setattr(
-        "agency.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
     )
 
     result = _NativeBackend(agConfig()).run_daemon_attempt(

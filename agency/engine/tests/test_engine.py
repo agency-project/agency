@@ -71,8 +71,8 @@ class _FakeDataCollector:
     def __init__(self):
         self.events = []
 
-    def record_event(self, type, payload, call_label=None, do_update=False, **_kw):
-        self.events.append((type, payload, call_label, do_update))
+    def record_event(self, type, payload, call_label=None, overwrite=False, **_kw):
+        self.events.append((type, payload, call_label, overwrite))
 
 
 class _FakeAgent:

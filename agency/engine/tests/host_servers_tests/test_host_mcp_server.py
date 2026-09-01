@@ -69,8 +69,8 @@ class _FakeDataCollector:
     def __init__(self):
         self.events = []
 
-    def record_event(self, type, payload, call_label=None, do_update=False, **_kw):
-        self.events.append((type, payload, call_label, do_update))
+    def record_event(self, type, payload, call_label=None, overwrite=False, **_kw):
+        self.events.append((type, payload, call_label, overwrite))
 
 
 def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, output_schema=None):

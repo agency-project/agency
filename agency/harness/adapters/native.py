@@ -87,7 +87,10 @@ class _NativeBackend(agharness_backend):
                 ),
             )
 
-        from ...agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_in_container
+        from ...utils.agutil import (
+            AGENCY_PACKAGE_CONTAINER_MOUNT,
+            ensure_python_packages_in_container,
+        )
 
         sandbox = runtime.sandbox
         assert sandbox is not None

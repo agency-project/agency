@@ -46,7 +46,7 @@ def _resolve_binary_in_container(sandbox, binary: str) -> "str | None":
     if rc == 0:
         return cached_path
 
-    from ...agutil import agharness_binary_cache_dir
+    from ...utils.agutil import agharness_binary_cache_dir
 
     cache_file = agharness_binary_cache_dir() / binary
     if not cache_file.exists():
@@ -75,10 +75,10 @@ def _resolve_binary_in_container(sandbox, binary: str) -> "str | None":
 # recovers the exact original conversation, with real prompt-cache hits;
 # without the file, --resume fails cleanly ("No conversation found").
 #
-# Deliberately NOT the source of truth for history -- ag.ctx.recent_transcript
+# Deliberately NOT the source of truth for history -- ag.context.recent_transcript
 # stays that. This is a per-engine, opt-in optimization: extracted from and
 # reinjected into whatever sandbox handles the next call, stored on
-# ag.ctx.harness_sessions (and agent.save()/load()'s state.json), never on
+# ag.context.harness_sessions (and agent.save()/load()'s state.json), never on
 # the sandbox's own filesystem.
 _SESSION_SLUG_RE = re.compile(r"[^a-zA-Z0-9]")
 

@@ -45,9 +45,9 @@ from __future__ import annotations
 from concurrent.futures import Future
 from typing import Callable
 
-from .agdata import agdata, agerror
+from ..agdata import agdata, agerror
 from .agutil import format_exception
-from .profiler import agprof
+from ..profiler import agprof
 
 
 class agtask(agdata):

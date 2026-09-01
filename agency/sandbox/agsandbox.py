@@ -13,7 +13,7 @@ from .base import agsandbox_backend, backend_for_image_kind
 from .container import _RUN_ID
 
 if TYPE_CHECKING:
-    from ..agresources import agResourcePool
+    from ..orchestrator.agresources import agResourcePool
 
 
 # Exists to register agSandbox's config fields (via __set_name__ at import
@@ -185,7 +185,7 @@ class agSandbox(_AgSandboxFields):
         # particular agent ever actually runs a harness. A bind mount is a
         # live view, not a copy -- the socket file inside this directory
         # doesn't need to exist yet.
-        from ..agutil import (
+        from ..utils.agutil import (
             AGENCY_PACKAGE_CONTAINER_MOUNT,
             agency_package_dir,
             agharness_binary_cache_dir,

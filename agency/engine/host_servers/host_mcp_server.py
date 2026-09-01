@@ -13,8 +13,8 @@ from ...agdata import agdata
 if TYPE_CHECKING:
     from starlette.applications import Starlette
 
-    from ...agDataCollector import agDataCollector
-    from ...agresources import agResourcePool
+    from ...agdatacollector import agDataCollector
+    from ...orchestrator.agresources import agResourcePool
     from ...agskill import agskill
     from ...agtool import agtool
     from ...sandbox.agsandbox import agSandbox
@@ -43,7 +43,7 @@ class HostMcpServer:
             self._data_collector.record_event(
                 type="agent_state",
                 payload={"state": "running_tools", "tool": tool.name},
-                do_update=True,
+                overwrite=True,
                 flush=True,
             )
             persistent = {

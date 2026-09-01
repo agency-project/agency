@@ -181,7 +181,7 @@ import uuid as _uuid
 from pathlib import Path
 
 from ..agconfig import agConfig
-from ..agresources import amd_render_node_paths_by_pci_bus
+from ..utils.agutil import amd_render_node_paths_by_pci_bus
 from .base import (
     AgSandboxBackendFields,
     agsandbox_backend,
@@ -384,7 +384,7 @@ def _all_chroot_gpu_dev_paths() -> "list[str]":
 
 
 def _detect_chroot_gpu_dev_paths() -> "list[str]":
-    from ..agresources import detect_gpus
+    from ..utils.agutil import detect_gpus
 
     if not detect_gpus():
         return []

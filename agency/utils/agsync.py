@@ -35,8 +35,8 @@ def _agsync_impl(*targets) -> None:
         # Mix of variadic and lists
         agsync(my_agent, teams)
     """
-    from .agent import agent as _agent_cls
-    from .agteam import agteam as _agteam_cls
+    from ..agent import agent as _agent_cls
+    from ..agteam import agteam as _agteam_cls
     from .agmap import agtask as _agtask_cls
 
     # Flatten: each positional arg may itself be a list
@@ -75,13 +75,8 @@ def _agsync_impl(*targets) -> None:
     # Snapshot WeakSet now; dead entries are skipped automatically.
     team_agents = [ag for team in teams for ag in team._agents]
 
-    from .orchestrator import peek_orchestrator
-
-    orchestrator = peek_orchestrator()
     for ag in solo_agents + team_agents:
-        if orchestrator is not None:
-            orchestrator.wait_for_agent(ag)
-        ag.ctx.resolve_prev_dependencies()
+        ag.context.resolve_prev_dependencies()
 
     # Join any agmap tasks passed as targets. Task errors resolve to agerror
     # (agmap's never-crash-siblings contract) rather than re-raising here.
@@ -95,7 +90,7 @@ def _agsync_impl(*targets) -> None:
 
 
 def agsync(*targets) -> None:
-    from .profiler import agprof
+    from ..profiler import agprof
 
     with agprof.span("agsync:join"):
         return _agsync_impl(*targets)

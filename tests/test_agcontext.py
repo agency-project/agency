@@ -11,18 +11,18 @@ from agency.agcontext import agcontext
 
 
 def test_default_construction():
-    ctx = agcontext()
-    assert ctx.recent_transcript == []
-    assert ctx.harness_sessions == {}
-    assert ctx._future is None
+    context = agcontext()
+    assert context.recent_transcript == []
+    assert context.harness_sessions == {}
+    assert context._future is None
 
 
 def test_construction_with_values():
     msgs = [{"role": "user", "content": "hi"}]
     sessions = {"claude_code": {"session_id": "s1", "blob_b64": "abc"}}
-    ctx = agcontext(recent_transcript=msgs, harness_sessions=sessions)
-    assert ctx.recent_transcript is msgs
-    assert ctx.harness_sessions is sessions
+    context = agcontext(recent_transcript=msgs, harness_sessions=sessions)
+    assert context.recent_transcript is msgs
+    assert context.harness_sessions is sessions
 
 
 def test_recent_transcript_default_is_empty_list_not_shared():
@@ -50,17 +50,17 @@ def test_is_pending_false_when_no_future():
 
 def test_is_pending_true_when_future_set():
     f: Future = Future()
-    ctx = agcontext(_future=f)
-    assert ctx.is_pending() is True
+    context = agcontext(_future=f)
+    assert context.is_pending() is True
 
 
 def test_is_pending_false_after_resolve():
     f: Future[agcontext] = Future()
-    ctx = agcontext(_future=f)
+    context = agcontext(_future=f)
     resolved = agcontext(recent_transcript=[{"role": "user", "content": "resolved"}])
     f.set_result(resolved)
-    ctx.resolve_prev_dependencies()
-    assert ctx.is_pending() is False
+    context.resolve_prev_dependencies()
+    assert context.is_pending() is False
 
 
 # ---------------------------------------------------------------------------
@@ -69,9 +69,9 @@ def test_is_pending_false_after_resolve():
 
 
 def test_resolve_no_op_when_not_pending():
-    ctx = agcontext(recent_transcript=[{"role": "user", "content": "x"}])
-    ctx.resolve_prev_dependencies()
-    assert ctx.recent_transcript == [{"role": "user", "content": "x"}]
+    context = agcontext(recent_transcript=[{"role": "user", "content": "x"}])
+    context.resolve_prev_dependencies()
+    assert context.recent_transcript == [{"role": "user", "content": "x"}]
 
 
 def test_resolve_merges_future_state():
@@ -91,17 +91,17 @@ def test_resolve_merges_future_state():
 
 def test_resolve_clears_future():
     f: Future[agcontext] = Future()
-    ctx = agcontext(_future=f)
+    context = agcontext(_future=f)
     f.set_result(agcontext())
-    ctx.resolve_prev_dependencies()
-    assert ctx._future is None
+    context.resolve_prev_dependencies()
+    assert context._future is None
 
 
 def test_resolve_blocks_until_future_set():
     import threading
 
     f: Future[agcontext] = Future()
-    ctx = agcontext(_future=f)
+    context = agcontext(_future=f)
 
     def setter():
         import time
@@ -111,18 +111,18 @@ def test_resolve_blocks_until_future_set():
 
     t = threading.Thread(target=setter, daemon=True)
     t.start()
-    ctx.resolve_prev_dependencies()
+    context.resolve_prev_dependencies()
     t.join()
-    assert ctx.harness_sessions == {"claude_code": {"session_id": "from-setter"}}
+    assert context.harness_sessions == {"claude_code": {"session_id": "from-setter"}}
 
 
 def test_resolve_is_idempotent():
     f: Future[agcontext] = Future()
-    ctx = agcontext(_future=f)
+    context = agcontext(_future=f)
     f.set_result(agcontext(harness_sessions={"claude_code": {"session_id": "s"}}))
-    ctx.resolve_prev_dependencies()
-    ctx.resolve_prev_dependencies()  # second call must not raise
-    assert ctx.harness_sessions == {"claude_code": {"session_id": "s"}}
+    context.resolve_prev_dependencies()
+    context.resolve_prev_dependencies()  # second call must not raise
+    assert context.harness_sessions == {"claude_code": {"session_id": "s"}}
 
 
 # ---------------------------------------------------------------------------
@@ -131,41 +131,41 @@ def test_resolve_is_idempotent():
 
 
 def test_copy_returns_new_instance():
-    ctx = agcontext(recent_transcript=[{"role": "user", "content": "a"}])
-    c = ctx.copy()
-    assert c is not ctx
+    context = agcontext(recent_transcript=[{"role": "user", "content": "a"}])
+    c = context.copy()
+    assert c is not context
 
 
 def test_copy_deep_copies_recent_transcript():
     msgs = [{"role": "user", "content": "original"}]
-    ctx = agcontext(recent_transcript=msgs)
-    c = ctx.copy()
+    context = agcontext(recent_transcript=msgs)
+    c = context.copy()
     c.recent_transcript[0]["content"] = "mutated"
-    assert ctx.recent_transcript[0]["content"] == "original"
+    assert context.recent_transcript[0]["content"] == "original"
 
 
 def test_copy_deep_copies_harness_sessions():
     sessions = {"claude_code": {"session_id": "s1"}}
-    ctx = agcontext(harness_sessions=sessions)
-    c = ctx.copy()
+    context = agcontext(harness_sessions=sessions)
+    c = context.copy()
     c.harness_sessions["claude_code"]["session_id"] = "s2"
-    assert ctx.harness_sessions["claude_code"]["session_id"] == "s1"
+    assert context.harness_sessions["claude_code"]["session_id"] == "s1"
 
 
 def test_copy_resolves_pending_future():
     f: Future[agcontext] = Future()
-    ctx = agcontext(_future=f)
+    context = agcontext(_future=f)
     f.set_result(agcontext(recent_transcript=[{"role": "user", "content": "from future"}]))
-    c = ctx.copy()
+    c = context.copy()
     assert c.recent_transcript == [{"role": "user", "content": "from future"}]
     assert c._future is None
 
 
 def test_copy_does_not_carry_future():
     f: Future[agcontext] = Future()
-    ctx = agcontext(_future=f)
+    context = agcontext(_future=f)
     f.set_result(agcontext())
-    c = ctx.copy()
+    c = context.copy()
     assert c._future is None
     assert c.is_pending() is False
 
@@ -176,24 +176,24 @@ def test_copy_does_not_carry_future():
 
 
 def test_repr_not_pending():
-    ctx = agcontext(
+    context = agcontext(
         recent_transcript=[
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hey"},
         ],
     )
-    r = repr(ctx)
+    r = repr(context)
     assert "recent_transcript=2" in r
     assert "harnesses=[]" in r
     assert "pending" not in r
 
 
 def test_repr_shows_harness_names():
-    ctx = agcontext(harness_sessions={"claude_code": {"session_id": "s1"}})
-    assert "harnesses=['claude_code']" in repr(ctx)
+    context = agcontext(harness_sessions={"claude_code": {"session_id": "s1"}})
+    assert "harnesses=['claude_code']" in repr(context)
 
 
 def test_repr_pending():
     f: Future[agcontext] = Future()
-    ctx = agcontext(_future=f)
-    assert "(pending)" in repr(ctx)
+    context = agcontext(_future=f)
+    assert "(pending)" in repr(context)

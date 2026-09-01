@@ -22,9 +22,9 @@ class _FakeDataCollector:
         self.spans = []
 
     def record_event(
-        self, type, payload, call_label=None, do_update=False, term_message=None, flush=False
+        self, type, payload, call_label=None, overwrite=False, term_message=None, flush=False
     ):
-        self.events.append((type, payload, call_label, do_update, term_message, flush))
+        self.events.append((type, payload, call_label, overwrite, term_message, flush))
 
     def record_span(
         self,
@@ -354,7 +354,7 @@ def test_record_event_forwards_term_message_and_flush():
     server.record_event(
         "agent_state",
         {"state": "agent_idle"},
-        do_update=True,
+        overwrite=True,
         term_message="[x] idle",
         flush=True,
     )
@@ -393,7 +393,7 @@ def test_build_app_record_event_route_forwards_term_message_and_flush():
         json={
             "type": "agent_state",
             "payload": {"state": "agent_idle"},
-            "do_update": True,
+            "overwrite": True,
             "term_message": "[x] idle",
             "flush": True,
         },

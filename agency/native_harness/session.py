@@ -1,9 +1,9 @@
 """On-disk session continuity for the standalone native harness.
 
 Native's old design never needed this: it was a long-lived process agency
-itself kept alive and RPC'd into, so `prev_ctx.messages` (agency's own
-in-memory continuation, held on the host) was the only continuity that
-existed. A one-shot CLI in the Claude-Code mold has no such in-memory
+itself kept alive and RPC'd into, so the agent's `context.recent_transcript`
+(agency's own in-memory continuation, held on the host) was the only
+continuity that existed. A one-shot CLI in the Claude-Code mold has no such in-memory
 carry-over between invocations -- each `native_harness -p "..."` call is a
 fresh process -- so continuity has to live on disk instead, the same way
 Claude Code's own `--resume <session_id>` works against its own JSONL

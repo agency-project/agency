@@ -42,7 +42,7 @@ from pathlib import Path
 
 from ..profiler import agprof
 from ..agconfig import agConfig
-from ..agresources import amd_render_node_paths_by_pci_bus, detect_gpus, _AgResourcePoolFields
+from ..utils.agutil import amd_render_node_paths_by_pci_bus, detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
 from ._layer_squash import merge_layer_tars, overlay_diff_to_tar, sha256_file, build_save_archive
 
@@ -165,7 +165,7 @@ def _pid_alive(pid: int) -> bool:
     reaper (`agutil._reap_orphaned_gateway_dirs`) share one definition of
     "owner still alive" -- the test both rely on before deleting anything.
     """
-    from ..agutil import pid_alive
+    from ..utils.agutil import pid_alive
 
     return pid_alive(pid)
 

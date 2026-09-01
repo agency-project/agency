@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from ..agcontext import agcontext
     from ..agdata import agdata
     from ..agent import agent
-    from ..agresources import agResourcePool
+    from ..orchestrator.agresources import agResourcePool
     from ..agskill import agskill
     from .clients import SandboxInteractionClient
 
@@ -99,7 +99,7 @@ class AgentEngine:
         self._agent.data_collector.record_event(
             type="agent_state",
             payload={"state": "running_harness"},
-            do_update=True,
+            overwrite=True,
             flush=True,
         )
 

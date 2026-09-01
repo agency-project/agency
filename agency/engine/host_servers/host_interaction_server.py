@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from ...harness._syscall_event import agsyscallevent
 
 if TYPE_CHECKING:
-    from ...agDataCollector import agDataCollector
+    from ...agdatacollector import agDataCollector
     from ...agskill import agskill
 
 
@@ -44,7 +44,7 @@ class HostInteractionServer:
         type: str,
         payload: dict,
         call_label: "str | None" = None,
-        do_update: bool = False,
+        overwrite: bool = False,
         term_message: "str | None" = None,
         flush: bool = False,
     ) -> None:
@@ -52,7 +52,7 @@ class HostInteractionServer:
             type,
             payload,
             call_label=call_label,
-            do_update=do_update,
+            overwrite=overwrite,
             term_message=term_message,
             flush=flush,
         )
@@ -100,7 +100,7 @@ class HostInteractionServer:
                 request["type"],
                 request["payload"],
                 call_label=request.get("call_label"),
-                do_update=request.get("do_update", False),
+                overwrite=request.get("overwrite", False),
                 term_message=request.get("term_message"),
                 flush=request.get("flush", False),
             )

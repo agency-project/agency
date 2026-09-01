@@ -4,23 +4,12 @@ import json
 import os
 import queue
 import tarfile
-import threading
 import uuid as _uuid_mod
 import weakref
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from .agutil import agency_tmp_root as _agency_tmp_root
-
-# Single run-level ID for the default log directory.
-# [REFACTOR] combine with the RUN_ID in agcontainer
-_RUN_ID = _uuid_mod.uuid4().hex[:12]
-_RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-# Same root as the UDS gateway (see agutil.agency_tmp_root for why it is
-# hardcoded rather than following $TMPDIR) -- one location policy for every
-# host-side runtime path agency owns, instead of logs and sockets diverging.
-_DEFAULT_LOG_DIR = _agency_tmp_root() / f"{_RUN_TS}_{_RUN_ID}"
+from .utils.agutil import _DEFAULT_LOG_DIR
 
 # Global weak registry of all live agent instances.
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
@@ -35,10 +24,10 @@ def _llm_config_snapshot(agconfig: "agConfig") -> dict:
 
 from .agdata import agdata
 from .agcontext import agcontext
-from .agDataCollector import agDataCollector, agDataCollectorConfigs, _ts
+from .agdatacollector import agDataCollector, agDataCollectorConfigs, _ts
+from .orchestrator import get_orchestrator
 from .sandbox.agsandbox import agSandbox, agSandboxConfig
 from .sandbox import agSandboxBackendConfig
-from .agresources import agResourcePool
 from .llm.agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
@@ -92,31 +81,6 @@ def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_defau
     return classvar_default if agconfig is None else agconfig.get("agent", name, classvar_default)
 
 
-_SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
-
-
-class agent_state:
-    """Atomically owned live state used by orchestration and inspection."""
-
-    def __init__(self, agname: str) -> None:
-        self.agname = agname
-        self.state = "inactive"
-        self.skill: "str | None" = None
-        self.tool: "str | None" = None
-        self.blocked_on: "agent | None" = None
-        self._lock = threading.RLock()
-
-    def snapshot(self) -> "tuple[str, str | None, str | None]":
-        with self._lock:
-            return self.state, self.skill, self.tool
-
-    def update_state(
-        self, state: str, skill: "str | None" = None, tool: "str | None" = None
-    ) -> None:
-        with self._lock:
-            self.state, self.skill, self.tool = state, skill, tool
-
-
 # [REFACTOR] Check how it works
 class agent:
     """Orchestrator that maintains shared history and delegates to named agskills.
@@ -136,16 +100,19 @@ class agent:
     Class-level configuration (set once before creating agents)::
 
         agent.log_dir        = Path("runs/logs")
-        agent.agresource_pool  = agResourcePool()
         agent.ping_interval_s = 300
         agent.poll_interval_s = 5
         agent.max_outer_iters = 144
+
+    The GPU/CPU/memory pool is no longer a class-level override on ``agent``
+    -- it's owned by the process-wide orchestrator, constructed eagerly at
+    import time. Override it via ``get_orchestrator().agresource_pool = ...``
+    instead.
     """
 
     # [REFACTOR] Move to agconfig
     log_dir: ClassVar[Path | None] = None
     output_dir: ClassVar[Path | None] = None
-    agresource_pool: ClassVar[agResourcePool] = agResourcePool(mark_gpus=False)
     ping_interval_s: ClassVar[int] = 300
     poll_interval_s: ClassVar[int] = 5
     max_outer_iters: ClassVar[int] = 144
@@ -178,7 +145,7 @@ class agent:
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
         if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
-            from ._context import _active_team as _at
+            from .agteam import _active_team as _at
 
             _t = _at.get(None)
             if (
@@ -213,29 +180,16 @@ class agent:
         self.harness: str = (
             harness if harness is not None else _AgAgentFields(self.agconfig).harness
         )  # [REFACTOR] Change to config only
-        self.ctx: agcontext = agcontext()
+        self.context: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
         self.engine: "AgentEngine | None" = None
 
-        _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
-        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
+        # Eagerly construct the process-wide orchestrator
+        get_orchestrator(self.agconfig)
 
-        data_collector_configs = self.agconfig.__dict__.get("agDataCollectorConfigs")
-        if data_collector_configs is None:
-            data_collector_configs = agDataCollectorConfigs(
-                db_path=str(log_dir / f"{self.agname}_data.sqlite3")
-            )
-            self.agconfig.agDataCollectorConfigs = data_collector_configs
-        self.data_collector = agDataCollector(self.agconfig)
-        self.data_collector.start()
-        self._state = agent_state(str(self.agname))
-        self.inbox: queue.Queue[str] = queue.Queue()
-
-        _live_agents.add(self)
-
-        from ._context import _active_team
+        from .agteam import _active_team
 
         _team = _active_team.get(None)
         if _team is not None:
@@ -244,34 +198,57 @@ class agent:
         team_name = _team.team_name if _team is not None else None
 
         _llm_config = _llm_config_snapshot(self.agconfig)
-        _context_limit = _llm_config.get("context_limit")
-        ctx = f"  context={_context_limit}" if _context_limit else "  context=unknown"
         team_tag = f"  team={team_name}" if team_name else ""
-        self.data_collector.record_event(
-            type="agent_created",
-            payload={
+        self._finish_construction(
+            event_type="agent_created",
+            event_payload={
                 "agname": self.agname,
                 "team": team_name,
                 "llm_config": _llm_config,
-                "context_limit": _context_limit,
             },
             term_message=(
-                f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}{ctx}{team_tag}"
+                f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}{team_tag}"
             ),
+            reuse_data_collector_configs=True,
         )
-        self._set_ui_state("inactive")
+
+    def _finish_construction(
+        self,
+        *,
+        event_type: str,
+        event_payload: dict,
+        term_message: str,
+        reuse_data_collector_configs: bool = False,
+    ) -> None:
+        """Shared tail of _initialize()/fork()/load(): data collector setup,
+        initial runtime state, live registry, and the construction-event log
+        -- everything that only needs agname/agconfig already resolved,
+        regardless of how they were resolved."""
+        _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
+        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
+
+        data_collector_configs = (
+            self.agconfig.__dict__.get("agDataCollectorConfigs")
+            if reuse_data_collector_configs
+            else None
+        )
+        if data_collector_configs is None:
+            self.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
+                db_path=str(log_dir / f"{self.agname}_data.sqlite3")
+            )
+        self.data_collector = agDataCollector(self.agconfig)
+        self.data_collector.start()
+        self._current_state = "agent_idle"
+        self.inbox: queue.Queue[str] = queue.Queue()
+        _live_agents.add(self)
+
+        self.data_collector.record_event(
+            type=event_type, payload=event_payload, term_message=term_message
+        )
+        self.record_state("agent_idle")
         self.change_config(self.agconfig)
 
     def change_config(self, agconfig: "agConfig") -> None:
-        """Replace this agent's agconfig with a clone of the given one, and
-        push that same clone down to every sub-object that holds its own
-        independent copy (``self.data_collector``, ``self.sandbox`` if one
-        has been created, and ``self.engine``). Reassigning ``self.agconfig``
-        alone does not reach those clones, so this is the supported way to
-        change live config (e.g. ``max_completion_tokens``) after
-        construction -- also called by __init__/fork/load themselves, once
-        their sub-objects exist, so config-snapshot recording lives in one
-        place."""
         self.agconfig = agconfig.clone()
         self.data_collector.set_config(self.agconfig)
         if self.sandbox is not None:
@@ -281,7 +258,7 @@ class agent:
         self.data_collector.record_event(
             type="agent_config",
             payload=self.agconfig.dynamic_snapshot(),
-            do_update=True,
+            overwrite=True,
         )
 
     def get_config_copy(self) -> "agConfig | None":
@@ -309,56 +286,23 @@ class agent:
     @property
     def history(self) -> agdata:
         """Return the committed transcript after this agent becomes idle."""
-        from .orchestrator import peek_orchestrator
-
-        orchestrator = peek_orchestrator()
-        if orchestrator is not None:
-            orchestrator.wait_for_agent(self)
-        return agdata(messages=self.ctx.get_resolved_transcript())
+        return agdata(messages=self.context.get_resolved_transcript())
 
     @history.setter
     def history(self, value: agdata) -> None:
-        from .orchestrator import peek_orchestrator
+        self.context.resolve_prev_dependencies()
+        self.context.set_transcript(value._data.get("messages", []))
 
-        orchestrator = peek_orchestrator()
-        if orchestrator is not None:
-            orchestrator.wait_for_agent(self)
-        self.ctx.set_transcript(value._data.get("messages", []))
-
-    def _set_ui_state(
+    def record_state(
         self, state: str, skill: "str | None" = None, tool: "str | None" = None
     ) -> None:
-        self._state.update_state(state, skill, tool)
+        self._current_state = state
         self.data_collector.record_event(
             type="agent_state",
             payload={"state": state, "skill": skill, "tool": tool},
-            do_update=True,
+            overwrite=True,
+            flush=True,
         )
-        try:
-            from . import agwebui as _agwebui
-
-            if _agwebui._active is not None:
-                _agwebui._active.emitter.agent_state(self.agname, state, skill, tool)
-        except Exception as exc:
-            print(f"[agent] WARNING: agent_state push failed for {self.agname}: {exc}")
-
-    def is_paused(self) -> bool:
-        return self._state.state == "paused"
-
-    def is_settled(self, _seen: "set[str] | None" = None) -> bool:
-        from .orchestrator import peek_orchestrator
-
-        orchestrator = peek_orchestrator()
-        if orchestrator is not None and not orchestrator.is_agent_idle(self):
-            return orchestrator.is_agent_settled(self)
-        producer = self._state.blocked_on
-        if producer is not None:
-            seen = _seen if _seen is not None else set()
-            if str(producer.agname) in seen:
-                return True
-            seen.add(str(self.agname))
-            return producer.is_settled(seen)
-        return self._state.state in _SETTLED_LEAF_STATES
 
     # ------------------------------------------------------------------
     # UI / history helpers — called by agskill during execution
@@ -457,7 +401,7 @@ class agent:
             self.data_collector.record_event(
                 type="agent_state",
                 payload={"state": "agent_exit"},
-                do_update=True,
+                overwrite=True,
                 flush=True,
             )
             self.data_collector.record_event(
@@ -472,7 +416,6 @@ class agent:
     # ------------------------------------------------------------------
     # Fork
     # ------------------------------------------------------------------
-    # [REFACTOR] Why not call _init()_?
     @classmethod
     def fork(cls, src: "agent", agname: str | None = None) -> "agent":
         """Return an independent agent forked from *src*."""
@@ -484,13 +427,8 @@ class agent:
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.harness = src.harness
         ag.engine = None
-        from .orchestrator import peek_orchestrator
-
-        orchestrator = peek_orchestrator()
-        if orchestrator is not None:
-            orchestrator.wait_for_agent(src)
-        src.ctx.resolve_prev_dependencies()
-        ag.ctx = src.ctx.copy()
+        src.context.resolve_prev_dependencies()
+        ag.context = src.context.copy()
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
@@ -500,27 +438,17 @@ class agent:
         ag.sandbox = (
             src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
         )
-        _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", cls.log_dir)
-        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        ag.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
-            db_path=str(log_dir / f"{ag.agname}_data.sqlite3")
-        )
-        ag.data_collector = agDataCollector(ag.agconfig)
-        ag.data_collector.start()
-        ag._state = agent_state(str(ag.agname))
-        ag.inbox = queue.Queue()
-        _live_agents.add(ag)
 
-        from ._context import _active_team
+        from .agteam import _active_team
 
         _team = _active_team.get(None)
         if _team is not None:
             _team._agents.add(ag)
         team_name = _team.team_name if _team is not None else None
 
-        ag.data_collector.record_event(
-            type="agent_forked",
-            payload={
+        ag._finish_construction(
+            event_type="agent_forked",
+            event_payload={
                 "agname": ag.agname,
                 "parent_agname": src.agname,
                 "team": team_name,
@@ -528,8 +456,6 @@ class agent:
             },
             term_message=f"[{ag.agname}] FORKED   from {src.agname}",
         )
-        ag._set_ui_state("inactive")
-        ag.change_config(ag.agconfig)
         return ag
 
     # ------------------------------------------------------------------
@@ -591,24 +517,20 @@ class agent:
         path = Path(path)
         image_tag = f"agency/ckpt-{self.agname}"
 
-        from .orchestrator import peek_orchestrator
-
-        orchestrator = peek_orchestrator()
-        if orchestrator is not None and not orchestrator.is_agent_idle(self):
+        if self.context.is_pending():
             self.data_collector.record_event(
                 type="agent_checkpoint_waiting",
                 payload={"agname": self.agname},
                 term_message=f"[{self.agname}] CKPT ⏳  waiting for in-flight task to complete...",
             )
-            orchestrator.wait_for_agent(self)
-        self.ctx.resolve_prev_dependencies()
+        self.context.resolve_prev_dependencies()
 
         state = {
             "agname": self.agname,
             "parent_agent_id": self._parent_agent_id,
             "harness": self.harness,
             "llm_config": _llm_config_snapshot(self.agconfig),
-            "history": self.ctx.recent_transcript,
+            "history": self.context.recent_transcript,
             "ts": _ts(),
         }
         if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
@@ -616,12 +538,12 @@ class agent:
             # container.tar is in -- a chroot snapshot directory and a
             # docker/podman image tag are unrelated formats.
             state["sandbox_image_kind"] = self.sandbox.image_kind
-        if self.ctx.harness_sessions:
+        if self.context.harness_sessions:
             # See docs/Design_harness_history.md -- travels with the
             # agent's own checkpoint, not with container.tar, so it's
             # available regardless of which sandbox this checkpoint is
             # later restored onto.
-            state["harness_sessions"] = self.ctx.harness_sessions
+            state["harness_sessions"] = self.context.harness_sessions
         state_bytes = json.dumps(state, indent=2).encode()
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -715,7 +637,7 @@ class agent:
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
         ag.engine = None
-        ag.ctx = agcontext(
+        ag.context = agcontext(
             recent_transcript=list(state.get("history", [])),
             harness_sessions=state.get("harness_sessions", {}),
         )
@@ -740,29 +662,20 @@ class agent:
             else None
         )
 
-        _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", agent.log_dir)
-        log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        ag.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
-            db_path=str(log_dir / f"{ag.agname}_data.sqlite3")
-        )
-        ag.data_collector = agDataCollector(ag.agconfig)
-        ag.data_collector.start()
-        ag._state = agent_state(str(ag.agname))
-        ag.inbox: queue.Queue = queue.Queue()
+        # load() can be the very first agent constructed in a process (no
+        # prior agent to have already triggered this), so it needs its own
+        # eager trigger too.
+        get_orchestrator(ag.agconfig)
 
-        _live_agents.add(ag)
-
-        ag.data_collector.record_event(
-            type="agent_loaded",
-            payload={
+        ag._finish_construction(
+            event_type="agent_loaded",
+            event_payload={
                 "agname": ag.agname,
                 "source": str(path),
                 "checkpoint_ts": state.get("ts"),
             },
             term_message=f"[{ag.agname}] LOADED   from {path}",
         )
-        ag._set_ui_state("inactive")
-        ag.change_config(ag.agconfig)
 
         return ag
 

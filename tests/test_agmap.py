@@ -12,8 +12,8 @@ import time
 import pytest
 
 from agency.agdata import agdata
-from agency.agmap import agmap, agtask
-from agency.agsync import agsync
+from agency.utils.agmap import agmap, agtask
+from agency.utils.agsync import agsync
 
 
 def _runtime_available() -> bool:

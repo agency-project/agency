@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 
-from .agutil import _b36_suffix
+from .utils.agutil import _b36_suffix
 
 _NOUNS = [
     "alex",

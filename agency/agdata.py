@@ -7,7 +7,7 @@ if TYPE_CHECKING:
 
 from .profiler import agprof
 from .agtype import agtype
-from .agutil import _camel_to_snake
+from .utils.agutil import _camel_to_snake
 
 
 class AgError(RuntimeError):

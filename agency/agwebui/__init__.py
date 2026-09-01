@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..agutil import sigterm_as_exit
+from ..utils.agutil import sigterm_as_exit
 from ..profiler import agprof
 from .emitter import agwebui_emitter
 
@@ -256,9 +256,9 @@ class agwebui:
         # Emit initial resource pool state so the dashboard shows GPU/CPU
         # capacity immediately without waiting for the first acquire/release.
         try:
-            from ..agent import agent as _agent_cls
+            from ..orchestrator import get_orchestrator
 
-            _pool = _agent_cls.agresource_pool
+            _pool = get_orchestrator().agresource_pool
             if _pool is not None:
                 _pool._emit_resource()
         except Exception as _e:

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import uvicorn
 from fastapi import FastAPI
 
-from ...agutil import new_uds_path
+from ...utils.agutil import new_uds_path
 from .host_interaction_server import HostInteractionServer
 from .host_mcp_server import HostMcpServer
 from .llm_handler_server import LlmHandlerServer
@@ -18,7 +18,7 @@ from .llm_handler_server import LlmHandlerServer
 if TYPE_CHECKING:
     from ...agconfig import agConfig
     from ...agent import agent
-    from ...agresources import agResourcePool
+    from ...orchestrator.agresources import agResourcePool
     from ...agskill import agskill
     from ...sandbox.agsandbox import agSandbox
 

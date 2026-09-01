@@ -118,7 +118,7 @@ def test_setup_runs_before_run():
         def run(self):
             calls.append("run")
 
-    from agency.agsync import agsync
+    from agency.utils.agsync import agsync
 
     t = _OrderTeam()
     t.run()

@@ -18,7 +18,7 @@ from ...llm.agllm import agllm
 
 if TYPE_CHECKING:
     from ...agconfig import agConfig
-    from ...agDataCollector import agDataCollector
+    from ...agdatacollector import agDataCollector
 
 TRANSIENT_DISPATCH_EXCS = (
     RATE_LIMIT_EXCS + API_CONN_EXCS + API_ERROR_EXCS + (ssl.SSLError, OSError, httpx.TransportError)
@@ -197,7 +197,7 @@ class LlmHandlerServer:
         self._data_collector.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
-            do_update=True,
+            overwrite=True,
             flush=True,
             call_label=call_label,
         )
@@ -236,7 +236,7 @@ class LlmHandlerServer:
         self._data_collector.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
-            do_update=True,
+            overwrite=True,
             flush=True,
             call_label=call_label,
         )

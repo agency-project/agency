@@ -17,7 +17,7 @@ import uuid
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agency.agresources import agResourcePool
+from agency.orchestrator.agresources import agResourcePool
 
 
 def _worker_import_agent():
@@ -160,14 +160,14 @@ def test_public_facade_operation_uses_shared_lock(operation, args):
 
 class TestDetectGpus:
     def test_returns_list(self):
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         gpus = detect_gpus()
         assert isinstance(gpus, list)
         assert all(isinstance(g, int) for g in gpus)
 
     def test_nvidia_smi_unavailable_returns_empty(self, monkeypatch):
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         monkeypatch.setattr(
             "subprocess.run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
@@ -176,7 +176,7 @@ class TestDetectGpus:
 
     def test_nvidia_smi_nonzero_exit_returns_empty(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 1
@@ -186,7 +186,7 @@ class TestDetectGpus:
 
     def test_nvidia_smi_parses_indices(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 0
@@ -200,7 +200,7 @@ class TestDetectGpus:
 
     def test_cvd_filter_applied_to_nvidia_smi_output(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 0
@@ -211,7 +211,7 @@ class TestDetectGpus:
 
     def test_cvd_unset_returns_all_from_nvidia_smi(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 0
@@ -228,50 +228,50 @@ class TestDetectGpus:
 
 class TestCvdFilter:
     def test_no_env_var_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         assert _cvd_filter([0, 1, 2, 3]) == [0, 1, 2, 3]
 
     def test_filters_to_allowed_subset(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,3,5,7")
         assert _cvd_filter([0, 1, 2, 3, 4, 5, 6, 7]) == [0, 3, 5, 7]
 
     def test_single_gpu(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
         assert _cvd_filter([0, 1, 2, 3]) == [3]
 
     def test_empty_string_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_nodevfiles_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "NoDevFiles")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_none_string_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "none")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_cvd_id_not_in_pool_ignored(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         # CVD says GPU 9 is allowed but nvidia-smi only reported [0,1,2]
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,9")
         assert _cvd_filter([0, 1, 2]) == [0]
 
     def test_preserves_order_from_pool_list(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,3,1")
         # Order follows the pool list, not CVD order
@@ -292,14 +292,14 @@ class TestCvdFilter:
 
 class TestDetectCpus:
     def test_returns_positive_int(self):
-        from agency.agresources import detect_cpus
+        from agency.utils.agutil import detect_cpus
 
         cpus = detect_cpus()
         assert isinstance(cpus, int)
         assert cpus >= 1
 
     def test_os_cpu_count_none_returns_one(self, monkeypatch):
-        from agency.agresources import detect_cpus
+        from agency.utils.agutil import detect_cpus
 
         monkeypatch.setattr("os.cpu_count", lambda: None)
         assert detect_cpus() == 1
@@ -307,7 +307,7 @@ class TestDetectCpus:
 
 class TestDetectMemoryMb:
     def test_returns_positive_int(self):
-        from agency.agresources import detect_memory_mb
+        from agency.utils.agutil import detect_memory_mb
 
         mb = detect_memory_mb()
         assert isinstance(mb, int)
@@ -315,7 +315,7 @@ class TestDetectMemoryMb:
 
     def test_fallback_when_proc_missing(self, monkeypatch, tmp_path):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_memory_mb
+        from agency.utils.agutil import detect_memory_mb
 
         # Point /proc/meminfo to a non-existent path and make sysctl fail
         monkeypatch.setattr("builtins.open", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
@@ -351,12 +351,13 @@ class TestPoolAutoDetect:
         assert pool.total_cpus == 4
         assert pool.total_memory_mb == 8192
 
-    def test_agent_has_default_pool(self):
-        from agency.agent import agent
+    def test_orchestrator_has_default_pool(self):
+        from agency.orchestrator import get_orchestrator
 
-        assert agent.agresource_pool is not None
-        assert isinstance(agent.agresource_pool.total_cpus, int)
-        assert isinstance(agent.agresource_pool.total_memory_mb, int)
+        pool = get_orchestrator().agresource_pool
+        assert pool is not None
+        assert isinstance(pool.total_cpus, int)
+        assert isinstance(pool.total_memory_mb, int)
 
 
 # ---------------------------------------------------------------------------
@@ -440,28 +441,28 @@ class TestGpuMarkers:
     """GPU markers are now allocated in-process via ctypes (no subprocesses)."""
 
     def test_mark_gpus_false_does_not_call_allocate(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[0, 1], mark_gpus=False)
         mock_alloc.assert_not_called()
 
     def test_mark_gpus_true_empty_gpu_list_does_not_call_allocate(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[], mark_gpus=True)
         mock_alloc.assert_not_called()
 
     def test_mark_gpus_true_calls_allocate_with_gpu_list(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[0, 1], mark_gpus=True)
         mock_alloc.assert_called_once_with([0, 1])
 
     def test_mark_gpus_true_single_gpu_calls_allocate(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[2], mark_gpus=True)
@@ -476,14 +477,14 @@ class TestGpuMarkers:
         assert not hasattr(pool, "_stop_gpu_markers")
 
     def test_allocate_gpu_markers_skips_on_no_libcuda(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         with patch.object(ctypes, "CDLL", side_effect=OSError("libcuda.so.1 not found")):
             _allocate_gpu_markers([0, 1])  # must not raise
 
     def test_allocate_gpu_markers_skips_on_cuinit_failure(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_cuda = MagicMock()
@@ -496,7 +497,7 @@ class TestGpuMarkers:
         """When CUDA_VISIBLE_DEVICES=0,3,5,7, physical IDs must be remapped to
         CUDA device indices 0-3 before calling cuCtxCreate_v2.  This is the
         exact bug that caused markers to be missing on GPUs 3 and 5."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_cuda = MagicMock()
@@ -516,7 +517,7 @@ class TestGpuMarkers:
     def test_allocate_gpu_markers_falls_back_to_rocm_when_no_libcuda(self):
         """On an AMD-only host (no libcuda.so.1 at all), markers must be
         allocated via ROCm/HIP instead of silently doing nothing."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_hip = MagicMock()
@@ -536,7 +537,7 @@ class TestGpuMarkers:
         assert mock_hip.hipMalloc.call_count == 2
 
     def test_allocate_gpu_markers_skips_rocm_on_hipinit_failure(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_hip = MagicMock()
@@ -552,7 +553,7 @@ class TestGpuMarkers:
         mock_hip.hipSetDevice.assert_not_called()
 
     def test_allocate_gpu_markers_skips_entirely_when_neither_cuda_nor_rocm_present(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         with patch.object(ctypes, "CDLL", side_effect=OSError("not found")):
@@ -562,7 +563,7 @@ class TestGpuMarkers:
         """When HIP_VISIBLE_DEVICES=1,3, physical IDs must be remapped to HIP
         device indices 0-1 before calling hipSetDevice -- same remap bug class
         as the CUDA/CUDA_VISIBLE_DEVICES case above, for the ROCm path."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_hip = MagicMock()
@@ -586,7 +587,7 @@ class TestGpuMarkers:
 
     def test_allocate_gpu_markers_does_not_try_rocm_when_cuda_available(self):
         """CUDA present and working -- ROCm/HIP must never be attempted."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_cuda = MagicMock()
@@ -599,7 +600,7 @@ class TestGpuMarkers:
 
     def test_non_main_process_name_blocks_allocation(self):
         """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         mock_proc = MagicMock()
         mock_proc.name = "ForkPoolWorker-1"
@@ -613,7 +614,7 @@ class TestGpuMarkers:
         script = (
             "import sys; "
             "from unittest.mock import patch; "
-            "from agency import agresources; "
+            "from agency.orchestrator import agresources; "
             "calls = []; "
             "original = agresources._allocate_gpu_markers; "
             "agresources._allocate_gpu_markers = lambda ids: calls.append(ids) or original(ids); "
@@ -1595,7 +1596,7 @@ class TestAgSandboxExecDetached:
 class TestAgSandboxAgencyPackageMount:
     @docker
     def test_agency_package_is_mounted_and_matches_host(self):
-        from agency.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, agency_package_dir
+        from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, agency_package_dir
 
         sb = _make_sandbox()
         try:
@@ -1614,7 +1615,7 @@ class TestAgSandboxAgencyPackageMount:
 
     @docker
     def test_agency_package_mount_is_read_only(self):
-        from agency.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
+        from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
 
         sb = _make_sandbox()
         try:
@@ -1635,7 +1636,7 @@ class TestAgSandboxAgencyPackageMount:
 class TestEnsurePythonPackagesInContainer:
     @docker
     def test_installs_a_missing_package(self):
-        from agency.agutil import ensure_python_packages_in_container
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
@@ -1654,7 +1655,7 @@ class TestEnsurePythonPackagesInContainer:
         """A package already importable (httpx, confirmed present in the
         base image) must not trigger any pip install at all -- verified by
         making pip3 itself unusable and confirming that doesn't matter."""
-        from agency.agutil import ensure_python_packages_in_container
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
@@ -1670,7 +1671,7 @@ class TestEnsurePythonPackagesInContainer:
 
     @docker
     def test_raises_on_a_nonexistent_package(self):
-        from agency.agutil import ensure_python_packages_in_container
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
@@ -1688,7 +1689,7 @@ class TestEnsurePythonPackagesInContainer:
         importable afterward), plus the noop-when-present test above
         already covers the "don't touch what's already there" contract
         directly."""
-        from agency.agutil import ensure_python_packages_in_container
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:

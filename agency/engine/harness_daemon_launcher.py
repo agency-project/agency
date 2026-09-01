@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_in_container
+from ..utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_in_container
 from .clients import SandboxInteractionClient
 
 if TYPE_CHECKING:

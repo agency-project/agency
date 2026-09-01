@@ -52,7 +52,7 @@ _BARE_THREAD_ALLOWLIST = {
         "TracerLoop._fork_and_exec",
     ): (2, "subprocess pipe readers"),
     # General background I/O and UI maintenance.
-    ("agency/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
+    ("agency/utils/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
     ("agency/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
     ("agency/agwebui/emitter.py", "agwebui_emitter.emit"): (1, "event pruning"),
     ("agency/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),

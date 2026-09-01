@@ -378,9 +378,9 @@ def test_skill_add_host_mcp_tools_used_in_run():
 
 def test_run_returns_direct_answer_from_engine():
     skill = agskill(name="qa", system_prompt="Answer questions.")
-    skill._test_execute = lambda ag, ctx, inp, max_steps=None: (
+    skill._test_execute = lambda ag, context, inp, max_steps=None: (
         agdata(result='{"answer": "Paris"}'),
-        ctx,
+        context,
         [],
     )
     ag = make_agent()
@@ -450,14 +450,19 @@ def test_fork_deep_copies_history():
 
 def test_fork_deep_copies_harness_sessions():
     ag = make_agent()
-    ag.ctx.harness_sessions = {"claude_code": {"session_id": "session-1", "blob_b64": "c3RhdGU="}}
+    ag.context.harness_sessions = {
+        "claude_code": {"session_id": "session-1", "blob_b64": "c3RhdGU="}
+    }
 
     forked = agent.fork(ag)
-    forked.ctx.harness_sessions["claude_code"]["session_id"] = "session-2"
+    forked.context.harness_sessions["claude_code"]["session_id"] = "session-2"
 
-    assert ag.ctx.harness_sessions["claude_code"]["session_id"] == "session-1"
-    assert forked.ctx.harness_sessions is not ag.ctx.harness_sessions
-    assert forked.ctx.harness_sessions["claude_code"] is not ag.ctx.harness_sessions["claude_code"]
+    assert ag.context.harness_sessions["claude_code"]["session_id"] == "session-1"
+    assert forked.context.harness_sessions is not ag.context.harness_sessions
+    assert (
+        forked.context.harness_sessions["claude_code"]
+        is not ag.context.harness_sessions["claude_code"]
+    )
 
 
 def test_fork_copies_history_and_config():
@@ -785,7 +790,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     assert ag2.agname == saved_agname
-    assert len(ag2.ctx.recent_transcript) > 0
+    assert len(ag2.context.recent_transcript) > 0
     assert ag2 in agent.all()
 
     import sqlite3
