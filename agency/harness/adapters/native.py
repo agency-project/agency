@@ -9,6 +9,9 @@ from __future__ import annotations
 import json
 import shlex
 import uuid
+
+from fastapi import Request
+
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
 
@@ -184,7 +187,6 @@ class _NativeBackend(agharness_backend):
             agharness.cleanup_config_home_in_container(sandbox, scratch_dir)
 
     def register(self, app, router) -> None:
-        from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
 
         @app.post("/v1/chat/completions")
@@ -287,6 +289,7 @@ class _NativeBackend(agharness_backend):
             "messages": messages,
             "tools": raw_request.get("tools"),
             "tool_choice": raw_request.get("tool_choice"),
+            "agency_internal_kind": raw_request.get("agency_internal_kind"),
         }
 
     def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:

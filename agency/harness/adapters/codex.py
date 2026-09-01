@@ -9,6 +9,9 @@ from __future__ import annotations
 import json
 import shutil
 import uuid
+
+from fastapi import Request
+
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
 
@@ -161,7 +164,7 @@ class _CodexBackend(agharness_backend):
                 self._ENV_KEY_NAME: runtime.token,
             }
 
-            px = agProxyPtrace(runtime.agconfig)
+            px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
             handle = px.launch(
                 argv,
                 envp,
@@ -221,7 +224,6 @@ class _CodexBackend(agharness_backend):
         return stdout.strip()
 
     def register(self, app, router) -> None:
-        from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
 
         def _auth_error():

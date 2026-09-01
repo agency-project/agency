@@ -12,6 +12,9 @@ import re
 import shutil
 import uuid
 from pathlib import Path
+
+from fastapi import Request
+
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
 
@@ -397,7 +400,9 @@ class _ClaudeCodeBackend(agharness_backend):
                 if "HOME" in os.environ:
                     envp["HOME"] = os.environ["HOME"]
 
-            px = agProxyPtrace(runtime.agconfig)
+            # Agency selected this exact root CLI executable. Authorize only
+            # its initial exec; descendant executions remain policy-controlled.
+            px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
 
             argv = [
                 resolved,
@@ -479,7 +484,6 @@ class _ClaudeCodeBackend(agharness_backend):
         return text, usage, session_id
 
     def register(self, app, router) -> None:
-        from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
 
         def _auth_error():

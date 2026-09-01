@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 import uuid
 from pathlib import Path
 
@@ -42,6 +43,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
         harness="fake",
         resume_session_id="session-1",
         prior_session_blob_b64=base64.b64encode(b"prior session state").decode("ascii"),
+        attempt_token="attempt-one",
     )
 
     result = daemon._run_adapter_attempt(
@@ -58,6 +60,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
     assert isinstance(seen["runtime"], AdapterRuntime)
     assert seen["runtime"].engine_name == "agent-1"
     assert seen["runtime"].model == "model"
+    assert seen["runtime"].token == "attempt-one"
     assert result.session_id == "session-2"
     assert base64.b64decode(result.session_blob_b64) == b"updated session state"
 
@@ -67,21 +70,40 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
         prompt=PromptPayload("system", "user"),
         harness="claude_code",
         max_steps=4,
+        attempt_token="attempt-one",
     )
     expected = HarnessAttemptResult(ok=True, final_text="done")
     seen = []
     manager = HarnessManager.__new__(HarnessManager)
     manager._agconfig = agConfig()
     manager._engine_name = "agent-1"
-    manager._harness_api = type(
-        "HarnessApi",
-        (),
-        {
-            "base_url": "http://127.0.0.1:8766",
-            "resolve_model": lambda self: "model",
-            "syscall_policy": object(),
-        },
-    )()
+    manager._attempt_lock = threading.Lock()
+    manager._current_attempt_token = None
+    policy = object()
+
+    class HarnessApi:
+        base_url = "http://127.0.0.1:8766"
+
+        def __init__(self):
+            self.events = []
+
+        def register_attempt_token(self, token):
+            self.events.append(("register", token))
+
+        def clear_attempt_token(self, token):
+            self.events.append(("clear", token))
+            return True
+
+        def resolve_model(self, token):
+            self.events.append(("resolve", token))
+            return "model"
+
+        def syscall_policy(self, token):
+            self.events.append(("policy", token))
+            return policy
+
+    manager._harness_api = HarnessApi()
+    manager._attempt_handler = manager._run_adapter_request
 
     def run_adapter(got_request, config, base_url, model, engine_name, syscall_policy):
         seen.append((got_request, config, base_url, model, engine_name, syscall_policy))
@@ -97,9 +119,73 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
             "http://127.0.0.1:8766",
             "model",
             "agent-1",
-            manager._harness_api.syscall_policy,
+            policy,
         )
     ]
+    assert manager._harness_api.events == [
+        ("register", "attempt-one"),
+        ("resolve", "attempt-one"),
+        ("policy", "attempt-one"),
+        ("clear", "attempt-one"),
+    ]
+    assert manager._current_attempt_token is None
+
+
+def test_daemon_rejects_missing_attempt_token_without_registering():
+    manager = HarnessManager.__new__(HarnessManager)
+    manager._attempt_lock = threading.Lock()
+    manager._current_attempt_token = None
+    manager._harness_api = type(
+        "HarnessApi",
+        (),
+        {"register_attempt_token": lambda self, token: (_ for _ in ()).throw(AssertionError())},
+    )()
+    manager._attempt_handler = lambda _request: (_ for _ in ()).throw(AssertionError())
+
+    result = manager._dispatch_attempt(
+        HarnessAttemptRequest(
+            prompt=PromptPayload("system", "user"),
+            harness="claude_code",
+        )
+    )
+
+    assert result.ok is False
+    assert result.error_message == "missing harness attempt token"
+
+
+def test_daemon_revokes_attempt_token_when_handler_raises():
+    events = []
+    manager = HarnessManager.__new__(HarnessManager)
+    manager._attempt_lock = threading.Lock()
+    manager._current_attempt_token = None
+    manager._harness_api = type(
+        "HarnessApi",
+        (),
+        {
+            "register_attempt_token": lambda self, token: events.append(("register", token)),
+            "clear_attempt_token": lambda self, token: events.append(("clear", token)),
+        },
+    )()
+
+    def fail(_request):
+        raise RuntimeError("adapter failed")
+
+    manager._attempt_handler = fail
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system", "user"),
+        harness="claude_code",
+        attempt_token="attempt-one",
+    )
+
+    try:
+        manager._dispatch_attempt(request)
+    except RuntimeError as exc:
+        assert str(exc) == "adapter failed"
+    else:
+        raise AssertionError("handler failure was swallowed")
+
+    assert events == [("register", "attempt-one"), ("clear", "attempt-one")]
+    assert manager._current_attempt_token is None
 
 
 def test_harness_manager_returns_attempt_result_on_original_rpc():
@@ -110,6 +196,7 @@ def test_harness_manager_returns_attempt_result_on_original_rpc():
         prompt=PromptPayload("system", "user", "output"),
         harness="claude_code",
         max_steps=8,
+        attempt_token="attempt-one",
     )
     expected = HarnessAttemptResult(
         ok=True,

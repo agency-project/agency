@@ -107,6 +107,50 @@ def test_steering_is_fifo_replayed_per_boundary_and_rejected_after_final_answer(
         invocation.steer("too late")
 
 
+def test_interruptible_checkpoint_abort_wakes_pause_without_consuming_steering():
+    control = AgentControl()
+    invocation = control.begin_invocation("interruptible")
+    abort_event = threading.Event()
+    outcome = {}
+    invocation.steer("deliver after reconnect")
+    invocation.pause()
+
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault(
+            "decision",
+            invocation._checkpoint_interruptibly(
+                "native:tool:1",
+                allow_steering=True,
+                phase="boundary",
+                abort_event=abort_event,
+            ),
+        ),
+        daemon=True,
+    )
+    worker.start()
+    with control._condition:
+        assert control._condition.wait_for(
+            lambda: invocation._phase == "paused",
+            timeout=2.0,
+        )
+
+    invocation._abort_checkpoint_wait(abort_event)
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert outcome == {"decision": None}
+    assert invocation.is_pause_requested() is True
+    assert control.is_paused_actual() is False
+
+    invocation.resume()
+    retry = invocation._checkpoint(
+        "native:tool:1",
+        allow_steering=True,
+        phase="boundary",
+    )
+    assert [entry.instructions for entry in retry.steering] == ["deliver after reconnect"]
+
+
 def test_completion_claim_remains_won_after_agent_and_invocation_close():
     control = AgentControl()
     invocation = control.begin_invocation("commit")

@@ -1,20 +1,36 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 
 import httpx
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from agency.harness._syscall_event import agsyscallevent
 from agency.harness.clients.host_services_client import HostServicesClient
+from agency.harness.interaction_router import build_router as build_interaction_router
+from agency.harness.mcp_proxy import build_router as build_mcp_router
+from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
 
 
-def _bridge(handler):
+def _bridge(handler, token: str = "token"):
     bridge = HostServicesClient.__new__(HostServicesClient)
     bridge.client = httpx.Client(
         transport=httpx.MockTransport(handler), base_url="http://agency-host"
     )
     bridge.profiler_uds_path = None
+    bridge._uds_path = "/unused/test-host.sock"
+    bridge._timeout_s = 300
+    bridge._new_checkpoint_async_client = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://agency-host",
+    )
     bridge._profiler_synced_tokens = set()
+    bridge._attempt_token_lock = threading.Lock()
+    bridge._active_attempt_token = None
+    bridge.register_attempt_token(token)
     return bridge
 
 
@@ -23,9 +39,15 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
 
     def handler(request):
         requests.append(request)
+        assert request.headers[ATTEMPT_TOKEN_HEADER] == "token"
         responses = {
             ("GET", "/llm/resolve_model"): {"model": "gpt-test"},
             ("GET", "/llm/context_limit"): {"context_limit": 128_000},
+            ("POST", "/interaction/checkpoint"): {
+                "cancelled": False,
+                "destroyed": False,
+                "steering": [{"sequence": 1, "instructions": "focus"}],
+            },
             ("POST", "/interaction/record_event"): {"ok": True},
             ("POST", "/interaction/check_tool"): {"allowed": False, "reason": "blocked"},
             ("POST", "/interaction/check_syscall"): {"allowed": True, "reason": None},
@@ -36,6 +58,16 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
     try:
         assert bridge.resolve_model("token") == "gpt-test"
         assert bridge.context_limit("token") == 128_000
+        assert bridge.checkpoint(
+            "token",
+            "native:generation:0",
+            allow_steering=True,
+            phase="model",
+        ) == {
+            "cancelled": False,
+            "destroyed": False,
+            "steering": [{"sequence": 1, "instructions": "focus"}],
+        }
         bridge.log_warning("token", "bad shape")
         assert bridge.check_tool_policy("token", "bash", {"cmd": "x"}) == {
             "decision": "deny",
@@ -50,14 +82,19 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             path="/bin/true",
             timestamp=1.0,
         )
-        assert bridge.check_syscall_policy(syscall) is True
+        assert bridge.check_syscall_policy("token", syscall) is True
     finally:
-        bridge.client.close()
+        bridge.close()
 
     bodies = [json.loads(request.content) if request.content else None for request in requests]
     assert bodies == [
         None,
         None,
+        {
+            "boundary_id": "native:generation:0",
+            "allow_steering": True,
+            "phase": "model",
+        },
         {"type": "warning", "payload": {"message": "bad shape"}},
         {"tool_name": "bash", "tool_input": {"cmd": "x"}},
         {
@@ -83,6 +120,7 @@ def test_bridge_dispatch_uses_llm_route_and_preserves_agency_response():
     }
 
     def handler(request):
+        assert request.headers[ATTEMPT_TOKEN_HEADER] == "token"
         seen.append((request.method, request.url.path, json.loads(request.content)))
         return httpx.Response(200, json=agency_response)
 
@@ -90,7 +128,7 @@ def test_bridge_dispatch_uses_llm_route_and_preserves_agency_response():
     try:
         result = bridge.dispatch("token", {"model": "gpt-test", "messages": []})
     finally:
-        bridge.client.close()
+        bridge.close()
 
     assert result == agency_response
     assert seen == [("POST", "/llm/dispatch", {"model": "gpt-test", "messages": []})]
@@ -99,6 +137,7 @@ def test_bridge_dispatch_uses_llm_route_and_preserves_agency_response():
 def test_bridge_stream_dispatch_yields_wire_items_and_stops_at_done():
     def handler(request):
         assert request.url.path == "/llm/dispatch"
+        assert request.headers[ATTEMPT_TOKEN_HEADER] == "token"
         assert json.loads(request.content)["stream"] is True
         return httpx.Response(
             200,
@@ -117,10 +156,235 @@ def test_bridge_stream_dispatch_yields_wire_items_and_stops_at_done():
     try:
         items = list(bridge.dispatch_stream("token", {"model": "gpt-test", "messages": []}))
     finally:
-        bridge.client.close()
+        bridge.close()
 
     assert items[0] == {"type": "delta", "content": "hel"}
     assert items[1] == {"type": "delta", "content": "lo"}
     assert items[2]["type"] == "done"
     assert items[2]["stop_reason"] == "stop"
     assert items[2]["message"]["blocks"] == [{"type": "text", "index": 0, "text": "hello"}]
+
+
+def test_bridge_rejects_stale_token_before_host_request():
+    requests = []
+    bridge = _bridge(lambda request: requests.append(request) or httpx.Response(200, json={}))
+    try:
+        assert bridge.validate_token("non-ascii-é") is False
+        assert bridge.validate_token("malformed-\ud800") is False
+        assert bridge.clear_attempt_token("token") is True
+        bridge.register_attempt_token("successor")
+        assert bridge.clear_attempt_token("token") is False
+        assert bridge.validate_token("successor") is True
+        try:
+            bridge.dispatch("token", {"messages": []})
+        except RuntimeError as exc:
+            assert str(exc) == "unknown or missing bearer token"
+        else:
+            raise AssertionError("stale token was accepted")
+    finally:
+        bridge.close()
+
+    assert requests == []
+
+
+def test_profiler_and_context_routes_reject_unknown_tokens():
+    bridge = _bridge(lambda _request: httpx.Response(200, json={}))
+    app = FastAPI()
+    app.include_router(build_interaction_router(bridge))
+    try:
+        with TestClient(app) as client:
+            assert (
+                client.post(
+                    "/agprof/hook",
+                    headers={"Authorization": "Bearer stale"},
+                    json={"name": "event"},
+                ).status_code
+                == 401
+            )
+            assert (
+                client.get(
+                    "/agprof/status",
+                    headers={"Authorization": "Bearer stale"},
+                ).status_code
+                == 401
+            )
+            status = client.get(
+                "/agprof/status",
+                headers={"Authorization": "Bearer token"},
+            )
+            assert status.status_code == 200
+            assert status.json() == {"configured": False}
+            assert (
+                client.post(
+                    "/internal/context_limit",
+                    json={"token": "stale"},
+                ).status_code
+                == 401
+            )
+            assert (
+                client.post(
+                    "/internal/checkpoint",
+                    headers={"Authorization": "Bearer stale"},
+                    json={
+                        "boundary_id": "tool:1",
+                        "allow_steering": False,
+                        "phase": "boundary",
+                    },
+                ).status_code
+                == 401
+            )
+    finally:
+        bridge.close()
+
+
+def test_checkpoint_route_forwards_the_active_token_and_validated_boundary():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.headers[ATTEMPT_TOKEN_HEADER] == "token"
+        return httpx.Response(
+            200,
+            json={"cancelled": False, "destroyed": False, "steering": []},
+        )
+
+    bridge = _bridge(handler)
+    app = FastAPI()
+    app.include_router(build_interaction_router(bridge))
+    try:
+        with TestClient(app) as client:
+            invalid = client.post(
+                "/internal/checkpoint",
+                headers={"Authorization": "Bearer token"},
+                json={"boundary_id": "", "allow_steering": 1, "phase": ""},
+            )
+            response = client.post(
+                "/internal/checkpoint",
+                headers={"Authorization": "Bearer token"},
+                json={
+                    "boundary_id": "native:tool:0",
+                    "allow_steering": False,
+                    "phase": "boundary",
+                },
+            )
+    finally:
+        bridge.close()
+
+    assert invalid.status_code == 400
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": False, "destroyed": False, "steering": []}
+    assert len(seen) == 1
+    assert json.loads(seen[0].content) == {
+        "boundary_id": "native:tool:0",
+        "allow_steering": False,
+        "phase": "boundary",
+    }
+
+
+def test_checkpoint_route_cancels_its_upstream_uds_request_on_client_disconnect():
+    async def scenario():
+        checkpoint_started = asyncio.Event()
+        checkpoint_cancelled = asyncio.Event()
+
+        class Bridge:
+            @staticmethod
+            def validate_token(token):
+                return token == "token"
+
+            @staticmethod
+            async def checkpoint_async(*_args, **_kwargs):
+                checkpoint_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    checkpoint_cancelled.set()
+
+        app = FastAPI()
+        app.include_router(build_interaction_router(Bridge()))
+        payload = json.dumps(
+            {
+                "boundary_id": "native:paused",
+                "allow_steering": False,
+                "phase": "boundary",
+            }
+        ).encode()
+        sent = []
+        request_delivered = False
+
+        async def receive():
+            nonlocal request_delivered
+            if not request_delivered:
+                request_delivered = True
+                return {"type": "http.request", "body": payload, "more_body": False}
+            await checkpoint_started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+
+        await app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/internal/checkpoint",
+                "raw_path": b"/internal/checkpoint",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [
+                    (b"authorization", b"Bearer token"),
+                    (b"content-type", b"application/json"),
+                ],
+                "client": ("test", 1),
+                "server": ("test", 80),
+            },
+            receive,
+            send,
+        )
+
+        assert checkpoint_cancelled.is_set()
+        assert sent[0]["type"] == "http.response.start"
+        assert sent[0]["status"] == 499
+
+    asyncio.run(scenario())
+
+
+def test_mcp_proxy_requires_active_token_replaces_spoofed_header_and_preserves_response_headers():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.headers[ATTEMPT_TOKEN_HEADER] == "token"
+        return httpx.Response(
+            200,
+            content=b'{"jsonrpc":"2.0","result":{}}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "session-1",
+            },
+        )
+
+    bridge = _bridge(handler)
+    app = FastAPI()
+    app.include_router(build_mcp_router(bridge))
+    try:
+        with TestClient(app) as client:
+            assert client.post("/mcp", json={}).status_code == 401
+            response = client.post(
+                "/mcp?mode=test",
+                headers={
+                    "Authorization": "Bearer token",
+                    ATTEMPT_TOKEN_HEADER: "spoofed",
+                },
+                content=b'{"jsonrpc":"2.0"}',
+            )
+    finally:
+        bridge.close()
+
+    assert response.status_code == 200
+    assert response.headers["mcp-session-id"] == "session-1"
+    assert response.json() == {"jsonrpc": "2.0", "result": {}}
+    assert len(seen) == 1
+    assert dict(seen[0].url.params) == {"mode": "test"}

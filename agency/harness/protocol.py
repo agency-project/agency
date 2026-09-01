@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+ATTEMPT_TOKEN_HEADER = "X-Agency-Attempt-Token"
+
+
 @dataclass
 class PromptPayload:
     system_instruction: str
@@ -20,6 +23,9 @@ class HarnessAttemptRequest:
     resume_session_id: "str | None" = None
     # Session files are opaque bytes, so the JSON protocol carries them as base64.
     prior_session_blob_b64: "str | None" = None
+    # Fresh for each host -> sandbox RPC. The long-lived daemon and host
+    # gateway accept only the token belonging to the currently active attempt.
+    attempt_token: "str | None" = None
 
 
 @dataclass
@@ -34,4 +40,9 @@ class HarnessAttemptResult:
     error_message: str = ""
 
 
-__all__ = ["PromptPayload", "HarnessAttemptRequest", "HarnessAttemptResult"]
+__all__ = [
+    "ATTEMPT_TOKEN_HEADER",
+    "PromptPayload",
+    "HarnessAttemptRequest",
+    "HarnessAttemptResult",
+]

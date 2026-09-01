@@ -7,14 +7,18 @@ harness-facing LLM, interaction, and MCP routes."""
 
 from __future__ import annotations
 
+import hmac
 import json
 import socket
 import struct
+import threading
 import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 import httpx
+
+from ..protocol import ATTEMPT_TOKEN_HEADER
 
 if TYPE_CHECKING:
     from .._syscall_event import agsyscallevent
@@ -49,21 +53,59 @@ class HostServicesClient:
     def __init__(
         self, uds_path: str, profiler_uds_path: "str | None", timeout_s: float = 300
     ) -> None:
+        self._uds_path = uds_path
+        self._timeout_s = timeout_s
         transport = httpx.HTTPTransport(uds=uds_path)
         self.client = httpx.Client(
             transport=transport, base_url="http://agmanager-host", timeout=timeout_s
         )
         self.profiler_uds_path = profiler_uds_path
         self._profiler_synced_tokens: "set[str]" = set()
+        self._attempt_token_lock = threading.Lock()
+        self._active_attempt_token: "str | None" = None
+
+    def register_attempt_token(self, token: str) -> None:
+        """Activate exactly one credential for the current daemon attempt."""
+        if not isinstance(token, str) or not token:
+            raise ValueError("attempt token must be a non-empty string")
+        with self._attempt_token_lock:
+            if self._active_attempt_token is not None:
+                raise RuntimeError("another harness attempt token is already active")
+            self._active_attempt_token = token
+
+    def clear_attempt_token(self, token: str) -> bool:
+        """Revoke only the matching credential, making stale cleanup harmless."""
+        if not isinstance(token, str) or not token:
+            return False
+        with self._attempt_token_lock:
+            active = self._active_attempt_token
+            if active is None or not self._attempt_tokens_match(active, token):
+                return False
+            self._active_attempt_token = None
+            self._profiler_synced_tokens.discard(active)
+            return True
 
     def validate_token(self, token: str) -> bool:
-        # The host UDS is private to one agent. Bearer-token validation is
-        # therefore owned by the sandbox-side daemon, not a host routing
-        # registry shared by multiple agents.
-        return bool(token)
+        if not isinstance(token, str) or not token:
+            return False
+        with self._attempt_token_lock:
+            active = self._active_attempt_token
+            return active is not None and self._attempt_tokens_match(active, token)
+
+    @staticmethod
+    def _attempt_tokens_match(active: str, candidate: str) -> bool:
+        try:
+            return hmac.compare_digest(active.encode(), candidate.encode())
+        except UnicodeEncodeError:
+            return False
+
+    def _attempt_headers(self, token: str) -> dict[str, str]:
+        if not self.validate_token(token):
+            raise RuntimeError("unknown or missing bearer token")
+        return {ATTEMPT_TOKEN_HEADER: token}
 
     def resolve_model(self, token: str) -> str:
-        resp = self.client.get("/llm/resolve_model")
+        resp = self.client.get("/llm/resolve_model", headers=self._attempt_headers(token))
         resp.raise_for_status()
         return resp.json()["model"]
 
@@ -76,12 +118,72 @@ class HostServicesClient:
         graceful-when-unknown behavior `native_harness/compaction.py`'s
         `maybe_compact()` already has."""
         try:
-            resp = self.client.get("/llm/context_limit")
+            resp = self.client.get("/llm/context_limit", headers=self._attempt_headers(token))
             if resp.status_code != 200:
                 return None
             return resp.json().get("context_limit")
         except Exception:
             return None
+
+    def checkpoint(
+        self,
+        token: str,
+        boundary_id: str,
+        *,
+        allow_steering: bool,
+        phase: str,
+    ) -> dict:
+        """Wait at an invocation-bound host safe boundary."""
+        response = self.client.post(
+            "/interaction/checkpoint",
+            json={
+                "boundary_id": boundary_id,
+                "allow_steering": allow_steering,
+                "phase": phase,
+            },
+            headers=self._attempt_headers(token),
+            # A pause intentionally outlives the ordinary LLM transport timeout.
+            timeout=None,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def checkpoint_async(
+        self,
+        token: str,
+        boundary_id: str,
+        *,
+        allow_steering: bool,
+        phase: str,
+    ) -> dict:
+        """Wait at a checkpoint on a cancellable per-request UDS client.
+
+        The native harness reaches this method through an async sandbox route.
+        Cancelling that route closes only this request's UDS connection, which
+        lets the host observe ``http.disconnect`` without disturbing concurrent
+        LLM, MCP, profiler, or policy traffic on the shared synchronous client.
+        """
+        async with self._new_checkpoint_async_client() as client:
+            response = await client.post(
+                "/interaction/checkpoint",
+                json={
+                    "boundary_id": boundary_id,
+                    "allow_steering": allow_steering,
+                    "phase": phase,
+                },
+                headers=self._attempt_headers(token),
+                timeout=None,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    def _new_checkpoint_async_client(self) -> httpx.AsyncClient:
+        transport = httpx.AsyncHTTPTransport(uds=self._uds_path)
+        return httpx.AsyncClient(
+            transport=transport,
+            base_url="http://agmanager-host",
+            timeout=self._timeout_s,
+        )
 
     def log_warning(self, token: str, message: str) -> None:
         # DATACOLLECTOR: append -- the one existing production call already wired through
@@ -89,21 +191,30 @@ class HostServicesClient:
         self.client.post(
             "/interaction/record_event",
             json={"type": "warning", "payload": {"message": message}},
+            headers=self._attempt_headers(token),
         )
 
     def check_tool_policy(self, token: str, tool_name: str, tool_input: dict) -> dict:
         resp = self.client.post(
             "/interaction/check_tool",
             json={"tool_name": tool_name, "tool_input": tool_input},
+            headers=self._attempt_headers(token),
         )
+        resp.raise_for_status()
         result = resp.json()
         return {
             "decision": "allow" if result.get("allowed") else "deny",
             "reason": result.get("reason"),
         }
 
-    def check_syscall_policy(self, syscall: "agsyscallevent") -> "bool | tuple[bool, str]":
-        response = self.client.post("/interaction/check_syscall", json=asdict(syscall))
+    def check_syscall_policy(
+        self, token: str, syscall: "agsyscallevent"
+    ) -> "bool | tuple[bool, str]":
+        response = self.client.post(
+            "/interaction/check_syscall",
+            json=asdict(syscall),
+            headers=self._attempt_headers(token),
+        )
         response.raise_for_status()
         result = response.json()
         allowed = bool(result.get("allowed"))
@@ -111,14 +222,21 @@ class HostServicesClient:
         return (allowed, reason) if reason else allowed
 
     def dispatch(self, token: str, agency_context: dict) -> dict:
-        resp = self.client.post("/llm/dispatch", json=agency_context)
+        resp = self.client.post(
+            "/llm/dispatch",
+            json=agency_context,
+            headers=self._attempt_headers(token),
+        )
         if resp.status_code != 200:
             raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
         return resp.json()
 
     def dispatch_stream(self, token: str, agency_context: dict):
         with self.client.stream(
-            "POST", "/llm/dispatch", json={**agency_context, "stream": True}
+            "POST",
+            "/llm/dispatch",
+            json={**agency_context, "stream": True},
+            headers=self._attempt_headers(token),
         ) as resp:
             if resp.status_code != 200:
                 resp.read()
@@ -133,7 +251,33 @@ class HostServicesClient:
                 if item["type"] == "done":
                     return
 
+    def forward_mcp_request(
+        self,
+        token: str,
+        method: str,
+        *,
+        content: bytes,
+        headers: dict[str, str],
+        params: dict[str, str],
+    ) -> httpx.Response:
+        """Forward MCP while replacing any sandbox-supplied attempt header."""
+        upstream_headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() != ATTEMPT_TOKEN_HEADER.lower()
+        }
+        upstream_headers.update(self._attempt_headers(token))
+        return self.client.request(
+            method,
+            "/mcp",
+            content=content,
+            headers=upstream_headers,
+            params=params,
+        )
+
     def forward_profiler_event(self, token: str, event: dict) -> dict:
+        if not self.validate_token(token):
+            return {"ok": False, "error": "unknown or missing token"}
         if self.profiler_uds_path is None:
             return {"ok": False, "error": "no profiler bridge configured for this launch"}
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -173,6 +317,12 @@ class HostServicesClient:
             return _recv_framed(sock)
         finally:
             sock.close()
+
+    def close(self) -> None:
+        with self._attempt_token_lock:
+            self._active_attempt_token = None
+            self._profiler_synced_tokens.clear()
+        self.client.close()
 
 
 __all__ = ["HostServicesClient"]

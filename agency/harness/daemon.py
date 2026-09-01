@@ -14,7 +14,6 @@ import signal
 import subprocess
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -34,11 +33,12 @@ _HARNESS_API_PORT = 8766
 class _HostSyscallPolicy:
     """Ptrace policy adapter backed by the host interaction service."""
 
-    def __init__(self, host_services: HostServicesClient) -> None:
+    def __init__(self, host_services: HostServicesClient, attempt_token: str) -> None:
         self._host_services = host_services
+        self._attempt_token = attempt_token
 
     def check(self, _agent, syscall):
-        return self._host_services.check_syscall_policy(syscall)
+        return self._host_services.check_syscall_policy(self._attempt_token, syscall)
 
 
 class _LocalSandboxBackend:
@@ -82,7 +82,6 @@ class _LocalSandbox:
 class _HarnessApiServer:
     def __init__(self, host_uds_path: str, port: int, harness_backend: agharness_backend) -> None:
         self._bridge = HostServicesClient(host_uds_path, None)
-        self.syscall_policy = _HostSyscallPolicy(self._bridge)
         self._port = port
         self._harness_backend = harness_backend
         self._server: "uvicorn.Server | None" = None
@@ -119,12 +118,21 @@ class _HarnessApiServer:
             self._server.should_exit = True
         if self._thread is not None:
             self._thread.join(timeout=10.0)
-        self._bridge.client.close()
+        self._bridge.close()
         self._server = None
         self._thread = None
 
-    def resolve_model(self) -> str:
-        return self._bridge.resolve_model("harness-daemon")
+    def register_attempt_token(self, token: str) -> None:
+        self._bridge.register_attempt_token(token)
+
+    def clear_attempt_token(self, token: str) -> bool:
+        return self._bridge.clear_attempt_token(token)
+
+    def resolve_model(self, token: str) -> str:
+        return self._bridge.resolve_model(token)
+
+    def syscall_policy(self, token: str) -> _HostSyscallPolicy:
+        return _HostSyscallPolicy(self._bridge, token)
 
 
 def _render_attempt_prompt(request: HarnessAttemptRequest) -> str:
@@ -145,6 +153,9 @@ def _run_adapter_attempt(
     engine_name: str,
     syscall_policy,
 ) -> HarnessAttemptResult:
+    attempt_token = request.attempt_token
+    if not isinstance(attempt_token, str) or not attempt_token:
+        return HarnessAttemptResult(ok=False, error_message="missing harness attempt token")
     try:
         adapter = agharness_backend.for_config(request.harness, agconfig)
         if type(adapter).run_daemon_attempt is agharness_backend.run_daemon_attempt:
@@ -164,7 +175,7 @@ def _run_adapter_attempt(
             model=model,
             engine_name=engine_name,
             harness_base_url=harness_base_url,
-            token=f"daemon-{uuid.uuid4().hex}",
+            token=attempt_token,
             syscall_policy=syscall_policy,
             sandbox=_LocalSandbox() if request.harness == "native" else None,
         )
@@ -212,18 +223,47 @@ class HarnessManager:
         self._engine_name = engine_name
         harness_backend = agharness_backend.for_config(harness, self._agconfig)
         self._harness_api = _HarnessApiServer(host_uds_path, harness_api_port, harness_backend)
-        handler = attempt_handler if attempt_handler is not None else self._dispatch_attempt
-        self._interaction_server = SandboxInteractionServer(sandbox_uds_path, handler)
+        self._attempt_handler = (
+            attempt_handler if attempt_handler is not None else self._run_adapter_request
+        )
+        self._attempt_lock = threading.Lock()
+        self._current_attempt_token: "str | None" = None
+        self._interaction_server = SandboxInteractionServer(
+            sandbox_uds_path,
+            self._dispatch_attempt,
+        )
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
+        token = request.attempt_token
+        if not isinstance(token, str) or not token:
+            return HarnessAttemptResult(ok=False, error_message="missing harness attempt token")
+        with self._attempt_lock:
+            try:
+                self._harness_api.register_attempt_token(token)
+            except Exception as exc:
+                return HarnessAttemptResult(
+                    ok=False,
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+            self._current_attempt_token = token
+            try:
+                return self._attempt_handler(request)
+            finally:
+                self._current_attempt_token = None
+                self._harness_api.clear_attempt_token(token)
+
+    def _run_adapter_request(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
+        token = self._current_attempt_token
+        if token is None or request.attempt_token != token:
+            return HarnessAttemptResult(ok=False, error_message="no active harness attempt token")
         try:
             return _run_adapter_attempt(
                 request,
                 self._agconfig,
                 self._harness_api.base_url,
-                self._harness_api.resolve_model(),
+                self._harness_api.resolve_model(token),
                 self._engine_name,
-                self._harness_api.syscall_policy,
+                self._harness_api.syscall_policy(token),
             )
         except Exception as exc:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")

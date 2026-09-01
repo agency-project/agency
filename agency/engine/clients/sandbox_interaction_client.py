@@ -10,7 +10,7 @@ from ...harness.protocol import HarnessAttemptRequest, HarnessAttemptResult
 
 
 class SandboxInteractionClient:
-    def __init__(self, uds_path: str, timeout_s: float = 300.0) -> None:
+    def __init__(self, uds_path: str, timeout_s: "float | None" = 300.0) -> None:
         self._client = httpx.Client(
             transport=httpx.HTTPTransport(uds=uds_path),
             base_url="http://agency-sandbox",

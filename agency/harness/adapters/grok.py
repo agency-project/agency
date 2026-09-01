@@ -25,6 +25,9 @@ from __future__ import annotations
 import json
 import shutil
 import uuid
+
+from fastapi import Request
+
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
 
@@ -130,7 +133,7 @@ class _GrokBackend(agharness_backend):
                 "GROK_HOME": str(config_home),
             }
 
-            px = agProxyPtrace(runtime.agconfig)
+            px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
             handle = px.launch(
                 argv,
                 envp,
@@ -191,7 +194,6 @@ class _GrokBackend(agharness_backend):
         return text, usage, session_id
 
     def register(self, app, router) -> None:
-        from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
 
         @app.post("/v1/chat/completions")

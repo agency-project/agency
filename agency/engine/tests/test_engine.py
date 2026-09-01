@@ -14,7 +14,7 @@ from agency.agschema import agschema
 from agency.agdata import agerror
 from agency.engine import engine as mod
 from agency.engine.engine import AgentEngine
-from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
+from agency.harness.protocol import HarnessAttemptResult, PromptPayload
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,14 +101,18 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
     collected_iter = iter(collected_sequence) if collected_sequence is not None else None
 
     class _FakeHostServerManager:
-        def __init__(self, agent, sandbox, skill, resource_pool):
+        def __init__(self, agent, sandbox, skill, resource_pool, *, invocation=None):
             self.agent = agent
             self.sandbox = sandbox
             self.skill = skill
             self.resource_pool = resource_pool
+            self.invocation = invocation
             self.started = False
             self.stopped = False
             self.set_config_calls = []
+            self.active_attempt_token = None
+            self.bound_attempt_tokens = []
+            self.cleared_attempt_tokens = []
 
             self.host_mcp_server = SimpleNamespace(
                 collected_output=lambda: next(collected_iter) if collected_iter is not None else {}
@@ -124,6 +128,18 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
 
         def set_config(self, agconfig) -> None:
             self.set_config_calls.append(agconfig)
+
+        def bind_attempt_token(self, token: str) -> None:
+            assert self.active_attempt_token is None
+            self.active_attempt_token = token
+            self.bound_attempt_tokens.append(token)
+
+        def clear_attempt_token(self, token: str) -> bool:
+            if token != self.active_attempt_token:
+                return False
+            self.active_attempt_token = None
+            self.cleared_attempt_tokens.append(token)
+            return True
 
     monkeypatch.setattr(mod, "HostServerManager", _FakeHostServerManager)
 
@@ -143,7 +159,12 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
 
     def fake_ensure_harness_daemon(sandbox, host_uds_path, engine_name, harness, agconfig):
         holder["daemon_sandbox"] = sandbox
-        return SimpleNamespace(client=lambda: client)
+
+        def client_for_attempt(timeout_s=300.0):
+            holder["attempt_client_timeout_s"] = timeout_s
+            return client
+
+        return SimpleNamespace(client=client_for_attempt)
 
     monkeypatch.setattr(mod, "ensure_harness_daemon", fake_ensure_harness_daemon)
     return holder
@@ -160,6 +181,11 @@ def test_init_stores_agent_and_starts_with_no_host_server_manager():
     assert engine._agent is agent
     assert engine._host_server_manager is None
     assert engine._sandbox_interaction_client is None
+
+
+def test_direct_execute_noop_invocation_supports_llm_completion_hook():
+    assert mod._NOOP_INVOCATION._note_model_result(has_tool_calls=False) is None
+    assert mod._NOOP_INVOCATION._note_model_result(has_tool_calls=True) is None
 
 
 def test_host_server_manager_property_raises_before_run():
@@ -652,9 +678,15 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
+    invocation = AgentControl().begin_invocation("controlled")
 
     result = engine.execute(
-        agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+        agcontext(),
+        skill,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        engine._agent.sandbox,
+        invocation=invocation,
     )
 
     manager = holder["manager"]
@@ -662,8 +694,10 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     assert holder["requests"][0].harness == "claude_code"
     assert manager.sandbox is engine._agent.sandbox
     assert holder["daemon_sandbox"] is engine._agent.sandbox
+    assert manager.invocation is invocation
     assert manager.started is True
     assert manager.stopped is True
+    assert holder["attempt_client_timeout_s"] is None
     assert result is execution
 
 
@@ -957,6 +991,9 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
 
     # 1 initial attempt + 2 retries = 3 calls total, then gives up
     assert [request.prompt for request in holder["requests"]] == [p0, retry, retry]
+    tokens = holder["manager"].bound_attempt_tokens
+    assert len(tokens) == len(set(tokens)) == 3
+    assert holder["manager"].cleared_attempt_tokens == tokens
     assert result is execution
 
 
@@ -991,19 +1028,71 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     assert holder["manager"].stopped is True
 
 
-def test_run_attempt_returns_original_rpc_response_without_host_callback():
+def test_run_attempt_binds_a_fresh_token_for_only_each_rpc_duration():
     expected = HarnessAttemptResult(ok=True, final_text="same response")
-    seen = []
     engine = AgentEngine(_FakeAgent())
-    engine._sandbox_interaction_client = SimpleNamespace(
-        run_harness_attempt=lambda request: seen.append(request) or expected
-    )
-    prompt = PromptPayload("system", "user")
+    active = []
+    bound = []
+    cleared = []
+    seen = []
 
-    result = engine._run_attempt(prompt, max_steps=7)
+    class Manager:
+        @staticmethod
+        def bind_attempt_token(token):
+            assert active == []
+            active.append(token)
+            bound.append(token)
 
-    assert result is expected
-    assert seen == [HarnessAttemptRequest(prompt=prompt, harness="claude_code", max_steps=7)]
+        @staticmethod
+        def clear_attempt_token(token):
+            assert active == [token]
+            active.clear()
+            cleared.append(token)
+            return True
+
+    def run_harness_attempt(request):
+        assert request.attempt_token == active[0]
+        seen.append(request)
+        return expected
+
+    engine._host_server_manager = Manager()
+    engine._sandbox_interaction_client = SimpleNamespace(run_harness_attempt=run_harness_attempt)
+
+    assert engine._run_attempt(PromptPayload("system", "first"), max_steps=7) is expected
+    assert engine._run_attempt(PromptPayload("system", "retry"), max_steps=7) is expected
+
+    assert active == []
+    assert len(bound) == 2
+    assert len(set(bound)) == 2
+    assert cleared == bound
+    assert [request.attempt_token for request in seen] == bound
+
+
+def test_run_attempt_clears_its_token_when_the_rpc_raises():
+    engine = AgentEngine(_FakeAgent())
+    active = []
+
+    class Manager:
+        @staticmethod
+        def bind_attempt_token(token):
+            active.append(token)
+
+        @staticmethod
+        def clear_attempt_token(token):
+            assert active == [token]
+            active.clear()
+            return True
+
+    def fail(_request):
+        raise RuntimeError("rpc failed")
+
+    engine._host_server_manager = Manager()
+    engine._sandbox_interaction_client = SimpleNamespace(run_harness_attempt=fail)
+
+    with pytest.raises(RuntimeError, match="rpc failed"):
+        engine._run_attempt(PromptPayload("system", "user"))
+
+    assert active == []
 
 
 # ---------------------------------------------------------------------------

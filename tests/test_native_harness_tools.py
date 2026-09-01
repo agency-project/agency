@@ -4,9 +4,49 @@ dispatch."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+from mcp.types import ImageContent, TextContent
 
 from agency.native_harness import tools
+from agency.native_harness.mcp_client import _decode_tool_result
+
+
+class TestMcpToolResults:
+    def test_uses_structured_content_when_present(self):
+        result = SimpleNamespace(structured_content={"r": 1}, content=[])
+        assert _decode_tool_result(result) == {"r": 1}
+
+    def test_decodes_json_object_from_text_content(self):
+        result = SimpleNamespace(
+            structured_content=None,
+            content=[SimpleNamespace(text='{\n  "r": 1\n}')],
+        )
+        assert _decode_tool_result(result) == {"r": 1}
+
+    def test_wraps_plain_text_for_compatibility(self):
+        result = SimpleNamespace(
+            structured_content=None,
+            content=[SimpleNamespace(text="plain text")],
+        )
+        assert _decode_tool_result(result) == {"result": "plain text"}
+
+    def test_preserves_multiple_and_non_text_content_blocks(self):
+        result = SimpleNamespace(
+            structured_content=None,
+            content=[
+                TextContent(type="text", text="caption"),
+                ImageContent(type="image", data="aGVsbG8=", mimeType="image/png"),
+            ],
+        )
+
+        assert _decode_tool_result(result) == {
+            "content": [
+                {"type": "text", "text": "caption"},
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            ]
+        }
 
 
 class TestReplace:

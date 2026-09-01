@@ -22,6 +22,44 @@ import asyncio
 import json
 
 
+def _decode_tool_result(result) -> dict:
+    """Recover a mapping from MCP structured content or JSON text content."""
+    if result.structured_content is not None:
+        return result.structured_content
+    content = list(result.content or [])
+    if len(content) == 1 and isinstance(getattr(content[0], "text", None), str):
+        text = content[0].text
+        try:
+            decoded = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        else:
+            if isinstance(decoded, dict):
+                return decoded
+        return {"result": text}
+    if not content:
+        return {}
+
+    # MCP content is a tagged union, not text-only. Preserve every image,
+    # audio, resource, and text block when the result cannot use the legacy
+    # single-text compatibility shape above.
+    blocks = []
+    for block in content:
+        model_dump = getattr(block, "model_dump", None)
+        if callable(model_dump):
+            blocks.append(model_dump(mode="json", by_alias=True, exclude_none=True))
+        elif isinstance(block, dict):
+            blocks.append(dict(block))
+        else:
+            blocks.append(
+                {
+                    "type": str(getattr(block, "type", type(block).__name__)),
+                    "value": str(block),
+                }
+            )
+    return {"content": blocks}
+
+
 def _mcp_server_configs(mcp_config: "dict | None") -> "list[tuple[str, str, dict]]":
     """`(server_name, url, headers)` for every `type: "http"` server in an
     already-parsed `--mcp-config` blob. Non-HTTP server types (a local
@@ -72,11 +110,7 @@ async def _call_tool_async(url: str, headers: dict, tool_name: str, arguments: d
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
-            if result.structured_content is not None:
-                return result.structured_content
-            if result.content:
-                return {"result": result.content[0].text}
-            return {}
+            return _decode_tool_result(result)
 
 
 class McpToolset:

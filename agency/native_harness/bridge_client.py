@@ -5,7 +5,7 @@ pointed at this run's own `agmanager_harness` instance and a `--bridge-
 token` bearer credential -- the same single (base_url, token) pair that
 already serves LLM dispatch (`llm_client.py` points its OpenAI-compatible
 client's `base_url` at `<bridge-base-url>` too), so ONE bridge configures
-policy checks, pause/inbox check-in, and context-limit lookup all at once,
+policy checks, lifecycle checkpoints, and context-limit lookup all at once,
 mirroring how Claude Code's own single `ANTHROPIC_BASE_URL`/
 `ANTHROPIC_AUTH_TOKEN` pair already serves its LLM traffic, its permission
 hook, and its profiler hook through the very same `agmanager_harness`
@@ -20,6 +20,11 @@ pause, never compact" (context_limit=None), not an error."""
 from __future__ import annotations
 
 import httpx
+
+
+CONTROL_PHASE_BOUNDARY = "boundary"
+CONTROL_PHASE_CLOSING = "closing"
+CONTROL_PHASE_MODEL = "model"
 
 
 class BridgeClient:
@@ -42,14 +47,47 @@ class BridgeClient:
             # silently become "allow everything."
             return {"decision": "deny", "reason": f"policy bridge unreachable: {e}"}
 
-    def check_in(self) -> list:
+    def checkpoint(
+        self,
+        boundary_id: str,
+        *,
+        allow_steering: bool,
+        phase: str,
+    ) -> dict:
         try:
-            resp = self._client.post("/internal/check_in", json={"token": self.token})
+            resp = self._client.post(
+                "/internal/checkpoint",
+                json={
+                    "boundary_id": boundary_id,
+                    "allow_steering": allow_steering,
+                    "phase": phase,
+                },
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=None,
+            )
             if resp.status_code != 200:
-                return []
-            return resp.json().get("messages") or []
-        except Exception:
-            return []
+                return {
+                    "cancelled": True,
+                    "destroyed": False,
+                    "steering": [],
+                    "error": f"control bridge returned {resp.status_code}",
+                }
+            result = resp.json()
+            return {
+                "cancelled": bool(result.get("cancelled")),
+                "destroyed": bool(result.get("destroyed")),
+                "steering": result.get("steering") or [],
+            }
+        except Exception as exc:
+            # A configured control bridge is authoritative; continuing when
+            # it is unreachable could run another model call or tool after a
+            # pause/cancel that Agency can no longer deliver.
+            return {
+                "cancelled": True,
+                "destroyed": False,
+                "steering": [],
+                "error": f"control bridge unreachable: {exc}",
+            }
 
     def context_limit(self) -> "int | None":
         try:
@@ -60,5 +98,13 @@ class BridgeClient:
         except Exception:
             return None
 
+    def close(self) -> None:
+        self._client.close()
 
-__all__ = ["BridgeClient"]
+
+__all__ = [
+    "BridgeClient",
+    "CONTROL_PHASE_BOUNDARY",
+    "CONTROL_PHASE_CLOSING",
+    "CONTROL_PHASE_MODEL",
+]

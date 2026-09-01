@@ -82,11 +82,52 @@ class InvocationHandle:
         using the same boundary therefore sees the same overlay without
         consuming the queue a second time.
         """
+        decision = self._checkpoint_wait(
+            boundary_id,
+            allow_steering=allow_steering,
+            phase=phase,
+            abort_event=None,
+        )
+        assert decision is not None
+        return decision
+
+    def _checkpoint_interruptibly(
+        self,
+        boundary_id: str,
+        *,
+        allow_steering: bool,
+        phase: str,
+        abort_event: threading.Event,
+    ) -> "InvocationDecision | None":
+        """Wait at a boundary until control admits it or its caller disconnects.
+
+        ``None`` means the caller-owned operation was aborted.  In that case
+        no steering is assigned, consumed, or cached for ``boundary_id``.
+        The ordinary ``_checkpoint`` API remains non-interruptible and always
+        returns an ``InvocationDecision``.
+        """
+        return self._checkpoint_wait(
+            boundary_id,
+            allow_steering=allow_steering,
+            phase=phase,
+            abort_event=abort_event,
+        )
+
+    def _checkpoint_wait(
+        self,
+        boundary_id: str,
+        *,
+        allow_steering: bool,
+        phase: str,
+        abort_event: "threading.Event | None",
+    ) -> "InvocationDecision | None":
         if not isinstance(boundary_id, str) or not boundary_id:
             raise ValueError("boundary_id must be a non-empty string")
         requested_phase = self._normalize_phase(phase)
 
         with self._control._condition:
+            if abort_event is not None and abort_event.is_set():
+                return None
             if not self._closed and self._phase != "closing":
                 self._phase = requested_phase
             while (
@@ -103,6 +144,15 @@ class InvocationHandle:
                 self._control._condition.wait()
                 if self._phase == "paused" and not self._closed:
                     self._phase = self._phase_before_pause
+                if abort_event is not None and abort_event.is_set():
+                    # This waiter is no longer parked, so restore its prior
+                    # phase while preserving the requested pause/suspension.
+                    # A later retry will park at the same gate.
+                    self._control._condition.notify_all()
+                    return None
+
+            if abort_event is not None and abort_event.is_set():
+                return None
 
             effective_phase = self._phase
             assigned = self._boundary_steering.get(boundary_id)
@@ -123,6 +173,12 @@ class InvocationHandle:
                 destroyed=self._destroyed,
                 steering=assigned,
             )
+
+    def _abort_checkpoint_wait(self, abort_event: threading.Event) -> None:
+        """Abort one interruptible wait and wake it without timeout polling."""
+        abort_event.set()
+        with self._control._condition:
+            self._control._condition.notify_all()
 
     def _note_model_result(self, has_tool_calls: bool) -> None:
         """Advance the model/tool phase and establish the final-answer fence."""

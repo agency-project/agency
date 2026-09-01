@@ -14,7 +14,7 @@ from agency.engine.host_servers.host_server_manager import (
     HostServerManagerConfigs,
 )
 from agency.engine.clients import SandboxInteractionClient
-from agency.harness.clients import HostInteractionClient
+from agency.harness.clients import HostServicesClient
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
@@ -33,6 +33,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
     seen_requests = []
     result_holder = {}
     errors = []
+    attempt_token = "dual-uds-attempt"
 
     def mock_policy(tool_input):
         assert tool_input == {"path": "/workspace/example.py"}
@@ -55,14 +56,20 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
     attempt_thread = None
 
     try:
+        host_manager.bind_attempt_token(attempt_token)
         assert host_manager.start() == str(host_socket)
-        host_client = HostInteractionClient(str(host_socket), timeout_s=2.0)
+        host_client = HostServicesClient(str(host_socket), None, timeout_s=2.0)
+        host_client.register_attempt_token(attempt_token)
 
         def mock_attempt_handler(request):
             seen_requests.append(request)
             attempt_received.set()
-            allowed, reason = host_client.check_tool("read_file", {"path": "/workspace/example.py"})
-            assert (allowed, reason) == (True, "mock policy allowed")
+            decision = host_client.check_tool_policy(
+                attempt_token,
+                "read_file",
+                {"path": "/workspace/example.py"},
+            )
+            assert decision == {"decision": "allow", "reason": "mock policy allowed"}
             reverse_rpc_completed.set()
             assert release_attempt_result.wait(timeout=2.0)
             return HarnessAttemptResult(
@@ -93,6 +100,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
                 user_content="fix the bug",
                 output_instruction="return JSON",
             ),
+            attempt_token=attempt_token,
         )
 
         def run_attempt():

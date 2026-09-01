@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from ...harness._syscall_event import agsyscallevent
@@ -15,9 +18,87 @@ if TYPE_CHECKING:
 
 
 class HostInteractionServer:
-    def __init__(self, skill: "agskill", data_collector: "agDataCollector") -> None:
+    def __init__(
+        self,
+        skill: "agskill",
+        data_collector: "agDataCollector",
+        *,
+        invocation=None,
+    ) -> None:
         self._policy = skill.policy
         self._data_collector = data_collector
+        # Bound by HostServerManager to the exact orchestrator request.  The
+        # sandbox never supplies an invocation id and therefore cannot target
+        # another request's lifecycle state.
+        self._invocation = invocation
+
+    def checkpoint(self, boundary_id: str, *, allow_steering: bool, phase: str) -> dict:
+        if self._invocation is None:
+            return {"cancelled": False, "destroyed": False, "steering": []}
+        decision = self._invocation._checkpoint(
+            boundary_id,
+            allow_steering=allow_steering,
+            phase=phase,
+        )
+        return self._serialize_checkpoint_decision(decision)
+
+    @staticmethod
+    def _serialize_checkpoint_decision(decision) -> dict:
+        def value(item, name: str, default=None):
+            return (
+                item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
+            )
+
+        return {
+            "cancelled": bool(value(decision, "cancelled", False)),
+            "destroyed": bool(value(decision, "destroyed", False)),
+            "steering": [
+                {
+                    "sequence": int(value(entry, "sequence", 0)),
+                    "instructions": str(value(entry, "instructions", "")),
+                }
+                for entry in (value(decision, "steering", ()) or ())
+            ],
+        }
+
+    def _checkpoint_interruptibly(
+        self,
+        boundary_id: str,
+        *,
+        allow_steering: bool,
+        phase: str,
+        abort_event: threading.Event,
+    ) -> "dict | None":
+        if self._invocation is None:
+            return (
+                None
+                if abort_event.is_set()
+                else {"cancelled": False, "destroyed": False, "steering": []}
+            )
+        checkpoint = getattr(self._invocation, "_checkpoint_interruptibly", None)
+        if checkpoint is None:
+            # Preserve duck-typed test and third-party invocation fakes that
+            # implement only the established private checkpoint seam.
+            decision = self._invocation._checkpoint(
+                boundary_id,
+                allow_steering=allow_steering,
+                phase=phase,
+            )
+        else:
+            decision = checkpoint(
+                boundary_id,
+                allow_steering=allow_steering,
+                phase=phase,
+                abort_event=abort_event,
+            )
+        return None if decision is None else self._serialize_checkpoint_decision(decision)
+
+    def _abort_checkpoint_wait(self, abort_event: threading.Event) -> None:
+        abort = getattr(self._invocation, "_abort_checkpoint_wait", None)
+        if abort is None:
+            abort_event.set()
+            return
+        abort(abort_event)
 
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
         hook = (self._policy.tool_hooks or {}).get(tool_name)
@@ -93,6 +174,69 @@ class HostInteractionServer:
         def _check_syscall(request: dict) -> JSONResponse:
             allowed, reason = self.check_syscall(agsyscallevent(**request))
             return JSONResponse({"allowed": allowed, "reason": reason})
+
+        @app.post("/checkpoint")
+        async def _checkpoint(request: dict, raw_request: Request) -> JSONResponse:
+            boundary_id = request.get("boundary_id")
+            phase = request.get("phase")
+            allow_steering = request.get("allow_steering")
+            if (
+                not isinstance(boundary_id, str)
+                or not boundary_id
+                or not isinstance(phase, str)
+                or not phase
+                or not isinstance(allow_steering, bool)
+            ):
+                return JSONResponse({"error": "invalid lifecycle checkpoint"}, status_code=400)
+
+            abort_event = threading.Event()
+            checkpoint_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._checkpoint_interruptibly,
+                    boundary_id,
+                    allow_steering=allow_steering,
+                    phase=phase,
+                    abort_event=abort_event,
+                )
+            )
+
+            async def wait_for_disconnect() -> None:
+                while True:
+                    message = await raw_request.receive()
+                    if message["type"] == "http.disconnect":
+                        return
+
+            disconnect_task = asyncio.create_task(wait_for_disconnect())
+            try:
+                done, _pending = await asyncio.wait(
+                    (checkpoint_task, disconnect_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if checkpoint_task in done:
+                    result = checkpoint_task.result()
+                    if result is None:
+                        return JSONResponse(
+                            {"error": "lifecycle checkpoint aborted"}, status_code=499
+                        )
+                    return JSONResponse(result)
+
+                # Do not cancel the to_thread task: that abandons its worker
+                # while the invocation condition remains blocked. Signal the
+                # wait itself, wake the condition, and join the worker first.
+                self._abort_checkpoint_wait(abort_event)
+                await checkpoint_task
+                return JSONResponse(
+                    {"error": "lifecycle checkpoint client disconnected"},
+                    status_code=499,
+                )
+            finally:
+                disconnect_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await disconnect_task
+                if not checkpoint_task.done():
+                    self._abort_checkpoint_wait(abort_event)
+                    with suppress(asyncio.CancelledError):
+                        await asyncio.shield(checkpoint_task)
 
         @app.post("/record_event")
         def _record_event(request: dict) -> JSONResponse:

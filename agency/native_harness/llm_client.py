@@ -55,13 +55,22 @@ class LLMClient:
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
         )
 
-    def dispatch(self, model: str, messages: list, tools: "list[dict] | None" = None) -> dict:
+    def dispatch(
+        self,
+        model: str,
+        messages: list,
+        tools: "list[dict] | None" = None,
+        *,
+        internal_kind: "str | None" = None,
+    ) -> dict:
         """Returns `{"message": {...}, "usage": {...} | None}` on success,
         `{"error": "..."}` on failure (exhausted retries or a non-retryable
         status)."""
         kwargs = {"model": model, "messages": messages, "stream": True}
         if tools:
             kwargs["tools"] = tools
+        if internal_kind is not None:
+            kwargs["agency_internal_kind"] = internal_kind
 
         last_error = "dispatch failed with no attempts made"
         for attempt in range(_DISPATCH_MAX_RETRIES):

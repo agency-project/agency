@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from typing import TYPE_CHECKING
 
 from ..harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
@@ -37,6 +38,10 @@ class _NoopInvocation:
     @staticmethod
     def _claim_completion() -> bool:
         return True
+
+    @staticmethod
+    def _note_model_result(*, has_tool_calls: bool) -> None:
+        del has_tool_calls
 
     @staticmethod
     def is_cancelled() -> bool:
@@ -135,7 +140,13 @@ class AgentEngine:
                     return self._controlled_error(active_invocation, admission.destroyed)
 
                 output = self._execute_harness(
-                    context, skill, skill_input, resource_pool, sandbox, max_steps=max_steps
+                    context,
+                    skill,
+                    skill_input,
+                    resource_pool,
+                    sandbox,
+                    max_steps=max_steps,
+                    invocation=active_invocation,
                 )
                 completion = active_invocation._checkpoint(
                     "engine:before-commit",
@@ -197,6 +208,8 @@ class AgentEngine:
         resource_pool: "agResourcePool",
         sandbox: agSandbox,
         max_steps: "int | None" = None,
+        *,
+        invocation=None,
     ) -> "agdata":
         """Run host services and the sandbox-side harness while locked."""
 
@@ -208,7 +221,13 @@ class AgentEngine:
         )
 
         # Start connections
-        manager = HostServerManager(self._agent, sandbox, skill, resource_pool)
+        manager = HostServerManager(
+            self._agent,
+            sandbox,
+            skill,
+            resource_pool,
+            invocation=invocation,
+        )
         with self._services_lock:
             self._host_server_manager = manager
             self._services_closed = False
@@ -228,7 +247,11 @@ class AgentEngine:
 
             # Obtain Host -> Sandbox handle
             with self._services_lock:
-                self._sandbox_interaction_client = handle.client()
+                # Invocation pause is intentionally unbounded. Readiness probes
+                # retain their short timeout, while the execution-owned outer
+                # RPC must not retire its attempt token merely because a valid
+                # safe-boundary pause lasts longer than five minutes.
+                self._sandbox_interaction_client = handle.client(timeout_s=None)
 
             # Prefix retained host-only context that this harness session has
             # not incorporated yet.  Stateless harnesses have no advancing
@@ -378,16 +401,27 @@ class AgentEngine:
         resume_session_id: "str | None" = None,
         prior_session_blob_b64: "str | None" = None,
     ) -> HarnessAttemptResult:
-        if self._sandbox_interaction_client is None:
+        client = self._sandbox_interaction_client
+        manager = self._host_server_manager
+        if client is None:
             raise RuntimeError("Harness Manager client is not configured")
-        request = HarnessAttemptRequest(
-            prompt=prompt,
-            harness=self._agent.harness,
-            max_steps=max_steps,
-            resume_session_id=resume_session_id,
-            prior_session_blob_b64=prior_session_blob_b64,
-        )
-        return self._sandbox_interaction_client.run_harness_attempt(request)
+        if manager is None:
+            raise RuntimeError("Host Server Manager is not configured")
+
+        attempt_token = uuid.uuid4().hex
+        manager.bind_attempt_token(attempt_token)
+        try:
+            request = HarnessAttemptRequest(
+                prompt=prompt,
+                harness=self._agent.harness,
+                max_steps=max_steps,
+                resume_session_id=resume_session_id,
+                prior_session_blob_b64=prior_session_blob_b64,
+                attempt_token=attempt_token,
+            )
+            return client.run_harness_attempt(request)
+        finally:
+            manager.clear_attempt_token(attempt_token)
 
     def _missing_output_fields(self, skill: "agskill") -> "list[str]":
         if (

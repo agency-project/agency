@@ -28,7 +28,7 @@ class DaemonHandle:
     container_sandbox_uds_path: str
     engine_name: str
 
-    def client(self, timeout_s: float = 300.0) -> SandboxInteractionClient:
+    def client(self, timeout_s: "float | None" = 300.0) -> SandboxInteractionClient:
         return SandboxInteractionClient(self.sandbox_uds_path, timeout_s=timeout_s)
 
 

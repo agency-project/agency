@@ -27,7 +27,9 @@ import asyncio
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from .common import extract_bearer_token
 
 if TYPE_CHECKING:
     from .clients.host_services_client import HostServicesClient
@@ -42,15 +44,21 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
     # sub-paths, so there is nothing under "/mcp/*" to proxy.
     @router.api_route("/mcp", methods=["GET", "POST", "DELETE"])
     async def mcp_proxy(request: Request):
+        token = extract_bearer_token(request)
+        if not token or not bridge.validate_token(token):
+            return JSONResponse(
+                {"error": "unknown or missing bearer token"},
+                status_code=401,
+            )
         body = await request.body()
         headers = {
             k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
         }
 
         def _forward():
-            return bridge.client.request(
+            return bridge.forward_mcp_request(
+                token,
                 request.method,
-                "/mcp",
                 content=body,
                 headers=headers,
                 params=dict(request.query_params),

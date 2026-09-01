@@ -445,8 +445,14 @@ class agProxyPtrace:
     holds config, not per-launch state (that lives on the returned
     `agProxyPtraceHandle`/`TracerLoop`)."""
 
-    def __init__(self, agconfig: "agConfig | None" = None) -> None:
+    def __init__(
+        self,
+        agconfig: "agConfig | None" = None,
+        *,
+        allow_initial_exec: bool = False,
+    ) -> None:
         self._agconfig = agconfig
+        self._allow_initial_exec = allow_initial_exec
 
     def launch(
         self,
@@ -469,8 +475,23 @@ class agProxyPtrace:
             envp,
             timing="exact",
         )
+        initial_exec_pending = self._allow_initial_exec
 
         def syscall_hook(stop) -> _TraceDecision:
+            nonlocal initial_exec_pending
+            # Agency selected this exact root executable and argv.  Consume a
+            # one-shot authorization for that launch without granting the
+            # harness or its descendants a general exec-policy bypass.
+            if (
+                initial_exec_pending
+                and stop.syscall == "execve"
+                and stop.pid == loop.root_pid
+                and stop.path == argv[0]
+                and stop.argv == argv
+            ):
+                initial_exec_pending = False
+                return _TraceDecision(kind="allow")
+
             event = agsyscallevent(
                 syscall=stop.syscall,
                 pid=stop.pid,

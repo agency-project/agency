@@ -3,13 +3,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import threading
 import time
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
+from starlette.responses import StreamingResponse
 
+from agency._agent_control import AgentControl
 from agency.agconfig import agConfig
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
@@ -87,17 +93,23 @@ class _FakeDataCollector:
     def __init__(self):
         self.events = []
         self.stream_deltas = []
+        self.stream_delta_history = []
         self.finalized = []
+        self.operations = []
 
     def record_event(self, type, payload, call_label=None, overwrite=False, **_kw):
         self.events.append((type, payload, call_label, overwrite))
 
     def record_stream_delta(self, type, payload, call_label=None, flush=False):
-        self.stream_deltas.append((type, payload, call_label))
+        entry = (type, payload, call_label)
+        self.stream_deltas.append(entry)
+        self.stream_delta_history.append(entry)
+        self.operations.append(("delta", call_label, payload))
 
     def finalize_stream(self, call_label, type, payloads, term_message=None):
         self.stream_deltas = [d for d in self.stream_deltas if d[2] != call_label]
         self.finalized.append((call_label, type, payloads))
+        self.operations.append(("finalize", call_label, type))
 
 
 def _cfg(**fields) -> agConfig:
@@ -116,9 +128,261 @@ def _drain(handle) -> "list[dict]":
     item = handle.first()
     lines = [item]
     while item["type"] not in ("done", "error"):
-        item = handle._queue.get()
+        item = handle.first()
         lines.append(item)
     return lines
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+async def _disconnect_after_first_response_body(response: StreamingResponse) -> "list[dict]":
+    body_sent = asyncio.Event()
+    sent = []
+
+    async def receive():
+        await body_sent.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            body_sent.set()
+            # Keep the response task at the first network write until the
+            # disconnect watcher cancels it. This prevents the async iterator
+            # from consuming queued backlog before cleanup begins.
+            await asyncio.Event().wait()
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+    await response(scope, receive, send)
+    return sent
+
+
+async def _post_app_until_disconnect(app, payload: dict, disconnect: asyncio.Event) -> "list[dict]":
+    encoded = json.dumps(payload).encode()
+    request_sent = False
+    sent = []
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": encoded, "more_body": False}
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/dispatch",
+        "raw_path": b"/dispatch",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(encoded)).encode()),
+        ],
+        "client": ("test", 1234),
+        "server": ("test", 80),
+    }
+    try:
+        await app(scope, receive, send)
+    except ClientDisconnect:
+        pass
+    return sent
+
+
+def _completed_tool_history() -> "list[dict]":
+    return [
+        {
+            "role": "user",
+            "blocks": [{"type": "text", "index": 0, "text": "compare both"}],
+        },
+        {
+            "role": "assistant",
+            "blocks": [
+                {
+                    "type": "tool_use",
+                    "index": 0,
+                    "id": "call-a",
+                    "name": "lookup",
+                    "arguments": '{"item":"a"}',
+                },
+                {
+                    "type": "tool_use",
+                    "index": 1,
+                    "id": "call-b",
+                    "name": "lookup",
+                    "arguments": '{"item":"b"}',
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "blocks": [
+                {
+                    "type": "tool_result",
+                    "index": 0,
+                    "tool_call_id": "call-a",
+                    "text": "result-a",
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "blocks": [
+                {
+                    "type": "tool_result",
+                    "index": 0,
+                    "tool_call_id": "call-b",
+                    "text": "result-b",
+                }
+            ],
+        },
+    ]
+
+
+def _tool_message(call_id: str = "next") -> dict:
+    return {
+        "role": "assistant",
+        "blocks": [
+            {
+                "type": "tool_use",
+                "index": 0,
+                "id": call_id,
+                "name": "lookup",
+                "arguments": "{}",
+            }
+        ],
+    }
+
+
+def _steering_texts(messages: "list[dict]") -> "list[str]":
+    return [
+        block["text"]
+        for message in messages
+        if message.get("role") == "user"
+        for block in message.get("blocks", [])
+        if block.get("type") == "text" and block.get("text", "").startswith("[AGENCY STEERING]\n")
+    ]
+
+
+class _RecordingBackend:
+    model = "recording"
+
+    def __init__(self, *, final: bool = False) -> None:
+        self.final = final
+        self.requests: "list[tuple[str, dict]]" = []
+
+    def _result(self) -> dict:
+        message = (
+            {
+                "role": "assistant",
+                "blocks": [{"type": "text", "index": 0, "text": "done"}],
+            }
+            if self.final
+            else _tool_message()
+        )
+        return {
+            "message": message,
+            "usage": None,
+            "stop_reason": "stop" if self.final else "tool_use",
+        }
+
+    def dispatch(self, request: dict) -> dict:
+        self.requests.append(("nonstream", copy.deepcopy(request)))
+        return self._result()
+
+    def dispatch_stream(self, request: dict, *, on_client=None):
+        del on_client
+        self.requests.append(("stream", copy.deepcopy(request)))
+        if self.final:
+            yield {"type": "content", "index": 0, "block_type": "text", "text": "done"}
+        else:
+            yield {
+                "type": "content",
+                "index": 0,
+                "block_type": "tool_use",
+                "id": "next",
+                "name": "lookup",
+                "arguments": "{}",
+            }
+        yield {"type": "usage", "usage": None, "stop_reason": "stop"}
+
+
+class _BlockingToolBackend(_RecordingBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def _block(self) -> None:
+        self.entered.set()
+        assert self.release.wait(timeout=2.0)
+
+    def dispatch(self, request: dict) -> dict:
+        self.requests.append(("nonstream", copy.deepcopy(request)))
+        self._block()
+        return self._result()
+
+    def dispatch_stream(self, request: dict, *, on_client=None):
+        del on_client
+        self.requests.append(("stream", copy.deepcopy(request)))
+        self._block()
+        yield {
+            "type": "content",
+            "index": 0,
+            "block_type": "tool_use",
+            "id": "next",
+            "name": "lookup",
+            "arguments": "{}",
+        }
+        yield {"type": "usage", "usage": None, "stop_reason": "tool_use"}
+
+
+class _TextThenBlockingToolBackend(_RecordingBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.after_text = threading.Event()
+        self.release = threading.Event()
+
+    def dispatch_stream(self, request: dict, *, on_client=None):
+        del on_client
+        self.requests.append(("stream", copy.deepcopy(request)))
+        yield {"type": "content", "index": 0, "block_type": "text", "text": "working"}
+        self.after_text.set()
+        assert self.release.wait(timeout=2.0)
+        yield {
+            "type": "content",
+            "index": 1,
+            "block_type": "tool_use",
+            "id": "next",
+            "name": "lookup",
+            "arguments": "{}",
+        }
+        yield {"type": "usage", "usage": None, "stop_reason": "tool_use"}
+
+
+def _controlled_server(backend, invocation) -> LlmHandlerServer:
+    server = LlmHandlerServer(
+        _cfg(model="gpt-test"),
+        _FakeDataCollector(),
+        invocation=invocation,
+    )
+    server._backend = backend
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +482,13 @@ def test_dispatch_bad_request_raises_dispatch_error_and_closes_client(monkeypatc
         assert e.status_code == 400
         assert e.transient is False
     assert client.closed is True
+    assert server._data_collector.finalized == [
+        (
+            server._data_collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "ValueError: bad request"}],
+        )
+    ]
 
 
 def test_dispatch_transient_error_raises_dispatch_error(monkeypatch):
@@ -234,6 +505,13 @@ def test_dispatch_transient_error_raises_dispatch_error(monkeypatch):
         assert e.status_code == 503
         assert e.transient is True
     assert client.closed is True
+    assert server._data_collector.finalized == [
+        (
+            server._data_collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "ConnectionError: down"}],
+        )
+    ]
 
 
 def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
@@ -247,6 +525,13 @@ def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
     except RuntimeError:
         pass
     assert client.closed is True
+    assert server._data_collector.finalized == [
+        (
+            server._data_collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "RuntimeError: boom"}],
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +692,9 @@ def test_start_stream_first_chunk_bad_request_becomes_error_item(monkeypatch):
     assert item == {"type": "error", "message": "nope", "transient": False, "status_code": 400}
     handle._thread.join(timeout=2.0)
     assert client.closed is True
+    assert server._data_collector.finalized == [
+        (handle.call_label, "llm_stream_error", [{"error": "ValueError: nope"}])
+    ]
 
 
 def test_start_stream_first_chunk_transient_error_becomes_error_item(monkeypatch):
@@ -420,6 +708,9 @@ def test_start_stream_first_chunk_transient_error_becomes_error_item(monkeypatch
     item = handle.first()
     assert item == {"type": "error", "message": "down", "transient": True, "status_code": 503}
     handle._thread.join(timeout=2.0)
+    assert server._data_collector.finalized == [
+        (handle.call_label, "llm_stream_error", [{"error": "ConnectionError: down"}])
+    ]
 
 
 def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
@@ -442,6 +733,572 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
     }
     handle._thread.join(timeout=2.0)
     assert client.closed is True
+    assert server._data_collector.finalized == [
+        (
+            handle.call_label,
+            "llm_stream_error",
+            [{"error": "RuntimeError: mid-stream failure"}],
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# invocation controls / steering safe boundaries
+# ---------------------------------------------------------------------------
+
+
+def test_steering_is_fifo_protocol_valid_and_stable_across_stream_replay():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend()
+    server = _controlled_server(backend, invocation)
+    history = _completed_tool_history()
+
+    control.steer("first")
+    control.steer("second")
+    server.dispatch({"messages": history})
+
+    first_request = backend.requests[-1][1]
+    assert first_request["messages"][: len(history)] == history
+    assert _steering_texts(first_request["messages"]) == [
+        "[AGENCY STEERING]\nfirst",
+        "[AGENCY STEERING]\nsecond",
+    ]
+    assert [message["role"] for message in first_request["messages"][-4:]] == [
+        "tool",
+        "tool",
+        "user",
+        "user",
+    ]
+
+    # Streaming is transport-only and therefore reuses the same semantic
+    # boundary assignment rather than consuming newly queued steering.
+    control.steer("third")
+    stream = server.start_stream({"messages": history, "stream": True})
+    assert _drain(stream)[-1]["type"] == "done"
+    stream._thread.join(timeout=2.0)
+    replay_request = backend.requests[-1][1]
+    assert _steering_texts(replay_request["messages"]) == [
+        "[AGENCY STEERING]\nfirst",
+        "[AGENCY STEERING]\nsecond",
+    ]
+
+    expanded = history + [
+        _tool_message(),
+        {
+            "role": "tool",
+            "blocks": [
+                {
+                    "type": "tool_result",
+                    "index": 0,
+                    "tool_call_id": "next",
+                    "text": "next-result",
+                }
+            ],
+        },
+    ]
+    server.dispatch({"messages": expanded})
+    assert _steering_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY STEERING]\nfirst",
+        "[AGENCY STEERING]\nsecond",
+        "[AGENCY STEERING]\nthird",
+    ]
+    assert invocation.phase == "boundary"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_final_response_establishes_closing_fence(streaming: bool):
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend(final=True)
+    server = _controlled_server(backend, invocation)
+    control.steer("before final")
+    request = {"messages": _completed_tool_history(), "stream": streaming}
+
+    if streaming:
+        stream = server.start_stream(request)
+        assert _drain(stream)[-1]["type"] == "done"
+        stream._thread.join(timeout=2.0)
+    else:
+        assert server.dispatch(request)["message"]["blocks"][0]["text"] == "done"
+
+    assert invocation.phase == "closing"
+    with pytest.raises(RuntimeError, match="phase is closing"):
+        control.steer("too late")
+
+
+def test_failed_attempt_reuses_pre_boundary_steering_on_identical_retry():
+    class _FailOnceBackend(_RecordingBackend):
+        def __init__(self) -> None:
+            super().__init__(final=True)
+            self.failed = False
+
+        def dispatch(self, request: dict) -> dict:
+            self.requests.append(("nonstream", copy.deepcopy(request)))
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("provider disconnected")
+            return self._result()
+
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _FailOnceBackend()
+    server = _controlled_server(backend, invocation)
+    control.steer("assigned before attempt")
+    request = {"messages": _completed_tool_history()}
+
+    with pytest.raises(RuntimeError, match="provider disconnected"):
+        server.dispatch(request)
+
+    assert invocation.phase == "model"
+    with pytest.raises(RuntimeError, match="phase is model"):
+        control.steer("would be stranded")
+
+    server.dispatch(request)
+    assert [_steering_texts(item[1]["messages"]) for item in backend.requests] == [
+        ["[AGENCY STEERING]\nassigned before attempt"],
+        ["[AGENCY STEERING]\nassigned before attempt"],
+    ]
+
+
+def test_incomplete_tool_batch_does_not_drain_or_inject_steering():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend()
+    server = _controlled_server(backend, invocation)
+    complete = _completed_tool_history()
+    control.steer("wait for every result")
+
+    server.dispatch({"messages": complete[:-1]})
+    assert _steering_texts(backend.requests[-1][1]["messages"]) == []
+
+    server.dispatch({"messages": complete})
+    assert _steering_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY STEERING]\nwait for every result"
+    ]
+
+
+def test_internal_compaction_bypasses_controls_and_strips_marker():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend()
+    server = _controlled_server(backend, invocation)
+    control.steer("for the next user-visible generation")
+    history = _completed_tool_history()
+
+    server.dispatch({"messages": history, "agency_internal_kind": "compaction"})
+    compaction_request = backend.requests[-1][1]
+    assert "agency_internal_kind" not in compaction_request
+    assert _steering_texts(compaction_request["messages"]) == []
+    assert invocation.phase == "starting"
+
+    server.dispatch({"messages": history})
+    assert _steering_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY STEERING]\nfor the next user-visible generation"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("destroyed", "streaming", "expected"),
+    [
+        (False, False, "agent invocation cancelled"),
+        (False, True, "agent invocation cancelled"),
+        (True, False, "agent destroyed"),
+        (True, True, "agent destroyed"),
+    ],
+)
+def test_pre_model_stop_returns_conflict_without_calling_provider(
+    destroyed: bool, streaming: bool, expected: str
+):
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend()
+    server = _controlled_server(backend, invocation)
+    if destroyed:
+        control.destroy()
+    else:
+        control.cancel()
+
+    response = TestClient(server.build_app()).post(
+        "/dispatch", json={"messages": _completed_tool_history(), "stream": streaming}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"error": {"message": expected, "transient": False}}
+    assert backend.requests == []
+    assert server._data_collector.events == []
+    assert server._data_collector.finalized == []
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_pause_during_model_parks_post_model_boundary_before_tool_delivery(streaming: bool):
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _BlockingToolBackend()
+    server = _controlled_server(backend, invocation)
+    request = {"messages": _completed_tool_history(), "stream": streaming}
+    finished = threading.Event()
+    outcome = {}
+
+    if streaming:
+        stream = server.start_stream(request)
+    else:
+
+        def dispatch() -> None:
+            try:
+                outcome["result"] = server.dispatch(request)
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=dispatch, daemon=True)
+        worker.start()
+
+    assert backend.entered.wait(timeout=2.0)
+    assert invocation.phase == "model"
+    control.pause()
+    assert control.is_paused_actual() is False
+    backend.release.set()
+
+    assert _wait_until(control.is_paused_actual)
+    if streaming:
+        assert stream._queue.empty()
+        assert stream._thread.is_alive()
+    else:
+        assert finished.is_set() is False
+
+    control.resume()
+    if streaming:
+        assert _drain(stream)[-1]["type"] == "done"
+        stream._thread.join(timeout=2.0)
+        assert not stream._thread.is_alive()
+    else:
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert "error" not in outcome
+        assert outcome["result"]["message"]["blocks"][0]["type"] == "tool_use"
+    assert invocation.phase == "boundary"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_cancel_during_model_suppresses_post_model_tool_delivery(streaming: bool):
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _BlockingToolBackend()
+    server = _controlled_server(backend, invocation)
+    request = {"messages": _completed_tool_history(), "stream": streaming}
+
+    if streaming:
+        stream = server.start_stream(request)
+    else:
+        outcome = {}
+
+        def run_dispatch() -> None:
+            try:
+                outcome["result"] = server.dispatch(request)
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run_dispatch, daemon=True)
+        worker.start()
+
+    assert backend.entered.wait(timeout=2.0)
+    assert invocation.phase == "model"
+    control.cancel()
+    backend.release.set()
+
+    if streaming:
+        terminal = _drain(stream)[-1]
+        stream._thread.join(timeout=2.0)
+        assert terminal == {
+            "type": "error",
+            "message": "agent invocation cancelled",
+            "transient": False,
+            "status_code": 409,
+        }
+    else:
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert "result" not in outcome
+        assert str(outcome["error"]) == "agent invocation cancelled"
+        assert outcome["error"].status_code == 409
+
+    collector = server._data_collector
+    assert len(collector.events) == 1
+    assert collector.finalized == [
+        (
+            collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "_DispatchError: agent invocation cancelled"}],
+        )
+    ]
+    if streaming:
+        assert collector.events[0][2] == stream.call_label
+
+
+def test_unclassified_first_stream_read_error_always_wakes_consumer():
+    def create(**kwargs):
+        del kwargs
+        raise RuntimeError("setup exploded")
+
+    server, client = _make_server(create_fn=create)
+    handle = server.start_stream({"messages": []})
+
+    assert handle.first() == {
+        "type": "error",
+        "message": "setup exploded",
+        "transient": False,
+        "status_code": 500,
+    }
+    handle._thread.join(timeout=2.0)
+    assert not handle._thread.is_alive()
+    assert client.closed is True
+    assert server._data_collector.finalized == [
+        (
+            handle.call_label,
+            "llm_stream_error",
+            [{"error": "RuntimeError: setup exploded"}],
+        )
+    ]
+    assert server.get_main_transcript() == []
+
+
+def test_controlled_paths_preserve_collector_call_labels_and_finalization():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend()
+    server = _controlled_server(backend, invocation)
+    handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
+
+    assert _drain(handle)[-1]["type"] == "done"
+    handle._thread.join(timeout=2.0)
+    collector = server._data_collector
+    assert collector.events == [("agent_state", {"state": "waiting_llm"}, handle.call_label, True)]
+    assert collector.finalized[-1][0] == handle.call_label
+    assert collector.finalized[-1][1] == "llm_block"
+
+
+def test_malformed_nonstream_result_finalizes_the_collector_call_label():
+    class MalformedBackend(_RecordingBackend):
+        def dispatch(self, request: dict) -> dict:
+            self.requests.append(("nonstream", copy.deepcopy(request)))
+            return {"usage": None, "message": {"role": "assistant", "blocks": []}}
+
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    server = _controlled_server(MalformedBackend(), invocation)
+
+    with pytest.raises(KeyError, match="stop_reason"):
+        server.dispatch({"messages": _completed_tool_history()})
+
+    collector = server._data_collector
+    assert collector.finalized == [
+        (
+            collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "KeyError: 'stop_reason'"}],
+        )
+    ]
+
+
+@pytest.mark.parametrize("failure_point", ["span", "annotate"])
+def test_nonstream_outer_infrastructure_failure_finalizes_once(monkeypatch, failure_point):
+    server, _ = _make_server(create_fn=lambda **_kwargs: None)
+    if failure_point == "span":
+        monkeypatch.setattr(
+            agprof,
+            "span",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("span failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            mod,
+            "_annotate",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("annotate failed")),
+        )
+
+    with pytest.raises(RuntimeError, match=f"{failure_point} failed"):
+        server.dispatch({"messages": []})
+
+    collector = server._data_collector
+    assert collector.finalized == [
+        (
+            collector.events[0][2],
+            "llm_stream_error",
+            [{"error": f"RuntimeError: {failure_point} failed"}],
+        )
+    ]
+    assert [operation[0] for operation in collector.operations] == ["finalize"]
+
+
+def test_stream_spawn_failure_finalizes_the_collector_call_label(monkeypatch):
+    server, _ = _make_server(create_fn=lambda **_kwargs: iter([]))
+
+    def fail_spawn(*_args, **_kwargs):
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(agprof, "spawn_traced", fail_spawn)
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        server.start_stream({"messages": []})
+
+    collector = server._data_collector
+    assert collector.finalized == [
+        (
+            collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "RuntimeError: spawn failed"}],
+        )
+    ]
+
+
+def test_stream_spawn_failure_observes_control_cancel(monkeypatch):
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    server = _controlled_server(_RecordingBackend(), invocation)
+
+    def cancel_then_fail(*_args, **_kwargs):
+        control.cancel()
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(agprof, "spawn_traced", cancel_then_fail)
+
+    with pytest.raises(mod._DispatchError, match="agent invocation cancelled"):
+        server.start_stream({"messages": _completed_tool_history()})
+
+    collector = server._data_collector
+    assert collector.finalized == [
+        (
+            collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "_DispatchError: agent invocation cancelled"}],
+        )
+    ]
+
+
+def test_stream_spawn_failure_after_disconnect_finalizes_as_cancelled(monkeypatch):
+    server, _ = _make_server(create_fn=lambda **_kwargs: iter([]))
+    abort_event = threading.Event()
+
+    def abort_then_fail(*_args, **_kwargs):
+        abort_event.set()
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(agprof, "spawn_traced", abort_then_fail)
+
+    with pytest.raises(mod._RequestAborted):
+        server.start_stream({"messages": []}, abort_event=abort_event)
+
+    collector = server._data_collector
+    assert collector.finalized == [
+        (collector.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
+    ]
+
+
+def test_stream_thread_start_failure_finalizes_and_removes_the_handle(monkeypatch):
+    class StartFailure:
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    server, _ = _make_server(create_fn=lambda **_kwargs: iter([]))
+    monkeypatch.setattr(agprof, "spawn_traced", lambda *_args, **_kwargs: StartFailure())
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        server.start_stream({"messages": []})
+
+    assert server._handles == []
+    collector = server._data_collector
+    assert collector.finalized == [
+        (
+            collector.events[0][2],
+            "llm_stream_error",
+            [{"error": "RuntimeError: thread start failed"}],
+        )
+    ]
+
+
+def test_outer_stream_producer_failure_wakes_consumer_and_finalizes(monkeypatch):
+    server, _ = _make_server(create_fn=lambda **_kwargs: iter([]))
+    monkeypatch.setattr(
+        mod,
+        "_annotate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("span annotation failed")),
+    )
+
+    handle = server.start_stream({"messages": []})
+
+    assert handle.first() == {
+        "type": "error",
+        "message": "span annotation failed",
+        "transient": False,
+        "status_code": 500,
+    }
+    handle._thread.join(timeout=2.0)
+    assert not handle._thread.is_alive()
+    assert server._data_collector.finalized == [
+        (
+            handle.call_label,
+            "llm_stream_error",
+            [{"error": "RuntimeError: span annotation failed"}],
+        )
+    ]
+
+
+def test_rejected_stream_error_enqueue_finalizes_as_cancelled():
+    class _FailingBackend:
+        model = "failing"
+
+        def dispatch_stream(self, request, *, on_client=None):
+            del request, on_client
+            raise RuntimeError("provider failed")
+            yield  # pragma: no cover
+
+    class _RejectErrorHandle(mod._StreamHandle):
+        def register_stream_exchange(self, item=None, **entry_fields):
+            if item is not None and item.get("type") == "error":
+                self.cancel()
+                return False
+            return super().register_stream_exchange(item, **entry_fields)
+
+    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataCollector())
+    server._backend = _FailingBackend()
+    handle = _RejectErrorHandle(mod.queue.Queue(), threading.Event(), "rejected-error")
+
+    server._run_stream_producer({"messages": []}, None, False, handle)
+
+    assert server._data_collector.finalized == [
+        ("rejected-error", "llm_stream_cancelled", [{"cancelled": True}])
+    ]
+
+
+def test_stream_collector_records_every_provider_item_in_order_before_finalize():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend()
+    server = _controlled_server(backend, invocation)
+    handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
+
+    assert _drain(handle)[-1]["type"] == "done"
+    handle._thread.join(timeout=2.0)
+    expected_items = [
+        {
+            "type": "content",
+            "index": 0,
+            "block_type": "tool_use",
+            "id": "next",
+            "name": "lookup",
+            "arguments": "{}",
+        },
+        {"type": "usage", "usage": None, "stop_reason": "stop"},
+    ]
+    collector = server._data_collector
+    assert [entry[1] for entry in collector.stream_delta_history] == expected_items
+    assert collector.operations == [
+        ("delta", handle.call_label, expected_items[0]),
+        ("delta", handle.call_label, expected_items[1]),
+        ("finalize", handle.call_label, "llm_block"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +1313,12 @@ def test_handle_relay_stays_in_handles_on_completion():
     server, _ = _make_server(create_fn=create)
     handle = server.start_stream({"messages": []})
     first = handle.first()
-    list(handle.relay(first))
+
+    async def consume() -> None:
+        async for _chunk in handle.relay(first):
+            pass
+
+    asyncio.run(consume())
     assert handle in server._handles
 
 
@@ -474,6 +1336,79 @@ def test_cancel_sets_event_and_closes_stream_ref_once():
     handle.cancel()
     assert handle._cancel_event.is_set()
     assert close_calls == [1]
+
+
+def test_stream_ref_published_after_cancel_is_closed_immediately_once():
+    close_calls = []
+
+    class _Stream:
+        def close(self):
+            close_calls.append(1)
+
+    handle = mod._StreamHandle(mod.queue.Queue(), threading.Event())
+    handle.cancel()
+    handle._set_stream_ref(_Stream())
+    handle.cancel()
+
+    assert close_calls == [1]
+
+
+def test_failed_stream_close_remains_retryable():
+    close_calls = []
+
+    class _Stream:
+        def close(self):
+            close_calls.append(1)
+            if len(close_calls) == 1:
+                raise RuntimeError("close failed")
+
+    handle = mod._StreamHandle(mod.queue.Queue(), threading.Event())
+    handle._set_stream_ref(_Stream())
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        handle.cancel()
+    handle.cancel()
+    assert close_calls == [1, 1]
+
+
+def test_disconnect_cleanup_joins_producer_even_when_initial_close_raises():
+    server, _ = _make_server(create_fn=lambda **kw: iter([]))
+    producer_release = threading.Event()
+    producer = threading.Thread(target=producer_release.wait, daemon=True)
+    handle = mod._StreamHandle(mod.queue.Queue(), threading.Event())
+    handle._thread = producer
+    producer.start()
+    close_calls = []
+
+    class _Stream:
+        def close(self):
+            close_calls.append(1)
+            if len(close_calls) == 1:
+                raise RuntimeError("close failed")
+            producer_release.set()
+
+    handle._set_stream_ref(_Stream())
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    request = SimpleNamespace(receive=receive)
+    first_worker, first_result = server._spawn_http_worker(handle.first)
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        asyncio.run(
+            server._wait_for_http_worker(
+                request,
+                first_worker,
+                first_result,
+                handle.cancel,
+                handle.cancel_and_join,
+            )
+        )
+
+    assert close_calls == [1, 1]
+    assert not first_worker.is_alive()
+    assert not producer.is_alive()
 
 
 def test_producer_stops_early_when_cancelled_mid_stream():
@@ -496,6 +1431,69 @@ def test_producer_stops_early_when_cancelled_mid_stream():
     handle._thread.join(timeout=2.0)
     assert not handle._thread.is_alive()
     assert client.closed is True
+
+
+def test_streaming_response_disconnect_unblocks_full_queue_and_joins_producer():
+    q = mod.queue.Queue(maxsize=1)
+    handle = mod._StreamHandle(q, threading.Event())
+    assert handle.register_stream_exchange({"type": "delta", "content": "queued"})
+
+    producer_entered = threading.Event()
+    producer_finished = threading.Event()
+    enqueue_result = []
+
+    def produce() -> None:
+        producer_entered.set()
+        enqueue_result.append(
+            handle.register_stream_exchange(
+                {"type": "done"},
+                response={"role": "assistant", "blocks": [{"type": "tool_use"}]},
+            )
+        )
+        producer_finished.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    handle._thread = producer
+    producer.start()
+    assert producer_entered.wait(timeout=2.0)
+    assert producer_finished.wait(timeout=0.05) is False
+
+    response = StreamingResponse(
+        handle.relay({"type": "delta", "content": "first"}),
+        media_type="application/x-ndjson",
+    )
+    asyncio.run(_disconnect_after_first_response_body(response))
+
+    assert producer_finished.is_set()
+    assert enqueue_result == [False]
+    assert not producer.is_alive()
+    assert handle._cancel_event.is_set()
+    assert handle.get_transcript()[0]["response"] is None
+
+
+def test_streaming_response_disconnect_interrupts_paused_post_model_checkpoint():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _TextThenBlockingToolBackend()
+    server = _controlled_server(backend, invocation)
+    handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
+    first = handle.first()
+
+    assert first == {"type": "delta", "content": "working"}
+    assert backend.after_text.wait(timeout=2.0)
+    control.pause()
+    backend.release.set()
+    assert _wait_until(control.is_paused_actual)
+    assert handle._thread.is_alive()
+
+    response = StreamingResponse(handle.relay(first), media_type="application/x-ndjson")
+    asyncio.run(_disconnect_after_first_response_body(response))
+
+    assert not handle._thread.is_alive()
+    assert control.is_pause_requested()
+    assert server._data_collector.finalized == [
+        (handle.call_label, "llm_stream_cancelled", [{"cancelled": True}])
+    ]
 
 
 def test_stop_cancels_and_joins_all_handles():
@@ -528,6 +1526,99 @@ def test_stop_cancels_and_joins_all_handles():
     assert elapsed < 2.0
     assert client.closed is True
     assert not handle._thread.is_alive()
+    server.stop()
+
+
+def test_stop_raises_while_producer_is_alive_and_can_be_retried(monkeypatch):
+    server, _ = _make_server(create_fn=lambda **kw: iter([]))
+    release = threading.Event()
+    producer = threading.Thread(target=release.wait, daemon=True)
+    handle = mod._StreamHandle(mod.queue.Queue(), threading.Event())
+    handle._thread = producer
+    server._handles.append(handle)
+    producer.start()
+    monkeypatch.setattr(mod, "_STREAM_JOIN_TIMEOUT_S", 0.0)
+
+    with pytest.raises(RuntimeError, match="1 LLM stream producer.*did not stop"):
+        server.stop()
+    assert producer.is_alive()
+
+    release.set()
+    producer.join(timeout=2.0)
+    assert not producer.is_alive()
+    server.stop()
+
+
+def test_stop_linearizes_against_concurrent_stream_start(monkeypatch):
+    server, _ = _make_server(create_fn=lambda **kw: iter([]))
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    start_outcome = {}
+    stop_outcome = {}
+
+    class _SlowStartThread:
+        def __init__(self, handle):
+            self.handle = handle
+            self.started = False
+            self.alive = False
+
+        def start(self):
+            start_entered.set()
+            assert release_start.wait(timeout=2.0)
+            self.started = True
+            self.alive = True
+
+        def join(self, timeout=None):
+            del timeout
+            if not self.started:
+                raise RuntimeError("cannot join thread before it is started")
+            if self.handle._cancel_event.is_set():
+                self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    monkeypatch.setattr(
+        agprof,
+        "spawn_traced",
+        lambda *_args, **_kwargs: _SlowStartThread(_args[-1]),
+    )
+
+    def start() -> None:
+        try:
+            start_outcome["handle"] = server.start_stream({"messages": []})
+        except BaseException as error:
+            start_outcome["error"] = error
+
+    def stop() -> None:
+        try:
+            server.stop()
+        except BaseException as error:
+            stop_outcome["error"] = error
+        finally:
+            stop_outcome["finished"] = True
+
+    starter = threading.Thread(target=start, daemon=True)
+    stopper = threading.Thread(target=stop, daemon=True)
+    starter.start()
+    assert start_entered.wait(timeout=2.0)
+    stopper.start()
+    assert stopper.join(timeout=0.05) is None
+    assert "finished" not in stop_outcome
+
+    release_start.set()
+    starter.join(timeout=2.0)
+    stopper.join(timeout=2.0)
+
+    assert "error" not in start_outcome
+    assert "error" not in stop_outcome
+    assert stop_outcome["finished"] is True
+    handle = start_outcome["handle"]
+    assert handle._cancel_event.is_set()
+    assert not handle._thread.is_alive()
+
+    with pytest.raises(RuntimeError, match="LLM handler server is stopping"):
+        server.start_stream({"messages": []})
 
 
 def test_stop_with_no_handles_returns_immediately():
@@ -538,6 +1629,32 @@ def test_stop_with_no_handles_returns_immediately():
 # ---------------------------------------------------------------------------
 # build_app / HTTP routes
 # ---------------------------------------------------------------------------
+
+
+def test_http_worker_prefers_disconnect_when_completion_is_simultaneously_ready(monkeypatch):
+    server, _ = _make_server(create_fn=lambda **kw: iter([]))
+    result = mod.Future()
+    result.set_result("complete")
+    worker = threading.Thread(target=lambda: None)
+    worker.start()
+    worker.join(timeout=2.0)
+    aborted = threading.Event()
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    request = SimpleNamespace(receive=receive)
+    real_wait = asyncio.wait
+
+    async def wait_for_both(awaitables, *, return_when):
+        del return_when
+        return await real_wait(awaitables, return_when=asyncio.ALL_COMPLETED)
+
+    monkeypatch.setattr(mod.asyncio, "wait", wait_for_both)
+    disconnected = asyncio.run(server._wait_for_http_worker(request, worker, result, aborted.set))
+
+    assert disconnected is True
+    assert aborted.is_set()
 
 
 def test_build_app_dispatch_route_non_streaming():
@@ -605,6 +1722,99 @@ def test_build_app_dispatch_route_streaming_error_returns_error_status(monkeypat
     response = client.post("/dispatch", json={"messages": [], "stream": True})
     assert response.status_code == 400
     assert response.json() == {"error": {"message": "nope", "transient": False}}
+
+
+def test_stream_http_disconnect_while_paused_before_model_leaves_no_collector_call():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _RecordingBackend()
+    server = _controlled_server(backend, invocation)
+    control.pause()
+
+    async def scenario() -> None:
+        disconnect = asyncio.Event()
+        request = asyncio.create_task(
+            _post_app_until_disconnect(
+                server.build_app(),
+                {"messages": _completed_tool_history(), "stream": True},
+                disconnect,
+            )
+        )
+        assert await asyncio.to_thread(_wait_until, control.is_paused_actual)
+        disconnect.set()
+        await asyncio.wait_for(request, timeout=2.0)
+
+    asyncio.run(scenario())
+
+    assert backend.requests == []
+    assert server._data_collector.events == []
+    assert server._data_collector.finalized == []
+    assert control.is_pause_requested()
+
+
+def test_stream_http_disconnect_before_first_item_joins_producer():
+    backend = _BlockingToolBackend()
+    server = _controlled_server(backend, invocation=None)
+
+    async def scenario() -> None:
+        disconnect = asyncio.Event()
+        request = asyncio.create_task(
+            _post_app_until_disconnect(
+                server.build_app(),
+                {"messages": _completed_tool_history(), "stream": True},
+                disconnect,
+            )
+        )
+        assert await asyncio.to_thread(backend.entered.wait, 2.0)
+        # Closing a real provider stream wakes its first read. This fake models
+        # that wake independently so the event loop may block until cleanup
+        # has fully joined the producer.
+        wake_provider = threading.Timer(0.05, backend.release.set)
+        wake_provider.start()
+        disconnect.set()
+        await asyncio.wait_for(request, timeout=2.0)
+        wake_provider.join(timeout=2.0)
+
+    asyncio.run(scenario())
+
+    collector = server._data_collector
+    assert collector.finalized == [
+        (collector.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
+    ]
+    assert all(
+        handle._thread is None or not handle._thread.is_alive() for handle in server._handles
+    )
+
+
+def test_nonstream_http_disconnect_interrupts_paused_post_model_checkpoint():
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _BlockingToolBackend()
+    server = _controlled_server(backend, invocation)
+
+    async def scenario() -> None:
+        disconnect = asyncio.Event()
+        request = asyncio.create_task(
+            _post_app_until_disconnect(
+                server.build_app(),
+                {"messages": _completed_tool_history()},
+                disconnect,
+            )
+        )
+        assert await asyncio.to_thread(backend.entered.wait, 2.0)
+        control.pause()
+        backend.release.set()
+        assert await asyncio.to_thread(_wait_until, control.is_paused_actual)
+        disconnect.set()
+        await asyncio.wait_for(request, timeout=2.0)
+
+    asyncio.run(scenario())
+
+    collector = server._data_collector
+    assert collector.finalized == [
+        (collector.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
+    ]
+    assert control.is_pause_requested()
 
 
 def test_build_app_resolve_model_route():
