@@ -55,6 +55,11 @@ _BARE_THREAD_ALLOWLIST = {
     ("agency/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
     ("agency/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
     ("agency/agwebui/emitter.py", "agwebui_emitter.emit"): (1, "event pruning"),
+    ("agency/agcollector.py", "GlobalDataCollector.start"): (1, "SQLite writer"),
+    (
+        "agency/orchestrator/orchestrator.py",
+        "GlobalAgentOrchestrator.__init__",
+    ): (1, "scheduler control plane"),
     ("agency/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),
 }
 

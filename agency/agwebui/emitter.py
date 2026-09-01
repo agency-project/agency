@@ -1,13 +1,15 @@
-"""agwebui_emitter — writes structured UI events to a SQLite database.
+"""agwebui_emitter — publishes structured events for the Web UI.
 
-The execution process calls these methods; the standalone web server polls
-the database and pushes events to connected browsers.  No agency imports here
-so this module can be imported from both sides if needed.
+In normal agency runs the emitter is a facade over the global data collector,
+whose asynchronous writer owns SQLite. Direct construction retains the legacy
+synchronous writer for isolated compatibility and emitter tests. No agency
+imports live here, so this module can still be imported from either side.
 """
 
 from __future__ import annotations
 
 import json
+import copy
 import re as _re
 import sqlite3
 import threading
@@ -66,16 +68,45 @@ def ansi_to_hex(ansi: str) -> str:
 
 
 class agwebui_emitter:
-    """Thread-safe SQLite event writer for the web UI."""
+    """Thread-safe Web UI publisher.
 
-    def __init__(self, run_dir: Path) -> None:
-        self._db_path = run_dir / "ui_events.db"
+    ``defer_to_global=True`` buffers startup events until the process-wide
+    collector is configured, then routes every event to its sole SQLite
+    writer. The default legacy mode is intentionally retained for direct
+    users of this low-level class.
+    """
+
+    def __init__(self, run_dir: Path, *, defer_to_global: bool = False) -> None:
+        self._db_path = run_dir / ("agency.sqlite3" if defer_to_global else "ui_events.db")
+        self._db_pointer_path = run_dir / "global_data_path.txt"
         self._reply_dir = run_dir / "ui_replies"
         self._reply_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._defer_to_global = defer_to_global
+        self._collector = None
+        self._pending_events: list[dict] = []
+        self._insert_count = 0
         # Prevents concurrent prune threads from piling up.
         self._prune_lock = threading.Lock()
-        self._init_db()
+        if not defer_to_global:
+            self._init_db()
+
+    def bind_collector(self, collector) -> None:
+        """Bind this facade to a global collector and drain startup events."""
+        with self._lock:
+            if self._collector is collector:
+                return
+            if self._collector is not None:
+                raise RuntimeError("Web UI emitter is already bound to a collector")
+            db_path = Path(collector.db_path)
+            pointer_tmp = self._db_pointer_path.with_suffix(".tmp")
+            pointer_tmp.write_text(str(db_path.resolve()), encoding="utf-8")
+            pointer_tmp.replace(self._db_pointer_path)
+            for event in self._pending_events:
+                collector.record_ui_event(event)
+            self._db_path = db_path
+            self._collector = collector
+            self._pending_events.clear()
 
     # Event types with a meaningful "current value" -- each gets its own
     # latest-value table (one row per key, upserted in place) IN ADDITION to
@@ -192,6 +223,14 @@ class agwebui_emitter:
     # ------------------------------------------------------------------
 
     def emit(self, event: dict) -> None:
+        if self._defer_to_global:
+            with self._lock:
+                if self._collector is None:
+                    self._pending_events.append(copy.deepcopy(event))
+                else:
+                    self._collector.record_ui_event(event)
+            return
+
         data = json.dumps(event, ensure_ascii=False, default=str)
         ts = float(event.get("ts") or time.time())
         etype = event.get("type", "")
@@ -268,6 +307,9 @@ class agwebui_emitter:
 
     def _flush_prune(self) -> None:
         """Block until any in-flight background prune has completed. For tests only."""
+        if self._collector is not None:
+            self._collector.flush()
+            return
         with self._prune_lock:
             pass
 

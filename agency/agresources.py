@@ -8,13 +8,9 @@ import re
 import subprocess
 import threading
 import time
-from typing import TYPE_CHECKING
 
 from .profiler import agprof
 from .agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
-
-if TYPE_CHECKING:
-    from .agDataCollector import agDataCollector
 
 
 # Exists to register agResourcePool's config fields (via __set_name__ at
@@ -445,14 +441,6 @@ class agResourcePool(_AgResourcePoolFields):
         self._cpu_mem_cond = threading.Condition()
         self.cpus_acquired: float = 0.0
         self.memory_acquired_mb: int = 0
-        # Lazy: agResourcePool is constructed as a class-level singleton at
-        # `agent` class-body-evaluation time (agent.py's own module import),
-        # so eagerly importing `.agent` here for its log dir would be a
-        # circular import. Deferring construction to first actual use (see
-        # _ensure_data_collector()) means that import only ever happens well
-        # after `agency.agent` has finished loading.
-        self._data_collector: "agDataCollector | None" = None
-        self._data_collector_lock = threading.Lock()
         if mark_gpus and self.gpus:
             import multiprocessing
 
@@ -637,50 +625,43 @@ class agResourcePool(_AgResourcePoolFields):
             who=sandbox._name, action="release_cpu_mem", cpus=held_cpus, memory_mb=held_mb
         )
 
-    def _ensure_data_collector(self) -> "agDataCollector":
-        """Lazily construct this pool's own agDataCollector, scoped to the
-        pool (a process-wide singleton), not to any individual agent."""
-        if self._data_collector is not None:
-            return self._data_collector
-        with self._data_collector_lock:
-            if self._data_collector is None:
-                from pathlib import Path
-
-                from .agent import agent as _Agent, _DEFAULT_LOG_DIR
-                from .agDataCollector import agDataCollector, agDataCollectorConfigs
-
-                log_dir = Path(_Agent.log_dir) if _Agent.log_dir is not None else _DEFAULT_LOG_DIR
-                dc_agconfig = agConfig()
-                dc_agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
-                    db_path=str(log_dir / "resources_data.sqlite3")
-                )
-                dc = agDataCollector(dc_agconfig)
-                dc.start()
-                self._data_collector = dc
-        return self._data_collector
-
     def _update_resource_log(
         self, *, who: "str | None" = None, action: "str | None" = None, **request
     ) -> None:
-        dc = self._ensure_data_collector()
-        dc.record_event(
-            type="resource_update",
-            payload={
-                "gpus_acquired": self._gpus_acquired,
-                "gpus_total": len(self.gpus),
-                "cpus_acquired": self.cpus_acquired,
-                "cpus_total": self.total_cpus,
-                "memory_acquired_mb": self.memory_acquired_mb,
-                "memory_total_mb": self.total_memory_mb,
-            },
-            do_update=True,
-        )
-        dc.record_event(
-            type="resource_request",
-            payload={"who": who, "action": action, "request": request or None},
-            do_update=False,
-            flush=True,
-        )
+        payload = {
+            "gpus_acquired": self._gpus_acquired,
+            "gpus_total": len(self.gpus),
+            "cpus_acquired": self.cpus_acquired,
+            "cpus_total": self.total_cpus,
+            "memory_acquired_mb": self.memory_acquired_mb,
+            "memory_total_mb": self.total_memory_mb,
+        }
+        try:
+            from .orchestrator import peek_orchestrator
+
+            orchestrator = peek_orchestrator()
+            if orchestrator is not None:
+                orchestrator.data_collector.record_event(
+                    "resource_update",
+                    payload,
+                    source="resource_manager",
+                    scope_key="global",
+                    do_update=True,
+                )
+                orchestrator.data_collector.record_event(
+                    "resource_request",
+                    {"who": who, "action": action, "request": request or None},
+                    source="resource_manager",
+                )
+        except Exception as exc:
+            print(f"[agresources] WARNING: global resource collection failed: {exc}")
+        try:
+            from . import agwebui as _agwebui
+
+            if _agwebui._active is not None:
+                _agwebui._active.emitter.resource_update(**payload)
+        except Exception as exc:
+            print(f"[agresources] WARNING: resource_update push failed: {exc}")
 
     def __repr__(self) -> str:
         return (

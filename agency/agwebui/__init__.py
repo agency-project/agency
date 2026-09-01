@@ -1,10 +1,10 @@
 """agwebui — web-based UI for monitoring agency runs.
 
 Starts a standalone FastAPI server in a separate process and serves a
-browser dashboard.  The execution process writes structured events to a
-SQLite database (ui_events.db); the server polls it and pushes updates
-over WebSocket.  The execution script runs directly in the main thread —
-no asyncio conflicts.
+browser dashboard. The execution process publishes structured events to the
+global collector; its single asynchronous SQLite writer maintains the UI
+projection tables that the server polls. The execution script runs directly
+in the main thread — no asyncio conflicts.
 
 Usage::
 
@@ -170,7 +170,11 @@ class agwebui:
     """
 
     def __init__(self, run_dir: Path, port: int) -> None:
-        self.emitter = agwebui_emitter(run_dir)
+        # Startup events are buffered until the first agent submission freezes
+        # the process-wide collector configuration. This avoids giving the UI
+        # a second SQLite owner while still letting agent construction emit
+        # registration/config state before the first run.
+        self.emitter = agwebui_emitter(run_dir, defer_to_global=True)
         self._run_dir = run_dir
         self._port = port
         self._server_proc: subprocess.Popen | None = None
@@ -297,7 +301,20 @@ class agwebui:
                 traceback.print_exc()
             finally:
                 command_stop.set()
-                ui.emitter.done()
+                # A workload with no agent submission still needs to persist
+                # its buffered UI events. In the normal case this is a no-op
+                # because the orchestrator bound the emitter on first use.
+                from ..orchestrator import get_orchestrator
+
+                try:
+                    _orchestrator = get_orchestrator(default_db_path=ui.emitter._db_path)
+                    ui.emitter.bind_collector(_orchestrator.data_collector)
+                    ui.emitter.done()
+                    _orchestrator.flush(timeout_s=10)
+                except Exception as _e:
+                    # UI telemetry must not replace the workload's result or
+                    # mask an explicit orchestrator shutdown performed by fn.
+                    print(f"[agwebui] WARNING: final UI flush failed: {_e}")
                 _active = None
 
                 # Skip lingering if we're already unwinding from a SIGTERM --

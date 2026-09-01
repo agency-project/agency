@@ -99,6 +99,20 @@ def _wait_for(condition, timeout=3.0, interval=0.05):
 # ---------------------------------------------------------------------------
 
 
+def test_db_path_follows_global_collector_pointer(tmp_path):
+    import agency.agwebui.server as srv
+
+    old_run_dir = srv._run_dir
+    try:
+        srv._run_dir = tmp_path
+        assert srv._db_path() == tmp_path / "ui_events.db"
+        target = tmp_path / "configured" / "agency.sqlite3"
+        (tmp_path / "global_data_path.txt").write_text(str(target), encoding="utf-8")
+        assert srv._db_path() == target
+    finally:
+        srv._run_dir = old_run_dir
+
+
 def test_health(server):
     client, _, _ = server
     resp = client.get("/health")

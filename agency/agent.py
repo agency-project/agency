@@ -4,11 +4,12 @@ import json
 import os
 import queue
 import tarfile
+import threading
 import uuid as _uuid_mod
 import weakref
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from .agutil import agency_tmp_root as _agency_tmp_root
 
@@ -34,7 +35,8 @@ def _llm_config_snapshot(agconfig: "agConfig") -> dict:
 
 from .agdata import agdata
 from .agcontext import agcontext
-from .agDataCollector import agDataCollector, agDataCollectorConfigs, _ts
+from .agDataCollector import _ts
+from .agcollector import AgentDataCollectorFacade
 from .sandbox.agsandbox import agSandbox, agSandboxConfig
 from .sandbox import agSandboxBackendConfig
 from .agresources import agResourcePool
@@ -43,7 +45,9 @@ from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .profiler import agprof
-from .engine import AgentEngine
+
+if TYPE_CHECKING:
+    from .engine import AgentEngine
 
 
 # Exists only to register agent's config fields (via __set_name__ at import
@@ -87,6 +91,31 @@ def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_defau
     so these fields stay plain ClassVars, resolved via this helper instead.
     """
     return classvar_default if agconfig is None else agconfig.get("agent", name, classvar_default)
+
+
+_SETTLED_LEAF_STATES = ("inactive", "finished", "error", "paused")
+
+
+class agent_state:
+    """Atomically owned live state used by orchestration and inspection."""
+
+    def __init__(self, agname: str) -> None:
+        self.agname = agname
+        self.state = "inactive"
+        self.skill: "str | None" = None
+        self.tool: "str | None" = None
+        self.blocked_on: "agent | None" = None
+        self._lock = threading.RLock()
+
+    def snapshot(self) -> "tuple[str, str | None, str | None]":
+        with self._lock:
+            return self.state, self.skill, self.tool
+
+    def update_state(
+        self, state: str, skill: "str | None" = None, tool: "str | None" = None
+    ) -> None:
+        with self._lock:
+            self.state, self.skill, self.tool = state, skill, tool
 
 
 # [REFACTOR] Check how it works
@@ -189,20 +218,16 @@ class agent:
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
-        self.engine = AgentEngine(self)
+        self.engine: "AgentEngine | None" = None
 
         _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
 
-        data_collector_configs = self.agconfig.__dict__.get("agDataCollectorConfigs")
-        if data_collector_configs is None:
-            data_collector_configs = agDataCollectorConfigs(
-                db_path=str(log_dir / f"{self.agname}_data.sqlite3")
-            )
-            self.agconfig.agDataCollectorConfigs = data_collector_configs
-        self.data_collector = agDataCollector(self.agconfig)
-        self.data_collector.start()
-
+        self.data_collector = AgentDataCollectorFacade(
+            agname=str(self.agname),
+            default_db_path=log_dir / "agency.sqlite3",
+        )
+        self._state = agent_state(str(self.agname))
         self.inbox: queue.Queue[str] = queue.Queue()
 
         _live_agents.add(self)
@@ -231,12 +256,7 @@ class agent:
                 f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}{ctx}{team_tag}"
             ),
         )
-        self.data_collector.record_event(
-            type="agent_state",
-            payload={"state": "agent_idle"},
-            do_update=True,
-            flush=True,
-        )
+        self._set_ui_state("inactive")
         self.change_config(self.agconfig)
 
     def change_config(self, agconfig: "agConfig") -> None:
@@ -253,7 +273,8 @@ class agent:
         self.data_collector.set_config(self.agconfig)
         if self.sandbox is not None:
             self.sandbox.change_config(self.agconfig)
-        self.engine.set_config(self.agconfig)
+        if self.engine is not None:
+            self.engine.set_config(self.agconfig)
         self.data_collector.record_event(
             type="agent_config",
             payload=self.agconfig.dynamic_snapshot(),
@@ -284,12 +305,57 @@ class agent:
 
     @property
     def history(self) -> agdata:
-        """Return the current history, blocking until any in-flight task finishes."""
+        """Return the committed transcript after this agent becomes idle."""
+        from .orchestrator import peek_orchestrator
+
+        orchestrator = peek_orchestrator()
+        if orchestrator is not None:
+            orchestrator.wait_for_agent(self)
         return agdata(messages=self.ctx.get_resolved_transcript())
 
     @history.setter
     def history(self, value: agdata) -> None:
+        from .orchestrator import peek_orchestrator
+
+        orchestrator = peek_orchestrator()
+        if orchestrator is not None:
+            orchestrator.wait_for_agent(self)
         self.ctx.set_transcript(value._data.get("messages", []))
+
+    def _set_ui_state(
+        self, state: str, skill: "str | None" = None, tool: "str | None" = None
+    ) -> None:
+        self._state.update_state(state, skill, tool)
+        self.data_collector.record_event(
+            type="agent_state",
+            payload={"state": state, "skill": skill, "tool": tool},
+            do_update=True,
+        )
+        try:
+            from . import agwebui as _agwebui
+
+            if _agwebui._active is not None:
+                _agwebui._active.emitter.agent_state(self.agname, state, skill, tool)
+        except Exception as exc:
+            print(f"[agent] WARNING: agent_state push failed for {self.agname}: {exc}")
+
+    def is_paused(self) -> bool:
+        return self._state.state == "paused"
+
+    def is_settled(self, _seen: "set[str] | None" = None) -> bool:
+        from .orchestrator import peek_orchestrator
+
+        orchestrator = peek_orchestrator()
+        if orchestrator is not None and not orchestrator.is_agent_idle(self):
+            return orchestrator.is_agent_settled(self)
+        producer = self._state.blocked_on
+        if producer is not None:
+            seen = _seen if _seen is not None else set()
+            if str(producer.agname) in seen:
+                return True
+            seen.add(str(self.agname))
+            return producer.is_settled(seen)
+        return self._state.state in _SETTLED_LEAF_STATES
 
     # ------------------------------------------------------------------
     # UI / history helpers — called by agskill during execution
@@ -342,24 +408,22 @@ class agent:
     # Execution — delegates to agskill
     # ------------------------------------------------------------------
 
+    def _ensure_sandbox(self) -> agSandbox:
+        """Create the sandbox lazily on the admitted engine thread."""
+        if self.sandbox is not None:
+            return self.sandbox
+        sandbox_config = self.agconfig
+        agent_output_dir = self.output_path
+        if agent_output_dir is not None:
+            sandbox_config = sandbox_config.clone() if sandbox_config else agConfig()
+            agSandboxConfig(sandbox_config).add_mount(
+                "agent_output", agent_output_dir, "/agent_output"
+            )
+        self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
+        return self.sandbox
+
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
-        """Submit the skill and return a pending agdata immediately.
-
-        Delegates scheduling and future creation to skill.run(self, ...). The
-        skill worker sends actual execution back through this agent's
-        engine. Calls on the same agent are serialized via the context
-        future chain.
-        """
-        if self.sandbox is None:
-            sandbox_config = self.agconfig
-            agent_output_dir = self.output_path
-            if agent_output_dir is not None:
-                sandbox_config = sandbox_config.clone() if sandbox_config else agConfig()
-                agSandboxConfig(sandbox_config).add_mount(
-                    "agent_output", agent_output_dir, "/agent_output"
-                )
-            self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
-
+        """Submit a request; admission creates its fresh engine and thread."""
         if max_steps is None:
             return skill.run(self, skill_input)
         return skill.run(self, skill_input, max_steps=max_steps)
@@ -416,7 +480,12 @@ class agent:
         # the matching comment in __init__.
         ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
         ag.harness = src.harness
-        ag.engine = AgentEngine(ag)
+        ag.engine = None
+        from .orchestrator import peek_orchestrator
+
+        orchestrator = peek_orchestrator()
+        if orchestrator is not None:
+            orchestrator.wait_for_agent(src)
         src.ctx.resolve_prev_dependencies()
         ag.ctx = src.ctx.copy()
         _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
@@ -430,15 +499,11 @@ class agent:
         )
         _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", cls.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        # Always a fresh path scoped to the fork's own agname -- ag.agconfig was cloned
-        # from src.agconfig, which already carries src's OWN agDataCollectorConfigs, so
-        # this must be overwritten rather than reused (see agDataCollectorConfigs on
-        # agDataCollector.__init__'s docstring for why "already set" can't be trusted here).
-        ag.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
-            db_path=str(log_dir / f"{ag.agname}_data.sqlite3")
+        ag.data_collector = AgentDataCollectorFacade(
+            agname=str(ag.agname),
+            default_db_path=log_dir / "agency.sqlite3",
         )
-        ag.data_collector = agDataCollector(ag.agconfig)
-        ag.data_collector.start()
+        ag._state = agent_state(str(ag.agname))
         ag.inbox = queue.Queue()
         _live_agents.add(ag)
 
@@ -459,12 +524,7 @@ class agent:
             },
             term_message=f"[{ag.agname}] FORKED   from {src.agname}",
         )
-        ag.data_collector.record_event(
-            type="agent_state",
-            payload={"state": "agent_idle"},
-            do_update=True,
-            flush=True,
-        )
+        ag._set_ui_state("inactive")
         ag.change_config(ag.agconfig)
         return ag
 
@@ -527,12 +587,16 @@ class agent:
         path = Path(path)
         image_tag = f"agency/ckpt-{self.agname}"
 
-        if self.ctx.is_pending():
+        from .orchestrator import peek_orchestrator
+
+        orchestrator = peek_orchestrator()
+        if orchestrator is not None and not orchestrator.is_agent_idle(self):
             self.data_collector.record_event(
                 type="agent_checkpoint_waiting",
                 payload={"agname": self.agname},
                 term_message=f"[{self.agname}] CKPT ⏳  waiting for in-flight task to complete...",
             )
+            orchestrator.wait_for_agent(self)
         self.ctx.resolve_prev_dependencies()
 
         state = {
@@ -646,7 +710,7 @@ class agent:
                 ag.agconfig.set("agllm_backend", k, v)
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
-        ag.engine = AgentEngine(ag)
+        ag.engine = None
         ag.ctx = agcontext(
             recent_transcript=list(state.get("history", [])),
             harness_sessions=state.get("harness_sessions", {}),
@@ -674,14 +738,11 @@ class agent:
 
         _log_dir_val = _classvar_or_agconfig(ag.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
-        # Always a fresh path scoped to the restored agent's own agname -- see the
-        # matching comment in fork() for why an inherited agDataCollectorConfigs can't
-        # be trusted here.
-        ag.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
-            db_path=str(log_dir / f"{ag.agname}_data.sqlite3")
+        ag.data_collector = AgentDataCollectorFacade(
+            agname=str(ag.agname),
+            default_db_path=log_dir / "agency.sqlite3",
         )
-        ag.data_collector = agDataCollector(ag.agconfig)
-        ag.data_collector.start()
+        ag._state = agent_state(str(ag.agname))
         ag.inbox: queue.Queue = queue.Queue()
 
         _live_agents.add(ag)
@@ -695,12 +756,7 @@ class agent:
             },
             term_message=f"[{ag.agname}] LOADED   from {path}",
         )
-        ag.data_collector.record_event(
-            type="agent_state",
-            payload={"state": "agent_idle"},
-            do_update=True,
-            flush=True,
-        )
+        ag._set_ui_state("inactive")
         ag.change_config(ag.agconfig)
 
         return ag

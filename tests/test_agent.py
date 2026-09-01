@@ -180,7 +180,7 @@ def test_run_retains_and_reuses_injected_sandbox():
     assert seen == [supplied_sandbox, supplied_sandbox]
 
 
-def test_run_creates_sandbox_facade_with_output_mount(monkeypatch, tmp_path):
+def test_scheduled_run_creates_sandbox_facade_with_output_mount(monkeypatch, tmp_path):
     import importlib
 
     created = []
@@ -190,16 +190,19 @@ def test_run_creates_sandbox_facade_with_output_mount(monkeypatch, tmp_path):
         created.append((agname, agconfig))
         return facade
 
-    class FakeSkill:
-        def run(self, ag, skill_input, max_steps=None):
-            return agdata(done=True)
+    skill = agskill(name="s", system_prompt="")
+
+    def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
+        return agdata(done=True), prev_ctx, []
+
+    skill._test_execute = fake_execute_react
 
     agent_module = importlib.import_module("agency.agent")
     monkeypatch.setattr(agent_module, "agSandbox", fake_sandbox)
     monkeypatch.setattr(agent, "output_dir", tmp_path)
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}))
 
-    result = ag.run(FakeSkill(), agdata())
+    result = ag.run(skill, agdata())
 
     assert result.done is True
     assert ag.sandbox is facade
@@ -225,7 +228,7 @@ def test_repr():
 def test_harness_defaults_to_native():
     ag = make_agent()
     assert ag.harness == "native"
-    assert isinstance(ag.engine, AgentEngine)
+    assert ag.engine is None
 
 
 def test_harness_explicit_constructor_arg():
@@ -244,22 +247,25 @@ def test_harness_from_agconfig():
 
 
 @pytest.mark.parametrize("harness_name", ["native", "claude_code"])
-def test_run_dispatches_to_agent_engine(harness_name):
+def test_run_dispatches_to_agent_engine(harness_name, monkeypatch):
     calls = []
 
     class FakeAgentEngine:
+        def __init__(self, agent):
+            self.agent = agent
+
         def execute(self, **kwargs):
             calls.append(kwargs)
             return agdata(done=True)
 
     skill = agskill(name="s", system_prompt="")
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), harness=harness_name)
-    assert isinstance(ag.engine, AgentEngine)
+    assert ag.engine is None
     sandbox = MagicMock()
     sandbox._lock = threading.RLock()
     sandbox._has_pending_background_work.return_value = False
     ag.sandbox = sandbox
-    ag.engine = FakeAgentEngine()
+    monkeypatch.setattr("agency.orchestrator.orchestrator.AgentEngine", FakeAgentEngine)
 
     result = ag.run(skill, agdata(task="go"), max_steps=7)
 
@@ -269,6 +275,7 @@ def test_run_dispatches_to_agent_engine(harness_name):
     assert calls[0]["skill_input"].to_dict() == {"task": "go"}
     assert calls[0]["sandbox"] is sandbox
     assert calls[0]["max_steps"] == 7
+    assert isinstance(ag.engine, FakeAgentEngine)
 
 
 # ---------------------------------------------------------------------------
@@ -424,11 +431,11 @@ def test_fork_inherits_config():
     assert agllm.for_config(forked.agconfig).as_dict() == agllm.for_config(ag.agconfig).as_dict()
 
 
-def test_fork_inherits_harness_and_creates_engine():
+def test_fork_inherits_harness_and_defers_engine_creation():
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), harness="claude_code")
     forked = agent.fork(ag)
     assert forked.harness == "claude_code"
-    assert isinstance(forked.engine, AgentEngine)
+    assert forked.engine is None
 
 
 def test_fork_deep_copies_history():
@@ -784,8 +791,8 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     import sqlite3
 
     ag2.data_collector.flush()
-    con = sqlite3.connect(ag2.data_collector._configs.db_path)
-    types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
+    con = sqlite3.connect(ag2.data_collector.db_path)
+    types = [row[0] for row in con.execute("SELECT type FROM lifecycle_events").fetchall()]
     con.close()
     assert "agent_loaded" in types
     del ag2
@@ -810,7 +817,7 @@ def test_save_and_load_restores_harness(tmp_path, monkeypatch):
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     assert ag2.harness == "claude_code"
-    assert isinstance(ag2.engine, AgentEngine)
+    assert ag2.engine is None
     del ag2
     _agname._allocated.discard(saved_agname)
 
@@ -849,7 +856,7 @@ def test_load_defaults_harness_to_native_when_absent(tmp_path, monkeypatch):
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     assert ag2.harness == "native"
-    assert isinstance(ag2.engine, AgentEngine)
+    assert ag2.engine is None
     del ag2
     _agname._allocated.discard(saved_agname)
     # Container filesystem round-trip (write_file → save → load → read_file)
@@ -1059,8 +1066,8 @@ def _recorded_event_types(ag) -> list:
     import sqlite3
 
     ag.data_collector.flush()
-    con = sqlite3.connect(ag.data_collector._configs.db_path)
-    types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
+    con = sqlite3.connect(ag.data_collector.db_path)
+    types = [row[0] for row in con.execute("SELECT type FROM lifecycle_events").fetchall()]
     con.close()
     return types
 

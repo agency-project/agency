@@ -428,6 +428,12 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
   } else if (st === 'inactive') {
     dot = `<span class="dot-inactive">○</span>`;
     statusHtml = `<span class="dim">idle</span>`;
+  } else if (st === 'queued') {
+    dot = `<span class="status-queued">◌</span>`;
+    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-queued">queued</span>`;
+  } else if (st === 'blocked_on_dependency') {
+    dot = `<span class="status-blocked">◌</span>`;
+    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-blocked">Dependency Wait</span>`;
   } else if (st === 'llm') {
     dot = `<span style="color:${color}">●</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-llm">LLM Wait</span>`;

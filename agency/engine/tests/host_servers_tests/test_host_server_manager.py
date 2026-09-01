@@ -6,6 +6,7 @@ import asyncio
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import httpx2
 from mcp import ClientSession
@@ -50,6 +51,26 @@ def test_construction_wires_skill_into_interaction_server(tmp_path):
     manager, _, _ = _make_manager(tmp_path, policy=policy)
     assert isinstance(manager._interaction_server, HostInteractionServer)
     assert manager._interaction_server._policy is policy
+
+
+def test_injected_scoped_collector_replaces_per_execution_sqlite_owner():
+    agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
+    agent = SimpleNamespace(agconfig=agconfig, inbox=object())
+    skill = SimpleNamespace(policy=agpolicy())
+    collector = MagicMock()
+
+    manager = HostServerManager(
+        agent,
+        SimpleNamespace(),
+        skill,
+        SimpleNamespace(),
+        data_collector=collector,
+    )
+
+    assert manager._data_collector is collector
+    assert manager._interaction_server._data_collector is collector
+    assert "agDataCollectorConfigs" not in agconfig.__dict__
+    collector.set_config.assert_called_once_with(agconfig)
 
 
 def test_construction_captures_run_context_for_llm_requests(tmp_path, monkeypatch):
