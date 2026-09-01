@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -42,9 +43,21 @@ class agdata:
         else:
             with agprof.span("sync:result_wait"):
                 resolved = f.result()
+        if not isinstance(resolved, agdata):
+            as_pending = getattr(resolved, "_as_pending_agdata", None)
+            if not callable(as_pending):
+                raise TypeError(
+                    "pending agdata future resolved to an incompatible value: "
+                    f"{type(resolved).__name__}"
+                )
+            resolved = as_pending()
         resolved._resolve()  # chain: future may resolve to another pending agdata
         object.__setattr__(self, "_data", object.__getattribute__(resolved, "_data"))
         object.__setattr__(self, "_future", None)
+
+    def _as_pending_agdata(self) -> "agdata":
+        """Return the common pending-data representation used by the scheduler."""
+        return self
 
     def is_pending(self) -> bool:
         """Return True if this agdata is still waiting for a future result."""
@@ -65,7 +78,7 @@ class agdata:
         return self
 
     @staticmethod
-    def wait_all(pending: "list[agdata]") -> "list[agdata]":
+    def wait_all(pending: "list") -> "list":
         """Block until every agdata in *pending* is resolved.
 
         Use as a barrier over a fan-out::
@@ -78,7 +91,14 @@ class agdata:
                 print(r.report_path)   # all resolved, no further blocking
         """
         for p in pending:
-            p._resolve()
+            resolver = getattr(p, "_resolve", None)
+            if callable(resolver):
+                resolver()
+                continue
+            waiter = getattr(p, "wait", None)
+            if not callable(waiter):
+                raise TypeError(f"object is not waitable: {type(p).__name__}")
+            waiter()
         return pending
 
     # ------------------------------------------------------------------
@@ -88,6 +108,10 @@ class agdata:
     @staticmethod
     def _to_serializable(obj):
         """Recursively convert agdata objects (including nested ones) to plain types."""
+        if not isinstance(obj, agdata):
+            as_pending = getattr(obj, "_as_pending_agdata", None)
+            if callable(as_pending):
+                obj = as_pending()
         if isinstance(obj, type) and issubclass(obj, agtype):
             return obj.schema_type()
         if isinstance(obj, type):
@@ -108,6 +132,16 @@ class agdata:
             return {k: agdata._to_serializable(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [agdata._to_serializable(v) for v in obj]
+        if isinstance(obj, tuple):
+            return [agdata._to_serializable(v) for v in obj]
+        if is_dataclass(obj) and not isinstance(obj, type):
+            return {
+                field.name: agdata._to_serializable(getattr(obj, field.name))
+                for field in fields(obj)
+            }
+        model_dump = getattr(obj, "model_dump", None)
+        if callable(model_dump):
+            return agdata._to_serializable(model_dump())
         return obj
 
     def to_dict(self) -> dict:
@@ -158,16 +192,28 @@ class agdata:
             return self._data == other._data
         return NotImplemented
 
+    @staticmethod
+    def _resolve_dependency(value):
+        if not isinstance(value, agdata):
+            as_pending = getattr(value, "_as_pending_agdata", None)
+            if callable(as_pending):
+                value = as_pending()
+        if isinstance(value, agdata):
+            value._resolve()
+            return value
+        if isinstance(value, list):
+            return [agdata._resolve_dependency(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(agdata._resolve_dependency(item) for item in value)
+        if isinstance(value, dict):
+            return {key: agdata._resolve_dependency(item) for key, item in value.items()}
+        return value
+
     def resolve_input_dependencies(self) -> None:
-        """Resolve any pending agdata values nested inside self, in-place."""
+        """Resolve pending data/result handles nested inside self, in-place."""
         self._resolve()
-        for val in self._data.values():
-            if isinstance(val, agdata):
-                val._resolve()
-            elif isinstance(val, list):
-                for item in val:
-                    if isinstance(item, agdata):
-                        item._resolve()
+        for key, value in tuple(self._data.items()):
+            self._data[key] = self._resolve_dependency(value)
 
 
 class agerror(agdata):

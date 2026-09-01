@@ -1,4 +1,6 @@
 import json
+from dataclasses import dataclass
+from concurrent.futures import Future
 import pytest
 
 from agency.agdata import agdata, agerror
@@ -185,3 +187,61 @@ def test_pending_equality_resolves_both():
 def test_normal_agdata_pending_is_false():
     d = agdata(x=1)
     assert d.is_pending() is False
+
+
+class _PendingWrapper:
+    def __init__(self, value: agdata):
+        future: Future[agdata] = Future()
+        future.set_result(value)
+        self.pending = agdata(_future=future)
+
+    def _as_pending_agdata(self):
+        return self.pending
+
+    def _resolve(self):
+        self.pending._resolve()
+
+
+def test_wait_all_and_recursive_dependency_resolution_accept_pending_protocol():
+    first = _PendingWrapper(agdata(answer=1))
+    second = _PendingWrapper(agdata(answer=2))
+    values = [first, second]
+    assert agdata.wait_all(values) is values
+
+    nested = agdata(items=[first, (second,), {"again": first}])
+    nested.resolve_input_dependencies()
+    assert nested.items[0].answer == 1
+    assert nested.items[1][0].answer == 2
+    assert nested.items[2]["again"].answer == 1
+
+
+@dataclass
+class _StructuredValue:
+    result: object
+
+
+class _ModelValue:
+    def __init__(self, result):
+        self.result = result
+
+    def model_dump(self):
+        return {"result": self.result}
+
+
+def test_nested_serialization_materializes_pending_protocol_tuples_and_models():
+    wrapped = _PendingWrapper(agdata(result="literal"))
+    value = agdata(
+        tuple_value=(wrapped,),
+        dataclass_value=_StructuredValue(wrapped),
+        model_value=_ModelValue(wrapped),
+    )
+    assert value.to_dict() == {
+        "tuple_value": [{"result": "literal"}],
+        "dataclass_value": {"result": {"result": "literal"}},
+        "model_value": {"result": {"result": "literal"}},
+    }
+
+
+def test_wait_all_rejects_non_waitable_values():
+    with pytest.raises(TypeError, match="not waitable"):
+        agdata.wait_all([object()])

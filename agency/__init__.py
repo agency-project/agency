@@ -6,6 +6,8 @@ from .agskill import agskill
 from .agtool import agtool
 from .agdatacollector import agDataCollector, agDataCollectorConfigs
 from .agent import agent
+from ._agent_control import AgentDestroyedError
+from ._submission import CloseHandle, Invocation, MessageSubmission, Submission
 from .utils.agmap import agmap, agtask
 from .agteam import agteam
 from .utils.agsync import agsync
@@ -20,6 +22,8 @@ from .orchestrator import (
 )
 from .utils.agutil import sigterm_as_exit
 from .profiler import agprof
+
+Agent = agent
 
 __all__ = [
     "agdata",
@@ -38,6 +42,12 @@ __all__ = [
     "agDataCollector",
     "agDataCollectorConfigs",
     "agent",
+    "Agent",
+    "AgentDestroyedError",
+    "Submission",
+    "Invocation",
+    "MessageSubmission",
+    "CloseHandle",
     "agmap",
     "agtask",
     "agteam",

@@ -2,6 +2,8 @@
 
 from concurrent.futures import Future
 
+import pytest
+
 from agency.agcontext import agcontext
 
 
@@ -14,6 +16,8 @@ def test_default_construction():
     context = agcontext()
     assert context.recent_transcript == []
     assert context.harness_sessions == {}
+    assert context.retained_messages == []
+    assert context.harness_message_cursors == {}
     assert context._future is None
 
 
@@ -80,12 +84,23 @@ def test_resolve_merges_future_state():
     resolved = agcontext(
         recent_transcript=[{"role": "assistant", "content": "done"}],
         harness_sessions={"claude_code": {"session_id": "s1"}},
+        retained_messages=[
+            {
+                "sequence": 1,
+                "type": "message",
+                "role": "user",
+                "content": "remember",
+            }
+        ],
+        harness_message_cursors={"claude_code": 1},
     )
     f.set_result(resolved)
     placeholder.resolve_prev_dependencies()
 
     assert placeholder.recent_transcript == [{"role": "assistant", "content": "done"}]
     assert placeholder.harness_sessions == {"claude_code": {"session_id": "s1"}}
+    assert placeholder.retained_messages[0]["content"] == "remember"
+    assert placeholder.harness_message_cursors == {"claude_code": 1}
     assert placeholder._future is None
 
 
@@ -152,6 +167,67 @@ def test_copy_deep_copies_harness_sessions():
     assert context.harness_sessions["claude_code"]["session_id"] == "s1"
 
 
+def test_retained_messages_are_validated_selected_and_cursor_advanced_monotonically():
+    context = agcontext()
+    context.append_retained_message(
+        {
+            "sequence": 1,
+            "type": "message",
+            "role": "user",
+            "content": "first",
+            "source": "send",
+        }
+    )
+    context.append_retained_message(
+        {
+            "sequence": 2,
+            "type": "message",
+            "role": "system",
+            "content": "second",
+        }
+    )
+
+    pending = context.pending_retained_messages("claude_code")
+    assert [entry["content"] for entry in pending] == ["first", "second"]
+    pending[0]["content"] = "mutated copy"
+    assert context.retained_messages[0]["content"] == "first"
+
+    context.advance_retained_cursor("claude_code", 1)
+    assert [entry["content"] for entry in context.pending_retained_messages("claude_code")] == [
+        "second"
+    ]
+    with pytest.raises(ValueError, match="cannot move backwards"):
+        context.advance_retained_cursor("claude_code", 0)
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ({"sequence": 0, "type": "message", "role": "user", "content": "x"}, "positive"),
+        ({"sequence": 1, "type": "event", "role": "user", "content": "x"}, "type"),
+        ({"sequence": 1, "type": "message", "role": "assistant", "content": "x"}, "role"),
+        ({"sequence": 1, "type": "message", "role": "user", "content": 1}, "content"),
+    ],
+)
+def test_retained_message_validation(entry, message):
+    with pytest.raises(ValueError, match=message):
+        agcontext().append_retained_message(entry)
+
+
+def test_copy_deep_copies_retained_state():
+    context = agcontext(
+        retained_messages=[
+            {"sequence": 1, "type": "message", "role": "user", "content": "original"}
+        ],
+        harness_message_cursors={"native": 1},
+    )
+    copied = context.copy()
+    copied.retained_messages[0]["content"] = "changed"
+    copied.harness_message_cursors["native"] = 2
+    assert context.retained_messages[0]["content"] == "original"
+    assert context.harness_message_cursors == {"native": 1}
+
+
 def test_copy_resolves_pending_future():
     f: Future[agcontext] = Future()
     context = agcontext(_future=f)
@@ -185,6 +261,7 @@ def test_repr_not_pending():
     r = repr(context)
     assert "recent_transcript=2" in r
     assert "harnesses=[]" in r
+    assert "retained=0" in r
     assert "pending" not in r
 
 
