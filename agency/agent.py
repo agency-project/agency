@@ -7,6 +7,7 @@ import tarfile
 import threading
 import uuid as _uuid_mod
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -35,7 +36,7 @@ from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .profiler import agprof
 from ._agent_control import AgentControl
-from ._submission import Invocation, Submission
+from ._submission import CloseHandle, Invocation, Submission
 
 if TYPE_CHECKING:
     from .engine import AgentEngine
@@ -187,6 +188,7 @@ class agent:
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
+        self._owns_sandbox = sandbox is None
         self.engine: "AgentEngine | None" = None
 
         # Eagerly construct the process-wide orchestrator
@@ -246,6 +248,11 @@ class agent:
         self._control = AgentControl()
         self._submissions: set[Submission] = set()
         self._next_submission_id = 1
+        self._active_operations = 0
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_scheduled = False
+        self._cleanup_done = False
+        self._close_handle = CloseHandle()
         self._current_state = "agent_idle"
         self.inbox: queue.Queue[str] = queue.Queue()
         _live_agents.add(self)
@@ -256,18 +263,88 @@ class agent:
         self.record_state("agent_idle")
         self.change_config(self.agconfig)
 
+    def _submission_finished(self, submission: Submission) -> None:
+        with self._orchestrator._event_cond:
+            with self._submission_lock:
+                self._submissions.discard(submission)
+        self._maybe_cleanup_destroyed()
+
+    @contextmanager
+    def _operation_lease(self, operation: str, *, allow_destroyed: bool = False):
+        """Keep runtime resources alive for one already-admitted host operation."""
+        with self._orchestrator._event_cond:
+            with self._submission_lock:
+                if not allow_destroyed:
+                    self._control.assert_alive(operation)
+                self._active_operations += 1
+        try:
+            yield
+        finally:
+            with self._orchestrator._event_cond:
+                with self._submission_lock:
+                    self._active_operations -= 1
+            self._maybe_cleanup_destroyed()
+
+    def _maybe_cleanup_destroyed(self) -> None:
+        schedule = False
+        with self._orchestrator._event_cond:
+            with self._submission_lock:
+                if (
+                    self._control.is_destroyed()
+                    and self._control.active_invocation() is None
+                    and self._active_operations == 0
+                    and not self._submissions
+                    and not self._cleanup_scheduled
+                ):
+                    self._cleanup_scheduled = True
+                    schedule = True
+        if schedule:
+            try:
+                thread = agprof.spawn_traced(self._finalize_destroy, daemon=True)
+                thread.name = f"agency-destroy-{self.agname}"
+                thread.start()
+            except BaseException:
+                self._finalize_destroy()
+
+    def _finalize_destroy(self) -> None:
+        with self._cleanup_lock:
+            if self._cleanup_done:
+                return
+            self._cleanup_done = True
+        try:
+            self.data_collector.record_event(
+                type="agent_destroyed",
+                payload={"agname": self.agname},
+                term_message=f"[{self.agname}] DESTROYED",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[agent] WARNING: destroy log failed for {self.agname}: {exc}")
+        if self._owns_sandbox and self.sandbox is not None:
+            try:
+                self.sandbox.destroy()
+            except Exception as exc:
+                print(f"[agent] WARNING: sandbox cleanup failed for {self.agname}: {exc}")
+        try:
+            self.data_collector.stop()
+        except Exception as exc:
+            print(f"[agent] WARNING: collector cleanup failed for {self.agname}: {exc}")
+        self._control.mark_destroyed()
+        self._close_handle._settle()
+
     def change_config(self, agconfig: "agConfig") -> None:
-        self.agconfig = agconfig.clone()
-        self.data_collector.set_config(self.agconfig)
-        if self.sandbox is not None:
-            self.sandbox.change_config(self.agconfig)
-        if self.engine is not None:
-            self.engine.set_config(self.agconfig)
-        self.data_collector.record_event(
-            type="agent_config",
-            payload=self.agconfig.dynamic_snapshot(),
-            overwrite=True,
-        )
+        with self._operation_lease("change config"):
+            self.agconfig = agconfig.clone()
+            self.data_collector.set_config(self.agconfig)
+            if self.sandbox is not None:
+                self.sandbox.change_config(self.agconfig)
+            if self.engine is not None:
+                self.engine.set_config(self.agconfig)
+            self.data_collector.record_event(
+                type="agent_config",
+                payload=self.agconfig.dynamic_snapshot(),
+                overwrite=True,
+            )
 
     def get_config_copy(self) -> "agConfig | None":
         """Return a clone of this agent's agconfig, or None if it has none."""
@@ -303,12 +380,23 @@ class agent:
     @property
     def history(self) -> agdata:
         """Return the committed transcript after this agent becomes idle."""
-        return agdata(messages=self.context.get_resolved_transcript())
+        with self._operation_lease("read history", allow_destroyed=True):
+            return agdata(messages=self.context.get_resolved_transcript())
 
     @history.setter
     def history(self, value: agdata) -> None:
-        self.context.resolve_prev_dependencies()
-        self.context.set_transcript(value._data.get("messages", []))
+        with self._operation_lease("replace history"):
+            messages = value.to_dict().get("messages", [])
+            while True:
+                with self._orchestrator._event_cond:
+                    with self._submission_lock:
+                        current = self.context
+                current.resolve_prev_dependencies()
+                with self._orchestrator._event_cond:
+                    with self._submission_lock:
+                        if self.context is current:
+                            current.set_transcript(messages)
+                            return
 
     def record_state(
         self, state: str, skill: "str | None" = None, tool: "str | None" = None
@@ -357,26 +445,73 @@ class agent:
         """Release the snapshot of invocations currently in ``PREPARED``."""
         self._orchestrator.start_prepared(self)
 
-    def pause(self) -> None:
-        """Request that this agent's harness manager stop at its next safe
-        checkpoint. Non-blocking — delivered as an inbox entry the harness
-        manager drains via check_inbox()."""
-        self.inbox.put({"type": "pause"})
+    def suspend(self) -> None:
+        """Close the independent agent-wide scheduler/execution gate."""
+        self._orchestrator.suspend_agent(self)
         self.data_collector.record_event(
-            type="agent_pause_requested",
+            type="agent_suspend_requested",
             payload={"agname": self.agname},
-            term_message=f"[{self.agname}] PAUSE ▶  requested",
+            term_message=f"[{self.agname}] SUSPEND ▶  requested",
         )
 
+    def pause(self) -> None:
+        """Compatibility alias for :meth:`suspend`."""
+        self.suspend()
+
     def resume(self) -> None:
-        """Clear a pause request. Non-blocking — delivered as an inbox entry
-        the harness manager drains via check_inbox()."""
-        self.inbox.put({"type": "resume"})
+        """Reopen only the agent-wide suspension gate."""
+        self._orchestrator.resume_agent(self)
         self.data_collector.record_event(
             type="agent_resumed",
             payload={"agname": self.agname},
-            term_message=f"[{self.agname}] PAUSE ✓  resumed",
+            term_message=f"[{self.agname}] SUSPEND ✓  resumed",
         )
+
+    def steer(self, instructions: str) -> None:
+        """Queue FIFO steering for the active invocation."""
+        self._control.steer(instructions)
+
+    def cancel(self) -> None:
+        """Cancel only the currently active invocation, if any."""
+        self._orchestrator.cancel_active(self)
+
+    def destroy(self) -> CloseHandle:
+        """Reject new work and asynchronously drain and clean up this agent."""
+        first = self._orchestrator.destroy_agent(self)
+        if first:
+            _live_agents.discard(self)
+            try:
+                self.data_collector.record_event(
+                    type="agent_destroying",
+                    payload={"agname": self.agname},
+                    term_message=f"[{self.agname}] DESTROY ▶  cleanup scheduled",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[agent] WARNING: destroy request logging failed for {self.agname}: {exc}")
+            self._maybe_cleanup_destroyed()
+        return self._close_handle
+
+    def is_suspended(self) -> bool:
+        return self._control.is_suspended()
+
+    def is_paused(self) -> bool:
+        return self._control.is_paused_actual()
+
+    @property
+    def lifecycle_state(self) -> str:
+        return self._control.lifecycle_state().upper()
+
+    def is_settled(self) -> bool:
+        if self._control.is_fully_destroyed():
+            return True
+        if self._control.is_destroyed():
+            return False
+        if self._control.is_suspended():
+            active = self._control.active_invocation()
+            return active is None or self._control.is_paused_actual()
+        with self._orchestrator._event_cond:
+            return not self._submissions or self._control.is_paused_actual()
 
     # ------------------------------------------------------------------
     # Execution — delegates to agskill
@@ -456,6 +591,12 @@ class agent:
     @classmethod
     def fork(cls, src: "agent", agname: str | None = None) -> "agent":
         """Return an independent agent forked from *src*."""
+        with src._operation_lease("fork"):
+            return cls._fork_leased(src, agname)
+
+    @classmethod
+    def _fork_leased(cls, src: "agent", agname: str | None = None) -> "agent":
+        """Construct a fork while the source agent's resources are leased."""
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname)
         ag._parent_agent_id = str(src.agname)
@@ -475,6 +616,7 @@ class agent:
         ag.sandbox = (
             src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
         )
+        ag._owns_sandbox = True
 
         from .agteam import _active_team
 
@@ -551,6 +693,11 @@ class agent:
 
     def save(self, path: "Path | str") -> None:
         """Checkpoint this agent to a single .ckpt file."""
+        with self._operation_lease("save"):
+            self._save_leased(path)
+
+    def _save_leased(self, path: "Path | str") -> None:
+        """Write one checkpoint while explicit destruction waits for this lease."""
         path = Path(path)
         image_tag = f"agency/ckpt-{self.agname}"
 
@@ -698,6 +845,7 @@ class agent:
             if checkpoint
             else None
         )
+        ag._owns_sandbox = True
 
         # load() can be the very first agent constructed in a process (no
         # prior agent to have already triggered this), so it needs its own

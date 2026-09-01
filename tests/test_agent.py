@@ -25,7 +25,17 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
     """
     real_execute = AgentEngine.execute
 
-    def execute(self, *, context, skill, skill_input, resource_pool, sandbox, max_steps=None):
+    def execute(
+        self,
+        *,
+        context,
+        skill,
+        skill_input,
+        resource_pool,
+        sandbox,
+        max_steps=None,
+        invocation=None,
+    ):
         stub = getattr(skill, "_test_execute", None)
         if stub is None:
             return real_execute(

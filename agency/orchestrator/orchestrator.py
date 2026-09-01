@@ -5,7 +5,7 @@ import heapq
 import itertools
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -79,14 +79,21 @@ class _ExecutionRequest:
     engine_started_wall: "float | None" = None
     terminal_output: "agdata | None" = None
     terminal_error: str = ""
+    terminal_state: str = "failed"
+    terminal_event: str = "request_failed"
+    terminal_counts_as_failure: bool = True
 
 
 @dataclass
 class _RunCompletion:
     output: agdata
     context: agcontext
-    failed: bool
+    outcome: str
     error_message: str = ""
+
+    @property
+    def failed(self) -> bool:
+        return self.outcome == "failed"
 
 
 class GlobalAgentOrchestrator(_AgOrchestratorFields):
@@ -120,6 +127,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._failed_total = 0
         self._accepting = True
         self._state = "running"
+        self._scheduler_failure: "BaseException | None" = None
         self._shutdown_ack: "Future[None] | None" = None
         self._stop_loop = False
         self.scheduler = ExecutionScheduler(self)
@@ -225,6 +233,35 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             if invocation._request_id in self._requests:
                 self._post_locked("control_changed", invocation._request_id)
 
+    def suspend_agent(self, ag: "agent") -> None:
+        with self._event_cond:
+            ag._control.suspend()
+            self._post_locked("control_changed", ("agent", ag))
+
+    def resume_agent(self, ag: "agent") -> None:
+        with self._event_cond:
+            ag._control.resume_agent()
+            self._post_locked("control_changed", ("agent", ag))
+
+    def cancel_active(self, ag: "agent") -> None:
+        with self._event_cond:
+            active = ag._control.active_invocation()
+            if isinstance(active, Invocation):
+                active.cancel()
+            self._post_locked("control_changed", ("agent", ag))
+
+    def destroy_agent(self, ag: "agent") -> bool:
+        """Close one agent's admission and mark all of its requests for teardown."""
+        with self._event_cond:
+            with ag._submission_lock:
+                first = ag._control.destroy()
+                if not first:
+                    return False
+                for submission in tuple(ag._submissions):
+                    submission._request_destroy()
+            self._post_locked("control_changed", ("agent", ag))
+        return True
+
     def snapshot(self) -> OrchestratorSnapshot:
         with self._event_cond:
             return OrchestratorSnapshot(**self._snapshot_dict_locked())
@@ -238,6 +275,11 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 self._accepting = False
                 self._post_locked("shutdown", self._shutdown_ack)
             ack = self._shutdown_ack
+        # Result callbacks execute synchronously on the publishing thread.  A
+        # callback may request shutdown, but the scheduler cannot wait for or
+        # join its own event loop from inside that callback.
+        if threading.current_thread() is self._scheduler_thread:
+            wait = False
         if not wait:
             return
         ack.result(timeout=timeout_s)
@@ -255,17 +297,46 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         heapq.heappush(self._events, (next(self._event_sequence), kind, value))
         self._event_cond.notify_all()
 
-    def _scheduler_main(self) -> None:
-        cycle_ack: "Future[None] | None" = None
+    @staticmethod
+    def _settle_future(future: Future, value: object, label: str) -> None:
+        """Publish a value without allowing a hostile callback to strand state."""
+        if future.done():
+            return
         try:
-            while True:
-                with self._event_cond:
-                    while not self._events and not self._stop_loop:
-                        self._event_cond.wait()
-                    if self._stop_loop:
-                        break
-                    _seq, kind, value = heapq.heappop(self._events)
-                    cycle_ack = None
+            future.set_result(value)
+        except InvalidStateError:
+            pass
+        except BaseException as exc:
+            # concurrent.futures already catches ordinary callback Exceptions;
+            # this protects scheduler invariants from BaseException subclasses.
+            print(f"[agorchestrator] WARNING: {label} callback failed: {format_exception(exc)}")
+
+    @staticmethod
+    def _reject_future(future: Future, exc: BaseException, label: str) -> None:
+        """Reject an acknowledgement while preserving the drain state machine."""
+        if future.done():
+            return
+        try:
+            future.set_exception(exc)
+        except InvalidStateError:
+            pass
+        except BaseException as callback_exc:
+            print(
+                f"[agorchestrator] WARNING: {label} callback failed: "
+                f"{format_exception(callback_exc)}"
+            )
+
+    def _scheduler_main(self) -> None:
+        while True:
+            finalize_shutdown = False
+            with self._event_cond:
+                while not self._events and not self._stop_loop:
+                    self._event_cond.wait()
+                if self._stop_loop:
+                    break
+                _seq, kind, value = heapq.heappop(self._events)
+                cycle_ack: "Future[None] | None" = None
+                try:
                     if kind == "dependency_done":
                         # The event is only a wakeup. execute() resolves the
                         # complete wait pool before it schedules anything.
@@ -280,29 +351,62 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     elif kind == "pass_through_done":
                         self._handle_pass_through_done_locked(value)
                     elif kind == "shutdown":
-                        self._state = "stopping"
-                    self.scheduler.execute()
-                    if cycle_ack is not None and not cycle_ack.done():
-                        cycle_ack.set_result(None)
-                    finalize_shutdown = self._finish_shutdown_if_possible_locked()
-                if finalize_shutdown:
-                    with self._event_cond:
-                        if self._shutdown_ack is not None and not self._shutdown_ack.done():
-                            self._shutdown_ack.set_result(None)
-                        self._stop_loop = True
-                        self._event_cond.notify_all()
-        except BaseException as exc:
-            print(f"[agorchestrator] FATAL scheduler failure: {format_exception(exc)}")
-            with self._event_cond:
-                if cycle_ack is not None and not cycle_ack.done():
-                    cycle_ack.set_exception(exc)
-                for request in list(self._requests.values()):
-                    if request.state != "running":
-                        self._fail_request_locked(
-                            request, f"scheduler failed: {format_exception(exc)}"
-                        )
-                if self._shutdown_ack is not None and not self._shutdown_ack.done():
-                    self._shutdown_ack.set_exception(exc)
+                        if self._scheduler_failure is None:
+                            self._state = "stopping"
+                    # A fatal transition closes scheduling permanently, but
+                    # the event loop remains alive to drain engine and context
+                    # completion events that were already in flight.
+                    if self._scheduler_failure is None:
+                        self.scheduler.execute()
+                except BaseException as exc:
+                    self._enter_scheduler_failure_locked(exc, cycle_ack)
+                else:
+                    if cycle_ack is not None:
+                        self._settle_future(cycle_ack, None, "schedule acknowledgement")
+                finalize_shutdown = self._finish_shutdown_if_possible_locked()
+            if finalize_shutdown:
+                with self._event_cond:
+                    if self._shutdown_ack is not None:
+                        self._settle_future(self._shutdown_ack, None, "shutdown acknowledgement")
+                    self._stop_loop = True
+                    self._event_cond.notify_all()
+
+    def _enter_scheduler_failure_locked(
+        self,
+        exc: BaseException,
+        cycle_ack: "Future[None] | None",
+    ) -> None:
+        """Close admission and enter a completion-only drain after a fatal event."""
+        if cycle_ack is not None:
+            self._reject_future(cycle_ack, exc, "schedule rejection")
+        if self._scheduler_failure is not None:
+            return
+
+        self._scheduler_failure = exc
+        self._accepting = False
+        self._state = "failed"
+        message = f"scheduler failed: {format_exception(exc)}"
+        print(f"[agorchestrator] FATAL scheduler failure: {format_exception(exc)}")
+
+        # Every submitter whose request was already registered must be released
+        # from its cycle acknowledgement.  Retain only events required to drain
+        # active engines and asynchronous context pass-through continuations.
+        drain_events: list[tuple[int, str, object]] = []
+        while self._events:
+            event = heapq.heappop(self._events)
+            _sequence, kind, value = event
+            if kind == "schedule" and isinstance(value, tuple):
+                _request_id, ack = value
+                if isinstance(ack, Future):
+                    self._reject_future(ack, exc, "queued schedule rejection")
+            if kind in {"engine_done", "pass_through_done", "shutdown"}:
+                drain_events.append(event)
+        self._events = drain_events
+        heapq.heapify(self._events)
+
+        for request in list(self._requests.values()):
+            if request.state != "running":
+                self._fail_request_locked(request, message)
 
     def _register_submission_locked(
         self,
@@ -371,15 +475,28 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             raise RuntimeError("only skill invocations can launch an engine")
         if request.skill is None:
             raise RuntimeError("skill request has no skill")
-        request.state = "running"
-        self._end_phase_span_locked(request)
-        request.agent._control.activate_invocation(invocation)
-        invocation._mark_running()
-        self._active_by_agent[request.agent] = request.request_id
-        request.engine_started_wall = time.time()
-        request.agent.record_state("running_skill", skill=request.skill.name)
-        self._publish_request_locked("request_started", request, {})
+        if invocation.is_destroyed():
+            self._destroy_request_locked(request)
+            return
+        if invocation.is_cancelled():
+            self._cancel_request_locked(request)
+            return
         try:
+            request.agent._control.activate_invocation(invocation)
+        except BaseException as exc:
+            self._fail_request_locked(request, format_exception(exc))
+            return
+        try:
+            # From the moment control activation succeeds, every exception must
+            # produce an engine_done event.  Otherwise the request could look
+            # active forever even though no worker was started.
+            request.state = "running"
+            self._end_phase_span_locked(request)
+            invocation._mark_running()
+            self._active_by_agent[request.agent] = request.request_id
+            request.engine_started_wall = time.time()
+            request.agent.record_state("running_skill", skill=request.skill.name)
+            self._publish_request_locked("request_started", request, {})
             # An engine belongs to exactly one dispatched request.  The agent
             # retains a compatibility/inspection reference to the latest one.
             request.engine = AgentEngine(request.agent)
@@ -395,7 +512,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     _RunCompletion(
                         output=agerror(format_exception(exc)),
                         context=request.context_dependency.copy(),
-                        failed=True,
+                        outcome="failed",
                         error_message=format_exception(exc),
                     ),
                 ),
@@ -421,7 +538,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 )
                 completion = self._perform_execution(request)
                 agprof.annotate(
-                    outcome="failure" if completion.failed else "success",
+                    outcome=completion.outcome,
                     error_type="skill_error" if completion.failed else None,
                 )
         except BaseException as exc:
@@ -429,7 +546,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             completion = _RunCompletion(
                 output=agerror(message),
                 context=request.context_dependency.copy(),
-                failed=True,
+                outcome="failed",
                 error_message=message,
             )
         finally:
@@ -445,6 +562,17 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         local_skill_input = request.skill_input
         history_before = list(committed_context.recent_transcript)
         collector = ag.data_collector
+        invocation = request.submission
+        if not isinstance(invocation, Invocation):
+            raise RuntimeError("skill execution is not bound to an Invocation")
+
+        admission = invocation._checkpoint(
+            "before-infrastructure",
+            allow_steering=False,
+            phase="infrastructure",
+        )
+        if admission.destroyed or admission.cancelled:
+            return self._controlled_completion(request, committed_context, admission.destroyed)
 
         try:
             with agprof.span("resolve"):
@@ -470,11 +598,31 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 resource_pool=self.agresource_pool,
                 sandbox=sandbox,
                 max_steps=request.max_steps,
+                invocation=invocation,
             )
-            updated_context = working_context
+            # A skill-level failure is a rolled-back transaction even when the
+            # engine reports it as an agerror rather than raising.  Never
+            # publish mutations made to the working context on that path.
+            updated_context = (
+                committed_context if isinstance(outer_result, agerror) else working_context
+            )
         except Exception as exc:
             outer_result = agerror(format_exception(exc))
             updated_context = committed_context
+
+        checkpoint = invocation._checkpoint(
+            "after-engine",
+            allow_steering=False,
+            phase="boundary",
+        )
+        if checkpoint.destroyed or checkpoint.cancelled:
+            return self._controlled_completion(request, committed_context, checkpoint.destroyed)
+        if not invocation._claim_completion():
+            return self._controlled_completion(
+                request,
+                committed_context,
+                invocation.is_destroyed(),
+            )
 
         self._finish_execution_log(
             request,
@@ -487,8 +635,32 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         return _RunCompletion(
             output=outer_result,
             context=updated_context,
-            failed=failed,
+            outcome="failed" if failed else "succeeded",
             error_message=str(outer_result._data.get("error", "")),
+        )
+
+    def _controlled_completion(
+        self,
+        request: _ExecutionRequest,
+        committed_context: agcontext,
+        destroyed: bool,
+    ) -> _RunCompletion:
+        outcome = "destroyed" if destroyed else "cancelled"
+        message = "agent destroyed" if destroyed else "agent invocation cancelled"
+        try:
+            request.agent.data_collector.record_event(
+                type=f"skill_{outcome}",
+                payload={"skill": request.skill.name if request.skill is not None else None},
+                term_message=f"[{request.agent.agname}] SKILL ■  {outcome}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[agorchestrator] WARNING: controlled completion logging failed: {exc}")
+        return _RunCompletion(
+            output=agerror(message),
+            context=committed_context,
+            outcome=outcome,
+            error_message=message,
         )
 
     def _finish_execution_log(
@@ -561,10 +733,9 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 "engine:execution",
                 request.engine_started_wall,
                 completed_wall,
-                {"outcome": "failure" if completion.failed else "success"},
+                {"outcome": completion.outcome},
             )
-        if not request.context_future.done():
-            request.context_future.set_result(completion.context)
+        self._settle_future(request.context_future, completion.context, "output-context")
         invocation = request.submission
         if isinstance(invocation, Invocation):
             if request.agent._control.active_invocation() is invocation:
@@ -572,25 +743,34 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             else:
                 invocation._close_without_activation()
             invocation._mark_terminal(completion.output)
-        request.state = "failed" if completion.failed else "completed"
+        request.state = "completed" if completion.outcome == "succeeded" else completion.outcome
         self._completed_total += 1
         if completion.failed:
             self._failed_total += 1
-        self._end_run_span_locked(request, completion.failed, completion.error_message)
-        self._publish_request_locked(
-            "request_failed" if completion.failed else "request_completed",
+        self._end_run_span_locked(
             request,
-            {"error": completion.error_message} if completion.failed else {},
+            completion.failed,
+            completion.error_message,
+            outcome=completion.outcome,
+        )
+        event_type = {
+            "succeeded": "request_completed",
+            "failed": "request_failed",
+            "cancelled": "request_cancelled",
+            "destroyed": "request_destroyed",
+        }[completion.outcome]
+        self._publish_request_locked(
+            event_type,
+            request,
+            {"error": completion.error_message} if completion.outcome != "succeeded" else {},
         )
         self._finish_request_locked(request)
-        if not request.result_future.done():
-            request.result_future.set_result(completion.output)
         self._active_by_agent.pop(request.agent, None)
         self._update_agent_display_locked(request.agent)
+        self._settle_future(request.result_future, completion.output, "invocation result")
+        request.agent._submission_finished(request.submission)
 
     def _finish_request_locked(self, request: _ExecutionRequest) -> None:
-        with request.agent._submission_lock:
-            request.agent._submissions.discard(request.submission)
         outstanding = self._outstanding_by_agent.get(request.agent)
         if outstanding is not None:
             outstanding.discard(request.request_id)
@@ -612,7 +792,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 context = predecessor.copy()
             except BaseException:
                 context = agcontext()
-            request.context_future.set_result(context)
+            self._settle_future(request.context_future, context, "pass-through context")
             return True
 
         def _propagate(finished: "Future[agcontext]", request_id: str = request.request_id) -> None:
@@ -624,31 +804,86 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
     def _handle_pass_through_done_locked(self, value: object) -> None:
         request_id, finished = value
         request = self._requests.get(request_id)
-        if request is None or request.state != "settling_failed":
+        if request is None or request.state != "settling_terminal":
             return
         if not request.context_future.done():
             try:
                 context = finished.result().copy()
             except BaseException:
                 context = agcontext()
-            request.context_future.set_result(context)
-        self._finish_failed_request_locked(request)
+            self._settle_future(request.context_future, context, "pass-through context")
+        self._finish_terminal_request_locked(request)
 
     def _fail_request_locked(self, request: _ExecutionRequest, message: str) -> None:
-        if request.state in ("completed", "failed", "settling_failed", "running"):
-            return
-        request.state = "settling_failed"
-        self._completed_total += 1
-        self._failed_total += 1
-        request.terminal_output = agerror(message)
-        request.terminal_error = message
-        self._end_phase_span_locked(request)
-        self._end_run_span_locked(request, True, message)
-        self._publish_request_locked("request_failed", request, {"error": message})
-        if self._pass_through_context_future(request):
-            self._finish_failed_request_locked(request)
+        self._begin_terminal_request_locked(
+            request,
+            output=agerror(message),
+            message=message,
+            terminal_state="failed",
+            event_type="request_failed",
+            counts_as_failure=True,
+        )
 
-    def _finish_failed_request_locked(self, request: _ExecutionRequest) -> None:
+    def _cancel_request_locked(self, request: _ExecutionRequest) -> None:
+        self._begin_terminal_request_locked(
+            request,
+            output=agerror("agent invocation cancelled"),
+            message="agent invocation cancelled",
+            terminal_state="cancelled",
+            event_type="request_cancelled",
+            counts_as_failure=False,
+        )
+
+    def _destroy_request_locked(self, request: _ExecutionRequest) -> None:
+        self._begin_terminal_request_locked(
+            request,
+            output=agerror("agent destroyed"),
+            message="agent destroyed",
+            terminal_state="destroyed",
+            event_type="request_destroyed",
+            counts_as_failure=False,
+        )
+
+    def _begin_terminal_request_locked(
+        self,
+        request: _ExecutionRequest,
+        *,
+        output: agdata,
+        message: str,
+        terminal_state: str,
+        event_type: str,
+        counts_as_failure: bool,
+    ) -> None:
+        if request.state in {
+            "completed",
+            "failed",
+            "cancelled",
+            "destroyed",
+            "settling_terminal",
+            "running",
+        }:
+            return
+        request.state = "settling_terminal"
+        self._completed_total += 1
+        if counts_as_failure:
+            self._failed_total += 1
+        request.terminal_output = output
+        request.terminal_error = message
+        request.terminal_state = terminal_state
+        request.terminal_event = event_type
+        request.terminal_counts_as_failure = counts_as_failure
+        self._end_phase_span_locked(request)
+        self._end_run_span_locked(
+            request,
+            counts_as_failure,
+            message,
+            outcome=terminal_state,
+        )
+        self._publish_request_locked(event_type, request, {"error": message})
+        if self._pass_through_context_future(request):
+            self._finish_terminal_request_locked(request)
+
+    def _finish_terminal_request_locked(self, request: _ExecutionRequest) -> None:
         output = request.terminal_output or agerror(request.terminal_error or "request failed")
         submission = request.submission
         if isinstance(submission, Invocation):
@@ -657,13 +892,19 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             else:
                 submission._close_without_activation()
             submission._mark_terminal(output)
-        request.state = "failed"
+        request.state = request.terminal_state
         self._finish_request_locked(request)
-        if not request.result_future.done():
-            request.result_future.set_result(output)
         self._update_agent_display_locked(request.agent)
+        self._settle_future(request.result_future, output, "terminal submission result")
+        request.agent._submission_finished(request.submission)
 
     def _update_agent_display_locked(self, ag: "agent") -> None:
+        if ag._control.is_destroyed():
+            ag.record_state("destroying")
+            return
+        if ag._control.is_suspended():
+            ag.record_state("suspended")
+            return
         outstanding = [
             self._requests[rid]
             for rid in self._outstanding_by_agent.get(ag, ())
@@ -720,13 +961,20 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             self._record_agent_span(request, phase_name, phase_started_wall, ended_wall, {})
 
     def _end_run_span_locked(
-        self, request: _ExecutionRequest, failed: bool, error_message: str = ""
+        self,
+        request: _ExecutionRequest,
+        failed: bool,
+        error_message: str = "",
+        *,
+        outcome: "str | None" = None,
     ) -> None:
         span = request.run_span
         request.run_span = None
         ended_wall = time.time()
+        outcome = outcome or ("failed" if failed else "succeeded")
+        profiler_outcome = "success" if outcome == "succeeded" else "failure"
         if span is not None:
-            metadata = {"outcome": "failure" if failed else "success"}
+            metadata = {"outcome": profiler_outcome, "lifecycle_outcome": outcome}
             if failed:
                 metadata.update(error_type="skill_error", error_message=error_message)
             span.end(
@@ -734,7 +982,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 end_wall_ns=time.time_ns(),
                 metadata=metadata,
             )
-        attributes = {"outcome": "failure" if failed else "success"}
+        attributes = {"outcome": profiler_outcome, "lifecycle_outcome": outcome}
         if failed:
             attributes["error_message"] = error_message
         self._record_agent_span(
@@ -809,7 +1057,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         }
 
     def _finish_shutdown_if_possible_locked(self) -> bool:
-        if self._state != "stopping":
+        if self._state not in {"stopping", "failed"}:
             return False
         if self._active_by_agent or any(r.state == "ready" for r in self._requests.values()):
             return False
@@ -825,10 +1073,49 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 request,
                 "orchestrator shut down before the request's dependencies resolved",
             )
+        self._force_unmanaged_terminal_contexts_locked()
         if self._requests:
             return False
         self._state = "stopped"
         return True
+
+    def _force_unmanaged_terminal_contexts_locked(self) -> None:
+        """Break shutdown-only waits on predecessor futures we do not own.
+
+        During normal operation a terminal request faithfully waits for its
+        predecessor.  Once admission is closed, an unresolved external future
+        has no managed producer that this scheduler can drain, so retaining the
+        wait would violate the stronger shutdown invariant that every public
+        future settles.
+        """
+        made_progress = True
+        while made_progress:
+            made_progress = False
+            for request in list(self._requests.values()):
+                if request.state != "settling_terminal":
+                    continue
+                if request.context_future.done():
+                    self._finish_terminal_request_locked(request)
+                    made_progress = True
+                    continue
+                predecessor_future = request.context_dependency._future
+                if predecessor_future is None or predecessor_future.done():
+                    try:
+                        context = request.context_dependency.copy()
+                    except BaseException:
+                        context = agcontext()
+                else:
+                    producer_id = self._future_producers.get(predecessor_future)
+                    if producer_id is not None and producer_id in self._requests:
+                        continue
+                    context = agcontext()
+                self._settle_future(
+                    request.context_future,
+                    context,
+                    "forced shutdown context",
+                )
+                self._finish_terminal_request_locked(request)
+                made_progress = True
 
 
 _global_orchestrator: "GlobalAgentOrchestrator | None" = None

@@ -25,7 +25,16 @@ class ExecutionScheduler:
     def execute(self) -> None:
         """Run one complete dependency-resolution and scheduling cycle."""
         owner = self._orchestrator
-        for request in owner._requests.values():
+        for request in list(owner._requests.values()):
+            submission = request.submission
+            if getattr(submission, "is_destroyed", lambda: False)():
+                if request.state != "running":
+                    owner._destroy_request_locked(request)
+                continue
+            if getattr(submission, "is_cancelled", lambda: False)():
+                if request.state != "running":
+                    owner._cancel_request_locked(request)
+                continue
             if request.state == "prepared" and getattr(request.submission, "_ready", False):
                 request.state = "submitted"
         resolved: list[_ExecutionRequest] = []
@@ -125,6 +134,12 @@ class ExecutionScheduler:
                 if pending_exec.agent in owner._active_by_agent:
                     skipped.append(entry)
                     continue
+                if pending_exec.agent._control.is_suspended():
+                    skipped.append(entry)
+                    continue
+                if getattr(pending_exec.submission, "is_pause_requested", lambda: False)():
+                    skipped.append(entry)
+                    continue
                 selected = pending_exec
                 break
             for entry in skipped:
@@ -191,12 +206,23 @@ class ExecutionScheduler:
                     for field in fields(current)
                 }
                 return replace(current, **updates)
-            model_fields = getattr(type(current), "model_fields", None)
+            model_dump = getattr(current, "model_dump", None)
             model_copy = getattr(current, "model_copy", None)
-            if isinstance(model_fields, dict) and callable(model_copy):
-                return model_copy(
-                    update={name: materialize(getattr(current, name)) for name in model_fields}
-                )
+            if callable(model_dump):
+                dumped = model_dump()
+                if not isinstance(dumped, dict):
+                    raise TypeError(
+                        f"{type(current).__name__}.model_dump() must return a dictionary"
+                    )
+                updates = {name: materialize(value) for name, value in dumped.items()}
+                if callable(model_copy):
+                    return model_copy(update=updates)
+                try:
+                    for name, value in updates.items():
+                        setattr(current, name, value)
+                except (AttributeError, TypeError):
+                    return updates
+                return current
             return current
 
         return materialize(value)
@@ -239,8 +265,11 @@ class ExecutionScheduler:
                 values = current
             elif is_dataclass(current) and not isinstance(current, type):
                 values = (getattr(current, field.name) for field in fields(current))
-            elif isinstance(getattr(type(current), "model_fields", None), dict):
-                values = (getattr(current, name) for name in getattr(type(current), "model_fields"))
+            elif callable(model_dump := getattr(current, "model_dump", None)):
+                dumped = model_dump()
+                if not isinstance(dumped, dict):
+                    return f"{type(current).__name__}.model_dump() must return a dictionary"
+                values = dumped.values()
             else:
                 return None
             marker = id(current)

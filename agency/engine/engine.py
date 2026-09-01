@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..agent import agent
     from ..orchestrator.agresources import agResourcePool
     from ..agskill import agskill
+    from .._submission import Invocation
     from .clients import SandboxInteractionClient
 
 
@@ -44,6 +45,7 @@ class AgentEngine:
         resource_pool: "agResourcePool",
         sandbox: agSandbox,
         max_steps: "int | None" = None,
+        invocation: "Invocation | None" = None,
     ) -> "agdata":
         """Execute one request and own its complete sandbox transaction."""
 
@@ -57,20 +59,21 @@ class AgentEngine:
                 output = self._execute_harness(
                     context, skill, skill_input, resource_pool, sandbox, max_steps=max_steps
                 )
-                if not isinstance(output, agerror):
-                    with agprof.span("teardown:commit"):
-                        try:
-                            sandbox.commit()
-                        finally:
-                            if not sandbox._has_pending_background_work():
-                                try:
-                                    sandbox.stop()
-                                except Exception as exc:
-                                    # DATACOLLECTOR: append -- ad-hoc print, uncaptured by any structured channel today.
-                                    print(
-                                        f"[engine] WARNING: post-commit hibernate failed "
-                                        f"for {self._agent.agname}: {exc}"
-                                    )
+                if isinstance(output, agerror):
+                    return output
+                with agprof.span("teardown:commit"):
+                    try:
+                        sandbox.commit()
+                    finally:
+                        if not sandbox._has_pending_background_work():
+                            try:
+                                sandbox.stop()
+                            except Exception as exc:
+                                # DATACOLLECTOR: append -- ad-hoc print, uncaptured by any structured channel today.
+                                print(
+                                    f"[engine] WARNING: post-commit hibernate failed "
+                                    f"for {self._agent.agname}: {exc}"
+                                )
                 failed = False
                 return output
             finally:

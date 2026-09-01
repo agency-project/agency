@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -207,6 +207,32 @@ class agdata:
             return tuple(agdata._resolve_dependency(item) for item in value)
         if isinstance(value, dict):
             return {key: agdata._resolve_dependency(item) for key, item in value.items()}
+        if is_dataclass(value) and not isinstance(value, type):
+            return replace(
+                value,
+                **{
+                    field.name: agdata._resolve_dependency(getattr(value, field.name))
+                    for field in fields(value)
+                },
+            )
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if not isinstance(dumped, dict):
+                raise TypeError(f"{type(value).__name__}.model_dump() must return a dictionary")
+            updates = {key: agdata._resolve_dependency(item) for key, item in dumped.items()}
+            model_copy = getattr(value, "model_copy", None)
+            if callable(model_copy):
+                return model_copy(update=updates)
+            try:
+                for key, item in updates.items():
+                    setattr(value, key, item)
+            except (AttributeError, TypeError):
+                # Generic immutable model-like values have no standard copy
+                # protocol.  Preserve their resolved data rather than leaving
+                # hidden pending handles behind.
+                return updates
+            return value
         return value
 
     def resolve_input_dependencies(self) -> None:

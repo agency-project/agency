@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from typing import TYPE_CHECKING
 
 from ._agent_control import InvocationHandle
@@ -235,8 +235,13 @@ class CloseHandle:
         return self
 
     def _settle(self) -> None:
-        if not self._future.done():
+        try:
             self._future.set_result(None)
+        except InvalidStateError:
+            # Concurrent cleanup paths are deliberately idempotent.  Future's
+            # done()/set_result() pair is not itself atomic, so losing this
+            # benign race must not leak out of destruction.
+            pass
 
     def __repr__(self) -> str:
         return f"CloseHandle(done={self.done()})"
