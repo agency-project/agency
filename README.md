@@ -1,8 +1,8 @@
 # Agency
 
-A multi-agent framework with sandboxed execution, isolated filesystems, GPU access control, and automatic background-process tracking. Submission is lazy: PREPARED, dependency-blocked, suspension-gated, and host-only message requests create no engine or sandbox infrastructure before dispatch. A sandbox is created only after an engine-backed invocation is admitted, then its transaction is committed or discarded before output context and results are published.
+A multi-agent framework with sandboxed execution, isolated filesystems, GPU access control, and automatic background-process tracking. Submission is lazy: dependency-blocked, suspension-gated, and host-only context-message requests create no engine or sandbox infrastructure before dispatch. A sandbox is created only after an engine-backed invocation is admitted, then its transaction is committed or discarded before output context and results are published.
 
-Agents are non-blocking by default. `agent.run()` returns an `Invocation` immediately. The invocation is both the exact lifecycle handle controlled by the global orchestrator and an agdata-compatible pending result: it can be awaited, passed into another skill, or read through attribute access. A process-wide, event-driven orchestrator holds PREPARED and dependency-blocked work without occupying a worker or execution slot, then dispatches eligible work onto a reusable worker pool. Every dispatch still receives a fresh `AgentEngine`. Concurrency is unlimited by default and can be capped globally.
+Agents are non-blocking by default. `agent.run()` returns a scheduler-eligible `Invocation` immediately. The invocation is both the exact lifecycle handle controlled by the global orchestrator and an agdata-compatible pending result: it can be awaited, passed into another skill, or read through attribute access. A process-wide, event-driven orchestrator holds dependency-blocked work without occupying a worker or execution slot, then dispatches eligible work onto a reusable worker pool. Every dispatch still receives a fresh `AgentEngine`. Concurrency is unlimited by default and can be capped globally.
 
 ## Requirements
 
@@ -79,22 +79,25 @@ All submissions reserve one position in the agent's authoritative context chain.
 first = ag.run(skill, agdata(topic="one"))
 second = ag.run(other_skill, first)  # Invocation is a pending data dependency
 
-held = ag.prepare(skill, agdata(topic="three"))
-message = ag.send("Keep citations next to the claims they support")
+# Ordered context for submissions that come after it.
+message = ag.queue_message("Keep citations next to the claims they support")
+message.wait()
+third = ag.run(skill, agdata(topic="three"))
 
-# `held` intentionally blocks the later message until its original position opens.
-held.start()       # starts only this prepared invocation
-# ag.start()       # alternatively starts a snapshot of all currently prepared work
+# An additional instruction for this exact already-submitted invocation.
+third.send_message("Use only primary sources")
+third.pause()
+third.resume()
 
 close = ag.destroy()  # rejects new submissions immediately
 close.wait()          # waits for asynchronous cleanup; repeated destroy() returns this handle
 ```
 
-While an invocation is active, `inv.steer(...)`, `inv.pause()`, `inv.resume()`, and `inv.cancel()` control only that invocation. They are observed at safe boundaries, never halfway through a model request or tool call. Steering closes at the final-answer fence, so callers should handle `RuntimeError` if execution has already crossed it.
+`Invocation.send_message(...)`, `inv.pause()`, `inv.resume()`, and `inv.cancel()` target only that exact invocation. Controls are observed at safe boundaries, never halfway through a model request or tool call. A message accepted during a model request is delivered through a follow-up generation at the next valid boundary. Message and pause requests are rejected after the final-answer fence.
 
-`ag.suspend()` is the independent agent-wide gate: it prevents new engine-backed dispatch and parks active work at its next safe boundary if it has not crossed the closing/completion fence. Queued work held by the gate occupies no worker or global slot; an already-running invocation retains its slot while parked. `ag.resume()` clears only that gate. It neither starts PREPARED work nor clears an invocation-specific pause. `ag.pause()` remains a compatibility alias for `ag.suspend()`.
+`ag.suspend()` is the independent agent-wide gate: it prevents new engine-backed dispatch and parks active work at its next safe boundary if it has not crossed the closing/completion fence. Queued work held by the gate occupies no worker or global slot; an already-running invocation retains its slot while parked. `ag.resume()` clears only that gate and does not clear an invocation-specific pause.
 
-`ag.send()` returns a `MessageSubmission`. It copies its predecessor context and appends retained host-only context without creating an engine, sandbox, harness, or model request. See [Invocation API](docs/Invocation_API.md) for result compatibility and lifecycle details.
+`ag.queue_message()` returns a `MessageSubmission`. It advances the serialized agent context chain by copying its predecessor context and appending retained host-only context without creating an engine, sandbox, harness, or model request. It does not retroactively modify an invocation submitted before it. See [Invocation API](docs/Invocation_API.md) for the distinction from `Invocation.send_message()`.
 
 **OpenAI**
 
@@ -170,7 +173,7 @@ See [`examples/README.md`](examples/README.md) for more details on each example.
 
 ## Core concepts
 
-**`agent` / `Agent`** — a state container with LLM config, sandboxed tools, one authoritative conversation-context chain (`agcontext`), and a name. `run()`, `prepare()`, and `send()` atomically reserve positions in that chain. Engine-backed requests receive a fresh `AgentEngine` only when the global orchestrator dispatches them; reusable orchestrator workers provide cross-agent concurrency while preserving one active engine-backed request per agent. Sandboxes and harness services are created lazily. `Agent` is the public alias of `agent`.
+**`agent` / `Agent`** — a state container with LLM config, sandboxed tools, one authoritative conversation-context chain (`agcontext`), and a name. `run()` and `queue_message()` atomically reserve positions in that chain. Engine-backed requests receive a fresh `AgentEngine` only when the global orchestrator dispatches them; reusable orchestrator workers provide cross-agent concurrency while preserving one active engine-backed request per agent. Sandboxes and harness services are created lazily. `Agent` is the public alias of `agent`.
 
 **`agskill`** — a named skill with its own system prompt, optional input/output schemas, and an optional tool list. `agskill.run(agent, input)` uses the same orchestrator path and returns the same `Invocation` shape as `agent.run()`. Harness execution begins only after scheduler admission.
 
@@ -208,6 +211,6 @@ Runs the same checks as the `pre-commit` git hook and the CI `pre-commit` job: `
 
 | File | Topic |
 |---|---|
-| [Invocation_API.md](docs/Invocation_API.md) | `Invocation`, PREPARED work, ordered messages, controls, and destruction |
+| [Invocation_API.md](docs/Invocation_API.md) | `Invocation`, ordered context messages, exact-invocation controls, and destruction |
 | [Design_orchestrator.md](docs/Design_orchestrator.md) | Atomic context-chain publication, event scheduling, reusable workers, and shutdown |
 | [Design_execution_loop.md](docs/Design_execution_loop.md) | Safe-boundary control delivery, transactions, attempt isolation, and retained cursors |

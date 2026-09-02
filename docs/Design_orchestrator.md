@@ -5,12 +5,12 @@
 The implementation is split by ownership:
 
 - `agency/orchestrator/orchestrator.py` owns atomic submission, request lifecycle, context settlement, the scheduler event thread, reusable execution workers, telemetry, and singleton shutdown.
-- `agency/orchestrator/scheduler.py` owns dependency discovery, the wait pool, managed-cycle detection, the ready heap, message routing, and dispatch policy. The orchestrator performs message settlement.
+- `agency/orchestrator/scheduler.py` owns dependency discovery, the wait pool, managed-cycle detection, the ready heap, context-message routing, and dispatch policy. The orchestrator performs context-message settlement.
 - `agency/orchestrator/agresources.py` remains the process-wide CPU, memory, and GPU resource authority.
 
 ## One authoritative context chain
 
-Every agent has one context head. A call to `run()`, `prepare()`, or `send()` takes the orchestrator condition and then the agent submission lock and performs one atomic publication:
+Every agent has one context head. A call to `run()` or `queue_message()` takes the orchestrator condition and then the agent submission lock and performs one atomic publication:
 
 1. Verify that the orchestrator and agent still accept work.
 2. Allocate the agent's next monotonic ordering ID.
@@ -19,7 +19,7 @@ Every agent has one context head. A call to `run()`, `prepare()`, or `send()` ta
 5. Publish that placeholder as the new head.
 6. Register an orchestrator request that references the exact public submission.
 
-Registration and chain publication therefore have the same linearization point. The predecessor context is an implicit dependency, so same-agent submissions cannot overtake one another. A PREPARED node intentionally blocks everything behind it until it is started or becomes terminal.
+Registration and chain publication therefore have the same linearization point. The predecessor context is an implicit dependency, so same-agent submissions cannot overtake one another.
 
 Pre-execution failures and controlled terminal paths that did not commit new context pass their predecessor through without adding context, using an event-driven continuation only when that predecessor remains unresolved. An ordinary executed skill failure instead copies its predecessor and appends the canonical rollback notice. Context is always settled before the public result, so result callbacks see the submission's context as complete.
 
@@ -30,9 +30,6 @@ The scheduler thread blocks on a condition-backed event queue. Submission, contr
 The important internal states are:
 
 ```text
-PREPARED gate closed
-        │ start()
-        ▼
 submitted ── unresolved predecessor/input ──> blocked
         │                                      │ dependency event
         └──────────── dependencies ready ◀─────┘
@@ -47,14 +44,13 @@ Each event runs a complete cycle: resolve every waiting request, detect managed 
 
 Dispatch requires all of the following:
 
-- the invocation readiness gate is open;
 - predecessor and explicit input dependencies are resolved;
 - the agent is not suspended;
 - the invocation is not terminal or specifically paused;
 - no other engine-backed request is active for that agent;
 - global engine capacity is available.
 
-`max_concurrent_engines=None` preserves effectively unlimited cross-agent concurrency. A positive integer caps active engine-backed requests across the process. PREPARED, dependency-blocked, message, and queued requests held behind agent suspension consume no engine capacity. An invocation that was already running when it parked at a suspension boundary remains active and retains its slot.
+`max_concurrent_engines=None` preserves effectively unlimited cross-agent concurrency. A positive integer caps active engine-backed requests across the process. Dependency-blocked and queued requests held behind agent suspension consume no engine capacity; context-only messages never claim it. An invocation that was already running when it parked at a suspension boundary remains active and retains its slot.
 
 ## Reusable workers, fresh engines
 
@@ -68,13 +64,13 @@ Engine completion is posted back to the scheduler. The worker never publishes pu
 
 ## Host-only messages
 
-`send()` registers a request with kind `message`. Once its predecessor resolves, the scheduler copies that context, appends the validated retained message, settles the output context, then settles the empty result. This path does not create an `AgentEngine`, sandbox, daemon, host server, harness, or model request, and it does not use an execution worker or global engine slot.
+`queue_message()` registers a request with kind `context_message`. Once its predecessor resolves, the scheduler copies that context, appends the validated retained message, settles the output context, then settles the empty result. This path does not create an `AgentEngine`, sandbox, daemon, host server, harness, or model request, and it does not use an execution worker or global engine slot.
 
-Agent suspension is not a dispatch gate for a ready message. Any unresolved predecessor still blocks it through the ordinary context chain, including a PREPARED request or a running invocation parked by suspension.
+Agent suspension is not a dispatch gate for a ready context message. Any unresolved predecessor still blocks it through the ordinary context chain, including a running invocation parked by suspension.
 
 ## Controls and terminal settlement
 
-Prepared cancellation, dependency failure, scheduler rejection, and destruction are handled on the scheduler thread without creating execution infrastructure. Running cancellation and destruction are observed by the exact `Invocation` at safe boundaries; the completion claim in the engine transaction prevents a late successful commit from winning after a terminal control.
+Queued cancellation, dependency failure, scheduler rejection, and destruction are handled on the scheduler thread without creating execution infrastructure. Running cancellation and destruction are observed by the exact `Invocation` at safe boundaries; the completion claim in the engine transaction prevents a late successful commit from winning after a terminal control.
 
 Ordinary skill failure discards its working context and appends the canonical retained rollback notice. Cancellation and destruction pass through committed predecessor context without that notice.
 

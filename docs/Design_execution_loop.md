@@ -17,27 +17,27 @@ An ordinary skill failure discards the working transaction and publishes a clean
 
 ## Safe-boundary controls
 
-The exact invocation is propagated through `AgentEngine`, `HostServerManager`, the host interaction service, and native or external harness control paths. Pause, suspension, cancellation, destruction, and steering are observed only at explicit boundaries:
+The exact invocation is propagated through `AgentEngine`, `HostServerManager`, the host interaction service, and native or external harness control paths. Pause, suspension, cancellation, destruction, and invocation messages are observed only at explicit boundaries:
 
 | Boundary | What has completed | Control behavior |
 |---|---|---|
 | Before infrastructure | Fresh engine and worker job exist; contexts are copied | Cancel or destroy avoids sandbox and service creation |
 | Before harness execution | Sandbox lock acquired | Pause/suspension may park; cancel/destroy discards |
-| Before model generation | Prior history/tool result is complete | FIFO steering may be attached when the protocol permits a user turn |
-| After model output / before tools | Provider call is complete | Cancel/destroy is observed; a final answer establishes the closing fence |
+| Before model generation | Prior history/tool result is complete | FIFO invocation messages may be attached when the protocol permits a user turn |
+| After model output / before tools | Provider call is complete | Cancel/destroy is observed; a final answer atomically hands off any in-flight messages or establishes the closing fence |
 | After each tool result is published | Tool call is complete | Pause/cancel/destroy is observed before another model turn |
 | Before sandbox commit | Harness attempt returned and host-side services are closed | Completion must be claimed atomically; the sandbox daemon may remain until hibernation or removal |
 | Before public success | Commit and session update succeeded | Orchestrator rechecks the same monotonic completion claim |
 
 There is no asynchronous interruption halfway through a provider request or tool function. A pause can remain parked indefinitely at a boundary; execution-owned RPCs do not expire the attempt merely because a valid pause lasts longer than a readiness probe.
 
-Recording the first final model result changes the invocation to `closing`; the following post-model checkpoint observes terminal controls. New steering and pause requests are rejected after this fence. Cancellation and destruction race with a monotonic completion claim: if either control wins, the container and working context are discarded; if completion wins, a later control cannot retroactively invalidate the already claimed transaction.
+At a final model result, Agency atomically checks the exact invocation inbox. If a message was accepted while the provider call was in flight, the LLM service performs a follow-up generation with that message before it may close. Otherwise the invocation changes to `closing`. New messages and pause requests are rejected after this fence. Cancellation and destruction race with a monotonic completion claim: if either control wins, the container and working context are discarded; if completion wins, a later control cannot retroactively invalidate the already claimed transaction.
 
 ## Native and external harnesses
 
-The native ReAct loop checkpoints before generation, after internal compaction, after model output, and after each published tool result. Internal compaction requests explicitly bypass ordinary steering, but a post-compaction checkpoint still observes pause, cancellation, and destruction before task generation.
+The native ReAct loop checkpoints before generation, after internal compaction, after model output, and after each published tool result. Internal compaction requests explicitly bypass ordinary invocation messages, but a post-compaction checkpoint still observes pause, cancellation, and destruction before task generation.
 
-External harnesses send model traffic through the invocation-bound LLM service. The service fingerprints the semantic request to derive a stable boundary ID, admits steering only where adding a user turn preserves tool-call pairing, and retains the assigned overlay by sequence and a separately derived history anchor. An identical provider or CLI retry reuses that boundary assignment instead of consuming steering twice. If external compaction removes an old anchor, an already admitted instruction moves to the current generation instead of disappearing.
+External harnesses send model traffic through the invocation-bound LLM service. The service fingerprints the semantic request to derive a stable boundary ID, admits invocation messages only where adding a user turn preserves tool-call pairing, and retains the assigned overlay by sequence and a separately derived history anchor. An identical provider or CLI retry reuses that boundary assignment instead of consuming a message twice. If external compaction removes an old anchor, an already admitted instruction moves to the current generation instead of disappearing. A message that arrives during a final provider call is assigned at an atomic post-model boundary and produces a traced follow-up generation.
 
 Both paths use the same `Invocation` control state. A harness cannot select another invocation by supplying an ID.
 
@@ -47,7 +47,7 @@ Every harness attempt receives a fresh unguessable token in `HarnessAttemptReque
 
 External harness launchers have a separate, narrowly scoped one-shot authorization for their exact initial executable path, PID, and arguments. Descendant execution remains subject to normal policy.
 
-Checkpoint HTTP handlers watch for caller disconnects. A disconnected client aborts its interruptible boundary wait and wakes the underlying condition without consuming or assigning steering. LLM stream shutdown closes provider streams, wakes producers and consumers on both generic errors and cancellation, joins their workers, and leaves failed close operations retryable.
+Checkpoint HTTP handlers watch for caller disconnects. A disconnected client aborts its interruptible boundary wait and wakes the underlying condition without consuming or assigning an invocation message. LLM stream shutdown closes provider streams, wakes producers and consumers on both generic errors and cancellation, joins their workers, and leaves failed close operations retryable.
 
 ## Streaming telemetry
 
@@ -55,7 +55,7 @@ The lowercase `agdatacollector.py` collector remains authoritative. Each provide
 
 ## Retained context and sessions
 
-An ordered `send()` entry lives in `agcontext.retained_messages` independently of the latest transcript. Before a harness attempt, the engine prefixes entries beyond that harness's retained-message cursor.
+An ordered `queue_message()` entry lives in `agcontext.retained_messages` independently of the latest transcript. Before a harness attempt, the engine prefixes entries beyond that harness's retained-message cursor.
 
 When a successful stateful harness returns a restorable session, the engine stages the session blob and the highest incorporated retained sequence. It publishes both only after sandbox commit succeeds. Cancellation or destruction that wins before the completion claim, along with harness failure, schema failure, rollback, or commit failure, clears the staged update and cannot advance the cursor. A later control that loses to an existing completion claim is a no-op, so the already-claimed commit and session publication proceed. Stateless harnesses have no advancing session cursor, so retained messages remain available on later calls.
 
