@@ -16,7 +16,7 @@ from starlette.datastructures import Headers
 from ...harness.protocol import ATTEMPT_TOKEN_HEADER
 from ...utils.agutil import new_uds_path
 from .host_interaction_server import HostInteractionServer
-from .host_mcp_server import HostMcpServer
+from .host_mcp_server import HostMcpServer, bind_data_logger_for_current_thread
 from .llm_handler_server import LlmHandlerServer
 
 if TYPE_CHECKING:
@@ -248,7 +248,14 @@ class HostServerManager:
                 app.mount(prefix, sub_app)
             config = uvicorn.Config(app, uds=self._configs.uds_path, log_level="warning")
             server = uvicorn.Server(config)
-            thread = threading.Thread(target=server.run, daemon=True, name="host-server-manager")
+
+            data_logger = self._data_logger
+
+            def _run_server() -> None:
+                bind_data_logger_for_current_thread(data_logger)
+                server.run()
+
+            thread = threading.Thread(target=_run_server, daemon=True, name="host-server-manager")
             self._server = server
             self._server_thread = thread
             try:

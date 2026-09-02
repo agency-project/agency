@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import logging
+import threading
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -18,6 +20,40 @@ if TYPE_CHECKING:
     from ...agskill import agskill
     from ...agtool import agtool
     from ...sandbox.agsandbox import agSandbox
+
+_current_data_logger = threading.local()
+
+
+def bind_data_logger_for_current_thread(data_logger: "agDataLogger") -> None:
+    """Route this thread's `mcp.server.*` logging to *data_logger* instead of
+    the terminal. `HostServerManager` runs one agent's whole MCP server --
+    uvicorn, its asyncio loop, and every request the loop handles -- in one
+    dedicated thread, so a thread-local is enough to attribute log records
+    to the right agent without the mcp library knowing about agDataLogger."""
+    _current_data_logger.data_logger = data_logger
+
+
+class _ThreadRoutedLogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        data_logger = getattr(_current_data_logger, "data_logger", None)
+        if data_logger is None:
+            return
+        payload = {
+            "logger": record.name,
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        try:
+            data_logger.record_event("mcp_server_log", payload)
+        except Exception:
+            self.handleError(record)
+
+
+_mcp_server_logger = logging.getLogger("mcp.server")
+_mcp_server_logger.addHandler(_ThreadRoutedLogHandler())
+_mcp_server_logger.propagate = False
 
 
 class HostMcpServer:
