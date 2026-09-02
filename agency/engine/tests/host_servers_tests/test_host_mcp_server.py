@@ -65,12 +65,12 @@ class _FakeResourcePool:
         sandbox._gpu_ids = []
 
 
-class _FakeDataCollector:
+class _FakeDataLogger:
     def __init__(self):
         self.events = []
 
-    def record_event(self, type, payload, call_label=None, overwrite=False, **_kw):
-        self.events.append((type, payload, call_label, overwrite))
+    def record_event(self, type, payload, call_label=None, update_latest_snapshot=False, **_kw):
+        self.events.append((type, payload, call_label, update_latest_snapshot))
 
 
 def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, output_schema=None):
@@ -82,7 +82,7 @@ def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, outp
         add_host_mcp_tools=add_host_mcp_tools,
         output_schema=output_schema,
     )
-    server = HostMcpServer(sandbox, skill, resource_pool, _FakeDataCollector())
+    server = HostMcpServer(sandbox, skill, resource_pool, _FakeDataLogger())
     server.build_app()
     return server, sandbox, resource_pool
 

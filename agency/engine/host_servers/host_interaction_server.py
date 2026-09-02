@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from ...harness._syscall_event import agsyscallevent
 
 if TYPE_CHECKING:
-    from ...agdatacollector import agDataCollector
+    from ...observability.agdatalogger import agDataLogger
     from ...agskill import agskill
 
 
@@ -21,12 +21,12 @@ class HostInteractionServer:
     def __init__(
         self,
         skill: "agskill",
-        data_collector: "agDataCollector",
+        data_logger: "agDataLogger",
         *,
         invocation=None,
     ) -> None:
         self._policy = skill.policy
-        self._data_collector = data_collector
+        self._data_logger = data_logger
         # Bound by HostServerManager to the exact orchestrator request.  The
         # sandbox never supplies an invocation id and therefore cannot target
         # another request's lifecycle state.
@@ -125,15 +125,15 @@ class HostInteractionServer:
         type: str,
         payload: dict,
         call_label: "str | None" = None,
-        overwrite: bool = False,
+        update_latest_snapshot: bool = False,
         term_message: "str | None" = None,
         flush: bool = False,
     ) -> None:
-        self._data_collector.record_event(
+        self._data_logger.record_event(
             type,
             payload,
             call_label=call_label,
-            overwrite=overwrite,
+            update_latest_snapshot=update_latest_snapshot,
             term_message=term_message,
             flush=flush,
         )
@@ -150,7 +150,7 @@ class HostInteractionServer:
         parent: "str | None" = None,
         call_label: "str | None" = None,
     ) -> None:
-        self._data_collector.record_span(
+        self._data_logger.record_span(
             name,
             start_ts,
             end_ts,
@@ -244,7 +244,7 @@ class HostInteractionServer:
                 request["type"],
                 request["payload"],
                 call_label=request.get("call_label"),
-                overwrite=request.get("overwrite", False),
+                update_latest_snapshot=request.get("update_latest_snapshot", False),
                 term_message=request.get("term_message"),
                 flush=request.get("flush", False),
             )

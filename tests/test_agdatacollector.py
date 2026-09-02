@@ -1,4 +1,4 @@
-"""Tests for agdatacollector.py -- the per-agent, write-side event/span store."""
+"""Tests for agdatalogger.py -- the per-agent, write-side event/span store."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from agency.agdatacollector import agDataCollector, agDataCollectorConfigs
+from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
 
 
 # ---------------------------------------------------------------------------
@@ -18,13 +18,13 @@ from agency.agdatacollector import agDataCollector, agDataCollectorConfigs
 
 
 def _make_agconfig(db_path, **overrides):
-    configs = agDataCollectorConfigs(db_path=db_path, **overrides)
-    return SimpleNamespace(agDataCollectorConfigs=configs)
+    configs = agDataLoggerConfigs(db_path=db_path, **overrides)
+    return SimpleNamespace(agDataLoggerConfigs=configs)
 
 
-def _make_collector(tmp_path, **overrides):
+def _make_logger(tmp_path, **overrides):
     db_path = str(tmp_path / "agent.db")
-    return agDataCollector(_make_agconfig(db_path, **overrides)), db_path
+    return agDataLogger(_make_agconfig(db_path, **overrides)), db_path
 
 
 def _select_all(db_path, table):
@@ -38,18 +38,18 @@ def _select_all(db_path, table):
 
 
 # ---------------------------------------------------------------------------
-# agDataCollectorConfigs
+# agDataLoggerConfigs
 # ---------------------------------------------------------------------------
 
 
 def test_configs_defaults():
-    configs = agDataCollectorConfigs(db_path="/tmp/does-not-matter.db")
+    configs = agDataLoggerConfigs(db_path="/tmp/does-not-matter.db")
     assert configs.flush_batch_size == 20
     assert configs.flush_interval_s == 1.0
 
 
 def test_configs_explicit_overrides():
-    configs = agDataCollectorConfigs(db_path="/tmp/x.db", flush_batch_size=5, flush_interval_s=0.1)
+    configs = agDataLoggerConfigs(db_path="/tmp/x.db", flush_batch_size=5, flush_interval_s=0.1)
     assert configs.flush_batch_size == 5
     assert configs.flush_interval_s == 0.1
 
@@ -60,7 +60,7 @@ def test_configs_explicit_overrides():
 
 
 def test_init_reads_configs_from_agconfig(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=7, flush_interval_s=1.5)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=7, flush_interval_s=1.5)
     assert dc._configs.db_path == db_path
     assert dc._configs.flush_batch_size == 7
     assert dc._configs.flush_interval_s == 1.5
@@ -77,7 +77,7 @@ def test_init_reads_configs_from_agconfig(tmp_path):
 
 
 def test_set_config_replaces_the_stored_configs_object(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=7)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=7)
     new_agconfig = _make_agconfig(db_path, flush_batch_size=42, flush_interval_s=9.0)
     dc.set_config(new_agconfig)
     assert dc._configs.flush_batch_size == 42
@@ -85,7 +85,7 @@ def test_set_config_replaces_the_stored_configs_object(tmp_path):
 
 
 def test_set_config_changes_flush_threshold_at_runtime(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"n": 1})
     assert _select_all(db_path, "events") == []  # buffered under the old, large threshold
@@ -101,7 +101,7 @@ def test_set_config_changing_db_path_does_not_move_an_open_connection(tmp_path):
     # NOT reopen the connection -- flush() keeps writing to whatever file
     # start() originally opened, even though _configs.db_path now points
     # elsewhere. Documented here rather than silently assumed.
-    dc, original_path = _make_collector(tmp_path)
+    dc, original_path = _make_logger(tmp_path)
     dc.start()
     other_path = str(tmp_path / "other.db")
     dc.set_config(_make_agconfig(other_path))
@@ -121,8 +121,8 @@ def test_set_config_changing_db_path_does_not_move_an_open_connection(tmp_path):
 
 def test_start_creates_parent_directory(tmp_path):
     nested = tmp_path / "a" / "b" / "c"
-    configs = agDataCollectorConfigs(db_path=str(nested / "agent.db"))
-    dc = agDataCollector(SimpleNamespace(agDataCollectorConfigs=configs))
+    configs = agDataLoggerConfigs(db_path=str(nested / "agent.db"))
+    dc = agDataLogger(SimpleNamespace(agDataLoggerConfigs=configs))
     assert not nested.exists()
     dc.start()
     try:
@@ -132,7 +132,7 @@ def test_start_creates_parent_directory(tmp_path):
 
 
 def test_start_enables_wal_mode(tmp_path):
-    dc, _ = _make_collector(tmp_path)
+    dc, _ = _make_logger(tmp_path)
     dc.start()
     try:
         mode = dc._conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -142,7 +142,7 @@ def test_start_enables_wal_mode(tmp_path):
 
 
 def test_start_creates_schema_tables(tmp_path):
-    dc, _ = _make_collector(tmp_path)
+    dc, _ = _make_logger(tmp_path)
     dc.start()
     try:
         tables = {
@@ -154,12 +154,12 @@ def test_start_creates_schema_tables(tmp_path):
 
 
 def test_start_is_safe_against_a_pre_existing_db_file(tmp_path):
-    dc1, db_path = _make_collector(tmp_path)
+    dc1, db_path = _make_logger(tmp_path)
     dc1.start()
     dc1.stop()
 
-    configs = agDataCollectorConfigs(db_path=db_path)
-    dc2 = agDataCollector(SimpleNamespace(agDataCollectorConfigs=configs))
+    configs = agDataLoggerConfigs(db_path=db_path)
+    dc2 = agDataLogger(SimpleNamespace(agDataLoggerConfigs=configs))
     dc2.start()  # CREATE TABLE IF NOT EXISTS must not raise on a reused file
     dc2.stop()
 
@@ -170,13 +170,13 @@ def test_start_is_safe_against_a_pre_existing_db_file(tmp_path):
 
 
 def test_stop_without_start_does_not_raise(tmp_path):
-    dc, _ = _make_collector(tmp_path)
+    dc, _ = _make_logger(tmp_path)
     dc.stop()
     assert dc._conn is None
 
 
 def test_stop_is_idempotent(tmp_path):
-    dc, _ = _make_collector(tmp_path)
+    dc, _ = _make_logger(tmp_path)
     dc.start()
     dc.stop()
     dc.stop()
@@ -184,7 +184,7 @@ def test_stop_is_idempotent(tmp_path):
 
 
 def test_stop_flushes_pending_records(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"n": 1})
     assert _select_all(db_path, "events") == []
@@ -199,7 +199,7 @@ def test_stop_flushes_pending_records(tmp_path):
 
 
 def test_flush_writes_buffered_rows_immediately(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"n": 1})
     dc.record_span("op", 0.0, 1.0, {})
@@ -212,7 +212,7 @@ def test_flush_writes_buffered_rows_immediately(tmp_path):
 
 
 def test_flush_on_empty_buffers_is_a_noop(tmp_path):
-    dc, db_path = _make_collector(tmp_path)
+    dc, db_path = _make_logger(tmp_path)
     dc.start()
     dc.flush()  # nothing buffered -- must not raise or write anything
     assert _select_all(db_path, "events") == []
@@ -220,7 +220,7 @@ def test_flush_on_empty_buffers_is_a_noop(tmp_path):
 
 
 def test_flush_updates_last_flush_ts_even_when_empty(tmp_path):
-    dc, _ = _make_collector(tmp_path)
+    dc, _ = _make_logger(tmp_path)
     dc.start()
     before = dc._last_flush_ts
     time.sleep(0.01)
@@ -235,7 +235,7 @@ def test_flush_updates_last_flush_ts_even_when_empty(tmp_path):
 
 
 def test_record_event_minimal_args_buffers_only(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"a": 1})
     assert len(dc._event_rows) == 1
@@ -251,7 +251,7 @@ def test_record_event_minimal_args_buffers_only(tmp_path):
 
 
 def test_record_event_with_call_label(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"a": 1}, call_label="call-42")
     dc.flush()
@@ -261,7 +261,7 @@ def test_record_event_with_call_label(tmp_path):
 
 
 def test_record_event_timestamps_itself(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     before = time.time()
     dc.record_event("tool", {})
@@ -273,18 +273,18 @@ def test_record_event_timestamps_itself(tmp_path):
 
 
 def test_record_event_do_update_false_does_not_touch_latest_values(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, overwrite=False)
+    dc.record_event("agent_state", {"s": "running"}, update_latest_snapshot=False)
     dc.flush()
     assert _select_all(db_path, "latest_values") == []
     dc.stop()
 
 
 def test_record_event_do_update_true_upserts_latest_values(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, call_label="c1", overwrite=True)
+    dc.record_event("agent_state", {"s": "running"}, call_label="c1", update_latest_snapshot=True)
     dc.flush()
 
     rows = _select_all(db_path, "latest_values")
@@ -292,17 +292,17 @@ def test_record_event_do_update_true_upserts_latest_values(tmp_path):
     assert rows[0]["type"] == "agent_state"
     assert rows[0]["call_label"] == "c1"
     assert json.loads(rows[0]["payload"]) == {"s": "running"}
-    # overwrite doesn't replace the append-only record -- it's in addition to it.
+    # update_latest_snapshot doesn't replace the append-only record -- it's in addition to it.
     assert len(_select_all(db_path, "events")) == 1
     dc.stop()
 
 
 def test_record_event_do_update_overwrites_same_type(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, overwrite=True)
+    dc.record_event("agent_state", {"s": "running"}, update_latest_snapshot=True)
     dc.flush()
-    dc.record_event("agent_state", {"s": "done"}, overwrite=True)
+    dc.record_event("agent_state", {"s": "done"}, update_latest_snapshot=True)
     dc.flush()
 
     rows = _select_all(db_path, "latest_values")
@@ -314,10 +314,10 @@ def test_record_event_do_update_overwrites_same_type(tmp_path):
 
 
 def test_record_event_do_update_different_types_get_separate_slots(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_event("agent_state", {"s": "running"}, overwrite=True)
-    dc.record_event("token_update", {"t": 10}, overwrite=True)
+    dc.record_event("agent_state", {"s": "running"}, update_latest_snapshot=True)
+    dc.record_event("token_update", {"t": 10}, update_latest_snapshot=True)
     dc.flush()
 
     types = {r["type"] for r in _select_all(db_path, "latest_values")}
@@ -331,7 +331,7 @@ def test_record_event_do_update_different_types_get_separate_slots(tmp_path):
 
 
 def test_record_span_minimal_args(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_span("llm:attempt", 10.0, 12.5, {"model": "x"})
     dc.flush()
@@ -339,7 +339,7 @@ def test_record_span_minimal_args(tmp_path):
     rows = _select_all(db_path, "spans")
     assert len(rows) == 1
     r = rows[0]
-    assert r["name"] == "llm:attempt"
+    assert r["span_name"] == "llm:attempt"
     assert r["start_ts"] == 10.0
     assert r["end_ts"] == 12.5
     assert r["cpu_ms"] is None
@@ -352,7 +352,7 @@ def test_record_span_minimal_args(tmp_path):
 
 
 def test_record_span_full_args(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_span(
         "tool:read_file",
@@ -377,7 +377,7 @@ def test_record_span_full_args(tmp_path):
 
 
 def test_record_span_does_not_touch_latest_values(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_span("op", 0.0, 1.0, {})
     dc.flush()
@@ -391,7 +391,7 @@ def test_record_span_does_not_touch_latest_values(tmp_path):
 
 
 def test_record_stream_delta_only_touches_stream_deltas(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_stream_delta("llm_stream_delta", {"text": "hi"}, call_label="c1")
     dc.flush()
@@ -406,7 +406,7 @@ def test_record_stream_delta_only_touches_stream_deltas(tmp_path):
 
 
 def test_finalize_stream_deletes_flushed_deltas_and_appends_events(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
     dc.record_stream_delta("llm_stream_delta", {"text": "i"}, call_label="c1")
@@ -425,7 +425,7 @@ def test_finalize_stream_deletes_flushed_deltas_and_appends_events(tmp_path):
 
 
 def test_finalize_stream_clears_not_yet_flushed_pending_deltas(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
     assert len(dc._stream_delta_rows) == 1
@@ -438,7 +438,7 @@ def test_finalize_stream_clears_not_yet_flushed_pending_deltas(tmp_path):
 
 
 def test_finalize_stream_only_clears_matching_call_label(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
     dc.record_stream_delta("llm_stream_delta", {"text": "x"}, call_label="c2")
@@ -453,7 +453,7 @@ def test_finalize_stream_only_clears_matching_call_label(tmp_path):
 
 
 def test_finalize_stream_writes_one_event_row_per_payload(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.finalize_stream(
         "c1", type="llm_block", payloads=[{"type": "thinking"}, {"type": "text", "text": "hi"}]
@@ -466,7 +466,7 @@ def test_finalize_stream_writes_one_event_row_per_payload(tmp_path):
 
 
 def test_finalize_stream_safe_with_no_prior_deltas(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.finalize_stream("c1", type="llm_block", payloads=[{"type": "text", "text": "hi"}])
     assert len(_select_all(db_path, "events")) == 1
@@ -479,7 +479,7 @@ def test_finalize_stream_safe_with_no_prior_deltas(tmp_path):
 
 
 def test_auto_flush_on_count_threshold(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=3, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=3, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"n": 1})
     dc.record_event("tool", {"n": 2})
@@ -490,7 +490,7 @@ def test_auto_flush_on_count_threshold(tmp_path):
 
 
 def test_auto_flush_on_time_threshold(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=0)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=0)
     dc.start()
     dc.record_event("tool", {"n": 1})  # elapsed-since-start is always >= 0
     assert len(_select_all(db_path, "events")) == 1
@@ -498,7 +498,7 @@ def test_auto_flush_on_time_threshold(tmp_path):
 
 
 def test_no_auto_flush_below_both_thresholds(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     for i in range(50):
         dc.record_event("tool", {"n": i})
@@ -509,7 +509,7 @@ def test_no_auto_flush_below_both_thresholds(tmp_path):
 
 
 def test_mixed_event_and_span_count_toward_the_same_threshold(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=2, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=2, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {})
     assert _select_all(db_path, "events") == []
@@ -525,7 +525,7 @@ def test_mixed_event_and_span_count_toward_the_same_threshold(tmp_path):
 
 
 def test_concurrent_record_calls_are_thread_safe(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=17, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=17, flush_interval_s=1000)
     dc.start()
 
     n_threads = 20
@@ -549,7 +549,7 @@ def test_concurrent_record_calls_are_thread_safe(tmp_path):
 
 
 def test_second_connection_can_read_while_writer_stays_open(tmp_path):
-    dc, db_path = _make_collector(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"n": 1})
     dc.flush()

@@ -19,7 +19,7 @@ def _make_agent():
 
 
 def test_dispatch_pause_command_pauses_named_agent():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
     _dispatch_command({"type": "pause", "agname": ag.agname})
@@ -27,7 +27,7 @@ def test_dispatch_pause_command_pauses_named_agent():
 
 
 def test_dispatch_resume_command_resumes_named_agent():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
     ag.suspend()
@@ -36,7 +36,7 @@ def test_dispatch_resume_command_resumes_named_agent():
 
 
 def test_dispatch_pause_command_ignores_unknown_agname():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
     _dispatch_command({"type": "pause", "agname": "__no_such_agent__"})
@@ -44,7 +44,7 @@ def test_dispatch_pause_command_ignores_unknown_agname():
 
 
 def test_dispatch_pause_all_pauses_every_live_agent():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     a, b = _make_agent(), _make_agent()
     _dispatch_command({"type": "pause_all"})
@@ -53,7 +53,7 @@ def test_dispatch_pause_all_pauses_every_live_agent():
 
 
 def test_dispatch_resume_all_resumes_every_live_agent():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     a, b = _make_agent(), _make_agent()
     a.suspend()
@@ -64,7 +64,7 @@ def test_dispatch_resume_all_resumes_every_live_agent():
 
 
 def test_dispatch_update_config_applies_to_named_agent():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
     _dispatch_command(
@@ -78,7 +78,7 @@ def test_dispatch_update_config_applies_to_named_agent():
 
 
 def test_dispatch_update_config_ignores_unknown_agname():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
     before = ag.agconfig.get("agskill", "react_max_steps")
@@ -93,7 +93,7 @@ def test_dispatch_update_config_ignores_unknown_agname():
 
 
 def test_dispatch_update_config_all_applies_to_every_agent():
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
 
     a, b = _make_agent(), _make_agent()
     _dispatch_command(
@@ -110,7 +110,7 @@ def test_dispatch_update_config_preserves_sandbox_mounts():
     """Webui editor payloads are dynamic_snapshot() only. Replacing the whole
     agconfig would drop agSandbox.mounts; forks after that bake HF weights
     into lifecycle images instead of using the shared host cache bind."""
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
     from agency.agent import agent
     from agency.agconfig import agConfig
     from agency.sandbox.agsandbox import agSandboxConfig
@@ -136,7 +136,7 @@ def test_dispatch_update_config_preserves_sandbox_mounts():
 def test_dispatch_update_config_all_preserves_sandbox_mounts():
     import copy
 
-    from agency.agwebui import _all_agteam_subclasses, _dispatch_command
+    from agency.observability.agwebui import _all_agteam_subclasses, _dispatch_command
     from agency.agent import agent
     from agency.agconfig import agConfig
     from agency.sandbox.agsandbox import agSandboxConfig
@@ -188,7 +188,7 @@ def test_dispatch_update_config_all_mutates_default_agconfig():
     """A bare agent() with no team context falls back to agent.default_agconfig
     -- update_config_all must mutate it in place so a future such agent
     clones fresh data, not just push into agents that already exist."""
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
     from agency.agent import agent
     from agency.agconfig import agConfig
 
@@ -211,7 +211,7 @@ def test_dispatch_update_config_all_mutates_team_class_attr_for_future_construct
     `agconfig = LLM_CONFIG`) must be reached via __subclasses__() and mutated
     in place, so a team constructed AFTER the update clones fresh data --
     not just teams/agents that already exist."""
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
     from agency.agteam import agteam
     from agency.agconfig import agConfig
 
@@ -241,7 +241,7 @@ def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents
     """A team instance that already exists (already cloned its own agconfig
     at construction) must be reached directly, and that update must cascade
     to every agent the team already tracks."""
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
     from agency.agteam import agteam
     from agency.agconfig import agConfig
     from agency.agent import agent as agent_cls
@@ -272,7 +272,7 @@ def test_dispatch_update_config_all_reaches_grandchild_team_class():
     """_all_agteam_subclasses() must recurse -- a team class that subclasses
     another team class (not agteam directly) still has to be reached, since
     __subclasses__() alone only returns direct subclasses."""
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
     from agency.agteam import agteam
     from agency.agconfig import agConfig
 
@@ -309,7 +309,7 @@ def test_dispatch_update_config_all_skips_team_class_with_no_agconfig():
     """A team subclass that never overrides agconfig (still None, inherited
     from the agteam base) must be safely skipped -- not crash, and not
     somehow acquire a config of its own."""
-    from agency.agwebui import _dispatch_command
+    from agency.observability.agwebui import _dispatch_command
     from agency.agteam import agteam
 
     class _CfgAllTeamNoConfig(agteam):
@@ -330,7 +330,7 @@ def test_dispatch_update_config_all_skips_team_class_with_no_agconfig():
 
 
 def test_poll_commands_applies_and_deletes_command_files(tmp_path):
-    from agency.agwebui import _poll_commands
+    from agency.observability.agwebui import _poll_commands
 
     ag = _make_agent()
     cmd_dir = tmp_path / "ui_commands"

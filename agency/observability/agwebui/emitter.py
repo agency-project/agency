@@ -62,18 +62,18 @@ def ansi_to_hex(ansi: str) -> str:
 
 
 class agwebui_emitter:
-    """Publish UI events through the process-wide asynchronous collector."""
+    """Publish UI events through the process-wide asynchronous logger."""
 
     _ASK_TIMEOUT_REPLY = "[no human available — timed out]"
 
     def __init__(self, run_dir: Path) -> None:
-        from ..agcollector import get_global_data_collector
+        from ..aglogger import get_global_data_logger
 
         intended_db_path = run_dir / "agency.sqlite3"
         self._reply_dir = run_dir / "ui_replies"
         self._reply_dir.mkdir(parents=True, exist_ok=True)
-        self._collector = get_global_data_collector(default_db_path=intended_db_path)
-        self._db_path = Path(self._collector.db_path)
+        self._logger = get_global_data_logger(default_db_path=intended_db_path)
+        self._db_path = Path(self._logger.db_path)
 
         pointer = run_dir / "global_data_path.txt"
         pointer_tmp = pointer.with_suffix(".tmp")
@@ -83,13 +83,13 @@ class agwebui_emitter:
     def emit(self, event: dict) -> None:
         """Enqueue one lightweight UI/global event without doing disk I/O."""
         try:
-            self._collector.record_ui_event(event)
+            self._logger.record_ui_event(event)
         except Exception as exc:
             print(f"[agwebui] WARNING: global event publish failed: {exc}")
 
     def _flush_prune(self) -> None:
         """Drain the global writer; retained under the legacy test-helper name."""
-        self._collector.flush(timeout_s=10)
+        self._logger.flush(timeout_s=10)
 
     def log(self, line: str) -> None:
         self.emit({"type": "log", "line": line, "ts": time.time()})
@@ -206,4 +206,4 @@ class agwebui_emitter:
 
     def done(self) -> None:
         self.emit({"type": "done", "ts": time.time()})
-        self._collector.flush(timeout_s=10)
+        self._logger.flush(timeout_s=10)

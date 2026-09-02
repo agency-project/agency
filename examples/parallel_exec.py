@@ -162,6 +162,6 @@ if __name__ == "__main__":
         except AgError as e:
             print(f"\nERROR: {e}")
 
-    from agency.agwebui import agwebui
+    from agency.observability.agwebui import agwebui
 
     agwebui.run(_script, port=8006)

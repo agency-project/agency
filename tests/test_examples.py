@@ -43,7 +43,7 @@ def test_example_runs_live(path):
     # Also reset sys.argv so examples that read sys.argv[1:] (e.g. for an
     # optional topic/image path) don't pick up pytest's own CLI args.
     with (
-        patch("agency.agwebui.agwebui.run", side_effect=lambda fn, *a, **kw: fn()),
+        patch("agency.observability.agwebui.agwebui.run", side_effect=lambda fn, *a, **kw: fn()),
         patch.object(sys, "argv", [str(path)]),
     ):
         runpy.run_path(str(path), run_name="__main__")

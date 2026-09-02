@@ -218,7 +218,7 @@ class _ProcessLifecycleProfiler:
     def for_active_session(
         cls, ag: "agent | None", envp: "dict[str, str]", *, timing: str = "exact"
     ) -> "_ProcessLifecycleProfiler | None":
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         if not agprof.enabled():
             return None
@@ -236,7 +236,7 @@ class _ProcessLifecycleProfiler:
         )
 
     def on_spawn(self, pid: int) -> None:
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         start_perf_ns = time.perf_counter_ns()
         start_wall_ns = time.time_ns()
@@ -306,7 +306,7 @@ class _ProcessLifecycleProfiler:
 
     def finalize(self) -> None:
         """Preserve every still-live process as an interrupted agprof span."""
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         with self._lock:
             if self._finalized:

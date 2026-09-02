@@ -204,7 +204,7 @@ def test_agent_agname_kwarg_accepted():
             pass
 
     team = _T(agconfig=_llm_agconfig(_ECHO_LLM))
-    assert team.ag.agname == "my-custom-agent_0000"
+    assert team.ag.agname == "agent_my-custom-agent_0000"
 
 
 def test_agents_property_returns_copy_not_live_list():

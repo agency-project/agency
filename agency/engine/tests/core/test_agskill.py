@@ -50,7 +50,7 @@ def make_mock_agent(sandbox=None, ping_interval_s=300, poll_interval_s=5):
         # it truthy too (see agtool.py's `not sandbox.persistent and ...`).
         ag.sandbox._has_pending_background_work.return_value = False
         ag.sandbox.persistent = False
-    ag.data_collector = MagicMock()
+    ag.data_logger = MagicMock()
     ag.agname = "test"
     return ag
 

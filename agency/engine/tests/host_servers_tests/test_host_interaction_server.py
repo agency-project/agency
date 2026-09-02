@@ -20,15 +20,21 @@ from agency.harness._syscall_event import agsyscallevent
 # ---------------------------------------------------------------------------
 
 
-class _FakeDataCollector:
+class _FakeDataLogger:
     def __init__(self):
         self.events = []
         self.spans = []
 
     def record_event(
-        self, type, payload, call_label=None, overwrite=False, term_message=None, flush=False
+        self,
+        type,
+        payload,
+        call_label=None,
+        update_latest_snapshot=False,
+        term_message=None,
+        flush=False,
     ):
-        self.events.append((type, payload, call_label, overwrite, term_message, flush))
+        self.events.append((type, payload, call_label, update_latest_snapshot, term_message, flush))
 
     def record_span(
         self,
@@ -61,10 +67,10 @@ def _make_skill(policy=None):
     return SimpleNamespace(policy=policy if policy is not None else agpolicy())
 
 
-def _make_server(policy=None, data_collector=None, invocation=None):
+def _make_server(policy=None, data_logger=None, invocation=None):
     skill = _make_skill(policy)
-    data_collector = data_collector if data_collector is not None else _FakeDataCollector()
-    return HostInteractionServer(skill, data_collector, invocation=invocation)
+    data_logger = data_logger if data_logger is not None else _FakeDataLogger()
+    return HostInteractionServer(skill, data_logger, invocation=invocation)
 
 
 def _make_syscall(
@@ -480,69 +486,61 @@ def test_build_app_check_syscall_route_denies_when_hook_raises():
 # ---------------------------------------------------------------------------
 
 
-def test_record_event_delegates_to_data_collector():
-    collector = _FakeDataCollector()
-    server = _make_server(data_collector=collector)
+def test_record_event_delegates_to_data_logger():
+    logger = _FakeDataLogger()
+    server = _make_server(data_logger=logger)
     server.record_event("warning", {"message": "bad shape"}, call_label="dispatch")
-    assert collector.events == [
-        ("warning", {"message": "bad shape"}, "dispatch", False, None, False)
-    ]
+    assert logger.events == [("warning", {"message": "bad shape"}, "dispatch", False, None, False)]
 
 
 def test_record_event_forwards_term_message_and_flush():
-    collector = _FakeDataCollector()
-    server = _make_server(data_collector=collector)
+    logger = _FakeDataLogger()
+    server = _make_server(data_logger=logger)
     server.record_event(
         "agent_state",
         {"state": "agent_idle"},
-        overwrite=True,
+        update_latest_snapshot=True,
         term_message="[x] idle",
         flush=True,
     )
-    assert collector.events == [
-        ("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True)
-    ]
+    assert logger.events == [("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True)]
 
 
-def test_record_span_delegates_to_data_collector():
-    collector = _FakeDataCollector()
-    server = _make_server(data_collector=collector)
+def test_record_span_delegates_to_data_logger():
+    logger = _FakeDataLogger()
+    server = _make_server(data_logger=logger)
     server.record_span("llm:attempt", 0.0, 1.0, {"model": "x"}, cpu_ms=5.0)
-    assert collector.spans == [
-        ("llm:attempt", 0.0, 1.0, {"model": "x"}, 5.0, None, None, None, None)
-    ]
+    assert logger.spans == [("llm:attempt", 0.0, 1.0, {"model": "x"}, 5.0, None, None, None, None)]
 
 
-def test_build_app_record_event_route_delegates_to_data_collector():
-    collector = _FakeDataCollector()
-    server = _make_server(data_collector=collector)
+def test_build_app_record_event_route_delegates_to_data_logger():
+    logger = _FakeDataLogger()
+    server = _make_server(data_logger=logger)
     client = TestClient(server.build_app())
     response = client.post(
         "/record_event", json={"type": "warning", "payload": {"message": "bad shape"}}
     )
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert collector.events == [("warning", {"message": "bad shape"}, None, False, None, False)]
+    assert logger.events == [("warning", {"message": "bad shape"}, None, False, None, False)]
 
 
 def test_build_app_record_event_route_forwards_term_message_and_flush():
-    collector = _FakeDataCollector()
-    server = _make_server(data_collector=collector)
+    logger = _FakeDataLogger()
+    server = _make_server(data_logger=logger)
     client = TestClient(server.build_app())
     response = client.post(
         "/record_event",
         json={
             "type": "agent_state",
             "payload": {"state": "agent_idle"},
-            "overwrite": True,
+            "update_latest_snapshot": True,
             "term_message": "[x] idle",
             "flush": True,
         },
     )
     assert response.status_code == 200
-    assert collector.events == [
-        ("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True)
-    ]
+    assert logger.events == [("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True)]
 
 
 def test_build_app_has_no_final_attempt_result_callback_route():
@@ -552,9 +550,9 @@ def test_build_app_has_no_final_attempt_result_callback_route():
     assert response.status_code == 404
 
 
-def test_build_app_record_span_route_delegates_to_data_collector():
-    collector = _FakeDataCollector()
-    server = _make_server(data_collector=collector)
+def test_build_app_record_span_route_delegates_to_data_logger():
+    logger = _FakeDataLogger()
+    server = _make_server(data_logger=logger)
     client = TestClient(server.build_app())
     response = client.post(
         "/record_span",
@@ -562,6 +560,4 @@ def test_build_app_record_span_route_delegates_to_data_collector():
     )
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert collector.spans == [
-        ("llm:attempt", 0.0, 1.0, {"model": "x"}, None, None, None, None, None)
-    ]
+    assert logger.spans == [("llm:attempt", 0.0, 1.0, {"model": "x"}, None, None, None, None, None)]

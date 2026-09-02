@@ -45,7 +45,7 @@ def _write_events(db_path: Path, events: list[dict]) -> None:
 @pytest.fixture()
 def server(tmp_path):
     """Yield (TestClient, run_dir, srv_module) with a fresh server state."""
-    import agency.agwebui.server as srv
+    import agency.observability.agwebui.server as srv
     from fastapi.testclient import TestClient
 
     # Snapshot all module-level globals before the app starts
@@ -529,30 +529,28 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
     client, run_dir, _srv = server
     from types import SimpleNamespace
 
-    from agency.agdatacollector import agDataCollector, agDataCollectorConfigs
-    from agency.agwebui.emitter import agwebui_emitter
+    from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+    from agency.observability.agwebui.emitter import agwebui_emitter
 
     agent_path = run_dir / "LateAgent_data.sqlite3"
-    detail_collector = agDataCollector(
-        SimpleNamespace(
-            agDataCollectorConfigs=agDataCollectorConfigs(db_path=str(agent_path))
-        )
+    detail_logger = agDataLogger(
+        SimpleNamespace(agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(agent_path)))
     )
-    detail_collector.start()
-    detail_collector.record_event(
+    detail_logger.start()
+    detail_logger.record_event(
         "agent_config",
         {"agskill": {"react_max_steps": 7}},
-        overwrite=True,
+        update_latest_snapshot=True,
     )
-    detail_collector.record_event(
+    detail_logger.record_event(
         "live_messages",
         {"messages": [{"role": "assistant", "content": "finished"}]},
-        overwrite=True,
+        update_latest_snapshot=True,
         flush=True,
     )
 
     emitter = agwebui_emitter(run_dir)
-    emitter._collector.record_event(
+    emitter._logger.record_event(
         "agent_registered",
         {"db_path": str(agent_path), "team": None},
         source="catalog",
@@ -569,11 +567,9 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
 
     connection = sqlite3.connect(emitter._db_path)
     try:
-        global_types = {
-            row[0] for row in connection.execute("SELECT type FROM events").fetchall()
-        }
+        global_types = {row[0] for row in connection.execute("SELECT type FROM events").fetchall()}
     finally:
         connection.close()
     assert "agent_config" not in global_types
     assert "live_messages" not in global_types
-    detail_collector.stop()
+    detail_logger.stop()

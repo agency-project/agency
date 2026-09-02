@@ -71,12 +71,12 @@ class _FakeSandbox:
         self.events.append("stop")
 
 
-class _FakeDataCollector:
+class _FakeDataLogger:
     def __init__(self):
         self.events = []
 
-    def record_event(self, type, payload, call_label=None, overwrite=False, **_kw):
-        self.events.append((type, payload, call_label, overwrite))
+    def record_event(self, type, payload, call_label=None, update_latest_snapshot=False, **_kw):
+        self.events.append((type, payload, call_label, update_latest_snapshot))
 
 
 class _FakeAgent:
@@ -88,7 +88,7 @@ class _FakeAgent:
         self.harness = "claude_code"
         self.agname = "test-agent"
         self.change_config_calls = []
-        self.data_collector = _FakeDataCollector()
+        self.data_logger = _FakeDataLogger()
 
     def change_config(self, agconfig):
         self.change_config_calls.append(agconfig)

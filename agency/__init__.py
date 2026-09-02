@@ -4,7 +4,7 @@ from .agtype import agtype, agfile, agbinary, agimage, agrawstring, agpath
 from .agschema import agschema
 from .agskill import agskill
 from .agtool import agtool
-from .agdatacollector import agDataCollector, agDataCollectorConfigs
+from .observability.agdatalogger import agDataLogger, agDataLoggerConfigs
 from .agent import agent
 from ._agent_control import AgentDestroyedError
 from ._submission import CloseHandle, Invocation, MessageSubmission, Submission
@@ -21,7 +21,7 @@ from .orchestrator import (
     get_orchestrator,
 )
 from .utils.agutil import sigterm_as_exit
-from .profiler import agprof
+from .observability.profiler import agprof
 
 Agent = agent
 
@@ -39,8 +39,8 @@ __all__ = [
     "AgError",
     "agskill",
     "agtool",
-    "agDataCollector",
-    "agDataCollectorConfigs",
+    "agDataLogger",
+    "agDataLoggerConfigs",
     "agent",
     "Agent",
     "AgentDestroyedError",

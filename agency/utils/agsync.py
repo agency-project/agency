@@ -90,7 +90,7 @@ def _agsync_impl(*targets) -> None:
 
 
 def agsync(*targets) -> None:
-    from ..profiler import agprof
+    from ..observability.profiler import agprof
 
     with agprof.span("agsync:join"):
         return _agsync_impl(*targets)

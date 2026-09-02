@@ -181,6 +181,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from agency.agwebui import agwebui
+    from agency.observability.agwebui import agwebui
 
     agwebui.run(main, port=8007)

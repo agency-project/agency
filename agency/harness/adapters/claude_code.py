@@ -247,7 +247,7 @@ class _ClaudeCodeBackend(agharness_backend):
         max_steps: "int | None",
     ) -> AttemptResult:
         from .. import agharness
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
         from ..ptrace.supervisor import agProxyPtrace
 
         binary = self.binary_path or self._DEFAULT_BINARY

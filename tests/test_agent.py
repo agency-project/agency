@@ -806,8 +806,8 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
 
     import sqlite3
 
-    ag2.data_collector.flush()
-    con = sqlite3.connect(ag2.data_collector._configs.db_path)
+    ag2.data_logger.flush()
+    con = sqlite3.connect(ag2.data_logger._configs.db_path)
     types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
     con.close()
     assert "agent_loaded" in types
@@ -1081,8 +1081,8 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
 def _recorded_event_types(ag) -> list:
     import sqlite3
 
-    ag.data_collector.flush()
-    con = sqlite3.connect(ag.data_collector._configs.db_path)
+    ag.data_logger.flush()
+    con = sqlite3.connect(ag.data_logger._configs.db_path)
     types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
     con.close()
     return types

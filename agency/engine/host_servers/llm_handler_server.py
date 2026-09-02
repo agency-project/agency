@@ -25,7 +25,7 @@ from ...llm.agllm import agllm
 
 if TYPE_CHECKING:
     from ...agconfig import agConfig
-    from ...agdatacollector import agDataCollector
+    from ...observability.agdatalogger import agDataLogger
 
 TRANSIENT_DISPATCH_EXCS = (
     RATE_LIMIT_EXCS + API_CONN_EXCS + API_ERROR_EXCS + (ssl.SSLError, OSError, httpx.TransportError)
@@ -296,13 +296,13 @@ class LlmHandlerServer:
     def __init__(
         self,
         agconfig: "agConfig",
-        data_collector: "agDataCollector",
+        data_logger: "agDataLogger",
         *,
         parent_context=None,
         invocation=None,
         enable_message_overlay: bool = True,
     ) -> None:
-        self._data_collector = data_collector
+        self._data_logger = data_logger
         self._handles: "list[_StreamHandle]" = []
         self._handles_lock = threading.Lock()
         self._stopping = False
@@ -388,17 +388,17 @@ class LlmHandlerServer:
         *,
         abort_event: "threading.Event | None" = None,
     ) -> dict:
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         request, boundary_id, controlled = self._prepare_request(
             request,
             abort_event=abort_event,
         )
         call_label = uuid.uuid4().hex[:12]
-        self._data_collector.record_event(
+        self._data_logger.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
-            overwrite=True,
+            update_latest_snapshot=True,
             flush=True,
             call_label=call_label,
         )
@@ -510,14 +510,14 @@ class LlmHandlerServer:
                     else:
                         complete_failure(error)
                     raise
-                self._data_collector.finalize_stream(call_label, type="llm_block", payloads=blocks)
+                self._data_logger.finalize_stream(call_label, type="llm_block", payloads=blocks)
                 finalized = True
                 return result
         except BaseException as error:
             if not finalized:
                 # Span creation/entry, initial annotation, and other outer
                 # infrastructure failures still cross the post-error control
-                # boundary before their collector label is terminated.
+                # boundary before their logger label is terminated.
                 complete_failure(error)
             raise
 
@@ -539,7 +539,7 @@ class LlmHandlerServer:
         abort_event: "threading.Event | None" = None,
         _handle: "_StreamHandle | None" = None,
     ) -> "_StreamHandle":
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         handle = _handle if _handle is not None else self._new_stream_handle(abort_event)
         if abort_event is not None and handle._cancel_event is not abort_event:
@@ -549,10 +549,10 @@ class LlmHandlerServer:
             abort_event=handle._cancel_event,
         )
         call_label = handle.call_label
-        self._data_collector.record_event(
+        self._data_logger.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
-            overwrite=True,
+            update_latest_snapshot=True,
             flush=True,
             call_label=call_label,
         )
@@ -630,7 +630,7 @@ class LlmHandlerServer:
 
     @staticmethod
     def _spawn_http_worker(target, /, *args, **kwargs) -> "tuple[threading.Thread, Future]":
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         result: Future = Future()
 
@@ -1002,7 +1002,7 @@ class LlmHandlerServer:
         if not completion.invocation_messages:
             return None
 
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         anchor = _history_anchor(
             _history_without_invocation_messages(request.get("messages") or [])
@@ -1141,14 +1141,14 @@ class LlmHandlerServer:
             raise _DispatchError(_INVOCATION_CANCELLED_MESSAGE, status_code=409, transient=False)
 
     def _finalize_error(self, call_label: "str | None", error: BaseException) -> None:
-        self._data_collector.finalize_stream(
+        self._data_logger.finalize_stream(
             call_label,
             type="llm_stream_error",
             payloads=[{"error": f"{type(error).__name__}: {error}"}],
         )
 
     def _finalize_cancelled(self, call_label: "str | None") -> None:
-        self._data_collector.finalize_stream(
+        self._data_logger.finalize_stream(
             call_label,
             type="llm_stream_cancelled",
             payloads=[{"cancelled": True}],
@@ -1167,7 +1167,7 @@ class LlmHandlerServer:
         controlled: bool,
         handle: "_StreamHandle",
     ) -> None:
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         finalized = False
 
@@ -1189,7 +1189,7 @@ class LlmHandlerServer:
             nonlocal finalized
             if finalized:
                 return
-            self._data_collector.finalize_stream(
+            self._data_logger.finalize_stream(
                 handle.call_label,
                 type="llm_block",
                 payloads=payloads,
@@ -1344,7 +1344,7 @@ class LlmHandlerServer:
                     for stream_item in itertools.chain([first_item], stream_iter):
                         if handle._cancel_event.is_set():
                             break
-                        self._data_collector.record_stream_delta(
+                        self._data_logger.record_stream_delta(
                             type="llm_stream_delta",
                             payload=stream_item,
                             call_label=handle.call_label,
@@ -1491,7 +1491,7 @@ class LlmHandlerServer:
                 terminal_error = e
                 # Failures in profiling or transcript setup still cross the
                 # post-error control boundary before waking ``first()`` and
-                # durably terminating the collector call label.
+                # durably terminating the logger call label.
                 try:
                     completed = self._complete_failed_model_request(
                         boundary_id,

@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 
-from agency.agwebui.emitter import agwebui_emitter, ansi_to_hex, _xterm256_hex
+from agency.observability.agwebui.emitter import agwebui_emitter, ansi_to_hex, _xterm256_hex
 
 
 def _events(emitter: agwebui_emitter) -> list[dict]:
@@ -112,9 +112,7 @@ def test_detailed_agent_emitters_do_not_enter_global_database(tmp_path):
     try:
         table_names = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
     finally:
         connection.close()
@@ -144,9 +142,7 @@ def test_ask_human_returns_reply_and_removes_file(tmp_path):
 
 def test_ask_human_timeout_is_reported(tmp_path):
     emitter = agwebui_emitter(tmp_path)
-    assert emitter.ask_human("a", "ask-2", "Continue?", timeout_s=0) == (
-        emitter._ASK_TIMEOUT_REPLY
-    )
+    assert emitter.ask_human("a", "ask-2", "Continue?", timeout_s=0) == (emitter._ASK_TIMEOUT_REPLY)
     assert [event["type"] for event in _events(emitter)] == [
         "ask_human",
         "human_reply",

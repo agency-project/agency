@@ -1,13 +1,13 @@
-"""agency.profiler — the framework's profiling subsystem.
+"""agency.observability.profiler — the framework's profiling subsystem.
 
 `agprof` is the profiling switch + span API (OpenTelemetry backend; see the
 module documentation for usage).
 
 Import styles supported:
 
-    from agency import agprof              # re-exported at package root
-    from agency.profiler import agprof     # explicit
-    from agency.profiler import span, session, workload, enabled  # direct API
+    from agency import agprof                            # re-exported at package root
+    from agency.observability.profiler import agprof      # explicit
+    from agency.observability.profiler import span, session, workload, enabled  # direct API
 """
 
 from . import agprof

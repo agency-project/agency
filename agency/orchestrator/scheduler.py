@@ -95,7 +95,7 @@ class ExecutionScheduler:
             if transitioned or producers_changed:
                 self.set_agent_blocked(pending_exec)
             if transitioned or dependencies_changed:
-                owner._publish_request_locked(
+                owner._record_request_event(
                     "request_blocked",
                     pending_exec,
                     {"dependency_count": len(dependencies)},
@@ -130,7 +130,7 @@ class ExecutionScheduler:
                     "queued",
                     skill=owner._request_label(pending_exec),
                 )
-            owner._publish_request_locked("request_ready", pending_exec, {})
+            owner._record_request_event("request_ready", pending_exec, {})
 
     def default_schedule(self) -> None:
         """Launch every eligible ready request allowed by current capacity."""

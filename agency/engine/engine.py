@@ -5,7 +5,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from ..harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
-from ..profiler import agprof
+from ..observability.profiler import agprof
 from ..sandbox.agsandbox import agSandbox
 from .harness_daemon_launcher import ensure_harness_daemon
 from .host_servers.host_server_manager import HostServerManager
@@ -213,10 +213,10 @@ class AgentEngine:
     ) -> "agdata":
         """Run host services and the sandbox-side harness while locked."""
 
-        self._agent.data_collector.record_event(
+        self._agent.data_logger.record_event(
             type="agent_state",
             payload={"state": "running_harness"},
-            overwrite=True,
+            update_latest_snapshot=True,
             flush=True,
         )
 

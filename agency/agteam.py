@@ -3,11 +3,10 @@ import functools
 import weakref
 from concurrent.futures import Future
 from contextvars import ContextVar
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .agconfig import agConfig
-from .profiler import agprof
+from .observability.profiler import agprof
 
 if TYPE_CHECKING:
     from .agent import agent as _Agent
@@ -96,28 +95,19 @@ class agteam:
         parent = _active_team.get(None)
         self._parent_team: "agteam | None" = parent
 
-        from .agent import agent as _Agent
-        from .agcollector import get_global_data_collector, resolve_global_db_path
-        from .utils.agutil import _DEFAULT_LOG_DIR
+        from .orchestrator import get_orchestrator
         from .agname import agname as _agname
 
         _base = config.get("name") or f"{type(self).__name__}"
-        self.team_name: str = _agname.allocate_agname(_base)
+        self.team_name: str = _agname.allocate_agname(_base, prefix="team")
         parent_team_name = parent.team_name if parent is not None else None
-        log_dir = Path(_Agent.log_dir) if _Agent.log_dir is not None else _DEFAULT_LOG_DIR
 
-        global_collector = get_global_data_collector(
-            self.agconfig,
-            default_db_path=resolve_global_db_path(log_dir),
-        )
-        self.data_collector = global_collector.scoped(
-            source="team",
-            scope_key=self.team_name,
-            attributes={"team": self.team_name},
-        )
-        self.data_collector.record_event(
+        self.data_logger = get_orchestrator(self.agconfig).data_logger
+        self.data_logger.record_event(
             type="team_created",
             payload={"team": self.team_name, "parent_team": parent_team_name},
+            name=self.team_name,
+            object="agteam",
             term_message=f"[{self.team_name}] CREATED  parent={parent_team_name}",
         )
 
@@ -127,10 +117,12 @@ class agteam:
         finally:
             _active_team.reset(token)
 
-        self.data_collector.record_event(
+        self.data_logger.record_event(
             type="team_registered",
             payload={"team_name": self.team_name, "agents": [a.agname for a in self._agents]},
-            overwrite=True,
+            name=self.team_name,
+            object="agteam",
+            update_latest_snapshot=True,
         )
 
     # ------------------------------------------------------------------
@@ -204,9 +196,11 @@ def _wrap_run(cls) -> None:
                 future.set_result(result if isinstance(result, agdata) else agdata(result=result))
             except Exception as exc:
                 tb = traceback.format_exc()
-                self.data_collector.record_event(
+                self.data_logger.record_event(
                     type="team_run_failed",
                     payload={"team": self.team_name, "traceback": tb},
+                    name=self.team_name,
+                    object="agteam",
                     term_message=tb,
                 )
                 future.set_exception(exc)

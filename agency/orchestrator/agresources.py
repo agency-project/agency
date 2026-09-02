@@ -13,11 +13,11 @@ from ..utils.agutil import (
     detect_gpus,
     detect_memory_mb,
 )
-from ..profiler import agprof
+from ..observability.profiler import agprof
 from ..agconfig import agConfig, _AgConfigViewBase
 
 if TYPE_CHECKING:
-    from ..agcollector import GlobalDomainCollector
+    from ..observability.agdatalogger import agDataLogger
 
 
 class agResourcePoolConfig(_AgConfigViewBase):
@@ -91,7 +91,7 @@ class agResourcePool(_AgResourcePoolFields):
         idle_memory: str | None = None,
         mark_gpus: bool = False,
         agconfig: "agConfig | None" = None,
-        data_collector: "GlobalDomainCollector | None" = None,
+        data_logger: "agDataLogger | None" = None,
     ) -> None:
         self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
         for _name, _value in (
@@ -128,9 +128,9 @@ class agResourcePool(_AgResourcePoolFields):
         # Composed in by the owner (GlobalAgentOrchestrator constructs both
         # eagerly and wires this one in) -- optional so a standalone pool
         # (tests, ad-hoc scripts) can skip resource-usage logging entirely
-        # rather than needing a real collector just to exercise allocation
+        # rather than needing a real logger just to exercise allocation
         # logic.
-        self._data_collector = data_collector
+        self._data_logger = data_logger
         if mark_gpus and self.gpus:
             import multiprocessing
 
@@ -316,7 +316,7 @@ class agResourcePool(_AgResourcePoolFields):
         )
 
     def _emit_resource(self) -> None:
-        dc = self._data_collector
+        dc = self._data_logger
         if dc is None:
             return
         dc.record_event(
@@ -329,20 +329,24 @@ class agResourcePool(_AgResourcePoolFields):
                 "memory_acquired_mb": self.memory_acquired_mb,
                 "memory_total_mb": self.total_memory_mb,
             },
-            overwrite=True,
+            name="resource_pool",
+            object="resource_pool",
+            update_latest_snapshot=True,
         )
 
     def _update_resource_log(
         self, *, who: "str | None" = None, action: "str | None" = None, **request
     ) -> None:
-        dc = self._data_collector
+        dc = self._data_logger
         if dc is None:
             return
         self._emit_resource()
         dc.record_event(
             type="resource_request",
             payload={"who": who, "action": action, "request": request or None},
-            overwrite=False,
+            name="resource_pool",
+            object="resource_pool",
+            update_latest_snapshot=False,
         )
 
     def __repr__(self) -> str:

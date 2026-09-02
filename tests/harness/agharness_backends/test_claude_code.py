@@ -167,7 +167,7 @@ def test_run_attempt_enables_exact_claude_hooks_only_while_profiling(_patch_whic
 
     with (
         patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls,
-        patch("agency.profiler.agprof.enabled", return_value=True),
+        patch("agency.observability.profiler.agprof.enabled", return_value=True),
     ):
         ptrace_cls.return_value.launch.side_effect = fake_launch
         _run_attempt(backend, ag, harness_base_url="http://harness.local", token="tok-1")

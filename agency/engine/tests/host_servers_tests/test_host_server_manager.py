@@ -14,7 +14,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from agency.agconfig import agConfig
-from agency.agdatacollector import agDataCollector, agDataCollectorConfigs
+from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.host_servers import host_server_manager as manager_mod
@@ -25,19 +25,19 @@ from agency.engine.host_servers.host_server_manager import (
     _AttemptFenceMiddleware,
 )
 from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
-from agency.profiler import agprof
+from agency.observability.profiler import agprof
 
 
 def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code"):
     configs = HostServerManagerConfigs(uds_path=str(tmp_path / "host.sock"))
-    data_collector_configs = agDataCollectorConfigs(db_path=str(tmp_path / "agent.db"))
+    data_logger_configs = agDataLoggerConfigs(db_path=str(tmp_path / "agent.db"))
     agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
     agconfig.HostServerManagerConfigs = configs
-    agconfig.agDataCollectorConfigs = data_collector_configs
+    agconfig.agDataLoggerConfigs = data_logger_configs
     agent = SimpleNamespace(
         agconfig=agconfig,
         harness=harness,
-        data_collector=agDataCollector(agconfig),
+        data_logger=agDataLogger(agconfig),
     )
     sandbox = SimpleNamespace()
     skill = SimpleNamespace(
@@ -59,11 +59,11 @@ def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code")
     )
 
 
-def test_construction_uses_the_agents_own_data_collector(tmp_path):
+def test_construction_uses_the_agents_own_data_logger(tmp_path):
     manager, agent, _ = _make_manager(tmp_path)
 
     assert manager._configs.uds_path.endswith(".sock")
-    assert manager._data_collector is agent.data_collector
+    assert manager._data_logger is agent.data_logger
 
 
 def test_construction_wires_skill_into_interaction_server(tmp_path):
@@ -384,11 +384,11 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     uds_path = f"/tmp/hsm_test_{suffix}.sock"
     db_path = f"/tmp/hsm_test_{suffix}.db"
     configs = HostServerManagerConfigs(uds_path=uds_path)
-    data_collector_configs = agDataCollectorConfigs(db_path=db_path)
+    data_logger_configs = agDataLoggerConfigs(db_path=db_path)
     agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
     agconfig.HostServerManagerConfigs = configs
-    agconfig.agDataCollectorConfigs = data_collector_configs
-    agent = SimpleNamespace(agconfig=agconfig, data_collector=agDataCollector(agconfig))
+    agconfig.agDataLoggerConfigs = data_logger_configs
+    agent = SimpleNamespace(agconfig=agconfig, data_logger=agDataLogger(agconfig))
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())
     resource_pool = SimpleNamespace()

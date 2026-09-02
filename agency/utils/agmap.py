@@ -47,7 +47,7 @@ from typing import Callable
 
 from ..agdata import agdata, agerror
 from .agutil import format_exception
-from ..profiler import agprof
+from ..observability.profiler import agprof
 
 
 class agtask(agdata):

@@ -19,7 +19,7 @@ agent.
     construction time, so `cfg` and `ag.agconfig` are independent copies --
     mutating `cfg` after `agent(agconfig=cfg)` no longer reaches `ag`.
     `ag.change_config(new_cfg)` replaces `ag.agconfig` and pushes a fresh
-    clone down through `ag.log`, `ag.data_collector`, and `ag.sandbox` -- no
+    clone down through `ag.log`, `ag.data_logger`, and `ag.sandbox` -- no
     new agent, no sandbox teardown. The LLM dispatch itself (inside the
     harness daemon) reads `ag.agconfig` fresh on every skill execution, so
     it picks up the change on the very next call with nothing further to push.
@@ -136,6 +136,6 @@ def main():
 
 
 if __name__ == "__main__":
-    from agency.agwebui import agwebui
+    from agency.observability.agwebui import agwebui
 
     agwebui.run(main, port=8003)

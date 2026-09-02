@@ -25,7 +25,7 @@ def _llm_config_snapshot(agconfig: "agConfig") -> dict:
 
 from .agdata import agdata
 from .agcontext import agcontext
-from .agdatacollector import agDataCollector, agDataCollectorConfigs, _ts
+from .observability.agdatalogger import agDataLogger, agDataLoggerConfigs, _ts
 from .orchestrator import get_orchestrator
 from .sandbox.agsandbox import agSandbox, agSandboxConfig
 from .sandbox import agSandboxBackendConfig
@@ -33,7 +33,7 @@ from .llm.agllm import agllm
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
-from .profiler import agprof
+from .observability.profiler import agprof
 from ._agent_control import AgentControl
 from ._submission import CloseHandle, Invocation, MessageSubmission, Submission
 
@@ -175,7 +175,7 @@ class agent:
             _src_agconfig.clone() if _src_agconfig is not None else None
         )  # [REFACTOR] Should use a single setter method, also no default agconfig
 
-        self.agname: _agname = _agname.allocate_agname(agname)
+        self.agname: _agname = _agname.allocate_agname(agname, prefix="agent")
         self._parent_agent_id: "str | None" = (
             None  # [REFACTOR]  Why do we need to keep reference of parent agent id?
         )
@@ -210,7 +210,7 @@ class agent:
             term_message=(
                 f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}{team_tag}"
             ),
-            reuse_data_collector_configs=True,
+            reuse_data_logger_configs=True,
         )
 
     def _finish_construction(
@@ -219,27 +219,27 @@ class agent:
         event_type: str,
         event_payload: dict,
         term_message: str,
-        reuse_data_collector_configs: bool = False,
+        reuse_data_logger_configs: bool = False,
     ) -> None:
-        """Shared tail of _initialize()/fork()/load(): data collector setup,
+        """Shared tail of _initialize()/fork()/load(): data logger setup,
         initial runtime state, live registry, and the construction-event log
         -- everything that only needs agname/agconfig already resolved,
         regardless of how they were resolved."""
         _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
 
-        data_collector_configs = (
-            self.agconfig.__dict__.get("agDataCollectorConfigs")
-            if reuse_data_collector_configs
-            else None
+        data_logger_configs = (
+            self.agconfig.__dict__.get("agDataLoggerConfigs") if reuse_data_logger_configs else None
         )
-        if data_collector_configs is None:
-            self.agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
+        if data_logger_configs is None:
+            self.agconfig.agDataLoggerConfigs = agDataLoggerConfigs(
                 db_path=str(log_dir / f"{self.agname}_data.sqlite3")
             )
-        self.data_collector = agDataCollector(self.agconfig)
-        self.data_collector.start()
-        from .agcollector import resolve_global_db_path
+        self.data_logger = agDataLogger(
+            self.agconfig, default_name=str(self.agname), default_object="agent"
+        )
+        self.data_logger.start()
+        from .observability.agdatalogger import resolve_global_db_path
 
         self._orchestrator = get_orchestrator(
             self.agconfig,
@@ -265,7 +265,7 @@ class agent:
         self._current_state = "agent_idle"
         _live_agents.add(self)
 
-        self.data_collector.record_event(
+        self.data_logger.record_event(
             type=event_type, payload=event_payload, term_message=term_message
         )
         self._register_global_catalog(event_payload.get("team"))
@@ -275,14 +275,13 @@ class agent:
     def _register_global_catalog(self, team_name: "str | None") -> None:
         """Publish only agent identity and its detailed database location globally."""
         try:
-            agent_db_path = Path(self.data_collector._configs.db_path)
-            self._orchestrator.data_collector.record_event(
+            agent_db_path = Path(self.data_logger._configs.db_path)
+            self._orchestrator.data_logger.record_event(
                 "agent_registered",
                 {"db_path": str(agent_db_path.resolve()), "team": team_name},
-                source="catalog",
-                agname=str(self.agname),
-                scope_key=str(self.agname),
-                overwrite=True,
+                name=str(self.agname),
+                object="agent",
+                update_latest_snapshot=True,
             )
         except Exception as exc:
             print(f"[agent] WARNING: global catalog registration failed for {self.agname}: {exc}")
@@ -336,7 +335,7 @@ class agent:
                 return
             self._cleanup_done = True
         try:
-            self.data_collector.record_event(
+            self.data_logger.record_event(
                 type="agent_destroyed",
                 payload={"agname": self.agname},
                 term_message=f"[{self.agname}] DESTROYED",
@@ -350,24 +349,24 @@ class agent:
             except Exception as exc:
                 print(f"[agent] WARNING: sandbox cleanup failed for {self.agname}: {exc}")
         try:
-            self.data_collector.stop()
+            self.data_logger.stop()
         except Exception as exc:
-            print(f"[agent] WARNING: collector cleanup failed for {self.agname}: {exc}")
+            print(f"[agent] WARNING: logger cleanup failed for {self.agname}: {exc}")
         self._control.mark_destroyed()
         self._close_handle._settle()
 
     def change_config(self, agconfig: "agConfig") -> None:
         with self._operation_lease("change config"):
             self.agconfig = agconfig.clone()
-            self.data_collector.set_config(self.agconfig)
+            self.data_logger.set_config(self.agconfig)
             if self.sandbox is not None:
                 self.sandbox.change_config(self.agconfig)
             if self.engine is not None:
                 self.engine.set_config(self.agconfig)
-            self.data_collector.record_event(
+            self.data_logger.record_event(
                 type="agent_config",
                 payload=self.agconfig.dynamic_snapshot(),
-                overwrite=True,
+                update_latest_snapshot=True,
             )
 
     def get_config_copy(self) -> "agConfig | None":
@@ -426,10 +425,10 @@ class agent:
         self, state: str, skill: "str | None" = None, tool: "str | None" = None
     ) -> None:
         self._current_state = state
-        self.data_collector.record_event(
+        self.data_logger.record_event(
             type="agent_state",
             payload={"state": state, "skill": skill, "tool": tool},
-            overwrite=True,
+            update_latest_snapshot=True,
             flush=True,
         )
 
@@ -468,7 +467,7 @@ class agent:
     def suspend(self) -> None:
         """Close the independent agent-wide scheduler/execution gate."""
         self._orchestrator.suspend_agent(self)
-        self.data_collector.record_event(
+        self.data_logger.record_event(
             type="agent_suspend_requested",
             payload={"agname": self.agname},
             term_message=f"[{self.agname}] SUSPEND ▶  requested",
@@ -477,7 +476,7 @@ class agent:
     def resume(self) -> None:
         """Reopen only the agent-wide suspension gate."""
         self._orchestrator.resume_agent(self)
-        self.data_collector.record_event(
+        self.data_logger.record_event(
             type="agent_resumed",
             payload={"agname": self.agname},
             term_message=f"[{self.agname}] SUSPEND ✓  resumed",
@@ -489,7 +488,7 @@ class agent:
         if first:
             _live_agents.discard(self)
             try:
-                self.data_collector.record_event(
+                self.data_logger.record_event(
                     type="agent_destroying",
                     payload={"agname": self.agname},
                     term_message=f"[{self.agname}] DESTROY ▶  cleanup scheduled",
@@ -571,13 +570,13 @@ class agent:
         via agSandbox.__del__ once this agent's reference to it is gone."""
         _live_agents.discard(self)
         try:
-            self.data_collector.record_event(
+            self.data_logger.record_event(
                 type="agent_state",
                 payload={"state": "agent_exit"},
-                overwrite=True,
+                update_latest_snapshot=True,
                 flush=True,
             )
-            self.data_collector.record_event(
+            self.data_logger.record_event(
                 type="agent_destroyed",
                 payload={"agname": self.agname},
                 term_message=f"[{self.agname}] DESTROYED",
@@ -599,7 +598,7 @@ class agent:
     def _fork_leased(cls, src: "agent", agname: str | None = None) -> "agent":
         """Construct a fork while the source agent's resources are leased."""
         ag: agent = cls.__new__(cls)
-        ag.agname = _agname.allocate_agname(agname)
+        ag.agname = _agname.allocate_agname(agname, prefix="agent")
         ag._parent_agent_id = str(src.agname)
         # Cloned so the fork's own agconfig is independent of src's -- see
         # the matching comment in __init__.
@@ -679,7 +678,7 @@ class agent:
 
             if agname in live_names:
                 existing = live_names[agname]
-                existing.data_collector.record_event(
+                existing.data_logger.record_event(
                     type="agent_load_skipped",
                     payload={"agname": agname, "ckpt": ckpt.name},
                     term_message=(
@@ -712,7 +711,7 @@ class agent:
                 checkpoint_context = self.context
 
         if checkpoint_context.is_pending():
-            self.data_collector.record_event(
+            self.data_logger.record_event(
                 type="agent_checkpoint_waiting",
                 payload={"agname": self.agname},
                 term_message=f"[{self.agname}] CKPT ⏳  waiting for in-flight task to complete...",
@@ -776,7 +775,7 @@ class agent:
                 tar.addfile(info, io.BytesIO(state_bytes))
 
         size_kb = path.stat().st_size // 1024
-        self.data_collector.record_event(
+        self.data_logger.record_event(
             type="agent_saved",
             payload={"agname": self.agname, "path": str(path), "size_kb": size_kb},
             term_message=f"[{self.agname}] CKPT ✓   saved → {path}  ({size_kb} KB)",

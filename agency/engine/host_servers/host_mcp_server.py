@@ -13,7 +13,7 @@ from ...agdata import agdata
 if TYPE_CHECKING:
     from starlette.applications import Starlette
 
-    from ...agdatacollector import agDataCollector
+    from ...observability.agdatalogger import agDataLogger
     from ...orchestrator.agresources import agResourcePool
     from ...agskill import agskill
     from ...agtool import agtool
@@ -26,12 +26,12 @@ class HostMcpServer:
         sandbox: "agSandbox",
         skill: "agskill",
         resource_pool: "agResourcePool",
-        data_collector: "agDataCollector",
+        data_logger: "agDataLogger",
     ) -> None:
         self._sandbox = sandbox
         self._skill = skill
         self._resource_pool = resource_pool
-        self._data_collector = data_collector
+        self._data_logger = data_logger
         self._persistent_vars: "dict[str, object]" = {}
         self._mcp_server: "MCPServer | None" = None
 
@@ -40,10 +40,10 @@ class HostMcpServer:
         required = set((tool.params or {}).get("required", list(properties.keys())))
 
         def call_tool(**kwargs: "object") -> dict:
-            self._data_collector.record_event(
+            self._data_logger.record_event(
                 type="agent_state",
                 payload={"state": "running_tools", "tool": tool.name},
-                overwrite=True,
+                update_latest_snapshot=True,
                 flush=True,
             )
             persistent = {

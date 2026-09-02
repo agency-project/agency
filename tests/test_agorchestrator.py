@@ -16,7 +16,7 @@ from agency.agdata import agdata, agerror
 from agency.agent import agent
 from agency.orchestrator import agOrchestratorConfig, get_orchestrator
 from agency.orchestrator.scheduler import ExecutionScheduler
-from agency.profiler import agprof
+from agency.observability.profiler import agprof
 from agency.agskill import agskill
 from agency.engine import AgentEngine
 
@@ -509,12 +509,12 @@ def test_profiler_adapter_persists_intervals_to_global_database(monkeypatch, tmp
     dependency.set_result(agdata(value=1))
     assert result.ok is True
     orchestrator = get_orchestrator()
-    orchestrator.flush(timeout_s=2)
+    orchestrator.flush()
 
-    connection = sqlite3.connect(orchestrator.data_collector.db_path)
+    connection = sqlite3.connect(orchestrator.data_logger.db_path)
     try:
         rows = connection.execute(
-            "SELECT name,agname,request_id,skill,attributes FROM spans ORDER BY id"
+            "SELECT span_name,name,object,attributes FROM spans ORDER BY id"
         ).fetchall()
     finally:
         connection.close()
@@ -526,17 +526,19 @@ def test_profiler_adapter_persists_intervals_to_global_database(monkeypatch, tmp
         "request:submission_to_completion",
     } <= names
     assert all(row[1] == str(ag.agname) for row in rows)
-    assert all(row[2] == "run0" for row in rows)
-    assert all(row[3] == "profiled" for row in rows)
-    assert all(json.loads(row[4])["request_kind"] == "skill" for row in rows)
+    assert all(row[2] == "agent" for row in rows)
+    attrs = [json.loads(row[3]) for row in rows]
+    assert all(a["request_kind"] == "skill" for a in attrs)
+    assert all(a["request_id"] == "run0" for a in attrs)
+    assert all(a["skill"] == "profiled" for a in attrs)
 
 
-def test_agents_keep_separate_data_collectors(tmp_path):
+def test_agents_keep_separate_data_loggers(tmp_path):
     first = _agent(tmp_path)
     second = _agent(tmp_path)
 
-    first_path = Path(first.data_collector._configs.db_path)
-    second_path = Path(second.data_collector._configs.db_path)
+    first_path = Path(first.data_logger._configs.db_path)
+    second_path = Path(second.data_logger._configs.db_path)
     assert first_path != second_path
     assert first_path.name == f"{first.agname}_data.sqlite3"
     assert second_path.name == f"{second.agname}_data.sqlite3"

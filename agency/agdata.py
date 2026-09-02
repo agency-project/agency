@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
-from .profiler import agprof
+from .observability.profiler import agprof
 from .agtype import agtype
 from .utils.agutil import _camel_to_snake
 

@@ -8,8 +8,8 @@ from contextlib import contextmanager
 
 import pytest
 
-from agency.profiler import agprof
-from agency.profiler import agprof_trace
+from agency.observability.profiler import agprof
+from agency.observability.profiler import agprof_trace
 
 
 def test_complete_summary_includes_per_process_workload_and_gpu_metrics(monkeypatch):
@@ -1180,7 +1180,7 @@ def test_default_and_invalid_scopes_do_not_autostart(monkeypatch, scope):
 
 
 def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
-    import agency.agwebui as agwebui_module
+    import agency.observability.agwebui as agwebui_module
 
     events = []
 

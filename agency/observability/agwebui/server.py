@@ -4,7 +4,7 @@ No agency imports — this process is completely isolated from the execution
 process.  It polls the global agency.sqlite3 event stream and reads selected agent databases on demand.
 Run via:
 
-    python -m agency.agwebui.server --run-dir <path> --port 7860
+    python -m agency.observability.agwebui.server --run-dir <path> --port 7860
 """
 
 from __future__ import annotations
@@ -263,21 +263,16 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
         }
         if "live_messages" not in latest:
             row = con.execute(
-                "SELECT payload FROM events WHERE type='skill_call' "
-                "ORDER BY id DESC LIMIT 1"
+                "SELECT payload FROM events WHERE type='skill_call' ORDER BY id DESC LIMIT 1"
             ).fetchone()
             if row:
                 skill_call = _json_object(row[0])
-                latest["live_messages"] = {
-                    "messages": skill_call.get("history_delta", [])
-                }
+                latest["live_messages"] = {"messages": skill_call.get("history_delta", [])}
         event_rows = con.execute(
-            "SELECT type,timestamp,call_label,payload FROM events "
-            "ORDER BY id DESC LIMIT 500"
+            "SELECT type,timestamp,call_label,payload FROM events ORDER BY id DESC LIMIT 500"
         ).fetchall()
         span_rows = con.execute(
-            "SELECT name,start_ts,end_ts,attributes FROM spans "
-            "ORDER BY id DESC LIMIT 500"
+            "SELECT name,start_ts,end_ts,attributes FROM spans ORDER BY id DESC LIMIT 500"
         ).fetchall()
     except Exception as exc:
         return {"error": f"agent database read failed: {exc}", "agname": agname}

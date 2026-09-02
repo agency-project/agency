@@ -15,13 +15,13 @@ from typing import Callable
 
 
 @dataclass(frozen=True)
-class _CollectorRecord:
+class _LoggerRecord:
     kind: str
     sequence: int
     data: dict
 
 
-class GlobalDataCollector:
+class GlobalDataLogger:
     """Process-wide live-state hub with one asynchronous SQLite writer.
 
     Publishers never execute SQLite statements. They update the small in-memory
@@ -62,7 +62,7 @@ class GlobalDataCollector:
     def start(self) -> None:
         with self._start_lock:
             if self._stopping or self._stopped:
-                raise RuntimeError("global data collector is shut down")
+                raise RuntimeError("global data logger is shut down")
             if self._started:
                 return
             try:
@@ -86,8 +86,8 @@ class GlobalDataCollector:
 
     def scoped(
         self, *, source: str, scope_key: str, attributes: "dict | None" = None
-    ) -> "GlobalDomainCollector":
-        return GlobalDomainCollector(
+    ) -> "GlobalDomainLogger":
+        return GlobalDomainLogger(
             self,
             source=source,
             scope_key=scope_key,
@@ -117,7 +117,7 @@ class GlobalDataCollector:
         immutable_payload = copy.deepcopy(payload)
         with self._publish_lock:
             if self._stopping or self._stopped:
-                raise RuntimeError("global data collector is shut down")
+                raise RuntimeError("global data logger is shut down")
             with self._state_lock:
                 self._sequence += 1
                 sequence = self._sequence
@@ -134,7 +134,7 @@ class GlobalDataCollector:
                 "payload": immutable_payload,
                 "overwrite": overwrite,
             }
-            self._queue.put(("record", _CollectorRecord("event", sequence, event)))
+            self._queue.put(("record", _LoggerRecord("event", sequence, event)))
         if flush:
             self.flush()
         return sequence
@@ -164,7 +164,7 @@ class GlobalDataCollector:
         immutable_attributes = copy.deepcopy(attributes)
         with self._publish_lock:
             if self._stopping or self._stopped:
-                raise RuntimeError("global data collector is shut down")
+                raise RuntimeError("global data logger is shut down")
             with self._state_lock:
                 self._sequence += 1
                 sequence = self._sequence
@@ -184,7 +184,7 @@ class GlobalDataCollector:
                 "call_label": call_label,
                 "attributes": immutable_attributes,
             }
-            self._queue.put(("record", _CollectorRecord("span", sequence, span)))
+            self._queue.put(("record", _LoggerRecord("span", sequence, span)))
         if flush:
             self.flush()
         return sequence
@@ -201,12 +201,12 @@ class GlobalDataCollector:
         immutable_event = copy.deepcopy(event)
         with self._publish_lock:
             if self._stopping or self._stopped:
-                raise RuntimeError("global data collector is shut down")
+                raise RuntimeError("global data logger is shut down")
             with self._state_lock:
                 self._sequence += 1
                 sequence = self._sequence
             immutable_event["sequence"] = sequence
-            self._queue.put(("record", _CollectorRecord("ui_event", sequence, immutable_event)))
+            self._queue.put(("record", _LoggerRecord("ui_event", sequence, immutable_event)))
         return sequence
 
     def update_runtime(self, snapshot: dict) -> None:
@@ -269,7 +269,7 @@ class GlobalDataCollector:
                     conn = None
                 self._set_persistence_error(exc)
             ready.set_result(None)
-            batch: list[_CollectorRecord] = []
+            batch: list[_LoggerRecord] = []
             deadline = time.monotonic() + self.flush_interval_s
             while True:
                 timeout = (
@@ -282,7 +282,7 @@ class GlobalDataCollector:
 
                 if command == "record":
                     record = value
-                    assert isinstance(record, _CollectorRecord)
+                    assert isinstance(record, _LoggerRecord)
                     batch.append(record)
                     self._notify_subscribers(record)
                 if (
@@ -319,7 +319,7 @@ class GlobalDataCollector:
             command, value = self._queue.get()
             if command == "record":
                 record = value
-                assert isinstance(record, _CollectorRecord)
+                assert isinstance(record, _LoggerRecord)
                 self._notify_subscribers(record)
             elif command == "flush":
                 assert isinstance(value, Future)
@@ -329,7 +329,7 @@ class GlobalDataCollector:
                 value.set_result(None)
                 return
 
-    def _notify_subscribers(self, record: _CollectorRecord) -> None:
+    def _notify_subscribers(self, record: _LoggerRecord) -> None:
         with self._state_lock:
             subscribers = list(self._subscribers)
         envelope = {"kind": record.kind, **copy.deepcopy(record.data)}
@@ -341,9 +341,9 @@ class GlobalDataCollector:
                     self._telemetry_error = (
                         f"subscriber {subscriber!r}: {type(exc).__name__}: {exc}"
                     )
-                print(f"[agcollector] WARNING: subscriber failed: {exc}")
+                print(f"[aglogger] WARNING: subscriber failed: {exc}")
 
-    def _write_batch(self, conn: sqlite3.Connection, records: list[_CollectorRecord]) -> None:
+    def _write_batch(self, conn: sqlite3.Connection, records: list[_LoggerRecord]) -> None:
         try:
             with conn:
                 for record in records:
@@ -354,7 +354,7 @@ class GlobalDataCollector:
                     else:
                         self._insert_ui_event(conn, record.data)
                 conn.execute(
-                    "INSERT INTO collector_metadata(key,value) VALUES('global_sequence',?) "
+                    "INSERT INTO logger_metadata(key,value) VALUES('global_sequence',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(max(record.sequence for record in records)),),
                 )
@@ -367,7 +367,7 @@ class GlobalDataCollector:
             first = self._persistence_error is None
             self._persistence_error = message
         if first:
-            print(f"[agcollector] WARNING: persistence failed: {message}")
+            print(f"[aglogger] WARNING: persistence failed: {message}")
 
     @staticmethod
     def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -428,7 +428,7 @@ class GlobalDataCollector:
                 payload TEXT NOT NULL,
                 PRIMARY KEY (type, scope_key)
             );
-            CREATE TABLE IF NOT EXISTS collector_metadata (
+            CREATE TABLE IF NOT EXISTS logger_metadata (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
@@ -468,13 +468,13 @@ class GlobalDataCollector:
 
     def _restore_sequence(self, conn: sqlite3.Connection) -> None:
         row = conn.execute(
-            "SELECT value FROM collector_metadata WHERE key='global_sequence'"
+            "SELECT value FROM logger_metadata WHERE key='global_sequence'"
         ).fetchone()
         if row is not None:
             persisted = int(row[0])
         else:
             # Compatibility with databases created by the first global-schema
-            # implementation, before collector_metadata existed.
+            # implementation, before logger_metadata existed.
             row = conn.execute(
                 "SELECT MAX(sequence) FROM ("
                 "SELECT sequence FROM lifecycle_events UNION ALL "
@@ -629,26 +629,25 @@ class GlobalDataCollector:
         )
 
 
-
-class GlobalDomainCollector:
+class GlobalDomainLogger:
     """Compatibility facade for one low-volume global-domain object."""
 
     def __init__(
         self,
-        collector: GlobalDataCollector,
+        logger: GlobalDataLogger,
         *,
         source: str,
         scope_key: str,
         attributes: "dict | None" = None,
     ) -> None:
-        self._collector = collector
+        self._logger = logger
         self.source = source
         self.scope_key = scope_key
         self.attributes = dict(attributes or {})
-        self.db_path = collector.db_path
+        self.db_path = logger.db_path
 
     def start(self) -> None:
-        self._collector.start()
+        self._logger.start()
 
     def stop(self) -> None:
         return None
@@ -657,11 +656,11 @@ class GlobalDomainCollector:
         return None
 
     def flush(self, timeout_s: "float | None" = None) -> None:
-        self._collector.flush(timeout_s=timeout_s)
+        self._logger.flush(timeout_s=timeout_s)
 
     def record_event(self, type: str, payload: dict, **kwargs) -> None:
         merged = {**self.attributes, **payload}
-        self._collector.record_event(
+        self._logger.record_event(
             type,
             merged,
             source=self.source,
@@ -672,7 +671,7 @@ class GlobalDomainCollector:
     def record_span(
         self, name: str, start_ts: float, end_ts: float, attributes: dict, **kwargs
     ) -> None:
-        self._collector.record_span(
+        self._logger.record_span(
             name,
             start_ts,
             end_ts,
@@ -682,7 +681,7 @@ class GlobalDomainCollector:
         )
 
 
-_global_collector: "GlobalDataCollector | None" = None
+_global_logger: "GlobalDataLogger | None" = None
 _global_lock = threading.Lock()
 
 
@@ -698,22 +697,20 @@ def resolve_global_db_path(log_dir: "str | Path") -> Path:
     return Path(log_dir) / "agency.sqlite3"
 
 
-def get_global_data_collector(
+def get_global_data_logger(
     agconfig=None,
     *,
     default_db_path: "str | Path | None" = None,
-) -> GlobalDataCollector:
-    """Return the lazy process-wide collector for non-agent data only."""
-    global _global_collector
+) -> GlobalDataLogger:
+    """Return the lazy process-wide logger for non-agent data only."""
+    global _global_logger
     with _global_lock:
-        if _global_collector is None:
+        if _global_logger is None:
             configured_path = (
-                agconfig.get("agorchestrator", "db_path", None)
-                if agconfig is not None
-                else None
+                agconfig.get("agorchestrator", "db_path", None) if agconfig is not None else None
             )
             if configured_path is None and default_db_path is None:
-                from .utils.agutil import _DEFAULT_LOG_DIR
+                from ..utils.agutil import _DEFAULT_LOG_DIR
 
                 default_db_path = _DEFAULT_LOG_DIR / "agency.sqlite3"
             db_path = configured_path or default_db_path
@@ -728,44 +725,44 @@ def get_global_data_collector(
                 if agconfig is not None
                 else 1.0
             )
-            _global_collector = GlobalDataCollector(
+            _global_logger = GlobalDataLogger(
                 db_path,
                 flush_batch_size=batch_size,
                 flush_interval_s=interval,
             )
-            _global_collector.start()
-        return _global_collector
+            _global_logger.start()
+        return _global_logger
 
 
-def peek_global_data_collector() -> "GlobalDataCollector | None":
-    return _global_collector
+def peek_global_data_logger() -> "GlobalDataLogger | None":
+    return _global_logger
 
 
-def _reset_global_data_collector_for_tests() -> None:
-    global _global_collector
+def _reset_global_data_logger_for_tests() -> None:
+    global _global_logger
     with _global_lock:
-        collector = _global_collector
-        _global_collector = None
-    if collector is not None:
-        collector.shutdown(timeout_s=10)
+        logger = _global_logger
+        _global_logger = None
+    if logger is not None:
+        logger.shutdown(timeout_s=10)
 
 
-def _shutdown_global_data_collector_at_exit() -> None:
-    collector = peek_global_data_collector()
-    if collector is not None:
+def _shutdown_global_data_logger_at_exit() -> None:
+    logger = peek_global_data_logger()
+    if logger is not None:
         try:
-            collector.shutdown(timeout_s=5)
+            logger.shutdown(timeout_s=5)
         except Exception:  # noqa: S110 - interpreter teardown is best effort
             pass
 
 
-atexit.register(_shutdown_global_data_collector_at_exit)
+atexit.register(_shutdown_global_data_logger_at_exit)
 
 
 __all__ = [
-    "GlobalDataCollector",
-    "GlobalDomainCollector",
-    "get_global_data_collector",
-    "peek_global_data_collector",
+    "GlobalDataLogger",
+    "GlobalDomainLogger",
+    "get_global_data_logger",
+    "peek_global_data_logger",
     "resolve_global_db_path",
 ]

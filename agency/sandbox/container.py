@@ -40,7 +40,7 @@ import uuid as _uuid
 from contextlib import contextmanager as _contextmanager
 from pathlib import Path
 
-from ..profiler import agprof
+from ..observability.profiler import agprof
 from ..agconfig import agConfig
 from ..utils.agutil import amd_render_node_paths_by_pci_bus, detect_gpus, _AgResourcePoolFields
 from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace

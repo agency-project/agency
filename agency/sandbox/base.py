@@ -226,7 +226,7 @@ def run_with_unkillable_child_grace(
         except BaseException as e:  # noqa: BLE001 - relayed verbatim to the waiter below
             future.set_exception(e)
 
-    from ..profiler import agprof
+    from ..observability.profiler import agprof
 
     agprof.spawn_traced(_task).start()
     try:

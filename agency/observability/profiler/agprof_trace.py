@@ -1,4 +1,4 @@
-"""Perfetto-compatible Chrome trace output for :mod:`agency.profiler.agprof`.
+"""Perfetto-compatible Chrome trace output for :mod:`agency.observability.profiler.agprof`.
 
 The emitter deliberately has no dependency on torch or the OpenTelemetry SDK.
 agprof's spans, resource samples, and GPU lease intervals all use

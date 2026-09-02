@@ -22,11 +22,11 @@ def reset_agent_state():
         "output_dir": agent.output_dir,
     }
     yield
-    from agency.agcollector import _reset_global_data_collector_for_tests
+    from agency.observability.aglogger import _reset_global_data_logger_for_tests
     from agency.orchestrator.orchestrator import _reset_orchestrator_for_tests
 
     _reset_orchestrator_for_tests()
-    _reset_global_data_collector_for_tests()
+    _reset_global_data_logger_for_tests()
     agent.ping_interval_s = saved["ping_interval_s"]
     agent.poll_interval_s = saved["poll_interval_s"]
     agent.max_outer_iters = saved["max_outer_iters"]

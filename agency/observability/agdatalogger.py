@@ -5,13 +5,14 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .agconfig import agConfig
+    from ..agconfig import agConfig
 
 
 def _ts() -> str:
@@ -19,18 +20,33 @@ def _ts() -> str:
 
 
 @dataclass
-class agDataCollectorConfigs:
+class agDataLoggerConfigs:
     db_path: str
     flush_batch_size: int = 20
     flush_interval_s: float = 1.0
 
 
-class agDataCollector:
-    def __init__(self, agconfig: "agConfig") -> None:
+class agDataLogger:
+    """A logger instance is reused across the system: one per agent (holding
+    that agent's own high-frequency execution data) and one shared global
+    instance (holding low-frequency system-overview data from agteam,
+    agResourcePool, and the orchestrator itself). Both are this same class,
+    same schema -- only ``default_name``/``default_object`` differ."""
+
+    def __init__(
+        self,
+        agconfig: "agConfig",
+        *,
+        default_name: "str | None" = None,
+        default_object: "str | None" = None,
+    ) -> None:
         self.set_config(agconfig)
+        self._default_name = default_name
+        self._default_object = default_object
 
         self._conn: "sqlite3.Connection | None" = None
         self._lock = threading.Lock()
+        self._sequence = 0
         self._event_rows: list[tuple] = []
         self._span_rows: list[tuple] = []
         self._latest_value_rows: list[tuple] = []
@@ -38,15 +54,28 @@ class agDataCollector:
         self._pending_count = 0
         self._last_flush_ts = 0.0
 
+    @property
+    def db_path(self) -> str:
+        return self._configs.db_path
+
+    def _next_id_locked(self) -> str:
+        """Caller must already hold self._lock. The zero-padded sequence
+        prefix keeps ids sortable in local insertion order -- rows that share
+        one `timestamp` (e.g. finalize_stream's loop, which computes it once
+        for every payload) still resolve correctly by `id` -- while the
+        uuid4 suffix keeps every id globally unique across independently
+        constructed instances (one per agent, plus the shared global one),
+        for a later merge into one physical table."""
+        self._sequence += 1
+        return f"{self._sequence:020d}{uuid.uuid4().hex}"
+
     def set_config(self, agconfig: "agConfig") -> None:
-        configs = agconfig.__dict__.get("agDataCollectorConfigs")
+        configs = agconfig.__dict__.get("agDataLoggerConfigs")
         if configs is None:
             configs = getattr(self, "_configs", None)
             if configs is None:
-                raise ValueError(
-                    "agDataCollector requires agconfig.agDataCollectorConfigs on first use"
-                )
-            agconfig.agDataCollectorConfigs = configs
+                raise ValueError("agDataLogger requires agconfig.agDataLoggerConfigs on first use")
+            agconfig.agDataLoggerConfigs = configs
         self._configs = configs
 
     def start(self) -> None:
@@ -58,10 +87,17 @@ class agDataCollector:
         self._last_flush_ts = time.time()
 
     def stop(self) -> None:
-        self.flush()
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        # flush-then-close must be one atomic critical section: this instance
+        # can now be shared (the process-wide global logger), so two threads
+        # -- e.g. the orchestrator's scheduler thread on shutdown and the
+        # interpreter's atexit handler -- can call stop() concurrently.
+        # Closing outside the lock let one thread's close() race a second
+        # thread's in-flight flush() on the same connection.
+        with self._lock:
+            self._flush_locked()
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     def flush(self) -> None:
         with self._lock:
@@ -72,20 +108,35 @@ class agDataCollector:
         type: str,
         payload: dict,
         *,
+        name: "str | None" = None,
+        object: "str | None" = None,
         call_label: "str | None" = None,
-        overwrite: bool = False,
+        update_latest_snapshot: bool = False,
         term_message: "str | None" = None,
         flush: bool = False,
     ) -> None:
         timestamp = time.time()
         payload_json = json.dumps(payload)
+        name = self._default_name if name is None else name
+        object = self._default_object if object is None else object
         if term_message is not None:
             print(term_message, file=sys.stderr)
         with self._lock:
-            self._event_rows.append((type, timestamp, call_label, payload_json, term_message))
-            if overwrite:
+            self._event_rows.append(
+                (
+                    self._next_id_locked(),
+                    type,
+                    timestamp,
+                    name,
+                    object,
+                    call_label,
+                    payload_json,
+                    term_message,
+                )
+            )
+            if update_latest_snapshot:
                 self._latest_value_rows.append(
-                    (type, timestamp, call_label, payload_json, term_message)
+                    (type, name, timestamp, object, call_label, payload_json, term_message)
                 )
             self._pending_count += 1
             if flush:
@@ -98,6 +149,8 @@ class agDataCollector:
         type: str,
         payload: dict,
         *,
+        name: "str | None" = None,
+        object: "str | None" = None,
         call_label: "str | None" = None,
         flush: bool = False,
     ) -> None:
@@ -105,8 +158,21 @@ class agDataCollector:
         table (never `events`, never `latest_values`)"""
         timestamp = time.time()
         payload_json = json.dumps(payload)
+        name = self._default_name if name is None else name
+        object = self._default_object if object is None else object
         with self._lock:
-            self._stream_delta_rows.append((type, timestamp, call_label, payload_json, None))
+            self._stream_delta_rows.append(
+                (
+                    self._next_id_locked(),
+                    type,
+                    timestamp,
+                    name,
+                    object,
+                    call_label,
+                    payload_json,
+                    None,
+                )
+            )
             self._pending_count += 1
             if flush:
                 self._flush_locked()
@@ -119,20 +185,35 @@ class agDataCollector:
         type: str,
         payloads: "list[dict]",
         *,
+        name: "str | None" = None,
+        object: "str | None" = None,
         term_message: "str | None" = None,
     ) -> None:
         """Atomically clear every `stream_deltas` row for *call_label* (both
         already-flushed and still-pending) and append each of *payloads* as
         its own permanent row in `events`."""
         timestamp = time.time()
+        name = self._default_name if name is None else name
+        object = self._default_object if object is None else object
         if term_message is not None:
             print(term_message, file=sys.stderr)
         with self._lock:
             self._stream_delta_rows = [
-                row for row in self._stream_delta_rows if row[2] != call_label
+                row for row in self._stream_delta_rows if row[5] != call_label
             ]
             for payload in payloads:
-                self._event_rows.append((type, timestamp, call_label, json.dumps(payload), None))
+                self._event_rows.append(
+                    (
+                        self._next_id_locked(),
+                        type,
+                        timestamp,
+                        name,
+                        object,
+                        call_label,
+                        json.dumps(payload),
+                        None,
+                    )
+                )
                 self._pending_count += 1
             self._flush_locked()
             if self._conn is not None:
@@ -141,11 +222,13 @@ class agDataCollector:
 
     def record_span(
         self,
-        name: str,
+        span_name: str,
         start_ts: float,
         end_ts: float,
         attributes: dict,
         *,
+        name: "str | None" = None,
+        object: "str | None" = None,
         cpu_ms: "float | None" = None,
         runqueue_ms: "float | None" = None,
         blocked_ms: "float | None" = None,
@@ -154,22 +237,28 @@ class agDataCollector:
         term_message: "str | None" = None,
         flush: bool = False,
     ) -> None:
+        name = self._default_name if name is None else name
+        object = self._default_object if object is None else object
         if term_message is not None:
             print(term_message, file=sys.stderr)
-        row = (
-            name,
-            start_ts,
-            end_ts,
-            cpu_ms,
-            runqueue_ms,
-            blocked_ms,
-            parent,
-            call_label,
-            json.dumps(attributes),
-            term_message,
-        )
         with self._lock:
-            self._span_rows.append(row)
+            self._span_rows.append(
+                (
+                    self._next_id_locked(),
+                    span_name,
+                    start_ts,
+                    end_ts,
+                    name,
+                    object,
+                    cpu_ms,
+                    runqueue_ms,
+                    blocked_ms,
+                    parent,
+                    call_label,
+                    json.dumps(attributes),
+                    term_message,
+                )
+            )
             self._pending_count += 1
             if flush:
                 self._flush_locked()
@@ -181,22 +270,28 @@ class agDataCollector:
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY,
+                id TEXT PRIMARY KEY,
                 type TEXT NOT NULL,
                 timestamp REAL NOT NULL,
+                name TEXT,
+                object TEXT,
                 call_label TEXT,
                 payload TEXT NOT NULL,
                 term_message TEXT
             )
             """
         )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_object ON events(object)")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS spans (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
+                id TEXT PRIMARY KEY,
+                span_name TEXT NOT NULL,
                 start_ts REAL NOT NULL,
                 end_ts REAL NOT NULL,
+                name TEXT,
+                object TEXT,
                 cpu_ms REAL,
                 runqueue_ms REAL,
                 blocked_ms REAL,
@@ -207,23 +302,30 @@ class agDataCollector:
             )
             """
         )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_spans_name ON spans(name)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_spans_object ON spans(object)")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS latest_values (
-                type TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
                 timestamp REAL NOT NULL,
+                object TEXT,
                 call_label TEXT,
                 payload TEXT NOT NULL,
-                term_message TEXT
+                term_message TEXT,
+                PRIMARY KEY (type, name)
             )
             """
         )
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS stream_deltas (
-                id INTEGER PRIMARY KEY,
+                id TEXT PRIMARY KEY,
                 type TEXT NOT NULL,
                 timestamp REAL NOT NULL,
+                name TEXT,
+                object TEXT,
                 call_label TEXT,
                 payload TEXT NOT NULL,
                 term_message TEXT
@@ -257,31 +359,35 @@ class agDataCollector:
         with self._conn:
             if self._event_rows:
                 self._conn.executemany(
-                    "INSERT INTO events (type, timestamp, call_label, payload, term_message) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO events (id, type, timestamp, name, object, call_label, "
+                    "payload, term_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     self._event_rows,
                 )
             if self._span_rows:
                 self._conn.executemany(
                     "INSERT INTO spans "
-                    "(name, start_ts, end_ts, cpu_ms, runqueue_ms, blocked_ms, parent, call_label, "
-                    "attributes, term_message) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(id, span_name, start_ts, end_ts, name, object, cpu_ms, runqueue_ms, "
+                    "blocked_ms, parent, call_label, attributes, term_message) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     self._span_rows,
                 )
             if self._latest_value_rows:
                 self._conn.executemany(
-                    "INSERT INTO latest_values (type, timestamp, call_label, payload, term_message) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(type) DO UPDATE SET "
-                    "timestamp=excluded.timestamp, call_label=excluded.call_label, "
-                    "payload=excluded.payload, term_message=excluded.term_message",
-                    self._latest_value_rows,
+                    "INSERT INTO latest_values (type, name, timestamp, object, call_label, "
+                    "payload, term_message) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(type, name) DO UPDATE SET "
+                    "timestamp=excluded.timestamp, object=excluded.object, "
+                    "call_label=excluded.call_label, payload=excluded.payload, "
+                    "term_message=excluded.term_message",
+                    [
+                        (t, n or "", ts, o, cl, p, tm)
+                        for (t, n, ts, o, cl, p, tm) in self._latest_value_rows
+                    ],
                 )
             if self._stream_delta_rows:
                 self._conn.executemany(
-                    "INSERT INTO stream_deltas (type, timestamp, call_label, payload, term_message) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO stream_deltas (id, type, timestamp, name, object, call_label, "
+                    "payload, term_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     self._stream_delta_rows,
                 )
         self._event_rows.clear()
@@ -290,3 +396,7 @@ class agDataCollector:
         self._stream_delta_rows.clear()
         self._pending_count = 0
         self._last_flush_ts = time.time()
+
+
+def resolve_global_db_path(log_dir: "str | Path") -> Path:
+    return Path(log_dir) / "global_data.sqlite3"

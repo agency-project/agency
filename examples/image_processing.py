@@ -144,7 +144,7 @@ class UrlImageTeam(agteam):
 
 if __name__ == "__main__":
     from datetime import datetime
-    from agency.agwebui import agwebui
+    from agency.observability.agwebui import agwebui
 
     args = sys.argv[1:]
 

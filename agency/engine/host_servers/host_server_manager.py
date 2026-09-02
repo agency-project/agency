@@ -76,21 +76,21 @@ class HostServerManager:
         *,
         invocation=None,
     ) -> None:
-        from ...profiler import agprof
+        from ...observability.profiler import agprof
 
         self._ensure_runtime_configs(agent.agconfig)
-        self._data_collector = agent.data_collector
+        self._data_logger = agent.data_logger
         self._llm_handler_server = LlmHandlerServer(
             agent.agconfig,
-            self._data_collector,
+            self._data_logger,
             parent_context=agprof.current_span_context(),
             invocation=invocation,
             enable_message_overlay=getattr(agent, "harness", None) != "native",
         )
-        self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool, self._data_collector)
+        self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool, self._data_logger)
         self._interaction_server = HostInteractionServer(
             skill,
-            self._data_collector,
+            self._data_logger,
             invocation=invocation,
         )
         self.set_config(agent.agconfig)

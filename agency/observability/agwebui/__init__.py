@@ -8,7 +8,7 @@ no asyncio conflicts.
 
 Usage::
 
-    from agency.agwebui import agwebui
+    from agency.observability.agwebui import agwebui
 
     agwebui.run(main_fn)            # opens http://localhost:7860
     agwebui.run(main_fn, port=8080)
@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..utils.agutil import sigterm_as_exit
+from ...utils.agutil import sigterm_as_exit
 from ..profiler import agprof
 from .emitter import agwebui_emitter
 
@@ -82,8 +82,8 @@ def _dispatch_command(cmd: dict) -> None:
     imports) server process can only write a plain file describing what it
     wants; this side -- running inside the execution process, with real
     agent objects -- is what actually applies it."""
-    from ..agent import agent as _agent_cls
-    from ..agconfig import agConfig as _agConfig_cls
+    from ...agent import agent as _agent_cls
+    from ...agconfig import agConfig as _agConfig_cls
 
     ctype = cmd.get("type")
     agname = cmd.get("agname")
@@ -108,7 +108,7 @@ def _dispatch_command(cmd: dict) -> None:
                 _apply_config_update(a, config, _agConfig_cls)
                 break
     elif ctype == "update_config_all":
-        from ..agteam import agteam as _agteam_cls
+        from ...agteam import agteam as _agteam_cls
 
         config = cmd.get("config") or {}
 
@@ -227,7 +227,7 @@ class agwebui:
             [
                 sys.executable,
                 "-m",
-                "agency.agwebui.server",
+                "agency.observability.agwebui.server",
                 "--run-dir",
                 str(run_dir),
                 "--port",
@@ -256,7 +256,7 @@ class agwebui:
         # Emit initial resource pool state so the dashboard shows GPU/CPU
         # capacity immediately without waiting for the first acquire/release.
         try:
-            from ..orchestrator import get_orchestrator
+            from ...orchestrator import get_orchestrator
 
             _pool = get_orchestrator().agresource_pool
             if _pool is not None:

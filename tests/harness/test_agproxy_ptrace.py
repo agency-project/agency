@@ -80,7 +80,7 @@ def test_ptrace_available_is_cached():
 def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypatch):
     """Only the kernel-confirmed path, never attacker-controlled argv, is named."""
     from agency.harness.ptrace import supervisor as ptrace_module
-    from agency.profiler import agprof
+    from agency.observability.profiler import agprof
 
     secret = "AGPROF_TOKEN_must-not-reach-the-trace"
     parent_context = object()
@@ -205,7 +205,7 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
 @pytest.mark.parametrize("failure_phase", ["start", "update", "end"])
 def test_profiler_callback_failure_cannot_abort_ptrace_lifecycle(monkeypatch, failure_phase):
     from agency.harness.ptrace import supervisor as ptrace_module
-    from agency.profiler import agprof
+    from agency.observability.profiler import agprof
 
     reached = []
 
@@ -305,7 +305,7 @@ def test_executable_display_name_redacts_sensitive_substrings():
 
 def test_process_lifecycle_finalize_interrupts_live_children(monkeypatch):
     from agency.harness.ptrace import supervisor as ptrace_module
-    from agency.profiler import agprof
+    from agency.observability.profiler import agprof
 
     external_span = object()
     interrupted = []
@@ -506,7 +506,7 @@ def test_launch_resolves_multi_exec_argv():
 @ptrace
 def test_launch_records_process_lifecycles_under_current_span(tmp_path):
     pytest.importorskip("opentelemetry.sdk.trace")
-    from agency.profiler import agprof
+    from agency.observability.profiler import agprof
 
     with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
         with agprof.span("run0:ptrace:test"):
@@ -532,7 +532,7 @@ def test_launch_records_process_lifecycles_under_current_span(tmp_path):
 @ptrace
 def test_traced_thread_does_not_create_process_span(tmp_path):
     pytest.importorskip("opentelemetry.sdk.trace")
-    from agency.profiler import agprof
+    from agency.observability.profiler import agprof
 
     script = (
         "import threading; "
@@ -556,7 +556,7 @@ def test_traced_thread_does_not_create_process_span(tmp_path):
 @ptrace
 def test_live_traced_process_is_incomplete_when_profiler_stops(tmp_path):
     pytest.importorskip("opentelemetry.sdk.trace")
-    from agency.profiler import agprof
+    from agency.observability.profiler import agprof
 
     handle = None
     try:

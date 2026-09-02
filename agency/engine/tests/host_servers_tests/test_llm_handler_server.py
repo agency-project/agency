@@ -19,7 +19,7 @@ from agency._agent_control import AgentControl
 from agency.agconfig import agConfig
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
-from agency.profiler import agprof
+from agency.observability.profiler import agprof
 
 # ---------------------------------------------------------------------------
 # Fakes -- duck-typed to match what serialize helpers read via getattr,
@@ -89,7 +89,7 @@ class _FakeClient:
         self.closed = True
 
 
-class _FakeDataCollector:
+class _FakeDataLogger:
     def __init__(self):
         self.events = []
         self.stream_deltas = []
@@ -97,8 +97,8 @@ class _FakeDataCollector:
         self.finalized = []
         self.operations = []
 
-    def record_event(self, type, payload, call_label=None, overwrite=False, **_kw):
-        self.events.append((type, payload, call_label, overwrite))
+    def record_event(self, type, payload, call_label=None, update_latest_snapshot=False, **_kw):
+        self.events.append((type, payload, call_label, update_latest_snapshot))
 
     def record_stream_delta(self, type, payload, call_label=None, flush=False):
         entry = (type, payload, call_label)
@@ -118,7 +118,7 @@ def _cfg(**fields) -> agConfig:
 
 def _make_server(create_fn=None, **fields) -> "tuple[LlmHandlerServer, _FakeClient]":
     fields.setdefault("model", "gpt-test")
-    server = LlmHandlerServer(_cfg(**fields), _FakeDataCollector())
+    server = LlmHandlerServer(_cfg(**fields), _FakeDataLogger())
     client = _FakeClient(create_fn)
     server._backend.make_client = lambda timeout: client
     return server, client
@@ -403,7 +403,7 @@ class _TextThenBlockingToolBackend(_RecordingBackend):
 def _controlled_server(backend, invocation) -> LlmHandlerServer:
     server = LlmHandlerServer(
         _cfg(model="gpt-test"),
-        _FakeDataCollector(),
+        _FakeDataLogger(),
         invocation=invocation,
     )
     server._backend = backend
@@ -507,9 +507,9 @@ def test_dispatch_bad_request_raises_dispatch_error_and_closes_client(monkeypatc
         assert e.status_code == 400
         assert e.transient is False
     assert client.closed is True
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (
-            server._data_collector.events[0][2],
+            server._data_logger.events[0][2],
             "llm_stream_error",
             [{"error": "ValueError: bad request"}],
         )
@@ -530,9 +530,9 @@ def test_dispatch_transient_error_raises_dispatch_error(monkeypatch):
         assert e.status_code == 503
         assert e.transient is True
     assert client.closed is True
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (
-            server._data_collector.events[0][2],
+            server._data_logger.events[0][2],
             "llm_stream_error",
             [{"error": "ConnectionError: down"}],
         )
@@ -550,9 +550,9 @@ def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
     except RuntimeError:
         pass
     assert client.closed is True
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (
-            server._data_collector.events[0][2],
+            server._data_logger.events[0][2],
             "llm_stream_error",
             [{"error": "RuntimeError: boom"}],
         )
@@ -621,7 +621,7 @@ def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tm
         with agprof.span("engine-run"):
             server = LlmHandlerServer(
                 _cfg(model="gpt-test"),
-                _FakeDataCollector(),
+                _FakeDataLogger(),
                 parent_context=agprof.current_span_context(),
             )
             client = _FakeClient(create)
@@ -717,7 +717,7 @@ def test_start_stream_first_chunk_bad_request_becomes_error_item(monkeypatch):
     assert item == {"type": "error", "message": "nope", "transient": False, "status_code": 400}
     handle._thread.join(timeout=2.0)
     assert client.closed is True
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (handle.call_label, "llm_stream_error", [{"error": "ValueError: nope"}])
     ]
 
@@ -733,7 +733,7 @@ def test_start_stream_first_chunk_transient_error_becomes_error_item(monkeypatch
     item = handle.first()
     assert item == {"type": "error", "message": "down", "transient": True, "status_code": 503}
     handle._thread.join(timeout=2.0)
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (handle.call_label, "llm_stream_error", [{"error": "ConnectionError: down"}])
     ]
 
@@ -758,7 +758,7 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
     }
     handle._thread.join(timeout=2.0)
     assert client.closed is True
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (
             handle.call_label,
             "llm_stream_error",
@@ -996,8 +996,8 @@ def test_pre_model_stop_returns_conflict_without_calling_provider(
     assert response.status_code == 409
     assert response.json() == {"error": {"message": expected, "transient": False}}
     assert backend.requests == []
-    assert server._data_collector.events == []
-    assert server._data_collector.finalized == []
+    assert server._data_logger.events == []
+    assert server._data_logger.finalized == []
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -1094,17 +1094,17 @@ def test_cancel_during_model_suppresses_post_model_tool_delivery(streaming: bool
         assert str(outcome["error"]) == "agent invocation cancelled"
         assert outcome["error"].status_code == 409
 
-    collector = server._data_collector
-    assert len(collector.events) == 1
-    assert collector.finalized == [
+    logger = server._data_logger
+    assert len(logger.events) == 1
+    assert logger.finalized == [
         (
-            collector.events[0][2],
+            logger.events[0][2],
             "llm_stream_error",
             [{"error": "_DispatchError: agent invocation cancelled"}],
         )
     ]
     if streaming:
-        assert collector.events[0][2] == stream.call_label
+        assert logger.events[0][2] == stream.call_label
 
 
 def test_unclassified_first_stream_read_error_always_wakes_consumer():
@@ -1124,7 +1124,7 @@ def test_unclassified_first_stream_read_error_always_wakes_consumer():
     handle._thread.join(timeout=2.0)
     assert not handle._thread.is_alive()
     assert client.closed is True
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (
             handle.call_label,
             "llm_stream_error",
@@ -1134,7 +1134,7 @@ def test_unclassified_first_stream_read_error_always_wakes_consumer():
     assert server.get_main_transcript() == []
 
 
-def test_controlled_paths_preserve_collector_call_labels_and_finalization():
+def test_controlled_paths_preserve_logger_call_labels_and_finalization():
     control = AgentControl()
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
@@ -1143,13 +1143,13 @@ def test_controlled_paths_preserve_collector_call_labels_and_finalization():
 
     assert _drain(handle)[-1]["type"] == "done"
     handle._thread.join(timeout=2.0)
-    collector = server._data_collector
-    assert collector.events == [("agent_state", {"state": "waiting_llm"}, handle.call_label, True)]
-    assert collector.finalized[-1][0] == handle.call_label
-    assert collector.finalized[-1][1] == "llm_block"
+    logger = server._data_logger
+    assert logger.events == [("agent_state", {"state": "waiting_llm"}, handle.call_label, True)]
+    assert logger.finalized[-1][0] == handle.call_label
+    assert logger.finalized[-1][1] == "llm_block"
 
 
-def test_malformed_nonstream_result_finalizes_the_collector_call_label():
+def test_malformed_nonstream_result_finalizes_the_logger_call_label():
     class MalformedBackend(_RecordingBackend):
         def dispatch(self, request: dict) -> dict:
             self.requests.append(("nonstream", copy.deepcopy(request)))
@@ -1162,10 +1162,10 @@ def test_malformed_nonstream_result_finalizes_the_collector_call_label():
     with pytest.raises(KeyError, match="stop_reason"):
         server.dispatch({"messages": _completed_tool_history()})
 
-    collector = server._data_collector
-    assert collector.finalized == [
+    logger = server._data_logger
+    assert logger.finalized == [
         (
-            collector.events[0][2],
+            logger.events[0][2],
             "llm_stream_error",
             [{"error": "KeyError: 'stop_reason'"}],
         )
@@ -1191,18 +1191,18 @@ def test_nonstream_outer_infrastructure_failure_finalizes_once(monkeypatch, fail
     with pytest.raises(RuntimeError, match=f"{failure_point} failed"):
         server.dispatch({"messages": []})
 
-    collector = server._data_collector
-    assert collector.finalized == [
+    logger = server._data_logger
+    assert logger.finalized == [
         (
-            collector.events[0][2],
+            logger.events[0][2],
             "llm_stream_error",
             [{"error": f"RuntimeError: {failure_point} failed"}],
         )
     ]
-    assert [operation[0] for operation in collector.operations] == ["finalize"]
+    assert [operation[0] for operation in logger.operations] == ["finalize"]
 
 
-def test_stream_spawn_failure_finalizes_the_collector_call_label(monkeypatch):
+def test_stream_spawn_failure_finalizes_the_logger_call_label(monkeypatch):
     server, _ = _make_server(create_fn=lambda **_kwargs: iter([]))
 
     def fail_spawn(*_args, **_kwargs):
@@ -1213,10 +1213,10 @@ def test_stream_spawn_failure_finalizes_the_collector_call_label(monkeypatch):
     with pytest.raises(RuntimeError, match="spawn failed"):
         server.start_stream({"messages": []})
 
-    collector = server._data_collector
-    assert collector.finalized == [
+    logger = server._data_logger
+    assert logger.finalized == [
         (
-            collector.events[0][2],
+            logger.events[0][2],
             "llm_stream_error",
             [{"error": "RuntimeError: spawn failed"}],
         )
@@ -1237,10 +1237,10 @@ def test_stream_spawn_failure_observes_control_cancel(monkeypatch):
     with pytest.raises(mod._DispatchError, match="agent invocation cancelled"):
         server.start_stream({"messages": _completed_tool_history()})
 
-    collector = server._data_collector
-    assert collector.finalized == [
+    logger = server._data_logger
+    assert logger.finalized == [
         (
-            collector.events[0][2],
+            logger.events[0][2],
             "llm_stream_error",
             [{"error": "_DispatchError: agent invocation cancelled"}],
         )
@@ -1260,9 +1260,9 @@ def test_stream_spawn_failure_after_disconnect_finalizes_as_cancelled(monkeypatc
     with pytest.raises(mod._RequestAborted):
         server.start_stream({"messages": []}, abort_event=abort_event)
 
-    collector = server._data_collector
-    assert collector.finalized == [
-        (collector.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
+    logger = server._data_logger
+    assert logger.finalized == [
+        (logger.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
     ]
 
 
@@ -1278,10 +1278,10 @@ def test_stream_thread_start_failure_finalizes_and_removes_the_handle(monkeypatc
         server.start_stream({"messages": []})
 
     assert server._handles == []
-    collector = server._data_collector
-    assert collector.finalized == [
+    logger = server._data_logger
+    assert logger.finalized == [
         (
-            collector.events[0][2],
+            logger.events[0][2],
             "llm_stream_error",
             [{"error": "RuntimeError: thread start failed"}],
         )
@@ -1306,7 +1306,7 @@ def test_outer_stream_producer_failure_wakes_consumer_and_finalizes(monkeypatch)
     }
     handle._thread.join(timeout=2.0)
     assert not handle._thread.is_alive()
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (
             handle.call_label,
             "llm_stream_error",
@@ -1331,18 +1331,18 @@ def test_rejected_stream_error_enqueue_finalizes_as_cancelled():
                 return False
             return super().register_stream_exchange(item, **entry_fields)
 
-    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataCollector())
+    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataLogger())
     server._backend = _FailingBackend()
     handle = _RejectErrorHandle(mod.queue.Queue(), threading.Event(), "rejected-error")
 
     server._run_stream_producer({"messages": []}, None, False, handle)
 
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         ("rejected-error", "llm_stream_cancelled", [{"cancelled": True}])
     ]
 
 
-def test_stream_collector_records_every_provider_item_in_order_before_finalize():
+def test_stream_logger_records_every_provider_item_in_order_before_finalize():
     control = AgentControl()
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
@@ -1362,9 +1362,9 @@ def test_stream_collector_records_every_provider_item_in_order_before_finalize()
         },
         {"type": "usage", "usage": None, "stop_reason": "stop"},
     ]
-    collector = server._data_collector
-    assert [entry[1] for entry in collector.stream_delta_history] == expected_items
-    assert collector.operations == [
+    logger = server._data_logger
+    assert [entry[1] for entry in logger.stream_delta_history] == expected_items
+    assert logger.operations == [
         ("delta", handle.call_label, expected_items[0]),
         ("delta", handle.call_label, expected_items[1]),
         ("finalize", handle.call_label, "llm_block"),
@@ -1561,7 +1561,7 @@ def test_streaming_response_disconnect_interrupts_paused_post_model_checkpoint()
 
     assert not handle._thread.is_alive()
     assert control.is_pause_requested()
-    assert server._data_collector.finalized == [
+    assert server._data_logger.finalized == [
         (handle.call_label, "llm_stream_cancelled", [{"cancelled": True}])
     ]
 
@@ -1584,7 +1584,7 @@ def test_stop_cancels_and_joins_all_handles():
             super().close()
             keep_going.set()
 
-    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataCollector())
+    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataLogger())
     client = _ClosingClient(lambda **kw: gen())
     server._backend.make_client = lambda timeout: client
 
@@ -1794,7 +1794,7 @@ def test_build_app_dispatch_route_streaming_error_returns_error_status(monkeypat
     assert response.json() == {"error": {"message": "nope", "transient": False}}
 
 
-def test_stream_http_disconnect_while_paused_before_model_leaves_no_collector_call():
+def test_stream_http_disconnect_while_paused_before_model_leaves_no_logger_call():
     control = AgentControl()
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
@@ -1817,8 +1817,8 @@ def test_stream_http_disconnect_while_paused_before_model_leaves_no_collector_ca
     asyncio.run(scenario())
 
     assert backend.requests == []
-    assert server._data_collector.events == []
-    assert server._data_collector.finalized == []
+    assert server._data_logger.events == []
+    assert server._data_logger.finalized == []
     assert control.is_pause_requested()
 
 
@@ -1847,9 +1847,9 @@ def test_stream_http_disconnect_before_first_item_joins_producer():
 
     asyncio.run(scenario())
 
-    collector = server._data_collector
-    assert collector.finalized == [
-        (collector.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
+    logger = server._data_logger
+    assert logger.finalized == [
+        (logger.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
     ]
     assert all(
         handle._thread is None or not handle._thread.is_alive() for handle in server._handles
@@ -1880,9 +1880,9 @@ def test_nonstream_http_disconnect_interrupts_paused_post_model_checkpoint():
 
     asyncio.run(scenario())
 
-    collector = server._data_collector
-    assert collector.finalized == [
-        (collector.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
+    logger = server._data_logger
+    assert logger.finalized == [
+        (logger.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
     ]
     assert control.is_pause_requested()
 

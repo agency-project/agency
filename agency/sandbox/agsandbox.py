@@ -6,7 +6,7 @@ import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from ..profiler import agprof
+from ..observability.profiler import agprof
 from ..agconfig import agConfig, StaticConfigParam, DynamicConfigParam, _AgConfigViewBase
 from ..agname import agname as _agname
 from .base import agsandbox_backend, backend_for_image_kind
@@ -144,7 +144,7 @@ class agSandbox(_AgSandboxFields):
         # so this never raises, even when the same base *agname* is used to
         # construct multiple sandboxes -- each gets its own auto-suffixed
         # claim instead.
-        self._agname = _agname.allocate_agname(f"sandbox_{agname}")
+        self._agname = _agname.allocate_agname(agname, prefix="sandbox")
         # AgentEngine holds this for a complete execution so two agents sharing
         # this facade cannot interleave harness or teardown operations.
         self._lock = threading.RLock()
