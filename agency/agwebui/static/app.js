@@ -605,6 +605,36 @@ function handleEvent(ev) {
       break;
     }
 
+    case 'request_submitted':
+    case 'request_blocked':
+    case 'request_ready':
+    case 'request_started':
+    case 'request_completed':
+    case 'request_failed':
+    case 'request_cancelled':
+    case 'request_destroyed': {
+      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
+      const stateMap = {
+        request_submitted: 'queued',
+        request_blocked: 'blocked_on_dependency',
+        request_ready: 'queued',
+        request_started: 'skill',
+        request_completed: 'finished',
+        request_failed: 'error',
+        request_cancelled: 'cancelled',
+        request_destroyed: 'destroyed',
+      };
+      state.agents.set(ev.agname, {
+        ...existing,
+        state: stateMap[ev.type],
+        skill: ev.skill || existing.skill || null,
+        tool: null,
+      });
+      if (!state.agentOrder.includes(ev.agname)) state.agentOrder.push(ev.agname);
+      renderAgentList();
+      break;
+    }
+
     case 'agent_state': {
       const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
       state.agents.set(ev.agname, {
@@ -718,6 +748,48 @@ function reorderAgents() {
   }
 }
 
+let agentDetailGeneration = 0;
+
+async function loadAgentDetail(agname) {
+  if (!agname) return;
+  const generation = ++agentDetailGeneration;
+  try {
+    const response = await fetch('/api/agents/' + encodeURIComponent(agname));
+    const detail = await response.json();
+    if (generation !== agentDetailGeneration || agname !== currentAgent()) return;
+    if (detail.error) {
+      appendLog('[agent detail] ' + detail.error);
+      return;
+    }
+    state.histories.set(agname, detail.messages || []);
+    const existing = state.agents.get(agname) || { color: '#d4d4d4' };
+    const agentState = detail.state || {};
+    const configPayload = detail.config || {};
+    state.agents.set(agname, {
+      ...existing,
+      state: agentState.state || existing.state || 'inactive',
+      skill: agentState.skill ?? existing.skill ?? null,
+      tool: agentState.tool ?? existing.tool ?? null,
+      config: configPayload.config || configPayload,
+    });
+    const tokenPayload = detail.tokens || {};
+    if (Object.keys(tokenPayload).length) {
+      state.tokenUsage.set(agname, {
+        inp: tokenPayload.agent_input || tokenPayload.input || 0,
+        out: tokenPayload.agent_output || tokenPayload.output || 0,
+        history: [],
+      });
+    }
+    renderAgentList();
+    renderHistory();
+    updateInteractionTitle();
+  } catch (error) {
+    if (generation === agentDetailGeneration) {
+      appendLog('[agent detail] fetch failed: ' + error);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Navigation
 // ---------------------------------------------------------------------------
@@ -734,6 +806,7 @@ document.getElementById('agent-tabs').addEventListener('click', e => {
   state.focusedIdx = 0;
   renderAgentList();
   renderHistory();
+  loadAgentDetail(currentAgent());
 });
 
 if ($agentSearch) {
@@ -757,6 +830,7 @@ function cycleNext() {
   state.focusedIdx = (state.focusedIdx + 1) % n;
   renderAgentList();
   renderHistory();
+  loadAgentDetail(currentAgent());
 }
 
 function cyclePrev() {
@@ -765,6 +839,7 @@ function cyclePrev() {
   state.focusedIdx = (state.focusedIdx - 1 + n) % n;
   renderAgentList();
   renderHistory();
+  loadAgentDetail(currentAgent());
 }
 
 // Click an agent in the right panel to focus it
@@ -777,6 +852,7 @@ $agentList.addEventListener('click', e => {
     state.focusedIdx = idx;
     renderAgentList();
     renderHistory();
+    loadAgentDetail(agname);
   }
 });
 

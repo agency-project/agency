@@ -9,14 +9,16 @@ import threading
 import time
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..agconfig import agConfig, StaticConfigParam, _AgConfigViewBase
+from ..agcollector import get_global_data_collector, resolve_global_db_path
+from ..agconfig import StaticConfigParam, _AgConfigViewBase
 from ..agcontext import agcontext
 from ..agdata import agdata, agerror
 from .._submission import Invocation, MessageSubmission, Submission
 from ..engine import AgentEngine
-from ..agdatacollector import agDataCollector, agDataCollectorConfigs, _ts
+from ..agdatacollector import _ts
 from ..utils.agutil import _DEFAULT_LOG_DIR, format_exception
 from ..profiler import agprof
 from .agresources import agResourcePool
@@ -24,11 +26,15 @@ from .scheduler import ExecutionScheduler
 
 if TYPE_CHECKING:
     from ..agent import agent
+    from ..agconfig import agConfig
     from ..agskill import agskill
 
 
 class _AgOrchestratorFields:
     max_concurrent_engines = StaticConfigParam("agorchestrator", default=None)
+    db_path = StaticConfigParam("agorchestrator", default=None)
+    flush_batch_size = StaticConfigParam("agorchestrator", default=500)
+    flush_interval_s = StaticConfigParam("agorchestrator", default=1.0)
 
     def __init__(self, agconfig: "agConfig | None" = None) -> None:
         self._agconfig = agconfig
@@ -51,6 +57,10 @@ class OrchestratorSnapshot:
     completed_total: int
     failed_total: int
     agents: dict
+    db_path: str
+    persistence_error: "str | None" = None
+    telemetry_error: "str | None" = None
+    queue_depth: int = 0
 
 
 @dataclass
@@ -101,7 +111,12 @@ class _RunCompletion:
 class GlobalAgentOrchestrator(_AgOrchestratorFields):
     """Event-driven process-wide scheduler for agent engine executions."""
 
-    def __init__(self, agconfig: "agConfig | None" = None) -> None:
+    def __init__(
+        self,
+        agconfig: "agConfig | None" = None,
+        *,
+        default_db_path: "str | Path | None" = None,
+    ) -> None:
         super().__init__(agconfig)
         if self.max_concurrent_engines is not None and (
             not isinstance(self.max_concurrent_engines, int)
@@ -109,13 +124,21 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             or self.max_concurrent_engines <= 0
         ):
             raise ValueError("max_concurrent_engines must be a positive integer or None")
-        dc_agconfig = agConfig()
-        dc_agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
-            db_path=str(_DEFAULT_LOG_DIR / "resources_data.sqlite3")
+        if default_db_path is None:
+            default_db_path = resolve_global_db_path(_DEFAULT_LOG_DIR)
+        self.data_collector = get_global_data_collector(
+            agconfig,
+            default_db_path=default_db_path,
         )
-        self.data_collector = agDataCollector(dc_agconfig)
-        self.data_collector.start()
-        self.agresource_pool = agResourcePool(mark_gpus=False, data_collector=self.data_collector)
+        resource_collector = self.data_collector.scoped(
+            source="resources",
+            scope_key="resource_pool",
+            attributes={"pool": "resource_pool"},
+        )
+        self.agresource_pool = agResourcePool(
+            mark_gpus=False,
+            data_collector=resource_collector,
+        )
         self._events: "list[tuple[int, str, object]]" = []
         self._event_cond = threading.Condition(threading.RLock())
         self._event_sequence = itertools.count()
@@ -145,6 +168,13 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         self._scheduler_thread = agprof.spawn_traced(self._scheduler_main, daemon=True)
         self._scheduler_thread.name = "agency-global-scheduler"
         self._scheduler_thread.start()
+        self._record_global_event(
+            "scheduler_started",
+            {"max_concurrent_engines": self.max_concurrent_engines},
+            overwrite=True,
+        )
+        with self._event_cond:
+            self._refresh_snapshot_locked()
 
     # ------------------------------------------------------------------
     # Public API
@@ -271,7 +301,18 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
 
     def snapshot(self) -> OrchestratorSnapshot:
         with self._event_cond:
-            return OrchestratorSnapshot(**self._snapshot_dict_locked())
+            data = self._snapshot_dict_locked()
+        collector = self.data_collector.snapshot()
+        return OrchestratorSnapshot(
+            **data,
+            db_path=str(self.data_collector.db_path),
+            persistence_error=collector.get("persistence_error"),
+            telemetry_error=collector.get("telemetry_error"),
+            queue_depth=int(collector.get("queue_depth", 0)),
+        )
+
+    def flush(self, timeout_s: "float | None" = None) -> None:
+        self.data_collector.flush(timeout_s=timeout_s)
 
     def shutdown(self, wait: bool = True, timeout_s: "float | None" = None) -> None:
         with self._event_cond:
@@ -375,7 +416,12 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                         if cycle_ack is not None:
                             self._settle_future(cycle_ack, None, "schedule acknowledgement")
                     finalize_shutdown = self._finish_shutdown_if_possible_locked()
+                    self._refresh_snapshot_locked()
                 if finalize_shutdown:
+                    try:
+                        self.data_collector.shutdown(timeout_s=10)
+                    except Exception as exc:
+                        print(f"[agorchestrator] WARNING: global collector shutdown failed: {exc}")
                     with self._event_cond:
                         if self._shutdown_ack is not None:
                             self._settle_future(
@@ -780,7 +826,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             return
         completed_wall = time.time()
         if request.engine_started_wall is not None:
-            self._record_agent_span(
+            self._record_global_span(
                 request,
                 "engine:execution",
                 request.engine_started_wall,
@@ -1074,7 +1120,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         if span is not None:
             span.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
         if phase_name is not None and phase_started_wall is not None:
-            self._record_agent_span(request, phase_name, phase_started_wall, ended_wall, {})
+            self._record_global_span(request, phase_name, phase_started_wall, ended_wall, {})
 
     def _end_run_span_locked(
         self,
@@ -1101,7 +1147,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         attributes = {"outcome": profiler_outcome, "lifecycle_outcome": outcome}
         if failed:
             attributes["error_message"] = error_message
-        self._record_agent_span(
+        self._record_global_span(
             request,
             "request:submission_to_completion",
             request.submitted_wall_ns / 1_000_000_000,
@@ -1109,7 +1155,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             attributes,
         )
 
-    def _record_agent_span(
+    def _record_global_span(
         self,
         request: _ExecutionRequest,
         name: str,
@@ -1118,38 +1164,40 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         attributes: dict,
     ) -> None:
         try:
-            request.agent.data_collector.record_span(
+            self.data_collector.record_span(
                 name,
                 start_ts,
                 end_ts,
-                {
-                    "request_id": request.request_id,
-                    "skill": self._request_label(request),
-                    "request_kind": request.kind,
-                    **attributes,
-                },
+                {"request_kind": request.kind, **attributes},
+                source="orchestrator",
+                agname=str(request.agent.agname),
+                request_id=request.request_id,
+                skill=self._request_label(request),
             )
         except Exception as exc:
-            print(f"[agorchestrator] WARNING: per-agent span recording failed: {exc}")
+            print(f"[agorchestrator] WARNING: global span recording failed: {exc}")
 
     def _publish_request_locked(
         self, event_type: str, request: _ExecutionRequest, payload: dict
     ) -> None:
         try:
-            request.agent.data_collector.record_event(
+            self.data_collector.record_event(
                 event_type,
                 {
-                    "request_id": request.request_id,
-                    "skill": self._request_label(request),
                     "request_kind": request.kind,
                     "state": request.state,
                     "submission_sequence": request.sequence,
                     **payload,
                 },
+                source="orchestrator",
+                agname=str(request.agent.agname),
+                request_id=request.request_id,
+                skill=self._request_label(request),
+                scope_key=request.request_id,
                 overwrite=True,
             )
         except Exception as exc:
-            print(f"[agorchestrator] WARNING: per-agent event recording failed: {exc}")
+            print(f"[agorchestrator] WARNING: global event recording failed: {exc}")
 
     @staticmethod
     def _request_label(request: _ExecutionRequest) -> str:
@@ -1178,6 +1226,42 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             "agents": agents,
         }
 
+    def _record_global_event(
+        self,
+        event_type: str,
+        payload: dict,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        try:
+            self.data_collector.record_event(
+                event_type,
+                payload,
+                source="orchestrator",
+                scope_key="scheduler",
+                overwrite=overwrite,
+            )
+        except Exception as exc:
+            print(f"[agorchestrator] WARNING: global event recording failed: {exc}")
+
+    def _refresh_snapshot_locked(self) -> None:
+        snapshot = self._snapshot_dict_locked()
+        try:
+            self.data_collector.update_runtime(snapshot)
+            self.data_collector.record_event(
+                "scheduler_state",
+                {
+                    key: value
+                    for key, value in snapshot.items()
+                    if key not in ("agents", "state")
+                },
+                source="orchestrator",
+                scope_key="scheduler",
+                overwrite=True,
+            )
+        except Exception as exc:
+            print(f"[agorchestrator] WARNING: scheduler telemetry failed: {exc}")
+
     def _finish_shutdown_if_possible_locked(self) -> bool:
         if self._state not in {"stopping", "failed"}:
             return False
@@ -1199,6 +1283,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         if self._requests:
             return False
         self._state = "stopped"
+        self._record_global_event("scheduler_stopped", {}, overwrite=True)
         return True
 
     def _force_unmanaged_terminal_contexts_locked(self) -> None:
@@ -1246,11 +1331,16 @@ _global_lock = threading.Lock()
 
 def get_orchestrator(
     agconfig: "agConfig | None" = None,
+    *,
+    default_db_path: "str | Path | None" = None,
 ) -> GlobalAgentOrchestrator:
     global _global_orchestrator
     with _global_lock:
         if _global_orchestrator is None:
-            _global_orchestrator = GlobalAgentOrchestrator(agconfig)
+            _global_orchestrator = GlobalAgentOrchestrator(
+                agconfig,
+                default_db_path=default_db_path,
+            )
         return _global_orchestrator
 
 

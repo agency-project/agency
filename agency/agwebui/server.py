@@ -1,7 +1,7 @@
 """Standalone web server for agwebui.
 
 No agency imports — this process is completely isolated from the execution
-process.  It polls ui_events.db and pushes events to browsers over WebSocket.
+process.  It polls the global agency.sqlite3 event stream and reads selected agent databases on demand.
 Run via:
 
     python -m agency.agwebui.server --run-dir <path> --port 7860
@@ -82,7 +82,13 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _db_path() -> Path:
-    return _run_dir / "ui_events.db"
+    pointer = _run_dir / "global_data_path.txt"
+    if pointer.exists():
+        try:
+            return Path(pointer.read_text(encoding="utf-8").strip())
+        except Exception:  # noqa: S110 - fall back to the run-local database
+            pass
+    return _run_dir / "agency.sqlite3"
 
 
 def _open_db(path: Path):
@@ -93,10 +99,9 @@ def _open_db(path: Path):
 
 def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None]:
     """Read initial event-count/timestamp bookkeeping from an existing
-    database. Registration/state recovery no longer happens here -- it's
-    covered unconditionally by _fetch_state_preamble() on every connect (see
-    that function and agwebui_emitter._UPSERT_TABLES' docstring), so there's
-    no separate in-memory registry to rebuild at startup any more.
+    database. Global registration/resource recovery is handled by
+    _fetch_state_preamble() on every connection, so no second in-memory
+    registry must be rebuilt at startup.
 
     Returns (last_event_id, event_count, first_ts, last_ts).
     """
@@ -113,24 +118,14 @@ def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None]:
     return 0, 0, None, None
 
 
-# Every latest-value table maintained by agwebui_emitter._UPSERT_TABLES,
-# plus resource_state -- read in full on every client connect so a client
-# joining or rejoining at any point in a run recovers the true current
-# value for every agent/team/resource gauge, not just whatever survived
-# TAIL_EVENTS' fixed-size replay window or _PRUNE_TYPES' downsampling.
-_STATE_TABLES = (
-    "agent_registry",
-    "team_registry",
-    "agent_tokens",
-    "agent_messages",
-    "agent_state",
-    "agent_config_state",
-)
+# Lightweight global projections read on every client connection. Detailed
+# state, config, tokens, and history are fetched from the selected agent's
+# database through /api/agents/{agname}.
+_STATE_TABLES = ("agent_registry", "team_registry")
 
 
 def _fetch_state_preamble(path: Path) -> list[str]:
-    """Return current registration/token/messages/agent-state/config/resource
-    state for cold-start (or reconnecting) clients."""
+    """Return global agent/team registration and resource state."""
     if not path.exists():
         return []
     rows: list[str] = []
@@ -223,6 +218,100 @@ def _fetch_events_range(path: Path, start_ts: float, end_ts: float) -> list[str]
         return []
 
 
+def _open_readonly(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+
+
+def _json_object(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
+    """Read detailed data only from the explicitly selected agent database."""
+    if not global_path.exists():
+        return {"error": "global database is not available", "agname": agname}
+    global_con: "sqlite3.Connection | None" = None
+    try:
+        global_con = _open_readonly(global_path)
+        row = global_con.execute(
+            "SELECT db_path FROM agent_registry WHERE agname=?", (agname,)
+        ).fetchone()
+    except Exception as exc:
+        return {"error": f"agent catalog lookup failed: {exc}", "agname": agname}
+    finally:
+        if global_con is not None:
+            global_con.close()
+    if row is None:
+        return {"error": "unknown agent", "agname": agname}
+
+    agent_path = Path(row[0])
+    if not agent_path.exists():
+        return {"error": "agent database is not available", "agname": agname}
+    con: "sqlite3.Connection | None" = None
+    try:
+        con = _open_readonly(agent_path)
+        latest = {
+            event_type: _json_object(payload)
+            for event_type, payload in con.execute(
+                "SELECT type,payload FROM latest_values "
+                "WHERE type IN ('live_messages','agent_state','agent_config','token_update')"
+            )
+        }
+        if "live_messages" not in latest:
+            row = con.execute(
+                "SELECT payload FROM events WHERE type='skill_call' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                skill_call = _json_object(row[0])
+                latest["live_messages"] = {
+                    "messages": skill_call.get("history_delta", [])
+                }
+        event_rows = con.execute(
+            "SELECT type,timestamp,call_label,payload FROM events "
+            "ORDER BY id DESC LIMIT 500"
+        ).fetchall()
+        span_rows = con.execute(
+            "SELECT name,start_ts,end_ts,attributes FROM spans "
+            "ORDER BY id DESC LIMIT 500"
+        ).fetchall()
+    except Exception as exc:
+        return {"error": f"agent database read failed: {exc}", "agname": agname}
+    finally:
+        if con is not None:
+            con.close()
+
+    return {
+        "agname": agname,
+        "messages": latest.get("live_messages", {}).get("messages", []),
+        "state": latest.get("agent_state", {}),
+        "config": latest.get("agent_config", {}),
+        "tokens": latest.get("token_update", {}),
+        "events": [
+            {
+                "type": event_type,
+                "timestamp": timestamp,
+                "call_label": call_label,
+                "payload": _json_object(payload),
+            }
+            for event_type, timestamp, call_label, payload in reversed(event_rows)
+        ],
+        "spans": [
+            {
+                "name": name,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "attributes": _json_object(attributes),
+            }
+            for name, start_ts, end_ts, attributes in reversed(span_rows)
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -278,6 +367,13 @@ async def api_events(start_ts: float = 0.0, end_ts: float = 0.0):
     return JSONResponse({"events": events, "from_ts": start_ts, "to_ts": end_ts})
 
 
+@app.get("/api/agents/{agname}")
+async def api_agent_detail(agname: str):
+    detail = await asyncio.to_thread(_fetch_agent_detail, _db_path(), agname)
+    status = 404 if detail.get("error") == "unknown agent" else 200
+    return JSONResponse(detail, status_code=status)
+
+
 # ---------------------------------------------------------------------------
 # WebSocket
 # ---------------------------------------------------------------------------
@@ -306,9 +402,8 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.send_text(sync)
             for line in tail_lines:
                 await ws.send_text(line)
-            # State preamble: registration roster, latest token counts,
-            # message snapshots, agent state, config, resource state. Sent
-            # after the tail replay so it overwrites any stale values there.
+            # Global registration/resource state follows the tail. Detailed
+            # agent data is loaded only when the client selects that agent.
             for line in state_preamble:
                 await ws.send_text(line)
         except Exception:
@@ -391,7 +486,7 @@ if __name__ == "__main__":
     import uvicorn
 
     parser = argparse.ArgumentParser(description="agwebui standalone server")
-    parser.add_argument("--run-dir", required=True, help="Directory containing ui_events.db")
+    parser.add_argument("--run-dir", required=True, help="Directory containing agency.sqlite3")
     parser.add_argument("--port", type=int, default=7860)
     parsed = parser.parse_args()
 

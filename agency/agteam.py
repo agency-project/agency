@@ -97,24 +97,24 @@ class agteam:
         self._parent_team: "agteam | None" = parent
 
         from .agent import agent as _Agent
+        from .agcollector import get_global_data_collector, resolve_global_db_path
         from .utils.agutil import _DEFAULT_LOG_DIR
         from .agname import agname as _agname
-        from .agdatacollector import agDataCollector, agDataCollectorConfigs
 
         _base = config.get("name") or f"{type(self).__name__}"
         self.team_name: str = _agname.allocate_agname(_base)
         parent_team_name = parent.team_name if parent is not None else None
         log_dir = Path(_Agent.log_dir) if _Agent.log_dir is not None else _DEFAULT_LOG_DIR
 
-        # A standalone agconfig, never shared with (or reachable from) self.agconfig --
-        # a team's own agDataCollectorConfigs must never leak into an agent's config via
-        # `_t.agconfig.clone()` team-inheritance (see agent.py's _initialize()).
-        _dc_agconfig = agConfig()
-        _dc_agconfig.agDataCollectorConfigs = agDataCollectorConfigs(
-            db_path=str(log_dir / f"{self.team_name}_data.sqlite3")
+        global_collector = get_global_data_collector(
+            self.agconfig,
+            default_db_path=resolve_global_db_path(log_dir),
         )
-        self.data_collector = agDataCollector(_dc_agconfig)
-        self.data_collector.start()
+        self.data_collector = global_collector.scoped(
+            source="team",
+            scope_key=self.team_name,
+            attributes={"team": self.team_name},
+        )
         self.data_collector.record_event(
             type="team_created",
             payload={"team": self.team_name, "parent_team": parent_team_name},
@@ -129,7 +129,7 @@ class agteam:
 
         self.data_collector.record_event(
             type="team_registered",
-            payload={"team": self.team_name, "agents": [a.agname for a in self._agents]},
+            payload={"team_name": self.team_name, "agents": [a.agname for a in self._agents]},
             overwrite=True,
         )
 

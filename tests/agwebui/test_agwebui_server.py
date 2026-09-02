@@ -127,25 +127,25 @@ def test_static_js_served(server):
 
 
 # ---------------------------------------------------------------------------
-# Tail task — reads ui_events.db and updates globals
+# Tail task — reads agency.sqlite3 and updates globals
 # ---------------------------------------------------------------------------
 
 
 def test_tail_task_reads_events_db(server):
-    """Tail task must read ui_events.db and advance _last_event_id."""
+    """Tail task must read agency.sqlite3 and advance _last_event_id."""
     client, run_dir, srv = server
-    db_path = run_dir / "ui_events.db"
+    db_path = run_dir / "agency.sqlite3"
     _write_events(db_path, [{"type": "log", "line": "hello", "ts": 1.0}])
 
     assert _wait_for(lambda: srv._last_event_id > 0), (
-        "tail task did not process ui_events.db within 3 s"
+        "tail task did not process agency.sqlite3 within 3 s"
     )
 
 
 def test_tail_task_appends_new_events(server):
     """Events inserted into the DB after startup are also picked up."""
     client, run_dir, srv = server
-    db_path = run_dir / "ui_events.db"
+    db_path = run_dir / "agency.sqlite3"
 
     _write_events(db_path, [{"type": "log", "line": "first", "ts": 1.0}])
     assert _wait_for(lambda: srv._last_event_id > 0), "tail task did not pick up first event"
@@ -225,7 +225,7 @@ def test_websocket_sends_timeline_sync_on_connect(server):
 def test_websocket_replays_history_on_connect(server):
     """Client connecting after events exist should receive full replay."""
     client, run_dir, srv = server
-    db_path = run_dir / "ui_events.db"
+    db_path = run_dir / "agency.sqlite3"
 
     _write_events(
         db_path,
@@ -252,7 +252,7 @@ def test_websocket_replays_history_on_connect(server):
 def test_websocket_new_client_sees_all_history(server):
     """A client that connects late gets every event emitted so far."""
     client, run_dir, srv = server
-    db_path = run_dir / "ui_events.db"
+    db_path = run_dir / "agency.sqlite3"
 
     _write_events(db_path, [{"type": "log", "line": f"msg{i}", "ts": float(i)} for i in range(3)])
     assert _wait_for(lambda: srv._last_event_id > 0), "tail task did not process DB"
@@ -271,7 +271,7 @@ def test_websocket_new_client_sees_all_history(server):
 def test_websocket_receives_live_events(server):
     """Events written to the DB after a client connects are pushed live."""
     client, run_dir, srv = server
-    db_path = run_dir / "ui_events.db"
+    db_path = run_dir / "agency.sqlite3"
 
     with client.websocket_connect("/ws") as ws:
         # Consume the initial timeline_sync (sent for the empty DB on connect)
@@ -473,7 +473,7 @@ def test_api_timeline_empty(server):
 def test_api_timeline_with_events(server):
     """Timeline endpoint returns event count and timestamp range."""
     client, run_dir, _ = server
-    db_path = run_dir / "ui_events.db"
+    db_path = run_dir / "agency.sqlite3"
     _write_events(
         db_path,
         [
@@ -496,7 +496,7 @@ def test_api_timeline_with_events(server):
 def test_api_events_range(server):
     """Events endpoint returns events in the requested time range."""
     client, run_dir, _ = server
-    db_path = run_dir / "ui_events.db"
+    db_path = run_dir / "agency.sqlite3"
     _write_events(
         db_path,
         [
@@ -521,39 +521,59 @@ def test_api_events_invalid_range_returns_empty(server):
 
 
 # ---------------------------------------------------------------------------
-# WebSocket — state preamble survives aging out of TAIL_EVENTS
+# Selected-agent details come from the per-agent database
 # ---------------------------------------------------------------------------
 
 
-def test_agent_config_survives_being_pushed_out_of_tail_window(server):
-    """Regression test: agent_config used to only ever be inserted into the
-    append-only events table, with no latest-value table of its own -- so
-    once more than TAIL_EVENTS other events landed after it, a client
-    connecting later could never recover it (see agwebui_emitter's
-    _UPSERT_TABLES). Uses the real emitter (not the hand-crafted
-    _write_events helper) so this exercises the actual upsert path, then
-    floods well past TAIL_EVENTS with unrelated log lines before connecting,
-    proving the config is still recoverable via the state preamble alone."""
-    client, run_dir, srv = server
+def test_agent_detail_endpoint_reads_selected_agent_database(server):
+    client, run_dir, _srv = server
+    from types import SimpleNamespace
+
+    from agency.agdatacollector import agDataCollector, agDataCollectorConfigs
     from agency.agwebui.emitter import agwebui_emitter
 
-    em = agwebui_emitter(run_dir)
-    em.agent_config("LateAgent", {"agskill": {"react_max_steps": 7}})
-    for i in range(srv.TAIL_EVENTS + 50):
-        em.log(f"filler{i}")
-
-    assert _wait_for(lambda: srv._last_event_id > srv.TAIL_EVENTS), (
-        "tail task did not catch up on the flood of filler events"
+    agent_path = run_dir / "LateAgent_data.sqlite3"
+    detail_collector = agDataCollector(
+        SimpleNamespace(
+            agDataCollectorConfigs=agDataCollectorConfigs(db_path=str(agent_path))
+        )
+    )
+    detail_collector.start()
+    detail_collector.record_event(
+        "agent_config",
+        {"agskill": {"react_max_steps": 7}},
+        overwrite=True,
+    )
+    detail_collector.record_event(
+        "live_messages",
+        {"messages": [{"role": "assistant", "content": "finished"}]},
+        overwrite=True,
+        flush=True,
     )
 
-    with client.websocket_connect("/ws") as ws:
-        # TAIL_EVENTS log lines exhaust the tail replay itself; the state
-        # preamble (where agent_config actually lives, as the only row in
-        # agent_config_state) is sent right after -- exactly one more
-        # message to wait for.
-        received = _recv_skipping_sync(ws, srv.TAIL_EVENTS + 1)
+    emitter = agwebui_emitter(run_dir)
+    emitter._collector.record_event(
+        "agent_registered",
+        {"db_path": str(agent_path), "team": None},
+        source="catalog",
+        agname="LateAgent",
+        overwrite=True,
+        flush=True,
+    )
 
-    configs = [e for e in received if e.get("type") == "agent_config"]
-    assert configs, "agent_config was not recovered via the state preamble"
-    assert configs[-1]["agname"] == "LateAgent"
-    assert configs[-1]["config"]["agskill"]["react_max_steps"] == 7
+    response = client.get("/api/agents/LateAgent")
+    assert response.status_code == 200
+    detail = response.json()
+    assert detail["config"]["agskill"]["react_max_steps"] == 7
+    assert detail["messages"] == [{"role": "assistant", "content": "finished"}]
+
+    connection = sqlite3.connect(emitter._db_path)
+    try:
+        global_types = {
+            row[0] for row in connection.execute("SELECT type FROM events").fetchall()
+        }
+    finally:
+        connection.close()
+    assert "agent_config" not in global_types
+    assert "live_messages" not in global_types
+    detail_collector.stop()

@@ -17,7 +17,7 @@ from ..profiler import agprof
 from ..agconfig import agConfig, _AgConfigViewBase
 
 if TYPE_CHECKING:
-    from ..agdatacollector import agDataCollector
+    from ..agcollector import GlobalDomainCollector
 
 
 class agResourcePoolConfig(_AgConfigViewBase):
@@ -91,7 +91,7 @@ class agResourcePool(_AgResourcePoolFields):
         idle_memory: str | None = None,
         mark_gpus: bool = False,
         agconfig: "agConfig | None" = None,
-        data_collector: "agDataCollector | None" = None,
+        data_collector: "GlobalDomainCollector | None" = None,
     ) -> None:
         self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
         for _name, _value in (
@@ -315,9 +315,7 @@ class agResourcePool(_AgResourcePoolFields):
             who=sandbox._name, action="release_cpu_mem", cpus=held_cpus, memory_mb=held_mb
         )
 
-    def _update_resource_log(
-        self, *, who: "str | None" = None, action: "str | None" = None, **request
-    ) -> None:
+    def _emit_resource(self) -> None:
         dc = self._data_collector
         if dc is None:
             return
@@ -333,11 +331,18 @@ class agResourcePool(_AgResourcePoolFields):
             },
             overwrite=True,
         )
+
+    def _update_resource_log(
+        self, *, who: "str | None" = None, action: "str | None" = None, **request
+    ) -> None:
+        dc = self._data_collector
+        if dc is None:
+            return
+        self._emit_resource()
         dc.record_event(
             type="resource_request",
             payload={"who": who, "action": action, "request": request or None},
             overwrite=False,
-            flush=True,
         )
 
     def __repr__(self) -> str:

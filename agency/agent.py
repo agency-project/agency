@@ -190,9 +190,6 @@ class agent:
         self._owns_sandbox = sandbox is None
         self.engine: "AgentEngine | None" = None
 
-        # Eagerly construct the process-wide orchestrator
-        self._orchestrator = get_orchestrator(self.agconfig)
-
         from .agteam import _active_team
 
         _team = _active_team.get(None)
@@ -242,7 +239,12 @@ class agent:
             )
         self.data_collector = agDataCollector(self.agconfig)
         self.data_collector.start()
-        self._orchestrator = get_orchestrator(self.agconfig)
+        from .agcollector import resolve_global_db_path
+
+        self._orchestrator = get_orchestrator(
+            self.agconfig,
+            default_db_path=resolve_global_db_path(log_dir),
+        )
         self._submission_lock = threading.RLock()
         initial_sequence = max(
             (
@@ -266,8 +268,24 @@ class agent:
         self.data_collector.record_event(
             type=event_type, payload=event_payload, term_message=term_message
         )
+        self._register_global_catalog(event_payload.get("team"))
         self.record_state("agent_idle")
         self.change_config(self.agconfig)
+
+    def _register_global_catalog(self, team_name: "str | None") -> None:
+        """Publish only agent identity and its detailed database location globally."""
+        try:
+            agent_db_path = Path(self.data_collector._configs.db_path)
+            self._orchestrator.data_collector.record_event(
+                "agent_registered",
+                {"db_path": str(agent_db_path.resolve()), "team": team_name},
+                source="catalog",
+                agname=str(self.agname),
+                scope_key=str(self.agname),
+                overwrite=True,
+            )
+        except Exception as exc:
+            print(f"[agent] WARNING: global catalog registration failed for {self.agname}: {exc}")
 
     def _submission_finished(self, submission: Submission) -> None:
         with self._orchestrator._event_cond:
@@ -846,11 +864,6 @@ class agent:
             else None
         )
         ag._owns_sandbox = True
-
-        # load() can be the very first agent constructed in a process (no
-        # prior agent to have already triggered this), so it needs its own
-        # eager trigger too.
-        ag._orchestrator = get_orchestrator(ag.agconfig)
 
         ag._finish_construction(
             event_type="agent_loaded",

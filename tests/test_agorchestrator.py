@@ -494,7 +494,7 @@ def test_shutdown_fails_permanently_blocked_requests(monkeypatch, tmp_path):
     assert orchestrator.snapshot().state == "stopped"
 
 
-def test_profiler_adapter_persists_intervals_to_agent_database(monkeypatch, tmp_path):
+def test_profiler_adapter_persists_intervals_to_global_database(monkeypatch, tmp_path):
     dependency: Future[agdata] = Future()
 
     def execute(self, *, context, **_kwargs):
@@ -508,11 +508,14 @@ def test_profiler_adapter_persists_intervals_to_agent_database(monkeypatch, tmp_
     )
     dependency.set_result(agdata(value=1))
     assert result.ok is True
-    ag.data_collector.flush()
+    orchestrator = get_orchestrator()
+    orchestrator.flush(timeout_s=2)
 
-    connection = sqlite3.connect(ag.data_collector._configs.db_path)
+    connection = sqlite3.connect(orchestrator.data_collector.db_path)
     try:
-        rows = connection.execute("SELECT name,attributes FROM spans ORDER BY id").fetchall()
+        rows = connection.execute(
+            "SELECT name,agname,request_id,skill,attributes FROM spans ORDER BY id"
+        ).fetchall()
     finally:
         connection.close()
     names = {row[0] for row in rows}
@@ -522,9 +525,10 @@ def test_profiler_adapter_persists_intervals_to_agent_database(monkeypatch, tmp_
         "engine:execution",
         "request:submission_to_completion",
     } <= names
-    correlated = [json.loads(attributes) for _name, attributes in rows]
-    assert all(item["request_id"] == "run0" for item in correlated)
-    assert all(item["skill"] == "profiled" for item in correlated)
+    assert all(row[1] == str(ag.agname) for row in rows)
+    assert all(row[2] == "run0" for row in rows)
+    assert all(row[3] == "profiled" for row in rows)
+    assert all(json.loads(row[4])["request_kind"] == "skill" for row in rows)
 
 
 def test_agents_keep_separate_data_collectors(tmp_path):
