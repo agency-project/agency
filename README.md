@@ -99,6 +99,119 @@ close.wait()          # waits for asynchronous cleanup; repeated destroy() retur
 
 `ag.queue_message()` returns a `MessageSubmission`. It advances the serialized agent context chain by copying its predecessor context and appending retained host-only context without creating an engine, sandbox, harness, or model request. It does not retroactively modify an invocation submitted before it. See [Invocation API](docs/Invocation_API.md) for the distinction from `Invocation.send_message()`.
 
+## Agent and Invocation API reference
+
+`Agent` is the public alias of `agent`.
+
+### Create an agent
+
+```python
+from agency import Agent
+
+ag = Agent(
+    agname=None,
+    sandbox=None,
+    agconfig=cfg,
+    harness=None,
+)
+```
+
+### Agent execution and context
+
+| API | Purpose |
+|---|---|
+| `ag.run(skill, skill_input, max_steps=None)` | Submit work and immediately return its `Invocation`. |
+| `await ag.asyncio_run(skill, skill_input, max_steps=None)` | Submit work, wait, and return the resolved `agdata`. |
+| `ag.queue_message(message)` | Add ordered context for submissions made after the message; returns a `MessageSubmission`. |
+| `ag.context` | The agent's authoritative context chain. |
+| `ag.ctx` | Read/write compatibility alias for `ag.context`. |
+| `ag.history` | Read the committed transcript as `agdata`, or assign `agdata` to replace it. |
+
+`queue_message()` affects later submissions, while `Invocation.send_message()` targets one invocation that has already been submitted:
+
+```python
+await ag.queue_message("Remember this for later work")
+inv = ag.run(skill, skill_input)
+inv.send_message("Apply this only to this invocation")
+```
+
+### Agent lifecycle
+
+| API | Purpose |
+|---|---|
+| `ag.suspend()` | Close the agent-wide dispatch gate and park active work at a safe boundary. |
+| `ag.resume()` | Reopen the agent-wide gate; does not resume an invocation paused with `inv.pause()`. |
+| `ag.destroy()` | Reject new work and begin asynchronous cleanup; returns a reusable `CloseHandle`. |
+| `ag.is_suspended()` | Report whether agent-wide suspension was requested. |
+| `ag.is_paused()` | Report whether active work is actually parked. |
+| `ag.is_settled()` | Report whether the agent currently has no unsettled work, or is safely parked. |
+| `ag.lifecycle_state` | Current agent lifecycle state, such as `ACTIVE`, `SUSPENDED`, `DESTROYING`, or `DESTROYED`. |
+
+Wait for destruction synchronously or asynchronously:
+
+```python
+close = ag.destroy()
+close.wait(timeout=None)
+# or
+await close
+```
+
+### Agent configuration, cloning, and checkpoints
+
+| API | Purpose |
+|---|---|
+| `ag.change_config(new_config)` | Replace the agent's live configuration with a clone of `new_config`. |
+| `ag.get_config_copy()` | Return an independent copy of the current configuration. |
+| `Agent.fork(source, agname=None)` | Create an independent agent from the source's resolved context, configuration, and sandbox snapshot. |
+| `ag.save(path)` | Save one agent checkpoint. |
+| `Agent.load(path, agconfig=None)` | Restore one agent checkpoint. |
+| `Agent.save_all(directory)` | Save every live agent and return the checkpoint paths. |
+| `Agent.load_all(directory, agconfig=None)` | Restore all checkpoints in a directory. |
+| `Agent.all()` | Return all live agents in this process. |
+
+Useful agent metadata includes `ag.agname`, `ag.harness`, `ag.output_path`, and `ag.container_output_path`. `ag.record_state(state, skill=None, tool=None)` is available for runtime logging and UI reporting.
+
+### Invocation results
+
+An invocation is an awaitable pending result. Waiting with `inv.wait()` returns the invocation, while awaiting it returns the resolved `agdata`:
+
+```python
+inv = ag.run(skill, skill_input)
+
+inv.wait(timeout=None)
+output = await inv
+pending_or_resolved = inv.result
+```
+
+| API | Purpose |
+|---|---|
+| `inv.result` | The pending or resolved output `agdata`. |
+| `inv.wait(timeout=None)` | Block until resolution and return `inv`. |
+| `await inv` | Resolve to the output `agdata`. |
+| `inv.is_pending()` | Report whether the result is unresolved. |
+| `inv.to_dict()` | Resolve and serialize the output as a dictionary. |
+| `inv.to_json()` | Resolve and serialize the output as JSON. |
+
+Unknown attributes proxy to the output, so `inv.answer` reads the output field named `answer`. To read an output field literally named `result`, use `inv.result.result`. An invocation can also be passed directly anywhere pending `agdata` is accepted.
+
+### Invocation controls and state
+
+| API | Purpose |
+|---|---|
+| `inv.send_message(message)` | Deliver an additional instruction to this invocation at its next valid safe boundary. |
+| `inv.pause()` | Request a safe-boundary pause for this invocation only. |
+| `inv.resume()` | Resume this invocation only. |
+| `inv.cancel()` | Cancel this invocation; repeated calls are safe. |
+| `inv.is_cancelled()` | Report whether cancellation was requested. |
+| `inv.is_destroyed()` | Report whether agent destruction reached this invocation. |
+| `inv.is_pause_requested()` | Report whether an invocation-specific pause is requested. |
+| `inv.state` | Public lifecycle state for the invocation. |
+| `inv.phase` | Current execution phase. |
+
+Identity and ordering fields are `inv.invocation_id`, `inv.ordering_id`, and `inv.skill_name`. Public invocation states are `QUEUED`, `RUNNING`, `PAUSED`, `CANCELLING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, and `DESTROYED`.
+
+The previous `prepare()`, `start()`, `ag.send()`, and `inv.steer()` APIs have been removed. Use `run()`, `queue_message()`, and `send_message()` instead.
+
 **OpenAI**
 
 ```python
