@@ -54,10 +54,10 @@ def _terminal_error(invocation, expected: str) -> None:
     assert invocation.wait(timeout=2).to_dict() == {"error": expected}
 
 
-def test_cancel_prepared_blocked_and_ready_without_building_engines(monkeypatch, tmp_path):
+def test_cancel_blocked_and_ready_without_building_engines(monkeypatch, tmp_path):
     capacity_started = threading.Event()
     release_capacity = threading.Event()
-    callback_finished = {name: threading.Event() for name in ("prepared", "blocked", "ready")}
+    callback_finished = {name: threading.Event() for name in ("seeded_ready", "blocked", "ready")}
     constructed_for: list[agent] = []
     executed: list[str] = []
     followups = []
@@ -80,16 +80,16 @@ def test_cancel_prepared_blocked_and_ready_without_building_engines(monkeypatch,
     monkeypatch.setattr(AgentEngine, "execute", execute)
 
     capacity_agent = _agent(tmp_path, max_engines=1)
-    prepared_agent = _agent(tmp_path, max_engines=1)
+    seeded_ready_agent = _agent(tmp_path, max_engines=1)
     blocked_agent = _agent(tmp_path, max_engines=1)
     ready_agent = _agent(tmp_path, max_engines=1)
     capacity = capacity_agent.run(agskill("capacity", ""), agdata(label="holds-capacity"))
     assert capacity_started.wait(timeout=2)
 
     seed = [{"role": "user", "content": "committed before cancellation"}]
-    prepared_agent.context = agcontext(recent_transcript=seed)
-    prepared = prepared_agent.prepare(
-        agskill("prepared", ""), agdata(label="must-not-run-prepared")
+    seeded_ready_agent.context = agcontext(recent_transcript=seed)
+    seeded_ready = seeded_ready_agent.run(
+        agskill("seeded-ready", ""), agdata(label="must-not-run-seeded-ready")
     )
     unresolved: Future[agdata] = Future()
     blocked = blocked_agent.run(
@@ -98,19 +98,19 @@ def test_cancel_prepared_blocked_and_ready_without_building_engines(monkeypatch,
     )
     ready = ready_agent.run(agskill("ready", ""), agdata(label="must-not-run-ready"))
 
-    assert _request_state(prepared) == "prepared"
+    assert _request_state(seeded_ready) == "ready"
     assert _request_state(blocked) == "blocked"
     assert _request_state(ready) == "ready"
 
-    def prepared_done(_future) -> None:
-        assert prepared._context_future.done()
-        callback_contexts["prepared"] = prepared._context_future.result().recent_transcript
+    def seeded_ready_done(_future) -> None:
+        assert seeded_ready._context_future.done()
+        callback_contexts["seeded_ready"] = seeded_ready._context_future.result().recent_transcript
         followups.append(
-            prepared_agent.run(agskill("followup", ""), agdata(label="callback-followup"))
+            seeded_ready_agent.run(agskill("followup", ""), agdata(label="callback-followup"))
         )
-        callback_finished["prepared"].set()
+        callback_finished["seeded_ready"].set()
 
-    prepared._result_future.add_done_callback(prepared_done)
+    seeded_ready._result_future.add_done_callback(seeded_ready_done)
     for name, invocation in (("blocked", blocked), ("ready", ready)):
 
         def observe_context(_future, *, name=name, invocation=invocation) -> None:
@@ -121,21 +121,21 @@ def test_cancel_prepared_blocked_and_ready_without_building_engines(monkeypatch,
 
         invocation._result_future.add_done_callback(observe_context)
 
-    prepared.cancel()
+    seeded_ready.cancel()
     blocked.cancel()
     ready.cancel()
 
-    _terminal_error(prepared, "agent invocation cancelled")
+    _terminal_error(seeded_ready, "agent invocation cancelled")
     _terminal_error(blocked, "agent invocation cancelled")
     _terminal_error(ready, "agent invocation cancelled")
     for finished in callback_finished.values():
         assert finished.wait(timeout=2)
     assert callback_contexts == {
-        "prepared": seed,
+        "seeded_ready": seed,
         "blocked": [],
         "ready": [],
     }
-    assert prepared.state == blocked.state == ready.state == "CANCELLED"
+    assert seeded_ready.state == blocked.state == ready.state == "CANCELLED"
     assert unresolved.done() is False
     assert constructed_for == [capacity_agent]
     assert blocked_agent.engine is None
@@ -231,7 +231,9 @@ def test_agent_cancel_targets_only_the_active_invocation(monkeypatch, tmp_path):
     assert calls == [("first", first), ("second", second)]
 
 
-def test_suspend_uses_no_capacity_and_resume_preserves_other_gates(monkeypatch, tmp_path):
+def test_suspend_uses_no_capacity_and_agent_resume_preserves_invocation_pause(
+    monkeypatch, tmp_path
+):
     other_started = threading.Event()
     release_other = threading.Event()
     suspended_started = threading.Event()
@@ -251,7 +253,6 @@ def test_suspend_uses_no_capacity_and_resume_preserves_other_gates(monkeypatch, 
     suspended_agent.suspend()
     queued = suspended_agent.run(agskill("queued", ""), agdata(label="suspended"))
     queued.pause()
-    prepared = suspended_agent.prepare(agskill("prepared", ""), agdata(label="prepared"))
 
     assert suspended_agent.is_suspended() is True
     assert _request_state(queued) == "ready"
@@ -264,7 +265,6 @@ def test_suspend_uses_no_capacity_and_resume_preserves_other_gates(monkeypatch, 
     _drain_scheduler()
     assert suspended_agent.is_suspended() is False
     assert queued.is_pause_requested() is True
-    assert prepared.state == "PREPARED"
     assert suspended_started.is_set() is False
     assert suspended_agent.engine is None
 
@@ -278,9 +278,6 @@ def test_suspend_uses_no_capacity_and_resume_preserves_other_gates(monkeypatch, 
     queued.resume()
     assert suspended_started.wait(timeout=2)
     assert queued.wait(timeout=2).label == "suspended"
-    assert prepared.state == "PREPARED"
-    prepared.cancel()
-    _terminal_error(prepared, "agent invocation cancelled")
 
 
 def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
@@ -331,7 +328,6 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
     with active._control._condition:
         assert active._control._condition.wait_for(lambda: active.state == "PAUSED", timeout=2)
 
-    prepared = active_agent.prepare(agskill("prepared", ""), agdata(label="prepared"))
     unresolved: Future[agdata] = Future()
     blocked = active_agent.run(
         agskill("blocked", ""),
@@ -341,7 +337,6 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
     ready = ready_agent.run(agskill("ready", ""), agdata(label="ready"))
 
     assert _request_state(active) == "running"
-    assert _request_state(prepared) == "prepared"
     assert _request_state(blocked) == "blocked"
     assert isinstance(message, MessageSubmission)
     assert _request_state(message) == "blocked"
@@ -349,7 +344,6 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
 
     invocations = {
         "active": active,
-        "prepared": prepared,
         "blocked": blocked,
         "message": message,
         "ready": ready,
@@ -377,8 +371,6 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
     assert ready_agent.destroy() is ready_close
     with pytest.raises(AgentDestroyedError):
         active_agent.run(agskill("rejected", ""), agdata())
-    with pytest.raises(AgentDestroyedError):
-        active_agent.prepare(agskill("rejected", ""), agdata())
     with pytest.raises(AgentDestroyedError):
         active_agent.send("rejected")
 

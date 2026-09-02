@@ -156,8 +156,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         skill: "agskill",
         skill_input: object,
         max_steps: "int | None" = None,
-        *,
-        ready: bool = True,
     ) -> Invocation:
         """Atomically publish and register one exact public Invocation.
 
@@ -182,7 +180,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     ag,
                     ag._control.allocate_invocation_id(),
                     skill.name,
-                    ready=ready,
                 )
                 predecessor = ag.context
                 ordering_id = ag._next_submission_id
@@ -244,35 +241,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         if cycle_ack is not None:
             cycle_ack.result()
         return submission
-
-    def start_invocation(self, invocation: Invocation) -> bool:
-        """Open one PREPARED gate and wake the event-driven scheduler."""
-        ag = invocation._agent
-        with self._event_cond:
-            with ag._submission_lock:
-                ag._control.assert_alive("start an invocation")
-                released = invocation in ag._submissions and invocation._release()
-            if released:
-                self._post_locked("control_changed", invocation._request_id)
-        return released
-
-    def start_prepared(self, ag: "agent") -> tuple[Invocation, ...]:
-        """Release the snapshot of invocations prepared at this instant."""
-        with self._event_cond:
-            with ag._submission_lock:
-                ag._control.assert_alive("start prepared invocations")
-                prepared = tuple(
-                    submission
-                    for submission in ag._submissions
-                    if isinstance(submission, Invocation) and submission.state == "PREPARED"
-                )
-                for invocation in prepared:
-                    invocation._release()
-            if prepared:
-                self._post_locked(
-                    "control_changed", tuple(invocation._request_id for invocation in prepared)
-                )
-        return prepared
 
     def notify_invocation_control(self, invocation: Invocation) -> None:
         with self._event_cond:
@@ -501,11 +469,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             submitted_perf_ns=submitted_perf_ns,
             submitted_wall_ns=submitted_wall_ns,
             context_dependency=context_dependency,
-            state=(
-                "prepared"
-                if isinstance(submission, Invocation) and submission.state == "PREPARED"
-                else "submitted"
-            ),
+            state="submitted",
         )
         skill_name = skill.name if skill is not None else kind
         request.run_span = agprof.start_external_span(
@@ -1231,7 +1195,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         pending = [
             request
             for request in self._requests.values()
-            if request.state in {"prepared", "submitted", "blocked"}
+            if request.state in {"submitted", "blocked"}
         ]
         for request in pending:
             self._fail_request_locked(

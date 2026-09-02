@@ -23,9 +23,6 @@ class _FakeAgent:
         self._submission_lock = threading.RLock()
         self.control_changes = []
 
-    def _start_invocation(self, invocation: Invocation) -> None:
-        invocation._release()
-
     def _notify_invocation_control(self, invocation: Invocation) -> None:
         self.control_changes.append(invocation)
 
@@ -42,7 +39,7 @@ def test_public_submission_exports_and_agent_alias():
 
 def test_invocation_result_wait_await_and_field_proxy_support_literal_result_field():
     owner = _FakeAgent()
-    invocation = Invocation(owner, 1, "answer", ready=True)
+    invocation = Invocation(owner, 1, "answer")
     output = agdata(result="literal", other=42)
     invocation._result_future.set_result(output)
     invocation._mark_terminal(output)
@@ -57,7 +54,7 @@ def test_invocation_result_wait_await_and_field_proxy_support_literal_result_fie
 
 def test_cancelling_one_async_waiter_does_not_cancel_shared_invocation_future():
     owner = _FakeAgent()
-    invocation = Invocation(owner, 1, "async", ready=True)
+    invocation = Invocation(owner, 1, "async")
 
     async def scenario():
         waiter = asyncio.ensure_future(invocation)
@@ -72,14 +69,14 @@ def test_cancelling_one_async_waiter_does_not_cancel_shared_invocation_future():
     assert invocation._result_future.cancelled() is False
 
 
-def test_invocation_prepare_start_and_control_state_are_idempotent():
+def test_invocation_is_queued_immediately_and_control_state_is_idempotent():
     owner = _FakeAgent()
-    invocation = Invocation(owner, 1, "prepared", ready=False)
+    invocation = Invocation(owner, 1, "queued")
 
-    assert invocation.state == "PREPARED"
-    invocation.start()
-    invocation.start()
     assert invocation.state == "QUEUED"
+    assert not hasattr(type(invocation), "start")
+    assert not hasattr(agent, "prepare")
+    assert not hasattr(agent, "start")
 
     invocation.pause()
     assert invocation.is_pause_requested()
@@ -93,7 +90,7 @@ def test_invocation_prepare_start_and_control_state_are_idempotent():
 
 def test_steering_is_fifo_replayed_per_boundary_and_rejected_after_final_answer():
     owner = _FakeAgent()
-    invocation = Invocation(owner, 1, "steer", ready=True)
+    invocation = Invocation(owner, 1, "steer")
     invocation.steer("first")
     invocation.steer("second")
 

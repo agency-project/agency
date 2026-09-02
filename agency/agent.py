@@ -419,9 +419,6 @@ class agent:
     # Pause / resume
     # ------------------------------------------------------------------
 
-    def _start_invocation(self, invocation: Invocation) -> None:
-        self._orchestrator.start_invocation(invocation)
-
     def _notify_invocation_control(self, invocation: Invocation) -> None:
         self._orchestrator.notify_invocation_control(invocation)
 
@@ -449,10 +446,6 @@ class agent:
             }
         )
         return sequence
-
-    def start(self) -> None:
-        """Release the snapshot of invocations currently in ``PREPARED``."""
-        self._orchestrator.start_prepared(self)
 
     def suspend(self) -> None:
         """Close the independent agent-wide scheduler/execution gate."""
@@ -553,21 +546,6 @@ class agent:
         if max_steps is None:
             return skill.run(self, skill_input)
         return skill.run(self, skill_input, max_steps=max_steps)
-
-    def prepare(
-        self,
-        skill,
-        skill_input: agdata,
-        max_steps: "int | None" = None,
-    ) -> Invocation:
-        """Reserve ordered work with a closed scheduler readiness gate."""
-        return self._orchestrator.submit(
-            self,
-            skill,
-            skill_input,
-            max_steps=max_steps,
-            ready=False,
-        )
 
     async def asyncio_run(
         self,

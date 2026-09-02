@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -63,8 +64,12 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
     monkeypatch.setattr(AgentEngine, "execute", execute)
     ag = _agent(tmp_path)
     skill = agskill("ordered", "")
+    gate_dependency: Future[agdata] = Future()
 
-    prepared = ag.prepare(skill, agdata(label="prepared"))
+    blocked = ag.run(
+        skill,
+        agdata(label="blocked", dependency=agdata(_future=gate_dependency)),
+    )
     message = ag.send("Remember the exact order")
     later = ag.run(skill, agdata(label="later"))
     callback_context_done: list[bool] = []
@@ -77,7 +82,7 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
     message._result_future.add_done_callback(observe_success)
 
     assert isinstance(message, MessageSubmission)
-    assert message.predecessor_context is prepared.output_context
+    assert message.predecessor_context is blocked.output_context
     assert later.predecessor_context is message.output_context
     assert ag.context is later.output_context
     assert message.is_pending()
@@ -94,8 +99,8 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
         assert request.result_future is message._result_future
         assert request.context_future is message._context_future
 
-    prepared.start()
-    assert prepared.wait(timeout=2).label == "prepared"
+    gate_dependency.set_result(agdata(open=True))
+    assert blocked.wait(timeout=2).label == "blocked"
     assert message.wait(timeout=2).to_dict() == {}
     assert callback_finished.wait(timeout=2)
     assert callback_context_done == [True]
@@ -110,7 +115,7 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
     }
     assert message.state == "SUCCEEDED"
     assert message._context_future.result().retained_messages == [entry]
-    assert observed_contexts == [("prepared", []), ("later", [entry])]
+    assert observed_contexts == [("blocked", []), ("later", [entry])]
     assert len(constructed) == 2
 
 
@@ -245,7 +250,11 @@ def test_concurrent_messages_follow_atomic_publication_order(monkeypatch, tmp_pa
     monkeypatch.setattr(AgentEngine, "__init__", tracked_init)
     monkeypatch.setattr(AgentEngine, "execute", lambda self, **_kwargs: agdata(done=True))
     ag = _agent(tmp_path)
-    gate = ag.prepare(agskill("gate", ""), agdata())
+    gate_dependency: Future[agdata] = Future()
+    gate = ag.run(
+        agskill("gate", ""),
+        agdata(dependency=agdata(_future=gate_dependency)),
+    )
     barrier = threading.Barrier(9)
     submissions: list[MessageSubmission] = []
     failures: list[BaseException] = []
@@ -276,7 +285,7 @@ def test_concurrent_messages_follow_atomic_publication_order(monkeypatch, tmp_pa
     assert ag.context is ordered[-1].output_context
     assert constructed == []
 
-    gate.start()
+    gate_dependency.set_result(agdata(open=True))
     assert gate.wait(timeout=2).done is True
     for submission in ordered:
         assert submission.wait(timeout=2).to_dict() == {}
@@ -295,7 +304,11 @@ def test_destroy_settles_blocked_message_context_before_result_without_engine(
     constructed = MagicMock()
     monkeypatch.setattr(AgentEngine, "__init__", constructed)
     ag = _agent(tmp_path)
-    prepared = ag.prepare(agskill("never", ""), agdata())
+    unresolved: Future[agdata] = Future()
+    blocked = ag.run(
+        agskill("never", ""),
+        agdata(dependency=agdata(_future=unresolved)),
+    )
     message = ag.send("must not commit")
     callback_observed_context = threading.Event()
 
@@ -306,7 +319,7 @@ def test_destroy_settles_blocked_message_context_before_result_without_engine(
     message._result_future.add_done_callback(observe)
     close = ag.destroy()
 
-    assert prepared.wait(timeout=2).error == "agent destroyed"
+    assert blocked.wait(timeout=2).error == "agent destroyed"
     assert message.wait(timeout=2).error == "agent destroyed"
     assert callback_observed_context.wait(timeout=2)
     assert message.state == "DESTROYED"

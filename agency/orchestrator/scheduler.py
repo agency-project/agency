@@ -40,8 +40,6 @@ class ExecutionScheduler:
                     if request.state != "running":
                         owner._cancel_request_locked(request)
                     continue
-            if request.state == "prepared" and getattr(request.submission, "_ready", False):
-                request.state = "submitted"
         resolved: list[_ExecutionRequest] = []
         wait_pool = sorted(
             (

@@ -70,29 +70,6 @@ def test_unresolved_dependency_uses_no_engine_thread_or_slot(monkeypatch, tmp_pa
     assert isinstance(ag.engine, AgentEngine)
 
 
-def test_prepared_request_creates_no_execution_worker_until_started(monkeypatch, tmp_path):
-    called = threading.Event()
-
-    def execute(self, *, context, **_kwargs):
-        called.set()
-        return _result(context, ok=True)
-
-    monkeypatch.setattr(AgentEngine, "execute", execute)
-    ag = _agent(tmp_path, max_engines=1)
-    prepared = ag.prepare(agskill("prepared", ""), agdata())
-    orchestrator = get_orchestrator()
-
-    assert prepared.state == "PREPARED"
-    assert ag.engine is None
-    assert not orchestrator._execution_workers._threads
-    assert not called.is_set()
-
-    prepared.start()
-    assert prepared.wait(timeout=2).ok is True
-    assert called.is_set()
-    assert len(orchestrator._execution_workers._threads) == 1
-
-
 def test_optional_global_capacity_refills_on_completion_notification(monkeypatch, tmp_path):
     release_first = threading.Event()
     first_started = threading.Event()

@@ -388,7 +388,7 @@ class agskill:
         from .orchestrator import get_orchestrator
 
         orchestrator = get_orchestrator(ag.agconfig)
-        return orchestrator.submit(ag, self, skill_input, max_steps=max_steps, ready=True)
+        return orchestrator.submit(ag, self, skill_input, max_steps=max_steps)
 
     async def asyncio_run(
         self,

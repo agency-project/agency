@@ -96,13 +96,12 @@ class _AgdataResultHandle:
 class Invocation(Submission, InvocationHandle, _AgdataResultHandle):
     """Awaitable identity, result dependency, and controls for one skill run."""
 
-    def __init__(self, ag: "agent", invocation_id: int, skill_name: str, *, ready: bool) -> None:
+    def __init__(self, ag: "agent", invocation_id: int, skill_name: str) -> None:
         Submission.__init__(self, ag)
         InvocationHandle.__init__(self, ag._control, invocation_id, skill_name)
         self._result_future: Future[agdata] = Future()
         self.result = agdata(_future=self._result_future)
-        self._state = "QUEUED" if ready else "PREPARED"
-        self._ready = ready
+        self._state = "QUEUED"
 
     @property
     def state(self) -> str:
@@ -110,10 +109,6 @@ class Invocation(Submission, InvocationHandle, _AgdataResultHandle):
             if self._phase == "paused" and self._state == "RUNNING":
                 return "PAUSED"
             return self._state
-
-    def start(self) -> None:
-        """Release this invocation if prepared, without changing its order."""
-        self._agent._start_invocation(self)
 
     def pause(self) -> None:
         super().pause()
@@ -137,15 +132,6 @@ class Invocation(Submission, InvocationHandle, _AgdataResultHandle):
         notify = getattr(self._agent, "_notify_invocation_control", None)
         if callable(notify):
             notify(self)
-
-    def _release(self) -> bool:
-        with self._control._condition:
-            if self._state != "PREPARED":
-                return False
-            self._state = "QUEUED"
-            self._ready = True
-            self._control._condition.notify_all()
-            return True
 
     def _mark_running(self) -> None:
         with self._control._condition:
@@ -206,7 +192,7 @@ class MessageSubmission(Submission, _AgdataResultHandle):
             self._state = "CANCELLING"
 
     def __getattr__(self, name: str):
-        if name in {"start", "steer", "pause", "resume", "cancel"}:
+        if name in {"steer", "pause", "resume", "cancel"}:
             raise AttributeError(f"MessageSubmission has no {name}() control")
         return super().__getattr__(name)
 

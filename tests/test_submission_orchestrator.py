@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import threading
 from concurrent.futures import Future
 from unittest.mock import MagicMock
@@ -101,169 +100,10 @@ def test_direct_and_nested_invocation_dependencies_materialize(monkeypatch, tmp_
     assert nested.wait(timeout=2).observed == 42
 
 
-def test_prepared_head_blocks_later_run_without_creating_an_engine(monkeypatch, tmp_path):
-    constructed: list[AgentEngine] = []
-    sandbox_creations: list[tuple[tuple, dict]] = []
-    execution_started = threading.Event()
-    order: list[str] = []
-    original_init = AgentEngine.__init__
-
-    agent_module = importlib.import_module("agency.agent")
-
-    def tracked_init(self, *args, **kwargs):
-        constructed.append(self)
-        original_init(self, *args, **kwargs)
-
-    def execute(self, *, skill_input, **_kwargs):
-        order.append(skill_input.label)
-        execution_started.set()
-        return agdata(label=skill_input.label)
-
-    fake_sandbox = MagicMock()
-    fake_sandbox._lock = threading.RLock()
-    fake_sandbox._checkpoint_image = None
-
-    def tracked_sandbox(*args, **kwargs):
-        sandbox_creations.append((args, kwargs))
-        return fake_sandbox
-
-    monkeypatch.setattr(AgentEngine, "__init__", tracked_init)
-    monkeypatch.setattr(AgentEngine, "execute", execute)
-    config = agConfig(
-        agOrchestratorConfig(max_concurrent_engines=1),
-        {"agent": {"log_dir": str(tmp_path)}},
-        {"agllm_backend": {"api_key": "test", "model": ""}},
-    )
-    ag = agent(agconfig=config)
-    orchestrator = get_orchestrator(ag.agconfig)
-    assert ag.sandbox is None
-    monkeypatch.setattr(agent_module, "agSandbox", tracked_sandbox)
-    skill = agskill("ordered", "")
-
-    prepared = ag.prepare(skill, agdata(label="prepared"))
-    later = ag.run(skill, agdata(label="later"))
-
-    assert prepared.state == "PREPARED"
-    assert not execution_started.is_set()
-    assert constructed == []
-    assert sandbox_creations == []
-    assert not orchestrator._execution_workers._threads
-    assert ag.sandbox is None
-    assert ag.engine is None
-    assert orchestrator.snapshot().running_count == 0
-
-    prepared.start()
-    assert prepared.wait(timeout=2).label == "prepared"
-    assert later.wait(timeout=2).label == "later"
-    assert order == ["prepared", "later"]
-    assert len(constructed) == 2
-    assert constructed[0] is not constructed[1]
-    assert len(sandbox_creations) == 1
-    assert len(orchestrator._execution_workers._threads) == 1
-
-
-def test_invocation_start_never_bypasses_an_earlier_prepared_head(monkeypatch, tmp_path):
-    execution_started = threading.Event()
-    order: list[str] = []
-
-    def execute(self, *, skill_input, **_kwargs):
-        order.append(skill_input.label)
-        execution_started.set()
-        return agdata(label=skill_input.label)
-
-    monkeypatch.setattr(AgentEngine, "execute", execute)
-    ag = _agent(tmp_path)
-    skill = agskill("ordered", "")
-
-    first = ag.prepare(skill, agdata(label="first"))
-    second = ag.prepare(skill, agdata(label="second"))
-    third = ag.run(skill, agdata(label="third"))
-
-    second.start()
-    assert second.state == "QUEUED"
-    assert first.state == "PREPARED"
-    assert not execution_started.is_set()
-
-    first.start()
-    assert first.wait(timeout=2).label == "first"
-    assert second.wait(timeout=2).label == "second"
-    assert third.wait(timeout=2).label == "third"
-    assert order == ["first", "second", "third"]
-
-
-def test_agent_start_releases_only_its_preexisting_snapshot(monkeypatch, tmp_path):
-    first_started = threading.Event()
-    release_first = threading.Event()
-    order: list[str] = []
-
-    def execute(self, *, skill_input, **_kwargs):
-        order.append(skill_input.label)
-        if skill_input.label == "one":
-            first_started.set()
-            assert release_first.wait(timeout=2)
-        return agdata(label=skill_input.label)
-
-    monkeypatch.setattr(AgentEngine, "execute", execute)
-    ag = _agent(tmp_path)
-    skill = agskill("snapshot", "")
-
-    one = ag.prepare(skill, agdata(label="one"))
-    two = ag.prepare(skill, agdata(label="two"))
-    ag.start()
-    assert first_started.wait(timeout=2)
-
-    later = ag.prepare(skill, agdata(label="later"))
-    release_first.set()
-    assert one.wait(timeout=2).label == "one"
-    assert two.wait(timeout=2).label == "two"
-    assert later.state == "PREPARED"
-    assert order == ["one", "two"]
-
-    ag.start()
-    assert later.wait(timeout=2).label == "later"
-    assert order == ["one", "two", "later"]
-
-
-def test_prepared_agent_uses_no_capacity_while_another_agent_progresses(monkeypatch, tmp_path):
-    other_started = threading.Event()
-    release_other = threading.Event()
-    order: list[str] = []
-
-    def execute(self, *, skill_input, **_kwargs):
-        order.append(skill_input.label)
-        if skill_input.label == "other":
-            other_started.set()
-            assert release_other.wait(timeout=2)
-        return agdata(label=skill_input.label)
-
-    monkeypatch.setattr(AgentEngine, "execute", execute)
-    blocked_agent = _agent(tmp_path, max_engines=1)
-    other_agent = _agent(tmp_path, max_engines=1)
-    skill = agskill("capacity", "")
-
-    prepared = blocked_agent.prepare(skill, agdata(label="prepared"))
-    behind = blocked_agent.run(skill, agdata(label="behind"))
-    other = other_agent.run(skill, agdata(label="other"))
-
-    assert other_started.wait(timeout=2)
-    assert order == ["other"]
-    assert blocked_agent.engine is None
-    snapshot = get_orchestrator().snapshot()
-    assert snapshot.running_count == 1
-    assert prepared.state == "PREPARED"
-    assert behind.is_pending()
-
-    release_other.set()
-    assert other.wait(timeout=2).label == "other"
-    prepared.start()
-    assert prepared.wait(timeout=2).label == "prepared"
-    assert behind.wait(timeout=2).label == "behind"
-    assert order == ["other", "prepared", "behind"]
-
-
-def test_concurrent_run_prepare_and_send_publish_and_register_in_one_order(monkeypatch, tmp_path):
+def test_concurrent_run_and_send_publish_and_register_in_one_order(monkeypatch, tmp_path):
     execution_started = threading.Event()
     execution_order: list[str] = []
+    gate_dependency: Future[agdata] = Future()
 
     def execute(self, *, skill_input, **_kwargs):
         execution_order.append(skill_input.label)
@@ -273,8 +113,8 @@ def test_concurrent_run_prepare_and_send_publish_and_register_in_one_order(monke
     monkeypatch.setattr(AgentEngine, "execute", execute)
     ag = _agent(tmp_path)
     skill = agskill("concurrent", "")
-    gate = ag.prepare(skill, agdata(label="gate"))
-    barrier = threading.Barrier(4)
+    gate = ag.run(skill, agdata(label="gate", dependency=agdata(_future=gate_dependency)))
+    barrier = threading.Barrier(3)
     submissions: dict[str, Invocation | MessageSubmission] = {}
     failures: list[BaseException] = []
 
@@ -282,13 +122,6 @@ def test_concurrent_run_prepare_and_send_publish_and_register_in_one_order(monke
         try:
             barrier.wait(timeout=2)
             submissions["run"] = ag.run(skill, agdata(label="run"))
-        except BaseException as exc:  # surface caller-thread failures in the test
-            failures.append(exc)
-
-    def submit_prepared() -> None:
-        try:
-            barrier.wait(timeout=2)
-            submissions["prepared"] = ag.prepare(skill, agdata(label="prepared"))
         except BaseException as exc:  # surface caller-thread failures in the test
             failures.append(exc)
 
@@ -301,7 +134,6 @@ def test_concurrent_run_prepare_and_send_publish_and_register_in_one_order(monke
 
     callers = [
         threading.Thread(target=submit_run),
-        threading.Thread(target=submit_prepared),
         threading.Thread(target=submit_message),
     ]
     for caller in callers:
@@ -313,13 +145,11 @@ def test_concurrent_run_prepare_and_send_publish_and_register_in_one_order(monke
 
     assert failures == []
     run = submissions["run"]
-    prepared = submissions["prepared"]
     message = submissions["message"]
     assert isinstance(run, Invocation)
-    assert isinstance(prepared, Invocation)
     assert isinstance(message, MessageSubmission)
-    assert {run.ordering_id, prepared.ordering_id, message.ordering_id} == {2, 3, 4}
-    ordered = sorted((run, prepared, message), key=lambda item: item.ordering_id)
+    assert {run.ordering_id, message.ordering_id} == {2, 3}
+    ordered = sorted((run, message), key=lambda item: item.ordering_id)
     predecessor = gate.output_context
     for submission in ordered:
         assert submission.predecessor_context is predecessor
@@ -339,11 +169,9 @@ def test_concurrent_run_prepare_and_send_publish_and_register_in_one_order(monke
             for submission in ordered
         ]
 
-    prepared.start()
-    gate.start()
+    gate_dependency.set_result(agdata(open=True))
     assert gate.wait(timeout=2).label == "gate"
     assert run.wait(timeout=2).label == "run"
-    assert prepared.wait(timeout=2).label == "prepared"
     assert message.wait(timeout=2).to_dict() == {}
     expected = [
         "gate",
