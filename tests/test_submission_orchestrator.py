@@ -100,6 +100,38 @@ def test_direct_and_nested_invocation_dependencies_materialize(monkeypatch, tmp_
     assert nested.wait(timeout=2).observed == 42
 
 
+def test_message_sent_before_dispatch_targets_exact_invocation_at_first_boundary(
+    monkeypatch, tmp_path
+):
+    dependency: Future[agdata] = Future()
+    observed = []
+
+    def execute(self, *, invocation, **_kwargs):
+        decision = invocation._checkpoint(
+            "test:first-valid-boundary",
+            allow_messages=True,
+            phase="boundary",
+        )
+        observed.extend(entry.content for entry in decision.invocation_messages)
+        return agdata(done=True)
+
+    monkeypatch.setattr(AgentEngine, "execute", execute)
+    ag = _agent(tmp_path)
+    invocation = ag.run(
+        agskill("queued-message", ""),
+        agdata(dependency=agdata(_future=dependency)),
+    )
+    context_head = ag.context
+
+    invocation.send_message("deliver after dispatch")
+
+    assert ag.context is context_head
+    assert ag.engine is None
+    dependency.set_result(agdata(open=True))
+    assert invocation.wait(timeout=2).done is True
+    assert observed == ["deliver after dispatch"]
+
+
 def test_concurrent_run_and_send_publish_and_register_in_one_order(monkeypatch, tmp_path):
     execution_started = threading.Event()
     execution_order: list[str] = []
@@ -125,16 +157,16 @@ def test_concurrent_run_and_send_publish_and_register_in_one_order(monkeypatch, 
         except BaseException as exc:  # surface caller-thread failures in the test
             failures.append(exc)
 
-    def submit_message() -> None:
+    def submit_context_message() -> None:
         try:
             barrier.wait(timeout=2)
-            submissions["message"] = ag.send("concurrent message")
+            submissions["message"] = ag.queue_message("concurrent message")
         except BaseException as exc:  # surface caller-thread failures in the test
             failures.append(exc)
 
     callers = [
         threading.Thread(target=submit_run),
-        threading.Thread(target=submit_message),
+        threading.Thread(target=submit_context_message),
     ]
     for caller in callers:
         caller.start()
@@ -165,7 +197,7 @@ def test_concurrent_run_and_send_publish_and_register_in_one_order(monkeypatch, 
             request.sequence for request in requests
         )
         assert [request.kind for request in requests] == [
-            "message" if isinstance(submission, MessageSubmission) else "skill"
+            "context_message" if isinstance(submission, MessageSubmission) else "skill"
             for submission in ordered
         ]
 

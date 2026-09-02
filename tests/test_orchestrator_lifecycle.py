@@ -159,7 +159,7 @@ def test_running_invocation_cancel_is_observed_by_its_exact_safe_boundary(monkey
         context.recent_transcript.append({"role": "assistant", "content": "uncommitted mutation"})
         entered_engine.set()
         assert enter_boundary.wait(timeout=2)
-        decision = invocation._checkpoint("test:after-tool", allow_steering=True, phase="tool")
+        decision = invocation._checkpoint("test:after-tool", allow_messages=True, phase="tool")
         seen["decision"] = decision
         boundary_observed.set()
         if decision.cancelled:
@@ -206,7 +206,7 @@ def test_agent_cancel_targets_only_the_active_invocation(monkeypatch, tmp_path):
             first_entered.set()
             assert release_first_boundary.wait(timeout=2)
             decision = invocation._checkpoint(
-                "test:first-boundary", allow_steering=True, phase="tool"
+                "test:first-boundary", allow_messages=True, phase="tool"
             )
             if decision.cancelled:
                 return agerror("agent invocation cancelled")
@@ -306,7 +306,7 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
         active_started.set()
         assert enter_paused_boundary.wait(timeout=2)
         decision = invocation._checkpoint(
-            "test:before-commit", allow_steering=True, phase="boundary"
+            "test:before-commit", allow_messages=True, phase="boundary"
         )
         boundary_released_by_destroy.set()
         assert allow_engine_return.wait(timeout=2)
@@ -333,7 +333,7 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
         agskill("blocked", ""),
         agdata(label="blocked", dependency=agdata(_future=unresolved)),
     )
-    message = active_agent.send("must be discarded by destruction")
+    message = active_agent.queue_message("must be discarded by destruction")
     ready = ready_agent.run(agskill("ready", ""), agdata(label="ready"))
 
     assert _request_state(active) == "running"
@@ -372,7 +372,7 @@ def test_destroy_settles_mixed_lifecycle_states_context_first_and_is_reusable(
     with pytest.raises(AgentDestroyedError):
         active_agent.run(agskill("rejected", ""), agdata())
     with pytest.raises(AgentDestroyedError):
-        active_agent.send("rejected")
+        active_agent.queue_message("rejected")
 
     assert boundary_released_by_destroy.wait(timeout=2)
     assert active._result_future.done() is False

@@ -269,13 +269,14 @@ def _tool_message(call_id: str = "next") -> dict:
     }
 
 
-def _steering_texts(messages: "list[dict]") -> "list[str]":
+def _invocation_message_texts(messages: "list[dict]") -> "list[str]":
     return [
         block["text"]
         for message in messages
         if message.get("role") == "user"
         for block in message.get("blocks", [])
-        if block.get("type") == "text" and block.get("text", "").startswith("[AGENCY STEERING]\n")
+        if block.get("type") == "text"
+        and block.get("text", "").startswith("[AGENCY INVOCATION MESSAGE]\n")
     ]
 
 
@@ -743,26 +744,26 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
 
 
 # ---------------------------------------------------------------------------
-# invocation controls / steering safe boundaries
+# invocation controls / message safe boundaries
 # ---------------------------------------------------------------------------
 
 
-def test_steering_is_fifo_protocol_valid_and_stable_across_stream_replay():
+def test_invocation_messages_are_fifo_protocol_valid_and_stable_across_stream_replay():
     control = AgentControl()
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
     history = _completed_tool_history()
 
-    control.steer("first")
-    control.steer("second")
+    invocation.send_message("first")
+    invocation.send_message("second")
     server.dispatch({"messages": history})
 
     first_request = backend.requests[-1][1]
     assert first_request["messages"][: len(history)] == history
-    assert _steering_texts(first_request["messages"]) == [
-        "[AGENCY STEERING]\nfirst",
-        "[AGENCY STEERING]\nsecond",
+    assert _invocation_message_texts(first_request["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nfirst",
+        "[AGENCY INVOCATION MESSAGE]\nsecond",
     ]
     assert [message["role"] for message in first_request["messages"][-4:]] == [
         "tool",
@@ -772,15 +773,15 @@ def test_steering_is_fifo_protocol_valid_and_stable_across_stream_replay():
     ]
 
     # Streaming is transport-only and therefore reuses the same semantic
-    # boundary assignment rather than consuming newly queued steering.
-    control.steer("third")
+    # boundary assignment rather than consuming newly queued invocation messages.
+    invocation.send_message("third")
     stream = server.start_stream({"messages": history, "stream": True})
     assert _drain(stream)[-1]["type"] == "done"
     stream._thread.join(timeout=2.0)
     replay_request = backend.requests[-1][1]
-    assert _steering_texts(replay_request["messages"]) == [
-        "[AGENCY STEERING]\nfirst",
-        "[AGENCY STEERING]\nsecond",
+    assert _invocation_message_texts(replay_request["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nfirst",
+        "[AGENCY INVOCATION MESSAGE]\nsecond",
     ]
 
     expanded = history + [
@@ -798,10 +799,10 @@ def test_steering_is_fifo_protocol_valid_and_stable_across_stream_replay():
         },
     ]
     server.dispatch({"messages": expanded})
-    assert _steering_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY STEERING]\nfirst",
-        "[AGENCY STEERING]\nsecond",
-        "[AGENCY STEERING]\nthird",
+    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nfirst",
+        "[AGENCY INVOCATION MESSAGE]\nsecond",
+        "[AGENCY INVOCATION MESSAGE]\nthird",
     ]
     assert invocation.phase == "boundary"
 
@@ -812,7 +813,7 @@ def test_final_response_establishes_closing_fence(streaming: bool):
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend(final=True)
     server = _controlled_server(backend, invocation)
-    control.steer("before final")
+    invocation.send_message("before final")
     request = {"messages": _completed_tool_history(), "stream": streaming}
 
     if streaming:
@@ -824,10 +825,10 @@ def test_final_response_establishes_closing_fence(streaming: bool):
 
     assert invocation.phase == "closing"
     with pytest.raises(RuntimeError, match="phase is closing"):
-        control.steer("too late")
+        invocation.send_message("too late")
 
 
-def test_failed_attempt_reuses_pre_boundary_steering_on_identical_retry():
+def test_failed_attempt_reuses_pre_boundary_message_on_identical_retry():
     class _FailOnceBackend(_RecordingBackend):
         def __init__(self) -> None:
             super().__init__(final=True)
@@ -844,7 +845,7 @@ def test_failed_attempt_reuses_pre_boundary_steering_on_identical_retry():
     invocation = control.begin_invocation("external")
     backend = _FailOnceBackend()
     server = _controlled_server(backend, invocation)
-    control.steer("assigned before attempt")
+    invocation.send_message("assigned before attempt")
     request = {"messages": _completed_tool_history()}
 
     with pytest.raises(RuntimeError, match="provider disconnected"):
@@ -852,29 +853,29 @@ def test_failed_attempt_reuses_pre_boundary_steering_on_identical_retry():
 
     assert invocation.phase == "model"
     with pytest.raises(RuntimeError, match="phase is model"):
-        control.steer("would be stranded")
+        invocation.send_message("would be stranded")
 
     server.dispatch(request)
-    assert [_steering_texts(item[1]["messages"]) for item in backend.requests] == [
-        ["[AGENCY STEERING]\nassigned before attempt"],
-        ["[AGENCY STEERING]\nassigned before attempt"],
+    assert [_invocation_message_texts(item[1]["messages"]) for item in backend.requests] == [
+        ["[AGENCY INVOCATION MESSAGE]\nassigned before attempt"],
+        ["[AGENCY INVOCATION MESSAGE]\nassigned before attempt"],
     ]
 
 
-def test_incomplete_tool_batch_does_not_drain_or_inject_steering():
+def test_incomplete_tool_batch_does_not_drain_or_inject_messages():
     control = AgentControl()
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
     complete = _completed_tool_history()
-    control.steer("wait for every result")
+    invocation.send_message("wait for every result")
 
     server.dispatch({"messages": complete[:-1]})
-    assert _steering_texts(backend.requests[-1][1]["messages"]) == []
+    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == []
 
     server.dispatch({"messages": complete})
-    assert _steering_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY STEERING]\nwait for every result"
+    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nwait for every result"
     ]
 
 
@@ -883,18 +884,18 @@ def test_internal_compaction_bypasses_controls_and_strips_marker():
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
-    control.steer("for the next user-visible generation")
+    invocation.send_message("for the next user-visible generation")
     history = _completed_tool_history()
 
     server.dispatch({"messages": history, "agency_internal_kind": "compaction"})
     compaction_request = backend.requests[-1][1]
     assert "agency_internal_kind" not in compaction_request
-    assert _steering_texts(compaction_request["messages"]) == []
+    assert _invocation_message_texts(compaction_request["messages"]) == []
     assert invocation.phase == "starting"
 
     server.dispatch({"messages": history})
-    assert _steering_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY STEERING]\nfor the next user-visible generation"
+    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nfor the next user-visible generation"
     ]
 
 

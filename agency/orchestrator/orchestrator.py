@@ -207,7 +207,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             cycle_ack.result()
         return invocation
 
-    def submit_message(self, ag: "agent", message: str) -> MessageSubmission:
+    def submit_context_message(self, ag: "agent", message: str) -> MessageSubmission:
         """Atomically publish one orchestrator-owned host-only context request."""
         cycle_ack: Future[None] | None = None
         with self._event_cond:
@@ -225,7 +225,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 try:
                     self._register_submission_locked(
                         submission,
-                        kind="message",
+                        kind="context_message",
                         skill=None,
                         skill_input=None,
                         max_steps=None,
@@ -618,7 +618,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
 
         admission = invocation._checkpoint(
             "before-infrastructure",
-            allow_steering=False,
+            allow_messages=False,
             phase="infrastructure",
         )
         if admission.destroyed or admission.cancelled:
@@ -663,7 +663,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
 
         checkpoint = invocation._checkpoint(
             "after-engine",
-            allow_steering=False,
+            allow_messages=False,
             phase="boundary",
         )
         if checkpoint.destroyed or checkpoint.cancelled:
@@ -838,7 +838,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         engine, sandbox, harness, and capacity ownership.
         """
         submission = request.submission
-        if request.kind != "message" or not isinstance(submission, MessageSubmission):
+        if request.kind != "context_message" or not isinstance(submission, MessageSubmission):
             raise RuntimeError("context-only completion requires a MessageSubmission")
         if request.state not in {"submitted", "blocked"}:
             return
@@ -867,7 +867,7 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                     "type": "message",
                     "role": "user",
                     "content": submission.message,
-                    "source": "send",
+                    "source": "queue_message",
                 }
             )
         except BaseException as exc:

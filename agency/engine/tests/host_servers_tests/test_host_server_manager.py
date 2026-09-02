@@ -90,12 +90,12 @@ def test_construction_binds_one_invocation_to_both_control_servers(tmp_path):
     assert manager._interaction_server._invocation is invocation
 
 
-def test_native_control_checkpoints_do_not_duplicate_the_llm_steering_overlay(tmp_path):
+def test_native_control_checkpoints_do_not_duplicate_the_llm_message_overlay(tmp_path):
     native, _, _ = _make_manager(tmp_path, harness="native")
     external, _, _ = _make_manager(tmp_path, harness="claude_code")
 
-    assert native._llm_handler_server._enable_steering_overlay is False
-    assert external._llm_handler_server._enable_steering_overlay is True
+    assert native._llm_handler_server._enable_message_overlay is False
+    assert external._llm_handler_server._enable_message_overlay is True
 
 
 def test_attempt_token_gate_accepts_only_the_exact_active_token(tmp_path):

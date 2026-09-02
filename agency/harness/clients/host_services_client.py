@@ -130,7 +130,7 @@ class HostServicesClient:
         token: str,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
     ) -> dict:
         """Wait at an invocation-bound host safe boundary."""
@@ -138,7 +138,7 @@ class HostServicesClient:
             "/interaction/checkpoint",
             json={
                 "boundary_id": boundary_id,
-                "allow_steering": allow_steering,
+                "allow_messages": allow_messages,
                 "phase": phase,
             },
             headers=self._attempt_headers(token),
@@ -153,7 +153,7 @@ class HostServicesClient:
         token: str,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
     ) -> dict:
         """Wait at a checkpoint on a cancellable per-request UDS client.
@@ -168,7 +168,7 @@ class HostServicesClient:
                 "/interaction/checkpoint",
                 json={
                     "boundary_id": boundary_id,
-                    "allow_steering": allow_steering,
+                    "allow_messages": allow_messages,
                     "phase": phase,
                 },
                 headers=self._attempt_headers(token),

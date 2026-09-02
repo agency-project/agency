@@ -34,17 +34,17 @@ def _agent(tmp_path, *, max_engines: int | None = None) -> agent:
 
 
 @pytest.mark.parametrize("invalid", [None, 1, object()])
-def test_send_rejects_non_strings(tmp_path, invalid):
+def test_queue_message_rejects_non_strings(tmp_path, invalid):
     ag = _agent(tmp_path)
     with pytest.raises(TypeError, match="message must be a string"):
-        ag.send(invalid)
+        ag.queue_message(invalid)
 
 
 @pytest.mark.parametrize("invalid", ["", "   ", "\n\t"])
-def test_send_rejects_empty_strings(tmp_path, invalid):
+def test_queue_message_rejects_empty_strings(tmp_path, invalid):
     ag = _agent(tmp_path)
     with pytest.raises(ValueError, match="message must be a non-empty string"):
-        ag.send(invalid)
+        ag.queue_message(invalid)
 
 
 def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkeypatch, tmp_path):
@@ -70,7 +70,7 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
         skill,
         agdata(label="blocked", dependency=agdata(_future=gate_dependency)),
     )
-    message = ag.send("Remember the exact order")
+    message = ag.queue_message("Remember the exact order")
     later = ag.run(skill, agdata(label="later"))
     callback_context_done: list[bool] = []
     callback_finished = threading.Event()
@@ -92,7 +92,7 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
     orchestrator = get_orchestrator()
     with orchestrator._event_cond:
         request = orchestrator._requests[message._request_id]
-        assert request.kind == "message"
+        assert request.kind == "context_message"
         assert request.submission is message
         assert request.skill is None
         assert request.skill_input is None
@@ -111,7 +111,7 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
         "type": "message",
         "role": "user",
         "content": "Remember the exact order",
-        "source": "send",
+        "source": "queue_message",
     }
     assert message.state == "SUCCEEDED"
     assert message._context_future.result().retained_messages == [entry]
@@ -119,7 +119,7 @@ def test_message_uses_exact_context_position_and_no_engine_infrastructure(monkey
     assert len(constructed) == 2
 
 
-def test_real_engine_replays_retained_send_into_a_stateless_run(monkeypatch, tmp_path):
+def test_real_engine_replays_queued_message_into_a_stateless_run(monkeypatch, tmp_path):
     requests = []
     managers = []
 
@@ -173,7 +173,7 @@ def test_real_engine_replays_retained_send_into_a_stateless_run(monkeypatch, tmp
     ag = _agent(tmp_path)
     ag.sandbox._has_pending_background_work.return_value = False
 
-    message = ag.send("Remember this stateless fact")
+    message = ag.queue_message("Remember this stateless fact")
     assert message.wait(timeout=2).to_dict() == {}
     invocation = ag.run(
         agskill("read-retained", "Use the retained message."),
@@ -223,7 +223,7 @@ def test_suspension_and_full_capacity_do_not_block_host_only_messages(monkeypatc
     assert holder_started.wait(timeout=2)
     message_agent.suspend()
 
-    message = message_agent.send("host-only while suspended")
+    message = message_agent.queue_message("host-only while suspended")
 
     assert message.wait(timeout=2).to_dict() == {}
     assert message.state == "SUCCEEDED"
@@ -262,7 +262,7 @@ def test_concurrent_messages_follow_atomic_publication_order(monkeypatch, tmp_pa
     def submit(index: int) -> None:
         try:
             barrier.wait(timeout=2)
-            submissions.append(ag.send(f"message-{index}"))
+            submissions.append(ag.queue_message(f"message-{index}"))
         except BaseException as exc:
             failures.append(exc)
 
@@ -309,7 +309,7 @@ def test_destroy_settles_blocked_message_context_before_result_without_engine(
         agskill("never", ""),
         agdata(dependency=agdata(_future=unresolved)),
     )
-    message = ag.send("must not commit")
+    message = ag.queue_message("must not commit")
     callback_observed_context = threading.Event()
 
     def observe(_future) -> None:
@@ -330,7 +330,7 @@ def test_destroy_settles_blocked_message_context_before_result_without_engine(
 
 def test_fork_and_checkpoint_preserve_messages_cursors_and_sequence(tmp_path):
     ag = _agent(tmp_path)
-    first = ag.send("persist me")
+    first = ag.queue_message("persist me")
     assert first.wait(timeout=2).to_dict() == {}
     ag.context.resolve_prev_dependencies()
     ag.context.harness_message_cursors["claude_code"] = 1
@@ -351,7 +351,7 @@ def test_fork_and_checkpoint_preserve_messages_cursors_and_sequence(tmp_path):
     assert loaded.context.retained_messages == first._context_future.result().retained_messages
     assert loaded.context.harness_message_cursors == {"claude_code": 1}
 
-    second = loaded.send("after load")
+    second = loaded.queue_message("after load")
     assert second.wait(timeout=2).to_dict() == {}
     assert [entry["sequence"] for entry in loaded.context.copy().retained_messages] == [1, 2]
     assert [entry["content"] for entry in loaded.context.retained_messages] == [

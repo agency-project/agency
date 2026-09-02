@@ -273,29 +273,29 @@ def test_build_app_has_no_daemon_command_polling_route():
     assert response.status_code == 404
 
 
-def test_checkpoint_is_bound_to_the_server_invocation_and_serializes_steering():
+def test_checkpoint_is_bound_to_the_server_invocation_and_serializes_messages():
     class Invocation:
         def __init__(self):
             self.calls = []
 
-        def _checkpoint(self, boundary_id, *, allow_steering, phase):
-            self.calls.append((boundary_id, allow_steering, phase))
+        def _checkpoint(self, boundary_id, *, allow_messages, phase):
+            self.calls.append((boundary_id, allow_messages, phase))
             return SimpleNamespace(
                 cancelled=False,
                 destroyed=False,
-                steering=[SimpleNamespace(sequence=7, instructions="continue carefully")],
+                invocation_messages=[SimpleNamespace(sequence=7, content="continue carefully")],
             )
 
     invocation = Invocation()
     server = _make_server(invocation=invocation)
 
-    result = server.checkpoint("native:tool:0", allow_steering=True, phase="boundary")
+    result = server.checkpoint("native:tool:0", allow_messages=True, phase="boundary")
 
     assert invocation.calls == [("native:tool:0", True, "boundary")]
     assert result == {
         "cancelled": False,
         "destroyed": False,
-        "steering": [{"sequence": 7, "instructions": "continue carefully"}],
+        "invocation_messages": [{"sequence": 7, "content": "continue carefully"}],
     }
 
 
@@ -304,22 +304,26 @@ def test_checkpoint_route_validates_wire_shape_and_uses_noop_without_invocation(
 
     invalid = client.post(
         "/checkpoint",
-        json={"boundary_id": "", "allow_steering": "yes", "phase": ""},
+        json={"boundary_id": "", "allow_messages": "yes", "phase": ""},
     )
     valid = client.post(
         "/checkpoint",
-        json={"boundary_id": "model:1", "allow_steering": False, "phase": "model"},
+        json={"boundary_id": "model:1", "allow_messages": False, "phase": "model"},
     )
 
     assert invalid.status_code == 400
     assert valid.status_code == 200
-    assert valid.json() == {"cancelled": False, "destroyed": False, "steering": []}
+    assert valid.json() == {
+        "cancelled": False,
+        "destroyed": False,
+        "invocation_messages": [],
+    }
 
 
 def test_paused_checkpoint_disconnect_wakes_and_joins_its_worker():
     control = AgentControl()
     invocation = control.begin_invocation("native")
-    invocation.steer("keep for reconnect")
+    invocation.send_message("keep for reconnect")
     invocation.pause()
     worker_exited = threading.Event()
     original_checkpoint = invocation._checkpoint_interruptibly
@@ -338,7 +342,7 @@ def test_paused_checkpoint_disconnect_wakes_and_joins_its_worker():
         body = json.dumps(
             {
                 "boundary_id": "native:tool:1",
-                "allow_steering": True,
+                "allow_messages": True,
                 "phase": "boundary",
             }
         ).encode()
@@ -400,10 +404,10 @@ def test_paused_checkpoint_disconnect_wakes_and_joins_its_worker():
     invocation.resume()
     retry = invocation._checkpoint(
         "native:tool:1",
-        allow_steering=True,
+        allow_messages=True,
         phase="boundary",
     )
-    assert [entry.instructions for entry in retry.steering] == ["keep for reconnect"]
+    assert [entry.content for entry in retry.invocation_messages] == ["keep for reconnect"]
 
 
 def test_build_app_check_syscall_route_allows():

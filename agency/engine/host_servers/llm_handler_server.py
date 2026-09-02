@@ -75,7 +75,7 @@ def _history_anchor(messages: "list[dict]") -> str:
 
 
 def _history_allows_user_turn(messages: "list[dict]") -> bool:
-    """Return whether appending a user steering turn preserves tool pairing."""
+    """Return whether appending an invocation message preserves tool pairing."""
     outstanding: "dict[str, int]" = {}
     for message in messages:
         for block in message.get("blocks", []):
@@ -95,9 +95,9 @@ def _history_allows_user_turn(messages: "list[dict]") -> bool:
 
 
 @dataclass(frozen=True)
-class _SteeringOverlay:
+class _MessageOverlay:
     sequence: int
-    instructions: str
+    content: str
     anchor: str
 
 
@@ -279,7 +279,7 @@ class LlmHandlerServer:
         *,
         parent_context=None,
         invocation=None,
-        enable_steering_overlay: bool = True,
+        enable_message_overlay: bool = True,
     ) -> None:
         self._data_collector = data_collector
         self._handles: "list[_StreamHandle]" = []
@@ -294,10 +294,10 @@ class LlmHandlerServer:
         self._transcript: "list[dict]" = []
         self._transcript_lock = threading.Lock()
         self._invocation = invocation
-        self._enable_steering_overlay = enable_steering_overlay
+        self._enable_message_overlay = enable_message_overlay
         self._control_lock = threading.RLock()
-        self._steering_overlays: "list[_SteeringOverlay]" = []
-        self._steering_sequences: "set[int]" = set()
+        self._message_overlays: "list[_MessageOverlay]" = []
+        self._message_sequences: "set[int]" = set()
         self.set_config(agconfig)
 
     def get_all_transcripts(self) -> "list[dict]":
@@ -790,7 +790,7 @@ class LlmHandlerServer:
             protocol_valid = _history_allows_user_turn(messages)
             decision = self._checkpoint_invocation(
                 f"{boundary_id}:pre",
-                allow_steering=self._enable_steering_overlay and protocol_valid,
+                allow_messages=self._enable_message_overlay and protocol_valid,
                 phase=_CONTROL_PHASE_PRE_GENERATION,
                 abort_event=abort_event,
             )
@@ -798,32 +798,32 @@ class LlmHandlerServer:
                 raise _RequestAborted
             self._raise_if_stopped(decision)
 
-            if self._enable_steering_overlay and protocol_valid:
+            if self._enable_message_overlay and protocol_valid:
                 anchor = _history_anchor(messages)
-                for entry in self._decision_value(decision, "steering", ()) or ():
+                for entry in self._decision_value(decision, "invocation_messages", ()) or ():
                     sequence = int(self._decision_value(entry, "sequence", 0))
-                    if sequence in self._steering_sequences:
+                    if sequence in self._message_sequences:
                         continue
-                    self._steering_sequences.add(sequence)
-                    self._steering_overlays.append(
-                        _SteeringOverlay(
+                    self._message_sequences.add(sequence)
+                    self._message_overlays.append(
+                        _MessageOverlay(
                             sequence=sequence,
-                            instructions=str(self._decision_value(entry, "instructions", "")),
+                            content=str(self._decision_value(entry, "content", "")),
                             anchor=anchor,
                         )
                     )
-                prepared["messages"] = self._inject_steering_overlays(messages)
+                prepared["messages"] = self._inject_message_overlays(messages)
 
         return prepared, boundary_id, True
 
-    def _inject_steering_overlays(self, messages: "list[dict]") -> "list[dict]":
-        overlays = sorted(self._steering_overlays, key=lambda item: item.sequence)
+    def _inject_message_overlays(self, messages: "list[dict]") -> "list[dict]":
+        overlays = sorted(self._message_overlays, key=lambda item: item.sequence)
         result: "list[dict]" = []
         inserted: "set[int]" = set()
 
         for overlay in overlays:
             if overlay.anchor == "root":
-                result.append(self._steering_message(overlay))
+                result.append(self._invocation_message(overlay))
                 inserted.add(overlay.sequence)
 
         prefix: "list[dict]" = []
@@ -833,25 +833,25 @@ class LlmHandlerServer:
             anchor = _history_anchor(prefix)
             for overlay in overlays:
                 if overlay.sequence not in inserted and overlay.anchor == anchor:
-                    result.append(self._steering_message(overlay))
+                    result.append(self._invocation_message(overlay))
                     inserted.add(overlay.sequence)
 
         # If a CLI compacted away an old anchor, retain the admitted
         # instruction at the current generation rather than silently losing it.
         for overlay in overlays:
             if overlay.sequence not in inserted:
-                result.append(self._steering_message(overlay))
+                result.append(self._invocation_message(overlay))
         return result
 
     @staticmethod
-    def _steering_message(overlay: _SteeringOverlay) -> dict:
+    def _invocation_message(overlay: _MessageOverlay) -> dict:
         return {
             "role": "user",
             "blocks": [
                 {
                     "type": "text",
                     "index": 0,
-                    "text": f"[AGENCY STEERING]\n{overlay.instructions}",
+                    "text": f"[AGENCY INVOCATION MESSAGE]\n{overlay.content}",
                 }
             ],
         }
@@ -871,7 +871,7 @@ class LlmHandlerServer:
             self._invocation._note_model_result(has_tool_calls=has_tool_calls)
             decision = self._checkpoint_invocation(
                 f"{boundary_id}:post",
-                allow_steering=False,
+                allow_messages=False,
                 phase=(
                     _CONTROL_PHASE_POST_GENERATION if has_tool_calls else _CONTROL_PHASE_CLOSING
                 ),
@@ -894,10 +894,10 @@ class LlmHandlerServer:
         with self._control_lock:
             decision = self._checkpoint_invocation(
                 f"{boundary_id}:post-error",
-                allow_steering=False,
-                # Keep steering sealed across a provider/CLI retry. An
+                allow_messages=False,
+                # Keep invocation messages sealed across a provider/CLI retry. An
                 # identical retry reuses the cached pre-boundary assignment,
-                # so accepting new steering here would otherwise strand it.
+                # so accepting a new message here would otherwise strand it.
                 phase=_CONTROL_PHASE_PRE_GENERATION,
                 abort_event=abort_event,
             )
@@ -910,7 +910,7 @@ class LlmHandlerServer:
         self,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
         abort_event: "threading.Event | None" = None,
     ):
@@ -919,7 +919,7 @@ class LlmHandlerServer:
             if callable(interruptible):
                 return interruptible(
                     boundary_id,
-                    allow_steering=allow_steering,
+                    allow_messages=allow_messages,
                     phase=phase,
                     abort_event=abort_event,
                 )
@@ -927,7 +927,7 @@ class LlmHandlerServer:
                 return None
         decision = self._invocation._checkpoint(
             boundary_id,
-            allow_steering=allow_steering,
+            allow_messages=allow_messages,
             phase=phase,
         )
         if abort_event is not None and abort_event.is_set():

@@ -44,21 +44,21 @@ class _ControlBridge:
         self.calls = []
         self.first_tool_checkpoint = threading.Event()
 
-    def checkpoint(self, boundary_id, *, allow_steering, phase):
-        self.calls.append((boundary_id, allow_steering, phase))
+    def checkpoint(self, boundary_id, *, allow_messages, phase):
+        self.calls.append((boundary_id, allow_messages, phase))
         if boundary_id.startswith("native:tool:0:0:"):
             self.first_tool_checkpoint.set()
         decision = self.handle._checkpoint(
             boundary_id,
-            allow_steering=allow_steering,
+            allow_messages=allow_messages,
             phase=phase,
         )
         return {
             "cancelled": decision.cancelled,
             "destroyed": decision.destroyed,
-            "steering": [
-                {"sequence": entry.sequence, "instructions": entry.instructions}
-                for entry in decision.steering
+            "invocation_messages": [
+                {"sequence": entry.sequence, "content": entry.content}
+                for entry in decision.invocation_messages
             ],
         }
 
@@ -165,7 +165,9 @@ def test_native_controls_arriving_during_compaction_stop_before_task_generation(
     assert any(call[0].startswith("native:post-compaction:0:") for call in bridge.calls)
 
 
-def test_native_pause_and_steer_after_each_tool_preserve_multi_tool_protocol(monkeypatch, tmp_path):
+def test_native_pause_and_message_after_each_tool_preserve_multi_tool_protocol(
+    monkeypatch, tmp_path
+):
     control = AgentControl()
     handle = control.begin_invocation("test")
     bridge = _ControlBridge(handle)
@@ -201,8 +203,8 @@ def test_native_pause_and_steer_after_each_tool_preserve_multi_tool_protocol(mon
     worker.start()
     try:
         assert first_tool_entered.wait(timeout=2.0)
-        control.steer("first instruction")
-        control.steer("second instruction")
+        handle.send_message("first instruction")
+        handle.send_message("second instruction")
         control.pause()
         release_first_tool.set()
 
@@ -227,8 +229,8 @@ def test_native_pause_and_steer_after_each_tool_preserve_multi_tool_protocol(mon
     second_generation = llm.requests[1][1]
     roles = [message["role"] for message in second_generation]
     assert roles[-4:] == ["assistant", "tool", "tool", "user"]
-    steering_text = second_generation[-1]["content"]
-    assert steering_text.index("first instruction") < steering_text.index("second instruction")
+    message_text = second_generation[-1]["content"]
+    assert message_text.index("first instruction") < message_text.index("second instruction")
     assert sum("first instruction" in str(message) for message in second_generation) == 1
     assert sum("second instruction" in str(message) for message in second_generation) == 1
 

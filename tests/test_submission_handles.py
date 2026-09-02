@@ -35,6 +35,10 @@ def test_public_submission_exports_and_agent_alias():
     assert Agent is agent
     assert issubclass(Invocation, Submission)
     assert issubclass(MessageSubmission, Submission)
+    assert hasattr(Invocation, "send_message")
+    assert not hasattr(Invocation, "steer")
+    assert hasattr(agent, "queue_message")
+    assert not hasattr(agent, "send")
 
 
 def test_invocation_result_wait_await_and_field_proxy_support_literal_result_field():
@@ -88,28 +92,38 @@ def test_invocation_is_queued_immediately_and_control_state_is_idempotent():
     assert owner.control_changes[-1] is invocation
 
 
-def test_steering_is_fifo_replayed_per_boundary_and_rejected_after_final_answer():
+def test_invocation_messages_are_fifo_replayed_and_rejected_after_final_answer():
     owner = _FakeAgent()
-    invocation = Invocation(owner, 1, "steer")
-    invocation.steer("first")
-    invocation.steer("second")
+    invocation = Invocation(owner, 1, "message")
+    invocation.send_message("first")
+    invocation.send_message("second")
 
-    first = invocation._checkpoint("tool-1", allow_steering=True, phase="tool")
-    retry = invocation._checkpoint("tool-1", allow_steering=True, phase="tool")
-    assert [entry.instructions for entry in first.steering] == ["first", "second"]
-    assert retry.steering == first.steering
+    first = invocation._checkpoint("tool-1", allow_messages=True, phase="tool")
+    retry = invocation._checkpoint("tool-1", allow_messages=True, phase="tool")
+    assert [entry.content for entry in first.invocation_messages] == ["first", "second"]
+    assert retry.invocation_messages == first.invocation_messages
 
     invocation._note_model_result(has_tool_calls=False)
     with pytest.raises(RuntimeError, match="phase is closing"):
-        invocation.steer("too late")
+        invocation.send_message("too late")
 
 
-def test_interruptible_checkpoint_abort_wakes_pause_without_consuming_steering():
+def test_sending_a_message_does_not_resume_a_paused_invocation():
+    owner = _FakeAgent()
+    invocation = Invocation(owner, 1, "paused-message")
+
+    invocation.pause()
+    invocation.send_message("wait until explicitly resumed")
+
+    assert invocation.is_pause_requested() is True
+
+
+def test_interruptible_checkpoint_abort_wakes_pause_without_consuming_messages():
     control = AgentControl()
     invocation = control.begin_invocation("interruptible")
     abort_event = threading.Event()
     outcome = {}
-    invocation.steer("deliver after reconnect")
+    invocation.send_message("deliver after reconnect")
     invocation.pause()
 
     worker = threading.Thread(
@@ -117,7 +131,7 @@ def test_interruptible_checkpoint_abort_wakes_pause_without_consuming_steering()
             "decision",
             invocation._checkpoint_interruptibly(
                 "native:tool:1",
-                allow_steering=True,
+                allow_messages=True,
                 phase="boundary",
                 abort_event=abort_event,
             ),
@@ -142,10 +156,10 @@ def test_interruptible_checkpoint_abort_wakes_pause_without_consuming_steering()
     invocation.resume()
     retry = invocation._checkpoint(
         "native:tool:1",
-        allow_steering=True,
+        allow_messages=True,
         phase="boundary",
     )
-    assert [entry.instructions for entry in retry.steering] == ["deliver after reconnect"]
+    assert [entry.content for entry in retry.invocation_messages] == ["deliver after reconnect"]
 
 
 def test_completion_claim_remains_won_after_agent_and_invocation_close():
@@ -180,7 +194,7 @@ def test_message_submission_is_pending_data_without_skill_controls():
     receipt._result_future.set_result(agdata(accepted=True))
 
     assert receipt.wait().accepted is True
-    for control in ("start", "steer", "pause", "resume", "cancel"):
+    for control in ("start", "send_message", "pause", "resume", "cancel"):
         assert not hasattr(receipt, control)
 
 

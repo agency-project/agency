@@ -45,11 +45,11 @@ def test_split_for_compaction_separates_system_task_input_head_tail():
     assert tail and tail[0]["content"] == "recent turn"
 
 
-def test_split_before_first_assistant_turn_keeps_fresh_steering_in_tail():
+def test_split_before_first_assistant_turn_keeps_fresh_invocation_message_in_tail():
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "task"},
-        {"role": "user", "content": "[AGENCY STEERING]\nMUST_KEEP_EXACT"},
+        {"role": "user", "content": "[AGENCY INVOCATION MESSAGE]\nMUST_KEEP_EXACT"},
         {"role": "user", "content": "additional current-turn context"},
     ]
 

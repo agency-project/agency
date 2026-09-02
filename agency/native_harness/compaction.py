@@ -166,7 +166,7 @@ def split_for_compaction(
         conv = list(messages)
     if not any(message.get("role") == "assistant" for message in conv):
         # Before the first model turn, everything after the task input is new
-        # user context (including freshly rendered steering), not history.
+        # user context (including freshly rendered invocation messages), not history.
         return sys_msg, conv[:1], [], conv[1:]
     ts = tail_start(conv, context_limit, tail_turns)
     task_input = conv[:1]
@@ -263,7 +263,7 @@ def maybe_compact(
         return messages, previous_summary
     head = prune_tool_outputs(head)
     summary_messages = build_summary_prompt_messages(task_input, head, previous_summary)
-    # Housekeeping generation must not consume user steering or establish the
+    # Housekeeping generation must not consume invocation messages or establish the
     # final-answer fence for the task generation that follows it.
     resp = llm.dispatch(model, summary_messages, internal_kind="compaction")
     if "error" in resp:

@@ -85,7 +85,7 @@ class HostServerManager:
             self._data_collector,
             parent_context=agprof.current_span_context(),
             invocation=invocation,
-            enable_steering_overlay=getattr(agent, "harness", None) != "native",
+            enable_message_overlay=getattr(agent, "harness", None) != "native",
         )
         self._host_mcp_server = HostMcpServer(sandbox, skill, resource_pool, self._data_collector)
         self._interaction_server = HostInteractionServer(

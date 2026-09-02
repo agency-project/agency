@@ -32,12 +32,12 @@ class HostInteractionServer:
         # another request's lifecycle state.
         self._invocation = invocation
 
-    def checkpoint(self, boundary_id: str, *, allow_steering: bool, phase: str) -> dict:
+    def checkpoint(self, boundary_id: str, *, allow_messages: bool, phase: str) -> dict:
         if self._invocation is None:
-            return {"cancelled": False, "destroyed": False, "steering": []}
+            return {"cancelled": False, "destroyed": False, "invocation_messages": []}
         decision = self._invocation._checkpoint(
             boundary_id,
-            allow_steering=allow_steering,
+            allow_messages=allow_messages,
             phase=phase,
         )
         return self._serialize_checkpoint_decision(decision)
@@ -52,12 +52,12 @@ class HostInteractionServer:
         return {
             "cancelled": bool(value(decision, "cancelled", False)),
             "destroyed": bool(value(decision, "destroyed", False)),
-            "steering": [
+            "invocation_messages": [
                 {
                     "sequence": int(value(entry, "sequence", 0)),
-                    "instructions": str(value(entry, "instructions", "")),
+                    "content": str(value(entry, "content", "")),
                 }
-                for entry in (value(decision, "steering", ()) or ())
+                for entry in (value(decision, "invocation_messages", ()) or ())
             ],
         }
 
@@ -65,7 +65,7 @@ class HostInteractionServer:
         self,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
         abort_event: threading.Event,
     ) -> "dict | None":
@@ -73,7 +73,7 @@ class HostInteractionServer:
             return (
                 None
                 if abort_event.is_set()
-                else {"cancelled": False, "destroyed": False, "steering": []}
+                else {"cancelled": False, "destroyed": False, "invocation_messages": []}
             )
         checkpoint = getattr(self._invocation, "_checkpoint_interruptibly", None)
         if checkpoint is None:
@@ -81,13 +81,13 @@ class HostInteractionServer:
             # implement only the established private checkpoint seam.
             decision = self._invocation._checkpoint(
                 boundary_id,
-                allow_steering=allow_steering,
+                allow_messages=allow_messages,
                 phase=phase,
             )
         else:
             decision = checkpoint(
                 boundary_id,
-                allow_steering=allow_steering,
+                allow_messages=allow_messages,
                 phase=phase,
                 abort_event=abort_event,
             )
@@ -179,13 +179,13 @@ class HostInteractionServer:
         async def _checkpoint(request: dict, raw_request: Request) -> JSONResponse:
             boundary_id = request.get("boundary_id")
             phase = request.get("phase")
-            allow_steering = request.get("allow_steering")
+            allow_messages = request.get("allow_messages")
             if (
                 not isinstance(boundary_id, str)
                 or not boundary_id
                 or not isinstance(phase, str)
                 or not phase
-                or not isinstance(allow_steering, bool)
+                or not isinstance(allow_messages, bool)
             ):
                 return JSONResponse({"error": "invalid lifecycle checkpoint"}, status_code=400)
 
@@ -194,7 +194,7 @@ class HostInteractionServer:
                 asyncio.to_thread(
                     self._checkpoint_interruptibly,
                     boundary_id,
-                    allow_steering=allow_steering,
+                    allow_messages=allow_messages,
                     phase=phase,
                     abort_event=abort_event,
                 )

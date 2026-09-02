@@ -83,20 +83,20 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             return JSONResponse({"error": "unknown or missing token"}, status_code=401)
         boundary_id = body.get("boundary_id")
         phase = body.get("phase")
-        allow_steering = body.get("allow_steering")
+        allow_messages = body.get("allow_messages")
         if (
             not isinstance(boundary_id, str)
             or not boundary_id
             or not isinstance(phase, str)
             or not phase
-            or not isinstance(allow_steering, bool)
+            or not isinstance(allow_messages, bool)
         ):
             return JSONResponse({"error": "invalid lifecycle checkpoint"}, status_code=400)
         checkpoint_task = asyncio.create_task(
             bridge.checkpoint_async(
                 token,
                 boundary_id,
-                allow_steering=allow_steering,
+                allow_messages=allow_messages,
                 phase=phase,
             )
         )

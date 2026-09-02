@@ -51,7 +51,7 @@ class BridgeClient:
         self,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
     ) -> dict:
         try:
@@ -59,7 +59,7 @@ class BridgeClient:
                 "/internal/checkpoint",
                 json={
                     "boundary_id": boundary_id,
-                    "allow_steering": allow_steering,
+                    "allow_messages": allow_messages,
                     "phase": phase,
                 },
                 headers={"Authorization": f"Bearer {self.token}"},
@@ -69,14 +69,14 @@ class BridgeClient:
                 return {
                     "cancelled": True,
                     "destroyed": False,
-                    "steering": [],
+                    "invocation_messages": [],
                     "error": f"control bridge returned {resp.status_code}",
                 }
             result = resp.json()
             return {
                 "cancelled": bool(result.get("cancelled")),
                 "destroyed": bool(result.get("destroyed")),
-                "steering": result.get("steering") or [],
+                "invocation_messages": result.get("invocation_messages") or [],
             }
         except Exception as exc:
             # A configured control bridge is authoritative; continuing when
@@ -85,7 +85,7 @@ class BridgeClient:
             return {
                 "cancelled": True,
                 "destroyed": False,
-                "steering": [],
+                "invocation_messages": [],
                 "error": f"control bridge unreachable: {exc}",
             }
 

@@ -9,7 +9,7 @@ this package's own dependencies instead of a UDS connection to
 `agllm_terminus`/`agmcp_server`/`agharness_messenger`.
 
 Order per turn follows explicit safe boundaries: checkpoint and render
-steering, compact, generate, checkpoint the model result, then checkpoint
+invocation messages, compact, generate, checkpoint the model result, then checkpoint
 after every published tool result."""
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ def run_react_loop(
     total_input_tokens = 0
     total_output_tokens = 0
     previous_summary: "str | None" = None
-    rendered_steering_sequences: "set[int]" = set()
+    rendered_message_sequences: "set[int]" = set()
 
     dispatch_table = dict(tools.TOOL_DISPATCH)
     tool_schemas = list(tools.BUILTIN_TOOL_SCHEMAS.values())
@@ -82,27 +82,28 @@ def run_react_loop(
         if bridge is not None:
             decision = bridge.checkpoint(
                 _native_boundary_id("generation", step, messages),
-                allow_steering=True,
+                allow_messages=True,
                 phase=CONTROL_PHASE_MODEL,
             )
             stopped = _stopped_message(decision)
             if stopped is not None:
                 return ReactLoopResult(status="error", message=stopped, turn_count=step)
-            steering = []
-            for entry in decision.get("steering") or []:
+            invocation_messages = []
+            for entry in decision.get("invocation_messages") or []:
                 try:
                     sequence = int(entry["sequence"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if sequence in rendered_steering_sequences:
+                if sequence in rendered_message_sequences:
                     continue
-                rendered_steering_sequences.add(sequence)
-                steering.append(str(entry.get("instructions", "")))
-            if steering:
+                rendered_message_sequences.add(sequence)
+                invocation_messages.append(str(entry.get("content", "")))
+            if invocation_messages:
                 messages.append(
                     {
                         "role": "user",
-                        "content": "[AGENCY STEERING]\n" + "\n\n".join(steering),
+                        "content": "[AGENCY INVOCATION MESSAGE]\n"
+                        + "\n\n".join(invocation_messages),
                     }
                 )
 
@@ -111,11 +112,11 @@ def run_react_loop(
         )
 
         if bridge is not None:
-            # Compaction bypasses ordinary user steering, but controls may
+            # Compaction bypasses ordinary invocation messages, but controls may
             # arrive while it is running. Observe them before task generation.
             decision = bridge.checkpoint(
                 _native_boundary_id("post-compaction", step, messages),
-                allow_steering=False,
+                allow_messages=False,
                 phase=CONTROL_PHASE_MODEL,
             )
             stopped = _stopped_message(decision)
@@ -130,7 +131,7 @@ def run_react_loop(
             response_has_tools = bool((resp.get("message") or {}).get("tool_calls"))
             decision = bridge.checkpoint(
                 _native_boundary_id("model", step, messages),
-                allow_steering=False,
+                allow_messages=False,
                 phase=(CONTROL_PHASE_BOUNDARY if response_has_tools else CONTROL_PHASE_CLOSING),
             )
             stopped = _stopped_message(decision)
@@ -177,7 +178,7 @@ def run_react_loop(
             if bridge is not None:
                 decision = bridge.checkpoint(
                     f"native:tool:{step}:{tool_index}:{tc['id']}",
-                    allow_steering=False,
+                    allow_messages=False,
                     phase=CONTROL_PHASE_BOUNDARY,
                 )
                 stopped = _stopped_message(decision)

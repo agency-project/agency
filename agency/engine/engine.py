@@ -24,15 +24,15 @@ if TYPE_CHECKING:
 class _NoopDecision:
     cancelled = False
     destroyed = False
-    steering: tuple = ()
+    invocation_messages: tuple = ()
 
 
 class _NoopInvocation:
     """Lifecycle compatibility for direct ``AgentEngine.execute`` callers."""
 
     @staticmethod
-    def _checkpoint(_boundary_id: str, *, allow_steering: bool, phase: str) -> _NoopDecision:
-        del allow_steering, phase
+    def _checkpoint(_boundary_id: str, *, allow_messages: bool, phase: str) -> _NoopDecision:
+        del allow_messages, phase
         return _NoopDecision()
 
     @staticmethod
@@ -133,7 +133,7 @@ class AgentEngine:
             try:
                 admission = active_invocation._checkpoint(
                     "engine:before-harness",
-                    allow_steering=False,
+                    allow_messages=False,
                     phase="infrastructure",
                 )
                 if admission.destroyed or admission.cancelled:
@@ -150,7 +150,7 @@ class AgentEngine:
                 )
                 completion = active_invocation._checkpoint(
                     "engine:before-commit",
-                    allow_steering=False,
+                    allow_messages=False,
                     phase="boundary",
                 )
                 if completion.destroyed or completion.cancelled:

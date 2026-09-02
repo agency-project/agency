@@ -533,13 +533,13 @@ class agent:
         self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
         return self.sandbox
 
-    def send(self, message: str) -> MessageSubmission:
+    def queue_message(self, message: str) -> MessageSubmission:
         """Append one ordered retained message without starting infrastructure."""
         if not isinstance(message, str):
             raise TypeError("message must be a string")
         if not message.strip():
             raise ValueError("message must be a non-empty string")
-        return self._orchestrator.submit_message(self, message)
+        return self._orchestrator.submit_context_message(self, message)
 
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> Invocation:
         """Submit ready work and immediately return its exact Invocation."""

@@ -175,7 +175,7 @@ def test_retained_messages_are_validated_selected_and_cursor_advanced_monotonica
             "type": "message",
             "role": "user",
             "content": "first",
-            "source": "send",
+            "source": "queue_message",
         }
     )
     context.append_retained_message(

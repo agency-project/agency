@@ -46,7 +46,7 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             ("POST", "/interaction/checkpoint"): {
                 "cancelled": False,
                 "destroyed": False,
-                "steering": [{"sequence": 1, "instructions": "focus"}],
+                "invocation_messages": [{"sequence": 1, "content": "focus"}],
             },
             ("POST", "/interaction/record_event"): {"ok": True},
             ("POST", "/interaction/check_tool"): {"allowed": False, "reason": "blocked"},
@@ -61,12 +61,12 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
         assert bridge.checkpoint(
             "token",
             "native:generation:0",
-            allow_steering=True,
+            allow_messages=True,
             phase="model",
         ) == {
             "cancelled": False,
             "destroyed": False,
-            "steering": [{"sequence": 1, "instructions": "focus"}],
+            "invocation_messages": [{"sequence": 1, "content": "focus"}],
         }
         bridge.log_warning("token", "bad shape")
         assert bridge.check_tool_policy("token", "bash", {"cmd": "x"}) == {
@@ -92,7 +92,7 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
         None,
         {
             "boundary_id": "native:generation:0",
-            "allow_steering": True,
+            "allow_messages": True,
             "phase": "model",
         },
         {"type": "warning", "payload": {"message": "bad shape"}},
@@ -227,7 +227,7 @@ def test_profiler_and_context_routes_reject_unknown_tokens():
                     headers={"Authorization": "Bearer stale"},
                     json={
                         "boundary_id": "tool:1",
-                        "allow_steering": False,
+                        "allow_messages": False,
                         "phase": "boundary",
                     },
                 ).status_code
@@ -245,7 +245,7 @@ def test_checkpoint_route_forwards_the_active_token_and_validated_boundary():
         assert request.headers[ATTEMPT_TOKEN_HEADER] == "token"
         return httpx.Response(
             200,
-            json={"cancelled": False, "destroyed": False, "steering": []},
+            json={"cancelled": False, "destroyed": False, "invocation_messages": []},
         )
 
     bridge = _bridge(handler)
@@ -256,14 +256,14 @@ def test_checkpoint_route_forwards_the_active_token_and_validated_boundary():
             invalid = client.post(
                 "/internal/checkpoint",
                 headers={"Authorization": "Bearer token"},
-                json={"boundary_id": "", "allow_steering": 1, "phase": ""},
+                json={"boundary_id": "", "allow_messages": 1, "phase": ""},
             )
             response = client.post(
                 "/internal/checkpoint",
                 headers={"Authorization": "Bearer token"},
                 json={
                     "boundary_id": "native:tool:0",
-                    "allow_steering": False,
+                    "allow_messages": False,
                     "phase": "boundary",
                 },
             )
@@ -272,11 +272,15 @@ def test_checkpoint_route_forwards_the_active_token_and_validated_boundary():
 
     assert invalid.status_code == 400
     assert response.status_code == 200
-    assert response.json() == {"cancelled": False, "destroyed": False, "steering": []}
+    assert response.json() == {
+        "cancelled": False,
+        "destroyed": False,
+        "invocation_messages": [],
+    }
     assert len(seen) == 1
     assert json.loads(seen[0].content) == {
         "boundary_id": "native:tool:0",
-        "allow_steering": False,
+        "allow_messages": False,
         "phase": "boundary",
     }
 
@@ -304,7 +308,7 @@ def test_checkpoint_route_cancels_its_upstream_uds_request_on_client_disconnect(
         payload = json.dumps(
             {
                 "boundary_id": "native:paused",
-                "allow_steering": False,
+                "allow_messages": False,
                 "phase": "boundary",
             }
         ).encode()

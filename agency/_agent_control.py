@@ -18,16 +18,16 @@ class AgentDestroyedError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class SteeringEntry:
+class InvocationMessage:
     sequence: int
-    instructions: str
+    content: str
 
 
 @dataclass(frozen=True)
 class InvocationDecision:
     cancelled: bool
     destroyed: bool
-    steering: tuple[SteeringEntry, ...] = ()
+    invocation_messages: tuple[InvocationMessage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class InvocationHandle:
     engine, and harness all receive this same object.
     """
 
-    _STEER_REJECT_PHASES = frozenset({"model", "closing"})
+    _MESSAGE_REJECT_PHASES = frozenset({"model", "closing"})
     _VALID_PHASES = frozenset(
         {"starting", "boundary", "infrastructure", "model", "tool", "paused", "closing"}
     )
@@ -61,8 +61,8 @@ class InvocationHandle:
         self._closed = False
         self._completion_claimed = False
         self._finish: InvocationFinish | None = None
-        self._pending_steering: deque[SteeringEntry] = deque()
-        self._boundary_steering: dict[str, tuple[SteeringEntry, ...]] = {}
+        self._pending_messages: deque[InvocationMessage] = deque()
+        self._boundary_messages: dict[str, tuple[InvocationMessage, ...]] = {}
 
     @property
     def phase(self) -> str:
@@ -73,18 +73,18 @@ class InvocationHandle:
         self,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
     ) -> InvocationDecision:
-        """Observe pause/suspension gates and deliver steering at a boundary.
+        """Observe pause/suspension gates and deliver invocation messages at a boundary.
 
-        Steering assigned to a ``boundary_id`` is cached.  A retried request
+        Messages assigned to a ``boundary_id`` are cached.  A retried request
         using the same boundary therefore sees the same overlay without
         consuming the queue a second time.
         """
         decision = self._checkpoint_wait(
             boundary_id,
-            allow_steering=allow_steering,
+            allow_messages=allow_messages,
             phase=phase,
             abort_event=None,
         )
@@ -95,20 +95,20 @@ class InvocationHandle:
         self,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
         abort_event: threading.Event,
     ) -> "InvocationDecision | None":
         """Wait at a boundary until control admits it or its caller disconnects.
 
         ``None`` means the caller-owned operation was aborted.  In that case
-        no steering is assigned, consumed, or cached for ``boundary_id``.
+        no invocation message is assigned, consumed, or cached for ``boundary_id``.
         The ordinary ``_checkpoint`` API remains non-interruptible and always
         returns an ``InvocationDecision``.
         """
         return self._checkpoint_wait(
             boundary_id,
-            allow_steering=allow_steering,
+            allow_messages=allow_messages,
             phase=phase,
             abort_event=abort_event,
         )
@@ -117,7 +117,7 @@ class InvocationHandle:
         self,
         boundary_id: str,
         *,
-        allow_steering: bool,
+        allow_messages: bool,
         phase: str,
         abort_event: "threading.Event | None",
     ) -> "InvocationDecision | None":
@@ -155,23 +155,23 @@ class InvocationHandle:
                 return None
 
             effective_phase = self._phase
-            assigned = self._boundary_steering.get(boundary_id)
+            assigned = self._boundary_messages.get(boundary_id)
             if assigned is None:
                 can_assign = (
-                    allow_steering
+                    allow_messages
                     and effective_phase != "closing"
                     and not self._cancelled
                     and not self._destroyed
                 )
-                assigned = tuple(self._pending_steering) if can_assign else ()
+                assigned = tuple(self._pending_messages) if can_assign else ()
                 if can_assign:
-                    self._pending_steering.clear()
-                self._boundary_steering[boundary_id] = assigned
+                    self._pending_messages.clear()
+                self._boundary_messages[boundary_id] = assigned
 
             return InvocationDecision(
                 cancelled=self._cancelled,
                 destroyed=self._destroyed,
-                steering=assigned,
+                invocation_messages=assigned,
             )
 
     def _abort_checkpoint_wait(self, abort_event: threading.Event) -> None:
@@ -205,8 +205,8 @@ class InvocationHandle:
             self._control._condition.notify_all()
             return True
 
-    def steer(self, instructions: str) -> None:
-        self._control._steer(self, instructions)
+    def send_message(self, message: str) -> None:
+        self._control._send_message(self, message)
 
     def pause(self) -> None:
         self._control._pause(self)
@@ -332,22 +332,22 @@ class AgentControl:
         with self._condition:
             return self._active
 
-    def _steer(self, handle: InvocationHandle, instructions: str) -> SteeringEntry:
+    def _send_message(self, handle: InvocationHandle, message: str) -> InvocationMessage:
         with self._condition:
-            self.assert_alive("steer")
-            if not isinstance(instructions, str):
-                raise TypeError("steering instructions must be a string")
-            if not instructions.strip():
-                raise ValueError("steering instructions must be a non-empty string")
+            self.assert_alive("send a message")
+            if not isinstance(message, str):
+                raise TypeError("message must be a string")
+            if not message.strip():
+                raise ValueError("message must be a non-empty string")
             if handle._control is not self:
                 raise RuntimeError("invocation handle belongs to another agent control")
             if handle._cancelled or handle._destroyed or handle._closed:
-                raise RuntimeError("cannot steer: skill invocation is ending")
-            if handle._phase in InvocationHandle._STEER_REJECT_PHASES:
-                raise RuntimeError(f"cannot steer while invocation phase is {handle._phase}")
+                raise RuntimeError("cannot send message: skill invocation is ending")
+            if handle._phase in InvocationHandle._MESSAGE_REJECT_PHASES:
+                raise RuntimeError(f"cannot send message while invocation phase is {handle._phase}")
             self._sequence += 1
-            entry = SteeringEntry(self._sequence, instructions)
-            handle._pending_steering.append(entry)
+            entry = InvocationMessage(self._sequence, message)
+            handle._pending_messages.append(entry)
             self._condition.notify_all()
             return entry
 
@@ -385,7 +385,7 @@ class AgentControl:
             handle._pause_requested = False
             self._condition.notify_all()
 
-    def steer(self, instructions: str) -> SteeringEntry:
+    def steer(self, instructions: str) -> InvocationMessage:
         with self._condition:
             self.assert_alive("steer")
             handle = self._active
@@ -395,7 +395,7 @@ class AgentControl:
                 if not instructions.strip():
                     raise ValueError("steering instructions must be a non-empty string")
                 raise RuntimeError("cannot steer: agent has no active skill invocation")
-        return self._steer(handle, instructions)
+        return self._send_message(handle, instructions)
 
     def pause(self) -> None:
         with self._condition:
@@ -503,5 +503,5 @@ __all__ = [
     "InvocationDecision",
     "InvocationFinish",
     "InvocationHandle",
-    "SteeringEntry",
+    "InvocationMessage",
 ]

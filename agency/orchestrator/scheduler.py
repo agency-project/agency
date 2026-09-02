@@ -27,7 +27,7 @@ class ExecutionScheduler:
         owner = self._orchestrator
         for request in list(owner._requests.values()):
             submission = request.submission
-            if request.kind == "message":
+            if request.kind == "context_message":
                 if submission._destroy_requested or request.agent._control.is_destroyed():
                     owner._destroy_request_locked(request)
                     continue
@@ -119,7 +119,7 @@ class ExecutionScheduler:
                 "blocked",
             ):
                 continue
-            if pending_exec.kind == "message":
+            if pending_exec.kind == "context_message":
                 owner._complete_message_locked(pending_exec)
                 continue
             owner._start_phase_span_locked(pending_exec, "sync:scheduler_queue")
