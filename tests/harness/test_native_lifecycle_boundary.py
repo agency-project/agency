@@ -137,19 +137,20 @@ def test_native_controls_arriving_during_compaction_stop_before_task_generation(
     worker.start()
     try:
         assert llm.compaction_entered.wait(timeout=2.0)
-        getattr(control, action)()
+        getattr(handle, action)()
         llm.release_compaction.set()
 
         if action == "pause":
             assert _wait_for_control(control, control.is_paused_actual)
             assert worker.is_alive()
             assert not llm.task_generation_started.is_set()
-            control.resume()
+            handle.resume()
 
         worker.join(timeout=2.0)
         assert not worker.is_alive()
     finally:
-        control.resume()
+        if handle.is_pause_requested() and handle.phase != "closing":
+            handle.resume()
         llm.release_compaction.set()
         worker.join(timeout=2.0)
         control.end_invocation(handle)
@@ -205,7 +206,7 @@ def test_native_pause_and_message_after_each_tool_preserve_multi_tool_protocol(
         assert first_tool_entered.wait(timeout=2.0)
         handle.send_message("first instruction")
         handle.send_message("second instruction")
-        control.pause()
+        handle.pause()
         release_first_tool.set()
 
         assert bridge.first_tool_checkpoint.wait(timeout=2.0)
@@ -213,11 +214,12 @@ def test_native_pause_and_message_after_each_tool_preserve_multi_tool_protocol(
         assert tool_events == ["one"]
         assert worker.is_alive()
 
-        control.resume()
+        handle.resume()
         worker.join(timeout=2.0)
         assert not worker.is_alive()
     finally:
-        control.resume()
+        if handle.is_pause_requested() and handle.phase != "closing":
+            handle.resume()
         release_first_tool.set()
         worker.join(timeout=2.0)
         control.end_invocation(handle)
@@ -273,7 +275,7 @@ def test_native_cancel_during_tool_waits_for_result_then_skips_remaining_batch(
     worker.start()
     try:
         assert first_tool_entered.wait(timeout=2.0)
-        control.cancel()
+        handle.cancel()
         assert tool_events == ["one"]
         release_first_tool.set()
         worker.join(timeout=2.0)

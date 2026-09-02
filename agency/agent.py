@@ -456,10 +456,6 @@ class agent:
             term_message=f"[{self.agname}] SUSPEND ▶  requested",
         )
 
-    def pause(self) -> None:
-        """Compatibility alias for :meth:`suspend`."""
-        self.suspend()
-
     def resume(self) -> None:
         """Reopen only the agent-wide suspension gate."""
         self._orchestrator.resume_agent(self)
@@ -468,14 +464,6 @@ class agent:
             payload={"agname": self.agname},
             term_message=f"[{self.agname}] SUSPEND ✓  resumed",
         )
-
-    def steer(self, instructions: str) -> None:
-        """Queue FIFO steering for the active invocation."""
-        self._control.steer(instructions)
-
-    def cancel(self) -> None:
-        """Cancel only the currently active invocation, if any."""
-        self._orchestrator.cancel_active(self)
 
     def destroy(self) -> CloseHandle:
         """Reject new work and asynchronously drain and clean up this agent."""

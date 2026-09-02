@@ -30,7 +30,7 @@ def test_dispatch_resume_command_resumes_named_agent():
     from agency.agwebui import _dispatch_command
 
     ag = _make_agent()
-    ag.pause()
+    ag.suspend()
     _dispatch_command({"type": "resume", "agname": ag.agname})
     assert ag.is_suspended() is False
 
@@ -56,8 +56,8 @@ def test_dispatch_resume_all_resumes_every_live_agent():
     from agency.agwebui import _dispatch_command
 
     a, b = _make_agent(), _make_agent()
-    a.pause()
-    b.pause()
+    a.suspend()
+    b.suspend()
     _dispatch_command({"type": "resume_all"})
     assert a.is_suspended() is False
     assert b.is_suspended() is False

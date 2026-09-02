@@ -257,13 +257,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             ag._control.resume_agent()
             self._post_locked("control_changed", ("agent", ag))
 
-    def cancel_active(self, ag: "agent") -> None:
-        with self._event_cond:
-            active = ag._control.active_invocation()
-            if isinstance(active, Invocation):
-                active.cancel()
-            self._post_locked("control_changed", ("agent", ag))
-
     def destroy_agent(self, ag: "agent") -> bool:
         """Close one agent's admission and mark all of its requests for teardown."""
         with self._event_cond:

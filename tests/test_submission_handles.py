@@ -39,6 +39,12 @@ def test_public_submission_exports_and_agent_alias():
     assert not hasattr(Invocation, "steer")
     assert hasattr(agent, "queue_message")
     assert not hasattr(agent, "send")
+    assert not hasattr(agent, "steer")
+    assert not hasattr(agent, "cancel")
+    assert not hasattr(agent, "pause")
+    assert hasattr(agent, "suspend")
+    assert hasattr(agent, "resume")
+    assert hasattr(agent, "destroy")
 
 
 def test_invocation_result_wait_await_and_field_proxy_support_literal_result_field():

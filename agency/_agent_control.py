@@ -385,48 +385,6 @@ class AgentControl:
             handle._pause_requested = False
             self._condition.notify_all()
 
-    def steer(self, instructions: str) -> InvocationMessage:
-        with self._condition:
-            self.assert_alive("steer")
-            handle = self._active
-            if handle is None:
-                if not isinstance(instructions, str):
-                    raise TypeError("steering instructions must be a string")
-                if not instructions.strip():
-                    raise ValueError("steering instructions must be a non-empty string")
-                raise RuntimeError("cannot steer: agent has no active skill invocation")
-        return self._send_message(handle, instructions)
-
-    def pause(self) -> None:
-        with self._condition:
-            self.assert_alive("pause")
-            handle = self._active
-        if handle is not None and handle.phase != "closing":
-            self._pause(handle)
-
-    def resume(self) -> None:
-        with self._condition:
-            self.assert_alive("resume")
-            handle = self._active
-            ending = bool(
-                handle
-                and (
-                    handle._cancelled
-                    or handle._destroyed
-                    or handle._closed
-                    or handle._phase == "closing"
-                )
-            )
-        if handle is not None and not ending:
-            self._resume(handle)
-
-    def cancel(self) -> None:
-        with self._condition:
-            self.assert_alive("cancel")
-            handle = self._active
-        if handle is not None:
-            self._cancel(handle)
-
     def suspend(self) -> None:
         with self._condition:
             self.assert_alive("suspend")

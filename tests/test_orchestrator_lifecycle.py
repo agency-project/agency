@@ -195,42 +195,6 @@ def test_running_invocation_cancel_is_observed_by_its_exact_safe_boundary(monkey
     assert ag.history.messages == seed
 
 
-def test_agent_cancel_targets_only_the_active_invocation(monkeypatch, tmp_path):
-    first_entered = threading.Event()
-    release_first_boundary = threading.Event()
-    calls = []
-
-    def execute(self, *, skill_input, invocation, **_kwargs):
-        calls.append((skill_input.label, invocation))
-        if skill_input.label == "first":
-            first_entered.set()
-            assert release_first_boundary.wait(timeout=2)
-            decision = invocation._checkpoint(
-                "test:first-boundary", allow_messages=True, phase="tool"
-            )
-            if decision.cancelled:
-                return agerror("agent invocation cancelled")
-        return agdata(label=skill_input.label)
-
-    monkeypatch.setattr(AgentEngine, "execute", execute)
-    ag = _agent(tmp_path)
-    skill = agskill("ordered", "")
-    first = ag.run(skill, agdata(label="first"))
-    assert first_entered.wait(timeout=2)
-    second = ag.run(skill, agdata(label="second"))
-
-    ag.cancel()
-    assert first.is_cancelled() is True
-    assert second.is_cancelled() is False
-    release_first_boundary.set()
-
-    _terminal_error(first, "agent invocation cancelled")
-    assert second.wait(timeout=2).label == "second"
-    assert first.state == "CANCELLED"
-    assert second.state == "SUCCEEDED"
-    assert calls == [("first", first), ("second", second)]
-
-
 def test_suspend_uses_no_capacity_and_agent_resume_preserves_invocation_pause(
     monkeypatch, tmp_path
 ):

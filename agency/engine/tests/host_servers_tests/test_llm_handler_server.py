@@ -918,7 +918,7 @@ def test_pre_model_stop_returns_conflict_without_calling_provider(
     if destroyed:
         control.destroy()
     else:
-        control.cancel()
+        invocation.cancel()
 
     response = TestClient(server.build_app()).post(
         "/dispatch", json={"messages": _completed_tool_history(), "stream": streaming}
@@ -958,7 +958,7 @@ def test_pause_during_model_parks_post_model_boundary_before_tool_delivery(strea
 
     assert backend.entered.wait(timeout=2.0)
     assert invocation.phase == "model"
-    control.pause()
+    invocation.pause()
     assert control.is_paused_actual() is False
     backend.release.set()
 
@@ -969,7 +969,7 @@ def test_pause_during_model_parks_post_model_boundary_before_tool_delivery(strea
     else:
         assert finished.is_set() is False
 
-    control.resume()
+    invocation.resume()
     if streaming:
         assert _drain(stream)[-1]["type"] == "done"
         stream._thread.join(timeout=2.0)
@@ -1006,7 +1006,7 @@ def test_cancel_during_model_suppresses_post_model_tool_delivery(streaming: bool
 
     assert backend.entered.wait(timeout=2.0)
     assert invocation.phase == "model"
-    control.cancel()
+    invocation.cancel()
     backend.release.set()
 
     if streaming:
@@ -1160,7 +1160,7 @@ def test_stream_spawn_failure_observes_control_cancel(monkeypatch):
     server = _controlled_server(_RecordingBackend(), invocation)
 
     def cancel_then_fail(*_args, **_kwargs):
-        control.cancel()
+        invocation.cancel()
         raise RuntimeError("spawn failed")
 
     monkeypatch.setattr(agprof, "spawn_traced", cancel_then_fail)
@@ -1482,7 +1482,7 @@ def test_streaming_response_disconnect_interrupts_paused_post_model_checkpoint()
 
     assert first == {"type": "delta", "content": "working"}
     assert backend.after_text.wait(timeout=2.0)
-    control.pause()
+    invocation.pause()
     backend.release.set()
     assert _wait_until(control.is_paused_actual)
     assert handle._thread.is_alive()
@@ -1730,7 +1730,7 @@ def test_stream_http_disconnect_while_paused_before_model_leaves_no_collector_ca
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
-    control.pause()
+    invocation.pause()
 
     async def scenario() -> None:
         disconnect = asyncio.Event()
@@ -1803,7 +1803,7 @@ def test_nonstream_http_disconnect_interrupts_paused_post_model_checkpoint():
             )
         )
         assert await asyncio.to_thread(backend.entered.wait, 2.0)
-        control.pause()
+        invocation.pause()
         backend.release.set()
         assert await asyncio.to_thread(_wait_until, control.is_paused_actual)
         disconnect.set()
