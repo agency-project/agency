@@ -114,6 +114,22 @@ def test_invocation_messages_are_fifo_replayed_and_rejected_after_final_answer()
         invocation.send_message("too late")
 
 
+def test_message_during_model_is_atomically_admitted_before_final_fence():
+    owner = _FakeAgent()
+    invocation = Invocation(owner, 1, "late-message")
+    invocation._checkpoint("model-1", allow_messages=False, phase="model")
+
+    invocation.send_message("revise the final answer")
+    decision = invocation._checkpoint_final_answer("model-1-final")
+
+    assert [entry.content for entry in decision.invocation_messages] == ["revise the final answer"]
+    assert invocation.phase == "boundary"
+
+    closing = invocation._checkpoint_final_answer("model-2-final")
+    assert closing.invocation_messages == ()
+    assert invocation.phase == "closing"
+
+
 def test_sending_a_message_does_not_resume_a_paused_invocation():
     owner = _FakeAgent()
     invocation = Invocation(owner, 1, "paused-message")

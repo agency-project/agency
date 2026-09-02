@@ -44,7 +44,6 @@ class InvocationHandle:
     engine, and harness all receive this same object.
     """
 
-    _MESSAGE_REJECT_PHASES = frozenset({"model", "closing"})
     _VALID_PHASES = frozenset(
         {"starting", "boundary", "infrastructure", "model", "tool", "paused", "closing"}
     )
@@ -188,6 +187,77 @@ class InvocationHandle:
                 if not has_tool_calls:
                     self._pause_requested = False
             self._control._condition.notify_all()
+
+    def _checkpoint_final_answer(
+        self,
+        boundary_id: str,
+        *,
+        abort_event: "threading.Event | None" = None,
+    ) -> "InvocationDecision | None":
+        """Atomically deliver late messages or establish the final-answer fence.
+
+        A message may arrive while a model request is in flight.  At a final
+        model result, this boundary either assigns every such message for a
+        follow-up generation or closes admission.  There is no gap in which a
+        message can be accepted and then stranded behind the closing fence.
+        """
+        if not isinstance(boundary_id, str) or not boundary_id:
+            raise ValueError("boundary_id must be a non-empty string")
+
+        with self._control._condition:
+            if abort_event is not None and abort_event.is_set():
+                return None
+
+            assigned = self._boundary_messages.get(boundary_id)
+            if assigned is None:
+                can_deliver = not (
+                    self._closed
+                    or self._cancelled
+                    or self._destroyed
+                    or self._control._is_closing_unlocked()
+                )
+                if can_deliver and self._pending_messages:
+                    self._phase = "boundary"
+                    while (self._pause_requested or self._control._suspend_requested) and not (
+                        self._cancelled or self._destroyed
+                    ):
+                        self._phase_before_pause = "boundary"
+                        self._phase = "paused"
+                        if (
+                            self._control._suspend_requested
+                            and not self._control._is_closing_unlocked()
+                        ):
+                            self._control._lifecycle = "suspended"
+                        self._control._condition.notify_all()
+                        self._control._condition.wait()
+                        if self._phase == "paused" and not self._closed:
+                            self._phase = "boundary"
+                        if abort_event is not None and abort_event.is_set():
+                            self._control._condition.notify_all()
+                            return None
+
+                    can_deliver = not (
+                        self._closed
+                        or self._cancelled
+                        or self._destroyed
+                        or self._control._is_closing_unlocked()
+                    )
+                    assigned = tuple(self._pending_messages) if can_deliver else ()
+                    if can_deliver:
+                        self._pending_messages.clear()
+                else:
+                    assigned = ()
+
+                if not assigned:
+                    self._phase = "closing"
+                    self._pause_requested = False
+                self._boundary_messages[boundary_id] = assigned
+
+            return InvocationDecision(
+                cancelled=self._cancelled,
+                destroyed=self._destroyed,
+                invocation_messages=assigned,
+            )
 
     def _claim_completion(self) -> bool:
         """Atomically win the cancellation/destruction-versus-commit race."""
@@ -343,7 +413,7 @@ class AgentControl:
                 raise RuntimeError("invocation handle belongs to another agent control")
             if handle._cancelled or handle._destroyed or handle._closed:
                 raise RuntimeError("cannot send message: skill invocation is ending")
-            if handle._phase in InvocationHandle._MESSAGE_REJECT_PHASES:
+            if handle._phase == "closing":
                 raise RuntimeError(f"cannot send message while invocation phase is {handle._phase}")
             self._sequence += 1
             entry = InvocationMessage(self._sequence, message)

@@ -353,6 +353,30 @@ class _BlockingToolBackend(_RecordingBackend):
         yield {"type": "usage", "usage": None, "stop_reason": "tool_use"}
 
 
+class _BlockingFinalOnceBackend(_RecordingBackend):
+    def __init__(self) -> None:
+        super().__init__(final=True)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def _block_first(self) -> None:
+        if len(self.requests) == 1:
+            self.entered.set()
+            assert self.release.wait(timeout=2.0)
+
+    def dispatch(self, request: dict) -> dict:
+        self.requests.append(("nonstream", copy.deepcopy(request)))
+        self._block_first()
+        return self._result()
+
+    def dispatch_stream(self, request: dict, *, on_client=None):
+        del on_client
+        self.requests.append(("stream", copy.deepcopy(request)))
+        self._block_first()
+        yield {"type": "content", "index": 0, "block_type": "text", "text": "draft"}
+        yield {"type": "usage", "usage": None, "stop_reason": "stop"}
+
+
 class _TextThenBlockingToolBackend(_RecordingBackend):
     def __init__(self) -> None:
         super().__init__()
@@ -852,14 +876,59 @@ def test_failed_attempt_reuses_pre_boundary_message_on_identical_retry():
         server.dispatch(request)
 
     assert invocation.phase == "model"
-    with pytest.raises(RuntimeError, match="phase is model"):
-        invocation.send_message("would be stranded")
+    invocation.send_message("deliver after retry")
 
     server.dispatch(request)
     assert [_invocation_message_texts(item[1]["messages"]) for item in backend.requests] == [
         ["[AGENCY INVOCATION MESSAGE]\nassigned before attempt"],
         ["[AGENCY INVOCATION MESSAGE]\nassigned before attempt"],
+        [
+            "[AGENCY INVOCATION MESSAGE]\nassigned before attempt",
+            "[AGENCY INVOCATION MESSAGE]\ndeliver after retry",
+        ],
     ]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_message_during_model_replaces_final_draft_at_next_safe_boundary(streaming: bool):
+    control = AgentControl()
+    invocation = control.begin_invocation("external")
+    backend = _BlockingFinalOnceBackend()
+    server = _controlled_server(backend, invocation)
+    request = {"messages": _completed_tool_history(), "stream": streaming}
+
+    if streaming:
+        stream = server.start_stream(request)
+    else:
+        outcome = {}
+
+        def dispatch() -> None:
+            outcome["result"] = server.dispatch(request)
+
+        worker = threading.Thread(target=dispatch, daemon=True)
+        worker.start()
+
+    assert backend.entered.wait(timeout=2.0)
+    assert invocation.phase == "model"
+    invocation.send_message("incorporate this before answering")
+    backend.release.set()
+
+    if streaming:
+        terminal = _drain(stream)[-1]
+        stream._thread.join(timeout=2.0)
+        assert terminal["type"] == "done"
+        assert terminal["message"]["blocks"][0]["text"] == "done"
+    else:
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert outcome["result"]["message"]["blocks"][0]["text"] == "done"
+
+    assert len(backend.requests) == 2
+    assert _invocation_message_texts(backend.requests[0][1]["messages"]) == []
+    assert _invocation_message_texts(backend.requests[1][1]["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nincorporate this before answering"
+    ]
+    assert invocation.phase == "closing"
 
 
 def test_incomplete_tool_batch_does_not_drain_or_inject_messages():
