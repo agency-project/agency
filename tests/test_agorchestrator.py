@@ -10,6 +10,8 @@ from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from agency.agconfig import agConfig
 from agency.agcontext import agcontext
 from agency.agdata import agdata, agerror
@@ -531,6 +533,56 @@ def test_profiler_adapter_persists_intervals_to_global_database(monkeypatch, tmp
     assert all(a["request_kind"] == "skill" for a in attrs)
     assert all(a["request_id"] == "run0" for a in attrs)
     assert all(a["skill"] == "profiled" for a in attrs)
+
+
+def test_profiler_routes_scheduler_and_execution_spans_to_their_data_loggers(
+    monkeypatch, tmp_path
+):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    def execute(self, *, context, **_kwargs):
+        with agprof.span("engine:inner"):
+            return _result(context, ok=True)
+
+    monkeypatch.setattr(AgentEngine, "execute", execute)
+    agprof.start(None, sample_hz=0, sample_gpu=False)
+    try:
+        ag = _agent(tmp_path)
+        assert ag.run(agskill("profiled", ""), agdata()).ok is True
+    finally:
+        agprof.stop()
+
+    orchestrator = get_orchestrator()
+    orchestrator.flush()
+    ag.data_logger.flush()
+    global_connection = sqlite3.connect(orchestrator.data_logger.db_path)
+    agent_connection = sqlite3.connect(ag.data_logger.db_path)
+    try:
+        global_names = [
+            row[0]
+            for row in global_connection.execute(
+                "SELECT span_name FROM spans ORDER BY id"
+            ).fetchall()
+        ]
+        agent_rows = agent_connection.execute(
+            "SELECT span_name,name,object,attributes FROM spans ORDER BY id"
+        ).fetchall()
+    finally:
+        global_connection.close()
+        agent_connection.close()
+
+    assert global_names.count("request:submission_to_completion") == 1
+    assert "sync:scheduler_queue" in global_names
+    agent_names = {row[0] for row in agent_rows}
+    assert {"engine:execute", "engine:inner"} <= agent_names
+    assert all(row[1] == str(ag.agname) for row in agent_rows)
+    assert all(row[2] == "agent" for row in agent_rows)
+    engine_attributes = json.loads(
+        next(row[3] for row in agent_rows if row[0] == "engine:execute")
+    )
+    assert engine_attributes["request_id"] == "run0"
+    assert engine_attributes["skill"] == "profiled"
 
 
 def test_agents_keep_separate_data_loggers(tmp_path):

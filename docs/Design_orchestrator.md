@@ -84,6 +84,19 @@ For every terminal path the scheduler:
 
 ## Telemetry and shutdown
 
-Request events and spans go to the request agent's lowercase `agdatacollector.py` SQLite collector. Scheduling snapshots and request lifecycle state remain in memory; the process-wide resource pool also uses its own SQLite collector for resource telemetry. LLM stream deltas remain temporary collector records and are finalized into durable events by the LLM server.
+Request lifecycle events and scheduler-derived spans go to the orchestrator's
+shared `agDataLogger`. Each execution worker binds `agprof` to that
+request's per-agent `agDataLogger`, so completed engine, sandbox, tool, and
+LLM profiler spans are persisted with the same schema as other agent data.
+The host-server thread and traced child threads inherit that binding.
+
+Profiler spans retain wall, CPU, run-queue, blocked, span-ID, parent-ID, and
+request-correlation fields. Scheduler external spans are exported directly
+through the shared logger when profiling is enabled; the existing lightweight
+timer writes the same scheduler interval when profiling is disabled, so the
+database has one row per interval in either mode. Logging failures remain
+observational and never alter request results. LLM stream deltas remain
+temporary `agdatalogger.py` records and are finalized into durable events by
+the LLM server.
 
 Explicit shutdown closes admission, drains active work and context continuations, fails requests that cannot run, joins the scheduler, and retires the reusable workers. Shutdown is idempotent. A callback executing on the scheduler thread may request non-blocking shutdown; scheduler teardown closes the worker pool after the event loop drains.

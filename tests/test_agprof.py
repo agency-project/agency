@@ -2,14 +2,119 @@
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
 from agency.observability.profiler import agprof
 from agency.observability.profiler import agprof_trace
+from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+
+
+def test_completed_profiler_spans_flow_to_bound_data_logger(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    logger = agDataLogger(
+        SimpleNamespace(
+            agDataLoggerConfigs=agDataLoggerConfigs(
+                db_path=str(tmp_path / "agent_data.sqlite3"),
+                flush_batch_size=100,
+                flush_interval_s=60,
+            )
+        ),
+        default_name="agent_test",
+        default_object="agent",
+    )
+    logger.start()
+
+    agprof.start(None, sample_hz=0, sample_gpu=False)
+    try:
+        with agprof.bind_data_logger(logger):
+            with agprof.span("parent"):
+                agprof.annotate(**{"agency.run_id": "run7"})
+
+                def child() -> None:
+                    with agprof.span("child"):
+                        pass
+
+                worker = agprof.spawn_traced(child)
+                worker.start()
+                worker.join(timeout=2)
+                assert not worker.is_alive()
+    finally:
+        agprof.stop()
+    logger.flush()
+
+    connection = sqlite3.connect(logger.db_path)
+    try:
+        rows = connection.execute(
+            "SELECT span_name,name,object,cpu_ms,runqueue_ms,blocked_ms,parent,attributes "
+            "FROM spans"
+        ).fetchall()
+    finally:
+        connection.close()
+        logger.stop()
+
+    by_name = {row[0]: row for row in rows}
+    assert set(by_name) == {"parent", "child"}
+    parent = by_name["parent"]
+    child_row = by_name["child"]
+    assert parent[1:3] == ("agent_test", "agent")
+    assert child_row[1:3] == ("agent_test", "agent")
+    assert parent[3] is not None
+    assert parent[5] >= 0
+    parent_attributes = json.loads(parent[7])
+    child_attributes = json.loads(child_row[7])
+    assert parent_attributes["agency.run_id"] == "run7"
+    assert child_row[6] == parent_attributes["agency.span_id"]
+    assert child_attributes["agency.parent_span_id"] == parent_attributes["agency.span_id"]
+
+
+def test_external_profiler_span_flows_to_explicit_data_logger(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    logger = agDataLogger(
+        SimpleNamespace(
+            agDataLoggerConfigs=agDataLoggerConfigs(
+                db_path=str(tmp_path / "global_data.sqlite3")
+            )
+        )
+    )
+    logger.start()
+
+    agprof.start(None, sample_hz=0, sample_gpu=False)
+    try:
+        span = agprof.start_external_span(
+            "sync:scheduler_queue",
+            start_perf_ns=1_000_000_000,
+            start_wall_ns=2_000_000_000,
+            metadata={"request_id": "run3"},
+            data_logger=logger,
+            data_name="agent_test",
+            data_object="agent",
+        )
+        assert span is not None
+        span.end(end_perf_ns=1_250_000_000, end_wall_ns=2_250_000_000)
+    finally:
+        agprof.stop()
+    logger.flush()
+
+    connection = sqlite3.connect(logger.db_path)
+    try:
+        row = connection.execute(
+            "SELECT span_name,start_ts,end_ts,name,object,blocked_ms,attributes FROM spans"
+        ).fetchone()
+    finally:
+        connection.close()
+        logger.stop()
+
+    assert row[:5] == ("sync:scheduler_queue", 2.0, 2.25, "agent_test", "agent")
+    assert row[5] == 250.0
+    assert json.loads(row[6])["request_id"] == "run3"
 
 
 def test_complete_summary_includes_per_process_workload_and_gpu_metrics(monkeypatch):

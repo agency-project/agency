@@ -253,8 +253,11 @@ class HostServerManager:
             data_logger = self._data_logger
 
             def _run_server() -> None:
+                from ...observability.profiler import agprof
+
                 bind_data_logger_for_current_thread(data_logger)
-                server.run()
+                with agprof.bind_data_logger(data_logger):
+                    server.run()
 
             thread = threading.Thread(target=_run_server, daemon=True, name="host-server-manager")
             self._server = server

@@ -76,6 +76,9 @@ _last_run_summary: "dict | None" = None
 
 _tls = threading.local()  # per-thread schedstat file cache only
 _span_stack: "ContextVar[tuple[_TimedSpan, ...]]" = ContextVar("agprof_span_stack", default=())
+_data_logger_binding: "ContextVar[tuple[object, str | None, str | None] | None]" = ContextVar(
+    "agprof_data_logger_binding", default=None
+)
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
@@ -281,6 +284,71 @@ def _otel_attribute(value):
     return json.dumps(value, sort_keys=True, default=str)
 
 
+@contextmanager
+def bind_data_logger(
+    data_logger,
+    *,
+    name: "str | None" = None,
+    object: "str | None" = None,
+):
+    """Route profiler spans created in this context to one agDataLogger.
+
+    The binding is captured by each span when it starts, so an external span
+    can safely finish on another thread. It is intentionally inert while
+    profiling is disabled, preserving agprof's existing no-op fast path.
+    """
+    token = _data_logger_binding.set((data_logger, name, object))
+    try:
+        yield
+    finally:
+        _data_logger_binding.reset(token)
+
+
+def _record_data_logger_span(
+    binding,
+    span_name: str,
+    start_wall_ns: int,
+    end_wall_ns: int,
+    attributes: dict,
+    *,
+    cpu_ns: "int | None" = None,
+    runqueue_ns: "int | None" = None,
+    span_id: "int | None" = None,
+    parent_span_id: "int | None" = None,
+) -> bool:
+    """Best-effort bridge from completed profiler spans to agDataLogger."""
+    if binding is None:
+        return False
+    data_logger, name, object = binding
+    wall_ns = max(0, end_wall_ns - start_wall_ns)
+    blocked_ns = max(0, wall_ns - (cpu_ns or 0) - (runqueue_ns or 0))
+    logger_attributes = dict(attributes)
+    if span_id is not None:
+        logger_attributes["agency.span_id"] = f"{span_id:016x}"
+    if parent_span_id is not None:
+        logger_attributes["agency.parent_span_id"] = f"{parent_span_id:016x}"
+    try:
+        data_logger.record_span(
+            span_name,
+            start_wall_ns / 1_000_000_000,
+            end_wall_ns / 1_000_000_000,
+            logger_attributes,
+            name=name,
+            object=object,
+            cpu_ms=None if cpu_ns is None else cpu_ns / 1_000_000,
+            runqueue_ms=None if runqueue_ns is None else runqueue_ns / 1_000_000,
+            blocked_ms=blocked_ns / 1_000_000,
+            parent=None if parent_span_id is None else f"{parent_span_id:016x}",
+            call_label=attributes.get("agency.run_id"),
+        )
+        return True
+    except Exception as exc:
+        # Profiling and persistence are observational. Neither may alter the
+        # execution result whose span is being recorded.
+        _agprof_print(f"[agprof] WARNING: datalogger span export failed: {exc}")
+        return False
+
+
 class _TimedSpan:
     """OTel span plus exact wall/CPU/run-queue deltas from this thread."""
 
@@ -298,6 +366,7 @@ class _TimedSpan:
         "_metadata",
         "_interrupted",
         "_stack_token",
+        "_data_logger_binding",
     )
 
     def __init__(self, tracer, name: str, parent_context=None) -> None:
@@ -309,6 +378,7 @@ class _TimedSpan:
         self._metadata: dict = {}
         self._interrupted = False
         self._stack_token = None
+        self._data_logger_binding = _data_logger_binding.get()
 
     def __enter__(self) -> "_TimedSpan":
         self._t0 = time.perf_counter_ns()
@@ -363,6 +433,9 @@ class _TimedSpan:
             self._span.record_exception(exc_val)
         context = self._span.get_span_context()
         parent = self._span.parent
+        attributes = {**metadata, **measurements}
+        span_id = context.span_id if context is not None else None
+        parent_span_id = parent.span_id if parent is not None else None
         _records.append(
             (
                 self._tid,
@@ -371,10 +444,21 @@ class _TimedSpan:
                 t1 - self._t0,
                 cpu1 - self._cpu0,
                 runq,
-                {**metadata, **measurements},
-                context.span_id if context is not None else None,
-                parent.span_id if parent is not None else None,
+                attributes,
+                span_id,
+                parent_span_id,
             )
+        )
+        _record_data_logger_span(
+            self._data_logger_binding,
+            self._name,
+            self._otel_t0,
+            otel_t1,
+            attributes,
+            cpu_ns=cpu1 - self._cpu0,
+            runqueue_ns=runq,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
         )
         self._span.end(end_time=otel_t1)
         if self._scope is not None:
@@ -422,6 +506,8 @@ class _ObservedSpan:
         "_ended",
         "_cancelled",
         "_lock",
+        "_data_logger_binding",
+        "_data_span_name",
     )
 
     def __init__(
@@ -433,6 +519,8 @@ class _ObservedSpan:
         start_wall_ns: int,
         metadata: "dict | None",
         parent_context,
+        data_logger_binding=None,
+        data_span_name: "str | None" = None,
     ) -> None:
         if parent_context is None:
             from opentelemetry.context import Context
@@ -449,6 +537,12 @@ class _ObservedSpan:
         self._ended = False
         self._cancelled = False
         self._lock = threading.Lock()
+        self._data_logger_binding = (
+            _data_logger_binding.get()
+            if data_logger_binding is None
+            else data_logger_binding
+        )
+        self._data_span_name = data_span_name
         self._span = None
         with _open_spans_lock:
             _open_spans[id(self)] = self
@@ -469,15 +563,15 @@ class _ObservedSpan:
         metadata: "dict | None" = None,
         start_perf_ns: "int | None" = None,
         start_wall_ns: "int | None" = None,
-    ) -> None:
+    ) -> bool:
         if (start_perf_ns is None) != (start_wall_ns is None):
             raise ValueError("start_perf_ns and start_wall_ns must be overridden together")
         with _open_spans_lock:
             if _open_spans.pop(id(self), None) is None:
-                return
+                return False
         with self._lock:
             if self._ended or self._interrupted or self._cancelled:
-                return
+                return False
             self._ended = True
             self._metadata.update(metadata or {})
             completed_metadata = dict(self._metadata)
@@ -508,6 +602,9 @@ class _ObservedSpan:
                 span.set_attribute(key, _otel_attribute(value))
             span_context = span.get_span_context()
             parent = span.parent
+            attributes = {**completed_metadata, **measurements}
+            span_id = span_context.span_id if span_context is not None else None
+            parent_span_id = parent.span_id if parent is not None else None
             _records.append(
                 (
                     self._tid,
@@ -516,12 +613,21 @@ class _ObservedSpan:
                     wall_ns,
                     None,
                     None,
-                    {**completed_metadata, **measurements},
-                    span_context.span_id if span_context is not None else None,
-                    parent.span_id if parent is not None else None,
+                    attributes,
+                    span_id,
+                    parent_span_id,
                 )
             )
             span.end(end_time=end_wall_ns)
+            return _record_data_logger_span(
+                self._data_logger_binding,
+                self._data_span_name or self._name,
+                effective_start_wall_ns,
+                end_wall_ns,
+                attributes,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
+            )
 
     def interrupt(self, ended_perf_ns: int) -> None:
         with self._lock:
@@ -625,12 +731,15 @@ def spawn_traced(fn, *args, daemon: bool = True, **kwargs) -> threading.Thread:
     from opentelemetry import context as otel_context
 
     context = otel_context.get_current()
+    data_logger_binding = _data_logger_binding.get()
 
     def run() -> None:
         token = otel_context.attach(context)
+        logger_token = _data_logger_binding.set(data_logger_binding)
         try:
             fn(*args, **kwargs)
         finally:
+            _data_logger_binding.reset(logger_token)
             otel_context.detach(token)
 
     return threading.Thread(target=run, daemon=daemon)
@@ -659,6 +768,10 @@ def start_external_span(
     start_wall_ns: int,
     metadata: "dict | None" = None,
     parent_context=None,
+    data_logger=None,
+    data_name: "str | None" = None,
+    data_object: "str | None" = None,
+    data_span_name: "str | None" = None,
 ) -> "_ObservedSpan | None":
     """Open a host-owned span whose interval is ended by a later callback.
 
@@ -684,6 +797,12 @@ def start_external_span(
             start_wall_ns=start_wall_ns,
             metadata=metadata,
             parent_context=parent_context,
+            data_logger_binding=(
+                None
+                if data_logger is None
+                else (data_logger, data_name, data_object)
+            ),
+            data_span_name=data_span_name,
         )
 
 

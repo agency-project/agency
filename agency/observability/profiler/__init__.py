@@ -13,6 +13,7 @@ Import styles supported:
 from . import agprof
 from .agprof import (
     annotate,
+    bind_data_logger,
     cancel_external_span,
     enabled,
     interrupt_external_span,
@@ -33,6 +34,7 @@ from .agprof import (
 __all__ = [
     "agprof",
     "annotate",
+    "bind_data_logger",
     "cancel_external_span",
     "enabled",
     "interrupt_external_span",
