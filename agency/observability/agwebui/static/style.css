@@ -1,6 +1,9 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
+  color-scheme: dark; /* always dark -- native form controls/scrollbars otherwise
+                          default to the OS/browser light theme regardless of the
+                          page's own (already dark-only) CSS variables below. */
   --bg:               #1a1a1a;
   --bg2:              #222;
   --bg3:              #2a2a2a;
@@ -322,17 +325,10 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .msg-tool-result{ color: var(--dim); margin: 2px 0; }
 .msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
 .msg-paused     { color: var(--red); }
-.msg-ask        { color: var(--yellow); margin: 4px 0; border-left: 3px solid var(--yellow); padding-left: 6px; }
-.msg-event      { color: var(--dim); font-size: 11px; margin: 4px 0 1px; }
-.msg-error      { color: var(--red);    margin: 3px 0; border-left: 3px solid var(--red); padding-left: 6px; }
-.msg-warning    { color: var(--yellow); margin: 3px 0; border-left: 3px solid var(--yellow); padding-left: 6px; }
 
 .role-user      { color: var(--cyan);   font-weight: bold; }
 .role-tool-call { color: var(--yellow); font-weight: bold; }
 .role-assistant { color: var(--green);  font-weight: bold; }
-.role-ask       { color: var(--yellow); font-weight: bold; }
-.role-error     { color: var(--red);    font-weight: bold; }
-.role-warning   { color: var(--yellow); font-weight: bold; }
 .dim            { opacity: 0.5; }
 
 /* ----------------------------------------------------------- Timeline */

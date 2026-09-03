@@ -10,11 +10,10 @@ const state = {
   teams:       new Map(),  // team_name -> Set<agname>
   histories:   new Map(),  // agname -> msg[]
   tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
-  globalTokens: { inp: 0, out: 0, history: [] },
   resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
   focusedIdx: 0,
-  pendingAsk: null,        // { agname, ask_id, question } | null
+  autoSelected: false,     // true once the first agent has been auto-selected
   activeTab:  'all',       // 'all' | 'live' | 'idle' | 'finished'
   timeline: {
     liveMode:  true,
@@ -162,7 +161,7 @@ function clearAgentState() {
   state.histories.clear();
   state.agentOrder = [];
   state.focusedIdx = 0;
-  state.pendingAsk = null;
+  state.autoSelected = false;
   $sharedLog.innerHTML = '';
   renderAgentList();
   renderHistory();
@@ -214,14 +213,12 @@ const $sharedLog        = document.getElementById('shared-log');
 const $agentHistory     = document.getElementById('agent-history');
 const $agentList        = document.getElementById('agent-list');
 const $interactionTitle = document.getElementById('interaction-title');
-const $agentInput       = document.getElementById('agent-input');
 const $navLabel         = document.getElementById('nav-label');
 const $countAll         = document.getElementById('count-all');
 const $countLive        = document.getElementById('count-live');
 const $countIdle        = document.getElementById('count-idle');
 const $countFinished    = document.getElementById('count-finished');
 const $agentSearch      = document.getElementById('agent-search');
-const $globalTokens     = document.getElementById('global-tokens');
 const $resourceStats    = document.getElementById('resource-stats');
 const $btnPauseToggle   = document.getElementById('btn-pause-toggle');
 const $btnPauseAll      = document.getElementById('btn-pause-all');
@@ -251,7 +248,6 @@ function updateResourceBadge() {
   $resourceStats.textContent = parts.length ? parts.join('  ') + '  (Used/Total)' : '';
 }
 
-const RATE_WINDOW_S = 60;
 
 function fmtTokens(inp, out, history) {
   function compact(n) {
@@ -273,11 +269,6 @@ function fmtTokens(inp, out, history) {
   return s;
 }
 
-function updateGlobalTokenBadge() {
-  const { inp, out, history } = state.globalTokens;
-  $globalTokens.textContent = (inp || out) ? fmtTokens(inp, out, history) : '';
-}
-
 function updateInteractionTitle() {
   const agname  = currentAgent();
   const visible = visibleOrder();
@@ -290,13 +281,12 @@ function updateInteractionTitle() {
     return;
   }
 
-  const waiting = (state.pendingAsk?.agname === agname) ? '  ?' : '';
   const usage   = state.tokenUsage.get(agname);
   const tokHtml = usage
     ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.history)}</span>`
     : '';
   $interactionTitle.innerHTML =
-    `${esc(agname)}  [${idx + 1}/${n}]  ← →${esc(waiting)}${tokHtml}`;
+    `${esc(agname)}  [${idx + 1}/${n}]  ← →${tokHtml}`;
   $navLabel.textContent = `${idx + 1} / ${n}`;
 }
 
@@ -310,14 +300,33 @@ $sharedLog.addEventListener('scroll', () => {
   logAutoScroll = $sharedLog.scrollHeight - $sharedLog.scrollTop - $sharedLog.clientHeight < 40;
 });
 
-function appendLog(line) {
+function _appendLogLine(html) {
   const div = document.createElement('div');
   div.className = 'log-line';
-  div.innerHTML = ansiToHtml(line);
+  div.innerHTML = html;
   $sharedLog.appendChild(div);
   if (logAutoScroll) $sharedLog.scrollTop = $sharedLog.scrollHeight;
   // Cap at 5000 lines to prevent unbounded growth
   while ($sharedLog.children.length > 5000) $sharedLog.removeChild($sharedLog.firstChild);
+}
+
+function appendLog(line) {
+  _appendLogLine(ansiToHtml(line));
+}
+
+// agterm-style colorization: term_message lines are plain text of the form
+// "[agname] rest of the message" -- color just the agent tag, matching the
+// old terminal-based agui's per-agent-colored `[agname]` prefix, and leave
+// the rest to ansiToHtml (term_message never contains ANSI codes, but this
+// keeps escaping consistent with every other log line).
+function appendAgentLog(termMessage, color) {
+  const m = /^(\[[^\]]+\])(.*)$/s.exec(termMessage);
+  if (!m || !color) {
+    appendLog(termMessage);
+    return;
+  }
+  const tag = `<span style="color:${color};font-weight:bold">${esc(m[1])}</span>`;
+  _appendLogLine(tag + ansiToHtml(m[2]));
 }
 
 // ---------------------------------------------------------------------------
@@ -479,66 +488,49 @@ function renderHistory() {
   const frags = [];
 
   for (const msg of msgs) {
-    const role    = msg.role    || '';
-    const content = msg.content || '';
+    const role   = msg.role   || '';
+    const blocks = msg.blocks || [];
+    // Every block carries an agency-native `type` (text/thinking/tool_use/
+    // tool_result/metadata) regardless of role -- see
+    // llm_handler_server.get_main_transcript() for the shape.
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
 
     if (role === 'system') {
-      frags.push(`<div class="msg-system">─── sys: ${esc(content)}</div>`);
+      if (text) frags.push(`<div class="msg-system">─── sys: ${esc(text)}</div>`);
 
     } else if (role === 'user') {
-      frags.push(`<div class="msg-user"><span class="role-user">▶ user</span>  ${esc(content)}</div>`);
+      if (text) frags.push(`<div class="msg-user"><span class="role-user">▶ user</span>  ${esc(text)}</div>`);
 
     } else if (role === 'assistant') {
-      const thinking   = msg._thinking || '';
-      const toolCalls  = msg.tool_calls || [];
-
-      if (thinking) {
-        frags.push(`<div class="msg-thinking">💭 thinking\n${esc(thinking)}</div>`);
-      }
-      for (const tc of toolCalls) {
-        const fn    = tc.function || {};
-        const fname = fn.name || '?';
-        let argsText = '';
-        try {
-          const raw = JSON.parse(fn.arguments || '{}');
-          argsText = Object.entries(raw)
-            .map(([k, v]) => `  ${esc(k)}: ${esc(String(v))}`)
-            .join('\n');
-        } catch {
-          argsText = esc(fn.arguments || '');
+      for (const b of blocks) {
+        if (b.type === 'thinking' && b.text) {
+          frags.push(`<div class="msg-thinking">💭 thinking\n${esc(b.text)}</div>`);
+        } else if (b.type === 'tool_use') {
+          let argsText = '';
+          try {
+            const raw = JSON.parse(b.arguments || '{}');
+            argsText = Object.entries(raw)
+              .map(([k, v]) => `  ${esc(k)}: ${esc(String(v))}`)
+              .join('\n');
+          } catch {
+            argsText = esc(b.arguments || '');
+          }
+          frags.push(
+            `<div class="msg-tool-call"><span class="role-tool-call">⚙ ${esc(b.name || '?')}</span>\n` +
+            `<span class="dim">${argsText}</span></div>`
+          );
         }
-        frags.push(
-          `<div class="msg-tool-call"><span class="role-tool-call">⚙ ${esc(fname)}</span>\n` +
-          `<span class="dim">${argsText}</span></div>`
-        );
       }
-      if (content) {
-        frags.push(`<div class="msg-assistant"><span class="role-assistant">◆ asst</span>\n${esc(content)}</div>`);
+      if (text) {
+        frags.push(`<div class="msg-assistant"><span class="role-assistant">◆ asst</span>\n${esc(text)}</div>`);
       }
 
     } else if (role === 'tool') {
-      frags.push(`<div class="msg-tool-result"><span class="dim">← ${esc(content)}</span></div>`);
-
-    } else if (msg.type === 'skill_start') {
-      frags.push(`<div class="msg-event">── skill: ${esc(msg.skill || '')} ──</div>`);
-
-    } else if (msg.type === 'skill_error') {
-      frags.push(
-        `<div class="msg-error"><span class="role-error">✗ skill error</span>` +
-        ` [${esc(msg.skill || '')}]\n${esc(msg.error || '')}</div>`
-      );
-
-    } else if (msg.type === 'llm_retry') {
-      frags.push(
-        `<div class="msg-warning"><span class="role-warning">⟳ LLM retry</span>` +
-        ` attempt ${esc(String(msg.attempt || ''))}: ${esc(msg.error || '')}</div>`
-      );
-
-    } else if (msg.type === 'llm_error') {
-      frags.push(
-        `<div class="msg-error"><span class="role-error">✗ LLM error</span>` +
-        `\n${esc(msg.error || '')}</div>`
-      );
+      for (const b of blocks) {
+        if (b.type === 'tool_result') {
+          frags.push(`<div class="msg-tool-result"><span class="dim">← ${esc(b.text || '')}</span></div>`);
+        }
+      }
     }
   }
 
@@ -554,13 +546,6 @@ function renderHistory() {
     else if (st === 'paused')    label = 'Paused';
     else                         label = 'Running…';
     frags.push(`<div class="msg-running${st === 'paused' ? ' msg-paused' : ''}">▶ ${esc(label)}</div>`);
-  }
-
-  // Pending ask_human question
-  if (state.pendingAsk?.agname === agname) {
-    frags.push(
-      `<div class="msg-ask"><span class="role-ask">? ${esc(state.pendingAsk.question)}</span></div>`
-    );
   }
 
   $agentHistory.innerHTML = frags.join('');
@@ -596,6 +581,14 @@ function handleEvent(ev) {
         reorderAgents();
       }
       renderAgentList();
+      // Auto-select the first agent this browser session ever sees --
+      // otherwise the interaction panel stays blank until the user clicks
+      // or tabs to an agent themselves.
+      if (!state.autoSelected && currentAgent()) {
+        state.autoSelected = true;
+        renderHistory();
+        loadAgentDetail(currentAgent());
+      }
       break;
 
     case 'agent_config': {
@@ -669,47 +662,6 @@ function handleEvent(ev) {
       if (ev.agname === currentAgent()) renderHistory();
       break;
 
-    case 'ask_human': {
-      state.pendingAsk = { agname: ev.agname, ask_id: ev.ask_id, question: ev.question };
-      const idx = state.agentOrder.indexOf(ev.agname);
-      if (idx >= 0) state.focusedIdx = idx;
-      renderAgentList();
-      renderHistory();
-      $agentInput.focus();
-      break;
-    }
-
-    case 'human_reply':
-      if (state.pendingAsk?.ask_id === ev.ask_id) state.pendingAsk = null;
-      renderHistory();
-      break;
-
-    case 'token_update': {
-      const prev    = state.tokenUsage.get(ev.agname) || { inp: 0, out: 0, history: [] };
-      const history = prev.history;
-      history.push({ ts: ev.ts, inp: ev.agent_input, out: ev.agent_output });
-      const cutoff  = ev.ts - RATE_WINDOW_S;
-      while (history.length > 1 && history[0].ts < cutoff) history.shift();
-      state.tokenUsage.set(ev.agname, { inp: ev.agent_input, out: ev.agent_output, history });
-
-      // Global token values from concurrent agents race: each agent reports
-      // global_base + its_own_live_progress, so values can arrive out of order.
-      // Track the running maximum as the displayed total and only append to
-      // history when the value is a new high-water mark, ensuring the rate
-      // window is always monotonically increasing (no negative rates).
-      const gInp = Math.max(state.globalTokens.inp, ev.global_input);
-      const gOut = Math.max(state.globalTokens.out, ev.global_output);
-      const gHistory = state.globalTokens.history;
-      if (ev.global_input >= state.globalTokens.inp) {
-        gHistory.push({ ts: ev.ts, inp: ev.global_input, out: ev.global_output });
-        while (gHistory.length > 1 && gHistory[0].ts < cutoff) gHistory.shift();
-      }
-      state.globalTokens = { inp: gInp, out: gOut, history: gHistory };
-      updateGlobalTokenBadge();
-      if (ev.agname === currentAgent()) updateInteractionTitle();
-      break;
-    }
-
     case 'resource_update':
       state.resources = {
         gpus_acquired:      ev.gpus_acquired      || 0,
@@ -726,6 +678,12 @@ function handleEvent(ev) {
       appendLog('\x1b[1;32m✓ All done\x1b[0m  —  press Ctrl+C in the terminal to exit');
       break;
   }
+
+  // Any event can carry the same human-readable line agDataLogger prints to
+  // stderr (e.g. "[agent] SKILL OK ..."). Nothing emits a dedicated `log`
+  // event to the global stream anymore, so this is how the shared log
+  // panel sees anything beyond the few cases above that append explicitly.
+  if (ev.term_message) appendAgentLog(ev.term_message, ev.color);
 }
 
 // Keep team agents contiguous and before standalone agents
@@ -749,6 +707,14 @@ function reorderAgents() {
 }
 
 let agentDetailGeneration = 0;
+// agname -> signature of the last content actually rendered. Polled every
+// 200ms, but the underlying data usually only changes once per LLM/tool
+// exchange -- rebuilding #agent-history's entire innerHTML unconditionally
+// on every tick was pure churn most of the time, and repeatedly replacing
+// that subtree risked jittering scrollTop enough to flip histAutoScroll to
+// false (see its listener below), silently freezing the visible view while
+// content kept accumulating underneath.
+const agentDetailSignatures = new Map();
 
 async function loadAgentDetail(agname) {
   if (!agname) return;
@@ -761,10 +727,19 @@ async function loadAgentDetail(agname) {
       appendLog('[agent detail] ' + detail.error);
       return;
     }
-    state.histories.set(agname, detail.messages || []);
-    const existing = state.agents.get(agname) || { color: '#d4d4d4' };
+    const newMessages = detail.messages || [];
     const agentState = detail.state || {};
     const configPayload = detail.config || {};
+    // Cheap but correct: messages can update in place (streaming text
+    // growing on the last one), not just grow in count, so compare full
+    // content, not just length.
+    const signature = JSON.stringify(newMessages) + ' ' + (agentState.state || '') +
+      ' ' + (agentState.tool || '');
+    const changed = agentDetailSignatures.get(agname) !== signature;
+    agentDetailSignatures.set(agname, signature);
+
+    state.histories.set(agname, newMessages);
+    const existing = state.agents.get(agname) || { color: '#d4d4d4' };
     state.agents.set(agname, {
       ...existing,
       state: agentState.state || existing.state || 'inactive',
@@ -781,7 +756,7 @@ async function loadAgentDetail(agname) {
       });
     }
     renderAgentList();
-    renderHistory();
+    if (changed) renderHistory();
     updateInteractionTitle();
   } catch (error) {
     if (generation === agentDetailGeneration) {
@@ -817,7 +792,6 @@ if ($agentSearch) {
 }
 
 document.addEventListener('keydown', e => {
-  if (document.activeElement === $agentInput) return;
   if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); cycleNext(); }
   if (e.key === 'Tab' &&  e.shiftKey) { e.preventDefault(); cyclePrev(); }
   if (e.key === '[') cyclePrev();
@@ -968,29 +942,6 @@ $configUpdateAll.addEventListener('click', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Input / ask_human reply
-// ---------------------------------------------------------------------------
-
-$agentInput.addEventListener('keydown', e => {
-  if (e.key !== 'Enter') return;
-  const text = $agentInput.value.trim();
-  $agentInput.value = '';
-  if (!text) return;
-
-  const agname = currentAgent();
-  if (!agname) return;
-
-  if (state.pendingAsk?.agname === agname) {
-    const { ask_id } = state.pendingAsk;
-    ws.send(JSON.stringify({ type: 'human_reply', ask_id, text }));
-    // Optimistically clear so the UI doesn't show stale ? state
-    state.pendingAsk = null;
-    renderHistory();
-  }
-  // Unsolicited messages are not yet forwarded to agents.
-});
-
-// ---------------------------------------------------------------------------
 // WebSocket
 // ---------------------------------------------------------------------------
 
@@ -1012,6 +963,37 @@ ws.onclose = () => {
 ws.onerror = () => {
   appendLog('\x1b[31m[web ui] connection error\x1b[0m');
 };
+
+// The interaction panel (messages/state/config/tokens) only ever refreshes
+// on an explicit selection (click, Tab/arrow, auto-select) -- /api/agents/
+// {agname} is a pull, not something the live event stream pushes updates
+// for. Poll the currently selected agent while connected so its own
+// messages/state/tokens keep advancing without the user re-clicking it.
+// loadAgentDetail() already guards a response landing after the selection
+// moved on (agentDetailGeneration / agname !== currentAgent()), so this is
+// safe to fire even mid-fetch or mid-navigation.
+//
+// Self-rescheduling setTimeout, NOT setInterval: setInterval fires on a
+// fixed wall-clock cadence regardless of whether the previous call has
+// resolved yet. If a round trip ever takes longer than the interval, calls
+// start overlapping -- and since each overlapping call bumps
+// agentDetailGeneration before the earlier one's fetch resolves, every
+// single response arrives already stale and gets silently discarded.
+// Confirmed this was happening for real: every response stale, latency
+// ~600ms against a 200ms interval -- permanent starvation once overlap
+// begins (each overlapping request competes for the browser's per-host
+// connection limit, which slows every request further, which causes more
+// overlap), not just an occasional race. Only scheduling the next poll
+// after the current one finishes makes that starvation structurally
+// impossible.
+async function _pollAgentDetailLoop() {
+  if (state.timeline.liveMode) {
+    const agname = currentAgent();
+    if (agname) await loadAgentDetail(agname);
+  }
+  setTimeout(_pollAgentDetailLoop, 200);
+}
+_pollAgentDetailLoop();
 
 // ---------------------------------------------------------------------------
 // Utilities

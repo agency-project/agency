@@ -67,6 +67,9 @@ class _OwnerA:
     tier2_field = StaticConfigParam("test_agconfig_a", default="static-default")
     tier3_field = DynamicConfigParam("test_agconfig_a", default="dynamic-default")
     shared_name = DynamicConfigParam("test_agconfig_a", default="a-default")
+    tier3_sensitive = DynamicConfigParam(
+        "test_agconfig_a", default="secret-default", sensitive=True
+    )
 
     def __init__(self, agconfig: "agConfig | None" = None) -> None:
         self._agconfig = agconfig
@@ -165,6 +168,25 @@ def test_dynamic_snapshot_keeps_json_safe_containers():
     cfg = agConfig({"test_agconfig_a": {"tier3_field": {"a": [1, 2, "x"], "b": None}}})
     snap = cfg.dynamic_snapshot()
     assert snap["test_agconfig_a"]["tier3_field"] == {"a": [1, 2, "x"], "b": None}
+
+
+def test_dynamic_snapshot_excludes_sensitive_fields():
+    """A field registered sensitive=True never crosses into the snapshot
+    external consumers (the webui config editor) read from -- overriding it
+    must not make it appear either."""
+    cfg = agConfig({"test_agconfig_a": {"tier3_sensitive": "the-real-secret"}})
+    snap = cfg.dynamic_snapshot()
+    assert "tier3_sensitive" not in snap.get("test_agconfig_a", {})
+
+
+def test_dynamic_snapshot_excludes_llm_backend_api_key():
+    """Regression guard for the real leak: agllm_backend.api_key must never
+    appear in a dynamic_snapshot(), since that's what agent.change_config()
+    persists as the agent_config event the webui serves over HTTP."""
+    cfg = agConfig({"agllm_backend": {"api_key": "sk-real-secret", "model": "m"}})
+    snap = cfg.dynamic_snapshot()
+    assert "api_key" not in snap.get("agllm_backend", {})
+    assert snap["agllm_backend"]["model"] == "m"
 
 
 def test_dynamic_snapshot_two_owners_do_not_collide():

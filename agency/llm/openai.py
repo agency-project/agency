@@ -159,7 +159,13 @@ class _OpenAICompatibleBackend(agllm):
         client = self.make_client(self._client_timeout())
         if on_client is not None:
             on_client(client)
-        raw_stream = client.chat.completions.create(**{**backend_request, "stream": True})
+        # Without stream_options.include_usage, the OpenAI streaming API
+        # never sends a usage field on any chunk -- chunk_usage below would
+        # be None for the entire stream, and every metadata block's usage
+        # would be silently empty.
+        raw_stream = client.chat.completions.create(
+            **{**backend_request, "stream": True, "stream_options": {"include_usage": True}}
+        )
         return raw_stream, client
 
     def _format_stream_to_agency(self, raw_stream):

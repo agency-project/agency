@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
   <title>Agency Web UI</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -10,7 +11,7 @@
   <div id="app">
     <div id="left">
       <div id="shared-log-container">
-        <div class="panel-title" id="shared-log-title">Shared Log<span class="badge-group"><span class="resource-badge" id="resource-stats"></span><span class="token-badge" id="global-tokens"></span></span></div>
+        <div class="panel-title" id="shared-log-title">Shared Log<span class="badge-group"><span class="resource-badge" id="resource-stats"></span></span></div>
         <div id="timeline-bar">
           <span id="timeline-from"></span>
           <input id="timeline-slider" type="range" min="0" max="0" value="0" step="1" disabled>
@@ -27,8 +28,6 @@
           <span id="nav-label"></span>
           <button id="nav-next" title="Next agent (] or Tab)">&#8594;</button>
         </div>
-        <input id="agent-input" type="text" placeholder="type reply, then Enter…"
-               autocomplete="off" spellcheck="false">
       </div>
     </div>
     <div id="right">

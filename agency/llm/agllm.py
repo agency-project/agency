@@ -108,7 +108,7 @@ class AgLLMBackendFields:
     default_max_tokens = GlobalConfigParam("agllm_backend", default=128000)
 
     model = DynamicConfigParam("agllm_backend", default="")
-    api_key = DynamicConfigParam("agllm_backend", default=None)
+    api_key = DynamicConfigParam("agllm_backend", default=None, sensitive=True)
     base_url = DynamicConfigParam("agllm_backend", default=None)
     provider = DynamicConfigParam("agllm_backend", default=None)
     region = DynamicConfigParam("agllm_backend", default=None)
@@ -134,9 +134,9 @@ class AgLLMBackendFields:
     guided_json = DynamicConfigParam("agllm_backend", default=None)
     guided_regex = DynamicConfigParam("agllm_backend", default=None)
     workspace_id = DynamicConfigParam("agllm_backend", default=None)
-    aws_access_key = DynamicConfigParam("agllm_backend", default=None)
-    aws_secret_key = DynamicConfigParam("agllm_backend", default=None)
-    aws_session_token = DynamicConfigParam("agllm_backend", default=None)
+    aws_access_key = DynamicConfigParam("agllm_backend", default=None, sensitive=True)
+    aws_secret_key = DynamicConfigParam("agllm_backend", default=None, sensitive=True)
+    aws_session_token = DynamicConfigParam("agllm_backend", default=None, sensitive=True)
     aws_profile = DynamicConfigParam("agllm_backend", default=None)
     aws_region = DynamicConfigParam("agllm_backend", default=None)
 

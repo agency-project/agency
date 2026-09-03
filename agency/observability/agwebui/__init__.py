@@ -1,10 +1,12 @@
 """agwebui — web-based UI for monitoring agency runs.
 
 Starts a standalone FastAPI server in a separate process and serves a
-browser dashboard.  The execution process writes structured events to a
-SQLite database (ui_events.db); the server polls it and pushes updates
-over WebSocket.  The execution script runs directly in the main thread —
-no asyncio conflicts.
+browser dashboard. The server process has no agency imports of its own; it
+reads the same log_dir the execution process's agents already write to
+(each agent's own agDataLogger database, plus the orchestrator's shared
+global_data.sqlite3) directly off disk and pushes updates over WebSocket.
+The execution script runs directly in the main thread — no asyncio
+conflicts.
 
 Usage::
 
@@ -24,13 +26,11 @@ import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ...utils.agutil import sigterm_as_exit
+from ...utils.agutil import _DEFAULT_LOG_DIR, sigterm_as_exit
 from ..profiler import agprof
-from .emitter import agwebui_emitter
 
 # Module-level singleton — set while agwebui.run() is active.
 _active: "agwebui | None" = None
@@ -77,11 +77,10 @@ def _all_agteam_subclasses(cls):
 def _dispatch_command(cmd: dict) -> None:
     """Apply one pause/resume command written by the webui server process.
 
-    Mirrors the ask_human file-drop pattern (agwebui/emitter.py's
-    _reply_dir), but in the opposite direction: the (isolated, no-agency-
-    imports) server process can only write a plain file describing what it
-    wants; this side -- running inside the execution process, with real
-    agent objects -- is what actually applies it."""
+    The (isolated, no-agency-imports) server process can only write a plain
+    file describing what it wants; this side -- running inside the
+    execution process, with real agent objects -- is what actually applies
+    it."""
     from ...agent import agent as _agent_cls
     from ...agconfig import agConfig as _agConfig_cls
 
@@ -140,6 +139,35 @@ def _dispatch_command(cmd: dict) -> None:
             _merge_config_fields(_agent_cls.default_agconfig, config)
 
 
+def _flush_loop(stop_event: threading.Event, interval: float = 0.5) -> None:
+    """Force periodic disk flushes of every live agDataLogger (the
+    orchestrator's global one, plus each agent's own) while the webui is
+    active.
+
+    agDataLogger only flushes as a side effect of a record_event() call
+    landing >= flush_interval_s after the last flush -- there's no
+    background timer of its own. During any quiet stretch (e.g. one long
+    LLM call, or simply nothing happening for a moment) nothing triggers
+    that, so the separate webui server process reading the same files
+    directly off disk would otherwise see stale or empty data until traffic
+    resumes."""
+    from ...agent import agent as _agent_cls
+    from ...orchestrator import peek_orchestrator
+
+    while not stop_event.wait(interval):
+        orchestrator = peek_orchestrator()
+        if orchestrator is not None:
+            try:
+                orchestrator.data_logger.flush()
+            except Exception as _e:
+                print(f"[agwebui] WARNING: failed to flush orchestrator data logger: {_e}")
+        for a in _agent_cls.all():
+            try:
+                a.data_logger.flush()
+            except Exception as _e:
+                print(f"[agwebui] WARNING: failed to flush data logger for {a.agname}: {_e}")
+
+
 def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
     command_dir.mkdir(parents=True, exist_ok=True)
     while not stop_event.is_set():
@@ -165,12 +193,11 @@ class agwebui:
     """Web-based UI for monitoring agency runs.
 
     Primary usage — ``agwebui.run(fn)`` starts the web server subprocess,
-    registers the event emitter, runs *fn()* in the calling thread, then
-    optionally lingers until Ctrl+C.
+    runs *fn()* in the calling thread, then optionally lingers until
+    Ctrl+C.
     """
 
     def __init__(self, run_dir: Path, port: int) -> None:
-        self.emitter = agwebui_emitter(run_dir)
         self._run_dir = run_dir
         self._port = port
         self._server_proc: subprocess.Popen | None = None
@@ -215,8 +242,12 @@ class agwebui:
                 )
 
         if run_dir is None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = Path("runs") / f"webui_{ts}"
+            # Same directory every agent()/agteam() already writes its own
+            # agDataLogger database to (unless overridden via `log_dir` on
+            # their agconfig) -- the webui reads that data directly, so it
+            # has to point at the same place rather than a throwaway of its
+            # own.
+            run_dir = _DEFAULT_LOG_DIR
         run_dir.mkdir(parents=True, exist_ok=True)
 
         ui = cls(run_dir=run_dir, port=port)
@@ -255,10 +286,19 @@ class agwebui:
 
         # Emit initial resource pool state so the dashboard shows GPU/CPU
         # capacity immediately without waiting for the first acquire/release.
+        # get_orchestrator() is a process-wide singleton: if this is the
+        # first call anywhere (no agent constructed yet), passing the same
+        # run_dir the server subprocess was pointed at keeps its global
+        # agDataLogger database where the webui is actually reading from --
+        # otherwise it would fall back to _DEFAULT_LOG_DIR and silently
+        # diverge from an explicitly-passed run_dir.
         try:
             from ...orchestrator import get_orchestrator
+            from ..agdatalogger import resolve_global_db_path
 
-            _pool = get_orchestrator().agresource_pool
+            _pool = get_orchestrator(
+                default_db_path=resolve_global_db_path(run_dir)
+            ).agresource_pool
             if _pool is not None:
                 _pool._emit_resource()
         except Exception as _e:
@@ -287,6 +327,15 @@ class agwebui:
             name="agwebui-commands",
         ).start()
 
+        # Keeps the dashboard's view of disk reasonably fresh (see
+        # _flush_loop's docstring) -- stops alongside the command relay.
+        threading.Thread(
+            target=_flush_loop,
+            args=(command_stop,),
+            daemon=True,
+            name="agwebui-flush",
+        ).start()
+
         with sigterm_as_exit("agwebui") as sigterm_received:
             try:
                 with agprof.workload():
@@ -297,7 +346,19 @@ class agwebui:
                 traceback.print_exc()
             finally:
                 command_stop.set()
-                ui.emitter.done()
+                try:
+                    from ...orchestrator import get_orchestrator
+
+                    get_orchestrator().data_logger.record_event(
+                        "done",
+                        {},
+                        name="webui",
+                        object="agwebui",
+                        update_latest_snapshot=True,
+                        flush=True,
+                    )
+                except Exception as _e:
+                    print(f"[agwebui] WARNING: failed to emit done event: {_e}")
                 _active = None
 
                 # Skip lingering if we're already unwinding from a SIGTERM --

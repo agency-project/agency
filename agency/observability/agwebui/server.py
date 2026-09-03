@@ -1,8 +1,9 @@
 """Standalone web server for agwebui.
 
 No agency imports — this process is completely isolated from the execution
-process.  It polls the global agency.sqlite3 event stream and reads selected agent databases on demand.
-Run via:
+process. It polls the orchestrator's global_data.sqlite3 event stream
+(agDataLogger's schema, written by the live execution process) directly and
+reads selected agents' own databases on demand. Run via:
 
     python -m agency.observability.agwebui.server --run-dir <path> --port 7860
 """
@@ -12,7 +13,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import sqlite3
+import threading
 import time as _time
 import uuid as _uuid
 from contextlib import asynccontextmanager
@@ -33,11 +36,7 @@ _STATIC = Path(__file__).parent / "static"
 # Config
 # ---------------------------------------------------------------------------
 
-# Events replayed to new clients on connect. Matches
-# agwebui_emitter._PRUNE_KEEP_RAW + _PRUNE_EVERY (500 + 500) -- the maximum
-# possible size of the always-fully-raw tail that mechanism guarantees (see
-# _PRUNE_KEEP_RAW's docstring), so a connecting client's replay window is
-# never partially bucket-compacted mid-window.
+# Events replayed to new clients on connect.
 TAIL_EVENTS = 1000
 INDEX_INTERVAL = 1_000  # events between sample points in the timeline index
 
@@ -46,17 +45,30 @@ INDEX_INTERVAL = 1_000  # events between sample points in the timeline index
 # ---------------------------------------------------------------------------
 
 _run_dir: Path = Path(".")
-_reply_dir: Path = Path(".")
 _command_dir: Path = Path(".")
 
-# Highest event id seen so far; 0 means nothing read yet.
-_last_event_id: int = 0
+# Highest event id seen so far -- ids are zero-padded-sequence + uuid4 hex
+# strings (agDataLogger._next_id_locked), sortable as TEXT; "" sorts before
+# every real id.
+_last_event_id: str = ""
 _event_count: int = 0
 _first_ts: float | None = None
 _last_ts: float | None = None
 
 _clients: set[WebSocket] = set()
 _lock: asyncio.Lock | None = None  # created at startup
+
+# Per-agent tail cursors for the shared-log relay (see _tail_and_broadcast) --
+# agname -> last seen event id in that agent's own db.
+_agent_log_cursors: "dict[str, str]" = {}
+# Single cadence for both the global db and every known agent's own db --
+# each tick's rows from all sources are merged and sorted by timestamp
+# before broadcasting, so a scheduler event and an agent event that
+# happened close together in real time arrive at the client in that same
+# order. Two independently-timed poll loops (a fast global one, a slower
+# per-agent one) used to race here instead.
+TAIL_POLL_INTERVAL = 0.3
+AGENT_LOG_BACKLOG_PER_AGENT = 200
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +94,172 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _db_path() -> Path:
-    pointer = _run_dir / "global_data_path.txt"
-    if pointer.exists():
-        try:
-            return Path(pointer.read_text(encoding="utf-8").strip())
-        except Exception:  # noqa: S110 - fall back to the run-local database
-            pass
-    return _run_dir / "agency.sqlite3"
+    """The orchestrator's global agDataLogger writes here -- see
+    agdatalogger.resolve_global_db_path(), duplicated inline rather than
+    imported since this process stays free of agency package imports."""
+    return _run_dir / "global_data.sqlite3"
+
+
+def _xterm256_hex(n: int) -> str:
+    """Ported from the old terminal-based agui's agterm.py (removed in
+    2705fa8) / agwebui_emitter.ansi_to_hex -- xterm-256 color index -> hex."""
+    if n < 16:
+        _ansi16 = [
+            "#000000", "#aa0000", "#00aa00", "#aa8800",
+            "#0000aa", "#aa00aa", "#00aaaa", "#aaaaaa",
+            "#555555", "#ff5555", "#55ff55", "#ffff55",
+            "#5555ff", "#ff55ff", "#55ffff", "#ffffff",
+        ]  # fmt: skip
+        return _ansi16[n]
+    if n < 232:
+        idx = n - 16
+
+        def _c(lvl: int) -> int:
+            return 0 if lvl == 0 else 55 + 40 * lvl
+
+        return f"#{_c(idx // 36):02x}{_c((idx // 6) % 6):02x}{_c(idx % 6):02x}"
+    v = 8 + (n - 232) * 10
+    return f"#{v:02x}{v:02x}{v:02x}"
+
+
+def _make_color_palette() -> "list[str]":
+    """Ported from agterm.py's _make_color_palette(): sample the 6x6x6
+    xterm-256 cube at component levels {0,2,4,5} (values 0/135/215/255),
+    drop the cube-greys (r==g==b) and the near-black corner (brightest
+    component <= 135) -- 54 clearly visible, well-spread colors -- then
+    shuffle once per process, same as the old terminal-based agui did, so
+    colors stay varied and stable for the life of one webui server run."""
+    levels = (0, 2, 4, 5)
+    indices: "list[int]" = []
+    for r in levels:
+        for g in levels:
+            for b in levels:
+                if r == g == b:
+                    continue
+                if max(r, g, b) <= 2:
+                    continue
+                indices.append(16 + 36 * r + 6 * g + b)
+    colors = [_xterm256_hex(idx) for idx in indices]
+    random.shuffle(colors)
+    return colors
+
+
+_AGENT_COLOR_PALETTE: "list[str]" = _make_color_palette()
+_agent_color_lock = threading.Lock()
+_agent_color_assignments: "dict[str, str]" = {}
+_agent_color_next = 0
+
+
+def _agent_color(agname: str) -> str:
+    """Assign each agent the next unused palette color the first time its
+    name is seen, then remember it -- round-robin in order of first
+    appearance, same assignment scheme as the old agterm.py (one counter,
+    incremented per agent, indexing into the shuffled palette)."""
+    global _agent_color_next
+    with _agent_color_lock:
+        color = _agent_color_assignments.get(agname)
+        if color is None:
+            color = _AGENT_COLOR_PALETTE[_agent_color_next % len(_AGENT_COLOR_PALETTE)]
+            _agent_color_next += 1
+            _agent_color_assignments[agname] = color
+        return color
+
+
+# The orchestrator's own events (global db) carry no term_message -- unlike
+# agent-side events, nothing ever printed them to a terminal, so there was
+# never a human-readable line to persist. Synthesized here, purely from
+# already-persisted payload fields, so "global orchestrator actions, the
+# scheduling events" show up on the shared log the same way agent-side
+# activity does, with zero changes to orchestrator.py/agteam.py itself.
+# scheduler_state deliberately excluded: it's a continuous snapshot (fires
+# after nearly every transition), not a discrete action -- logging it would
+# flood the shared log with near-duplicate resource-count dumps.
+#
+# All scheduling actions are tagged "[scheduler]" (the source of the
+# action), not the agent name -- request_* events are about an agent but
+# come from the orchestrator, so the agent name rides in the message text
+# instead, next to the request_id-scoped skill.
+_SCHEDULER_EVENT_TYPES = frozenset(
+    {
+        "scheduler_started",
+        "scheduler_stopped",
+        "request_submitted",
+        "request_blocked",
+        "request_ready",
+        "request_started",
+        "request_completed",
+        "request_failed",
+        "request_cancelled",
+        "request_destroyed",
+    }
+)
+# Fixed, not palette-assigned: "scheduler" isn't an agent identity, and
+# colors are reserved for real agent tags (see agterm.py's _EVENT_STYLES,
+# which kept event-tag styling separate from per-agent colors the same way).
+_SCHEDULER_TAG_COLOR = "#ffffff"
+
+
+def _synthesize_term_message(event_type: str, name: "str | None", payload: dict) -> "str | None":
+    skill = payload.get("skill")
+    if event_type == "scheduler_started":
+        return (
+            f"[scheduler] STARTED  max_concurrent_engines={payload.get('max_concurrent_engines')}"
+        )
+    if event_type == "scheduler_stopped":
+        return "[scheduler] STOPPED"
+    if event_type == "request_submitted":
+        return f"[scheduler] {name}  REQUEST ▶  submitted   {skill}"
+    if event_type == "request_blocked":
+        return f"[scheduler] {name}  REQUEST ⏸  blocked     {skill}"
+    if event_type == "request_ready":
+        return f"[scheduler] {name}  REQUEST ▶  ready       {skill}"
+    if event_type == "request_started":
+        return f"[scheduler] {name}  REQUEST ▶  started     {skill}"
+    if event_type == "request_completed":
+        return f"[scheduler] {name}  REQUEST ✓  completed   {skill}"
+    if event_type == "request_failed":
+        return f"[scheduler] {name}  REQUEST ✗  failed      {skill}"
+    if event_type == "request_cancelled":
+        return f"[scheduler] {name}  REQUEST ⊘  cancelled   {skill}"
+    if event_type == "request_destroyed":
+        return f"[scheduler] {name}  REQUEST ⊘  destroyed   {skill}"
+    if event_type == "team_registered":
+        return f"[{name}] TEAM REGISTERED  agents={payload.get('agents')}"
+    return None
+
+
+def _build_envelope(
+    event_type: str,
+    timestamp: float,
+    name: "str | None",
+    payload_json: str,
+    term_message: "str | None" = None,
+) -> str:
+    """Reconstruct the flat JSON envelope the client expects (`{"type":...,
+    "ts":..., "agname":..., ...payload fields}`) from one `events`/
+    `latest_values` row. Payload fields are spread first so the canonical
+    type/ts/agname always win over any (currently nonexistent) same-named
+    payload field. `term_message` (the same human-readable line agDataLogger
+    also prints to stderr, e.g. "[agent] SKILL OK ...") rides along when the
+    row has one, so the client's shared log can show it without a dedicated
+    `type: "log"` event -- nothing emits those anymore; falls back to
+    _synthesize_term_message() for global/orchestrator event types that
+    never had one to begin with. `color` rides along whenever the row is
+    identified by name (agent_registered, or any term_message-bearing line)
+    so the client can colorize that tag consistently in both the roster and
+    the shared log, agterm-style -- except scheduling actions, which are
+    tagged "[scheduler]" (a fixed color, not a per-agent one)."""
+    payload = _json_object(payload_json)
+    envelope = {**payload, "type": event_type, "ts": timestamp, "agname": name}
+    if term_message is None:
+        term_message = _synthesize_term_message(event_type, name, payload)
+    if event_type in _SCHEDULER_EVENT_TYPES:
+        envelope["color"] = _SCHEDULER_TAG_COLOR
+    elif name and (event_type == "agent_registered" or term_message):
+        envelope["color"] = _agent_color(name)
+    if term_message:
+        envelope["term_message"] = term_message
+    return json.dumps(envelope)
 
 
 def _open_db(path: Path):
@@ -97,7 +268,7 @@ def _open_db(path: Path):
     return con
 
 
-def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None]:
+def _seed_from_db(path: Path) -> tuple[str, int, float | None, float | None]:
     """Read initial event-count/timestamp bookkeeping from an existing
     database. Global registration/resource recovery is handled by
     _fetch_state_preamble() on every connection, so no second in-memory
@@ -106,54 +277,138 @@ def _seed_from_db(path: Path) -> tuple[int, int, float | None, float | None]:
     Returns (last_event_id, event_count, first_ts, last_ts).
     """
     if not path.exists():
-        return 0, 0, None, None
+        return "", 0, None, None
     try:
         con = _open_db(path)
-        row = con.execute("SELECT MAX(id), COUNT(*), MIN(ts), MAX(ts) FROM events").fetchone()
+        row = con.execute(
+            "SELECT MAX(id), COUNT(*), MIN(timestamp), MAX(timestamp) FROM events"
+        ).fetchone()
         con.close()
         if row and row[0] is not None:
             return row[0], row[1], row[2], row[3]
     except Exception as _e:
         print(f"[agwebui] WARNING: failed to read event summary from {path}: {_e}")
-    return 0, 0, None, None
+    return "", 0, None, None
 
 
 # Lightweight global projections read on every client connection. Detailed
 # state, config, tokens, and history are fetched from the selected agent's
 # database through /api/agents/{agname}.
-_STATE_TABLES = ("agent_registry", "team_registry")
+_PREAMBLE_TYPES = ("agent_registered", "team_registered", "resource_update")
 
 
 def _fetch_state_preamble(path: Path) -> list[str]:
-    """Return global agent/team registration and resource state."""
+    """Return global agent/team registration and resource state -- the
+    latest row of each, one per (type, name) key in `latest_values`."""
     if not path.exists():
         return []
     rows: list[str] = []
     try:
         con = _open_db(path)
-        for table in _STATE_TABLES:
-            for (data,) in con.execute(f"SELECT data FROM {table}"):
-                rows.append(data)
-        row = con.execute("SELECT data FROM resource_state WHERE id=1").fetchone()
-        if row:
-            rows.append(row[0])
+        for event_type, timestamp, name, payload, term_message in con.execute(
+            "SELECT type, timestamp, name, payload, term_message FROM latest_values "
+            "WHERE type IN (?,?,?)",
+            _PREAMBLE_TYPES,
+        ):
+            rows.append(_build_envelope(event_type, timestamp, name, payload, term_message))
         con.close()
     except Exception as _e:
         print(f"[agwebui] WARNING: failed to read state preamble from {path}: {_e}")
     return rows
 
 
-def _fetch_new_events(path: Path, after_id: int) -> list[tuple[int, str]]:
-    """Return all (id, data) rows with id > after_id, ordered by id."""
+def _known_agents(global_path: Path) -> "dict[str, str]":
+    """agname -> db_path for every currently-registered agent."""
+    if not global_path.exists():
+        return {}
+    try:
+        con = _open_db(global_path)
+        rows = con.execute(
+            "SELECT name, payload FROM latest_values WHERE type='agent_registered'"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return {}
+    agents: "dict[str, str]" = {}
+    for name, payload in rows:
+        db_path = _json_object(payload).get("db_path")
+        if name and db_path:
+            agents[name] = db_path
+    return agents
+
+
+def _fetch_new_term_messages(path: Path, after_id: str) -> list[tuple[str, str]]:
+    """Return (id, envelope_json) for rows with id > after_id that carry a
+    term_message -- the compact human-readable status lines
+    (agent_created/skill_start/skill_success/...), not the far more
+    numerous llm_block/event rows the shared log has no use for."""
     if not path.exists():
         return []
     try:
         con = _open_db(path)
         rows = con.execute(
-            "SELECT id, data FROM events WHERE id > ? ORDER BY id", (after_id,)
+            "SELECT id, type, timestamp, name, payload, term_message FROM events "
+            "WHERE id > ? AND term_message IS NOT NULL ORDER BY id",
+            (after_id,),
         ).fetchall()
         con.close()
-        return rows
+        return [
+            (event_id, _build_envelope(event_type, timestamp, name, payload, term_message))
+            for event_id, event_type, timestamp, name, payload, term_message in rows
+        ]
+    except Exception:
+        return []
+
+
+def _fetch_agent_log_backlog(
+    global_path: Path, limit_per_agent: int = AGENT_LOG_BACKLOG_PER_AGENT
+) -> list[str]:
+    """Replay each currently-registered agent's own term_message history so
+    a newly-connecting client's shared log isn't empty until new activity
+    happens. Bounded per agent -- this is short status-line text, not
+    message content, but the cap keeps a very long-lived agent's replay
+    from growing unbounded. Not globally time-sorted across agents (each
+    agent's own lines stay chronological); a best-effort shared log, not a
+    strictly merged one."""
+    lines: list[str] = []
+    for agname, db_path in _known_agents(global_path).items():
+        path = Path(db_path)
+        if not path.exists():
+            continue
+        try:
+            con = _open_db(path)
+            rows = con.execute(
+                "SELECT type, timestamp, name, payload, term_message FROM events "
+                "WHERE term_message IS NOT NULL ORDER BY id DESC LIMIT ?",
+                (limit_per_agent,),
+            ).fetchall()
+            con.close()
+        except Exception as _e:
+            print(f"[agwebui] WARNING: failed to read log backlog for {agname}: {_e}")
+            continue
+        lines.extend(
+            _build_envelope(event_type, timestamp, name, payload, term_message)
+            for event_type, timestamp, name, payload, term_message in reversed(rows)
+        )
+    return lines
+
+
+def _fetch_new_events(path: Path, after_id: str) -> list[tuple[str, str]]:
+    """Return all (id, envelope_json) rows with id > after_id, ordered by id."""
+    if not path.exists():
+        return []
+    try:
+        con = _open_db(path)
+        rows = con.execute(
+            "SELECT id, type, timestamp, name, payload, term_message FROM events "
+            "WHERE id > ? ORDER BY id",
+            (after_id,),
+        ).fetchall()
+        con.close()
+        return [
+            (event_id, _build_envelope(event_type, timestamp, name, payload, term_message))
+            for event_id, event_type, timestamp, name, payload, term_message in rows
+        ]
     except Exception:
         return []
 
@@ -165,11 +420,16 @@ def _fetch_tail_events(path: Path, n: int = TAIL_EVENTS) -> list[str]:
     try:
         con = _open_db(path)
         rows = con.execute(
-            "SELECT data FROM (SELECT id, data FROM events ORDER BY id DESC LIMIT ?) ORDER BY id",
+            "SELECT type, timestamp, name, payload, term_message FROM "
+            "(SELECT id, type, timestamp, name, payload, term_message FROM events "
+            "ORDER BY id DESC LIMIT ?) ORDER BY id",
             (n,),
         ).fetchall()
         con.close()
-        return [r[0] for r in rows]
+        return [
+            _build_envelope(event_type, timestamp, name, payload, term_message)
+            for event_type, timestamp, name, payload, term_message in rows
+        ]
     except Exception:
         return []
 
@@ -180,15 +440,17 @@ def _fetch_timeline(path: Path) -> dict:
         return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
     try:
         con = _open_db(path)
-        row = con.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM events").fetchone()
+        row = con.execute("SELECT MIN(timestamp), MAX(timestamp), COUNT(*) FROM events").fetchone()
         first_ts, last_ts, count = row if row else (None, None, 0)
         if not count:
             con.close()
             return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
-        # Sample up to 500 evenly spaced points across the event stream.
+        # Sample up to 500 evenly spaced points across the event stream. `id`
+        # is a TEXT sequence+uuid string, not usable with `%`, but the table's
+        # implicit rowid still increases in insertion (== id) order.
         step = max(1, count // 500)
         raw_samples = con.execute(
-            "SELECT ts FROM events WHERE (id % ?) = 1 ORDER BY id", (step,)
+            "SELECT timestamp FROM events WHERE (rowid % ?) = 1 ORDER BY rowid", (step,)
         ).fetchall()
         con.close()
         samples = [[i, r[0]] for i, r in enumerate(raw_samples)]
@@ -203,17 +465,21 @@ def _fetch_timeline(path: Path) -> dict:
 
 
 def _fetch_events_range(path: Path, start_ts: float, end_ts: float) -> list[str]:
-    """Return all event JSON strings with ts BETWEEN start_ts AND end_ts."""
+    """Return all event envelopes with timestamp BETWEEN start_ts AND end_ts."""
     if not path.exists():
         return []
     try:
         con = _open_db(path)
         rows = con.execute(
-            "SELECT data FROM events WHERE ts BETWEEN ? AND ? ORDER BY ts",
+            "SELECT type, timestamp, name, payload, term_message FROM events "
+            "WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp",
             (start_ts, end_ts),
         ).fetchall()
         con.close()
-        return [r[0] for r in rows]
+        return [
+            _build_envelope(event_type, timestamp, name, payload, term_message)
+            for event_type, timestamp, name, payload, term_message in rows
+        ]
     except Exception:
         return []
 
@@ -230,6 +496,60 @@ def _json_object(value: str) -> dict:
         return {}
 
 
+# finalize_stream() writes one `events` row per block (not one row per
+# exchange holding a blocks array) -- so the metadata block for an exchange
+# is its own row, type='llm_block', with its own $.type=='metadata' inside
+# payload; new_prompt_tokens is top-level (llm_handler_server._tag_metadata_
+# block) but completion_tokens stays nested under $.usage (anthropic.py/
+# openai.py's usage_dict). Only those two numbers are ever pulled out here;
+# the far more numerous text/tool_use/tool_result rows are filtered out by
+# SQLite itself and never reach Python, since nothing in the frontend
+# renders raw events anyway (only messages/state/config/tokens are).
+_TOKEN_TOTALS_SQL = (
+    "SELECT SUM(json_extract(payload, '$.new_prompt_tokens')), "
+    "SUM(json_extract(payload, '$.usage.completion_tokens')) "
+    "FROM events WHERE type = 'llm_block' AND json_extract(payload, '$.type') = 'metadata'"
+)
+
+
+def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
+    """The full current transcript for one agent's own db: the last
+    completed-skill-call snapshot (live_messages) plus whatever's happened
+    since (finalized exchanges not yet folded into a new live_messages, and
+    the exchange still actively streaming, if any). Shared by the HTTP pull
+    path (_fetch_agent_detail) and the push path (_tail_and_broadcast's
+    messages_snapshot broadcast) so both compute it identically."""
+    row = con.execute(
+        "SELECT payload, timestamp FROM latest_values WHERE type='live_messages'"
+    ).fetchone()
+    if row is not None:
+        base_messages = _json_object(row[0]).get("messages", [])
+        live_messages_ts = row[1]
+    else:
+        call_row = con.execute(
+            "SELECT payload FROM events WHERE type='skill_call' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        base_messages = _json_object(call_row[0]).get("history_delta", []) if call_row else []
+        live_messages_ts = 0.0
+    in_progress = con.execute(
+        "SELECT type, call_label, payload FROM events "
+        "WHERE type IN ('llm_block','tool_result') AND timestamp > ? ORDER BY id",
+        (live_messages_ts,),
+    ).fetchall()
+    # finalize_stream() atomically clears every stream_deltas row for a
+    # call_label the moment that exchange finishes (moving it to the
+    # permanent events rows read above) -- so whatever remains here is, by
+    # construction, exactly the exchange(s) still streaming right now.
+    streaming_rows = con.execute(
+        "SELECT call_label, payload FROM stream_deltas WHERE type='llm_stream_delta' ORDER BY id"
+    ).fetchall()
+    return (
+        base_messages
+        + _reconstruct_in_progress_messages(in_progress)
+        + _reconstruct_streaming_messages(streaming_rows)
+    )
+
+
 def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
     """Read detailed data only from the explicitly selected agent database."""
     if not global_path.exists():
@@ -238,17 +558,19 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
     try:
         global_con = _open_readonly(global_path)
         row = global_con.execute(
-            "SELECT db_path FROM agent_registry WHERE agname=?", (agname,)
+            "SELECT payload FROM latest_values WHERE type='agent_registered' AND name=?",
+            (agname,),
         ).fetchone()
     except Exception as exc:
         return {"error": f"agent catalog lookup failed: {exc}", "agname": agname}
     finally:
         if global_con is not None:
             global_con.close()
-    if row is None:
+    db_path = _json_object(row[0]).get("db_path") if row is not None else None
+    if not db_path:
         return {"error": "unknown agent", "agname": agname}
 
-    agent_path = Path(row[0])
+    agent_path = Path(db_path)
     if not agent_path.exists():
         return {"error": "agent database is not available", "agname": agname}
     con: "sqlite3.Connection | None" = None
@@ -257,54 +579,128 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
         latest = {
             event_type: _json_object(payload)
             for event_type, payload in con.execute(
-                "SELECT type,payload FROM latest_values "
-                "WHERE type IN ('live_messages','agent_state','agent_config','token_update')"
+                "SELECT type,payload FROM latest_values WHERE type IN ('agent_state','agent_config')"
             )
         }
-        if "live_messages" not in latest:
-            row = con.execute(
-                "SELECT payload FROM events WHERE type='skill_call' ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                skill_call = _json_object(row[0])
-                latest["live_messages"] = {"messages": skill_call.get("history_delta", [])}
-        event_rows = con.execute(
-            "SELECT type,timestamp,call_label,payload FROM events ORDER BY id DESC LIMIT 500"
-        ).fetchall()
-        span_rows = con.execute(
-            "SELECT name,start_ts,end_ts,attributes FROM spans ORDER BY id DESC LIMIT 500"
-        ).fetchall()
+        messages = _compute_agent_messages(con)
+        token_row = con.execute(_TOKEN_TOTALS_SQL).fetchone()
     except Exception as exc:
         return {"error": f"agent database read failed: {exc}", "agname": agname}
     finally:
         if con is not None:
             con.close()
 
+    input_tokens, output_tokens = token_row if token_row is not None else (None, None)
     return {
         "agname": agname,
-        "messages": latest.get("live_messages", {}).get("messages", []),
+        "messages": messages,
         "state": latest.get("agent_state", {}),
         "config": latest.get("agent_config", {}),
-        "tokens": latest.get("token_update", {}),
-        "events": [
-            {
-                "type": event_type,
-                "timestamp": timestamp,
-                "call_label": call_label,
-                "payload": _json_object(payload),
-            }
-            for event_type, timestamp, call_label, payload in reversed(event_rows)
-        ],
-        "spans": [
-            {
-                "name": name,
-                "start_ts": start_ts,
-                "end_ts": end_ts,
-                "attributes": _json_object(attributes),
-            }
-            for name, start_ts, end_ts, attributes in reversed(span_rows)
-        ],
+        "tokens": {"input": input_tokens or 0, "output": output_tokens or 0},
     }
+
+
+def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str]]") -> "list[dict]":
+    """live_messages only gets (re)written once, when a skill call finishes
+    (orchestrator._record_execution_results) -- there's no persisted
+    snapshot of an in-flight skill's transcript to read. But each LLM
+    exchange's response blocks are already persisted incrementally, one
+    events row per block, the moment that exchange finishes streaming
+    (finalize_stream()); tool_result rows (host_mcp_server.call_tool) are
+    the same. Reconstruct the still-running skill's messages from those,
+    in the same {role, blocks} shape as a real transcript entry, so the
+    interaction panel keeps advancing during execution instead of only at
+    completion.
+
+    Metadata blocks are dropped (bookkeeping, not chat content). Blocks
+    are grouped into one assistant message per call_label (each LLM
+    exchange gets its own call_label); a tool_result row becomes its own
+    'tool'-role message and always starts a fresh assistant message after
+    it, mirroring how a real transcript alternates turns."""
+    messages: "list[dict]" = []
+    current_call_label: "object" = object()  # sentinel, never equals a real call_label
+    current_blocks: "list[dict] | None" = None
+    for event_type, call_label, payload_json in rows:
+        block = _json_object(payload_json)
+        if event_type == "llm_block":
+            if block.get("type") == "metadata":
+                continue
+            if call_label != current_call_label or current_blocks is None:
+                current_blocks = []
+                messages.append({"role": "assistant", "blocks": current_blocks})
+                current_call_label = call_label
+            current_blocks.append(block)
+        elif event_type == "tool_result":
+            current_call_label = object()
+            current_blocks = None
+            messages.append(
+                {
+                    "role": "tool",
+                    "blocks": [{"type": "tool_result", "text": json.dumps(block.get("result"))}],
+                }
+            )
+    return messages
+
+
+# Field-by-field accumulation rules for one streamed block, ported from
+# llm_handler_server._run_stream_producer's own in-memory merge loop (the
+# same block_delta stream_items, just read back from stream_deltas instead
+# of consumed live) -- kept in exact lockstep with that loop; if it changes
+# how a field accumulates, mirror the change here too.
+def _merge_stream_item(block: dict, stream_item: dict) -> None:
+    text_piece = stream_item.get("text") or ""
+    if text_piece:
+        block["text"] += text_piece
+    citations_piece = stream_item.get("citations")
+    if citations_piece:
+        if block.get("citations") is None:
+            block["citations"] = []
+        block["citations"].extend(citations_piece)
+    sig_piece = stream_item.get("signature") or ""
+    if sig_piece:
+        block["signature"] = block.get("signature", "") + sig_piece
+    if stream_item.get("id"):
+        block["id"] = stream_item["id"]
+    name_piece = stream_item.get("name") or ""
+    if name_piece:
+        block["name"] = block.get("name", "") + name_piece
+    args_piece = stream_item.get("arguments") or ""
+    if args_piece:
+        block["arguments"] = block.get("arguments", "") + args_piece
+
+
+def _reconstruct_streaming_messages(rows: "list[tuple[str, str]]") -> "list[dict]":
+    """The exchange (if any) that's still streaming right now -- not yet
+    finalized into a permanent events row (finalize_stream() only runs once
+    the whole exchange completes), so without this the panel would freeze
+    for however long that one exchange takes (can be several real seconds)
+    even though the raw deltas are already landing on disk continuously.
+    Replicates llm_handler_server's own text/tool_use/thinking block merge
+    (see _merge_stream_item) purely on read; metadata blocks and bare
+    "usage" stream_items are dropped, same as the finalized-event path."""
+    by_call_label: "dict[object, dict[int, dict]]" = {}
+    order: "list[object]" = []
+    for call_label, payload_json in rows:
+        stream_item = _json_object(payload_json)
+        if stream_item.get("type") != "block_delta":
+            continue
+        block_type = stream_item.get("block_type")
+        if block_type == "metadata":
+            continue
+        blocks = by_call_label.setdefault(call_label, {})
+        if call_label not in order:
+            order.append(call_label)
+        idx = stream_item.get("index")
+        block = blocks.setdefault(idx, {"type": block_type, "index": idx, "text": ""})
+        _merge_stream_item(block, stream_item)
+    return [
+        {
+            "role": "assistant",
+            "blocks": [by_call_label[label][i] for i in sorted(by_call_label[label])],
+        }
+        for label in order
+        if by_call_label[label]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -322,13 +718,25 @@ async def _lifespan(app: FastAPI):
     # fresh on every connect regardless of server restarts.
     seed = await asyncio.to_thread(_seed_from_db, _db_path())
     _last_event_id, _event_count, _first_ts, _last_ts = seed
-    task = asyncio.create_task(_tail_events())
+    task = asyncio.create_task(_tail_and_broadcast())
     yield
     task.cancel()
 
 
 app = FastAPI(lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
+
+
+@app.middleware("http")
+async def _no_cache_static(request, call_next):
+    """Browsers otherwise happily cache app.js/style.css/index.html across
+    reloads with no revalidation -- painful during active iteration on this
+    file, since a plain refresh can silently keep serving stale JS/CSS with
+    no visible sign anything is wrong."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/")
@@ -382,6 +790,7 @@ async def websocket_endpoint(ws: WebSocket):
     # Fetch tail and state outside lock — read-only DB queries.
     tail_lines = await asyncio.to_thread(_fetch_tail_events, _db_path())
     state_preamble = await asyncio.to_thread(_fetch_state_preamble, _db_path())
+    agent_log_backlog = await asyncio.to_thread(_fetch_agent_log_backlog, _db_path())
 
     async with _lock:
         sync = json.dumps(
@@ -401,6 +810,9 @@ async def websocket_endpoint(ws: WebSocket):
             # agent data is loaded only when the client selects that agent.
             for line in state_preamble:
                 await ws.send_text(line)
+            # Per-agent shared-log backlog (see _fetch_agent_log_backlog).
+            for line in agent_log_backlog:
+                await ws.send_text(line)
         except Exception:
             return
         _clients.add(ws)
@@ -411,12 +823,7 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 msg = json.loads(data)
                 mtype = msg.get("type")
-                if mtype == "human_reply":
-                    ask_id = str(msg.get("ask_id", ""))
-                    text = str(msg.get("text", ""))
-                    if ask_id:
-                        _atomic_write_text(_reply_dir / f"{ask_id}.txt", text)
-                elif mtype in ("pause", "resume", "pause_all", "resume_all"):
+                if mtype in ("pause", "resume", "pause_all", "resume_all"):
                     cmd = {"type": mtype, "agname": msg.get("agname")}
                     cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
                     _atomic_write_text(cmd_file, json.dumps(cmd))
@@ -442,35 +849,57 @@ async def websocket_endpoint(ws: WebSocket):
 # ---------------------------------------------------------------------------
 
 
-async def _tail_events() -> None:
+async def _tail_and_broadcast() -> None:
+    """One merged poll loop for both the global db and every registered
+    agent's own db (the latter relays term_message lines -- SKILL start/
+    success/error, CREATED, ... -- into the same shared broadcast stream,
+    since the global db by itself carries almost none of these).
+
+    Each tick collects new rows from every source into one batch and sorts
+    that batch by timestamp before broadcasting -- two independently-timed
+    poll loops here previously (a fast global one, a slower per-agent one)
+    raced each other, so a scheduler event and an agent event that happened
+    close together in real time could arrive at the client out of order."""
     global _last_event_id, _event_count, _first_ts, _last_ts
 
     while True:
-        path = _db_path()
-        if path.exists():
-            rows = await asyncio.to_thread(_fetch_new_events, path, _last_event_id)
-            if rows:
+        batch: "list[tuple[float, str]]" = []  # (ts, envelope_json), unsorted
+
+        global_path = _db_path()
+        if global_path.exists():
+            global_rows = await asyncio.to_thread(_fetch_new_events, global_path, _last_event_id)
+            if global_rows:
                 now = _time.time()
                 if _first_ts is None:
                     _first_ts = now
                 _last_ts = now
+                for event_id, data in global_rows:
+                    _last_event_id = event_id
+                    _event_count += 1
+                    batch.append((json.loads(data)["ts"], data))
 
-                assert _lock is not None
-                async with _lock:
-                    for event_id, _ in rows:
-                        _last_event_id = event_id
-                        _event_count += 1
+        agents = await asyncio.to_thread(_known_agents, global_path)
+        for agname, agent_db_path in agents.items():
+            after_id = _agent_log_cursors.get(agname, "")
+            rows = await asyncio.to_thread(_fetch_new_term_messages, Path(agent_db_path), after_id)
+            for event_id, data in rows:
+                _agent_log_cursors[agname] = event_id
+                batch.append((json.loads(data)["ts"], data))
 
-                    dead: set[WebSocket] = set()
-                    for _, data in rows:
-                        for ws in list(_clients):
-                            try:
-                                await ws.send_text(data)
-                            except Exception:
-                                dead.add(ws)
-                    _clients.difference_update(dead)
+        if batch:
+            batch.sort(key=lambda item: item[0])
+            assert _lock is not None
+            async with _lock:
+                dead: set[WebSocket] = set()
+                for _, data in batch:
+                    for ws in list(_clients):
+                        try:
+                            await ws.send_text(data)
+                        except Exception:
+                            dead.add(ws)
+                _clients.difference_update(dead)
 
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(TAIL_POLL_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -481,14 +910,14 @@ if __name__ == "__main__":
     import uvicorn
 
     parser = argparse.ArgumentParser(description="agwebui standalone server")
-    parser.add_argument("--run-dir", required=True, help="Directory containing agency.sqlite3")
+    parser.add_argument(
+        "--run-dir", required=True, help="log_dir shared with the execution process's agents"
+    )
     parser.add_argument("--port", type=int, default=7860)
     parsed = parser.parse_args()
 
     _run_dir = Path(parsed.run_dir)
-    _reply_dir = _run_dir / "ui_replies"
     _command_dir = _run_dir / "ui_commands"
-    _reply_dir.mkdir(parents=True, exist_ok=True)
     _command_dir.mkdir(parents=True, exist_ok=True)
 
     uvicorn.run(app, host="0.0.0.0", port=parsed.port, log_level="error")

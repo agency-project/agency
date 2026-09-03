@@ -53,8 +53,10 @@ _BARE_THREAD_ALLOWLIST = {
     ): (2, "subprocess pipe readers"),
     # General background I/O and UI maintenance.
     ("agency/utils/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
-    ("agency/observability/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
-    ("agency/observability/aglogger.py", "GlobalDataLogger.start"): (1, "telemetry writer"),
+    (
+        "agency/observability/agwebui/__init__.py",
+        "agwebui.run",
+    ): (2, "UI command relay + periodic disk-flush loop"),
     ("agency/observability/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),
 }
 

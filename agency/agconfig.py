@@ -138,11 +138,15 @@ class agConfig:
 
         Non-JSON-safe values (anything but str/int/float/bool/None, or a
         list/dict composed only of those) are skipped -- they can't cross
-        the wire to the browser anyway.
+        the wire to the browser anyway. Fields registered with
+        ``sensitive=True`` (API keys, AWS credentials, ...) are skipped too
+        -- this snapshot is what external consumers like the webui's config
+        editor read the current value from, and a secret has no business
+        crossing that wire even for display.
         """
         result: dict[str, dict[str, Any]] = {}
         for (owner, name), knob in agConfig.FIELD_REGISTRY.items():
-            if not isinstance(knob, DynamicConfigParam):
+            if not isinstance(knob, DynamicConfigParam) or knob.sensitive:
                 continue
             value = self.get(owner, name, knob.default)
             if not _is_json_safe(value):
@@ -188,9 +192,10 @@ agConfig.GLOBAL = agConfig()
 
 
 class _ConfigParam:
-    def __init__(self, owner: str, default: Any) -> None:
+    def __init__(self, owner: str, default: Any, *, sensitive: bool = False) -> None:
         self.owner = owner
         self.default = default
+        self.sensitive = sensitive
         self.name: str | None = None
 
     def __set_name__(self, objtype: type, name: str) -> None:

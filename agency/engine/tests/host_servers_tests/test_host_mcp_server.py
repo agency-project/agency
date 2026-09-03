@@ -179,6 +179,32 @@ def test_dynamic_tool_dispatch_invokes_the_agtool_fn():
     assert "hello" in result.content[0].text
 
 
+def test_call_tool_records_tool_result_with_arguments_and_result():
+    """Tool arguments/results aren't in any llm_block row (only the model's
+    own tool_use block is) -- this is the only place a tool's actual return
+    value ever gets persisted, needed for live per-agent transcript
+    reconstruction in the webui."""
+    echo = agtool(
+        name="echo",
+        description="Echo back the message.",
+        fn=lambda d: agdata(msg=d._data["msg"]),
+        params={
+            "type": "object",
+            "properties": {"msg": {"type": "string"}},
+            "required": ["msg"],
+        },
+    )
+    server, _, _ = _make_server(add_host_mcp_tools=[echo])
+    asyncio.run(server._mcp_server.call_tool("echo", {"msg": "hello"}))
+
+    tool_result_events = [e for e in server._data_logger.events if e[0] == "tool_result"]
+    assert len(tool_result_events) == 1
+    _type, payload, _call_label, _snapshot = tool_result_events[0]
+    assert payload["tool"] == "echo"
+    assert payload["arguments"] == {"msg": "hello"}
+    assert payload["result"]["msg"] == "hello"
+
+
 def test_dynamic_tool_missing_required_field_raises_tool_error():
     echo = agtool(
         name="echo",

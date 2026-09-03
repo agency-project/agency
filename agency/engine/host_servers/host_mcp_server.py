@@ -55,6 +55,19 @@ _mcp_server_logger = logging.getLogger("mcp.server")
 _mcp_server_logger.addHandler(_ThreadRoutedLogHandler())
 _mcp_server_logger.propagate = False
 
+# MCPServer.__init__() (below) unconditionally calls mcp's own
+# configure_logging(), which does logging.basicConfig(level="INFO",
+# handlers=[RichHandler(...)]) the first time any MCPServer is constructed
+# in this process -- reconfiguring the process-wide root logger. Any
+# library using stdlib logging with no level of its own (httpx, boto3, the
+# LLM SDKs' HTTP transport, ...) then inherits that INFO level and starts
+# printing every request through Rich. Pin the noisy ones back down
+# explicitly here; harmless regardless of whether that basicConfig() has
+# already fired or fires later, since an explicit level always wins over
+# inherited effective level.
+for _noisy_logger_name in ("httpx", "httpcore", "boto3", "botocore", "urllib3"):
+    logging.getLogger(_noisy_logger_name).setLevel(logging.WARNING)
+
 
 class HostMcpServer:
     def __init__(
@@ -86,13 +99,28 @@ class HostMcpServer:
                 var_name: self._persistent_vars.setdefault(var_name, factory())
                 for var_name, factory in tool.persistent_vars.items()
             }
-            return tool(
+            result = tool(
                 agdata(**kwargs),
                 sandbox=self._sandbox,
                 resource_pool=self._resource_pool,
                 output_schema=self._skill.output_schema,
                 **persistent,
             ).to_dict()
+            # Best-effort: a tool's return shape isn't guaranteed JSON-safe
+            # the way skill_success's logged field *names* are (see
+            # orchestrator._record_execution_results) -- never let a
+            # telemetry failure take down the actual tool call over it.
+            try:
+                self._data_logger.record_event(
+                    type="tool_result",
+                    payload={"tool": tool.name, "arguments": kwargs, "result": result},
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[host_mcp_server] WARNING: tool_result logging failed for {tool.name}: {exc}"
+                )
+            return result
 
         call_tool.__name__ = tool.name
         call_tool.__signature__ = inspect.Signature(

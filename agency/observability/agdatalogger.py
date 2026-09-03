@@ -23,7 +23,7 @@ def _ts() -> str:
 class agDataLoggerConfigs:
     db_path: str
     flush_batch_size: int = 20
-    flush_interval_s: float = 1.0
+    flush_interval_s: float = 0.2
 
 
 class agDataLogger:

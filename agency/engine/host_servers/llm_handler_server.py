@@ -63,15 +63,27 @@ def _extract_metadata_usage(metadata_block: dict) -> "tuple[dict, object]":
     stop_reason as top-level keys) or assembled by the streaming path's
     generic block-delta merge loop (usage/stop_reason nested inside `data`
     fragments, since that loop only ever forwards -- never interprets --
-    the `data` field)."""
+    the `data` field).
+
+    A stream can legitimately split usage and stop_reason across two
+    separate fragments -- e.g. OpenAI's stream_options.include_usage sends
+    a finish_reason-bearing chunk and a separate usage-only trailer chunk --
+    so each field is found independently (most recent fragment that has it
+    wins), not assumed to land on the same fragment."""
     if "usage" in metadata_block:
         return metadata_block.get("usage") or {}, metadata_block.get("stop_reason")
     data = metadata_block.get("data")
+    usage: "dict | None" = None
+    stop_reason = None
     if isinstance(data, list):
         for fragment in reversed(data):
-            if isinstance(fragment, dict) and "usage" in fragment:
-                return fragment.get("usage") or {}, fragment.get("stop_reason")
-    return {}, None
+            if not isinstance(fragment, dict):
+                continue
+            if usage is None and fragment.get("usage"):
+                usage = fragment["usage"]
+            if stop_reason is None and fragment.get("stop_reason") is not None:
+                stop_reason = fragment["stop_reason"]
+    return usage or {}, stop_reason
 
 
 def _stable_digest(value) -> str:
@@ -394,14 +406,23 @@ class LlmHandlerServer:
 
     def _tag_metadata_block(self, request_messages: "list[dict]", message: dict) -> None:
         """Enrich this exchange's metadata block with its own new (non-
-        cumulative) prompt token count and the skill/request it belongs to."""
+        cumulative) prompt token count and the skill/request it belongs to.
+
+        Also promotes usage/stop_reason to top-level keys unconditionally:
+        the batch path already puts them there, but the streaming path's
+        generic block-delta merge loop only ever forwards raw fragments
+        into `data` -- without this, usage/stop_reason stay buried inside
+        `data` and are unreadable by anything (including this class's own
+        _extract_metadata_usage()) without repeating that fragment-walk."""
         blocks = message.get("blocks") or []
         metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
         if metadata_block is None:
             return
-        usage, _stop_reason = _extract_metadata_usage(metadata_block)
+        usage, stop_reason = _extract_metadata_usage(metadata_block)
         prompt_tokens = usage.get("prompt_tokens", 0) or 0
         completion_tokens = usage.get("completion_tokens", 0) or 0
+        metadata_block["usage"] = usage
+        metadata_block["stop_reason"] = stop_reason
         metadata_block["new_prompt_tokens"] = self._usage_tracker.resolve_new_prompt_tokens(
             request_messages, message, prompt_tokens, completion_tokens
         )

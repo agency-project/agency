@@ -45,7 +45,7 @@ def _select_all(db_path, table):
 def test_configs_defaults():
     configs = agDataLoggerConfigs(db_path="/tmp/does-not-matter.db")
     assert configs.flush_batch_size == 20
-    assert configs.flush_interval_s == 1.0
+    assert configs.flush_interval_s == 0.2
 
 
 def test_configs_explicit_overrides():
