@@ -9,6 +9,7 @@ from .agllm import agllm, _AgProviderBackendConfig, _OPENAI_GEN_FIELDS
 _HANDLED_MESSAGE_FIELDS = {"role", "content", "tool_calls", "reasoning_content", "function_call"}
 _HANDLED_DELTA_FIELDS = {"role", "content", "reasoning_content", "tool_calls", "function_call"}
 _CHATCOMPLETIONS_TYPE_PREFIX = "openai_chatcompletions_"
+_METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real content-block index
 
 _CHATCOMPLETIONS_TOOL_CHOICE_VALUES = {"auto", "required", "none"}
 
@@ -82,7 +83,18 @@ class _OpenAICompatibleBackend(agllm):
         usage = _serialize_openai_usage(getattr(raw_result, "usage", None))
         if choice is None:
             return {
-                "message": {"role": "assistant", "blocks": []},
+                "message": {
+                    "role": "assistant",
+                    "blocks": [
+                        {
+                            "type": "metadata",
+                            "index": 0,
+                            "usage": usage,
+                            "stop_reason": None,
+                            "data": _serialize_sdk_object(raw_result),
+                        }
+                    ],
+                },
                 "usage": usage,
                 "stop_reason": None,
             }
@@ -127,10 +139,20 @@ class _OpenAICompatibleBackend(agllm):
                         "data": value,
                     }
                 )
+        stop_reason = getattr(choice, "finish_reason", None)
+        blocks.append(
+            {
+                "type": "metadata",
+                "index": len(blocks),
+                "usage": usage,
+                "stop_reason": stop_reason,
+                "data": _serialize_sdk_object(raw_result),
+            }
+        )
         return {
             "message": {"role": "assistant", "blocks": blocks},
             "usage": usage,
-            "stop_reason": getattr(choice, "finish_reason", None),
+            "stop_reason": stop_reason,
         }
 
     def _call_backend_stream(self, backend_request: dict, on_client=None):
@@ -191,11 +213,26 @@ class _OpenAICompatibleBackend(agllm):
                         }
                 finish_reason = getattr(choice, "finish_reason", None)
             if chunk_usage is not None or finish_reason is not None:
+                usage = _serialize_openai_usage(chunk_usage) if chunk_usage is not None else None
+                # The metadata block is a plain block_delta -- like any other
+                # unknown native field, it flows through the host server's
+                # generic block accumulator with no dedicated handling
+                # required there. All translation of what "usage"/
+                # "stop_reason" mean stays in this backend, not the host
+                # server.
+                yield {
+                    "type": "block_delta",
+                    "index": _METADATA_BLOCK_INDEX,
+                    "block_type": "metadata",
+                    "data": {
+                        "usage": usage,
+                        "stop_reason": finish_reason,
+                        "raw_chunk": _serialize_sdk_object(chunk),
+                    },
+                }
                 yield {
                     "type": "usage",
-                    "usage": _serialize_openai_usage(chunk_usage)
-                    if chunk_usage is not None
-                    else None,
+                    "usage": usage,
                     "stop_reason": finish_reason,
                 }
 

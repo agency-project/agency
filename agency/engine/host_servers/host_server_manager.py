@@ -83,6 +83,7 @@ class HostServerManager:
         self._llm_handler_server = LlmHandlerServer(
             agent.agconfig,
             self._data_logger,
+            agent.llm_usage_tracker,
             parent_context=agprof.current_span_context(),
             invocation=invocation,
             enable_message_overlay=getattr(agent, "harness", None) != "native",

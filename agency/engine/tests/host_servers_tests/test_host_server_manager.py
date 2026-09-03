@@ -25,6 +25,7 @@ from agency.engine.host_servers.host_server_manager import (
     _AttemptFenceMiddleware,
 )
 from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
+from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
 
 
@@ -38,6 +39,7 @@ def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code")
         agconfig=agconfig,
         harness=harness,
         data_logger=agDataLogger(agconfig),
+        llm_usage_tracker=LlmUsageTracker(),
     )
     sandbox = SimpleNamespace()
     skill = SimpleNamespace(
@@ -388,7 +390,9 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
     agconfig.HostServerManagerConfigs = configs
     agconfig.agDataLoggerConfigs = data_logger_configs
-    agent = SimpleNamespace(agconfig=agconfig, data_logger=agDataLogger(agconfig))
+    agent = SimpleNamespace(
+        agconfig=agconfig, data_logger=agDataLogger(agconfig), llm_usage_tracker=LlmUsageTracker()
+    )
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())
     resource_pool = SimpleNamespace()

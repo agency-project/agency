@@ -19,6 +19,7 @@ from agency._agent_control import AgentControl
 from agency.agconfig import agConfig
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
+from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
 
 # ---------------------------------------------------------------------------
@@ -39,6 +40,9 @@ class _FakeMessage:
         self.content = content
         self.tool_calls = tool_calls
 
+    def model_dump(self):
+        return {"content": self.content, "tool_calls": self.tool_calls}
+
 
 class _FakeDelta:
     def __init__(self, content=None, tool_calls=None, **extra):
@@ -56,6 +60,13 @@ class _FakeChoice:
         self.delta = delta
         self.finish_reason = finish_reason
 
+    def model_dump(self):
+        return {
+            "message": self.message.model_dump() if self.message is not None else None,
+            "delta": self.delta.model_dump() if self.delta is not None else None,
+            "finish_reason": self.finish_reason,
+        }
+
 
 class _FakeUsage:
     def __init__(self, prompt_tokens=0, completion_tokens=0, total_tokens=None):
@@ -63,17 +74,36 @@ class _FakeUsage:
         self.completion_tokens = completion_tokens
         self.total_tokens = total_tokens
 
+    def model_dump(self):
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
 
 class _FakeResult:
     def __init__(self, choices, usage=None):
         self.choices = choices
         self.usage = usage
 
+    def model_dump(self):
+        return {
+            "choices": [c.model_dump() for c in self.choices],
+            "usage": self.usage.model_dump() if self.usage is not None else None,
+        }
+
 
 class _FakeChunk:
     def __init__(self, choices, usage=None):
         self.choices = choices
         self.usage = usage
+
+    def model_dump(self):
+        return {
+            "choices": [c.model_dump() for c in self.choices],
+            "usage": self.usage.model_dump() if self.usage is not None else None,
+        }
 
 
 class _FakeClient:
@@ -118,7 +148,7 @@ def _cfg(**fields) -> agConfig:
 
 def _make_server(create_fn=None, **fields) -> "tuple[LlmHandlerServer, _FakeClient]":
     fields.setdefault("model", "gpt-test")
-    server = LlmHandlerServer(_cfg(**fields), _FakeDataLogger())
+    server = LlmHandlerServer(_cfg(**fields), _FakeDataLogger(), usage_tracker=LlmUsageTracker())
     client = _FakeClient(create_fn)
     server._backend.make_client = lambda timeout: client
     return server, client
@@ -405,6 +435,7 @@ def _controlled_server(backend, invocation) -> LlmHandlerServer:
         _cfg(model="gpt-test"),
         _FakeDataLogger(),
         invocation=invocation,
+        usage_tracker=LlmUsageTracker(),
     )
     server._backend = backend
     return server
@@ -446,15 +477,49 @@ def test_dispatch_returns_message_usage_stop_reason():
 
     server, client = _make_server(create_fn=create)
     result = server.dispatch({"messages": [{"role": "user", "content": "hi"}]})
-    assert result == {
-        "message": {
-            "role": "assistant",
-            "blocks": [{"type": "text", "index": 0, "text": "hi there"}],
-        },
-        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
-        "stop_reason": "stop",
-    }
+    content_blocks = [b for b in result["message"]["blocks"] if b["type"] != "metadata"]
+    assert result["message"]["role"] == "assistant"
+    assert content_blocks == [{"type": "text", "index": 0, "text": "hi there"}]
+    assert result["usage"] == {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+    assert result["stop_reason"] == "stop"
     assert client.closed is True
+
+
+def test_dispatch_tags_metadata_block_with_new_prompt_tokens_across_exchanges():
+    """Two successive dispatch() calls on the same server share one
+    LlmUsageTracker -- the second exchange's metadata block must report
+    only the NEW prompt tokens, not the full cumulative prompt_tokens."""
+    responses = iter(
+        [
+            _FakeResult(
+                [_FakeChoice(message=_FakeMessage(content="first"), finish_reason="stop")],
+                usage=_FakeUsage(100, 20),
+            ),
+            _FakeResult(
+                [_FakeChoice(message=_FakeMessage(content="second"), finish_reason="stop")],
+                usage=_FakeUsage(135, 15),
+            ),
+        ]
+    )
+
+    def create(**kwargs):
+        return next(responses)
+
+    server, _client = _make_server(create_fn=create)
+
+    first_request = {"messages": [{"role": "user", "content": "hi"}]}
+    first_result = server.dispatch(first_request)
+    first_metadata = next(b for b in first_result["message"]["blocks"] if b["type"] == "metadata")
+    assert first_metadata["new_prompt_tokens"] == 100
+
+    second_request = {
+        "messages": first_request["messages"]
+        + [first_result["message"], {"role": "user", "content": "and then?"}]
+    }
+    second_result = server.dispatch(second_request)
+    second_metadata = next(b for b in second_result["message"]["blocks"] if b["type"] == "metadata")
+    # 135 - (100 + 20) == 15 tokens of genuinely new prompt content.
+    assert second_metadata["new_prompt_tokens"] == 15
 
 
 def test_dispatch_includes_tool_calls_when_present():
@@ -470,7 +535,8 @@ def test_dispatch_includes_tool_calls_when_present():
 
     server, _ = _make_server(create_fn=create)
     result = server.dispatch({"messages": []})
-    assert result["message"]["blocks"] == [
+    content_blocks = [b for b in result["message"]["blocks"] if b["type"] != "metadata"]
+    assert content_blocks == [
         {
             "type": "tool_use",
             "index": 0,
@@ -582,11 +648,18 @@ def test_start_stream_relays_text_deltas_then_done():
     assert items[1]["content"] == "lo"
     message = items[2]["message"]
     assert message["role"] == "assistant"
-    assert len(message["blocks"]) == 1
-    block = message["blocks"][0]
+    content_blocks = [b for b in message["blocks"] if b["type"] != "metadata"]
+    assert len(content_blocks) == 1
+    block = content_blocks[0]
     assert block["type"] == "text" and block["text"] == "Hello"
     assert "ts_start" in block and "ts_end" in block
     assert items[2]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+    metadata_block = next(b for b in message["blocks"] if b["type"] == "metadata")
+    assert metadata_block["data"][-1]["usage"] == {
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "total_tokens": 3,
+    }
     handle._thread.join(timeout=2.0)
     assert client.closed is True
 
@@ -623,6 +696,7 @@ def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tm
                 _cfg(model="gpt-test"),
                 _FakeDataLogger(),
                 parent_context=agprof.current_span_context(),
+                usage_tracker=LlmUsageTracker(),
             )
             client = _FakeClient(create)
             server._backend.make_client = lambda timeout: client
@@ -1331,7 +1405,9 @@ def test_rejected_stream_error_enqueue_finalizes_as_cancelled():
                 return False
             return super().register_stream_exchange(item, **entry_fields)
 
-    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataLogger())
+    server = LlmHandlerServer(
+        _cfg(model="gpt-test"), _FakeDataLogger(), usage_tracker=LlmUsageTracker()
+    )
     server._backend = _FailingBackend()
     handle = _RejectErrorHandle(mod.queue.Queue(), threading.Event(), "rejected-error")
 
@@ -1584,7 +1660,9 @@ def test_stop_cancels_and_joins_all_handles():
             super().close()
             keep_going.set()
 
-    server = LlmHandlerServer(_cfg(model="gpt-test"), _FakeDataLogger())
+    server = LlmHandlerServer(
+        _cfg(model="gpt-test"), _FakeDataLogger(), usage_tracker=LlmUsageTracker()
+    )
     client = _ClosingClient(lambda **kw: gen())
     server._backend.make_client = lambda timeout: client
 
@@ -1735,14 +1813,12 @@ def test_build_app_dispatch_route_non_streaming():
     client = TestClient(server.build_app())
     response = client.post("/dispatch", json={"messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
-    assert response.json() == {
-        "message": {
-            "role": "assistant",
-            "blocks": [{"type": "text", "index": 0, "text": "hi"}],
-        },
-        "usage": None,
-        "stop_reason": "stop",
-    }
+    body = response.json()
+    content_blocks = [b for b in body["message"]["blocks"] if b["type"] != "metadata"]
+    assert body["message"]["role"] == "assistant"
+    assert content_blocks == [{"type": "text", "index": 0, "text": "hi"}]
+    assert body["usage"] is None
+    assert body["stop_reason"] == "stop"
 
 
 def test_build_app_dispatch_route_bad_request_returns_400(monkeypatch):

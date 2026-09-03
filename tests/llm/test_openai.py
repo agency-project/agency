@@ -25,6 +25,16 @@ class _SdkObj(SimpleNamespace):
         return dict(self.__dict__)
 
 
+def _metadata_block(raw, *, index, stop_reason, usage=None):
+    return {
+        "type": "metadata",
+        "index": index,
+        "usage": usage,
+        "stop_reason": stop_reason,
+        "data": raw,
+    }
+
+
 class TestOpenAICompatibleBackend:
     def test_make_client_passes_config_through(self):
         backend = _OpenAICompatibleBackend(_cfg(api_key="k", base_url="http://x/v1"))
@@ -96,7 +106,10 @@ class TestFormatContextBackendToAgency:
     def test_extracts_text_block(self):
         raw = self._raw(_SdkObj(content="hello"))
         result = _OpenAICompatibleBackend(_cfg())._format_context_backend_to_agency(raw)
-        assert result["message"]["blocks"] == [{"type": "text", "index": 0, "text": "hello"}]
+        assert result["message"]["blocks"] == [
+            {"type": "text", "index": 0, "text": "hello"},
+            _metadata_block(raw, index=1, stop_reason="stop"),
+        ]
 
     def test_legacy_function_call_becomes_tool_use(self):
         raw = self._raw(
@@ -104,7 +117,8 @@ class TestFormatContextBackendToAgency:
         )
         result = _OpenAICompatibleBackend(_cfg())._format_context_backend_to_agency(raw)
         assert result["message"]["blocks"] == [
-            {"type": "tool_use", "index": 0, "id": "", "name": "get_weather", "arguments": "{}"}
+            {"type": "tool_use", "index": 0, "id": "", "name": "get_weather", "arguments": "{}"},
+            _metadata_block(raw, index=1, stop_reason="stop"),
         ]
 
     def test_refusal_field_preserved_with_named_type(self):
@@ -115,7 +129,8 @@ class TestFormatContextBackendToAgency:
                 "type": "openai_chatcompletions_refusal",
                 "index": 0,
                 "data": "I can't help with that",
-            }
+            },
+            _metadata_block(raw, index=1, stop_reason="stop"),
         ]
 
     def test_annotations_and_audio_both_preserved(self):
@@ -137,7 +152,10 @@ class TestFormatContextBackendToAgency:
     def test_message_without_model_dump_only_gets_known_fields(self):
         raw = self._raw(_ev(content="hi", tool_calls=None, reasoning_content=None))
         result = _OpenAICompatibleBackend(_cfg())._format_context_backend_to_agency(raw)
-        assert result["message"]["blocks"] == [{"type": "text", "index": 0, "text": "hi"}]
+        assert result["message"]["blocks"] == [
+            {"type": "text", "index": 0, "text": "hi"},
+            _metadata_block(raw, index=1, stop_reason="stop"),
+        ]
 
 
 class TestFormatStreamToAgency:

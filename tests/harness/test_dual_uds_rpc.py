@@ -17,6 +17,7 @@ from agency.engine.clients import SandboxInteractionClient
 from agency.harness.clients import HostServicesClient
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
+from agency.llm.usage_tracker import LlmUsageTracker
 
 
 def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
@@ -43,7 +44,9 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
     config = agConfig({"agllm_backend": {"model": "test-model"}})
     config.HostServerManagerConfigs = HostServerManagerConfigs(uds_path=str(host_socket))
     config.agDataLoggerConfigs = agDataLoggerConfigs(db_path=str(database))
-    agent = SimpleNamespace(agconfig=config, data_logger=agDataLogger(config))
+    agent = SimpleNamespace(
+        agconfig=config, data_logger=agDataLogger(config), llm_usage_tracker=LlmUsageTracker()
+    )
     skill = agskill(
         name="mock-attempt",
         system_prompt="mock",

@@ -29,6 +29,20 @@ def _ev(**kwargs):
     return SimpleNamespace(**kwargs)
 
 
+def _metadata_block(raw, *, index, stop_reason, prompt_tokens=0, completion_tokens=0):
+    return {
+        "type": "metadata",
+        "index": index,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "stop_reason": stop_reason,
+        "data": raw,
+    }
+
+
 class _SdkObj(SimpleNamespace):
     def model_dump(self):
         return dict(self.__dict__)
@@ -811,6 +825,7 @@ class TestFormatContextBackendToAgency:
         assert result["message"]["blocks"] == [
             {"type": "text", "index": 0, "text": "Hello "},
             {"type": "text", "index": 1, "text": "world"},
+            _metadata_block(raw, index=2, stop_reason="end_turn"),
         ]
 
     def test_text_block_citations_preserved(self):
@@ -821,7 +836,8 @@ class TestFormatContextBackendToAgency:
         )
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
         assert result["message"]["blocks"] == [
-            {"type": "text", "index": 0, "text": "see source", "citations": [{"url": "http://x"}]}
+            {"type": "text", "index": 0, "text": "see source", "citations": [{"url": "http://x"}]},
+            _metadata_block(raw, index=1, stop_reason="end_turn"),
         ]
 
     def test_tool_use_block_preserved(self):
@@ -832,7 +848,8 @@ class TestFormatContextBackendToAgency:
         )
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
         assert result["message"]["blocks"] == [
-            {"type": "tool_use", "index": 0, "id": "t1", "name": "f", "arguments": "{}"}
+            {"type": "tool_use", "index": 0, "id": "t1", "name": "f", "arguments": "{}"},
+            _metadata_block(raw, index=1, stop_reason="tool_use"),
         ]
 
     def test_thinking_block_preserved_with_signature(self):
@@ -843,13 +860,16 @@ class TestFormatContextBackendToAgency:
         )
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
         assert result["message"]["blocks"] == [
-            {"type": "thinking", "index": 0, "text": "pondering", "signature": "sig123"}
+            {"type": "thinking", "index": 0, "text": "pondering", "signature": "sig123"},
+            _metadata_block(raw, index=1, stop_reason="end_turn"),
         ]
 
     def test_no_blocks_when_content_empty(self):
         raw = _ev(content=[], usage=None, stop_reason="end_turn")
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
-        assert result["message"]["blocks"] == []
+        assert result["message"]["blocks"] == [
+            _metadata_block(raw, index=0, stop_reason="end_turn")
+        ]
 
     def test_usage_and_stop_reason_extracted(self):
         raw = _ev(content=[], usage=_ev(input_tokens=10, output_tokens=5), stop_reason="end_turn")
@@ -869,7 +889,8 @@ class TestFormatContextBackendToAgency:
                 "type": "anthropic_redacted_thinking",
                 "index": 0,
                 "data": {"type": "redacted_thinking", "data": "encrypted-blob"},
-            }
+            },
+            _metadata_block(raw, index=1, stop_reason="end_turn"),
         ]
 
     def test_unrecognized_block_without_model_dump_stored_as_is(self):
@@ -877,7 +898,8 @@ class TestFormatContextBackendToAgency:
         raw = _ev(content=[raw_block], usage=None, stop_reason="end_turn")
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
         assert result["message"]["blocks"] == [
-            {"type": "anthropic_server_tool_use", "index": 0, "data": raw_block}
+            {"type": "anthropic_server_tool_use", "index": 0, "data": raw_block},
+            _metadata_block(raw, index=1, stop_reason="end_turn"),
         ]
 
 
@@ -1157,9 +1179,10 @@ class TestFormatStreamToAgency:
 
     def test_empty_stream_still_yields_final_usage_item(self):
         items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter([])))
-        assert len(items) == 1
-        assert items[0]["type"] == "usage"
-        assert items[0]["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        assert [i["type"] for i in items] == ["block_delta", "usage"]
+        assert items[0]["block_type"] == "metadata"
+        assert items[-1]["type"] == "usage"
+        assert items[-1]["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     def test_missing_usage_on_message_start_defaults_to_zero(self):
         stream = [_ev(type="message_start", message=_ev(usage=None))]

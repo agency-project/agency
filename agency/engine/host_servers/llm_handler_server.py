@@ -22,6 +22,7 @@ from starlette.requests import ClientDisconnect
 
 from ...llm import API_CONN_EXCS, API_ERROR_EXCS, BAD_REQUEST_EXCS, RATE_LIMIT_EXCS
 from ...llm.agllm import agllm
+from ...llm.usage_tracker import LlmUsageTracker
 
 if TYPE_CHECKING:
     from ...agconfig import agConfig
@@ -54,6 +55,23 @@ def _annotate(span, **metadata) -> None:
 
 def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
     return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
+
+
+def _extract_metadata_usage(metadata_block: dict) -> "tuple[dict, object]":
+    """Read usage/stop_reason back off a metadata block, regardless of
+    whether it was built directly by a backend's batch path (usage/
+    stop_reason as top-level keys) or assembled by the streaming path's
+    generic block-delta merge loop (usage/stop_reason nested inside `data`
+    fragments, since that loop only ever forwards -- never interprets --
+    the `data` field)."""
+    if "usage" in metadata_block:
+        return metadata_block.get("usage") or {}, metadata_block.get("stop_reason")
+    data = metadata_block.get("data")
+    if isinstance(data, list):
+        for fragment in reversed(data):
+            if isinstance(fragment, dict) and "usage" in fragment:
+                return fragment.get("usage") or {}, fragment.get("stop_reason")
+    return {}, None
 
 
 def _stable_digest(value) -> str:
@@ -297,12 +315,14 @@ class LlmHandlerServer:
         self,
         agconfig: "agConfig",
         data_logger: "agDataLogger",
+        usage_tracker: "LlmUsageTracker",
         *,
         parent_context=None,
         invocation=None,
         enable_message_overlay: bool = True,
     ) -> None:
         self._data_logger = data_logger
+        self._usage_tracker = usage_tracker
         self._handles: "list[_StreamHandle]" = []
         self._handles_lock = threading.Lock()
         self._stopping = False
@@ -371,6 +391,22 @@ class LlmHandlerServer:
         }
         with self._transcript_lock:
             self._transcript.append(entry)
+
+    def _tag_metadata_block(self, request_messages: "list[dict]", message: dict) -> None:
+        """Enrich this exchange's metadata block with its own new (non-
+        cumulative) prompt token count and the skill/request it belongs to."""
+        blocks = message.get("blocks") or []
+        metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
+        if metadata_block is None:
+            return
+        usage, _stop_reason = _extract_metadata_usage(metadata_block)
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        completion_tokens = usage.get("completion_tokens", 0) or 0
+        metadata_block["new_prompt_tokens"] = self._usage_tracker.resolve_new_prompt_tokens(
+            request_messages, message, prompt_tokens, completion_tokens
+        )
+        metadata_block["request_id"] = getattr(self._invocation, "_request_id", None)
+        metadata_block["skill"] = getattr(self._invocation, "skill_name", None)
 
     def set_config(self, agconfig: "agConfig") -> None:
         self._agconfig = agconfig
@@ -500,6 +536,7 @@ class LlmHandlerServer:
                         input_tokens=(usage or {}).get("prompt_tokens", 0),
                         output_tokens=(usage or {}).get("completion_tokens", 0),
                     )
+                    self._tag_metadata_block(request["messages"], message)
                     self._record_exchange(request, message, usage, stop_reason)
                 except _RequestAborted:
                     finalize_cancelled()
@@ -510,7 +547,7 @@ class LlmHandlerServer:
                     else:
                         complete_failure(error)
                     raise
-                self._data_logger.finalize_stream(call_label, type="llm_block", payloads=blocks)
+                self._finalize_success(call_label, blocks)
                 finalized = True
                 return result
         except BaseException as error:
@@ -1154,6 +1191,13 @@ class LlmHandlerServer:
             payloads=[{"cancelled": True}],
         )
 
+    def _finalize_success(self, call_label: "str | None", payloads: "list[dict]") -> None:
+        self._data_logger.finalize_stream(
+            call_label,
+            type="llm_block",
+            payloads=payloads,
+        )
+
     def _build_kwargs(self, request: dict) -> dict:
         kwargs = self._backend.build_kwargs(request["messages"], request.get("tools"))
         if request.get("tool_choice") is not None:
@@ -1189,11 +1233,7 @@ class LlmHandlerServer:
             nonlocal finalized
             if finalized:
                 return
-            self._data_logger.finalize_stream(
-                handle.call_label,
-                type="llm_block",
-                payloads=payloads,
-            )
+            self._finalize_success(handle.call_label, payloads)
             finalized = True
 
         def publish_error(
@@ -1485,6 +1525,7 @@ class LlmHandlerServer:
                 if not enqueued:
                     finalize_cancelled()
                     return
+                self._tag_metadata_block(request["messages"], message)
                 finalize_success(message["blocks"])
         except BaseException as e:
             if not finalized:

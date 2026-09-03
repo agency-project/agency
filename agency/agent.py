@@ -30,6 +30,7 @@ from .orchestrator import get_orchestrator
 from .sandbox.agsandbox import agSandbox, agSandboxConfig
 from .sandbox import agSandboxBackendConfig
 from .llm.agllm import agllm
+from .llm.usage_tracker import LlmUsageTracker
 from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
@@ -239,6 +240,7 @@ class agent:
             self.agconfig, default_name=str(self.agname), default_object="agent"
         )
         self.data_logger.start()
+        self.llm_usage_tracker = LlmUsageTracker()
         from .observability.agdatalogger import resolve_global_db_path
 
         self._orchestrator = get_orchestrator(

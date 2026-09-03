@@ -96,6 +96,7 @@ def _serialize_sdk_object(obj):
 
 
 _ANTHROPIC_TYPE_PREFIX = "anthropic_"
+_METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real content-block index
 
 
 def _anthropic_native_block_type(native_type: str) -> str:
@@ -387,14 +388,25 @@ class _AnthropicBackend(agllm):
         usage = getattr(raw_result, "usage", None)
         input_tokens = (getattr(usage, "input_tokens", 0) or 0) if usage else 0
         output_tokens = (getattr(usage, "output_tokens", 0) or 0) if usage else 0
+        usage_dict = {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+        stop_reason = getattr(raw_result, "stop_reason", None)
+        blocks.append(
+            {
+                "type": "metadata",
+                "index": len(blocks),
+                "usage": usage_dict,
+                "stop_reason": stop_reason,
+                "data": _serialize_sdk_object(raw_result),
+            }
+        )
         return {
             "message": {"role": "assistant", "blocks": blocks},
-            "usage": {
-                "prompt_tokens": input_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            },
-            "stop_reason": getattr(raw_result, "stop_reason", None),
+            "usage": usage_dict,
+            "stop_reason": stop_reason,
         }
 
     def _call_backend_stream(self, backend_request: dict, on_client=None):
@@ -416,6 +428,7 @@ class _AnthropicBackend(agllm):
         stop_reason = None
         tool_blocks: "dict[int, dict]" = {}  # index -> {"id", "name", "json_parts"}
         unknown_blocks: "dict[int, dict]" = {}  # index -> {"native_type", "start", "deltas"}
+        metadata_events: "list[dict]" = []  # raw message_start/message_delta events, for the metadata block
 
         for event in raw_stream:
             etype = getattr(event, "type", None)
@@ -423,6 +436,9 @@ class _AnthropicBackend(agllm):
                 usage = getattr(event.message, "usage", None)
                 if usage is not None:
                     input_tokens = getattr(usage, "input_tokens", 0) or 0
+                    metadata_events.append(
+                        {"event": "message_start", "usage": _serialize_sdk_object(usage)}
+                    )
             elif etype == "content_block_start":
                 block = event.content_block
                 if block.type == "tool_use":
@@ -500,6 +516,9 @@ class _AnthropicBackend(agllm):
                 delta_stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
                 if delta_stop_reason is not None:
                     stop_reason = delta_stop_reason
+                metadata_events.append(
+                    {"event": "message_delta", "data": _serialize_sdk_object(event)}
+                )
 
         # If the stream ended (e.g. stop_reason="max_tokens") while a tool_use
         # block was still open, content_block_stop never fires for it and the
@@ -532,12 +551,28 @@ class _AnthropicBackend(agllm):
                 "data": {"start": unknown["start"], "deltas": unknown["deltas"]},
             }
 
+        usage_dict = {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+        # The metadata block is a plain block_delta -- like any other unknown
+        # native block, it flows through the host server's generic block
+        # accumulator with no dedicated handling required there. All
+        # translation of what "usage"/"stop_reason" mean stays in this
+        # backend, not the host server.
+        yield {
+            "type": "block_delta",
+            "index": _METADATA_BLOCK_INDEX,
+            "block_type": "metadata",
+            "data": {
+                "usage": usage_dict,
+                "stop_reason": stop_reason,
+                "raw_events": metadata_events,
+            },
+        }
         yield {
             "type": "usage",
-            "usage": {
-                "prompt_tokens": input_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            },
+            "usage": usage_dict,
             "stop_reason": stop_reason,
         }
