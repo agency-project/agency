@@ -705,7 +705,7 @@ def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tm
             )
             assert response.status_code == 200
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     assert records["llm:attempt[0]"][8] == records["engine-run"][7]
 
 

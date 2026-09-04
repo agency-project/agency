@@ -103,6 +103,67 @@ class agDataLogger:
         with self._lock:
             self._flush_locked()
 
+    def read_profile_records(self, profile_session_id: str) -> list[tuple]:
+        """Return agprof-compatible span records for one profiling session.
+
+        Profiler-only clock and trace fields live in each span's attributes,
+        keeping the shared span schema useful to non-profiler producers. The
+        logger is flushed under the same lock before reading, so callers see
+        every span accepted before this method acquired the lock.
+        """
+        with self._lock:
+            self._flush_locked()
+            connection = self._conn
+            owns_connection = connection is None
+            if owns_connection:
+                if self._configs.db_path == ":memory:":
+                    return []
+                connection = sqlite3.connect(self._configs.db_path, timeout=30)
+            assert connection is not None
+            try:
+                rows = connection.execute(
+                    "SELECT span_name,attributes FROM spans ORDER BY id"
+                ).fetchall()
+            finally:
+                if owns_connection:
+                    connection.close()
+
+        records = []
+        for span_name, attributes_json in rows:
+            try:
+                attributes = json.loads(attributes_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if attributes.get("agency.profile_session_id") != profile_session_id:
+                continue
+            attributes.pop("agency.profile_session_id", None)
+            profile_span_name = attributes.pop("agency.profile_span_name", span_name)
+            start_perf_ns = attributes.get("agency.perf_start_ns")
+            wall_ns = attributes.get("agency.wall_ns")
+            thread_id = attributes.get("agency.thread_id")
+            if start_perf_ns is None or wall_ns is None or thread_id is None:
+                continue
+            span_id = attributes.get("agency.span_id")
+            parent_span_id = attributes.get("agency.parent_span_id")
+            records.append(
+                (
+                    int(thread_id),
+                    profile_span_name,
+                    int(start_perf_ns),
+                    int(wall_ns),
+                    int(attributes.get("agency.cpu_ns", 0)),
+                    (
+                        None
+                        if attributes.get("agency.runq_ns") is None
+                        else int(attributes["agency.runq_ns"])
+                    ),
+                    attributes,
+                    None if span_id is None else int(span_id, 16),
+                    None if parent_span_id is None else int(parent_span_id, 16),
+                )
+            )
+        return records
+
     def record_event(
         self,
         type: str,

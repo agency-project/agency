@@ -79,9 +79,7 @@ def test_external_profiler_span_flows_to_explicit_data_logger(monkeypatch, tmp_p
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
     logger = agDataLogger(
         SimpleNamespace(
-            agDataLoggerConfigs=agDataLoggerConfigs(
-                db_path=str(tmp_path / "global_data.sqlite3")
-            )
+            agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(tmp_path / "global_data.sqlite3"))
         )
     )
     logger.start()
@@ -115,6 +113,55 @@ def test_external_profiler_span_flows_to_explicit_data_logger(monkeypatch, tmp_p
     assert row[:5] == ("sync:scheduler_queue", 2.0, 2.25, "agent_test", "agent")
     assert row[5] == 250.0
     assert json.loads(row[6])["request_id"] == "run3"
+
+
+def test_external_data_span_name_preserves_profiler_trace_name(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    logger = agDataLogger(
+        SimpleNamespace(
+            agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(tmp_path / "global.sqlite3"))
+        )
+    )
+    logger.start()
+
+    agprof.start(None, sample_hz=0, sample_gpu=False)
+    try:
+        span = agprof.start_external_span(
+            "run0:test:agent",
+            start_perf_ns=1_000_000_000,
+            start_wall_ns=2_000_000_000,
+            data_logger=logger,
+            data_span_name="request:submission_to_completion",
+        )
+        span.end(end_perf_ns=1_250_000_000, end_wall_ns=2_250_000_000)
+    finally:
+        agprof.stop()
+        logger.stop()
+
+    assert [record[1] for record in agprof.profile_records()] == ["run0:test:agent"]
+
+
+def test_profiler_uses_memory_when_its_disk_datalogger_cannot_start(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    real_start = agDataLogger.start
+
+    def start_or_fail(self):
+        if self.db_path != ":memory:":
+            raise OSError("disk unavailable")
+        real_start(self)
+
+    messages = []
+    monkeypatch.setattr(agDataLogger, "start", start_or_fail)
+    monkeypatch.setattr(agprof, "_agprof_print", messages.append)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("memory-fallback"):
+            pass
+
+    assert [record[1] for record in agprof.profile_records()] == ["memory-fallback"]
+    assert any("using memory only: disk unavailable" in message for message in messages)
 
 
 def test_complete_summary_includes_per_process_workload_and_gpu_metrics(monkeypatch):
@@ -225,8 +272,8 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_session_sample_gpu", False)
     monkeypatch.setattr(
         agprof,
-        "_records",
-        [(7, "stage:work", 0, 1_000_000, 500_000, 100_000)],
+        "_load_profile_records",
+        lambda _session_id: [(7, "stage:work", 0, 1_000_000, 500_000, 100_000)],
     )
     monkeypatch.setattr(agprof, "_samples", [])
     monkeypatch.setattr(agprof, "_leases", [])
@@ -281,7 +328,7 @@ def test_stop_reports_and_reraises_fatal_trace_failure(monkeypatch, tmp_path, fa
     monkeypatch.setattr(agprof, "_out_dir", tmp_path)
     monkeypatch.setattr(agprof, "_sampler", None)
     monkeypatch.setattr(agprof, "_session_started_ns", time.perf_counter_ns())
-    monkeypatch.setattr(agprof, "_records", [])
+    monkeypatch.setattr(agprof, "_load_profile_records", lambda _session_id: [])
     monkeypatch.setattr(agprof, "_samples", [])
     monkeypatch.setattr(agprof, "_leases", [])
     monkeypatch.setattr(agprof, "_leases_open", {})
@@ -572,7 +619,7 @@ def test_stop_snapshots_open_spans_as_interrupted(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_session_started_ns", time.perf_counter_ns() - 1_000_000)
     monkeypatch.setattr(agprof, "_session_sample_hz", 0.0)
     monkeypatch.setattr(agprof, "_session_sample_gpu", False)
-    monkeypatch.setattr(agprof, "_records", [])
+    monkeypatch.setattr(agprof, "_load_profile_records", lambda _session_id: [])
     monkeypatch.setattr(agprof, "_samples", [])
     monkeypatch.setattr(agprof, "_leases", [])
     monkeypatch.setattr(agprof, "_leases_open", {})
@@ -595,7 +642,7 @@ def test_stop_snapshots_open_spans_as_interrupted(monkeypatch, tmp_path):
     assert summary["run_metrics"]["completed"] == 0
     assert summary["run_metrics"]["interrupted"] == 1
     assert summary["incomplete_spans"][0]["label"] == "run0:test:agent"
-    assert not agprof._records
+    assert not agprof.profile_records()
     assert active._span.ended
     assert active._span.attributes["outcome"] == "interrupted"
 
@@ -609,7 +656,7 @@ def test_real_otel_session_records_nested_parent_ids(monkeypatch, tmp_path):
             with agprof.span("sandbox:exec"):
                 agprof.annotate(operation="read")
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     run = records["run0:test:agent"]
     sandbox = records["sandbox:exec"]
     assert len(run) == 9
@@ -653,7 +700,7 @@ def test_external_span_completion_can_retime_exact_interval(monkeypatch, tmp_pat
                 metadata={"outcome": "success"},
             )
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     run = records["run0:test:agent"]
     tool = records["tool:bash"]
     assert tool[2] == exact_start_perf_ns
@@ -687,7 +734,7 @@ def test_open_external_span_is_interrupted_at_profiler_stop(monkeypatch, tmp_pat
     assert external._interrupted
     assert external._span.end_time is not None
     external.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
-    assert not any(record[1] == "process:sleep" for record in agprof._records)
+    assert not any(record[1] == "process:sleep" for record in agprof.profile_records())
 
 
 def test_cancel_external_span_is_silent_and_idempotent(monkeypatch, tmp_path):
@@ -708,7 +755,7 @@ def test_cancel_external_span_is_silent_and_idempotent(monkeypatch, tmp_path):
     assert external._cancelled
     assert external._span is None
     assert id(external) not in agprof._open_spans
-    assert not any(record[1] == "tool:duplicate" for record in agprof._records)
+    assert not any(record[1] == "tool:duplicate" for record in agprof.profile_records())
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert not any(span["label"] == "tool:duplicate" for span in summary["incomplete_spans"])
 
@@ -813,7 +860,7 @@ def test_concurrent_async_spans_keep_annotations_task_local(monkeypatch, tmp_pat
     with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
         asyncio.run(overlap_spans())
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     assert records["async:first"][6]["owner"] == "first"
     assert records["async:second"][6]["owner"] == "second"
     assert records["async:first"][8] is None
@@ -1202,7 +1249,7 @@ def test_spawn_traced_preserves_parent_span_across_thread(monkeypatch, tmp_path)
             thread.join(timeout=2)
             assert not thread.is_alive()
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     assert records["child"][8] == records["parent"][7]
 
 
@@ -1235,7 +1282,7 @@ def test_agmap_tasks_are_traced_children_of_the_enclosing_span(monkeypatch, tmp_
 
     assert [task.result for task in results] == [2, 4, 6]
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     for index in range(3):
         record = records[f"agmap:_double[{index}]"]
         assert record[8] == records["parent"][7]  # parent_span_id -> the map's span
@@ -1258,7 +1305,7 @@ def test_agmap_task_error_is_annotated_as_a_failure(monkeypatch, tmp_path):
 
     assert "mapped task blew up" in result._data["error"]
 
-    record = {record[1]: record for record in agprof._records}["agmap:_boom[0]"]
+    record = {record[1]: record for record in agprof.profile_records()}["agmap:_boom[0]"]
     assert record[6]["outcome"] == "failure"
     assert record[6]["error_type"] == "agmap_task_error"
 

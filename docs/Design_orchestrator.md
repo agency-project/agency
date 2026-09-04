@@ -89,6 +89,12 @@ shared `agDataLogger`. Each execution worker binds `agprof` to that
 request's per-agent `agDataLogger`, so completed engine, sandbox, tool, and
 LLM profiler spans are persisted with the same schema as other agent data.
 The host-server thread and traced child threads inherit that binding.
+Spans outside an agent or scheduler binding use a profiler-owned datalogger
+(profile_data.sqlite3 for an on-disk profile, otherwise an in-memory
+database). Each profiling session has a correlation ID. At shutdown, agprof
+flushes the participating dataloggers and builds the Perfetto trace and
+summaries from their persisted span rows; spans are no longer appended to a
+second profiler-private list on the execution path.
 
 Profiler spans retain wall, CPU, run-queue, blocked, span-ID, parent-ID, and
 request-correlation fields. Scheduler external spans are exported directly

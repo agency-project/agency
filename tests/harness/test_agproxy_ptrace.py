@@ -519,7 +519,7 @@ def test_launch_records_process_lifecycles_under_current_span(tmp_path):
             _stdout, _stderr, rc = handle.wait(timeout=10)
             assert rc == 0
 
-    records = list(agprof._records)
+    records = agprof.profile_records()
     run_record = next(record for record in records if record[1] == "run0:ptrace:test")
     process_records = [record for record in records if record[1].startswith("process:")]
     assert {record[1] for record in process_records} >= {"process:true", "process:echo"}
@@ -549,7 +549,9 @@ def test_traced_thread_does_not_create_process_span(tmp_path):
         _stdout, _stderr, rc = handle.wait(timeout=10)
         assert rc == 0
 
-    process_records = [record for record in agprof._records if record[1].startswith("process:")]
+    process_records = [
+        record for record in agprof.profile_records() if record[1].startswith("process:")
+    ]
     assert [record[1] for record in process_records] == [f"process:{Path(sys.executable).name}"]
 
 
