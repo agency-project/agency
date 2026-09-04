@@ -53,22 +53,24 @@ later = ag.run(other_skill, other_input)
 
 When its predecessor resolves, the scheduler copies that context, appends the validated retained user message, then settles an empty result. This host-only path creates no engine, sandbox, harness, host service, model request, worker job, or capacity claim. Agent suspension is not a gate for a ready context-only message, although an unresolved predecessor can still block it.
 
-`MessageSubmission` supports pending result, waiting, awaiting, context chaining, and serialization behavior. It deliberately has no `send_message()`, `pause()`, `resume()`, or `cancel()` invocation controls.
+`MessageSubmission` supports pending result, waiting, awaiting, context chaining, and serialization behavior. It deliberately has no `redirect()`, `pause()`, `resume()`, or `cancel()` invocation controls.
 
 ## Exact-invocation messages and controls
 
-`Invocation.send_message()` targets one already-submitted invocation without creating a context-chain node or changing submission order:
+`Invocation.redirect()` targets one already-submitted invocation without creating a context-chain node or changing submission order:
 
 ```python
-inv.send_message("Do not modify database rows")
+inv.redirect("Do not modify database rows")
 inv.pause()
 inv.resume()
 inv.cancel()
 ```
 
-An invocation message can be accepted while the invocation is queued or running. Before dispatch it is delivered at the first protocol-valid safe boundary. During execution it is delivered at the next one, in FIFO order. It never interrupts a model request or tool execution, does not resume a paused invocation, and does not clear agent suspension. If it arrives during a model request that otherwise produces a final response, Agency atomically admits it for a follow-up generation before establishing the final-answer fence.
+A redirect can be accepted while the invocation is queued or running. It atomically joins the pending FIFO under the invocation's shared control lock. Before every new action, admission checks that queue under the same lock. Pending redirects prevent the action from starting and force a return to the model. A tool already admitted may finish; the remaining actions from a stale model result are skipped.
 
-Boundary assignments are retry-stable and sequence-deduplicated. Internal compaction/model-management calls do not consume ordinary invocation messages. A message is rejected after the final-answer, cancellation, destruction, or completion fence.
+Redirects remain pending until a successful model turn incorporates them. Failed requests, disconnects, and retries do not consume them. Internal compaction calls do not acknowledge redirects. Redirecting does not resume a paused invocation or clear agent suspension.
+
+The final-answer checkpoint atomically chooses between processing pending redirects and entering `closing`. Redirects are rejected after that fence, cancellation, destruction, or completion. Stdin and harness-specific live-message transport are separate concerns.
 
 Pause and cancellation are also cooperative safe-boundary controls. Cancellation is idempotent in blocked, queued, running, paused, and terminal states; work that has not dispatched settles without creating an engine.
 
@@ -77,7 +79,7 @@ Public invocation states are `QUEUED`, `RUNNING`, `PAUSED`, `SUCCEEDED`, `FAILED
 The concise distinction is:
 
 - `Agent.queue_message()` advances the agent's serialized context chain for later submissions.
-- `Invocation.send_message()` delivers an additional instruction to one exact already-submitted invocation.
+- `Invocation.redirect()` delivers an additional instruction to one exact already-submitted invocation.
 
 ## Agent-wide lifecycle
 

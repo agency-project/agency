@@ -20,8 +20,10 @@ a profiler span when the call will be allowed.  For ``PostToolUse``
 bridge, which forwards them to agProfilerIngest's separate host UDS; the
 bearer token is header-only and is never included in the semantic payload.
 
-Both integrations fail open. A transient policy/profiler failure must not
-block a harness tool call; failures remain visible on stderr for debugging.
+Tool admission fails closed: only an explicit allow from Agency may start a
+new tool. This preserves redirect, pause, and cancellation fences when the
+policy gateway is unavailable. Profiler delivery remains best-effort;
+telemetry failures do not revoke an admitted tool.
 """
 
 import json
@@ -49,19 +51,25 @@ def main() -> int:
         # DATACOLLECTOR: append -- this subprocess has zero agency imports and no transport
         # to agDataCollector today; folding needs a new HTTP call here, not just a type name.
         print(f"[agpolicy hook] could not parse hook input: {exc}", file=sys.stderr)
-        _emit("allow", "hook input was not valid JSON, failing open")
+        _emit("deny", "Cannot check invocation admission: hook input was not valid JSON")
+        return 0
+
+    if not isinstance(payload, dict):
+        _emit("deny", "Cannot check invocation admission: hook input must be an object")
         return 0
 
     hook_event_name = payload.get("hook_event_name") or "PreToolUse"
     if hook_event_name != "PreToolUse":
         if hook_event_name in ("PostToolUse", "PostToolUseFailure"):
             _post_profiler_event(payload, hook_event_name)
+        else:
+            _emit("deny", "Cannot check invocation admission: unknown hook event")
         return 0
 
     kind, reason = _check_tool_policy(payload)
     if kind == "allow":
         # A denied PreToolUse does not receive a matching PostToolUse. Open
-        # only after policy has allowed/fails-open so no denied call leaves
+        # only after policy explicitly allows so no denied call leaves
         # an unmatched profiler span behind.
         _post_profiler_event(payload, hook_event_name)
         _emit("allow", reason)
@@ -76,37 +84,43 @@ def main() -> int:
 
 
 def _check_tool_policy(payload: dict) -> "tuple[str, str | None]":
-    tool_name = payload.get("tool_name", "")
-    tool_input = payload.get("tool_input") or {}
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_name, str) or not tool_name.strip() or not isinstance(tool_input, dict):
+        return "deny", "Cannot check invocation admission: invalid tool name or input"
 
     base_url = os.environ.get("AGPOLICY_BASE_URL")
     token = os.environ.get("AGPOLICY_TOKEN")
     if not base_url or not token:
-        # DATACOLLECTOR: append -- security-relevant (policy fails open silently); same
-        # no-transport gap as above.
         print(
-            "[agpolicy hook] AGPOLICY_BASE_URL/AGPOLICY_TOKEN not set, failing open",
+            "[agpolicy hook] AGPOLICY_BASE_URL/AGPOLICY_TOKEN not set, denying tool",
             file=sys.stderr,
         )
-        return "allow", "agpolicy gateway not configured, failing open"
+        return "deny", "Cannot check invocation admission: agpolicy gateway not configured"
 
-    body = json.dumps({"tool_name": tool_name, "tool_input": tool_input}).encode()
-    req = urllib.request.Request(
-        base_url.rstrip("/") + "/agpolicy/check_tool",
-        data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-        method="POST",
-    )
     try:
+        body = json.dumps({"tool_name": tool_name, "tool_input": tool_input}).encode()
+        req = urllib.request.Request(
+            base_url.rstrip("/") + "/agpolicy/check_tool",
+            data=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=_POLICY_TIMEOUT_S) as resp:
             result = json.loads(resp.read())
+        if not isinstance(result, dict) or result.get("decision") not in ("allow", "deny"):
+            return "deny", "Cannot check invocation admission: invalid agpolicy decision"
+        reason = result.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            return "deny", "Cannot check invocation admission: invalid agpolicy reason"
     except Exception as exc:
-        # DATACOLLECTOR: append -- security-relevant (policy fails open silently); same
-        # no-transport gap as above.
-        print(f"[agpolicy hook] check_tool request failed: {exc!r}, failing open", file=sys.stderr)
-        return "allow", f"agpolicy gateway unreachable ({exc}), failing open"
+        print(f"[agpolicy hook] check_tool request failed: {exc!r}, denying tool", file=sys.stderr)
+        return (
+            "deny",
+            "Cannot check invocation admission: agpolicy request failed; return to the model",
+        )
 
-    return result.get("decision", "allow"), result.get("reason")
+    return result["decision"], reason
 
 
 def _post_profiler_event(payload: dict, hook_event_name: str) -> None:

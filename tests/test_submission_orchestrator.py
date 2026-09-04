@@ -123,7 +123,7 @@ def test_message_sent_before_dispatch_targets_exact_invocation_at_first_boundary
     )
     context_head = ag.context
 
-    invocation.send_message("deliver after dispatch")
+    invocation.redirect("deliver after dispatch")
 
     assert ag.context is context_head
     assert ag.engine is None

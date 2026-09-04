@@ -351,6 +351,8 @@ class LlmHandlerServer:
         self._control_lock = threading.RLock()
         self._message_overlays: "list[_MessageOverlay]" = []
         self._message_sequences: "set[int]" = set()
+        self._model_redirects: dict[str, tuple] = {}
+        self._model_protocol_valid: dict[str, bool] = {}
         self.set_config(agconfig)
 
     def get_all_transcripts(self) -> "list[dict]":
@@ -911,6 +913,10 @@ class LlmHandlerServer:
                     anchor=anchor,
                 )
                 prepared["messages"] = self._inject_message_overlays(messages)
+            self._model_protocol_valid[boundary_id] = protocol_valid
+            self._model_redirects[boundary_id] = tuple(
+                self._decision_value(decision, "invocation_messages", ()) or ()
+            )
 
         return prepared, boundary_id, True
 
@@ -1002,7 +1008,12 @@ class LlmHandlerServer:
         if decision is None:
             raise _RequestAborted
         self._raise_if_stopped(decision)
-        additional = tuple(self._decision_value(decision, "invocation_messages", ()) or ())
+        included = {self._decision_value(entry, "sequence", 0) for entry in pending}
+        additional = tuple(
+            entry
+            for entry in (self._decision_value(decision, "invocation_messages", ()) or ())
+            if self._decision_value(entry, "sequence", 0) not in included
+        )
         if additional:
             self._remember_message_overlays(additional, anchor=anchor)
             prepared["messages"].extend(
@@ -1016,6 +1027,8 @@ class LlmHandlerServer:
                 for entry in additional
             )
             boundary_id = f"llm:{_request_fingerprint(prepared)}:follow-up"
+        self._model_protocol_valid[boundary_id] = True
+        self._model_redirects[boundary_id] = pending + additional
         return prepared, boundary_id
 
     def _complete_model_request(
@@ -1026,15 +1039,30 @@ class LlmHandlerServer:
         controlled: bool,
         abort_event: "threading.Event | None" = None,
     ) -> _ModelCompletion:
-        if not controlled or self._invocation is None or boundary_id is None:
+        # The native loop owns acknowledgement and its final fence because it
+        # renders redirects itself. External adapters use the host overlay.
+        if (
+            not controlled
+            or self._invocation is None
+            or boundary_id is None
+            or not self._enable_message_overlay
+        ):
             return _ModelCompletion(not (abort_event is not None and abort_event.is_set()))
         has_tool_calls = any(block.get("type") == "tool_use" for block in message.get("blocks", []))
         with self._control_lock:
+            if abort_event is not None and abort_event.is_set():
+                return _ModelCompletion(False)
+            acknowledge = getattr(self._invocation, "_acknowledge_redirects", None)
+            if callable(acknowledge):
+                acknowledge(self._model_redirects.get(boundary_id, ()))
+            # Result checkpoints must be fresh even for an identical retry:
+            # a redirect can arrive after an earlier result was returned.
+            result_boundary = f"{boundary_id}:{uuid.uuid4().hex}"
             if has_tool_calls:
                 self._invocation._note_model_result(has_tool_calls=True)
                 decision = self._checkpoint_invocation(
-                    f"{boundary_id}:post",
-                    allow_messages=False,
+                    f"{result_boundary}:post",
+                    allow_messages=self._model_protocol_valid.get(boundary_id, True),
                     phase=_CONTROL_PHASE_POST_GENERATION,
                     abort_event=abort_event,
                 )
@@ -1042,7 +1070,7 @@ class LlmHandlerServer:
                 final_checkpoint = getattr(self._invocation, "_checkpoint_final_answer", None)
                 if callable(final_checkpoint):
                     decision = final_checkpoint(
-                        f"{boundary_id}:post-final",
+                        f"{result_boundary}:post-final",
                         abort_event=abort_event,
                     )
                 else:

@@ -28,6 +28,7 @@ class InvocationDecision:
     cancelled: bool
     destroyed: bool
     invocation_messages: tuple[InvocationMessage, ...] = ()
+    action_admitted: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,17 @@ class InvocationHandle:
     """
 
     _VALID_PHASES = frozenset(
-        {"starting", "boundary", "infrastructure", "model", "tool", "paused", "closing"}
+        {
+            "starting",
+            "boundary",
+            "infrastructure",
+            "model",
+            "tool",
+            "action",
+            "model-result",
+            "paused",
+            "closing",
+        }
     )
 
     def __init__(self, control: "AgentControl", invocation_id: int, skill_name: str) -> None:
@@ -77,9 +88,9 @@ class InvocationHandle:
     ) -> InvocationDecision:
         """Observe pause/suspension gates and deliver invocation messages at a boundary.
 
-        Messages assigned to a ``boundary_id`` are cached.  A retried request
-        using the same boundary therefore sees the same overlay without
-        consuming the queue a second time.
+        Model snapshots assigned to a ``boundary_id`` are retry-stable. They
+        remain pending until acknowledged by a successful model turn. Action
+        admission and the final fence always examine live state under the lock.
         """
         decision = self._checkpoint_wait(
             boundary_id,
@@ -127,6 +138,11 @@ class InvocationHandle:
         with self._control._condition:
             if abort_event is not None and abort_event.is_set():
                 return None
+            if requested_phase == "closing":
+                return self._checkpoint_final_answer(boundary_id, abort_event=abort_event)
+            if requested_phase == "model-result":
+                self._acknowledge_redirects(self._boundary_messages.get(boundary_id, ()))
+                requested_phase = "boundary"
             if not self._closed and self._phase != "closing":
                 self._phase = requested_phase
             while (
@@ -153,6 +169,22 @@ class InvocationHandle:
             if abort_event is not None and abort_event.is_set():
                 return None
 
+            if requested_phase == "action":
+                # This is the admission linearization point. A later redirect
+                # may not revoke this action, but fences every subsequent one.
+                admitted = not (
+                    self._pending_messages
+                    or self._closed
+                    or self._phase == "closing"
+                    or self._cancelled
+                    or self._destroyed
+                )
+                if self._phase != "closing":
+                    self._phase = "tool" if admitted else "boundary"
+                return InvocationDecision(
+                    self._cancelled, self._destroyed, action_admitted=admitted
+                )
+
             effective_phase = self._phase
             assigned = self._boundary_messages.get(boundary_id)
             if assigned is None:
@@ -163,8 +195,6 @@ class InvocationHandle:
                     and not self._destroyed
                 )
                 assigned = tuple(self._pending_messages) if can_assign else ()
-                if can_assign:
-                    self._pending_messages.clear()
                 self._boundary_messages[boundary_id] = assigned
 
             return InvocationDecision(
@@ -179,13 +209,19 @@ class InvocationHandle:
         with self._control._condition:
             self._control._condition.notify_all()
 
+    def _acknowledge_redirects(self, entries) -> None:
+        """Retire only redirects incorporated by a successful model turn."""
+        with self._control._condition:
+            sequences = {entry.sequence for entry in entries}
+            self._pending_messages = deque(
+                entry for entry in self._pending_messages if entry.sequence not in sequences
+            )
+
     def _note_model_result(self, has_tool_calls: bool) -> None:
-        """Advance the model/tool phase and establish the final-answer fence."""
+        """Record progress; only the final checkpoint may close redirect admission."""
         with self._control._condition:
             if not self._closed and self._phase != "closing":
-                self._phase = "tool" if has_tool_calls else "closing"
-                if not has_tool_calls:
-                    self._pause_requested = False
+                self._phase = "tool" if has_tool_calls else "boundary"
             self._control._condition.notify_all()
 
     def _checkpoint_final_answer(
@@ -208,50 +244,47 @@ class InvocationHandle:
             if abort_event is not None and abort_event.is_set():
                 return None
 
-            assigned = self._boundary_messages.get(boundary_id)
-            if assigned is None:
+            can_deliver = not (
+                self._closed
+                or self._phase == "closing"
+                or self._cancelled
+                or self._destroyed
+                or self._control._is_closing_unlocked()
+            )
+            if can_deliver and self._pending_messages:
+                self._phase = "boundary"
+                while (self._pause_requested or self._control._suspend_requested) and not (
+                    self._cancelled or self._destroyed
+                ):
+                    self._phase_before_pause = "boundary"
+                    self._phase = "paused"
+                    if (
+                        self._control._suspend_requested
+                        and not self._control._is_closing_unlocked()
+                    ):
+                        self._control._lifecycle = "suspended"
+                    self._control._condition.notify_all()
+                    self._control._condition.wait()
+                    if self._phase == "paused" and not self._closed:
+                        self._phase = "boundary"
+                    if abort_event is not None and abort_event.is_set():
+                        self._control._condition.notify_all()
+                        return None
+
                 can_deliver = not (
                     self._closed
                     or self._cancelled
                     or self._destroyed
                     or self._control._is_closing_unlocked()
                 )
-                if can_deliver and self._pending_messages:
-                    self._phase = "boundary"
-                    while (self._pause_requested or self._control._suspend_requested) and not (
-                        self._cancelled or self._destroyed
-                    ):
-                        self._phase_before_pause = "boundary"
-                        self._phase = "paused"
-                        if (
-                            self._control._suspend_requested
-                            and not self._control._is_closing_unlocked()
-                        ):
-                            self._control._lifecycle = "suspended"
-                        self._control._condition.notify_all()
-                        self._control._condition.wait()
-                        if self._phase == "paused" and not self._closed:
-                            self._phase = "boundary"
-                        if abort_event is not None and abort_event.is_set():
-                            self._control._condition.notify_all()
-                            return None
+                assigned = tuple(self._pending_messages) if can_deliver else ()
+            else:
+                assigned = ()
 
-                    can_deliver = not (
-                        self._closed
-                        or self._cancelled
-                        or self._destroyed
-                        or self._control._is_closing_unlocked()
-                    )
-                    assigned = tuple(self._pending_messages) if can_deliver else ()
-                    if can_deliver:
-                        self._pending_messages.clear()
-                else:
-                    assigned = ()
-
-                if not assigned:
-                    self._phase = "closing"
-                    self._pause_requested = False
-                self._boundary_messages[boundary_id] = assigned
+            if not assigned:
+                self._phase = "closing"
+                self._pause_requested = False
+            self._control._condition.notify_all()
 
             return InvocationDecision(
                 cancelled=self._cancelled,
@@ -275,8 +308,13 @@ class InvocationHandle:
             self._control._condition.notify_all()
             return True
 
-    def send_message(self, message: str) -> None:
-        self._control._send_message(self, message)
+    def redirect(self, message: str) -> None:
+        """Urgently redirect this invocation before its next action or final answer.
+
+        An action already admitted may finish. Redirects remain pending in FIFO
+        order until a successful model turn incorporates them.
+        """
+        self._control._redirect(self, message)
 
     def pause(self) -> None:
         self._control._pause(self)
@@ -402,9 +440,9 @@ class AgentControl:
         with self._condition:
             return self._active
 
-    def _send_message(self, handle: InvocationHandle, message: str) -> InvocationMessage:
+    def _redirect(self, handle: InvocationHandle, message: str) -> InvocationMessage:
         with self._condition:
-            self.assert_alive("send a message")
+            self.assert_alive("redirect an invocation")
             if not isinstance(message, str):
                 raise TypeError("message must be a string")
             if not message.strip():
@@ -412,9 +450,9 @@ class AgentControl:
             if handle._control is not self:
                 raise RuntimeError("invocation handle belongs to another agent control")
             if handle._cancelled or handle._destroyed or handle._closed:
-                raise RuntimeError("cannot send message: skill invocation is ending")
+                raise RuntimeError("cannot redirect: skill invocation is ending")
             if handle._phase == "closing":
-                raise RuntimeError(f"cannot send message while invocation phase is {handle._phase}")
+                raise RuntimeError(f"cannot redirect while invocation phase is {handle._phase}")
             self._sequence += 1
             entry = InvocationMessage(self._sequence, message)
             handle._pending_messages.append(entry)

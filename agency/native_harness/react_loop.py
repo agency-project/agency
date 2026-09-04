@@ -79,16 +79,17 @@ def run_react_loop(
         dispatch_table[name] = lambda args_json, _name=name: mcp.call(_name, args_json)
 
     for step in range(max_steps):
+        invocation_messages = []
+        generation_boundary = _native_boundary_id("generation", step, messages)
         if bridge is not None:
             decision = bridge.checkpoint(
-                _native_boundary_id("generation", step, messages),
+                generation_boundary,
                 allow_messages=True,
                 phase=CONTROL_PHASE_MODEL,
             )
             stopped = _stopped_message(decision)
             if stopped is not None:
                 return ReactLoopResult(status="error", message=stopped, turn_count=step)
-            invocation_messages = []
             for entry in decision.get("invocation_messages") or []:
                 try:
                     sequence = int(entry["sequence"])
@@ -98,14 +99,6 @@ def run_react_loop(
                     continue
                 rendered_message_sequences.add(sequence)
                 invocation_messages.append(str(entry.get("content", "")))
-            if invocation_messages:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "[AGENCY INVOCATION MESSAGE]\n"
-                        + "\n\n".join(invocation_messages),
-                    }
-                )
 
         messages, previous_summary = maybe_compact(
             messages, context_limit, llm, model, previous_summary
@@ -123,16 +116,25 @@ def run_react_loop(
             if stopped is not None:
                 return ReactLoopResult(status="error", message=stopped, turn_count=step)
 
+        # Preserve the exact redirect text across compaction. Only the task
+        # generation below may acknowledge this snapshot.
+        if invocation_messages:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "[AGENCY INVOCATION MESSAGE]\n" + "\n\n".join(invocation_messages),
+                }
+            )
+
         resp = llm.dispatch(model, messages, tool_schemas or None)
         if "error" in resp:
             return ReactLoopResult(status="error", message=str(resp["error"]), turn_count=step + 1)
 
         if bridge is not None:
-            response_has_tools = bool((resp.get("message") or {}).get("tool_calls"))
             decision = bridge.checkpoint(
-                _native_boundary_id("model", step, messages),
+                generation_boundary,
                 allow_messages=False,
-                phase=(CONTROL_PHASE_BOUNDARY if response_has_tools else CONTROL_PHASE_CLOSING),
+                phase="model-result",
             )
             stopped = _stopped_message(decision)
             if stopped is not None:
@@ -143,8 +145,19 @@ def run_react_loop(
         total_output_tokens += usage.get("completion_tokens", 0) or 0
 
         message = resp["message"]
-        messages.append(message)
         tool_calls = message.get("tool_calls") or []
+        if not tool_calls and bridge is not None:
+            decision = bridge.checkpoint(
+                _native_boundary_id("final", step, messages),
+                allow_messages=True,
+                phase=CONTROL_PHASE_CLOSING,
+            )
+            stopped = _stopped_message(decision)
+            if stopped is not None:
+                return ReactLoopResult(status="error", message=stopped, turn_count=step + 1)
+            if decision.get("invocation_messages"):
+                continue
+        messages.append(message)
         if not tool_calls:
             return ReactLoopResult(
                 status="done",
@@ -156,6 +169,27 @@ def run_react_loop(
             )
 
         for tool_index, tc in enumerate(tool_calls):
+            if bridge is not None:
+                decision = bridge.checkpoint(
+                    f"native:action:{step}:{tool_index}:{tc['id']}",
+                    allow_messages=False,
+                    phase="action",
+                )
+                stopped = _stopped_message(decision)
+                if stopped is not None:
+                    return ReactLoopResult(status="error", message=stopped, turn_count=step + 1)
+                if not decision.get("action_admitted"):
+                    # Complete the protocol without executing any remaining
+                    # action authorized by the stale model result.
+                    messages.extend(
+                        {
+                            "role": "tool",
+                            "tool_call_id": skipped["id"],
+                            "content": "Not executed: invocation redirected. Reconsider this action.",
+                        }
+                        for skipped in tool_calls[tool_index:]
+                    )
+                    break
             fn_name = tc["function"]["name"]
             fn_args = tc["function"]["arguments"]
             handler = dispatch_table.get(fn_name)

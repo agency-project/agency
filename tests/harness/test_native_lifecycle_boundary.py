@@ -54,6 +54,7 @@ class _ControlBridge:
             phase=phase,
         )
         return {
+            "action_admitted": decision.action_admitted,
             "cancelled": decision.cancelled,
             "destroyed": decision.destroyed,
             "invocation_messages": [
@@ -204,8 +205,8 @@ def test_native_pause_and_message_after_each_tool_preserve_multi_tool_protocol(
     worker.start()
     try:
         assert first_tool_entered.wait(timeout=2.0)
-        handle.send_message("first instruction")
-        handle.send_message("second instruction")
+        handle.redirect("first instruction")
+        handle.redirect("second instruction")
         handle.pause()
         release_first_tool.set()
 
@@ -226,7 +227,7 @@ def test_native_pause_and_message_after_each_tool_preserve_multi_tool_protocol(
 
     result = result_holder["result"]
     assert result.status == "done"
-    assert tool_events == ["one", "two"]
+    assert tool_events == ["one"]
 
     second_generation = llm.requests[1][1]
     roles = [message["role"] for message in second_generation]
@@ -289,3 +290,91 @@ def test_native_cancel_during_tool_waits_for_result_then_skips_remaining_batch(
     assert result_holder["result"].message == "agent invocation cancelled"
     assert tool_events == ["one"]
     assert len(llm.requests) == 1
+
+
+@pytest.mark.parametrize("arrival", ["during-model", "before-action", "before-final"])
+def test_native_redirect_discards_stale_action_or_final(monkeypatch, tmp_path, arrival):
+    handle = AgentControl().begin_invocation("redirect")
+    tool_events = []
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: tool_events.append(args))
+
+    class Bridge(_ControlBridge):
+        def checkpoint(self, boundary_id, *, allow_messages, phase):
+            if (
+                (arrival == "before-action" and phase == "action")
+                or (arrival == "before-final" and phase == "closing")
+            ) and not self.injected:
+                self.injected = True
+                handle.redirect("new instruction")
+            return super().checkpoint(boundary_id, allow_messages=allow_messages, phase=phase)
+
+        injected = False
+
+    class Llm(_Llm):
+        def dispatch(self, *args, **kwargs):
+            result = super().dispatch(*args, **kwargs)
+            if arrival == "during-model" and len(self.requests) == 1:
+                handle.redirect("new instruction")
+            return result
+
+    first = _final_response("stale") if arrival == "before-final" else _tool_response("stale")
+    llm = Llm([first, _final_response("revised")])
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        bridge=Bridge(handle),
+        max_steps=3,
+        offload_dir=str(tmp_path),
+    )
+    assert result.final_text == "revised"
+    assert tool_events == []
+    assert "new instruction" in str(llm.requests[1][1])
+    assert not handle._pending_messages
+    assert handle.phase == "closing"
+
+
+def test_native_failed_model_leaves_redirect_pending_for_new_attempt(tmp_path):
+    handle = AgentControl().begin_invocation("retry")
+    handle.redirect("retain me")
+    failed = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        _Llm([{"error": "failed"}]),
+        bridge=_ControlBridge(handle),
+        offload_dir=str(tmp_path),
+    )
+    assert failed.status == "error"
+    assert [entry.content for entry in handle._pending_messages] == ["retain me"]
+    llm = _Llm([_final_response()])
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        bridge=_ControlBridge(handle),
+        offload_dir=str(tmp_path),
+    )
+    assert result.status == "done"
+    assert "retain me" in str(llm.requests[0][1])
+    assert not handle._pending_messages
+
+
+def test_redirect_text_is_rendered_after_compaction(monkeypatch, tmp_path):
+    handle = AgentControl().begin_invocation("compaction")
+    handle.redirect("exact redirect text")
+    compacted = [{"role": "user", "content": "summary"}]
+    monkeypatch.setattr(
+        "agency.native_harness.react_loop.maybe_compact",
+        lambda *args: (copy.deepcopy(compacted), "summary"),
+    )
+    llm = _Llm([_final_response()])
+    result = run_react_loop(
+        [{"role": "user", "content": "old"}],
+        "model",
+        llm,
+        bridge=_ControlBridge(handle),
+        offload_dir=str(tmp_path),
+    )
+    assert result.status == "done"
+    assert "exact redirect text" in llm.requests[0][1][-1]["content"]
+    assert not handle._pending_messages

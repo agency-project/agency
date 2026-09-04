@@ -76,11 +76,14 @@ class HostMcpServer:
         skill: "agskill",
         resource_pool: "agResourcePool",
         data_logger: "agDataLogger",
+        *,
+        invocation=None,
     ) -> None:
         self._sandbox = sandbox
         self._skill = skill
         self._resource_pool = resource_pool
         self._data_logger = data_logger
+        self._invocation = invocation
         self._persistent_vars: "dict[str, object]" = {}
         self._mcp_server: "MCPServer | None" = None
 
@@ -89,6 +92,16 @@ class HostMcpServer:
         required = set((tool.params or {}).get("required", list(properties.keys())))
 
         def call_tool(**kwargs: "object") -> dict:
+            if self._invocation is not None:
+                decision = self._invocation._checkpoint(
+                    "host-mcp:action", allow_messages=False, phase="action"
+                )
+                if decision.cancelled or decision.destroyed:
+                    return {"error": "agent invocation stopped"}
+                if not decision.action_admitted:
+                    return {
+                        "error": "Invocation redirected. Return to the model before taking another action."
+                    }
             self._data_logger.record_event(
                 type="agent_state",
                 payload={"state": "running_tools", "tool": tool.name},

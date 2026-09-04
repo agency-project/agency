@@ -35,7 +35,8 @@ def test_public_submission_exports_and_agent_alias():
     assert Agent is agent
     assert issubclass(Invocation, Submission)
     assert issubclass(MessageSubmission, Submission)
-    assert hasattr(Invocation, "send_message")
+    assert hasattr(Invocation, "redirect")
+    assert not hasattr(Invocation, "send_message")
     assert not hasattr(Invocation, "steer")
     assert hasattr(agent, "queue_message")
     assert not hasattr(agent, "send")
@@ -101,17 +102,18 @@ def test_invocation_is_queued_immediately_and_control_state_is_idempotent():
 def test_invocation_messages_are_fifo_replayed_and_rejected_after_final_answer():
     owner = _FakeAgent()
     invocation = Invocation(owner, 1, "message")
-    invocation.send_message("first")
-    invocation.send_message("second")
+    invocation.redirect("first")
+    invocation.redirect("second")
 
     first = invocation._checkpoint("tool-1", allow_messages=True, phase="tool")
     retry = invocation._checkpoint("tool-1", allow_messages=True, phase="tool")
     assert [entry.content for entry in first.invocation_messages] == ["first", "second"]
     assert retry.invocation_messages == first.invocation_messages
 
-    invocation._note_model_result(has_tool_calls=False)
+    invocation._acknowledge_redirects(first.invocation_messages)
+    invocation._checkpoint_final_answer("final")
     with pytest.raises(RuntimeError, match="phase is closing"):
-        invocation.send_message("too late")
+        invocation.redirect("too late")
 
 
 def test_message_during_model_is_atomically_admitted_before_final_fence():
@@ -119,12 +121,13 @@ def test_message_during_model_is_atomically_admitted_before_final_fence():
     invocation = Invocation(owner, 1, "late-message")
     invocation._checkpoint("model-1", allow_messages=False, phase="model")
 
-    invocation.send_message("revise the final answer")
+    invocation.redirect("revise the final answer")
     decision = invocation._checkpoint_final_answer("model-1-final")
 
     assert [entry.content for entry in decision.invocation_messages] == ["revise the final answer"]
     assert invocation.phase == "boundary"
 
+    invocation._acknowledge_redirects(decision.invocation_messages)
     closing = invocation._checkpoint_final_answer("model-2-final")
     assert closing.invocation_messages == ()
     assert invocation.phase == "closing"
@@ -135,7 +138,7 @@ def test_sending_a_message_does_not_resume_a_paused_invocation():
     invocation = Invocation(owner, 1, "paused-message")
 
     invocation.pause()
-    invocation.send_message("wait until explicitly resumed")
+    invocation.redirect("wait until explicitly resumed")
 
     assert invocation.is_pause_requested() is True
 
@@ -145,7 +148,7 @@ def test_interruptible_checkpoint_abort_wakes_pause_without_consuming_messages()
     invocation = control.begin_invocation("interruptible")
     abort_event = threading.Event()
     outcome = {}
-    invocation.send_message("deliver after reconnect")
+    invocation.redirect("deliver after reconnect")
     invocation.pause()
 
     worker = threading.Thread(
@@ -216,7 +219,7 @@ def test_message_submission_is_pending_data_without_skill_controls():
     receipt._result_future.set_result(agdata(accepted=True))
 
     assert receipt.wait().accepted is True
-    for control in ("start", "send_message", "pause", "resume", "cancel"):
+    for control in ("start", "redirect", "pause", "resume", "cancel"):
         assert not hasattr(receipt, control)
 
 
@@ -227,3 +230,106 @@ def test_close_handle_is_reusable_waitable_and_awaitable():
     close._settle()
     assert close.wait() is close
     assert asyncio.run(_await(close)) is close
+
+
+@pytest.mark.parametrize(
+    "invalid, error", [(None, TypeError), (42, TypeError), ("", ValueError), ("  ", ValueError)]
+)
+def test_redirect_validates_message(invalid, error):
+    invocation = AgentControl().begin_invocation("redirect")
+    with pytest.raises(error):
+        invocation.redirect(invalid)
+    assert not invocation._pending_messages
+
+
+@pytest.mark.parametrize("ending", ["cancel", "destroy", "finish", "final"])
+def test_redirect_rejected_after_lifecycle_fences(ending):
+    control = AgentControl()
+    invocation = control.begin_invocation("redirect")
+    if ending == "cancel":
+        invocation.cancel()
+    elif ending == "destroy":
+        control.destroy()
+    elif ending == "finish":
+        control.finish_invocation(invocation)
+    else:
+        invocation._checkpoint_final_answer("final")
+    with pytest.raises(RuntimeError):
+        invocation.redirect("too late")
+    assert not invocation._checkpoint(
+        "action", allow_messages=False, phase="action"
+    ).action_admitted
+    if ending in {"finish", "final"}:
+        assert invocation.phase == "closing"
+
+
+def test_redirect_snapshot_does_not_consume_pending_or_acknowledge_later_redirects():
+    invocation = AgentControl().begin_invocation("redirect")
+    invocation.redirect("first")
+    first = invocation._checkpoint("attempt", allow_messages=True, phase="model")
+    invocation.redirect("second")
+    retry = invocation._checkpoint("attempt", allow_messages=True, phase="model")
+    assert retry == first
+    assert [entry.content for entry in invocation._pending_messages] == ["first", "second"]
+    assert not invocation._checkpoint(
+        "action", allow_messages=False, phase="action"
+    ).action_admitted
+    invocation._acknowledge_redirects(first.invocation_messages)
+    assert [entry.content for entry in invocation._pending_messages] == ["second"]
+    next_turn = invocation._checkpoint("next", allow_messages=True, phase="model")
+    invocation._acknowledge_redirects(next_turn.invocation_messages)
+    assert invocation._checkpoint("action", allow_messages=False, phase="action").action_admitted
+    invocation.redirect("third")
+    # Admission decisions are never cached, even for a repeated action ID.
+    assert not invocation._checkpoint(
+        "action", allow_messages=False, phase="action"
+    ).action_admitted
+
+
+@pytest.mark.parametrize("boundary", ["action", "final"])
+def test_redirect_races_with_atomic_fence(boundary):
+    for _ in range(25):
+        control = AgentControl()
+        invocation = control.begin_invocation("race")
+        barrier = threading.Barrier(2)
+        outcome = {}
+
+        def redirect():
+            barrier.wait(timeout=2)
+            try:
+                invocation.redirect("race")
+                outcome["accepted"] = True
+            except RuntimeError:
+                outcome["accepted"] = False
+
+        worker = threading.Thread(target=redirect)
+        worker.start()
+        barrier.wait(timeout=2)
+        if boundary == "final":
+            decision = invocation._checkpoint_final_answer("fence")
+        else:
+            decision = invocation._checkpoint("fence", allow_messages=False, phase="action")
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        if boundary == "final":
+            assert bool(decision.invocation_messages) == outcome["accepted"]
+            assert (invocation.phase == "closing") != outcome["accepted"]
+        else:
+            assert outcome["accepted"]
+            assert invocation._pending_messages
+            assert not invocation._checkpoint(
+                "next", allow_messages=False, phase="action"
+            ).action_admitted
+
+
+def test_final_checkpoint_rechecks_pending_after_acknowledgement():
+    invocation = AgentControl().begin_invocation("final")
+    invocation.redirect("first")
+    first = invocation._checkpoint_final_answer("same")
+    invocation._acknowledge_redirects(first.invocation_messages)
+    invocation.redirect("second")
+    second = invocation._checkpoint_final_answer("same")
+    assert [entry.content for entry in second.invocation_messages] == ["second"]
+    invocation._acknowledge_redirects(second.invocation_messages)
+    assert not invocation._checkpoint_final_answer("same").invocation_messages
+    assert invocation.phase == "closing"

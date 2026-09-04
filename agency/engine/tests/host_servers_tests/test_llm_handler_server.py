@@ -859,8 +859,8 @@ def test_invocation_messages_are_fifo_protocol_valid_and_stable_across_stream_re
     server = _controlled_server(backend, invocation)
     history = _completed_tool_history()
 
-    invocation.send_message("first")
-    invocation.send_message("second")
+    invocation.redirect("first")
+    invocation.redirect("second")
     server.dispatch({"messages": history})
 
     first_request = backend.requests[-1][1]
@@ -876,9 +876,9 @@ def test_invocation_messages_are_fifo_protocol_valid_and_stable_across_stream_re
         "user",
     ]
 
-    # Streaming is transport-only and therefore reuses the same semantic
-    # boundary assignment rather than consuming newly queued invocation messages.
-    invocation.send_message("third")
+    # Even an identical request must incorporate new redirects before its
+    # result can authorize another action.
+    invocation.redirect("third")
     stream = server.start_stream({"messages": history, "stream": True})
     assert _drain(stream)[-1]["type"] == "done"
     stream._thread.join(timeout=2.0)
@@ -886,6 +886,7 @@ def test_invocation_messages_are_fifo_protocol_valid_and_stable_across_stream_re
     assert _invocation_message_texts(replay_request["messages"]) == [
         "[AGENCY INVOCATION MESSAGE]\nfirst",
         "[AGENCY INVOCATION MESSAGE]\nsecond",
+        "[AGENCY INVOCATION MESSAGE]\nthird",
     ]
 
     expanded = history + [
@@ -917,7 +918,7 @@ def test_final_response_establishes_closing_fence(streaming: bool):
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend(final=True)
     server = _controlled_server(backend, invocation)
-    invocation.send_message("before final")
+    invocation.redirect("before final")
     request = {"messages": _completed_tool_history(), "stream": streaming}
 
     if streaming:
@@ -929,7 +930,7 @@ def test_final_response_establishes_closing_fence(streaming: bool):
 
     assert invocation.phase == "closing"
     with pytest.raises(RuntimeError, match="phase is closing"):
-        invocation.send_message("too late")
+        invocation.redirect("too late")
 
 
 def test_failed_attempt_reuses_pre_boundary_message_on_identical_retry():
@@ -949,14 +950,14 @@ def test_failed_attempt_reuses_pre_boundary_message_on_identical_retry():
     invocation = control.begin_invocation("external")
     backend = _FailOnceBackend()
     server = _controlled_server(backend, invocation)
-    invocation.send_message("assigned before attempt")
+    invocation.redirect("assigned before attempt")
     request = {"messages": _completed_tool_history()}
 
     with pytest.raises(RuntimeError, match="provider disconnected"):
         server.dispatch(request)
 
     assert invocation.phase == "model"
-    invocation.send_message("deliver after retry")
+    invocation.redirect("deliver after retry")
 
     server.dispatch(request)
     assert [_invocation_message_texts(item[1]["messages"]) for item in backend.requests] == [
@@ -990,7 +991,7 @@ def test_message_during_model_replaces_final_draft_at_next_safe_boundary(streami
 
     assert backend.entered.wait(timeout=2.0)
     assert invocation.phase == "model"
-    invocation.send_message("incorporate this before answering")
+    invocation.redirect("incorporate this before answering")
     backend.release.set()
 
     if streaming:
@@ -1017,7 +1018,7 @@ def test_incomplete_tool_batch_does_not_drain_or_inject_messages():
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
     complete = _completed_tool_history()
-    invocation.send_message("wait for every result")
+    invocation.redirect("wait for every result")
 
     server.dispatch({"messages": complete[:-1]})
     assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == []
@@ -1033,7 +1034,7 @@ def test_internal_compaction_bypasses_controls_and_strips_marker():
     invocation = control.begin_invocation("external")
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
-    invocation.send_message("for the next user-visible generation")
+    invocation.redirect("for the next user-visible generation")
     history = _completed_tool_history()
 
     server.dispatch({"messages": history, "agency_internal_kind": "compaction"})
@@ -1984,3 +1985,80 @@ def test_build_app_context_limit_route(monkeypatch):
     response = client.get("/context_limit")
     assert response.status_code == 200
     assert response.json() == {"context_limit": 4096}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_redirect_during_tool_generating_model_replaces_stale_result(streaming):
+    handle = AgentControl().begin_invocation("external")
+
+    class Backend(_RecordingBackend):
+        def _result(self):
+            if len(self.requests) == 1:
+                handle.redirect("reconsider the tool")
+            return super()._result()
+
+        def dispatch_stream(self, request, *, on_client=None):
+            yield from super().dispatch_stream(request, on_client=on_client)
+            handle.redirect("reconsider the tool")
+
+    backend = Backend()
+    server = _controlled_server(backend, handle)
+    request = {"messages": _completed_tool_history(), "stream": streaming}
+    if streaming:
+        stream = server.start_stream(request)
+        assert _drain(stream)[-1]["type"] == "done"
+        stream._thread.join(timeout=2)
+    else:
+        server.dispatch(request)
+    assert len(backend.requests) == 2
+    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nreconsider the tool"
+    ]
+    assert not handle._pending_messages
+
+
+def test_failed_follow_up_retains_redirect_across_server_replacement():
+    handle = AgentControl().begin_invocation("external")
+
+    class Backend(_RecordingBackend):
+        def dispatch(self, request):
+            self.requests.append(("nonstream", copy.deepcopy(request)))
+            if len(self.requests) == 1:
+                handle.redirect("retain first")
+                return self._result()
+            handle.redirect("retain second")
+            raise RuntimeError("follow-up failed")
+
+    server = _controlled_server(Backend(), handle)
+    request = {"messages": _completed_tool_history()}
+    with pytest.raises(RuntimeError, match="follow-up failed"):
+        server.dispatch(request)
+    assert [entry.content for entry in handle._pending_messages] == [
+        "retain first",
+        "retain second",
+    ]
+    backend = _RecordingBackend(final=True)
+    replacement = _controlled_server(backend, handle)
+    replacement.dispatch(request)
+    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
+        "[AGENCY INVOCATION MESSAGE]\nretain first",
+        "[AGENCY INVOCATION MESSAGE]\nretain second",
+    ]
+    assert not handle._pending_messages
+    assert handle.phase == "closing"
+
+
+def test_native_host_model_result_leaves_acknowledgement_and_final_fence_to_loop():
+    handle = AgentControl().begin_invocation("native")
+    handle.redirect("native snapshot")
+    handle._checkpoint("native-generation", allow_messages=True, phase="model")
+    backend = _RecordingBackend(final=True)
+    server = _controlled_server(backend, handle)
+    server._enable_message_overlay = False
+    server.dispatch({"messages": _completed_tool_history()})
+    assert [entry.content for entry in handle._pending_messages] == ["native snapshot"]
+    assert handle.phase != "closing"
+    handle._checkpoint("native-generation", allow_messages=False, phase="model-result")
+    handle._checkpoint_final_answer("native-final")
+    assert not handle._pending_messages
+    assert handle.phase == "closing"

@@ -479,7 +479,7 @@ def test_agency_stream_to_harness_text_stream():
     assert types[0] == "message_start"
     assert types[1] == "content_block_start"
     assert types[2] == "content_block_delta"
-    assert types[3] == "content_block_delta"
+    assert types[3] == "content_block_stop"
     assert "content_block_stop" in types
     assert types[-2] == "message_delta"
     assert types[-1] == "message_stop"
@@ -490,6 +490,26 @@ def test_agency_stream_to_harness_text_stream():
     message_delta = next(d for t, d in events if t == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "end_turn"
     assert message_delta["usage"]["output_tokens"] == 2
+
+
+def test_agency_stream_discards_draft_text_replaced_by_redirect():
+    def stream():
+        yield {"type": "delta", "content": "STALE-FINAL-ANSWER"}
+        yield {
+            "type": "done",
+            "message": {"role": "assistant", "blocks": [_text_block("GENERATION-REDIRECTED")]},
+            "stop_reason": "stop",
+        }
+
+    frames = "".join(_backend()._format_agency_stream_to_harness(stream(), "claude-x"))
+    assert "STALE-FINAL-ANSWER" not in frames
+    events = _parse_sse(frames)
+    text = "".join(
+        data["delta"]["text"]
+        for kind, data in events
+        if kind == "content_block_delta" and data["delta"]["type"] == "text_delta"
+    )
+    assert text == "GENERATION-REDIRECTED"
 
 
 def test_agency_stream_to_harness_tool_use_after_text():

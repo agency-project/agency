@@ -148,6 +148,26 @@ def _anthropic_system_to_text(system) -> "str | None":
     return None
 
 
+_SESSION_TITLE_PROMPT_MARKER = "Generate a concise, sentence-case title (3-7 words)"
+_HEADLESS_SESSION_TITLE = '{"title":"Agency session"}'
+
+
+def _is_session_title_request(raw_request: dict) -> bool:
+    """Identify Claude Code's internal session-title generation request.
+
+    Headless harness runs do not display the title, so sending this auxiliary
+    request through the invocation's model endpoint only adds latency and can
+    incorrectly compete with the user-visible turn's final-answer checkpoint.
+    """
+    parts = [_anthropic_system_to_text(raw_request.get("system")) or ""]
+    parts.extend(
+        _stringify_anthropic_content(message.get("content"))
+        for message in raw_request.get("messages", [])
+        if isinstance(message, dict)
+    )
+    return any(_SESSION_TITLE_PROMPT_MARKER in part for part in parts)
+
+
 def _anthropic_tools_to_agency(tools) -> "list[dict] | None":
     if not tools:
         return None
@@ -506,6 +526,26 @@ class _ClaudeCodeBackend(agharness_backend):
             if warning:
                 router.log_warning(token, warning)
             model = router.resolve_model(token)
+            if _is_session_title_request(body):
+                title_text = '{"title":"Agency session"}'
+                title_response = {
+                    "type": "done",
+                    "message": {
+                        "role": "assistant",
+                        "blocks": [{"type": "text", "index": 0, "text": title_text}],
+                    },
+                    "stop_reason": "stop",
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                }
+                if body.get("stream"):
+
+                    def title_gen():
+                        yield from self._format_agency_stream_to_harness(
+                            [{"type": "delta", "content": title_text}, title_response], model
+                        )
+
+                    return StreamingResponse(title_gen(), media_type="text/event-stream")
+                return JSONResponse(self._format_context_agency_to_harness(title_response, model))
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
 
@@ -694,52 +734,43 @@ class _ClaudeCodeBackend(agharness_backend):
             },
         )
         next_index = 0
-        text_index = None
         for item in agency_stream:
             if item["type"] == "delta":
-                content = item.get("content")
-                if content:
-                    if text_index is None:
-                        text_index = next_index
-                        next_index += 1
-                        yield _sse(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": text_index,
-                                "content_block": {"type": "text", "text": ""},
-                            },
-                        )
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": text_index,
-                            "delta": {"type": "text_delta", "text": content},
-                        },
-                    )
+                # Draft deltas can be superseded by an in-flight redirect.
+                # Anthropic SSE cannot retract text already sent to Claude;
+                # emit only the authoritative message after the checkpoint.
                 continue
-            if text_index is not None:
-                text_block = next(
-                    (b for b in item["message"].get("blocks", []) if b["type"] == "text"), None
-                )
-                for citation in (text_block.get("citations") if text_block else None) or []:
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": text_index,
-                            "delta": {"type": "citations_delta", "citation": citation},
-                        },
-                    )
-                yield _sse(
-                    "content_block_stop", {"type": "content_block_stop", "index": text_index}
-                )
             for b in item["message"].get("blocks", []):
-                if b["type"] == "text":
-                    continue
                 idx = next_index
                 next_index += 1
+                if b["type"] == "text":
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {"type": "text_delta", "text": b.get("text", "")},
+                        },
+                    )
+                    for citation in b.get("citations") or []:
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "citations_delta", "citation": citation},
+                            },
+                        )
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                    continue
                 if b["type"] == "thinking":
                     yield _sse(
                         "content_block_start",

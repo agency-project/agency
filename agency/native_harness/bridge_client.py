@@ -77,6 +77,7 @@ class BridgeClient:
                 "cancelled": bool(result.get("cancelled")),
                 "destroyed": bool(result.get("destroyed")),
                 "invocation_messages": result.get("invocation_messages") or [],
+                "action_admitted": bool(result.get("action_admitted")),
             }
         except Exception as exc:
             # A configured control bridge is authoritative; continuing when

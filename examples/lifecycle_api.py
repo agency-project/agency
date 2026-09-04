@@ -369,7 +369,7 @@ def _exercise_ordered_chain(
             and ready.predecessor_context is tail.output_context,
             "context futures are the authoritative chain",
         )
-        controls = ("send_message", "pause", "resume", "cancel")
+        controls = ("redirect", "pause", "resume", "cancel")
         _check(
             evidence,
             all(not hasattr(message, control) for control in controls),
@@ -389,8 +389,8 @@ def _exercise_ordered_chain(
             "queue_message commits while agent dispatch is suspended",
         )
 
-        head.send_message(f"Remember {FIFO_FIRST} as the first marker fragment.")
-        head.send_message(f"Append {FIFO_SECOND} after the first fragment using one | separator.")
+        head.redirect(f"Remember {FIFO_FIRST} as the first marker fragment.")
+        head.redirect(f"Append {FIFO_SECOND} after the first fragment using one | separator.")
         _check(
             evidence,
             not ticket.entered.wait(timeout=0.3),
@@ -399,7 +399,7 @@ def _exercise_ordered_chain(
         ag.resume()
         _wait_for_gate(ticket, timeout_s)
         _check(evidence, head.state == "RUNNING", "head invocation reaches running state")
-        head.send_message(f"After the gate, output exactly {FIFO_MARKER}.")
+        head.redirect(f"After the gate, output exactly {FIFO_MARKER}.")
         head.pause()
         ticket.release.set()
         _check(
@@ -607,7 +607,7 @@ def _exercise_cancellation(
         _expect_runtime_rejection(
             evidence,
             "terminal invocation rejects messages",
-            lambda: cancelled.send_message("too late"),
+            lambda: cancelled.redirect("too late"),
         )
         _expect_runtime_rejection(
             evidence,
@@ -725,7 +725,7 @@ def _exercise_destruction(
         _expect_destroyed(
             evidence,
             "destroy rejects invocation messages",
-            lambda: active.send_message("rejected"),
+            lambda: active.redirect("rejected"),
         )
         _expect_destroyed(
             evidence,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -34,3 +35,36 @@ def test_registered_adapter_routes_inject_fastapi_request(backend_cls, path):
 
     assert response.status_code == 401
     assert "unknown or missing bearer token" in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_claude_session_title_request_is_answered_without_model_dispatch(stream):
+    app = FastAPI()
+    bridge = SimpleNamespace(
+        validate_token=lambda _token: True,
+        resolve_model=lambda _token: "test-model",
+        dispatch=MagicMock(side_effect=AssertionError("title request reached the model")),
+        dispatch_stream=MagicMock(side_effect=AssertionError("title request reached the model")),
+        log_warning=MagicMock(),
+    )
+    _ClaudeCodeBackend(agConfig()).register(app, bridge)
+    body = {
+        "stream": stream,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Generate a concise, sentence-case title (3-7 words) "
+                    "that captures the main topic of this coding session."
+                ),
+            }
+        ],
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/v1/messages", headers={"x-api-key": "token"}, json=body)
+
+    assert response.status_code == 200
+    assert "Agency session" in response.text
+    bridge.dispatch.assert_not_called()
+    bridge.dispatch_stream.assert_not_called()

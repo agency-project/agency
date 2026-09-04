@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import urllib.error
+
+import pytest
 
 from agency.harness import _harness_permission_hook as hook
 
@@ -127,3 +130,148 @@ def test_missing_tool_use_id_skips_profiler_without_blocking(monkeypatch, capsys
 def test_profiler_timeout_budget_stays_at_or_below_200ms_per_tool():
     # Pre and Post each make at most one synchronous telemetry request.
     assert hook._PROFILER_TIMEOUT_S * 2 <= 0.2
+
+
+@pytest.fixture
+def pretool(monkeypatch):
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
+    monkeypatch.setenv("AGPROF_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPROF_TOKEN", "profiler-token")
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload())))
+    return monkeypatch
+
+
+def _assert_denied(capsys):
+    assert hook.main() == 0
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+    assert output["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("missing", ["AGPOLICY_BASE_URL", "AGPOLICY_TOKEN"])
+def test_missing_policy_configuration_denies_without_profiler(pretool, capsys, missing):
+    pretool.delenv(missing)
+    requests = []
+    pretool.setattr(hook.urllib.request, "urlopen", lambda *a, **kw: requests.append(a))
+    _assert_denied(capsys)
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timeout"),
+        urllib.error.URLError("connection refused"),
+        urllib.error.HTTPError("http://gateway", 401, "unauthorized", {}, None),
+        urllib.error.HTTPError("http://gateway", 503, "unavailable", {}, None),
+    ],
+)
+def test_policy_transport_failure_denies_without_profiler(pretool, capsys, failure):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request.full_url)
+        raise failure
+
+    pretool.setattr(hook.urllib.request, "urlopen", urlopen)
+    _assert_denied(capsys)
+    assert requests == ["http://gateway/agpolicy/check_tool"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        [],
+        {},
+        {"decision": None},
+        {"decision": "rewrite"},
+        {"decision": "ask"},
+        {"decision": True},
+        {"decision": "allow", "reason": {}},
+        "invalid-json",
+    ],
+)
+def test_malformed_policy_response_denies_without_profiler(pretool, capsys, response):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request.full_url)
+        result = _Response(response)
+        if response == "invalid-json":
+            result._body = b"not JSON"
+        return result
+
+    pretool.setattr(hook.urllib.request, "urlopen", urlopen)
+    _assert_denied(capsys)
+    assert requests == ["http://gateway/agpolicy/check_tool"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["not JSON", "null", "[]", "{}", '{"tool_name": 3}', '{"tool_name": "Bash", "tool_input": []}'],
+)
+def test_malformed_hook_input_denies_before_request(pretool, capsys, payload):
+    pretool.setattr(hook.sys, "stdin", io.StringIO(payload))
+    requests = []
+    pretool.setattr(hook.urllib.request, "urlopen", lambda *a, **kw: requests.append(a))
+    _assert_denied(capsys)
+    assert requests == []
+
+
+def test_bad_gateway_url_denies_instead_of_crashing(pretool, capsys):
+    pretool.setenv("AGPOLICY_BASE_URL", "not-a-url")
+    _assert_denied(capsys)
+
+
+def test_profiler_failure_does_not_revoke_explicit_admission(pretool, capsys):
+    def urlopen(request, timeout):
+        if request.full_url.endswith("/agpolicy/check_tool"):
+            return _Response({"decision": "allow"})
+        raise TimeoutError("profiler down")
+
+    pretool.setattr(hook.urllib.request, "urlopen", urlopen)
+    assert hook.main() == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out)["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert "profiler request failed" in output.err
+
+
+def test_pending_redirect_denies_claude_tool_until_acknowledged(pretool, capsys):
+    from types import SimpleNamespace
+
+    from agency._agent_control import AgentControl
+    from agency.agpolicy import agpolicy
+    from agency.engine.host_servers.host_interaction_server import HostInteractionServer
+
+    invocation = AgentControl().begin_invocation("claude")
+    invocation.redirect("reconsider this action")
+    server = HostInteractionServer(
+        SimpleNamespace(policy=agpolicy(default_to_deny=False)),
+        None,
+        invocation=invocation,
+    )
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request.full_url)
+        if request.full_url.endswith("/agprof/hook"):
+            return _Response({"ok": True})
+        payload = json.loads(request.data)
+        allowed, reason = server.check_tool(payload["tool_name"], payload["tool_input"])
+        return _Response({"decision": "allow" if allowed else "deny", "reason": reason})
+
+    pretool.setattr(hook.urllib.request, "urlopen", urlopen)
+    _assert_denied(capsys)
+    snapshot = invocation._checkpoint("model", allow_messages=True, phase="model")
+    pretool.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload())))
+    _assert_denied(capsys)
+    assert requests == ["http://gateway/agpolicy/check_tool"] * 2
+    invocation._acknowledge_redirects(snapshot.invocation_messages)
+    pretool.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload())))
+    assert hook.main() == 0
+    assert (
+        json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "allow"
+    )
