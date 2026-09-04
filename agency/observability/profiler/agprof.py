@@ -66,8 +66,6 @@ _counters_lock = threading.Lock()
 
 _profile_session_id: "str | None" = None
 _profile_data_logger = None
-_profile_data_loggers: "dict[int, object]" = {}
-_profile_data_loggers_lock = threading.Lock()
 _last_profile_records: "list[tuple]" = []
 _open_spans: "dict[int, object]" = {}
 _open_spans_lock = threading.Lock()
@@ -77,9 +75,6 @@ _last_run_summary: "dict | None" = None
 
 _tls = threading.local()  # per-thread schedstat file cache only
 _span_stack: "ContextVar[tuple[_TimedSpan, ...]]" = ContextVar("agprof_span_stack", default=())
-_data_logger_binding: "ContextVar[tuple[object, str | None, str | None] | None]" = ContextVar(
-    "agprof_data_logger_binding", default=None
-)
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
@@ -161,7 +156,13 @@ def _cgroup_reexec_command(slice_name: str, cgroup_dir: str) -> list[str]:
     gid = os.getgid()
     user = os.environ.get("USER") or str(uid)
     home = os.environ.get("HOME") or str(Path.home())
-    original_argv = list(getattr(sys, "orig_argv", ())) or [sys.executable, *sys.argv]
+    orig_argv = getattr(sys, "orig_argv", None)
+    # argv[0] must be the resolved interpreter path: the reconstructed command
+    # below runs through sudo/systemd-run/setpriv, whose secure_path can
+    # override $PATH even with sudo -E, so a bare "python3" (whatever the
+    # caller typed) can resolve to a different interpreter than the one
+    # actually running -- silently losing this venv's installed packages.
+    original_argv = [sys.executable, *orig_argv[1:]] if orig_argv else [sys.executable, *sys.argv]
     scope_name = slice_name.removesuffix(".slice") + ".scope"
     profiler_environment = [
         f"{key}={os.environ[key]}"
@@ -285,28 +286,7 @@ def _otel_attribute(value):
     return json.dumps(value, sort_keys=True, default=str)
 
 
-@contextmanager
-def bind_data_logger(
-    data_logger,
-    *,
-    name: "str | None" = None,
-    object: "str | None" = None,
-):
-    """Route profiler spans created in this context to one agDataLogger.
-
-    The binding is captured by each span when it starts, so an external span
-    can safely finish on another thread. It is intentionally inert while
-    profiling is disabled, preserving agprof's existing no-op fast path.
-    """
-    token = _data_logger_binding.set((data_logger, name, object))
-    try:
-        yield
-    finally:
-        _data_logger_binding.reset(token)
-
-
 def _record_data_logger_span(
-    binding,
     span_name: str,
     start_wall_ns: int,
     end_wall_ns: int,
@@ -319,10 +299,10 @@ def _record_data_logger_span(
     profile_session_id: "str | None" = None,
     profile_span_name: "str | None" = None,
 ) -> bool:
-    """Best-effort bridge from completed profiler spans to agDataLogger."""
-    if binding is None:
+    """Best-effort bridge from a completed profiler span to agprof's own agDataLogger."""
+    data_logger = _profile_data_logger
+    if data_logger is None:
         return False
-    data_logger, name, object = binding
     wall_ns = max(0, end_wall_ns - start_wall_ns)
     blocked_ns = max(0, wall_ns - (cpu_ns or 0) - (runqueue_ns or 0))
     logger_attributes = dict(attributes)
@@ -335,15 +315,11 @@ def _record_data_logger_span(
     if parent_span_id is not None:
         logger_attributes["agency.parent_span_id"] = f"{parent_span_id:016x}"
     try:
-        with _profile_data_loggers_lock:
-            _profile_data_loggers[id(data_logger)] = data_logger
         data_logger.record_span(
             span_name,
             start_wall_ns / 1_000_000_000,
             end_wall_ns / 1_000_000_000,
             logger_attributes,
-            name=name,
-            object=object,
             cpu_ms=None if cpu_ns is None else cpu_ns / 1_000_000,
             runqueue_ms=None if runqueue_ns is None else runqueue_ns / 1_000_000,
             blocked_ms=blocked_ns / 1_000_000,
@@ -359,36 +335,16 @@ def _record_data_logger_span(
 
 
 def _load_profile_records(profile_session_id: "str | None") -> list[tuple]:
-    """Flush and merge this session's spans from every participating logger."""
-    if profile_session_id is None:
+    """Flush and read this session's spans from agprof's own data logger."""
+    data_logger = _profile_data_logger
+    if profile_session_id is None or data_logger is None:
         return []
-    with _profile_data_loggers_lock:
-        data_loggers = list(_profile_data_loggers.values())
-
-    # Distinct logger objects may point at the same SQLite file. Flush every
-    # object first, then read each physical store once to avoid duplicate rows.
-    for data_logger in data_loggers:
-        try:
-            data_logger.flush()
-        except Exception as exc:
-            _agprof_print(f"[agprof] WARNING: datalogger flush failed: {exc}")
-
-    records: list[tuple] = []
-    read_stores: set[object] = set()
-    for data_logger in data_loggers:
-        try:
-            db_path = data_logger.db_path
-            store_key: object = (
-                ("memory", id(data_logger))
-                if db_path == ":memory:"
-                else ("sqlite", str(Path(db_path).resolve()))
-            )
-            if store_key in read_stores:
-                continue
-            read_stores.add(store_key)
-            records.extend(data_logger.read_profile_records(profile_session_id))
-        except Exception as exc:
-            _agprof_print(f"[agprof] WARNING: datalogger span read failed: {exc}")
+    try:
+        data_logger.flush()
+        records = data_logger.read_profile_records(profile_session_id)
+    except Exception as exc:
+        _agprof_print(f"[agprof] WARNING: datalogger span read failed: {exc}")
+        return []
     records.sort(key=lambda record: (record[2], record[0], record[1]))
     return records
 
@@ -410,7 +366,6 @@ class _TimedSpan:
         "_metadata",
         "_interrupted",
         "_stack_token",
-        "_data_logger_binding",
         "_profile_session_id",
     )
 
@@ -423,9 +378,6 @@ class _TimedSpan:
         self._metadata: dict = {}
         self._interrupted = False
         self._stack_token = None
-        self._data_logger_binding = _data_logger_binding.get()
-        if self._data_logger_binding is None and _profile_data_logger is not None:
-            self._data_logger_binding = (_profile_data_logger, None, None)
         self._profile_session_id = _profile_session_id
 
     def __enter__(self) -> "_TimedSpan":
@@ -485,7 +437,6 @@ class _TimedSpan:
         span_id = context.span_id if context is not None else None
         parent_span_id = parent.span_id if parent is not None else None
         _record_data_logger_span(
-            self._data_logger_binding,
             self._name,
             self._otel_t0,
             otel_t1,
@@ -543,7 +494,6 @@ class _ObservedSpan:
         "_ended",
         "_cancelled",
         "_lock",
-        "_data_logger_binding",
         "_data_span_name",
         "_profile_session_id",
     )
@@ -557,7 +507,6 @@ class _ObservedSpan:
         start_wall_ns: int,
         metadata: "dict | None",
         parent_context,
-        data_logger_binding=None,
         data_span_name: "str | None" = None,
     ) -> None:
         if parent_context is None:
@@ -575,13 +524,8 @@ class _ObservedSpan:
         self._ended = False
         self._cancelled = False
         self._lock = threading.Lock()
-        self._data_logger_binding = (
-            _data_logger_binding.get() if data_logger_binding is None else data_logger_binding
-        )
         self._data_span_name = data_span_name
         self._profile_session_id = _profile_session_id
-        if self._data_logger_binding is None and _profile_data_logger is not None:
-            self._data_logger_binding = (_profile_data_logger, None, None)
         self._span = None
         with _open_spans_lock:
             _open_spans[id(self)] = self
@@ -646,7 +590,6 @@ class _ObservedSpan:
             parent_span_id = parent.span_id if parent is not None else None
             span.end(end_time=end_wall_ns)
             return _record_data_logger_span(
-                self._data_logger_binding,
                 self._data_span_name or self._name,
                 effective_start_wall_ns,
                 end_wall_ns,
@@ -759,15 +702,12 @@ def spawn_traced(fn, *args, daemon: bool = True, **kwargs) -> threading.Thread:
     from opentelemetry import context as otel_context
 
     context = otel_context.get_current()
-    data_logger_binding = _data_logger_binding.get()
 
     def run() -> None:
         token = otel_context.attach(context)
-        logger_token = _data_logger_binding.set(data_logger_binding)
         try:
             fn(*args, **kwargs)
         finally:
-            _data_logger_binding.reset(logger_token)
             otel_context.detach(token)
 
     return threading.Thread(target=run, daemon=daemon)
@@ -796,9 +736,6 @@ def start_external_span(
     start_wall_ns: int,
     metadata: "dict | None" = None,
     parent_context=None,
-    data_logger=None,
-    data_name: "str | None" = None,
-    data_object: "str | None" = None,
     data_span_name: "str | None" = None,
 ) -> "_ObservedSpan | None":
     """Open a host-owned span whose interval is ended by a later callback.
@@ -825,9 +762,6 @@ def start_external_span(
             start_wall_ns=start_wall_ns,
             metadata=metadata,
             parent_context=parent_context,
-            data_logger_binding=(
-                None if data_logger is None else (data_logger, data_name, data_object)
-            ),
             data_span_name=data_span_name,
         )
 
@@ -1388,9 +1322,6 @@ def start(
                 default_object="profiler",
             )
             profile_data_logger.start()
-        with _profile_data_loggers_lock:
-            _profile_data_loggers.clear()
-            _profile_data_loggers[id(profile_data_logger)] = profile_data_logger
         _profile_session_id = profile_session_id
         _profile_data_logger = profile_data_logger
         _last_profile_records = []
@@ -1455,8 +1386,6 @@ def stop():
             profile_data_logger.stop()
         except Exception as exc:
             _agprof_print(f"[agprof] WARNING: profiler datalogger shutdown failed: {exc}")
-    with _profile_data_loggers_lock:
-        _profile_data_loggers.clear()
     _profile_session_id = None
     _profile_data_logger = None
     samples = list(_samples)

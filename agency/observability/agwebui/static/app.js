@@ -946,6 +946,7 @@ $configUpdateAll.addEventListener('click', () => {
 // ---------------------------------------------------------------------------
 
 const ws = new WebSocket(`ws://${location.host}/ws`);
+let wsClosed = false;
 
 ws.onmessage = e => {
   try {
@@ -957,6 +958,7 @@ ws.onmessage = e => {
 };
 
 ws.onclose = () => {
+  wsClosed = true;
   appendLog('\x1b[31m[web ui] connection closed — reload to reconnect\x1b[0m');
 };
 
@@ -987,6 +989,7 @@ ws.onerror = () => {
 // after the current one finishes makes that starvation structurally
 // impossible.
 async function _pollAgentDetailLoop() {
+  if (wsClosed) return;
   if (state.timeline.liveMode) {
     const agname = currentAgent();
     if (agname) await loadAgentDetail(agname);

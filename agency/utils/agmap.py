@@ -100,7 +100,10 @@ def _spawn(fn: "Callable[[object], object]", arg: object, index: int = 0) -> agt
                 outcome="failure" if error else "success",
                 error_type="agmap_task_error" if error else None,
             )
-            future.set_result(result)
+        # Resolved only after the span above fully exits (and is persisted),
+        # so a caller unblocked by this future can never race agprof.stop()
+        # into reading the profile store before this task's span lands in it.
+        future.set_result(result)
 
     agprof.spawn_traced(_run).start()
     return agtask(_future=future)

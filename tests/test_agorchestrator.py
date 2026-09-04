@@ -496,7 +496,10 @@ def test_shutdown_fails_permanently_blocked_requests(monkeypatch, tmp_path):
     assert orchestrator.snapshot().state == "stopped"
 
 
-def test_profiler_adapter_persists_intervals_to_global_database(monkeypatch, tmp_path):
+def test_request_spans_are_not_recorded_when_profiling_is_disabled(monkeypatch, tmp_path):
+    """Spans are an opt-in profiling concept now -- with no agprof session
+    active, request/phase timing isn't persisted anywhere, only the coarser
+    event log (request_submitted et al.) is."""
     dependency: Future[agdata] = Future()
 
     def execute(self, *, context, **_kwargs):
@@ -512,32 +515,23 @@ def test_profiler_adapter_persists_intervals_to_global_database(monkeypatch, tmp
     assert result.ok is True
     orchestrator = get_orchestrator()
     orchestrator.flush()
+    ag.data_logger.flush()
 
-    connection = sqlite3.connect(orchestrator.data_logger.db_path)
+    global_connection = sqlite3.connect(orchestrator.data_logger.db_path)
+    agent_connection = sqlite3.connect(ag.data_logger.db_path)
     try:
-        rows = connection.execute(
-            "SELECT span_name,name,object,attributes FROM spans ORDER BY id"
-        ).fetchall()
+        assert global_connection.execute("SELECT COUNT(*) FROM spans").fetchone()[0] == 0
+        assert agent_connection.execute("SELECT COUNT(*) FROM spans").fetchone()[0] == 0
+        event_types = {
+            row[0] for row in global_connection.execute("SELECT type FROM events").fetchall()
+        }
     finally:
-        connection.close()
-    names = {row[0] for row in rows}
-    assert {
-        "sync:dependency_wait",
-        "sync:scheduler_queue",
-        "engine:execution",
-        "request:submission_to_completion",
-    } <= names
-    assert all(row[1] == str(ag.agname) for row in rows)
-    assert all(row[2] == "agent" for row in rows)
-    attrs = [json.loads(row[3]) for row in rows]
-    assert all(a["request_kind"] == "skill" for a in attrs)
-    assert all(a["request_id"] == "run0" for a in attrs)
-    assert all(a["skill"] == "profiled" for a in attrs)
+        global_connection.close()
+        agent_connection.close()
+    assert "request_submitted" in event_types
 
 
-def test_profiler_routes_scheduler_and_execution_spans_to_their_data_loggers(
-    monkeypatch, tmp_path
-):
+def test_profiler_routes_all_spans_to_agprofs_own_data_logger(monkeypatch, tmp_path):
     pytest.importorskip("opentelemetry.sdk.trace")
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
 
@@ -546,7 +540,8 @@ def test_profiler_routes_scheduler_and_execution_spans_to_their_data_loggers(
             return _result(context, ok=True)
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
-    agprof.start(None, sample_hz=0, sample_gpu=False)
+    profile_dir = tmp_path / "profile"
+    agprof.start(profile_dir, sample_hz=0, sample_gpu=False)
     try:
         ag = _agent(tmp_path)
         assert ag.run(agskill("profiled", ""), agdata()).ok is True
@@ -558,28 +553,26 @@ def test_profiler_routes_scheduler_and_execution_spans_to_their_data_loggers(
     ag.data_logger.flush()
     global_connection = sqlite3.connect(orchestrator.data_logger.db_path)
     agent_connection = sqlite3.connect(ag.data_logger.db_path)
+    profile_connection = sqlite3.connect(str(profile_dir / "profile_data.sqlite3"))
     try:
-        global_names = [
-            row[0]
-            for row in global_connection.execute(
-                "SELECT span_name FROM spans ORDER BY id"
-            ).fetchall()
-        ]
-        agent_rows = agent_connection.execute(
-            "SELECT span_name,name,object,attributes FROM spans ORDER BY id"
+        # Neither the global nor the agent's own db ever sees a span row --
+        # everything lands in agprof's own datalogger, one file total.
+        assert global_connection.execute("SELECT COUNT(*) FROM spans").fetchone()[0] == 0
+        assert agent_connection.execute("SELECT COUNT(*) FROM spans").fetchone()[0] == 0
+        profile_rows = profile_connection.execute(
+            "SELECT span_name,attributes FROM spans ORDER BY id"
         ).fetchall()
     finally:
         global_connection.close()
         agent_connection.close()
+        profile_connection.close()
 
-    assert global_names.count("request:submission_to_completion") == 1
-    assert "sync:scheduler_queue" in global_names
-    agent_names = {row[0] for row in agent_rows}
-    assert {"engine:execute", "engine:inner"} <= agent_names
-    assert all(row[1] == str(ag.agname) for row in agent_rows)
-    assert all(row[2] == "agent" for row in agent_rows)
+    profile_names = [row[0] for row in profile_rows]
+    assert profile_names.count("request:submission_to_completion") == 1
+    assert "sync:scheduler_queue" in profile_names
+    assert {"engine:execute", "engine:inner"} <= set(profile_names)
     engine_attributes = json.loads(
-        next(row[3] for row in agent_rows if row[0] == "engine:execute")
+        next(row[1] for row in profile_rows if row[0] == "engine:execute")
     )
     assert engine_attributes["request_id"] == "run0"
     assert engine_attributes["skill"] == "profiled"

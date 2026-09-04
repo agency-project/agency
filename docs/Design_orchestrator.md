@@ -84,25 +84,22 @@ For every terminal path the scheduler:
 
 ## Telemetry and shutdown
 
-Request lifecycle events and scheduler-derived spans go to the orchestrator's
-shared `agDataLogger`. Each execution worker binds `agprof` to that
-request's per-agent `agDataLogger`, so completed engine, sandbox, tool, and
-LLM profiler spans are persisted with the same schema as other agent data.
-The host-server thread and traced child threads inherit that binding.
-Spans outside an agent or scheduler binding use a profiler-owned datalogger
-(profile_data.sqlite3 for an on-disk profile, otherwise an in-memory
-database). Each profiling session has a correlation ID. At shutdown, agprof
-flushes the participating dataloggers and builds the Perfetto trace and
-summaries from their persisted span rows; spans are no longer appended to a
-second profiler-private list on the execution path.
+Request lifecycle events go to the orchestrator's shared `agDataLogger`;
+spans are a separate, purely opt-in concept. Every span -- request/phase
+spans from the scheduler, `engine:execute`, sandbox, tool, and LLM profiler
+spans alike -- is recorded only while an `agprof` session is active, and all
+of them are persisted to that one session's own `agDataLogger`
+(`profile_data.sqlite3` for an on-disk profile, otherwise an in-memory
+database) rather than being routed to whichever agent or the orchestrator
+happened to be executing. With profiling disabled, no span rows are written
+at all; the event log (`request_submitted`, `request_started`, etc.) is the
+only durable record of request timing in that mode. Each profiling session
+has a correlation ID. At shutdown, agprof flushes its own datalogger and
+builds the Perfetto trace and summaries from its persisted span rows.
 
 Profiler spans retain wall, CPU, run-queue, blocked, span-ID, parent-ID, and
-request-correlation fields. Scheduler external spans are exported directly
-through the shared logger when profiling is enabled; the existing lightweight
-timer writes the same scheduler interval when profiling is disabled, so the
-database has one row per interval in either mode. Logging failures remain
-observational and never alter request results. LLM stream deltas remain
-temporary `agdatalogger.py` records and are finalized into durable events by
-the LLM server.
+request-correlation fields. Logging failures remain observational and never
+alter request results. LLM stream deltas remain temporary `agdatalogger.py`
+records and are finalized into durable events by the LLM server.
 
 Explicit shutdown closes admission, drains active work and context continuations, fails requests that cannot run, joins the scheduler, and retires the reusable workers. Shutdown is idempotent. A callback executing on the scheduler thread may request non-blocking shutdown; scheduler teardown closes the worker pool after the event loop drains.

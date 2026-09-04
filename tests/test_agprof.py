@@ -6,124 +6,88 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 import pytest
 
 from agency.observability.profiler import agprof
 from agency.observability.profiler import agprof_trace
-from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+from agency.observability.agdatalogger import agDataLogger
 
 
-def test_completed_profiler_spans_flow_to_bound_data_logger(monkeypatch, tmp_path):
+def test_completed_profiler_spans_flow_to_agprofs_own_data_logger(monkeypatch, tmp_path):
     pytest.importorskip("opentelemetry.sdk.trace")
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
-    logger = agDataLogger(
-        SimpleNamespace(
-            agDataLoggerConfigs=agDataLoggerConfigs(
-                db_path=str(tmp_path / "agent_data.sqlite3"),
-                flush_batch_size=100,
-                flush_interval_s=60,
-            )
-        ),
-        default_name="agent_test",
-        default_object="agent",
-    )
-    logger.start()
 
-    agprof.start(None, sample_hz=0, sample_gpu=False)
+    agprof.start(tmp_path, sample_hz=0, sample_gpu=False)
     try:
-        with agprof.bind_data_logger(logger):
-            with agprof.span("parent"):
-                agprof.annotate(**{"agency.run_id": "run7"})
+        with agprof.span("parent"):
+            agprof.annotate(**{"agency.run_id": "run7"})
 
-                def child() -> None:
-                    with agprof.span("child"):
-                        pass
+            def child() -> None:
+                with agprof.span("child"):
+                    pass
 
-                worker = agprof.spawn_traced(child)
-                worker.start()
-                worker.join(timeout=2)
-                assert not worker.is_alive()
+            worker = agprof.spawn_traced(child)
+            worker.start()
+            worker.join(timeout=2)
+            assert not worker.is_alive()
     finally:
         agprof.stop()
-    logger.flush()
 
-    connection = sqlite3.connect(logger.db_path)
+    connection = sqlite3.connect(str(tmp_path / "profile_data.sqlite3"))
     try:
         rows = connection.execute(
-            "SELECT span_name,name,object,cpu_ms,runqueue_ms,blocked_ms,parent,attributes "
-            "FROM spans"
+            "SELECT span_name,cpu_ms,runqueue_ms,blocked_ms,parent,attributes FROM spans"
         ).fetchall()
     finally:
         connection.close()
-        logger.stop()
 
     by_name = {row[0]: row for row in rows}
     assert set(by_name) == {"parent", "child"}
     parent = by_name["parent"]
     child_row = by_name["child"]
-    assert parent[1:3] == ("agent_test", "agent")
-    assert child_row[1:3] == ("agent_test", "agent")
-    assert parent[3] is not None
-    assert parent[5] >= 0
-    parent_attributes = json.loads(parent[7])
-    child_attributes = json.loads(child_row[7])
+    assert parent[1] is not None
+    assert parent[3] >= 0
+    parent_attributes = json.loads(parent[5])
+    child_attributes = json.loads(child_row[5])
     assert parent_attributes["agency.run_id"] == "run7"
-    assert child_row[6] == parent_attributes["agency.span_id"]
+    assert child_row[4] == parent_attributes["agency.span_id"]
     assert child_attributes["agency.parent_span_id"] == parent_attributes["agency.span_id"]
 
 
-def test_external_profiler_span_flows_to_explicit_data_logger(monkeypatch, tmp_path):
+def test_external_profiler_span_flows_to_agprofs_own_data_logger(monkeypatch, tmp_path):
     pytest.importorskip("opentelemetry.sdk.trace")
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
-    logger = agDataLogger(
-        SimpleNamespace(
-            agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(tmp_path / "global_data.sqlite3"))
-        )
-    )
-    logger.start()
 
-    agprof.start(None, sample_hz=0, sample_gpu=False)
+    agprof.start(tmp_path, sample_hz=0, sample_gpu=False)
     try:
         span = agprof.start_external_span(
             "sync:scheduler_queue",
             start_perf_ns=1_000_000_000,
             start_wall_ns=2_000_000_000,
             metadata={"request_id": "run3"},
-            data_logger=logger,
-            data_name="agent_test",
-            data_object="agent",
         )
         assert span is not None
         span.end(end_perf_ns=1_250_000_000, end_wall_ns=2_250_000_000)
     finally:
         agprof.stop()
-    logger.flush()
 
-    connection = sqlite3.connect(logger.db_path)
+    connection = sqlite3.connect(str(tmp_path / "profile_data.sqlite3"))
     try:
         row = connection.execute(
-            "SELECT span_name,start_ts,end_ts,name,object,blocked_ms,attributes FROM spans"
+            "SELECT span_name,start_ts,end_ts,blocked_ms,attributes FROM spans"
         ).fetchone()
     finally:
         connection.close()
-        logger.stop()
 
-    assert row[:5] == ("sync:scheduler_queue", 2.0, 2.25, "agent_test", "agent")
-    assert row[5] == 250.0
-    assert json.loads(row[6])["request_id"] == "run3"
+    assert row[:3] == ("sync:scheduler_queue", 2.0, 2.25)
+    assert row[3] == 250.0
+    assert json.loads(row[4])["request_id"] == "run3"
 
 
-def test_external_data_span_name_preserves_profiler_trace_name(monkeypatch, tmp_path):
+def test_external_data_span_name_preserves_profiler_trace_name(monkeypatch):
     pytest.importorskip("opentelemetry.sdk.trace")
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
-    logger = agDataLogger(
-        SimpleNamespace(
-            agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(tmp_path / "global.sqlite3"))
-        )
-    )
-    logger.start()
 
     agprof.start(None, sample_hz=0, sample_gpu=False)
     try:
@@ -131,13 +95,11 @@ def test_external_data_span_name_preserves_profiler_trace_name(monkeypatch, tmp_
             "run0:test:agent",
             start_perf_ns=1_000_000_000,
             start_wall_ns=2_000_000_000,
-            data_logger=logger,
             data_span_name="request:submission_to_completion",
         )
         span.end(end_perf_ns=1_250_000_000, end_wall_ns=2_250_000_000)
     finally:
         agprof.stop()
-        logger.stop()
 
     assert [record[1] for record in agprof.profile_records()] == ["run0:test:agent"]
 
@@ -907,9 +869,15 @@ def test_non_linux_environment_profiling_fails_before_cgroup_or_profiler(monkeyp
 
 
 def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
+    """argv[0] must be the resolved interpreter (sys.executable), not whatever
+    bare name the caller typed -- the reconstructed command runs through
+    sudo/systemd-run/setpriv, whose secure_path can override $PATH even under
+    sudo -E, so a bare "python" could resolve to a different interpreter than
+    the one actually running and silently lose the active venv."""
     captured = {}
     monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
-    monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py", "--quick"])
+    monkeypatch.setattr(agprof.sys, "orig_argv", ["python", "bench.py", "--quick"])
+    monkeypatch.setattr(agprof.sys, "executable", "/venv/bin/python")
     monkeypatch.setattr(agprof.os, "getuid", lambda: 1234)
     monkeypatch.setattr(agprof.os, "getgid", lambda: 5678)
     monkeypatch.setenv("USER", "benchmark")

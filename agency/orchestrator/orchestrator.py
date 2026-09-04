@@ -85,9 +85,6 @@ class _ExecutionRequest:
     engine: "AgentEngine | None" = None
     run_span: object = None
     phase_span: object = None
-    phase_name: "str | None" = None
-    phase_started_wall: "float | None" = None
-    engine_started_wall: "float | None" = None
     terminal_output: "agdata | None" = None
     terminal_error: str = ""
     terminal_state: str = "failed"
@@ -520,9 +517,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None),
             },
             parent_context=parent_context,
-            data_logger=self.data_logger,
-            data_name=str(ag.agname),
-            data_object="agent",
             data_span_name="request:submission_to_completion",
         )
         submission._bind_request(request_id)
@@ -559,7 +553,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
             self._end_phase_span_locked(request)
             invocation._mark_running()
             self._active_by_agent[request.agent] = request.request_id
-            request.engine_started_wall = time.time()
             request.agent.record_state("running_skill", skill=request.skill.name)
             self._record_request_event("request_started", request, {})
             # An engine belongs to exactly one dispatched request.  The agent
@@ -619,25 +612,22 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         label = f"{request.request_id}:{request.skill.name}:{request.agent.agname}"
         agprof.thread_name(label)
         try:
-            with agprof.bind_data_logger(request.agent.data_logger):
-                with agprof.span("engine:execute", parent_context=request.parent_context):
-                    agprof.annotate(
-                        **{
-                            "request_kind": request.kind,
-                            "request_id": request.request_id,
-                            "skill": request.skill.name,
-                            "agency.run_id": request.request_id,
-                            "agency.agent_id": str(request.agent.agname),
-                            "agency.parent_agent_id": getattr(
-                                request.agent, "_parent_agent_id", None
-                            ),
-                        }
-                    )
-                    completion = self._perform_execution(request)
-                    agprof.annotate(
-                        outcome=completion.outcome,
-                        error_type="skill_error" if completion.failed else None,
-                    )
+            with agprof.span("engine:execute", parent_context=request.parent_context):
+                agprof.annotate(
+                    **{
+                        "request_kind": request.kind,
+                        "request_id": request.request_id,
+                        "skill": request.skill.name,
+                        "agency.run_id": request.request_id,
+                        "agency.agent_id": str(request.agent.agname),
+                        "agency.parent_agent_id": getattr(request.agent, "_parent_agent_id", None),
+                    }
+                )
+                completion = self._perform_execution(request)
+                agprof.annotate(
+                    outcome=completion.outcome,
+                    error_type="skill_error" if completion.failed else None,
+                )
         except BaseException as exc:
             message = format_exception(exc)
             completion = _RunCompletion(
@@ -833,15 +823,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
         request = self._requests.get(request_id)
         if request is None:
             return
-        completed_wall = time.time()
-        if request.engine_started_wall is not None:
-            self._record_request_span(
-                request,
-                "engine:execution",
-                request.engine_started_wall,
-                completed_wall,
-                {"outcome": completion.outcome},
-            )
         self._settle_future(request.context_future, completion.context, "output-context")
         invocation = request.submission
         if isinstance(invocation, Invocation):
@@ -1105,8 +1086,6 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
 
     def _start_phase_span_locked(self, request: _ExecutionRequest, name: str) -> None:
         self._end_phase_span_locked(request)
-        request.phase_name = name
-        request.phase_started_wall = time.time()
         request.phase_span = agprof.start_external_span(
             name,
             start_perf_ns=time.perf_counter_ns(),
@@ -1119,26 +1098,13 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
                 "agency.agent_id": str(request.agent.agname),
             },
             parent_context=request.parent_context,
-            data_logger=self.data_logger,
-            data_name=str(request.agent.agname),
-            data_object="agent",
         )
 
     def _end_phase_span_locked(self, request: _ExecutionRequest) -> None:
         span = request.phase_span
         request.phase_span = None
-        phase_name = request.phase_name
-        phase_started_wall = request.phase_started_wall
-        request.phase_name = None
-        request.phase_started_wall = None
-        ended_wall = time.time()
-        span_exported = False
         if span is not None:
-            span_exported = bool(
-                span.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
-            )
-        if not span_exported and phase_name is not None and phase_started_wall is not None:
-            self._record_request_span(request, phase_name, phase_started_wall, ended_wall, {})
+            span.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
 
     def _end_run_span_locked(
         self,
@@ -1150,57 +1116,18 @@ class GlobalAgentOrchestrator(_AgOrchestratorFields):
     ) -> None:
         span = request.run_span
         request.run_span = None
-        ended_wall = time.time()
+        if span is None:
+            return
         outcome = outcome or ("failed" if failed else "succeeded")
         profiler_outcome = "success" if outcome == "succeeded" else "failure"
-        span_exported = False
-        if span is not None:
-            metadata = {"outcome": profiler_outcome, "lifecycle_outcome": outcome}
-            if failed:
-                metadata.update(error_type="skill_error", error_message=error_message)
-            span_exported = bool(
-                span.end(
-                    end_perf_ns=time.perf_counter_ns(),
-                    end_wall_ns=time.time_ns(),
-                    metadata=metadata,
-                )
-            )
-        if not span_exported:
-            attributes = {"outcome": profiler_outcome, "lifecycle_outcome": outcome}
-            if failed:
-                attributes["error_message"] = error_message
-            self._record_request_span(
-                request,
-                "request:submission_to_completion",
-                request.submitted_wall_ns / 1_000_000_000,
-                ended_wall,
-                attributes,
-            )
-
-    def _record_request_span(
-        self,
-        request: _ExecutionRequest,
-        span_name: str,
-        start_ts: float,
-        end_ts: float,
-        attributes: dict,
-    ) -> None:
-        try:
-            self.data_logger.record_span(
-                span_name,
-                start_ts,
-                end_ts,
-                {
-                    "request_kind": request.kind,
-                    "request_id": request.request_id,
-                    "skill": self._request_label(request),
-                    **attributes,
-                },
-                name=str(request.agent.agname),
-                object="agent",
-            )
-        except Exception as exc:
-            print(f"[agorchestrator] WARNING: span recording failed: {exc}")
+        metadata = {"outcome": profiler_outcome, "lifecycle_outcome": outcome}
+        if failed:
+            metadata.update(error_type="skill_error", error_message=error_message)
+        span.end(
+            end_perf_ns=time.perf_counter_ns(),
+            end_wall_ns=time.time_ns(),
+            metadata=metadata,
+        )
 
     def _record_request_event(
         self, event_type: str, request: _ExecutionRequest, payload: dict
