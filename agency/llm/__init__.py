@@ -22,6 +22,7 @@ from .openai import agOpenAIBackendConfig
 from .vllm import agVLLMBackendConfig
 from .anthropic import agAnthropicBackendConfig
 from .bedrock import agBedrockBackendConfig
+from .mock import agMockBackendConfig
 
 __all__ = [
     "agllm",
@@ -31,6 +32,7 @@ __all__ = [
     "agVLLMBackendConfig",
     "agAnthropicBackendConfig",
     "agBedrockBackendConfig",
+    "agMockBackendConfig",
     "BAD_REQUEST_EXCS",
     "API_CONN_EXCS",
     "RATE_LIMIT_EXCS",

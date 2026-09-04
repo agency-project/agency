@@ -297,6 +297,10 @@ class agllm(AgLLMBackendFields, _AgLLMFields):
 
         provider = agconfig.get("agllm_backend", "provider")
         model = agconfig.get("agllm_backend", "model", "") or ""
+        if provider == "mock":
+            from .mock import _MockBackend
+
+            return _MockBackend(agconfig)
         if provider == "bedrock":
             if _is_anthropic_bedrock_model(model):
                 return _AnthropicBedrockBackend(agconfig)

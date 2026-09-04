@@ -511,6 +511,8 @@ def test_dispatch_tags_metadata_block_with_new_prompt_tokens_across_exchanges():
     first_result = server.dispatch(first_request)
     first_metadata = next(b for b in first_result["message"]["blocks"] if b["type"] == "metadata")
     assert first_metadata["new_prompt_tokens"] == 100
+    # Non-streaming calls have no distinct "time to first token".
+    assert first_metadata["ttft_ms"] is None
 
     second_request = {
         "messages": first_request["messages"]
@@ -660,6 +662,10 @@ def test_start_stream_relays_text_deltas_then_done():
         "completion_tokens": 2,
         "total_tokens": 3,
     }
+    # Streaming calls persist TTFT into the durable record, not just an
+    # agprof span annotation -- a replay backend needs it without depending
+    # on profiling having been active during the original run.
+    assert isinstance(metadata_block["ttft_ms"], float) and metadata_block["ttft_ms"] >= 0
     handle._thread.join(timeout=2.0)
     assert client.closed is True
 

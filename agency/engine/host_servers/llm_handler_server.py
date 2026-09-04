@@ -404,7 +404,13 @@ class LlmHandlerServer:
         with self._transcript_lock:
             self._transcript.append(entry)
 
-    def _tag_metadata_block(self, request_messages: "list[dict]", message: dict) -> None:
+    def _tag_metadata_block(
+        self,
+        request_messages: "list[dict]",
+        message: dict,
+        *,
+        ttft_ms: "float | None" = None,
+    ) -> None:
         """Enrich this exchange's metadata block with its own new (non-
         cumulative) prompt token count and the skill/request it belongs to.
 
@@ -413,7 +419,14 @@ class LlmHandlerServer:
         generic block-delta merge loop only ever forwards raw fragments
         into `data` -- without this, usage/stop_reason stay buried inside
         `data` and are unreadable by anything (including this class's own
-        _extract_metadata_usage()) without repeating that fragment-walk."""
+        _extract_metadata_usage()) without repeating that fragment-walk.
+
+        ``ttft_ms`` (streaming calls only; None for the non-streaming path,
+        where "time to first token" isn't a meaningful distinct quantity) is
+        otherwise only ever recorded as an agprof span annotation -- an
+        optional, separate store a replay/mock backend can't rely on having
+        been populated during the original run. Persisting it here too makes
+        it a durable part of the same agDataLogger record as usage/stop_reason."""
         blocks = message.get("blocks") or []
         metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
         if metadata_block is None:
@@ -423,6 +436,7 @@ class LlmHandlerServer:
         completion_tokens = usage.get("completion_tokens", 0) or 0
         metadata_block["usage"] = usage
         metadata_block["stop_reason"] = stop_reason
+        metadata_block["ttft_ms"] = ttft_ms
         metadata_block["new_prompt_tokens"] = self._usage_tracker.resolve_new_prompt_tokens(
             request_messages, message, prompt_tokens, completion_tokens
         )
@@ -1393,7 +1407,8 @@ class LlmHandlerServer:
                         return
                     publish_error(e, status_code=500, transient=False)
                     return
-                _annotate(attempt_span, ttft_ms=round((time.perf_counter() - t0) * 1000, 3))
+                ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
+                _annotate(attempt_span, ttft_ms=ttft_ms)
 
                 handle.register_stream_exchange(
                     request=request, response={"role": "assistant", "blocks": []}
@@ -1546,7 +1561,7 @@ class LlmHandlerServer:
                 if not enqueued:
                     finalize_cancelled()
                     return
-                self._tag_metadata_block(request["messages"], message)
+                self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms)
                 finalize_success(message["blocks"])
         except BaseException as e:
             if not finalized:

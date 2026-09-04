@@ -87,6 +87,12 @@ class TestForConfig:
         backend = agllm.for_config(_cfg(provider="anthropic_aws", model="claude-sonnet-5"))
         assert isinstance(backend, _AnthropicAWSBackend)
 
+    def test_mock_provider_returns_mock_backend(self):
+        from agency.llm.mock import _MockBackend
+
+        backend = agllm.for_config(_cfg(provider="mock", replay_db_path="unused.sqlite3"))
+        assert isinstance(backend, _MockBackend)
+
 
 # ---------------------------------------------------------------------------
 # agllm base class defaults
