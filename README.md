@@ -85,7 +85,7 @@ message.wait()
 third = ag.run(skill, agdata(topic="three"))
 
 # An additional instruction for this exact already-submitted invocation.
-third.send_message("Use only primary sources")
+third.redirect("Use only primary sources")
 third.pause()
 third.resume()
 
@@ -93,11 +93,11 @@ close = ag.destroy()  # rejects new submissions immediately
 close.wait()          # waits for asynchronous cleanup; repeated destroy() returns this handle
 ```
 
-`Invocation.send_message(...)`, `inv.pause()`, `inv.resume()`, and `inv.cancel()` target only that exact invocation. Controls are observed at safe boundaries, never halfway through a model request or tool call. A message accepted during a model request is delivered through a follow-up generation at the next valid boundary. Message and pause requests are rejected after the final-answer fence.
+`Invocation.redirect(...)` is the invocation-level API formerly named `Invocation.send_message(...)`. It urgently redirects only that exact invocation: pending redirects fence every new action under the shared control lock and remain pending, in FIFO order, until a successful model turn incorporates them. An already-admitted tool may finish, but remaining actions from the stale model result are skipped. Redirect requests are rejected after the final-answer fence. The other invocation controls—`inv.pause()`, `inv.resume()`, and `inv.cancel()`—also target only that exact invocation.
 
 `ag.suspend()` is the independent agent-wide gate: it prevents new engine-backed dispatch and parks active work at its next safe boundary if it has not crossed the closing/completion fence. Queued work held by the gate occupies no worker or global slot; an already-running invocation retains its slot while parked. `ag.resume()` clears only that gate and does not clear an invocation-specific pause.
 
-`ag.queue_message()` returns a `MessageSubmission`. It advances the serialized agent context chain by copying its predecessor context and appending retained host-only context without creating an engine, sandbox, harness, or model request. It does not retroactively modify an invocation submitted before it. See [Invocation API](docs/Invocation_API.md) for the distinction from `Invocation.send_message()`.
+`ag.queue_message()` returns a `MessageSubmission`. It advances the serialized agent context chain by copying its predecessor context and appending retained host-only context without creating an engine, sandbox, harness, or model request. It does not retroactively modify an invocation submitted before it. See [Invocation API](docs/Invocation_API.md) for the distinction from `Invocation.redirect()`.
 
 ## Agent and Invocation API reference
 
@@ -127,12 +127,12 @@ ag = Agent(
 | `ag.ctx` | Read/write compatibility alias for `ag.context`. |
 | `ag.history` | Read the committed transcript as `agdata`, or assign `agdata` to replace it. |
 
-`queue_message()` affects later submissions, while `Invocation.send_message()` targets one invocation that has already been submitted:
+Do not use `queue_message()` as a replacement for the former invocation-level `send_message()`. `queue_message()` adds ordered context for later submissions, while `Invocation.redirect()` targets one invocation that has already been submitted:
 
 ```python
 await ag.queue_message("Remember this for later work")
 inv = ag.run(skill, skill_input)
-inv.send_message("Apply this only to this invocation")
+inv.redirect("Apply this only to this invocation")
 ```
 
 ### Agent lifecycle
@@ -198,7 +198,7 @@ Unknown attributes proxy to the output, so `inv.answer` reads the output field n
 
 | API | Purpose |
 |---|---|
-| `inv.send_message(message)` | Deliver an additional instruction to this invocation at its next valid safe boundary. |
+| `inv.redirect(message)` | Redirect this invocation before its next action or final answer. |
 | `inv.pause()` | Request a safe-boundary pause for this invocation only. |
 | `inv.resume()` | Resume this invocation only. |
 | `inv.cancel()` | Cancel this invocation; repeated calls are safe. |
@@ -210,7 +210,7 @@ Unknown attributes proxy to the output, so `inv.answer` reads the output field n
 
 Identity and ordering fields are `inv.invocation_id`, `inv.ordering_id`, and `inv.skill_name`. Public invocation states are `QUEUED`, `RUNNING`, `PAUSED`, `CANCELLING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, and `DESTROYED`.
 
-The previous `prepare()`, `start()`, `ag.send()`, and `inv.steer()` APIs have been removed. Use `run()`, `queue_message()`, and `send_message()` instead.
+The previous `prepare()`, `start()`, `ag.send()`, `inv.send_message()`, and `inv.steer()` APIs have been removed. Use `run()` for a new invocation, `queue_message()` for ordered context affecting later submissions, and `redirect()` for an urgent instruction to one already-submitted invocation.
 
 **OpenAI**
 
