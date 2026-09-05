@@ -1,21 +1,15 @@
 """
-Example: composing a consolidated agConfig from two owners, and dynamically
-updating a DynamicConfigParam field between two skill calls on the same
-agent.
+Example: building one flat agconfig covering both LLM and sandbox fields,
+and dynamically updating a field between two skill calls on the same agent.
 
-  - agConfig(agVLLMBackendConfig(...), agSandboxConfig(...)) merges the
-    agllm_backend fields and an agSandbox "data" mount into one agConfig in
-    a single call. The mount is set once, in agSandboxConfig()'s
-    constructor -- sandbox fields are all Static/GlobalConfigParam (locked
-    the first time a sandbox resolves them), so they're not a good fit for
-    changing between calls; see agAgentConfig/agLLMBackendConfig for fields
-    that are.
-  - agllm_backend.max_completion_tokens is a DynamicConfigParam: re-read
-    fresh from the agConfig on every LLM call, no caching or locking. Set it
-    too low (32) and the vLLM server truncates the tool-call JSON mid-
-    argument, so the skill can't complete its required output field within
-    a few ReAct steps.
-  - Every framework object clones whatever agConfig it's given at
+  - agconfig(...) is one flat call carrying both the LLM fields and an
+    agSandbox "data" mount (via add_mount()) -- there's no owner-nesting to
+    compose, every field lives on the same object.
+  - max_completion_tokens is read fresh from ag.agconfig on every LLM call,
+    no caching or locking. Set it too low (32) and the vLLM server truncates
+    the tool-call JSON mid-argument, so the skill can't complete its
+    required output field within a few ReAct steps.
+  - Every framework object clones whatever agconfig it's given at
     construction time, so `cfg` and `ag.agconfig` are independent copies --
     mutating `cfg` after `agent(agconfig=cfg)` no longer reaches `ag`.
     `ag.change_config(new_cfg)` replaces `ag.agconfig` and pushes a fresh
@@ -36,10 +30,8 @@ from datetime import datetime
 from pathlib import Path
 
 from agency import agent, agskill, agdata
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.agtype import agpath
-from agency.llm import agVLLMBackendConfig
-from agency.sandbox.agsandbox import agSandboxConfig
 
 _NOTE_TEXT = (
     "The quick brown fox jumps over the lazy dog. "
@@ -62,21 +54,20 @@ def main():
     data_dir = run_dir / "data"
     print(f"Run dir  : {run_dir}\n")
 
-    # One agConfig, built from two owners' views: agllm_backend fields
-    # (including a deliberately too-small max_completion_tokens) plus an
-    # agSandbox "data" mount, set once here and never changed.
-    cfg = agConfig(
-        agVLLMBackendConfig(
-            base_url=os.environ.get("LLM_BASE_URL"),
-            model=os.environ.get("LLM_MODEL", ""),
-            api_key=os.environ.get("LLM_API_KEY", ""),
-            temperature=0.7,
-            top_p=0.95,
-            top_k=20,
-            max_completion_tokens=32,
-        ),
-        agSandboxConfig().add_mount("data", data_dir, "/data"),
+    # One flat agconfig: LLM fields (including a deliberately too-small
+    # max_completion_tokens) plus an agSandbox "data" mount, set once here
+    # and never changed.
+    cfg = agconfig(
+        provider="vllm",
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
+        max_completion_tokens=32,
     )
+    cfg.add_mount("data", data_dir, "/data")
 
     write_note = agskill(
         name="write_note",
@@ -110,18 +101,17 @@ def main():
     print(
         "Bumping max_completion_tokens: 32 -> 4096 (dynamic update via ag.change_config, same agent)\n"
     )
-    new_cfg = agConfig(
-        agVLLMBackendConfig(
-            base_url=os.environ.get("LLM_BASE_URL"),
-            model=os.environ.get("LLM_MODEL", ""),
-            api_key=os.environ.get("LLM_API_KEY", ""),
-            temperature=0.7,
-            top_p=0.95,
-            top_k=20,
-            max_completion_tokens=4096,
-        ),
-        agSandboxConfig().add_mount("data", data_dir, "/data"),
+    new_cfg = agconfig(
+        provider="vllm",
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
+        max_completion_tokens=4096,
     )
+    new_cfg.add_mount("data", data_dir, "/data")
     ag.change_config(new_cfg)
 
     print(">> [call 2] max_completion_tokens=4096")

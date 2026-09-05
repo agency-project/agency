@@ -7,9 +7,9 @@ import os
 import sqlite3
 import threading
 import time
-from types import SimpleNamespace
 
-from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+from agency.observability.agdatalogger import agDataLogger
+from agency.configs.agconfig import agconfig as agconfig_cls
 
 
 # ---------------------------------------------------------------------------
@@ -18,8 +18,10 @@ from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
 
 
 def _make_agconfig(db_path, **overrides):
-    configs = agDataLoggerConfigs(db_path=db_path, **overrides)
-    return SimpleNamespace(agDataLoggerConfigs=configs)
+    return agconfig_cls(
+        data_logger_db_path=db_path,
+        **{f"data_logger_{name}": value for name, value in overrides.items()},
+    )
 
 
 def _make_logger(tmp_path, **overrides):
@@ -38,20 +40,24 @@ def _select_all(db_path, table):
 
 
 # ---------------------------------------------------------------------------
-# agDataLoggerConfigs
+# agconfig data_logger_* fields
 # ---------------------------------------------------------------------------
 
 
 def test_configs_defaults():
-    configs = agDataLoggerConfigs(db_path="/tmp/does-not-matter.db")
-    assert configs.flush_batch_size == 20
-    assert configs.flush_interval_s == 0.2
+    cfg = agconfig_cls(data_logger_db_path="/tmp/does-not-matter.db")
+    assert cfg.data_logger_flush_batch_size == 20
+    assert cfg.data_logger_flush_interval_s == 0.2
 
 
 def test_configs_explicit_overrides():
-    configs = agDataLoggerConfigs(db_path="/tmp/x.db", flush_batch_size=5, flush_interval_s=0.1)
-    assert configs.flush_batch_size == 5
-    assert configs.flush_interval_s == 0.1
+    cfg = agconfig_cls(
+        data_logger_db_path="/tmp/x.db",
+        data_logger_flush_batch_size=5,
+        data_logger_flush_interval_s=0.1,
+    )
+    assert cfg.data_logger_flush_batch_size == 5
+    assert cfg.data_logger_flush_interval_s == 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -61,9 +67,9 @@ def test_configs_explicit_overrides():
 
 def test_init_reads_configs_from_agconfig(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=7, flush_interval_s=1.5)
-    assert dc._configs.db_path == db_path
-    assert dc._configs.flush_batch_size == 7
-    assert dc._configs.flush_interval_s == 1.5
+    assert dc.agconfig.data_logger_db_path == db_path
+    assert dc.agconfig.data_logger_flush_batch_size == 7
+    assert dc.agconfig.data_logger_flush_interval_s == 1.5
     assert dc._conn is None
     assert dc._event_rows == []
     assert dc._span_rows == []
@@ -80,8 +86,8 @@ def test_set_config_replaces_the_stored_configs_object(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=7)
     new_agconfig = _make_agconfig(db_path, flush_batch_size=42, flush_interval_s=9.0)
     dc.set_config(new_agconfig)
-    assert dc._configs.flush_batch_size == 42
-    assert dc._configs.flush_interval_s == 9.0
+    assert dc.agconfig.data_logger_flush_batch_size == 42
+    assert dc.agconfig.data_logger_flush_interval_s == 9.0
 
 
 def test_set_config_changes_flush_threshold_at_runtime(tmp_path):
@@ -99,13 +105,13 @@ def test_set_config_changes_flush_threshold_at_runtime(tmp_path):
 def test_set_config_changing_db_path_does_not_move_an_open_connection(tmp_path):
     # Known, accepted limitation: swapping db_path while already started does
     # NOT reopen the connection -- flush() keeps writing to whatever file
-    # start() originally opened, even though _configs.db_path now points
-    # elsewhere. Documented here rather than silently assumed.
+    # start() originally opened, even though agconfig.data_logger_db_path now
+    # points elsewhere. Documented here rather than silently assumed.
     dc, original_path = _make_logger(tmp_path)
     dc.start()
     other_path = str(tmp_path / "other.db")
     dc.set_config(_make_agconfig(other_path))
-    assert dc._configs.db_path == other_path
+    assert dc.agconfig.data_logger_db_path == other_path
 
     dc.record_event("tool", {"n": 1})
     dc.flush()
@@ -121,8 +127,7 @@ def test_set_config_changing_db_path_does_not_move_an_open_connection(tmp_path):
 
 def test_start_creates_parent_directory(tmp_path):
     nested = tmp_path / "a" / "b" / "c"
-    configs = agDataLoggerConfigs(db_path=str(nested / "agent.db"))
-    dc = agDataLogger(SimpleNamespace(agDataLoggerConfigs=configs))
+    dc = agDataLogger(agconfig_cls(data_logger_db_path=str(nested / "agent.db")))
     assert not nested.exists()
     dc.start()
     try:
@@ -158,8 +163,7 @@ def test_start_is_safe_against_a_pre_existing_db_file(tmp_path):
     dc1.start()
     dc1.stop()
 
-    configs = agDataLoggerConfigs(db_path=db_path)
-    dc2 = agDataLogger(SimpleNamespace(agDataLoggerConfigs=configs))
+    dc2 = agDataLogger(agconfig_cls(data_logger_db_path=db_path))
     dc2.start()  # CREATE TABLE IF NOT EXISTS must not raise on a reused file
     dc2.stop()
 

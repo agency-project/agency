@@ -27,20 +27,18 @@ import html2text
 import httpx
 
 from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
-from agency.agconfig import agConfig
-from agency.llm import agVLLMBackendConfig
+from agency.configs.agconfig import agconfig
 from agency.utils.agutil import format_exception as _fmt_exc
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
-cfg = agConfig(
-    agVLLMBackendConfig(
-        base_url=os.environ.get("LLM_BASE_URL"),
-        model=os.environ.get("LLM_MODEL", ""),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        temperature=0.7,
-        top_p=0.95,
-        top_k=20,
-    )
+cfg = agconfig(
+    provider="vllm",
+    base_url=os.environ.get("LLM_BASE_URL"),
+    model=os.environ.get("LLM_MODEL", ""),
+    api_key=os.environ.get("LLM_API_KEY", ""),
+    temperature=0.7,
+    top_p=0.95,
+    top_k=20,
 )
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 _MAX_CHARS = 32_000
@@ -218,7 +216,7 @@ class PaperCrawlerTeam(agteam):
     ----------
     topic : str
         Research topic to search on arxiv.
-    agconfig : agConfig | None
+    agconfig : agconfig | None
         LLM endpoint config (and any other agconfig-based settings); falls
         back to the class-level default.
 

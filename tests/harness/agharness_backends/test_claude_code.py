@@ -26,9 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agency.agconfig import agConfig
-from agency.sandbox import agSandboxBackendConfig
-from agency.llm import agBedrockBackendConfig
+from agency.configs.agconfig import agconfig
 from agency.agdata import agdata
 from agency.agent import agent
 from agency.harness.adapters.claude_code import (
@@ -42,7 +40,7 @@ from agency.agskill import agskill
 def _make_agent(with_sandbox=True):
     ag = MagicMock()
     ag.agname = "test-agent"
-    ag.agconfig = agConfig()
+    ag.agconfig = agconfig()
     ag.model = "test-model"
     ag.sandbox = MagicMock() if with_sandbox else None
     return ag
@@ -98,7 +96,7 @@ def test_run_attempt_returns_error_when_binary_missing(monkeypatch):
     import shutil as _shutil
 
     monkeypatch.setattr(_shutil, "which", lambda name: None)
-    backend = _ClaudeCodeBackend(agConfig())
+    backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
 
     attempt = _run_attempt(backend, ag)
@@ -108,7 +106,7 @@ def test_run_attempt_returns_error_when_binary_missing(monkeypatch):
 
 
 def test_run_attempt_parses_json_result_field(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agConfig())
+    backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
 
     payload = json.dumps({"result": "Hi there!", "usage": {"input_tokens": 5, "output_tokens": 2}})
@@ -128,7 +126,7 @@ def test_run_attempt_does_not_override_home(monkeypatch, _patch_which_finds_clau
     HOME cut Claude Code off from its own ~/.claude/.credentials.json,
     forcing "Not logged in" on every run."""
     monkeypatch.setenv("HOME", "/real/home")
-    backend = _ClaudeCodeBackend(agConfig())
+    backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
 
     handle = _make_handle(stdout='{"result": "ok"}')
@@ -155,7 +153,7 @@ def test_run_attempt_does_not_override_home(monkeypatch, _patch_which_finds_clau
 
 
 def test_run_attempt_enables_exact_claude_hooks_only_while_profiling(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agConfig())
+    backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
@@ -179,7 +177,7 @@ def test_run_attempt_enables_exact_claude_hooks_only_while_profiling(_patch_whic
 
 
 def test_run_attempt_nonzero_exit_returns_error(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agConfig())
+    backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
 
     handle = _make_handle(stdout="", stderr="auth error", rc=1)
@@ -196,7 +194,7 @@ def test_run_attempt_threads_resume_session_id_into_argv(_patch_which_finds_clau
     (see test_base.py's TestSharedExecuteTemplate) and simply threaded
     through into `--resume <id>` here -- this only tests that threading,
     not the retry loop itself."""
-    backend = _ClaudeCodeBackend(agConfig())
+    backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
     handle = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
     captured = {}
@@ -215,7 +213,7 @@ def test_run_attempt_threads_resume_session_id_into_argv(_patch_which_finds_clau
 
 
 def test_run_attempt_omits_resume_flag_for_a_fresh_session(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agConfig())
+    backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
@@ -269,9 +267,10 @@ def test_real_claude_raw_text_end_to_end():
     # must actually happen, not just accept the connection. Uses the same
     # Bedrock bearer-token credential (AWS_BEARER_TOKEN_BEDROCK) this dev
     # environment already has.
-    cfg = agConfig(
-        agSandboxBackendConfig(backend="docker"),
-        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
+    cfg = agconfig(
+        backend="docker",
+        provider="bedrock",
+        model="us.anthropic.claude-sonnet-5",
     )
 
     ag = agent(agconfig=cfg, harness="claude_code")
@@ -304,9 +303,10 @@ def test_real_claude_tool_call_history_is_not_flattened():
     with the actual tool-call/tool-result turns in it -- not the old
     2-message [user, final-assistant-text] collapse, which would silently
     discard exactly this kind of turn."""
-    cfg = agConfig(
-        agSandboxBackendConfig(backend="docker"),
-        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
+    cfg = agconfig(
+        backend="docker",
+        provider="bedrock",
+        model="us.anthropic.claude-sonnet-5",
     )
     ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
@@ -337,9 +337,10 @@ def test_real_claude_structured_output_end_to_end():
     # A genuinely-working backend, not a placeholder -- see
     # test_real_claude_raw_text_end_to_end's comment for why the request
     # log check is against this agent's own agmanager_host.
-    cfg = agConfig(
-        agSandboxBackendConfig(backend="docker"),
-        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
+    cfg = agconfig(
+        backend="docker",
+        provider="bedrock",
+        model="us.anthropic.claude-sonnet-5",
     )
 
     ag = agent(agconfig=cfg, harness="claude_code")
@@ -370,9 +371,10 @@ def test_real_claude_history_continues_across_a_fresh_sandbox():
     brand-new sandbox (a different container instance) before call 2 asks
     the agent to recall that fact via `--resume` against the captured
     session blob."""
-    cfg = agConfig(
-        agSandboxBackendConfig(backend="docker"),
-        agBedrockBackendConfig(model="us.anthropic.claude-sonnet-5"),
+    cfg = agconfig(
+        backend="docker",
+        provider="bedrock",
+        model="us.anthropic.claude-sonnet-5",
     )
     skill = agskill(name="continuity_test_skill", system_prompt="You are a test assistant.")
 

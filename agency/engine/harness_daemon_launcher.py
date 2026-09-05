@@ -13,7 +13,7 @@ from ..utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_package
 from .clients import SandboxInteractionClient
 
 if TYPE_CHECKING:
-    from ..agconfig import agConfig
+    from ..configs.agconfig import agconfig as agconfig_cls
     from ..sandbox.agsandbox import agSandbox
 
 _CONTAINER_GATEWAY_DIR = "/var/run/agency_llm_gateway"
@@ -47,16 +47,17 @@ def _container_socket_path(host_path: Path) -> str:
     return f"{_CONTAINER_GATEWAY_DIR}/{host_path.name}"
 
 
-def _daemon_config(agconfig: "agConfig | None") -> dict:
+def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
     if agconfig is None:
         return {}
     # The daemon needs harness/ptrace knobs, not host credentials or live
     # Python objects. Keeping this allow-list narrow also keeps secrets out
     # of the detached process command line.
     return {
-        owner: dict(agconfig.data[owner])
-        for owner in ("agharness", "agproxy_ptrace")
-        if owner in agconfig.data
+        "binary_path": agconfig.binary_path,
+        "syscalls": list(agconfig.syscalls),
+        "profiler": agconfig.profiler,
+        "disable_harness_native_sandbox": agconfig.disable_harness_native_sandbox,
     }
 
 
@@ -74,7 +75,7 @@ def ensure_harness_daemon(
     engine_name: str,
     harness: str,
     *,
-    agconfig: "agConfig | None" = None,
+    agconfig: "agconfig_cls | None" = None,
     timeout_s: float = 30.0,
 ) -> DaemonHandle:
     """Ensure one ready Harness Manager exists for this engine and sandbox."""

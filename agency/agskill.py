@@ -7,38 +7,6 @@ from .agpolicy import agpolicy
 from .agtype import agtype
 from .agschema import agschema
 from .agtool import agtool
-from .agconfig import DynamicConfigParam, _AgConfigViewBase
-
-
-# Exists only to register agskill's config fields (via __set_name__ at import
-# time). Constants are plain class attributes (not descriptors) so other code
-# in this file needing the same hardcoded value can reference it directly.
-# Reads use a throwaway instance -- _AgSkillFields(agconfig) -- since
-# agskill instances don't hold their own agconfig (a skill runs on behalf of
-# different agents with different agconfigs), so there's no self to hang a
-# descriptor on.
-
-
-# [REFACTOR] Maybe belongs in the harness code?
-class _AgSkillFields:
-    react_max_steps = DynamicConfigParam("agskill", default=4096)
-    agbinary_validate_exec_timeout = DynamicConfigParam("agskill", default=5)
-    error_log_truncate = DynamicConfigParam("agskill", default=300)
-    last_output_log_truncate = DynamicConfigParam("agskill", default=2000)
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
-class agSkillConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agskill tunables in one call::
-
-        cfg = agConfig(agSkillConfig(react_max_steps=64))
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agskill"
 
 
 if TYPE_CHECKING:

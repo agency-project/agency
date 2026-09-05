@@ -5,7 +5,7 @@ from concurrent.futures import Future
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
-from .agconfig import agConfig
+from .configs.agconfig import agconfig as agconfig_cls
 from .observability.profiler import agprof
 
 if TYPE_CHECKING:
@@ -28,10 +28,11 @@ class agteam:
     thread and returns a pending :class:`agdata` immediately.  Field access
     on the returned value blocks until the workflow finishes::
 
-        cfg = agConfig()
-        cfg.agllm_backend.model = "claude-sonnet-5"
-        cfg.agllm_backend.provider = "anthropic"
-        cfg.agllm_backend.api_key = os.environ["ANTHROPIC_API_KEY"]
+        cfg = agconfig_cls(
+            model="claude-sonnet-5",
+            provider="anthropic",
+            api_key=os.environ["ANTHROPIC_API_KEY"],
+        )
 
         class PaperCrawlerTeam(agteam):
             agconfig = cfg
@@ -59,14 +60,14 @@ class agteam:
 
     Class attributes
     ----------------
-    agconfig : agConfig | None
+    agconfig : agconfig_cls | None
         Default LLM configuration (and any other agconfig-based settings)
         shared by all instances unless overridden at construction time.
         Agents created with no explicit ``agconfig=`` inside ``setup()``/
         ``run()`` inherit this automatically.
     """
 
-    agconfig: "agConfig | None" = None
+    agconfig: "agconfig_cls | None" = None
 
     # Global weak registry of all live agteam instances.
     _live_teams: "weakref.WeakSet[agteam]" = weakref.WeakSet()
@@ -76,13 +77,13 @@ class agteam:
         if "run" in cls.__dict__:
             _wrap_run(cls)
 
-    def __init__(self, agconfig: "agConfig | None" = None, **config) -> None:
+    def __init__(self, agconfig: "agconfig_cls | None" = None, **config) -> None:
         # Instance-level agconfig: explicit arg > class attribute. Cloned so
         # this team's own agconfig is independent of whatever source it was
         # built from -- mutating that source afterward must not silently
         # change an already-constructed team (or the agents it already spawned).
         _src_agconfig = agconfig if agconfig is not None else type(self).agconfig
-        self.agconfig: "agConfig | None" = (
+        self.agconfig: "agconfig_cls | None" = (
             _src_agconfig.clone() if _src_agconfig is not None else None
         )
         # Expose every config kwarg as a plain attribute
@@ -140,7 +141,7 @@ class agteam:
     # Helpers
     # ------------------------------------------------------------------
 
-    def change_config(self, agconfig: "agConfig") -> None:
+    def change_config(self, agconfig: "agconfig_cls") -> None:
         """Replace this team's agconfig with a clone of the given one, and
         push that same clone down to every agent this team has spawned so
         far (via ``agent.change_config``). Agents created afterward pick up
@@ -150,7 +151,7 @@ class agteam:
         for a in self._agents:
             a.change_config(self.agconfig)
 
-    def get_config_copy(self) -> "agConfig | None":
+    def get_config_copy(self) -> "agconfig_cls | None":
         """Return a clone of this team's agconfig, or None if it has none."""
         return self.agconfig.clone() if self.agconfig is not None else None
 

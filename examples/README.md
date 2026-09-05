@@ -97,11 +97,11 @@ python examples/sandbox_handoff.py
 
 ## dynamic_config_example.py
 
-**What it shows:** Composing an `agConfig` from two owners' fields in one call, and updating a `DynamicConfigParam` field on that same `agConfig` between two skill calls on the same agent — no clone, no sandbox teardown, no new agent.
+**What it shows:** Building one flat `agconfig` covering both LLM and sandbox fields in a single call, and updating a field on a fresh `agconfig` between two skill calls on the same agent via `ag.change_config()` — no sandbox teardown, no new agent.
 
-1. `agConfig(agVLLMBackendConfig(...), agSandboxConfig(...))` merges the `agllm_backend` fields (including a deliberately too-small `max_completion_tokens=32`) and an `agSandbox` "data" mount into one config.
+1. `agconfig(provider="vllm", ..., max_completion_tokens=32)` plus `cfg.add_mount("data", ...)` builds one flat config (including a deliberately too-small `max_completion_tokens=32`) with an `agSandbox` "data" mount.
 2. **Call 1** runs `write_note` with the tiny token budget; the vLLM server truncates the tool-call JSON mid-argument, so the skill can't complete within a few ReAct steps and the run fails as expected.
-3. `cfg.agllm_backend.max_completion_tokens = 4096` bumps the budget on the *same* `agConfig` — since it's a `DynamicConfigParam`, it's re-read fresh on every LLM call rather than cached/locked.
+3. A new `agconfig(..., max_completion_tokens=4096)` is built and pushed via `ag.change_config(new_cfg)` — read fresh on every LLM call, so the bump takes effect on the very next call with no clone/teardown needed.
 4. **Call 2** runs the identical skill again; with the higher budget it completes and the note is written and confirmed.
 
 ```bash

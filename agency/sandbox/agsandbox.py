@@ -7,86 +7,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from ..observability.profiler import agprof
-from ..agconfig import agConfig, StaticConfigParam, DynamicConfigParam, _AgConfigViewBase
+from ..configs.agconfig import agconfig as agconfig_cls
 from ..agname import agname as _agname
 from .base import agsandbox_backend, backend_for_image_kind
 from .container import _RUN_ID
 
 if TYPE_CHECKING:
     from ..orchestrator.agresources import agResourcePool
-
-
-# Exists to register agSandbox's config fields (via __set_name__ at import
-# time) and hold their hardcoded defaults as plain class attributes --
-# agSandbox inherits from this below, so self.base_image works via the
-# inherited ConfigParam descriptor exactly as if declared directly on it.
-# Only facade-level vocabulary lives here now (the image to run, and the
-# mounts to attach) -- every backend-mechanics tunable (timeouts, retries,
-# the docker/podman semaphore, ...) moved to agsandbox_backend.py's
-# AgSandboxBackendFields, since those are meaningful only to a container-
-# based backend, not to sandboxing in general.
-class _AgSandboxFields:
-    base_image = StaticConfigParam("agSandbox", default="agency-sandbox:latest")
-    persistent = DynamicConfigParam(
-        "agSandbox", default=False
-    )  # If True, agtool.py:dispatch_tools() never hibernates (sandbox.stop())
-    # this sandbox between tool calls within a skill run -- it only
-    # stops/commits at the skill-run boundary (agskill.py). This trades away
-    # GPU/keyring-slot release during the LLM "think" turn between tool
-    # calls (today's whole reason dispatch_tools() hibernates) for a
-    # container that stays warm for the entire skill call -- required once
-    # an agent's LLM calls or harness process themselves run inside the
-    # container rather than hopping in only for each tool call, since there
-    # is then no safe point to stop the container without killing whatever
-    # is making that call. Default False preserves today's per-tool-call
-    # hibernate behavior unchanged.
-
-
-class agSandboxConfig(_AgConfigViewBase):
-    """View over an ``agConfig`` exposing ``agSandbox``'s own vocabulary
-    (image, mounts) scoped to the ``"agSandbox"`` namespace.
-
-    ``base_image`` is a flat registered field, so it's just sugar over the
-    inherited ``update()``. ``mounts`` is a ``dict[str, tuple[str, str, str]]``
-    built incrementally (``add_mount``/``remove_mount`` read-modify-write it)
-    -- that doesn't fit ``update()``'s one-field-at-a-time-overwrite model, so
-    it's layered on top here directly via the raw ``agConfig`` get/set calls,
-    same as before this class subclassed ``_AgConfigViewBase``.
-    """
-
-    _OWNER = "agSandbox"
-
-    @property
-    def base_image(self) -> str:
-        return self._agconfig.get_static(
-            self._OWNER, "base_image", _AgSandboxFields.base_image.default
-        )
-
-    def set_base_image(self, image: str) -> "agSandboxConfig":
-        return self.update(base_image=image)
-
-    @property
-    def mounts(self) -> dict[str, tuple[str, str, str]]:
-        return self._agconfig.get_static(self._OWNER, "mounts", {})
-
-    def add_mount(
-        self, name: str, host_path, container_path: str, mode: str = "rw"
-    ) -> "agSandboxConfig":
-        # Raw (non-locking) read: this is a builder mutating a not-yet-consumed
-        # config, not a consumer resolving it — going through the `mounts`
-        # property here would lock the key via get_static() on its own first
-        # call and then immediately fail the .set() below.
-        current = self._agconfig.get(self._OWNER, "mounts", {})
-        mounts = {**current, name: (str(host_path), container_path, mode)}
-        self._agconfig.set(self._OWNER, "mounts", mounts)
-        return self
-
-    def remove_mount(self, name: str) -> "agSandboxConfig":
-        current = self._agconfig.get(self._OWNER, "mounts", {})
-        mounts = dict(current)
-        mounts.pop(name, None)
-        self._agconfig.set(self._OWNER, "mounts", mounts)
-        return self
 
 
 # Global registry of live sandboxes for atexit cleanup.
@@ -106,14 +33,14 @@ def _cleanup_all_sandboxes() -> None:
 atexit.register(_cleanup_all_sandboxes)
 
 
-class agSandbox(_AgSandboxFields):
+class agSandbox:
     """Facade over one ``agsandbox_backend`` instance for one agent.
 
     Owns nothing about *how* isolation is achieved -- that's entirely the
     backend's job (see agsandbox_backend.py: a container today, potentially
     a chroot jail or another mechanism in the future, selected via
-    ``agSandboxBackendConfig.backend``). This class resolves the image/mounts
-    vocabulary that's meaningful regardless of backend, builds the backend via
+    ``agconfig.backend``). This class resolves the image/mounts vocabulary
+    that's meaningful regardless of backend, builds the backend via
     ``agsandbox_backend.for_config()``, and forwards every sandboxing
     operation to it.
     """
@@ -122,7 +49,7 @@ class agSandbox(_AgSandboxFields):
         self,
         agname: str,
         checkpoint_image: str | None = None,
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
     ) -> None:
         with agprof.span("sandbox:create"):
             self._initialize(agname, checkpoint_image, agconfig)
@@ -131,7 +58,7 @@ class agSandbox(_AgSandboxFields):
         self,
         agname: str,
         checkpoint_image: str | None,
-        agconfig: "agConfig | None",
+        agconfig: "agconfig_cls | None",
     ) -> None:
         # Claimed from the SAME shared registry agent() uses (agname.py)
         # -- the "sandbox_" prefix guarantees this claim can never collide
@@ -150,25 +77,23 @@ class agSandbox(_AgSandboxFields):
         self._lock = threading.RLock()
         self._destroyed = False
         # Cloned so this sandbox's own agconfig is independent of the
-        # caller's -- mutating the caller's original agConfig afterward does
-        # not affect this sandbox. To change it live, mutate
-        # sandbox._agconfig (or one of its owner views) directly.
-        self._agconfig: "agConfig | None" = agconfig.clone() if agconfig is not None else None
+        # caller's -- mutating the caller's original agconfig afterward does
+        # not affect this sandbox. To change it live, use change_config().
+        self.agconfig: "agconfig_cls" = agconfig.clone() if agconfig is not None else agconfig_cls()
 
         # Container name is fixed at creation time so any explicitly serialized
         # or cross-process view still uses the same sandbox identity.
         self._name = f"sandbox-{_RUN_ID}-{self._agname}"
 
         # Resolve image/mounts once, here, rather than lazily -- a running
-        # backend is physically fixed once created, so this is a tier-2
-        # (object-static) read: it locks these keys on *this* agconfig
-        # instance against further mutation. Mounts are handed to the backend
+        # backend is physically fixed once created; agconfig.base_image/
+        # mounts aren't re-read after this. Mounts are handed to the backend
         # raw (host, container, mode) -- formatting them into a CLI flag (`-v
         # host:container:mode` for docker/podman, a bind mount for chroot) is
         # each backend's own business, not the facade's.
-        base_image = self.base_image
+        base_image = self.agconfig.base_image
         mounts: dict[str, tuple[str, str, str]] = {}
-        for mount_name, (host, container, mode) in agSandboxConfig(self._agconfig).mounts.items():
+        for mount_name, (host, container, mode) in self.agconfig.mounts.items():
             host_path = Path(host)
             host_path.mkdir(parents=True, exist_ok=True)
             mounts[mount_name] = (str(host_path.resolve()), container, mode)
@@ -217,7 +142,7 @@ class agSandbox(_AgSandboxFields):
         )
 
         self._backend = agsandbox_backend.for_config(
-            self._agconfig,
+            self.agconfig,
             agname=self._agname,
             name=self._name,
             checkpoint_image=checkpoint_image,
@@ -304,18 +229,18 @@ class agSandbox(_AgSandboxFields):
     # Config
     # ------------------------------------------------------------------
 
-    def change_config(self, agconfig: "agConfig | None") -> None:
+    def change_config(self, agconfig: "agconfig_cls | None") -> None:
         """Replace this sandbox's agconfig with a clone of the given one.
 
         Only affects fields read live going forward -- the backend's image
-        and mounts were resolved once at construction (tier-2, physically
-        fixed once the backend exists) and are not re-resolved here."""
-        self._agconfig = agconfig.clone() if agconfig is not None else None
-        self._backend.change_config(self._agconfig)
+        and mounts were resolved once at construction and are not
+        re-resolved here."""
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
+        self._backend.change_config(self.agconfig)
 
-    def get_config_copy(self) -> "agConfig | None":
-        """Return a clone of this sandbox's agconfig, or None if it has none."""
-        return self._agconfig.clone() if self._agconfig is not None else None
+    def get_config_copy(self) -> "agconfig_cls":
+        """Return a clone of this sandbox's agconfig."""
+        return self.agconfig.clone()
 
     def __getstate__(self) -> dict:
         # threading.RLock is not picklable. A lock is process-local, so there is
@@ -425,7 +350,7 @@ class agSandbox(_AgSandboxFields):
             _live_sandboxes.discard(self)
             self._backend.destroy()
 
-    def fork(self, new_agname: str, agconfig: "agConfig | None" = None) -> "agSandbox":
+    def fork(self, new_agname: str, agconfig: "agconfig_cls | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_agname* starting from this sandbox's
         current checkpoint image.  If no checkpoint exists the fork starts fresh.
 
@@ -441,7 +366,7 @@ class agSandbox(_AgSandboxFields):
         destroy() on it when done.
         """
         with agprof.span("sandbox:fork"):
-            cfg = agconfig if agconfig is not None else self._agconfig
+            cfg = agconfig if agconfig is not None else self.agconfig
             fork_sb = agSandbox(new_agname, agconfig=cfg)
             checkpoint_image = self._backend._checkpoint_image
             if checkpoint_image:

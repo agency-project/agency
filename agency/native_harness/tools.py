@@ -28,9 +28,9 @@ _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
 _WEBFETCH_DEFAULT_TIMEOUT = 30
 _WEBFETCH_MAX_TIMEOUT = 120
 
-# Same default as agtool.py's `_AgToolFields.output_offload_chars` (the
-# host-side dispatch_tools()'s own threshold) -- kept as a plain constant
-# since this package can't import agconfig (see this package's own
+# Same default as agconfig's `output_offload_chars` field (the host-side
+# dispatch_tools()'s own threshold) -- kept as a plain constant since this
+# package can't import agconfig (see this package's own
 # `__init__.py` docstring on why it avoids the `agency.*` import chain
 # entirely).
 _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000

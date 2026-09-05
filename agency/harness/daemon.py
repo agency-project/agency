@@ -20,7 +20,7 @@ from typing import Callable
 import uvicorn
 from fastapi import FastAPI
 
-from ..agconfig import agConfig
+from ..configs.agconfig import agconfig as agconfig_cls
 from . import interaction_router, mcp_proxy
 from .adapters.agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from .clients.host_services_client import HostServicesClient
@@ -147,7 +147,7 @@ def _render_attempt_prompt(request: HarnessAttemptRequest) -> str:
 
 def _run_adapter_attempt(
     request: HarnessAttemptRequest,
-    agconfig: agConfig,
+    agconfig: agconfig_cls,
     harness_base_url: str,
     model: str,
     engine_name: str,
@@ -215,11 +215,11 @@ class HarnessManager:
         engine_name: str,
         harness: str,
         *,
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
         attempt_handler: "Callable[[HarnessAttemptRequest], HarnessAttemptResult] | None" = None,
         harness_api_port: int = _HARNESS_API_PORT,
     ) -> None:
-        self._agconfig = agconfig if agconfig is not None else agConfig()
+        self._agconfig = agconfig if agconfig is not None else agconfig_cls()
         self._engine_name = engine_name
         harness_backend = agharness_backend.for_config(harness, self._agconfig)
         self._harness_api = _HarnessApiServer(host_uds_path, harness_api_port, harness_backend)
@@ -299,7 +299,7 @@ def main(argv: "list[str] | None" = None) -> None:
         args.host_uds,
         args.engine_name,
         args.harness,
-        agconfig=agConfig(json.loads(args.config_json)),
+        agconfig=agconfig_cls(**json.loads(args.config_json)),
         harness_api_port=args.harness_api_port,
     )
     stopped = threading.Event()

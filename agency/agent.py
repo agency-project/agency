@@ -15,23 +15,37 @@ from .utils.agutil import _DEFAULT_LOG_DIR
 # Global weak registry of all live agent instances.
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
+# Whitelisted LLM fields that round-trip through checkpoints/creation-event
+# logging -- NOT the whole flat agconfig (sandbox/orchestrator/etc. fields
+# were never meant to be part of a checkpoint). Built on agconfig.safe_snapshot()
+# so this is the same one canonical redaction path the webui's config editor
+# uses, rather than a second, independently-hand-maintained secret filter --
+# that's exactly how AWS credentials used to leak into checkpoints while only
+# api_key was stripped by hand here.
+_LLM_CHECKPOINT_FIELDS = (
+    "provider", "model", "base_url", "region", "context_limit",
+    "temperature", "reasoning_effort", "max_completion_tokens", "max_tokens",
+    "top_p", "frequency_penalty", "presence_penalty", "n", "stop", "logprobs",
+    "seed", "extra_body", "top_k", "repetition_penalty", "min_p", "min_tokens",
+    "guided_json", "guided_regex", "workspace_id", "aws_profile", "aws_region",
+)  # fmt: skip
 
-def _llm_config_snapshot(agconfig: "agConfig") -> dict:
-    """Backend config fields for logging/checkpointing, minus the secret
-    api_key -- a fresh, cheap (no network I/O) construction each call, not a
-    persisted instance."""
-    return {k: v for k, v in agllm.for_config(agconfig).as_dict().items() if k != "api_key"}
+
+def _llm_config_snapshot(agconfig: "agconfig_cls") -> dict:
+    """Backend config fields for logging/checkpointing, with secrets
+    redacted via agconfig.safe_snapshot() -- a fresh, cheap (no network I/O)
+    read each call, not a persisted instance."""
+    safe = agconfig.safe_snapshot()
+    return {k: safe[k] for k in _LLM_CHECKPOINT_FIELDS if safe.get(k) is not None}
 
 
 from .agdata import agdata
 from .agcontext import agcontext
-from .observability.agdatalogger import agDataLogger, agDataLoggerConfigs, _ts
+from .observability.agdatalogger import agDataLogger, _ts
 from .orchestrator import get_orchestrator
-from .sandbox.agsandbox import agSandbox, agSandboxConfig
-from .sandbox import agSandboxBackendConfig
-from .llm.agllm import agllm
+from .sandbox.agsandbox import agSandbox
 from .llm.usage_tracker import LlmUsageTracker
-from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
+from .configs.agconfig import agconfig as agconfig_cls
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .observability.profiler import agprof
@@ -42,47 +56,14 @@ if TYPE_CHECKING:
     from .engine import AgentEngine
 
 
-# Exists only to register agent's config fields (via __set_name__ at import
-# time). Reads use a throwaway instance -- _AgAgentFields(agconfig) -- since
-# these values are needed in a classmethod (load()) and an instance method
-# (save()) that doesn't otherwise inherit from this class.
-class _AgAgentFields:
-    checkpoint_save_timeout_s = DynamicConfigParam("agent", default=600)
-    checkpoint_load_timeout_s = DynamicConfigParam("agent", default=600)
-    harness = DynamicConfigParam(
-        "agent", default="native"
-    )  # Looked up via agharness_backend.for_config() by AgentEngine. "native" runs
-    # agency's own react loop as a persistent in-container process
-    # (agharness_backends/native.py); any other value names an external
-    # harness engine (claude_code/codex/opencode/grok).
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
-class agAgentConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agent tunables in one call::
-
-        cfg = agConfig(agAgentConfig(checkpoint_save_timeout_s=300))
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agent"
-
-
-# [REFACTOR] Remove
-def _classvar_or_agconfig(agconfig: "agConfig | None", name: str, classvar_default):
-    """Resolve one of agent's own knobs (log_dir, output_dir, ...): the plain
-    ClassVar default, optionally overridden by agconfig.
-
-    Deliberately NOT a ConfigParam descriptor: agent's docstring documents
-    ``agent.log_dir = Path(...)`` as a supported class-level override, and
-    assigning to a class attribute that holds a descriptor replaces the
-    descriptor itself (silently breaking it for every future instance) --
-    so these fields stay plain ClassVars, resolved via this helper instead.
-    """
-    return classvar_default if agconfig is None else agconfig.get("agent", name, classvar_default)
+def _resolve_agent_default(agconfig: "agconfig_cls | None", field: str, classvar_default):
+    """Resolve one of agent's own knobs (log_dir, output_dir): a set
+    agconfig.<field> wins; otherwise the plain ClassVar default (``agent.log_dir
+    = Path(...)``, set once before creating agents)."""
+    if agconfig is None:
+        return classvar_default
+    value = getattr(agconfig, field)
+    return value if value is not None else classvar_default
 
 
 # [REFACTOR] Check how it works
@@ -104,9 +85,6 @@ class agent:
     Class-level configuration (set once before creating agents)::
 
         agent.log_dir        = Path("runs/logs")
-        agent.ping_interval_s = 300
-        agent.poll_interval_s = 5
-        agent.max_outer_iters = 144
 
     The GPU/CPU/memory pool is no longer a class-level override on ``agent``
     -- it's owned by the process-wide orchestrator, constructed eagerly at
@@ -114,25 +92,21 @@ class agent:
     instead.
     """
 
-    # [REFACTOR] Move to agconfig
     log_dir: ClassVar[Path | None] = None
     output_dir: ClassVar[Path | None] = None
-    ping_interval_s: ClassVar[int] = 300
-    poll_interval_s: ClassVar[int] = 5
-    max_outer_iters: ClassVar[int] = 144
 
-    # Tier-1-style fallback: agent(agconfig=...) not given -> use this if set.
-    # Same "set once before creating agents" convention as the ClassVars
-    # above, so scripts that construct agents directly (agent(agname=...),
-    # with no agconfig= kwarg) still pick up a run-wide agConfig.
-    default_agconfig: "ClassVar[agConfig | None]" = None  # [REFACTOR] Remove
+    # Fallback: agent(agconfig=...) not given -> use this if set. Same "set
+    # once before creating agents" convention as log_dir/output_dir above, so
+    # scripts that construct agents directly (agent(agname=...), with no
+    # agconfig= kwarg) still pick up a run-wide agconfig.
+    default_agconfig: "ClassVar[agconfig_cls | None]" = None
 
     def __init__(
         self,
         agname: str | None = None,
         *,
         sandbox: "agSandbox | None" = None,
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
         harness: "str | None" = None,
     ):
         with agprof.span("agent:create"):
@@ -143,18 +117,24 @@ class agent:
         self,
         agname: "str | None",
         sandbox: "agSandbox | None",
-        agconfig: "agConfig | None",
+        agconfig: "agconfig_cls | None",
         harness: "str | None",
     ) -> None:
+        def _has_llm_config(cfg: "agconfig_cls | None") -> bool:
+            # A flat agconfig always has every field present (with its
+            # default), so "has the caller configured an LLM backend at
+            # all" can no longer mean "was any agllm_backend field ever
+            # .set()" -- model/provider being non-default is the pragmatic
+            # stand-in: either one identifies a real backend selection.
+            return cfg is not None and bool(cfg.model or cfg.provider)
+
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
-        if _src_agconfig is None or not _src_agconfig.data.get("agllm_backend"):
+        if not _has_llm_config(_src_agconfig):
             from .agteam import _active_team as _at
 
             _t = _at.get(None)
-            if (
-                _t is not None and _t.agconfig is not None and _t.agconfig.data.get("agllm_backend")
-            ):  # [REFACTOR] Why do we have auto team-config inheritance only when agllm_backend exists?
+            if _t is not None and _has_llm_config(_t.agconfig):
                 # Adopt the team's agconfig outright (not just for the LLM
                 # fields) -- log_dir/output_dir/sandbox settings etc. should
                 # also come from it, matching "agents inherit the team's
@@ -163,7 +143,7 @@ class agent:
             else:
                 raise TypeError(
                     "agent() requires an agconfig with LLM fields set "
-                    "(e.g. cfg.agllm_backend.model = ...) when called "
+                    "(e.g. agconfig(model=..., provider=...)) when called "
                     "outside an agteam context"
                 )
 
@@ -172,18 +152,14 @@ class agent:
         # or the active agteam's agconfig) -- mutating that source afterward
         # must not silently change an already-constructed agent. Use
         # ag.change_config(new_cfg) to change it live -- see that method.
-        self.agconfig: "agConfig | None" = (
-            _src_agconfig.clone() if _src_agconfig is not None else None
-        )  # [REFACTOR] Should use a single setter method, also no default agconfig
+        self.agconfig: "agconfig_cls" = _src_agconfig.clone()
 
         self.agname: _agname = _agname.allocate_agname(agname, prefix="agent")
         self._parent_agent_id: "str | None" = (
             None  # [REFACTOR]  Why do we need to keep reference of parent agent id?
         )
 
-        self.harness: str = (
-            harness if harness is not None else _AgAgentFields(self.agconfig).harness
-        )  # [REFACTOR] Change to config only
+        self.harness: str = harness if harness is not None else self.agconfig.harness
         self.context: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -226,16 +202,11 @@ class agent:
         initial runtime state, live registry, and the construction-event log
         -- everything that only needs agname/agconfig already resolved,
         regardless of how they were resolved."""
-        _log_dir_val = _classvar_or_agconfig(self.agconfig, "log_dir", agent.log_dir)
+        _log_dir_val = _resolve_agent_default(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
 
-        data_logger_configs = (
-            self.agconfig.__dict__.get("agDataLoggerConfigs") if reuse_data_logger_configs else None
-        )
-        if data_logger_configs is None:
-            self.agconfig.agDataLoggerConfigs = agDataLoggerConfigs(
-                db_path=str(log_dir / f"{self.agname}_data.sqlite3")
-            )
+        if not (reuse_data_logger_configs and self.agconfig.data_logger_db_path):
+            self.agconfig.data_logger_db_path = str(log_dir / f"{self.agname}_data.sqlite3")
         self.data_logger = agDataLogger(
             self.agconfig, default_name=str(self.agname), default_object="agent"
         )
@@ -277,7 +248,7 @@ class agent:
     def _register_global_catalog(self, team_name: "str | None") -> None:
         """Publish only agent identity and its detailed database location globally."""
         try:
-            agent_db_path = Path(self.data_logger._configs.db_path)
+            agent_db_path = Path(self.data_logger.db_path)
             self._orchestrator.data_logger.record_event(
                 "agent_registered",
                 {"db_path": str(agent_db_path.resolve()), "team": team_name},
@@ -357,7 +328,7 @@ class agent:
         self._control.mark_destroyed()
         self._close_handle._settle()
 
-    def change_config(self, agconfig: "agConfig") -> None:
+    def change_config(self, agconfig: "agconfig_cls") -> None:
         with self._operation_lease("change config"):
             self.agconfig = agconfig.clone()
             self.data_logger.set_config(self.agconfig)
@@ -367,13 +338,13 @@ class agent:
                 self.engine.set_config(self.agconfig)
             self.data_logger.record_event(
                 type="agent_config",
-                payload=self.agconfig.dynamic_snapshot(),
+                payload=self.agconfig.safe_snapshot(),
                 update_latest_snapshot=True,
             )
 
-    def get_config_copy(self) -> "agConfig | None":
-        """Return a clone of this agent's agconfig, or None if it has none."""
-        return self.agconfig.clone() if self.agconfig is not None else None
+    def get_config_copy(self) -> "agconfig_cls":
+        """Return a clone of this agent's agconfig."""
+        return self.agconfig.clone()
 
     # ------------------------------------------------------------------
     # Properties # [REFACTOR] Why as properties?
@@ -390,14 +361,14 @@ class agent:
 
     @property
     def output_path(self) -> Path | None:
-        out_dir = _classvar_or_agconfig(self.agconfig, "output_dir", agent.output_dir)
+        out_dir = _resolve_agent_default(self.agconfig, "output_dir", agent.output_dir)
         if out_dir is None:
             return None
         return Path(out_dir) / self.agname
 
     @property
     def container_output_path(self) -> str | None:
-        out_dir = _classvar_or_agconfig(self.agconfig, "output_dir", agent.output_dir)
+        out_dir = _resolve_agent_default(self.agconfig, "output_dir", agent.output_dir)
         if out_dir is None:
             return None
         return f"/agent_output/{self.agname}"
@@ -533,10 +504,8 @@ class agent:
         sandbox_config = self.agconfig
         agent_output_dir = self.output_path
         if agent_output_dir is not None:
-            sandbox_config = sandbox_config.clone() if sandbox_config else agConfig()
-            agSandboxConfig(sandbox_config).add_mount(
-                "agent_output", agent_output_dir, "/agent_output"
-            )
+            sandbox_config = sandbox_config.clone()
+            sandbox_config.add_mount("agent_output", agent_output_dir, "/agent_output")
         self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
         return self.sandbox
 
@@ -604,7 +573,7 @@ class agent:
         ag._parent_agent_id = str(src.agname)
         # Cloned so the fork's own agconfig is independent of src's -- see
         # the matching comment in __init__.
-        ag.agconfig = src.agconfig.clone() if src.agconfig is not None else None
+        ag.agconfig = src.agconfig.clone()
         ag.harness = src.harness
         ag.engine = None
         with src._orchestrator._event_cond:
@@ -614,12 +583,12 @@ class agent:
         with src._orchestrator._event_cond:
             with src._submission_lock:
                 ag.context = source_context.copy()
-        _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
+        _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
         if _out is not None:
-            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+            sb_cfg = sb_cfg.clone()
+            sb_cfg.add_mount("agent_output", _out, "/agent_output")
         ag.sandbox = (
             src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
         )
@@ -667,7 +636,7 @@ class agent:
     def load_all(
         cls,
         directory: "Path | str",
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
     ) -> "list[agent]":
         directory = Path(directory)
         live_names = {ag.agname: ag for ag in cls.all()}
@@ -753,7 +722,7 @@ class agent:
             backend_cls = type(self.sandbox._backend)
             backend_cls.tag_image(self.sandbox._checkpoint_image, image_tag)
             try:
-                _save_timeout = _AgAgentFields(self.agconfig).checkpoint_save_timeout_s
+                _save_timeout = self.agconfig.checkpoint_save_timeout_s
                 # Scrub the owning process's PID before embedding -- it's
                 # meaningless (and, since a .ckpt file can be restored by
                 # an unrelated process on a different host entirely,
@@ -787,15 +756,15 @@ class agent:
     def load(
         cls,
         path: "Path | str",
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
     ) -> "agent":
         """Restore an agent from a checkpoint file created by agent.save().
 
-        The checkpointed LLM config (everything except ``api_key``, which
-        ``save()`` strips) is merged into ``agconfig``'s ``agllm_backend``
-        fields -- a field already set explicitly on ``agconfig`` (e.g.
-        ``cfg.agllm_backend.api_key = ...``, to restore the secret ``save()``
-        dropped) wins over the checkpointed value.
+        The checkpointed LLM config (everything except the secret fields
+        ``save()`` strips) is applied to ``agconfig`` -- a field already
+        explicitly set on ``agconfig`` (e.g. ``cfg.api_key = ...``, to
+        restore the secret ``save()`` dropped) wins over the checkpointed
+        value; a field left at its default is filled in from the checkpoint.
         """
         path = Path(path)
         image_tag = f"agency/ckpt-restore-{_uuid_mod.uuid4().hex[:8]}"
@@ -810,7 +779,7 @@ class agent:
         checkpoint: str | None = None
         image_kind = state.get("sandbox_image_kind", "container")
         if image_bytes is not None:
-            _load_timeout = _AgAgentFields(agconfig).checkpoint_load_timeout_s
+            _load_timeout = (agconfig or agconfig_cls()).checkpoint_load_timeout_s
             backend_cls = agSandbox.backend_for_image_kind(image_kind)
             backend_cls.import_image(image_bytes, _load_timeout)
             original_tag = f"agency/ckpt-{state['agname']}"
@@ -828,13 +797,17 @@ class agent:
         ag.agname = _agname.claim_unique_agname(state["agname"])
         ag._parent_agent_id = state.get("parent_agent_id")
         _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
-        ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agConfig()
-        _already_set = (
-            _base_agconfig.data.get("agllm_backend", {}) if _base_agconfig is not None else {}
-        )
+        ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agconfig_cls()
+        # A flat agconfig always has every field present, so "was this field
+        # explicitly set by the caller" can no longer mean "present in
+        # .data" -- a field still at its class default is treated as
+        # unset, so the checkpoint's own value fills it in; anything the
+        # caller already changed (e.g. cfg.api_key = ..., restoring the
+        # secret save() stripped) wins over the checkpoint.
+        _defaults = agconfig_cls()
         for k, v in state.get("llm_config", {}).items():
-            if k not in _already_set:
-                ag.agconfig.set("agllm_backend", k, v)
+            if getattr(ag.agconfig, k) == getattr(_defaults, k):
+                setattr(ag.agconfig, k, v)
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
         ag.engine = None
@@ -844,12 +817,12 @@ class agent:
             retained_messages=state.get("retained_messages", []),
             harness_message_cursors=state.get("harness_message_cursors", {}),
         )
-        _out_dir = _classvar_or_agconfig(ag.agconfig, "output_dir", cls.output_dir)
+        _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig
         if _out is not None:
-            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
+            sb_cfg = sb_cfg.clone()
+            sb_cfg.add_mount("agent_output", _out, "/agent_output")
         if checkpoint and image_kind == "chroot":
             # Force the matching backend -- auto-detection (podman/docker
             # preferred when usable) would otherwise reconstruct this
@@ -857,8 +830,8 @@ class agent:
             # snapshot tag. Container-kind checkpoints don't need this: auto
             # picking podman vs. docker for them was already safe before
             # chroot existed.
-            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-            agSandboxBackendConfig(sb_cfg).update(backend="chroot")
+            sb_cfg = sb_cfg.clone()
+            sb_cfg.backend = "chroot"
         ag.sandbox = (
             agSandbox(ag.agname, checkpoint_image=checkpoint, agconfig=sb_cfg)
             if checkpoint

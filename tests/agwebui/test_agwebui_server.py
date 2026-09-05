@@ -11,7 +11,6 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -171,11 +170,10 @@ def test_db_provided_term_message_wins_over_synthesis(server):
 
 
 def _make_data_logger(db_path: Path):
-    from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+    from agency.observability.agdatalogger import agDataLogger
+    from agency.configs.agconfig import agconfig
 
-    logger = agDataLogger(
-        SimpleNamespace(agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(db_path)))
-    )
+    logger = agDataLogger(agconfig(data_logger_db_path=str(db_path)))
     logger.start()
     return logger
 

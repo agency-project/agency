@@ -13,15 +13,14 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from agency.agconfig import agConfig
-from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+from agency.configs.agconfig import agconfig
+from agency.observability.agdatalogger import agDataLogger
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.host_servers import host_server_manager as manager_mod
 from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.engine.host_servers.host_server_manager import (
     HostServerManager,
-    HostServerManagerConfigs,
     _AttemptFenceMiddleware,
 )
 from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
@@ -30,15 +29,15 @@ from agency.observability.profiler import agprof
 
 
 def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code"):
-    configs = HostServerManagerConfigs(uds_path=str(tmp_path / "host.sock"))
-    data_logger_configs = agDataLoggerConfigs(db_path=str(tmp_path / "agent.db"))
-    agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
-    agconfig.HostServerManagerConfigs = configs
-    agconfig.agDataLoggerConfigs = data_logger_configs
+    cfg = agconfig(
+        model="test-model",
+        host_server_uds_path=str(tmp_path / "host.sock"),
+        data_logger_db_path=str(tmp_path / "agent.db"),
+    )
     agent = SimpleNamespace(
-        agconfig=agconfig,
+        agconfig=cfg,
         harness=harness,
-        data_logger=agDataLogger(agconfig),
+        data_logger=agDataLogger(cfg),
         llm_usage_tracker=LlmUsageTracker(),
     )
     sandbox = SimpleNamespace()
@@ -64,7 +63,7 @@ def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code")
 def test_construction_uses_the_agents_own_data_logger(tmp_path):
     manager, agent, _ = _make_manager(tmp_path)
 
-    assert manager._configs.uds_path.endswith(".sock")
+    assert manager._configs.host_server_uds_path.endswith(".sock")
     assert manager._data_logger is agent.data_logger
 
 
@@ -192,7 +191,7 @@ def test_stop_cancels_llm_streams_before_joining_the_server(tmp_path):
 
 def test_stop_retains_a_live_server_thread_for_retry(tmp_path):
     manager, _, _ = _make_manager(tmp_path)
-    manager._configs.shutdown_timeout_s = 0
+    manager._configs.host_server_shutdown_timeout_s = 0
     manager._llm_handler_server = SimpleNamespace(stop=lambda: None)
     server = SimpleNamespace(should_exit=False, force_exit=False)
 
@@ -227,8 +226,8 @@ def test_stop_retains_a_live_server_thread_for_retry(tmp_path):
 
 def test_failed_start_clears_dead_worker_state_and_can_retry(tmp_path, monkeypatch):
     manager, _, _ = _make_manager(tmp_path)
-    manager._configs.startup_timeout_s = 0
-    manager._configs.shutdown_timeout_s = 0
+    manager._configs.host_server_startup_timeout_s = 0
+    manager._configs.host_server_shutdown_timeout_s = 0
     servers = []
 
     class FailedServer:
@@ -385,13 +384,13 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     suffix = uuid.uuid4().hex[:8]
     uds_path = f"/tmp/hsm_test_{suffix}.sock"
     db_path = f"/tmp/hsm_test_{suffix}.db"
-    configs = HostServerManagerConfigs(uds_path=uds_path)
-    data_logger_configs = agDataLoggerConfigs(db_path=db_path)
-    agconfig = agConfig({"agllm_backend": {"model": "test-model"}})
-    agconfig.HostServerManagerConfigs = configs
-    agconfig.agDataLoggerConfigs = data_logger_configs
+    cfg = agconfig(
+        model="test-model",
+        host_server_uds_path=uds_path,
+        data_logger_db_path=db_path,
+    )
     agent = SimpleNamespace(
-        agconfig=agconfig, data_logger=agDataLogger(agconfig), llm_usage_tracker=LlmUsageTracker()
+        agconfig=cfg, data_logger=agDataLogger(cfg), llm_usage_tracker=LlmUsageTracker()
     )
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())

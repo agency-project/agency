@@ -208,8 +208,10 @@ def test_return_value_description_mentions_path_not_content():
 class TestAgSandboxBinaryIO:
     def _make_sb(self):
         from agency.sandbox.container import _ContainerBackendBase
+        from agency.configs.agconfig import agconfig
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
+        sb._agconfig = agconfig()
         return sb
 
     def test_read_file_bytes_returns_raw_bytes(self):

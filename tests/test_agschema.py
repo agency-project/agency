@@ -279,11 +279,11 @@ def test_get_return_tool_description_prompt_agpath_warns_against_content():
 
 
 def test_prepare_inputs_in_sandbox_replaces_long_string():
-    from agency.agschema import _AgSchemaFields
+    from agency.configs.agconfig import agconfig
 
     s = agschema(agdata(text=str))
     sb = MagicMock()
-    data = agdata(text="x" * (_AgSchemaFields.input_offload_chars.default + 1))
+    data = agdata(text="x" * (agconfig().input_offload_chars + 1))
     paths, fields = s.prepare_inputs_in_sandbox(data, sb, "skill")
     assert fields == ["text"]
     assert len(paths) == 1

@@ -1,0 +1,329 @@
+"""agconfig — one flat, typed config object for the whole framework.
+
+Replaces the old tiered descriptor system (`GlobalConfigParam`/
+`StaticConfigParam`/`DynamicConfigParam`, 14 owner-scoped `*Fields` classes,
+21 `*Config` view classes spread across the codebase). Every tunable value
+in the system is now a plain member variable on this one class -- no
+owner-nesting (`cfg.temperature`, not `cfg.agllm_backend.temperature`), no
+tiers.
+
+Passed as ``agconfig=`` to any framework class's constructor. A parent
+object forwards its own ``agconfig`` to every child object it creates (e.g.
+``agent`` -> its ``agllm`` backend and ``agSandbox``), so one ``agconfig``
+built at the top of a script flows to everything it spawns::
+
+    cfg = agconfig(provider="bedrock", model="...", api_key="...", base_image="my-image:latest")
+    ag = agent(agconfig=cfg)
+
+Consumers hold a plain reference and read through it (``self.agconfig.model``),
+not a magically-inherited bare attribute -- ordinary composition, no
+descriptors involved.
+
+A handful of values that are genuinely process-wide (not meaningfully
+per-agent -- a docker call semaphore, one-time GPU/CPU/memory hardware
+detection, safety floors that must never be overridden per-agent) are
+module-level constants below, not fields on this class at all.
+
+What's deliberately dropped, not replaced, versus the old system:
+- The old tier-1 "locked after first read, can't be changed again this
+  process" guard, and each provider's ``_ALLOWED_FIELDS`` fail-fast
+  validation (every field now always exists on every instance; an
+  irrelevant field for a given provider/backend is just unused).
+  ``@dataclass(slots=True)`` keeps the one cheap, valuable safety property:
+  an unknown constructor kwarg or a typo'd attribute name still raises
+  immediately (``TypeError``/``AttributeError``) instead of silently doing
+  nothing.
+- Five fields confirmed dead (declared, never read anywhere in the
+  codebase) were dropped rather than carried forward: the old
+  ``agllm.call_max_concurrency``, ``agproxy_ptrace.attach_timeout_s``,
+  ``agent.ping_interval_s``/``poll_interval_s``/``max_outer_iters``.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field, fields
+from typing import Any, Callable, ClassVar
+
+# ---------------------------------------------------------------------------
+# Process-wide constants -- not per-agent config. Each one gates a real
+# shared resource or invariant (confirmed by tracing every reader):
+#   - DOCKER_SEMAPHORE_LIMIT: a literal module-level threading.Semaphore in
+#     sandbox/container.py, throttling every docker/podman subprocess call
+#     process-wide regardless of agent.
+#   - GPU/SYSCTL/MEMORY detection + MARKER_MB: host hardware detection runs
+#     once per process, shared by agResourcePool and the sandbox backends.
+#   - MIN_CPUS/MIN_MEMORY_MB: safety floors applied to any cpu/memory limit
+#     before it's ever applied to a running sandbox -- intentionally never
+#     per-agent overridable.
+#   - IDLE_CHECK_INTERVAL_S: read by a free function (_iter_batched) with no
+#     agconfig threaded through it at all.
+# ---------------------------------------------------------------------------
+DOCKER_SEMAPHORE_LIMIT: int = 16
+GPU_DETECT_TIMEOUT_S: float = 10
+SYSCTL_DETECT_TIMEOUT_S: float = 5
+MEMORY_DETECT_FALLBACK_MB: int = 4096
+MARKER_MB: int = 128
+MIN_CPUS: float = 1.0
+MIN_MEMORY_MB: int = 1024
+IDLE_CHECK_INTERVAL_S: float = 1.0
+
+
+def _is_json_safe(value: Any) -> bool:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_safe(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_safe(v) for k, v in value.items())
+    return False
+
+
+@dataclass(slots=True)
+class agconfig:
+    # ---------------------------------------------------------------------
+    # LLM -- merges the old "agllm" (process policy) and "agllm_backend"
+    # (per-call params) owners, plus the mock/replay backend's fields --
+    # there's no structural reason to keep any of these apart once there's
+    # no owner string forcing the split.
+    # ---------------------------------------------------------------------
+    provider: "str | None" = None
+    model: str = ""
+    api_key: "str | None" = None
+    base_url: "str | None" = None
+    region: "str | None" = None
+    context_limit: "int | None" = None
+    temperature: "float | None" = None
+    reasoning_effort: "str | None" = None
+    max_completion_tokens: "int | None" = None
+    max_tokens: "int | None" = None  # deprecated alias for max_completion_tokens
+    top_p: "float | None" = None
+    frequency_penalty: "float | None" = None
+    presence_penalty: "float | None" = None
+    n: "int | None" = None
+    stop: "str | list | None" = None
+    logprobs: "bool | int | None" = None
+    seed: "int | None" = None
+    extra_body: "dict | None" = None
+    top_k: "int | None" = None
+    repetition_penalty: "float | None" = None
+    min_p: "float | None" = None
+    min_tokens: "int | None" = None
+    guided_json: "dict | None" = None
+    guided_regex: "str | None" = None
+    workspace_id: "str | None" = None
+    aws_access_key: "str | None" = None
+    aws_secret_key: "str | None" = None
+    aws_session_token: "str | None" = None
+    aws_profile: "str | None" = None
+    aws_region: "str | None" = None
+    model_listing_timeout_seconds: float = 10.0
+    default_max_tokens: int = 128000
+    max_retries: int = 12
+    idle_timeout: float = 900.0  # seconds to wait for first chunk
+    stream_timeout: float = 1200.0  # seconds to wait between chunks mid-stream
+    retry_sleep_s: float = 2
+    http_connect_timeout: float = 10.0
+    http_write_timeout: float = 10.0
+    http_pool_timeout: float = 10.0
+    live_redraw_char_threshold: int = 100
+    rate_limit_base_backoff_s: float = 5.0
+    rate_limit_max_backoff_s: float = 80.0
+    rate_limit_retry_after_jitter_s: float = 5.0
+    default_context_limit: int = 200_000
+
+    # Mock/replay LLM backend (agency/llm/mock.py)
+    replay_db_path: "str | None" = None
+    timing_mode: str = "exact"
+    constant_ttft_s: float = 0.3
+    constant_tpot_s: float = 0.02
+    poisson_rate_hz: float = 10.0
+    poisson_ttft_mean_s: float = 0.3
+    poisson_seed: "int | None" = None
+    timing_fn: "Callable | None" = None  # a plain callable -- not JSON-safe,
+    # so safe_snapshot() silently omits it, same as any other non-JSON-safe value.
+
+    # ---------------------------------------------------------------------
+    # Sandbox facade (agency/sandbox/agsandbox.py)
+    # ---------------------------------------------------------------------
+    base_image: str = "agency-sandbox:latest"
+    persistent: bool = False
+    mounts: "dict[str, tuple[str, str, str]]" = field(default_factory=dict)
+
+    # ---------------------------------------------------------------------
+    # Sandbox backend mechanics (agency/sandbox/base.py) -- docker/podman
+    # daemon-call timeouts and retry policy. docker_semaphore_limit moved to
+    # the process-wide DOCKER_SEMAPHORE_LIMIT constant above (it gates an
+    # actual shared semaphore, not a per-agent tunable).
+    # ---------------------------------------------------------------------
+    backend: str = "auto"  # podman | docker | chroot | auto
+    inspect_timeout_s: float = 120
+    exec_quick_timeout_s: float = 120
+    docker_run_timeout_s: float = 120
+    docker_rm_timeout_s: float = 120
+    file_io_timeout_s: float = 120
+    image_timeout_s: float = 120
+    commit_timeout_s: float = 120
+    keyring_wait_timeout_s: float = 120
+    unkillable_child_grace_s: float = 10
+    container_limit_floor: int = 4
+    container_limit_buffer: int = 5
+    container_limit_fallback: int = 200
+    conflict_retry_max_attempts: int = 8
+    keyring_poll_interval_s: float = 5
+    container_removal_wait_s: float = 10
+    container_removal_poll_interval_s: float = 0.5
+    conflict_retry_backoff_base_s: float = 0.5
+    docker_stop_timeout_s: float = 120
+    docker_stop_grace_s: float = 0
+    docker_start_timeout_s: float = 120
+    stop_inspect_timeout_s: float = 30
+    commit_retry_attempts: int = 3
+    commit_retry_backoff_s: float = 1
+    stop_ps_check_timeout_s: float = 10
+    rm_retry_attempts: int = 3
+    rm_retry_backoff_s: float = 1
+    checkpoint_squash_max_depth: int = 100
+    squash_timeout_s: float = 600
+
+    # ---------------------------------------------------------------------
+    # Orchestrator (agency/orchestrator/orchestrator.py) -- the
+    # orchestrator's own global data logger. Prefixed to avoid colliding
+    # with the per-agent data_logger_* fields below, which are a different
+    # database with different defaults.
+    # ---------------------------------------------------------------------
+    max_concurrent_engines: "int | None" = None
+    orchestrator_db_path: "str | None" = None
+    orchestrator_flush_batch_size: int = 500
+    orchestrator_flush_interval_s: float = 1.0
+
+    # ---------------------------------------------------------------------
+    # Resource pool (agency/orchestrator/agresources.py) -- per-agent
+    # sandbox resource footprint. Detection timeouts and min_cpus/
+    # min_memory_mb safety floors moved to the process-wide constants above.
+    # ---------------------------------------------------------------------
+    idle_cpus: "float | None" = 8.0
+    idle_memory: "str | None" = None
+
+    # ---------------------------------------------------------------------
+    # Agent (agency/agent.py). log_dir/output_dir used to be plain ClassVars
+    # on `agent` (set once before creating agents, e.g. `agent.log_dir =
+    # Path(...)`) resolved through a helper function specifically to avoid a
+    # descriptor-on-a-class-attribute footgun -- that footgun doesn't exist
+    # once there's no descriptor at all, so they're now ordinary fields here:
+    # `agent.log_dir` stays a supported class-level default (checked first),
+    # a set `agconfig.log_dir` on a specific config overrides it.
+    # ---------------------------------------------------------------------
+    log_dir: "str | None" = None
+    output_dir: "str | None" = None
+    checkpoint_save_timeout_s: int = 600
+    checkpoint_load_timeout_s: int = 600
+    harness: str = "native"
+
+    # ---------------------------------------------------------------------
+    # Schema (agency/agschema.py)
+    # ---------------------------------------------------------------------
+    input_offload_chars: int = 40_000
+    offload_context_fraction: float = 0.1
+    chars_per_token: int = 4
+
+    # ---------------------------------------------------------------------
+    # Skill (agency/agskill.py)
+    # ---------------------------------------------------------------------
+    react_max_steps: int = 4096
+    agbinary_validate_exec_timeout: float = 5
+    error_log_truncate: int = 300
+    last_output_log_truncate: int = 2000
+
+    # ---------------------------------------------------------------------
+    # Tool (agency/agtool.py). timeout_s renamed tool_timeout_s -- it's
+    # already documented as a historical, no-longer-enforced ceiling, and
+    # "timeout_s" alone reads ambiguously next to dozens of other
+    # *_timeout_s fields once everything shares one flat namespace.
+    # ---------------------------------------------------------------------
+    tool_timeout_s: float = 1800
+    output_offload_chars: int = 40_000
+    offload_id_prefix_len: int = 12
+
+    # ---------------------------------------------------------------------
+    # Harness adapter (agency/harness/adapters/agharness_backend.py)
+    # ---------------------------------------------------------------------
+    session_resume_id: "str | None" = None
+    binary_path: "str | None" = None
+    mediation_mode: str = "auto"  # ptrace | native_hooks | auto
+
+    # ---------------------------------------------------------------------
+    # ptrace harness supervisor (agency/harness/ptrace/supervisor.py)
+    # ---------------------------------------------------------------------
+    syscalls: "tuple[str, ...]" = ("execve", "execveat")
+    profiler: "str | None" = None  # reserved for a future heavyweight profiler (e.g. perf)
+    disable_harness_native_sandbox: bool = True
+
+    # ---------------------------------------------------------------------
+    # Per-agent data logger (agency/observability/agdatalogger.py) --
+    # replaces the old informal agDataLoggerConfigs escape-hatch dataclass.
+    # db_path is computed once per agent (log_dir/<agname>_data.sqlite3) if
+    # not already set, same as today.
+    # ---------------------------------------------------------------------
+    data_logger_db_path: "str | None" = None
+    data_logger_flush_batch_size: int = 20
+    data_logger_flush_interval_s: float = 0.2
+
+    # ---------------------------------------------------------------------
+    # Host server manager (agency/engine/host_servers/host_server_manager.py)
+    # -- replaces the old informal HostServerManagerConfigs escape-hatch
+    # dataclass. uds_path is computed once per agent if not already set.
+    # ---------------------------------------------------------------------
+    host_server_uds_path: "str | None" = None
+    host_server_startup_timeout_s: float = 10.0
+    host_server_shutdown_timeout_s: float = 10.0
+
+    _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset(
+        {"api_key", "aws_access_key", "aws_secret_key", "aws_session_token"}
+    )
+
+    def clone(self) -> "agconfig":
+        """Independent copy -- mutating the clone never affects the
+        original (or vice versa). Used for agent.fork()/load()'s
+        independence guarantee and to layer a per-instance override onto a
+        shared/propagated config without touching what other in-flight
+        objects already consumed."""
+        return copy.deepcopy(self)
+
+    def update(self, **values: Any) -> "agconfig":
+        """Set several fields at once, e.g. from a partial webui-editor
+        payload. Raises on an unknown field name (same fail-fast intent the
+        old per-owner *Config views gave via _ALLOWED_FIELDS)."""
+        known = {f.name for f in fields(self)}
+        unknown = set(values) - known
+        if unknown:
+            raise TypeError(f"agconfig has no field(s) {sorted(unknown)}")
+        for name, value in values.items():
+            setattr(self, name, value)
+        return self
+
+    def safe_snapshot(self) -> "dict[str, Any]":
+        """JSON-safe, secret-redacted snapshot of every field -- what's
+        exposed to the webui's config editor and persisted into checkpoints/
+        event logs. The one canonical place that knows which fields are
+        secret; every serialization path must go through this rather than
+        hand-rolling its own filter (a second, independent filter is
+        exactly how AWS credentials used to leak into checkpoints -- see
+        the module that replaced this file's predecessor)."""
+        result: "dict[str, Any]" = {}
+        for f in fields(self):
+            if f.name.startswith("_") or f.name in self._SENSITIVE_FIELDS:
+                continue
+            value = getattr(self, f.name)
+            if not _is_json_safe(value):
+                continue
+            result[f.name] = value
+        return result
+
+    def add_mount(self, name: str, host_path, container_path: str, mode: str = "rw") -> "agconfig":
+        self.mounts[name] = (str(host_path), container_path, mode)
+        return self
+
+    def remove_mount(self, name: str) -> "agconfig":
+        self.mounts.pop(name, None)
+        return self

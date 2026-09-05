@@ -10,9 +10,8 @@ from agency.agtool import agtool
 from agency.agent import agent
 from agency._submission import Invocation
 from agency.agname import agname as _agname
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig as agconfig_cls
 from agency.engine import AgentEngine
-from agency.llm.agllm import agllm
 
 
 @pytest.fixture(autouse=True)
@@ -113,16 +112,29 @@ def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
     return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
-def _llm_agconfig(d: dict) -> agConfig:
+def _llm_agconfig(d: dict) -> agconfig_cls:
     # Force the docker sandbox backend for any test that ends up constructing
     # a real sandbox -- sandbox' "auto" selection now prefers
     # podman over docker when both are usable, but CI's images/build.sh only
     # builds/tags agency-sandbox:latest for docker, so podman has no local
     # image and would try (and fail) to pull one from a registry. This has
     # no effect on the many tests here that never touch ag.sandbox at all.
-    from agency.sandbox import agSandboxBackendConfig
+    #
+    # Default provider="mock" so agent()'s _has_llm_config() check (model or
+    # provider truthy) passes even for the many tests here that intentionally
+    # leave model="" -- they care about api_key/temperature/etc., not model.
+    d = dict(d)
+    d.setdefault("provider", "mock")
+    return agconfig_cls(backend="docker", **d)
 
-    return agConfig(agSandboxBackendConfig(backend="docker"), {"agllm_backend": dict(d)})
+
+def _inherited_config_snapshot(cfg: agconfig_cls) -> dict:
+    """safe_snapshot() minus data_logger_db_path -- that field is computed
+    per-agname (agname/<agname>_data.sqlite3), so a fork/clone legitimately
+    gets its own value even though every other field is inherited unchanged."""
+    snap = cfg.safe_snapshot()
+    snap.pop("data_logger_db_path", None)
+    return snap
 
 
 def make_agent() -> agent:
@@ -221,7 +233,7 @@ def test_scheduled_run_creates_sandbox_facade_with_output_mount(monkeypatch, tmp
     assert len(created) == 1
     agname, sandbox_config = created[0]
     assert agname == ag.agname
-    assert sandbox_config.get("agSandbox", "mounts", {}) == {
+    assert sandbox_config.mounts == {
         "agent_output": (str(tmp_path / ag.agname), "/agent_output", "rw")
     }
 
@@ -248,11 +260,7 @@ def test_harness_explicit_constructor_arg():
 
 
 def test_harness_from_agconfig():
-    from agency.agent import agAgentConfig
-
-    cfg = agConfig(
-        agAgentConfig(harness="opencode"), {"agllm_backend": {"api_key": "k", "model": ""}}
-    )
+    cfg = agconfig_cls(harness="opencode", provider="mock", api_key="k", model="")
     ag = agent(agconfig=cfg)
     assert ag.harness == "opencode"
 
@@ -439,7 +447,7 @@ def test_fork_inherits_config():
     ag = make_agent()
 
     forked = agent.fork(ag)
-    assert agllm.for_config(forked.agconfig).as_dict() == agllm.for_config(ag.agconfig).as_dict()
+    assert _inherited_config_snapshot(forked.agconfig) == _inherited_config_snapshot(ag.agconfig)
 
 
 def test_fork_inherits_harness_and_defers_engine_creation():
@@ -481,7 +489,7 @@ def test_fork_copies_history_and_config():
     ag.history = agdata(messages=[{"role": "user", "content": "prior"}])
 
     forked = agent.fork(ag)
-    assert agllm.for_config(forked.agconfig).as_dict() == agllm.for_config(ag.agconfig).as_dict()
+    assert _inherited_config_snapshot(forked.agconfig) == _inherited_config_snapshot(ag.agconfig)
     assert len(forked.history.messages) == 1
     assert forked.history.messages[0]["content"] == "prior"
 
@@ -807,7 +815,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     import sqlite3
 
     ag2.data_logger.flush()
-    con = sqlite3.connect(ag2.data_logger._configs.db_path)
+    con = sqlite3.connect(ag2.data_logger.db_path)
     types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
     con.close()
     assert "agent_loaded" in types
@@ -1073,6 +1081,49 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
     _agname._allocated.discard(ag.agname)
 
 
+def test_save_redacts_secrets_from_checkpoint(tmp_path):
+    """save()'s checkpoint must never leak api_key/aws_secret_key/
+    aws_session_token/aws_access_key in plaintext -- it must route through
+    agconfig.safe_snapshot()'s one canonical redaction path rather than a
+    second, independently hand-maintained filter that only strips api_key
+    (exactly how aws_secret_key/aws_session_token used to leak into
+    checkpoints). No sandbox/Docker needed: with no skill ever run, the
+    agent's sandbox stays None, so save() takes the state.json-only path."""
+    import tarfile
+
+    cfg = agconfig_cls(
+        provider="bedrock",
+        model="m",
+        api_key="super-secret-api-key",
+        aws_access_key="super-secret-access-key",
+        aws_secret_key="super-secret-secret-key",
+        aws_session_token="super-secret-session-token",
+    )
+    ag = agent(agconfig=cfg)
+    assert ag.sandbox is None  # no skill run -- state.json-only save path
+
+    ckpt = tmp_path / "agent.ckpt"
+    ag.save(ckpt)
+
+    with tarfile.open(ckpt, "r:gz") as tar:
+        raw = tar.extractfile("state.json").read()
+    text = raw.decode()
+
+    for secret in (
+        "super-secret-api-key",
+        "super-secret-access-key",
+        "super-secret-secret-key",
+        "super-secret-session-token",
+    ):
+        assert secret not in text
+
+    state = json.loads(raw)
+    assert state["llm_config"]["provider"] == "bedrock"
+    assert state["llm_config"]["model"] == "m"
+    for field in ("api_key", "aws_access_key", "aws_secret_key", "aws_session_token"):
+        assert field not in state["llm_config"]
+
+
 # ---------------------------------------------------------------------------
 # Skill outcome events
 # ---------------------------------------------------------------------------
@@ -1082,7 +1133,7 @@ def _recorded_event_types(ag) -> list:
     import sqlite3
 
     ag.data_logger.flush()
-    con = sqlite3.connect(ag.data_logger._configs.db_path)
+    con = sqlite3.connect(ag.data_logger.db_path)
     types = [row[0] for row in con.execute("SELECT type FROM events").fetchall()]
     con.close()
     return types
@@ -1140,10 +1191,9 @@ from agency.agschema import agschema as _agschema
 
 
 def test_prepare_inputs_in_sandbox_replaces_long_string():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_val = "x" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(text=long_val, small="hi")
     paths, fields = _agschema(agdata(text=str, small=str)).prepare_inputs_in_sandbox(
         inp, sandbox, "mskill"
@@ -1175,11 +1225,10 @@ def test_prepare_inputs_in_sandbox_skips_non_string_scalars():
 
 
 def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
-    long_val = "y" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_val = "y" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(text=long_val)
     paths, fields = _agschema(agdata(text=str)).prepare_inputs_in_sandbox(inp, sandbox, "skill")
     assert paths == []
@@ -1188,11 +1237,10 @@ def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
 
 
 def test_prepare_inputs_in_sandbox_list_large_strings_replaced_with_paths():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_a = "a" * (_AgSchemaFields.input_offload_chars.default + 1)
-    long_b = "b" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_a = "a" * (agconfig_cls().input_offload_chars + 1)
+    long_b = "b" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(items=[long_a, long_b])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     assert sandbox.write_file.call_count == 2
@@ -1216,10 +1264,9 @@ def test_prepare_inputs_in_sandbox_list_short_strings_unchanged():
 
 
 def test_prepare_inputs_in_sandbox_list_mixed_only_large_replaced():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_val = "x" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(items=["short", long_val])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     sandbox.write_file.assert_called_once()
@@ -1237,11 +1284,10 @@ def test_prepare_inputs_in_sandbox_list_non_string_elements_skipped():
 
 
 def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
-    long_val = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_val = "x" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(items=[long_val])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     assert paths == []
@@ -1250,10 +1296,9 @@ def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged
 
 
 def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    data_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
+    data_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(frames=[data_url, data_url])
     schema = agdata(frames=list[agimage])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1263,10 +1308,9 @@ def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
 
 
 def test_prepare_inputs_in_sandbox_skips_single_agtype_field():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    data_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
+    data_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(photo=data_url)
     schema = agdata(photo=agimage)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1275,12 +1319,11 @@ def test_prepare_inputs_in_sandbox_skips_single_agtype_field():
 
 
 def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
     # After agbinary.prepare() the value is a short sandbox path, but the skip
     # should fire on the schema hint alone — verify with a long string too.
-    long_path = "/workspace/inputs/" + "a" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_path = "/workspace/inputs/" + "a" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(audio=long_path)
     schema = agdata(audio=agbinary)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1290,10 +1333,9 @@ def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
 
 
 def test_prepare_inputs_in_sandbox_skips_agbinary_list_fields():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_path = "/workspace/inputs/" + "b" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_path = "/workspace/inputs/" + "b" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(clips=[long_path, long_path])
     schema = agdata(clips=list[agbinary])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1313,10 +1355,9 @@ def test_prepare_inputs_in_sandbox_processes_agfile_field_via_prepare():
 
 
 def test_prepare_inputs_in_sandbox_offloads_agrawstring_when_long():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_text = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_text = "x" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(prompt=long_text)
     schema = agdata(prompt=agrawstring)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1337,10 +1378,9 @@ def test_prepare_inputs_in_sandbox_preserves_short_agrawstring():
 
 
 def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_val = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_val = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(images={"a": long_val})
     schema = agdata(images=dict[str, agimage])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1350,10 +1390,9 @@ def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
 
 
 def test_prepare_inputs_in_sandbox_skips_tuple_agtype_field():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_val = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_val = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(pair=(long_val, "label"))
     schema = agdata(pair=tuple[agimage, str])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1495,10 +1534,9 @@ def test_recover_agtype_outputs_dict_of_list_agfile():
 
 
 def test_offload_skips_nested_list_agimage():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(batches=[[long_url], [long_url]])
     schema = agdata(batches=list[list[agimage]])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1507,10 +1545,9 @@ def test_offload_skips_nested_list_agimage():
 
 
 def test_offload_skips_dict_of_list_agimage():
-    from agency.agschema import _AgSchemaFields
 
     sandbox = MagicMock()
-    long_url = "data:image/jpeg;base64," + "A" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
     inp = agdata(groups={"g": [long_url]})
     schema = agdata(groups=dict[str, list[agimage]])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1640,11 +1677,10 @@ def test_random_offload_agtype_skip_fuzz():
     """100 randomly generated single-field schemas: _offload_large_fields must
     skip fields whose hint contains any non-agrawstring agtype at any nesting
     depth, and must offload plain str and agrawstring fields when the value
-    exceeds _AgSchemaFields.input_offload_chars.default.
+    exceeds agconfig_cls().input_offload_chars.
     """
     import random
     from typing import get_origin, get_args
-    from agency.agschema import _AgSchemaFields
 
     rng = random.Random(20240629)
 
@@ -1675,7 +1711,7 @@ def test_random_offload_agtype_skip_fuzz():
             return any(hint_has_non_raw_agtype(a) for a in args)
         return False
 
-    long_str = "x" * (_AgSchemaFields.input_offload_chars.default + 1)
+    long_str = "x" * (agconfig_cls().input_offload_chars + 1)
 
     failures = []
     for trial in range(100):
@@ -1734,15 +1770,15 @@ def test_agent_change_config_clones_given_agconfig():
     ag = make_agent()
     new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
     ag.change_config(new_cfg)
-    new_cfg.agllm_backend.temperature = 0.9
-    assert ag.agconfig.get("agllm_backend", "temperature") == 0.2
+    new_cfg.temperature = 0.9
+    assert ag.agconfig.temperature == 0.2
 
 
 def test_agent_change_config_updates_agconfig_attr():
     ag = make_agent()
     new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
     ag.change_config(new_cfg)
-    assert ag.agconfig.get("agllm_backend", "temperature") == 0.2
+    assert ag.agconfig.temperature == 0.2
     assert ag.agconfig is not new_cfg  # cloned, not aliased
 
 
@@ -1754,17 +1790,17 @@ def test_agent_get_config_copy_returns_clone_not_same_object():
 
 def test_agent_get_config_copy_reflects_current_values():
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))
-    assert ag.get_config_copy().agllm_backend.temperature == 0.7
+    assert ag.get_config_copy().temperature == 0.7
 
 
 def test_agent_get_config_copy_after_change_config_reflects_new_values():
     ag = make_agent()
     ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
-    assert ag.get_config_copy().agllm_backend.temperature == 0.2
+    assert ag.get_config_copy().temperature == 0.2
 
 
 def test_mutating_agent_get_config_copy_does_not_affect_agent():
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))
     copy = ag.get_config_copy()
-    copy.agllm_backend.temperature = 0.1
-    assert ag.agconfig.get("agllm_backend", "temperature") == 0.7
+    copy.temperature = 0.1
+    assert ag.agconfig.temperature == 0.7

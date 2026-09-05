@@ -25,7 +25,6 @@ import os
 import httpx
 import openai
 
-from .agllm import _AgProviderBackendConfig, _OPENAI_GEN_FIELDS, _VLLM_EXTRA_GEN_FIELDS
 from .openai import _OpenAICompatibleBackend
 from .anthropic import (
     _AnthropicBackend,
@@ -37,24 +36,6 @@ try:
     import anthropic as _anthropic_sdk
 except ImportError:
     _anthropic_sdk = None
-
-
-class agBedrockBackendConfig(_AgProviderBackendConfig):
-    """agLLMBackendConfig restricted to the fields Amazon Bedrock backends
-    read. `for_config()` picks between two backends under the hood based on
-    `model`: non-Anthropic models go through `_OpenAICompatibleBedrockBackend`
-    (the OpenAI-compatible Mantle gateway -- full generation surface, same as
-    `agVLLMBackendConfig`); Anthropic models on Bedrock go through
-    `_AnthropicBedrockBackend`, which -- like `agAnthropicBackendConfig` --
-    only applies temperature, top_p, max_tokens, and extra_body["top_k"],
-    silently ignoring the rest. `provider` is fixed to "bedrock"."""
-
-    _PROVIDER = "bedrock"
-    _ALLOWED_FIELDS = (
-        frozenset({"model", "api_key", "region", "context_limit"})
-        | _OPENAI_GEN_FIELDS
-        | _VLLM_EXTRA_GEN_FIELDS
-    )
 
 
 def _is_anthropic_bedrock_model(model: str) -> bool:
@@ -124,8 +105,8 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
     every Bedrock model except Anthropic's own (see module docstring above)."""
 
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
-        region = self.region or "us-east-1"
-        api_key = self.api_key or os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or None
+        region = self.agconfig.region or "us-east-1"
+        api_key = self.agconfig.api_key or os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or None
         mantle_url = f"https://bedrock-mantle.{region}.api.aws/v1"
         runtime_url = f"https://bedrock-runtime.{region}.amazonaws.com"
         # A Bedrock API key (e.g. "ABSK...") is a single opaque bearer token
@@ -164,7 +145,7 @@ class _AnthropicBedrockBackend(_AnthropicBackend):
             raise RuntimeError(
                 "Anthropic models on Bedrock require the 'anthropic' package: pip install anthropic"
             )
-        region = self.region or "us-east-1"
+        region = self.agconfig.region or "us-east-1"
         return _anthropic_sdk.AnthropicBedrock(aws_region=region, timeout=timeout)
 
     def list_models(self) -> list:
@@ -189,25 +170,25 @@ class _AnthropicAWSBackend(_AnthropicBackend):
 
     def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
         kwargs: dict = dict(timeout=timeout)
-        api_key = self.api_key or os.environ.get("ANTHROPIC_AWS_API_KEY")
+        api_key = self.agconfig.api_key or os.environ.get("ANTHROPIC_AWS_API_KEY")
         if api_key:
             kwargs["api_key"] = api_key
         for key in ("aws_access_key", "aws_secret_key", "aws_session_token", "aws_profile"):
-            value = getattr(self, key)
+            value = getattr(self.agconfig, key)
             if value:
                 kwargs[key] = value
-        region = self.aws_region or self.region
+        region = self.agconfig.aws_region or self.agconfig.region
         if region:
             kwargs["aws_region"] = region
         workspace_id = (
-            self.workspace_id
+            self.agconfig.workspace_id
             or os.environ.get("ANTHROPIC_AWS_WORKSPACE_ID")
             or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         )
         if workspace_id:
             kwargs["workspace_id"] = workspace_id
         base_url = (
-            self.base_url
+            self.agconfig.base_url
             or os.environ.get("ANTHROPIC_AWS_BASE_URL")
             or os.environ.get("ANTHROPIC_BASE_URL")
         )
@@ -230,7 +211,7 @@ class _AnthropicAWSBackend(_AnthropicBackend):
         if _anthropic_sdk is None or not hasattr(_anthropic_sdk, "AnthropicAWS"):
             return []
         client = _anthropic_sdk.AnthropicAWS(
-            **self._client_kwargs(httpx.Timeout(self.model_listing_timeout_seconds))
+            **self._client_kwargs(httpx.Timeout(self.agconfig.model_listing_timeout_seconds))
         )
         return list(client.models.list())
 

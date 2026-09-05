@@ -11,7 +11,6 @@ sandbox as m; m.X`) works exactly like the old
 
 from .base import (
     AgSandboxBackendFields,
-    agSandboxBackendConfig,
     agsandbox_backend,
     backend_for_image_kind,
 )
@@ -30,7 +29,6 @@ from .chroot import _ChrootBackend, chroot_available
 
 __all__ = [
     "AgSandboxBackendFields",
-    "agSandboxBackendConfig",
     "agsandbox_backend",
     "backend_for_image_kind",
     "_ContainerAlreadyRunning",

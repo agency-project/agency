@@ -7,28 +7,16 @@ import time
 from typing import TYPE_CHECKING
 
 from ..utils.agutil import (
-    _AgResourcePoolFields,
     _allocate_gpu_markers,
     detect_cpus,
     detect_gpus,
     detect_memory_mb,
 )
 from ..observability.profiler import agprof
-from ..agconfig import agConfig, _AgConfigViewBase
+from ..configs.agconfig import MIN_CPUS, MIN_MEMORY_MB, agconfig as agconfig_cls
 
 if TYPE_CHECKING:
     from ..observability.agdatalogger import agDataLogger
-
-
-class agResourcePoolConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agResourcePool tunables in one call::
-
-        cfg = agConfig(agResourcePoolConfig(gpu_detect_timeout_s=20))
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agResourcePool"
 
 
 def _memory_mb_to_docker_str(memory_mb: "float | None") -> "str | None":
@@ -51,7 +39,7 @@ class _GpuRequest:
         self.granted_ids: "list[int] | None" = None
 
 
-class agResourcePool(_AgResourcePoolFields):
+class agResourcePool:
     """Manages shared GPU tokens and CPU/memory limits for all sandboxes.
 
     All parameters are optional — call ``agResourcePool()`` with no arguments
@@ -75,11 +63,9 @@ class agResourcePool(_AgResourcePoolFields):
     (what an agent may request). ``idle_cpus``/``idle_memory`` are the
     resting-state limits -- applied both when a sandbox container is first
     created (see ``agsandbox.py``'s ``_ensure_started()``) and whenever it's
-    reset to idle afterward (restored by ``cpu_release``). Both are
-    ``DynamicConfigParam`` -- inherited from ``_AgResourcePoolFields``, so
-    they're re-read live from whichever ``agconfig`` this pool holds; the
-    keyword arguments below are just a convenience for setting them at
-    construction without building an ``agResourcePoolConfig`` separately.
+    reset to idle afterward (restored by ``cpu_release``). Read fresh from
+    ``self.agconfig`` on every use; the keyword arguments below are just a
+    convenience for setting them at construction.
     """
 
     def __init__(
@@ -90,16 +76,14 @@ class agResourcePool(_AgResourcePoolFields):
         idle_cpus: float | None = None,
         idle_memory: str | None = None,
         mark_gpus: bool = False,
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
         data_logger: "agDataLogger | None" = None,
     ) -> None:
-        self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
-        for _name, _value in (
-            ("idle_cpus", idle_cpus),
-            ("idle_memory", idle_memory),
-        ):
-            if _value is not None:
-                self._agconfig.set("agResourcePool", _name, _value)
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
+        if idle_cpus is not None:
+            self.agconfig.idle_cpus = idle_cpus
+        if idle_memory is not None:
+            self.agconfig.idle_memory = idle_memory
         self.gpus = list(gpus) if gpus is not None else detect_gpus()
         self.total_cpus = total_cpus if total_cpus is not None else detect_cpus()
         self.total_memory_mb = (
@@ -137,13 +121,13 @@ class agResourcePool(_AgResourcePoolFields):
             if multiprocessing.current_process().name == "MainProcess":
                 _allocate_gpu_markers(self.gpus)
 
-    def change_config(self, agconfig: "agConfig | None") -> None:
+    def change_config(self, agconfig: "agconfig_cls | None") -> None:
         """Replace this pool's agconfig with a clone of the given one."""
-        self._agconfig = agconfig.clone() if agconfig is not None else agConfig()
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
 
-    def get_config_copy(self) -> "agConfig":
+    def get_config_copy(self) -> "agconfig_cls":
         """Return a clone of this pool's agconfig."""
-        return self._agconfig.clone()
+        return self.agconfig.clone()
 
     def acquire_gpus(self, sandbox, count: int, timeout: "float | None" = None) -> "list[int]":
         """Block until *count* GPUs are free; grant them to *sandbox* (setting
@@ -271,8 +255,8 @@ class agResourcePool(_AgResourcePoolFields):
         """
         if cpus is None and memory_mb is None:
             return
-        applied_cpus = _floor(cpus, self.min_cpus)
-        applied_memory_mb = _floor(memory_mb, self.min_memory_mb)
+        applied_cpus = _floor(cpus, MIN_CPUS)
+        applied_memory_mb = _floor(memory_mb, MIN_MEMORY_MB)
         sandbox.update_limits(cpus=applied_cpus, memory=_memory_mb_to_docker_str(applied_memory_mb))
         if applied_cpus is not None:
             sandbox._cpu_acquired += applied_cpus
@@ -301,8 +285,8 @@ class agResourcePool(_AgResourcePoolFields):
         held_cpus = sandbox._cpu_acquired if cpu else 0.0
         held_mb = sandbox._memory_acquired_mb if memory else 0
         sandbox.update_limits(
-            cpus=_floor(self.idle_cpus, self.min_cpus) if cpu else None,
-            memory=self.idle_memory if memory else None,
+            cpus=_floor(self.agconfig.idle_cpus, MIN_CPUS) if cpu else None,
+            memory=self.agconfig.idle_memory if memory else None,
         )
         if cpu:
             sandbox._cpu_acquired = 0.0
@@ -353,5 +337,5 @@ class agResourcePool(_AgResourcePoolFields):
         return (
             f"agResourcePool(gpus={self.gpus!r}, "
             f"total_cpus={self.total_cpus}, total_memory_mb={self.total_memory_mb}, "
-            f"idle_cpus={self.idle_cpus}, idle_memory={self.idle_memory!r})"
+            f"idle_cpus={self.agconfig.idle_cpus}, idle_memory={self.agconfig.idle_memory!r})"
         )

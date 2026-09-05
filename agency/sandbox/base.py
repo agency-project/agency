@@ -3,7 +3,7 @@
 An `agSandbox` instance builds exactly one `agsandbox_backend` from its config
 (via `agsandbox_backend.for_config()`) and delegates every sandboxing
 operation (exec, file I/O, lifecycle, checkpointing) to it. Backend selection
-logic (podman vs. docker vs. chroot, see `agSandboxBackendConfig.backend`)
+logic (podman vs. docker vs. chroot, see `agconfig.backend`)
 lives here instead of being hardcoded into `agSandbox` itself.
 
 Every backend exposes the same surface `agSandbox` uses: `exec()`,
@@ -31,23 +31,16 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 from typing import TYPE_CHECKING, Callable
 
-from ..agconfig import agConfig, GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
+from ..configs.agconfig import agconfig as agconfig_cls
 
 if TYPE_CHECKING:
     from ..orchestrator.agresources import agResourcePool
 
 
-# ---------------------------------------------------------------------------
-# Backend config -- every tunable used by any backend, as ConfigParam
-# descriptors. `backend` (podman/docker/chroot/auto) is the analogue of
-# agllm_backend's `provider`. The rest are tier-1 (global) tunables for the
-# backend machinery itself (docker/podman daemon calls, the container
-# semaphore, the keyring quota) -- unchanged in kind from when they lived on
-# agsandbox.py's _AgSandboxFields, just moved to their own owner namespace.
-# ---------------------------------------------------------------------------
-
-
 class AgSandboxBackendFields:
+    """Plain constants unrelated to agconfig -- fallback defaults for
+    keyword args at a couple of call sites, not tunable per-agent."""
+
     DEFAULT_EXEC_TIMEOUT_S = (
         120  # Fallback for exec/_container_exec when no explicit timeout is passed.
     )
@@ -60,129 +53,6 @@ class AgSandboxBackendFields:
     WAIT_POLL_INTERVAL_S = (
         5  # wait_for_processes() fallback, overridden in practice by every real caller.
     )
-
-    backend = DynamicConfigParam("agsandbox_backend", default="auto")
-    docker_semaphore_limit = GlobalConfigParam("agsandbox_backend", default=16)
-
-    # Timeouts (seconds) for the various classes of docker/podman subprocess call.
-    inspect_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # Fast metadata queries: docker inspect, docker ps, nvidia-smi, docker update.
-    exec_quick_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # Quick in-container exec calls: kill <pids>, test -d, and similar.
-    docker_run_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # docker run: GPU init via the NVIDIA container runtime can take 60+ s under load.
-    docker_rm_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # docker rm -f: fast teardown; should complete in a few seconds.
-    file_io_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # In-container file I/O via docker exec (base64 read/write, mkdir).
-    image_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # docker images list / docker rmi.
-    commit_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # docker commit: snapshots a full overlay layer; large workspaces need extra time.
-    keyring_wait_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # Maximum time to wait for a keyring slot before abandoning a docker/podman run retry.
-    unkillable_child_grace_s = GlobalConfigParam(
-        "agsandbox_backend", default=10
-    )  # Extra time _run() waits for subprocess.run's own kill()+wait() to finish
-    # reaping a timed-out child before giving up and returning control to the
-    # caller anyway (see _run()'s docstring for why timeout= alone isn't reliable).
-
-    # _keyring_container_limit(): concurrent-container cap derived from the kernel
-    # session-keyring quota, which docker and podman (rootless, via runc) both
-    # consume identically (see that function's docstring for the full rationale).
-    container_limit_floor = GlobalConfigParam(
-        "agsandbox_backend", default=4
-    )  # Never cap below this many concurrent containers.
-    container_limit_buffer = GlobalConfigParam(
-        "agsandbox_backend", default=5
-    )  # Safety margin subtracted from the raw kernel/fallback quota.
-    container_limit_fallback = GlobalConfigParam(
-        "agsandbox_backend", default=200
-    )  # Assumed kernel quota when /proc/sys/kernel/keys/maxkeys isn't readable.
-
-    # _run_with_conflict_retry(): retrying `docker run` on name-conflict/keyring errors.
-    conflict_retry_max_attempts = GlobalConfigParam("agsandbox_backend", default=8)
-    keyring_poll_interval_s = GlobalConfigParam(
-        "agsandbox_backend", default=5
-    )  # Poll interval while waiting for a free keyring slot.
-    container_removal_wait_s = GlobalConfigParam(
-        "agsandbox_backend", default=10
-    )  # Max time to wait for a conflicting container to finish being removed.
-    container_removal_poll_interval_s = GlobalConfigParam("agsandbox_backend", default=0.5)
-    conflict_retry_backoff_base_s = GlobalConfigParam(
-        "agsandbox_backend", default=0.5
-    )  # Multiplied by attempt number for linear backoff between retries.
-
-    # stop(): hibernate (docker/podman stop, container kept).
-    docker_stop_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # docker stop: should complete fast, see docker_stop_grace_s below.
-    docker_stop_grace_s = GlobalConfigParam(
-        "agsandbox_backend", default=0
-    )  # `docker stop -t` grace period before SIGKILL. Default 0 (immediate
-    # SIGKILL) because every sandbox container's entrypoint is `tail -f
-    # /dev/null`, which never handles SIGTERM -- any nonzero grace period
-    # is pure wasted wall-clock waiting for a timeout that always fires.
-    docker_start_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=120
-    )  # docker start: resuming a hibernating container.
-
-    # commit(): checkpoint-in-place, container is not removed.
-    stop_inspect_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=30
-    )  # docker inspect (pre-commit image-id lookup).
-    commit_retry_attempts = GlobalConfigParam("agsandbox_backend", default=3)
-    commit_retry_backoff_s = GlobalConfigParam("agsandbox_backend", default=1)
-    stop_ps_check_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=10
-    )  # docker ps (checking whether the old image is still in use).
-
-    # rm_container(): force-remove teardown, discarding all container state.
-    rm_retry_attempts = GlobalConfigParam("agsandbox_backend", default=3)
-    rm_retry_backoff_s = GlobalConfigParam("agsandbox_backend", default=1)
-
-    # Every commit() is a diff layer on top of whatever the container was
-    # restarted from, and restart always resumes FROM the last checkpoint --
-    # so a long-running sandbox's layer chain grows by one every checkpoint
-    # cycle with nothing to bound it, until it crosses the container
-    # runtime's hard layer-depth cap ("max depth exceeded" on docker/moby).
-    # checkpoint_squash_max_depth periodically flattens the chain back to a
-    # single layer (export/import instead of commit) well before that cap,
-    # triggered by the chain's actual current depth
-    # (`len(_image_diff_ids(tag))`, a cheap `docker/podman inspect` --
-    # not proportional to image size) rather than a fixed commit count: a
-    # count can't account for how many layers the base image itself
-    # already consumes (a real base image was observed at 80 layers on its
-    # own), so a count-based interval could let the real depth cross the
-    # runtime's actual cap before the interval ever fired -- exactly what
-    # caused a real "max depth exceeded" failure on an ordinary plain commit.
-    checkpoint_squash_max_depth = GlobalConfigParam(
-        "agsandbox_backend", default=100
-    )  # Squash once the chain's actual depth reaches this; keep well under
-    # the real cap (~125 observed empirically on docker/moby) to leave
-    # margin for the squash itself and any variance across storage
-    # drivers/runtime versions.
-    squash_timeout_s = GlobalConfigParam(
-        "agsandbox_backend", default=600
-    )  # export/import serializes the FULL filesystem, not a diff -- needs more headroom than commit_timeout_s.
-
-
-class agSandboxBackendConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-selecting the sandbox backend::
-
-    cfg = agSandboxBackendConfig(backend="docker").agconfig
-    ag = agent(agconfig=cfg)
-    """
-
-    _OWNER = "agsandbox_backend"
 
 
 def run_with_unkillable_child_grace(
@@ -283,7 +153,7 @@ class agsandbox_backend(AgSandboxBackendFields):
 
     @staticmethod
     def for_config(
-        agconfig: "agConfig | None",
+        agconfig: "agconfig_cls | None",
         *,
         agname: str,
         name: str,
@@ -294,9 +164,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         from .chroot import chroot_available
         from .container import _runtime_works
 
-        requested = (
-            agconfig.get("agsandbox_backend", "backend", "auto") if agconfig else None
-        ) or "auto"
+        requested = (agconfig.backend if agconfig else None) or "auto"
 
         if requested == "auto":
             runtime = _auto_detect_runtime()
@@ -537,11 +405,13 @@ class agsandbox_backend(AgSandboxBackendFields):
         import base64
 
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=self.file_io_timeout_s, shell="sh"
+            f"base64 {shlex.quote(path)}", timeout=self._agconfig.file_io_timeout_s, shell="sh"
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
-                f"test -d {shlex.quote(path)}", timeout=self.exec_quick_timeout_s, shell="sh"
+                f"test -d {shlex.quote(path)}",
+                timeout=self._agconfig.exec_quick_timeout_s,
+                shell="sh",
             )
             if dir_rc == 0:
                 raise IsADirectoryError(f"Path is a directory, not a file: {path}")
@@ -571,11 +441,13 @@ class agsandbox_backend(AgSandboxBackendFields):
         import base64
 
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=self.file_io_timeout_s, shell="sh"
+            f"base64 {shlex.quote(path)}", timeout=self._agconfig.file_io_timeout_s, shell="sh"
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
-                f"test -d {shlex.quote(path)}", timeout=self.exec_quick_timeout_s, shell="sh"
+                f"test -d {shlex.quote(path)}",
+                timeout=self._agconfig.exec_quick_timeout_s,
+                shell="sh",
             )
             if dir_rc == 0:
                 raise IsADirectoryError(f"Path is a directory, not a file: {path}")
@@ -596,7 +468,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         sh_cmd = (
             f"mkdir -p $(dirname {quoted}) && printf '%s' {shlex.quote(b64)} | base64 -d > {quoted}"
         )
-        _, rc = self._container_exec(sh_cmd, timeout=self.file_io_timeout_s, shell="sh")
+        _, rc = self._container_exec(sh_cmd, timeout=self._agconfig.file_io_timeout_s, shell="sh")
         if rc != 0:
             raise OSError(f"Failed to write binary file {path} in container")
 
@@ -604,7 +476,10 @@ class agsandbox_backend(AgSandboxBackendFields):
         quoted = shlex.quote(path)
         sh_cmd = f"mkdir -p $(dirname {quoted}) && cat > {quoted}"
         _, rc = self._container_exec(
-            sh_cmd, stdin=content.encode("utf-8"), timeout=self.file_io_timeout_s, shell="sh"
+            sh_cmd,
+            stdin=content.encode("utf-8"),
+            timeout=self._agconfig.file_io_timeout_s,
+            shell="sh",
         )
         if rc != 0:
             raise OSError(f"Failed to write {path} in container")
@@ -712,7 +587,7 @@ class agsandbox_backend(AgSandboxBackendFields):
             '  echo "$__p $__ppid $__st $__nm"\n'
             "done"
         )
-        output, _ = self._read_proc_table(script, timeout=self.inspect_timeout_s)
+        output, _ = self._read_proc_table(script, timeout=self._agconfig.inspect_timeout_s)
 
         proc_info: dict[int, tuple[int, str, str]] = {}  # pid → (ppid, state, name)
         for line in output.splitlines():

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from types import SimpleNamespace
 
-from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+from agency.observability.agdatalogger import agDataLogger
 from agency.agent import agent
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig as agconfig_cls
 from agency.orchestrator import get_orchestrator
 from agency.agteam import agteam
 from agency.observability.agwebui.server import _fetch_agent_detail
@@ -26,9 +25,7 @@ def test_webui_reads_selected_agent_database_on_demand(tmp_path):
     database -- the one get_orchestrator() actually writes to."""
     global_path = tmp_path / "global_data.sqlite3"
     agent_path = tmp_path / "researcher_data.sqlite3"
-    agent_logger = agDataLogger(
-        SimpleNamespace(agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(agent_path)))
-    )
+    agent_logger = agDataLogger(agconfig_cls(data_logger_db_path=str(agent_path)))
     agent_logger.start()
     agent_logger.record_event(
         "agent_state", {"state": "inactive", "skill": None}, update_latest_snapshot=True
@@ -42,9 +39,7 @@ def test_webui_reads_selected_agent_database_on_demand(tmp_path):
     )
     agent_logger.stop()
 
-    global_logger = agDataLogger(
-        SimpleNamespace(agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(global_path)))
-    )
+    global_logger = agDataLogger(agconfig_cls(data_logger_db_path=str(global_path)))
     global_logger.start()
     global_logger.record_event(
         "agent_registered",
@@ -87,7 +82,7 @@ def test_team_uses_global_logger_instead_of_own_database(tmp_path):
 
 def test_resource_pool_uses_global_logger_instead_of_own_database(tmp_path):
     path = tmp_path / "agency.sqlite3"
-    orchestrator = get_orchestrator(agConfig({"agorchestrator": {"db_path": str(path)}}))
+    orchestrator = get_orchestrator(agconfig_cls(orchestrator_db_path=str(path)))
     pool = orchestrator.agresource_pool
     assert pool._data_logger is orchestrator.data_logger
 

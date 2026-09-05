@@ -5,14 +5,11 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from agency.agconfig import agConfig
-from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+from agency.configs.agconfig import agconfig
+from agency.observability.agdatalogger import agDataLogger
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
-from agency.engine.host_servers.host_server_manager import (
-    HostServerManager,
-    HostServerManagerConfigs,
-)
+from agency.engine.host_servers.host_server_manager import HostServerManager
 from agency.engine.clients import SandboxInteractionClient
 from agency.harness.clients import HostServicesClient
 from agency.harness.daemon import HarnessManager
@@ -41,9 +38,11 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
         policy_called.set()
         return True, "mock policy allowed"
 
-    config = agConfig({"agllm_backend": {"model": "test-model"}})
-    config.HostServerManagerConfigs = HostServerManagerConfigs(uds_path=str(host_socket))
-    config.agDataLoggerConfigs = agDataLoggerConfigs(db_path=str(database))
+    config = agconfig(
+        model="test-model",
+        host_server_uds_path=str(host_socket),
+        data_logger_db_path=str(database),
+    )
     agent = SimpleNamespace(
         agconfig=config, data_logger=agDataLogger(config), llm_usage_tracker=LlmUsageTracker()
     )

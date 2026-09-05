@@ -471,19 +471,19 @@ class TestKeyringQuotaDiagnostics:
     def test_keyring_container_limit_uses_kernel_maxkeys_minus_buffer(self):
         with patch("pathlib.Path.read_text", return_value="500\n"):
             limit = _container._keyring_container_limit()
-        fields = _container.AgSandboxBackendFields()
+        fields = _container.agconfig_cls()
         assert limit == 500 - fields.container_limit_buffer
 
     def test_keyring_container_limit_never_below_floor(self):
         with patch("pathlib.Path.read_text", return_value="1\n"):
             limit = _container._keyring_container_limit()
-        fields = _container.AgSandboxBackendFields()
+        fields = _container.agconfig_cls()
         assert limit == fields.container_limit_floor
 
     def test_keyring_container_limit_falls_back_when_proc_unreadable(self):
         with patch("pathlib.Path.read_text", side_effect=OSError("no such file")):
             limit = _container._keyring_container_limit()
-        fields = _container.AgSandboxBackendFields()
+        fields = _container.agconfig_cls()
         assert limit == fields.container_limit_fallback - fields.container_limit_buffer
 
     def test_keyring_quota_reports_used_max_and_free(self):
@@ -585,8 +585,8 @@ class TestRunWithConflictRetryHooks:
         # container and then unconditionally waits for a quota slot (a no-op
         # here, but the same code path _DockerBackend relies on to also wait
         # out a keyring exhaustion discovered alongside the conflict).
-        assert rm_mock.call_count == sb.conflict_retry_max_attempts
-        assert wait_mock.call_count == sb.conflict_retry_max_attempts
+        assert rm_mock.call_count == sb._agconfig.conflict_retry_max_attempts
+        assert wait_mock.call_count == sb._agconfig.conflict_retry_max_attempts
 
     def test_final_error_names_the_live_runtime_and_includes_diagnostics(self):
         sb = self._sb()
@@ -676,7 +676,7 @@ class TestRun:
         import time as _time
 
         sb = self._sb()
-        with patch.object(_container.AgSandboxBackendFields, "unkillable_child_grace_s", 0.05):
+        with patch.object(sb._agconfig, "unkillable_child_grace_s", 0.05):
             with patch("subprocess.run", side_effect=lambda *a, **k: _time.sleep(10)):
                 start = _time.monotonic()
                 with pytest.raises(subprocess.TimeoutExpired):
@@ -694,7 +694,7 @@ class TestRun:
 
         sb = self._sb()
         sem = _container._get_docker_semaphore()
-        with patch.object(_container.AgSandboxBackendFields, "unkillable_child_grace_s", 0.05):
+        with patch.object(sb._agconfig, "unkillable_child_grace_s", 0.05):
             with patch("subprocess.run", side_effect=lambda *a, **k: _time.sleep(10)):
                 with pytest.raises(subprocess.TimeoutExpired):
                     sb._run(["podman", "x"], timeout=0.05)
@@ -1681,12 +1681,11 @@ class TestCvdOverrideProtectionIntegration:
         import functools
         import uuid
 
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls
         from agency.orchestrator.agresources import agResourcePool
         from agency.sandbox.agsandbox import agSandbox
-        from agency.sandbox import agSandboxBackendConfig
 
-        cfg = agConfig(agSandboxBackendConfig(backend=backend))
+        cfg = agconfig_cls(backend=backend)
         sb = agSandbox(str(uuid.uuid4()), agconfig=cfg)
         pool = agResourcePool(mark_gpus=False)
         assert pool.gpus, "expected at least one real GPU to be detected on this host"

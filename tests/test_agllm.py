@@ -3,17 +3,12 @@
 from unittest.mock import MagicMock, patch
 
 from agency.llm.agllm import agllm
-from agency.agconfig import agConfig
-from agency.llm.agllm import _AgLLMFields
-from agency.llm import agOpenAIBackendConfig
+from agency.configs.agconfig import agconfig
 
 
-def _cfg(**fields) -> agConfig:
-    """Test helper: wrap agllm_backend fields in an agConfig."""
-    return agConfig({"agllm_backend": fields})
-
-
-DEFAULT_CONTEXT_LIMIT = _AgLLMFields.default_context_limit.default
+def _cfg(**fields) -> agconfig:
+    """Test helper: build a flat agconfig."""
+    return agconfig(**fields)
 
 
 def build_llm_kwargs(cfg, messages, openai_tools=None):
@@ -24,7 +19,7 @@ LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localh
 
 
 def test_build_llm_kwargs_includes_reasoning_effort():
-    cfg = agConfig(agOpenAIBackendConfig(model="gpt-5.6-luna", reasoning_effort="none"))
+    cfg = agconfig(model="gpt-5.6-luna", reasoning_effort="none")
 
     kwargs = build_llm_kwargs(
         cfg, [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}], None
@@ -101,9 +96,13 @@ def test_build_llm_kwargs_max_completion_tokens_wins_when_both_present(capsys):
 
 
 def test_build_llm_kwargs_unknown_params_not_forwarded():
-    cfg = _cfg(model="m", custom_param="ignored")
+    """build_kwargs only forwards the known OpenAI-style generation params --
+    other agconfig fields (provider selection, transport config, ...) don't
+    leak into the wire kwargs."""
+    cfg = _cfg(model="m", provider="openai", base_url="http://x")
     kw = build_llm_kwargs(cfg, [], None)
-    assert "custom_param" not in kw
+    assert "provider" not in kw
+    assert "base_url" not in kw
 
 
 def test_build_llm_kwargs_extra_body_params():
@@ -135,39 +134,39 @@ def test_llm_change_config_reaches_backend():
     change_config is the supported way to push a live update through."""
     llm = agllm.for_config(_cfg(temperature=0.7))
     llm.change_config(_cfg(temperature=0.2))
-    assert llm.temperature == 0.2
+    assert llm.agconfig.temperature == 0.2
 
 
 def test_llm_change_config_clones_given_agconfig():
     llm = agllm.for_config(_cfg())
     new_cfg = _cfg(temperature=0.2)
     llm.change_config(new_cfg)
-    new_cfg.agllm_backend.temperature = 0.9
-    assert llm.temperature == 0.2
+    new_cfg.temperature = 0.9
+    assert llm.agconfig.temperature == 0.2
 
 
 def test_llm_get_config_copy_returns_clone_not_same_object():
     llm = agllm.for_config(_cfg(temperature=0.7))
     copy = llm.get_config_copy()
-    assert copy is not llm._agconfig
+    assert copy is not llm.agconfig
 
 
 def test_llm_get_config_copy_reflects_current_values():
     llm = agllm.for_config(_cfg(temperature=0.7))
-    assert llm.get_config_copy().agllm_backend.temperature == 0.7
+    assert llm.get_config_copy().temperature == 0.7
 
 
 def test_llm_get_config_copy_after_change_config_reflects_new_values():
     llm = agllm.for_config(_cfg(temperature=0.7))
     llm.change_config(_cfg(temperature=0.2))
-    assert llm.get_config_copy().agllm_backend.temperature == 0.2
+    assert llm.get_config_copy().temperature == 0.2
 
 
 def test_mutating_llm_get_config_copy_does_not_affect_llm():
     llm = agllm.for_config(_cfg(temperature=0.7))
     copy = llm.get_config_copy()
-    copy.agllm_backend.temperature = 0.1
-    assert llm.temperature == 0.7
+    copy.temperature = 0.1
+    assert llm.agconfig.temperature == 0.7
 
 
 # ---------------------------------------------------------------------------

@@ -176,7 +176,7 @@ import threading
 import uuid as _uuid
 from pathlib import Path
 
-from ..agconfig import agConfig
+from ..configs.agconfig import agconfig as agconfig_cls
 from ..utils.agutil import amd_render_node_paths_by_pci_bus
 from .base import (
     AgSandboxBackendFields,
@@ -253,7 +253,7 @@ def _probe_chroot_available() -> bool:
             proc = subprocess.run(
                 [*prefix, "--user", "--map-root-user", "--mount", "true"],
                 capture_output=True,
-                timeout=AgSandboxBackendFields().inspect_timeout_s,
+                timeout=agconfig_cls().inspect_timeout_s,
             )
         except Exception as _e:
             # This candidate prefix isn't usable (missing binary, exec
@@ -428,7 +428,7 @@ class _ChrootBackend(agsandbox_backend):
         name: str,
         checkpoint_image: "str | None",
         mounts: "dict[str, tuple[str, str, str]]",
-        agconfig: "agConfig | None",
+        agconfig: "agconfig_cls | None",
     ) -> None:
         self._agname = agname
         self._gpu_ids: list[int] = []
@@ -453,17 +453,17 @@ class _ChrootBackend(agsandbox_backend):
         self._invocation_pgids: set[int] = set()
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
-        self._agconfig = agconfig
+        self._agconfig = agconfig if agconfig is not None else agconfig_cls()
         self._name = name
         self._mounts = mounts
         self._root = _CHROOT_JAILS_DIR / name
         self._workspace = self._root / "workspace"
 
-    def change_config(self, agconfig: "agConfig | None") -> None:
-        self._agconfig = agconfig
+    def change_config(self, agconfig: "agconfig_cls | None") -> None:
+        self._agconfig = agconfig if agconfig is not None else agconfig_cls()
 
-    def get_config_copy(self) -> "agConfig | None":
-        return self._agconfig.clone() if self._agconfig is not None else None
+    def get_config_copy(self) -> "agconfig_cls":
+        return self._agconfig.clone()
 
     def _lifecycle_tag(self) -> str:
         return f"agency/lifecycle-{self._name}".lower()
@@ -574,7 +574,7 @@ class _ChrootBackend(agsandbox_backend):
             '  echo "$__p $__ppid $__pgid $__st"\n'
             "done"
         )
-        output, _ = self._read_proc_table(script, timeout=self.inspect_timeout_s)
+        output, _ = self._read_proc_table(script, timeout=self._agconfig.inspect_timeout_s)
 
         proc_info: "dict[int, tuple[int, int, str]]" = {}
         for line in output.splitlines():
@@ -843,7 +843,7 @@ class _ChrootBackend(agsandbox_backend):
                 _call,
                 args=args,
                 timeout=timeout,
-                grace_s=self.unkillable_child_grace_s,
+                grace_s=self._agconfig.unkillable_child_grace_s,
             )
             output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
             return output, proc.returncode, (pgid_holder[0] if pgid_holder else None)
@@ -883,7 +883,7 @@ class _ChrootBackend(agsandbox_backend):
                 lambda: subprocess.run(["sh", "-c", script], capture_output=True, timeout=timeout),
                 args=["sh", "-c", script],
                 timeout=timeout,
-                grace_s=self.unkillable_child_grace_s,
+                grace_s=self._agconfig.unkillable_child_grace_s,
             )
             output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
             return output, proc.returncode

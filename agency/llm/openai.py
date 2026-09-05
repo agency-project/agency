@@ -4,7 +4,7 @@ from __future__ import annotations
 import httpx
 import openai
 
-from .agllm import agllm, _AgProviderBackendConfig, _OPENAI_GEN_FIELDS
+from .agllm import agllm
 
 _HANDLED_MESSAGE_FIELDS = {"role", "content", "tool_calls", "reasoning_content", "function_call"}
 _HANDLED_DELTA_FIELDS = {"role", "content", "reasoning_content", "tool_calls", "function_call"}
@@ -33,32 +33,18 @@ def _is_chatcompletions_tool_choice(tool_choice) -> bool:
     )
 
 
-class agOpenAIBackendConfig(_AgProviderBackendConfig):
-    """agLLMBackendConfig restricted to the fields `_OpenAICompatibleBackend`
-    reads for the real OpenAI API. Excludes the vLLM/sglang-only sampling
-    extensions `agVLLMBackendConfig` allows (top_k, repetition_penalty,
-    min_p, min_tokens, guided_json, guided_regex) -- OpenAI's API rejects
-    those in extra_body. `provider` is fixed to "openai"."""
-
-    _PROVIDER = "openai"
-    _ALLOWED_FIELDS = (
-        frozenset({"model", "api_key", "base_url", "context_limit", "reasoning_effort"})
-        | _OPENAI_GEN_FIELDS
-    )
-
-
 class _OpenAICompatibleBackend(agllm):
     """Default backend: OpenAI, vLLM, or any other OpenAI-compatible endpoint."""
 
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
         return openai.OpenAI(
-            api_key=self.api_key or "EMPTY",
-            base_url=self.base_url,
+            api_key=self.agconfig.api_key or "EMPTY",
+            base_url=self.agconfig.base_url,
             timeout=timeout,
         )
 
     def tokenize_url(self) -> "str | None":
-        base_url: str = self.base_url or ""
+        base_url: str = self.agconfig.base_url or ""
         root = base_url.rstrip("/")
         if root.endswith("/v1"):
             root = root[:-3]

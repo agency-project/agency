@@ -143,8 +143,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agency import AgError, agdata, agent, agprof, agskill, agsync
-from agency.agconfig import agConfig
-from agency.llm import agBedrockBackendConfig, agVLLMBackendConfig
+from agency.configs.agconfig import agconfig
 from agency.agtype import agpath
 
 # The only line that differs between this file and the native variant.
@@ -154,21 +153,19 @@ NET_FETCH_URL = os.environ.get("NET_FETCH_URL", "https://pypi.org/pypi/numpy/jso
 
 
 if os.environ.get("LLM_BASE_URL"):
-    cfg = agConfig(
-        agVLLMBackendConfig(
-            base_url=os.environ["LLM_BASE_URL"],
-            model=os.environ.get("LLM_MODEL", ""),
-            api_key=os.environ.get("LLM_API_KEY", ""),
-            temperature=0.7,
-            top_p=0.95,
-        )
+    cfg = agconfig(
+        provider="vllm",
+        base_url=os.environ["LLM_BASE_URL"],
+        model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
     )
 else:
-    cfg = agConfig(
-        agBedrockBackendConfig(
-            model=os.environ.get("LLM_MODEL", "us.anthropic.claude-sonnet-5"),
-            region=os.environ.get("LLM_REGION", "us-east-1"),
-        )
+    cfg = agconfig(
+        provider="bedrock",
+        model=os.environ.get("LLM_MODEL", "us.anthropic.claude-sonnet-5"),
+        region=os.environ.get("LLM_REGION", "us-east-1"),
     )
 
 

@@ -645,8 +645,7 @@ def test_on_exit_callback_fires():
 
 @ptrace
 def test_launch_resolves_openat_path():
-    from agency.agconfig import agConfig
-    from agency.harness.ptrace.supervisor import agPtraceConfig
+    from agency.configs.agconfig import agconfig
 
     events = []
 
@@ -655,7 +654,7 @@ def test_launch_resolves_openat_path():
             events.append(event)
             return True
 
-    cfg = agConfig(agPtraceConfig(syscalls=("execve", "execveat", "openat", "open")))
+    cfg = agconfig(syscalls=("execve", "execveat", "openat", "open"))
     px = agProxyPtrace(cfg)
     handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=RecordingPolicy())
     stdout, stderr, rc = handle.wait(timeout=10)
@@ -675,10 +674,9 @@ def test_deny_openat_blocks_file_read():
                 return (False, "no reading /etc/hostname")
             return True
 
-    from agency.agconfig import agConfig
-    from agency.harness.ptrace.supervisor import agPtraceConfig
+    from agency.configs.agconfig import agconfig
 
-    cfg = agConfig(agPtraceConfig(syscalls=("execve", "execveat", "openat", "open")))
+    cfg = agconfig(syscalls=("execve", "execveat", "openat", "open"))
     px = agProxyPtrace(cfg)
     handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=DenyHostnamePolicy())
     stdout, stderr, rc = handle.wait(timeout=10)

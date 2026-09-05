@@ -21,45 +21,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from ...agconfig import DynamicConfigParam, _AgConfigViewBase
-
 if TYPE_CHECKING:
-    from ...agconfig import agConfig
-
-
-class AgHarnessFields:
-    """Every harness config field used by any backend, as
-    DynamicConfigParam descriptors -- see llm/agllm.py's
-    AgLLMBackendFields for the same pattern."""
-
-    session_resume_id = DynamicConfigParam(
-        "agharness", default=None
-    )  # the harness's own session id from a prior run on this agent, for
-    # multi-turn resume -- set by a concrete backend after its first execute().
-    binary_path = DynamicConfigParam(
-        "agharness", default=None
-    )  # override the harness CLI's resolved path; None = look up the
-    # backend-specific default binary name via PATH.
-    mediation_mode = DynamicConfigParam(
-        "agharness", default="auto"
-    )  # "ptrace" | "native_hooks" | "auto" (ptrace if ptrace_available(),
-    # else native_hooks with a logged reduced-coverage warning) -- see
-    # `harness/_native_hooks.py`.
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
-class agHarnessConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agharness fields in one call::
-
-        cfg = agConfig(agHarnessConfig(mediation_mode="native_hooks"))
-        ag = agent(agconfig=cfg, harness="codex")
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agharness"
+    from ...configs.agconfig import agconfig as agconfig_cls
 
 
 @dataclass
@@ -95,7 +58,7 @@ class AdapterRuntime:
     logging, and UI state must not leak across the host/sandbox boundary.
     """
 
-    agconfig: "agConfig"
+    agconfig: "agconfig_cls"
     model: str
     engine_name: str
     harness_base_url: str
@@ -104,20 +67,20 @@ class AdapterRuntime:
     sandbox: "AdapterSandbox | None" = None
 
 
-class agharness_backend(AgHarnessFields):
+class agharness_backend:
     """One backend instance per agconfig -- drives one off-the-shelf
     harness CLI in place of agskill's native ReAct loop. Use
     `agharness_backend.for_config(engine, agconfig)` to get the right
     subclass; don't instantiate a subclass directly."""
 
-    def __init__(self, agconfig: "agConfig") -> None:
-        self._agconfig = agconfig.clone()
+    def __init__(self, agconfig: "agconfig_cls") -> None:
+        self.agconfig = agconfig.clone()
 
-    def change_config(self, agconfig: "agConfig") -> None:
-        self._agconfig = agconfig.clone()
+    def change_config(self, agconfig: "agconfig_cls") -> None:
+        self.agconfig = agconfig.clone()
 
-    def get_config_copy(self) -> "agConfig":
-        return self._agconfig.clone()
+    def get_config_copy(self) -> "agconfig_cls":
+        return self.agconfig.clone()
 
     def run_daemon_attempt(
         self,
@@ -144,7 +107,7 @@ class agharness_backend(AgHarnessFields):
         raise NotImplementedError
 
     @staticmethod
-    def for_config(harness: str, agconfig: "agConfig") -> "agharness_backend":
+    def for_config(harness: str, agconfig: "agconfig_cls") -> "agharness_backend":
         from .claude_code import _ClaudeCodeBackend
         from .codex import _CodexBackend
         from .grok import _GrokBackend

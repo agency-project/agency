@@ -19,20 +19,18 @@ import time
 from pathlib import Path
 
 from agency import agent, agdata, agskill, agteam
-from agency.agconfig import agConfig
-from agency.llm import agVLLMBackendConfig
+from agency.configs.agconfig import agconfig
 from agency.agtype import agpath
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
-cfg = agConfig(
-    agVLLMBackendConfig(
-        base_url=os.environ.get("LLM_BASE_URL"),
-        model=os.environ.get("LLM_MODEL", ""),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        temperature=0.7,
-        top_p=0.95,
-        top_k=20,
-    )
+cfg = agconfig(
+    provider="vllm",
+    base_url=os.environ.get("LLM_BASE_URL"),
+    model=os.environ.get("LLM_MODEL", ""),
+    api_key=os.environ.get("LLM_API_KEY", ""),
+    temperature=0.7,
+    top_p=0.95,
+    top_k=20,
 )
 
 

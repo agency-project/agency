@@ -3,7 +3,6 @@
 from .orchestrator import (
     GlobalAgentOrchestrator,
     OrchestratorSnapshot,
-    agOrchestratorConfig,
     get_orchestrator,
     peek_orchestrator,
 )
@@ -13,7 +12,6 @@ __all__ = [
     "GlobalAgentOrchestrator",
     "ExecutionScheduler",
     "OrchestratorSnapshot",
-    "agOrchestratorConfig",
     "get_orchestrator",
     "peek_orchestrator",
 ]

@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import json
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.harness.adapters.claude_code import _ClaudeCodeBackend
 
 
 def _backend() -> _ClaudeCodeBackend:
-    return _ClaudeCodeBackend(agConfig())
+    return _ClaudeCodeBackend(agconfig())
 
 
 def _text_block(text, index=0):

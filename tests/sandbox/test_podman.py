@@ -58,13 +58,12 @@ def _make_sandbox(**kwargs):
     podman daemon (see for_config()'s availability check) -- correct for
     those tests, but NOT for the mock-based unit tests below, which use
     _make_backend() instead specifically to avoid that requirement."""
-    from agency.agconfig import agConfig
+    from agency.configs.agconfig import agconfig as agconfig_cls
     from agency.sandbox.agsandbox import agSandbox
-    from agency.sandbox import agSandboxBackendConfig
 
     uid = str(uuid.uuid4())
-    agconfig = kwargs.pop("agconfig", None)
-    cfg = agConfig(agSandboxBackendConfig(backend="podman"), agconfig)
+    cfg = kwargs.pop("agconfig", None) or agconfig_cls()
+    cfg.backend = "podman"
     return agSandbox(uid, agconfig=cfg, **kwargs)
 
 
@@ -196,7 +195,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
                     with patch.object(sb, "_gpu_count_requested", 0):
@@ -229,7 +228,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted(stdout=b"", returncode=1)  # tag not found
             return FakeCompleted()
 
-        with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
                     with patch.object(sb, "_gpu_count_requested", 0):
@@ -303,7 +302,7 @@ class TestDanglingImageEagerCleanup:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._PodmanBackend, "_run", fake_run):
                     with patch.object(sb, "_container_status", return_value="running"):
                         with patch.object(sb, "_gpu_count_requested", 0):
@@ -354,7 +353,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
                     with patch.object(sb, "_gpu_count_requested", 0):
@@ -437,7 +436,6 @@ class TestDanglingImageEagerCleanup:
         for why a bare name that resolves to `localhost/alpine:latest` via
         Podman's `_resolve_image()` fails outright unless that exact tag was
         already pulled locally."""
-        import agency.sandbox.podman as _mod
 
         sb = _make_sandbox()
         sb._backend._base_image = "agency-sandbox:latest"
@@ -464,7 +462,7 @@ class TestDanglingImageEagerCleanup:
         try:
             sb.exec("echo one")
             before = _dangling_ids()
-            with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
                 sb.commit()
             after = _dangling_ids()
 
@@ -569,7 +567,7 @@ class TestCheckpointSquash:
         import agency.sandbox.podman as _mod
 
         sb = _make_backend()
-        max_depth = sb.checkpoint_squash_max_depth
+        max_depth = sb._agconfig.checkpoint_squash_max_depth
         deep_chain = [f"sha256:layer{i}" for i in range(max_depth)]
         calls = []
 
@@ -658,7 +656,7 @@ class TestCheckpointSquash:
                 return _FakeCompleted(stdout=b'["sha256:layer0"]')
             return _FakeCompleted()
 
-        with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._PodmanBackend, "_run", fake_run):
                 with patch.object(sb, "_container_status", return_value="running"):
                     with patch.object(sb, "_gpu_count_requested", 0):
@@ -688,7 +686,7 @@ class TestCheckpointSquash:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._PodmanBackend, "_run", fake_run):
                     with patch.object(sb, "_container_status", return_value="running"):
                         with patch.object(sb, "_gpu_count_requested", 0):
@@ -1084,7 +1082,6 @@ class TestCheckpointAccumulator:
         produces, the accumulator's own fold-count bookkeeping mismatches
         the real chain depth and the fast path can't be trusted -- exactly
         the scenario this test exists to exercise."""
-        import agency.sandbox.podman as _mod
 
         sb = _make_sandbox()
 
@@ -1104,7 +1101,7 @@ class TestCheckpointAccumulator:
         sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
 
         t0 = time.time()
-        with patch.object(_mod._PodmanBackend, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._agconfig, "checkpoint_squash_max_depth", 1):
             sb.commit()  # this cycle commits AND squashes
         elapsed = time.time() - t0
 

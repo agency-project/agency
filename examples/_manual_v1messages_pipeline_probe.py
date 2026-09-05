@@ -22,17 +22,15 @@ LLM_CONTEXT_LIMIT when the backend's model metadata endpoint is unavailable.
 import os
 from pathlib import Path
 from agency import agent, agskill, agdata
-from agency.agconfig import agConfig
-from agency.llm import agBedrockBackendConfig, agVLLMBackendConfig
+from agency.configs.agconfig import agconfig
 from agency.agtype import agpath
 
 if os.environ.get("LLM_BASE_URL"):
-    cfg = agConfig(
-        agVLLMBackendConfig(
-            base_url=os.environ["LLM_BASE_URL"],
-            model=os.environ.get("LLM_MODEL", ""),
-            api_key=os.environ.get("LLM_API_KEY", ""),
-        )
+    cfg = agconfig(
+        provider="vllm",
+        base_url=os.environ["LLM_BASE_URL"],
+        model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
     )
 else:
     bedrock_kwargs = {
@@ -41,7 +39,7 @@ else:
     }
     if os.environ.get("LLM_CONTEXT_LIMIT"):
         bedrock_kwargs["context_limit"] = int(os.environ["LLM_CONTEXT_LIMIT"])
-    cfg = agConfig(agBedrockBackendConfig(**bedrock_kwargs))
+    cfg = agconfig(provider="bedrock", **bedrock_kwargs)
 
 
 def _make_run_dir(name: str):

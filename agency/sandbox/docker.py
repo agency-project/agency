@@ -112,7 +112,7 @@ class _DockerBackend(_ContainerBackendBase):
                 self._run(
                     [self._runtime, "info", "--format", "{{json .}}"],
                     check=True,
-                    timeout=self.inspect_timeout_s,
+                    timeout=self._agconfig.inspect_timeout_s,
                 ).stdout.decode("utf-8", errors="replace")
             )
         except Exception as _e:
@@ -301,7 +301,7 @@ class _DockerBackend(_ContainerBackendBase):
                 completed = subprocess.run(
                     prefix + ["version"],
                     capture_output=True,
-                    timeout=self.inspect_timeout_s,
+                    timeout=self._agconfig.inspect_timeout_s,
                 )
             except Exception as _e:
                 # Expected when this prefix can't even be launched (missing
@@ -363,7 +363,7 @@ class _DockerBackend(_ContainerBackendBase):
             created = subprocess.run(
                 ctr_n + ["snapshots", "view", view, chain_id],
                 capture_output=True,
-                timeout=self.inspect_timeout_s,
+                timeout=self._agconfig.inspect_timeout_s,
             )
             if created.returncode != 0:
                 # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
@@ -379,7 +379,7 @@ class _DockerBackend(_ContainerBackendBase):
                 ctr_n + ["snapshots", "mounts", "/tmp/agency-ctr-unused", view],
                 capture_output=True,
                 text=True,
-                timeout=self.inspect_timeout_s,
+                timeout=self._agconfig.inspect_timeout_s,
             )
             if mounts.returncode != 0:
                 # DATACOLLECTOR: append, agname=self._agname -- fast-squash degrade warning for this cycle.
@@ -411,7 +411,7 @@ class _DockerBackend(_ContainerBackendBase):
                     subprocess.run(
                         ["sudo", "-n", "chmod", "-R", "a+rX", str(diff_dir.parent)],
                         capture_output=True,
-                        timeout=self.inspect_timeout_s,
+                        timeout=self._agconfig.inspect_timeout_s,
                     )
                 except Exception as _e:
                     # Best-effort: fold will see an unreadable dir and
@@ -460,7 +460,7 @@ class _DockerBackend(_ContainerBackendBase):
                 subprocess.run(
                     ctr_n + ["snapshots", "rm", view],
                     capture_output=True,
-                    timeout=self.inspect_timeout_s,
+                    timeout=self._agconfig.inspect_timeout_s,
                 )
             except Exception as _e:
                 # Best-effort cleanup of the temporary view snapshot.

@@ -29,11 +29,10 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from ...agconfig import GlobalConfigParam, DynamicConfigParam, _AgConfigViewBase
+from ...configs.agconfig import agconfig as agconfig_cls
 from .._syscall_event import agsyscallevent
 
 if TYPE_CHECKING:
-    from ...agconfig import agConfig
     from ...agent import agent
     from ...agpolicy import agpolicy
 
@@ -341,37 +340,6 @@ def _isolated_profiler_callback(callback: Callable) -> Callable:
     return invoke
 
 
-class _AgPtraceFields:
-    """Every agproxy_ptrace tunable, expressed as config descriptors."""
-
-    syscalls = DynamicConfigParam(
-        "agproxy_ptrace", default=("execve", "execveat")
-    )  # which syscalls the seccomp filter traps; see _ctypes_defs.SYSCALL_NUMBERS
-    # for the full set this module knows how to resolve arguments for.
-    profiler = DynamicConfigParam(
-        "agproxy_ptrace", default=None
-    )  # reserved for selecting a future heavyweight process profiler such as
-    # perf. This is deliberately separate from the automatic, low-cost agprof
-    # lifecycle records above: an active agprof session must see Tier-2
-    # spawn/exit coverage without requiring an unrelated config selector.
-    disable_harness_native_sandbox = DynamicConfigParam(
-        "agproxy_ptrace", default=True
-    )  # advisory flag for agharness backends: prefer disabling a harness's own
-    # OS-level sandboxing (bwrap/seatbelt/landlock) when running under
-    # agproxy_ptrace, to avoid seccomp-filter-stacking surprises (see the
-    # design doc's "Design Tensions" section). Not enforced by this module.
-    attach_timeout_s = GlobalConfigParam(
-        "agproxy_ptrace", default=30
-    )  # ceiling on waiting for the traced process's initial post-TRACEME stop.
-
-    def __init__(self, agconfig: "agConfig | None" = None) -> None:
-        self._agconfig = agconfig
-
-
-class agPtraceConfig(_AgConfigViewBase):
-    _OWNER = "agproxy_ptrace"
-
-
 class agProxyPtraceHandle:
     """A single launched, traced process tree. Returned by
     `agProxyPtrace.launch()`; not constructed directly."""
@@ -444,7 +412,7 @@ class agProxyPtrace:
 
     def __init__(
         self,
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
         *,
         allow_initial_exec: bool = False,
     ) -> None:
@@ -466,7 +434,9 @@ class agProxyPtrace:
         traced child is forked in the correct PID and mount namespaces. There
         is deliberately no host-to-container relay path here.
         """
-        syscalls = _AgPtraceFields(self._agconfig).syscalls
+        syscalls = (
+            self._agconfig.syscalls if self._agconfig is not None else agconfig_cls().syscalls
+        )
         process_profiler = _ProcessLifecycleProfiler.for_active_session(
             ag,
             envp,
@@ -522,7 +492,6 @@ class agProxyPtrace:
 
 __all__ = [
     "agsyscallevent",
-    "agPtraceConfig",
     "agProxyPtrace",
     "agProxyPtraceHandle",
     "ptrace_available",

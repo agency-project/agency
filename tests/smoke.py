@@ -6,10 +6,10 @@ from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agent import agent
 from agency.agtool import agtool
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 
-LLM_CONFIG = {"api_key": "dummy", "model": ""}
-LLM_AGCONFIG = agConfig({"agllm_backend": LLM_CONFIG})
+LLM_CONFIG = {"api_key": "dummy", "model": "dummy-model"}
+LLM_AGCONFIG = agconfig(**LLM_CONFIG)
 
 
 # ---------------------------------------------------------------------------

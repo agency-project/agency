@@ -63,13 +63,13 @@ def _make_sandbox(**kwargs):
     process-wide auto-detected default (which now prefers podman when both
     are usable -- see sandbox.base.agsandbox_backend.for_config()).
     """
-    from agency.agconfig import agConfig
+    from agency.configs.agconfig import agconfig as agconfig_cls
     from agency.sandbox.agsandbox import agSandbox
-    from agency.sandbox import agSandboxBackendConfig
 
     uid = str(uuid.uuid4())
-    agconfig = kwargs.pop("agconfig", None)
-    cfg = agConfig(agSandboxBackendConfig(backend="docker"), agconfig)
+    passed_cfg = kwargs.pop("agconfig", None)
+    cfg = passed_cfg.clone() if passed_cfg is not None else agconfig_cls()
+    cfg.backend = "docker"
     # Configuration-only tests do not need a live daemon.  The production
     # selector now validates explicit runtimes eagerly, so isolate those unit
     # tests from the daemon probe while leaving @docker operations untouched.
@@ -81,16 +81,15 @@ def _make_sandbox(**kwargs):
 def _agconfig_with_output_dir(output_dir):
     """Build an agconfig mounting output_dir at /agent_output, replacing the
     old output_dir= constructor kwarg."""
-    from agency.agconfig import agConfig
-    from agency.sandbox.agsandbox import agSandboxConfig
+    from agency.configs.agconfig import agconfig as agconfig_cls
 
-    cfg = agConfig()
-    agSandboxConfig(cfg).add_mount("agent_output", output_dir, "/agent_output")
+    cfg = agconfig_cls()
+    cfg.add_mount("agent_output", output_dir, "/agent_output")
     return cfg
 
 
 def test_facade_construction_does_not_start_backend():
-    from agency.agconfig import agConfig
+    from agency.configs.agconfig import agconfig as agconfig_cls
     from agency.sandbox.agsandbox import agSandbox
 
     backend = MagicMock()
@@ -98,7 +97,7 @@ def test_facade_construction_does_not_start_backend():
         "agency.sandbox.agsandbox.agsandbox_backend.for_config",
         return_value=backend,
     ):
-        sandbox = agSandbox(str(uuid.uuid4()), agconfig=agConfig())
+        sandbox = agSandbox(str(uuid.uuid4()), agconfig=agconfig_cls())
 
     try:
         backend._ensure_started.assert_not_called()
@@ -636,61 +635,69 @@ class TestGpuMarkers:
 
 class TestAgSandboxChangeConfigAndGetConfigCopy:
     def test_change_config_replaces_agconfig(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
-        sb.change_config(agConfig({"agllm_backend": {"temperature": 0.2}}))
-        assert sb._agconfig.get("agllm_backend", "temperature") == 0.2
+        sb = _make_sandbox(agconfig=agconfig_cls(temperature=0.7))
+        sb.change_config(agconfig_cls(temperature=0.2))
+        assert sb.agconfig.temperature == 0.2
 
     def test_change_config_clones_given_agconfig(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls
 
-        sb = _make_sandbox(agconfig=agConfig())
-        new_cfg = agConfig({"agllm_backend": {"temperature": 0.2}})
+        sb = _make_sandbox(agconfig=agconfig_cls())
+        new_cfg = agconfig_cls(temperature=0.2)
         sb.change_config(new_cfg)
-        new_cfg.agllm_backend.temperature = 0.9
-        assert sb._agconfig.get("agllm_backend", "temperature") == 0.2
+        new_cfg.temperature = 0.9
+        assert sb.agconfig.temperature == 0.2
 
     def test_get_config_copy_returns_clone_not_same_object(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls
 
-        cfg = agConfig({"agllm_backend": {"temperature": 0.7}})
+        cfg = agconfig_cls(temperature=0.7)
         sb = _make_sandbox(agconfig=cfg)
         copy = sb.get_config_copy()
-        assert copy is not sb._agconfig
+        assert copy is not sb.agconfig
 
     def test_get_config_copy_reflects_current_values(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
-        assert sb.get_config_copy().agllm_backend.temperature == 0.7
+        sb = _make_sandbox(agconfig=agconfig_cls(temperature=0.7))
+        assert sb.get_config_copy().temperature == 0.7
 
     def test_mutating_get_config_copy_does_not_affect_sandbox(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        sb = _make_sandbox(agconfig=agconfig_cls(temperature=0.7))
         copy = sb.get_config_copy()
-        copy.agllm_backend.temperature = 0.1
-        assert sb._agconfig.get("agllm_backend", "temperature") == 0.7
+        copy.temperature = 0.1
+        assert sb.agconfig.temperature == 0.7
 
     @docker
-    def test_get_config_copy_none_when_no_agconfig(self):
+    def test_get_config_copy_defaults_when_no_agconfig_given(self):
         # Bypasses _make_sandbox()'s forced backend="docker" agconfig on purpose --
         # this test is specifically about the truly-no-agconfig-at-all pathway.
+        # agSandbox.agconfig is always a real agconfig instance (never None), so
+        # constructing without one just means the sandbox falls back to defaults.
+        from agency.configs.agconfig import agconfig as agconfig_cls
         from agency.sandbox.agsandbox import agSandbox
 
         sb = agSandbox(str(uuid.uuid4()))
         try:
-            assert sb.get_config_copy() is None
+            copy = sb.get_config_copy()
+            assert copy is not None
+            assert copy.base_image == agconfig_cls().base_image
         finally:
             sb.destroy()
 
-    def test_change_config_none_clears_agconfig(self):
-        from agency.agconfig import agConfig
+    def test_change_config_none_resets_to_default_agconfig(self):
+        # agSandbox.agconfig can never be None -- change_config(None) resets
+        # it to a fresh default agconfig instead of clearing it.
+        from agency.configs.agconfig import agconfig as agconfig_cls
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        sb = _make_sandbox(agconfig=agconfig_cls(temperature=0.7))
         sb.change_config(None)
-        assert sb.get_config_copy() is None
+        assert sb.get_config_copy() is not None
+        assert sb.get_config_copy().temperature == agconfig_cls().temperature
 
 
 # ---------------------------------------------------------------------------
@@ -771,19 +778,19 @@ class TestAgSandboxLifecycle:
         simulate a second view of the same one (matching what cloudpickle
         actually does across worker processes: it preserves the
         already-computed name rather than reallocating it)."""
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls
         from agency.sandbox.agsandbox import agSandbox
-        from agency.sandbox import agSandboxBackendConfig, agsandbox_backend
+        from agency.sandbox import agsandbox_backend
 
         agname = str(uuid.uuid4())
-        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
+        cfg = agconfig_cls(backend="docker")
         sb_worker = agSandbox(agname, agconfig=cfg)  # "worker" — starts the container
         main_backend = agsandbox_backend.for_config(
             cfg,
             agname=sb_worker._backend._agname,
             name=sb_worker._backend._name,
             checkpoint_image=None,
-            base_image=sb_worker.base_image,
+            base_image=sb_worker.agconfig.base_image,
             mounts={},
         )  # "main process" — same name, never started it
         tag = f"agency/test-commit-started-false-{agname[:8]}"
@@ -823,8 +830,8 @@ class TestAgSandboxLifecycle:
     def test_ensure_started_reuses_running_container(self):
         """_ensure_started() must reuse a container already running in Docker rather
         than destroying it and starting fresh — the cross-worker-process file-persistence fix."""
-        from agency.agconfig import agConfig
-        from agency.sandbox import agSandboxBackendConfig, agsandbox_backend
+        from agency.configs.agconfig import agconfig as agconfig_cls
+        from agency.sandbox import agsandbox_backend
 
         sb = _make_sandbox()
         # Start the container and write a sentinel file.
@@ -838,13 +845,13 @@ class TestAgSandboxLifecycle:
         # on every construction (see agsandbox.py's __init__), so passing
         # sb's agname through it again would produce a DIFFERENT name, not
         # the same one this test needs to simulate reuse.
-        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
+        cfg = agconfig_cls(backend="docker")
         worker_backend = agsandbox_backend.for_config(
             cfg,
             agname=sb._backend._agname,
             name=sb._backend._name,
             checkpoint_image=None,
-            base_image=sb.base_image,
+            base_image=sb.agconfig.base_image,
             mounts={},
         )
         worker_backend._ensure_started()
@@ -1303,7 +1310,16 @@ class TestAgSandboxLifecycle:
         try:
             # Manually create a container in 'Created' state (no --detach run, just create).
             subprocess.run(
-                ["docker", "create", "--name", name, sb.base_image, "tail", "-f", "/dev/null"],
+                [
+                    "docker",
+                    "create",
+                    "--name",
+                    name,
+                    sb.agconfig.base_image,
+                    "tail",
+                    "-f",
+                    "/dev/null",
+                ],
                 capture_output=True,
                 check=True,
             )
@@ -1430,7 +1446,7 @@ class TestAgSandboxLifecycle:
 
 # ---------------------------------------------------------------------------
 # agSandbox — persistent sandboxes skip per-tool-call hibernation
-# (agtool.py:dispatch_tools(), agsandbox.py's _AgSandboxFields.persistent)
+# (agtool.py:dispatch_tools(), agconfig.persistent)
 # ---------------------------------------------------------------------------
 
 
@@ -1759,9 +1775,11 @@ class TestAgSandboxReadFileUnit:
     """
 
     def _make_sb(self):
+        from agency.configs.agconfig import agconfig as agconfig_cls
         from agency.sandbox.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
+        sb._agconfig = agconfig_cls()
         return sb
 
     def test_read_file_returns_text_content(self):

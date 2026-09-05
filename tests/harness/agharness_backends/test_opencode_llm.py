@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import json
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.harness.adapters.opencode import _OpencodeBackend
 
 
 def _backend() -> _OpencodeBackend:
-    return _OpencodeBackend(agConfig())
+    return _OpencodeBackend(agconfig())
 
 
 def test_harness_to_agency_plain_messages():

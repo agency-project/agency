@@ -12,11 +12,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig as agconfig_cls
 from agency.agcontext import agcontext
 from agency.agdata import agdata, agerror
 from agency.agent import agent
-from agency.orchestrator import agOrchestratorConfig, get_orchestrator
+from agency.orchestrator import get_orchestrator
 from agency.orchestrator.scheduler import ExecutionScheduler
 from agency.observability.profiler import agprof
 from agency.agskill import agskill
@@ -24,10 +24,11 @@ from agency.engine import AgentEngine
 
 
 def _agent(tmp_path, *, max_engines=None):
-    config = agConfig(
-        agOrchestratorConfig(max_concurrent_engines=max_engines),
-        {"agent": {"log_dir": str(tmp_path)}},
-        {"agllm_backend": {"api_key": "test", "model": ""}},
+    config = agconfig_cls(
+        max_concurrent_engines=max_engines,
+        log_dir=str(tmp_path),
+        api_key="test",
+        model="m",
     )
     sandbox = MagicMock()
     sandbox._lock = threading.RLock()
@@ -582,8 +583,8 @@ def test_agents_keep_separate_data_loggers(tmp_path):
     first = _agent(tmp_path)
     second = _agent(tmp_path)
 
-    first_path = Path(first.data_logger._configs.db_path)
-    second_path = Path(second.data_logger._configs.db_path)
+    first_path = Path(first.data_logger.db_path)
+    second_path = Path(second.data_logger.db_path)
     assert first_path != second_path
     assert first_path.name == f"{first.agname}_data.sqlite3"
     assert second_path.name == f"{second.agname}_data.sqlite3"

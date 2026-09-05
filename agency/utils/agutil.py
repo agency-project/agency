@@ -14,42 +14,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator, Iterable, TypeVar
 
-from ..agconfig import DynamicConfigParam, GlobalConfigParam, _AgConfigViewBase
+from ..configs.agconfig import (
+    GPU_DETECT_TIMEOUT_S,
+    IDLE_CHECK_INTERVAL_S,
+    MARKER_MB,
+    MEMORY_DETECT_FALLBACK_MB,
+    SYSCTL_DETECT_TIMEOUT_S,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 _T = TypeVar("_T")
-# Kept as a plain module attribute (not a ConfigParam) -- tests/conftest.py
-# monkeypatches this by name (`monkeypatch.setattr(_agutil_module,
-# "_BATCH_INTERVAL_S", 0.0)`) to speed up streaming tests; a descriptor would
-# silently break that.
+# Kept as a plain module attribute -- tests/conftest.py monkeypatches this by
+# name (`monkeypatch.setattr(_agutil_module, "_BATCH_INTERVAL_S", 0.0)`) to
+# speed up streaming tests.
 _BATCH_INTERVAL_S: float = 0.1  # main thread drains stream every 100 ms
-
-
-# Exists only to register agutil's config fields (via __set_name__ at import
-# time). Tier 1 (global): _iter_batched is a free function with no agconfig
-# threaded through it, so — like _AgResourcePoolFields -- reads use a
-# throwaway instance and GlobalConfigParam ignores it anyway, always routing
-# to agConfig.GLOBAL.
-class _AgUtilFields:
-    idle_check_interval_s = GlobalConfigParam(
-        "agutil", default=1.0
-    )  # how often to check idle timeout
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
-class agUtilConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agutil tunables in one call::
-
-        cfg = agConfig(agUtilConfig(idle_check_interval_s=0.5))
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agutil"
 
 
 _THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
@@ -184,7 +164,7 @@ def _iter_batched(
         _current_timeout = stream_timeout if _streaming else idle_timeout
         try:
             if _current_timeout is not None:
-                item = q.get(timeout=_AgUtilFields().idle_check_interval_s)
+                item = q.get(timeout=IDLE_CHECK_INTERVAL_S)
             else:
                 item = q.get()
         except queue.Empty:
@@ -637,52 +617,6 @@ def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 1
 # ---------------------------------------------------------------------------
 
 
-# Exists to register agResourcePool's config fields (via __set_name__ at
-# import time). The detection/gating tunables are tier 1 (global): read once
-# at process-wide resource-detection time, shared regardless of which
-# agconfig (if any) is in play. idle_cpus/idle_memory are tier 3 (dynamic):
-# a per-agent sandbox resource footprint, not a process-wide constant, so
-# they're read fresh from whichever agConfig the consumer holds
-# (agResourcePool itself, or a throwaway instance reading a sandbox's own
-# agconfig -- see agsandbox.py's _ensure_started(), which also applies these
-# as the container's starting limits, not just its idle-reset limits).
-class _AgResourcePoolFields:
-    gpu_detect_timeout_s = GlobalConfigParam(
-        "agResourcePool", default=10
-    )  # Seconds to wait for nvidia-smi/rocm-smi before giving up
-    sysctl_detect_timeout_s = GlobalConfigParam(
-        "agResourcePool", default=5
-    )  # Seconds to wait for sysctl hw.memsize on macOS
-    memory_detect_fallback_mb = GlobalConfigParam(
-        "agResourcePool", default=4096
-    )  # Safe fallback total RAM in MB when detection fails on both Linux and macOS
-    marker_mb = GlobalConfigParam(
-        "agResourcePool", default=128
-    )  # VRAM held per GPU as a framework presence marker (visible in nvidia-smi)
-
-    # CPU limit applied both when a sandbox container is first created (docker
-    # run) and whenever it's reset to idle (docker update, via cpu_release) --
-    # the same footprint at rest either way. idle_memory has no such fixed
-    # cap by default (None): both container.py's creation path and
-    # update_limits() treat None as "omit --memory", which is Docker's own
-    # native unlimited behavior (cgroup memory.max="max") -- correct here
-    # since sandboxes are torn down after use rather than reset-and-reused
-    # indefinitely, so there's no multi-tenant idle container to bound.
-    idle_cpus = DynamicConfigParam("agResourcePool", default=8.0)
-    idle_memory = DynamicConfigParam("agResourcePool", default=None)
-
-    # Floors applied to any cpu/memory limit before it's ever applied to a
-    # running sandbox (acquire_cpu_mem/release_cpu_mem) -- a running
-    # container throttled to 0 cpu shares or 0 memory can't make forward
-    # progress, so neither an LLM-requested value nor a misconfigured
-    # idle_cpus/idle_memory is ever allowed below this.
-    min_cpus = GlobalConfigParam("agResourcePool", default=1.0)
-    min_memory_mb = GlobalConfigParam("agResourcePool", default=1024)
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
 def _visible_device_remap(env_names: "tuple[str, ...]") -> dict[int, int]:
     """Build a physical-id -> remapped-index map from whichever of env_names
     is set (e.g. CUDA_VISIBLE_DEVICES="0,3,5,7" -> {0:0, 3:1, 5:2, 7:3}),
@@ -773,7 +707,7 @@ def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
     and there is no need to release it mid-run. Runs silently if neither
     CUDA nor ROCm is available.
     """
-    marker_bytes = _AgResourcePoolFields().marker_mb * 1024 * 1024
+    marker_bytes = MARKER_MB * 1024 * 1024
     if _allocate_gpu_markers_cuda(gpu_ids, marker_bytes):
         return
     _allocate_gpu_markers_rocm(gpu_ids, marker_bytes)
@@ -800,7 +734,7 @@ def _cvd_filter(gpu_ids: list[int]) -> list[int]:
 
 def detect_gpus() -> list[int]:
     """Return GPU IDs visible to nvidia-smi or rocm-smi, filtered by CUDA_VISIBLE_DEVICES."""
-    _timeout = _AgResourcePoolFields().gpu_detect_timeout_s
+    _timeout = GPU_DETECT_TIMEOUT_S
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
@@ -893,7 +827,7 @@ def amd_render_node_paths_by_pci_bus(candidates: "list[str]") -> "list[str] | No
             ["rocm-smi", "--showbus", "--csv"],
             capture_output=True,
             text=True,
-            timeout=_AgResourcePoolFields().gpu_detect_timeout_s,
+            timeout=GPU_DETECT_TIMEOUT_S,
         )
     except Exception:
         return None
@@ -954,11 +888,11 @@ def detect_memory_mb() -> int:
             ["sysctl", "-n", "hw.memsize"],
             capture_output=True,
             text=True,
-            timeout=_AgResourcePoolFields().sysctl_detect_timeout_s,
+            timeout=SYSCTL_DETECT_TIMEOUT_S,
         )
         if result.returncode == 0:
             return int(result.stdout.strip()) // (1024 * 1024)
     except Exception as _e:
         # DATACOLLECTOR: append -- process-level; both probes failed, worth real visibility.
         print(f"[agutil] sysctl memory probe failed, using configured fallback: {_e}")
-    return _AgResourcePoolFields().memory_detect_fallback_mb
+    return MEMORY_DETECT_FALLBACK_MB

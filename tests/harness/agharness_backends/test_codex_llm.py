@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import json
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.harness.adapters.codex import _CodexBackend
 
 
 def _backend() -> _CodexBackend:
-    return _CodexBackend(agConfig())
+    return _CodexBackend(agconfig())
 
 
 def _text_block(text, index=0):

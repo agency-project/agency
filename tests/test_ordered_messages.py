@@ -10,19 +10,20 @@ from unittest.mock import MagicMock
 import pytest
 
 from agency import MessageSubmission, agdata, agent, agskill
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.agname import agname as _agname
 from agency.engine import AgentEngine
 from agency.engine import engine as engine_module
 from agency.harness.protocol import HarnessAttemptResult
-from agency.orchestrator import agOrchestratorConfig, get_orchestrator
+from agency.orchestrator import get_orchestrator
 
 
-def _config(tmp_path, *, max_engines: int | None = None) -> agConfig:
-    return agConfig(
-        agOrchestratorConfig(max_concurrent_engines=max_engines),
-        {"agent": {"log_dir": str(tmp_path)}},
-        {"agllm_backend": {"api_key": "test", "model": ""}},
+def _config(tmp_path, *, max_engines: int | None = None) -> agconfig:
+    return agconfig(
+        max_concurrent_engines=max_engines,
+        log_dir=str(tmp_path),
+        api_key="test",
+        model="m",
     )
 
 

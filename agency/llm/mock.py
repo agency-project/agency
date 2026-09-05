@@ -31,67 +31,11 @@ import sqlite3
 import time
 from typing import TYPE_CHECKING, Callable, Iterator
 
-from ..agconfig import DynamicConfigParam
-from .agllm import AgLLMBackendFields, _AgProviderBackendConfig
-
 if TYPE_CHECKING:
-    from ..agconfig import agConfig
+    from ..configs.agconfig import agconfig as agconfig_cls
 
 _METADATA_BLOCK_INDEX = 2**31 - 1
 _CHUNKS_PER_BLOCK = 4
-
-
-class AgMockBackendFields:
-    """Config fields for the replay/mock LLM backend, registered under the
-    same `"agllm_backend"` owner every other provider's fields live under
-    (see `AgLLMBackendFields` in agllm.py)."""
-
-    replay_db_path = DynamicConfigParam("agllm_backend", default=None)
-    timing_mode = DynamicConfigParam("agllm_backend", default="exact")
-    constant_ttft_s = DynamicConfigParam("agllm_backend", default=0.3)
-    constant_tpot_s = DynamicConfigParam("agllm_backend", default=0.02)
-    poisson_rate_hz = DynamicConfigParam("agllm_backend", default=10.0)
-    poisson_ttft_mean_s = DynamicConfigParam("agllm_backend", default=0.3)
-    poisson_seed = DynamicConfigParam("agllm_backend", default=None)
-    # A plain Python callable -- see agMockBackendConfig's docstring for how
-    # to set it. Not JSON-safe, so agConfig.dynamic_snapshot() (the webui/
-    # checkpoint config view) silently omits it -- same mechanism that
-    # already skips any non-JSON-safe value, no `sensitive=True` needed.
-    # Takes priority over `timing_mode` when set. Read fresh via the
-    # DynamicConfigParam descriptor on every call, so setting it on a live
-    # agconfig takes effect immediately.
-    timing_fn = DynamicConfigParam("agllm_backend", default=None)
-
-
-class agMockBackendConfig(_AgProviderBackendConfig):
-    """agLLMBackendConfig restricted to the fields the mock/replay backend
-    reads::
-
-        cfg = agMockBackendConfig(replay_db_path="runs/agent_x_data.sqlite3", timing_mode="poisson")
-        cfg.update(poisson_rate_hz=12.0, timing_fn=my_generator)  # a plain callable overrides timing_mode
-        ag = agent(agconfig=cfg.agconfig)
-
-    Fields are set via the constructor or `.update(**fields)` (inherited
-    from `_AgConfigViewBase`) -- not by assigning attributes directly on this
-    view object, e.g. `cfg.timing_mode = ...` would just set a plain,
-    inert attribute on `cfg` itself, not reach the underlying agconfig.
-    Equivalently, on an existing agconfig: `agconfig.agllm_backend.timing_fn = my_generator`.
-    """
-
-    _PROVIDER = "mock"
-    _ALLOWED_FIELDS = frozenset(
-        {
-            "model",
-            "replay_db_path",
-            "timing_mode",
-            "constant_ttft_s",
-            "constant_tpot_s",
-            "poisson_rate_hz",
-            "poisson_ttft_mean_s",
-            "poisson_seed",
-            "timing_fn",
-        }
-    )
 
 
 def _load_replay_exchanges(db_path: str) -> "list[list[dict]]":
@@ -220,11 +164,11 @@ _BUILTIN_TIMING_MODES: "dict[str, Callable]" = {
 }
 
 
-class _MockBackend(AgLLMBackendFields, AgMockBackendFields):
+class _MockBackend:
     """Backend selected by `provider="mock"`. Holds the given agconfig
-    directly (not a clone -- so `cfg.timing_fn = ...`/`cfg.timing_mode = ...`
-    mutations made on a live agconfig after construction take effect on the
-    next call, same as any other DynamicConfigParam).
+    directly (not a clone -- so `agconfig.timing_fn = ...`/
+    `agconfig.timing_mode = ...` mutations made after construction take
+    effect on the next call).
 
     Replay state (the loaded exchange list and the position within it) is
     per-instance: reconstructing the backend (e.g. a later `set_config()`
@@ -232,20 +176,24 @@ class _MockBackend(AgLLMBackendFields, AgMockBackendFields):
     beginning. Not addressed here -- out of scope for the deterministic
     single-run-replay use case this backend targets."""
 
-    def __init__(self, agconfig: "agConfig") -> None:
-        self._agconfig = agconfig
+    def __init__(self, agconfig: "agconfig_cls") -> None:
+        self.agconfig = agconfig
         self._exchanges: "list[list[dict]] | None" = None
         self._next_index = 0
 
+    @property
+    def model(self) -> str:
+        return self.agconfig.model
+
     def _ensure_loaded(self) -> "list[list[dict]]":
         if self._exchanges is None:
-            if not self.replay_db_path:
+            if not self.agconfig.replay_db_path:
                 raise ValueError(
                     "mock LLM backend: replay_db_path is not set -- point it at the "
-                    "source agent's own <agname>_data.sqlite3 (agMockBackendConfig(...,"
+                    "source agent's own <agname>_data.sqlite3 (agconfig(provider='mock',"
                     " replay_db_path=...))"
                 )
-            self._exchanges = _load_replay_exchanges(self.replay_db_path)
+            self._exchanges = _load_replay_exchanges(self.agconfig.replay_db_path)
         return self._exchanges
 
     def _next_exchange(self) -> "list[dict]":
@@ -253,23 +201,29 @@ class _MockBackend(AgLLMBackendFields, AgMockBackendFields):
         if self._next_index >= len(exchanges):
             raise RuntimeError(
                 f"mock LLM backend: replay exhausted after {self._next_index} exchange(s) "
-                f"from {self.replay_db_path!r}"
+                f"from {self.agconfig.replay_db_path!r}"
             )
         blocks = exchanges[self._next_index]
         self._next_index += 1
         return blocks
 
     def _resolve_timing_fn(self) -> "Callable[[dict, list[int]], Iterator[float]]":
-        if self.timing_fn is not None:
-            return self.timing_fn
-        if self.timing_mode == "poisson":
-            return poisson_timing(self.poisson_rate_hz, self.poisson_ttft_mean_s, self.poisson_seed)
-        if self.timing_mode == "constant":
-            return constant_timing(self.constant_ttft_s, self.constant_tpot_s)
-        return _BUILTIN_TIMING_MODES.get(self.timing_mode, exact_replay_timing)
+        if self.agconfig.timing_fn is not None:
+            return self.agconfig.timing_fn
+        if self.agconfig.timing_mode == "poisson":
+            return poisson_timing(
+                self.agconfig.poisson_rate_hz,
+                self.agconfig.poisson_ttft_mean_s,
+                self.agconfig.poisson_seed,
+            )
+        if self.agconfig.timing_mode == "constant":
+            return constant_timing(self.agconfig.constant_ttft_s, self.agconfig.constant_tpot_s)
+        return _BUILTIN_TIMING_MODES.get(self.agconfig.timing_mode, exact_replay_timing)
 
     def fetch_context_limit(self) -> int:
-        return int(self.context_limit) if self.context_limit is not None else 200_000
+        return (
+            int(self.agconfig.context_limit) if self.agconfig.context_limit is not None else 200_000
+        )
 
     def dispatch(self, request: dict) -> dict:
         del request

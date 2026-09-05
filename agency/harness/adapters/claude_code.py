@@ -250,7 +250,7 @@ class _ClaudeCodeBackend(agharness_backend):
         from ...observability.profiler import agprof
         from ..ptrace.supervisor import agProxyPtrace
 
-        binary = self.binary_path or self._DEFAULT_BINARY
+        binary = self.agconfig.binary_path or self._DEFAULT_BINARY
         # A docker/podman-backed sandbox runs the harness INSIDE the
         # container (its own PID namespace, so its filesystem writes land
         # in the same workspace the rest of that agent's tools see), a
@@ -341,7 +341,7 @@ class _ClaudeCodeBackend(agharness_backend):
                 # agmanager_host. Real host credentials (API key, OAuth
                 # login, Bedrock env) are deliberately NOT forwarded: every
                 # claude-driven agent's LLM calls must go through this
-                # agent's own configured agConfig backend, not whatever
+                # agent's own configured agconfig backend, not whatever
                 # this host happens to have lying around.
                 "ANTHROPIC_BASE_URL": runtime.harness_base_url,
                 "ANTHROPIC_AUTH_TOKEN": runtime.token,

@@ -6,7 +6,7 @@ import os
 import re
 import httpx
 
-from .agllm import agllm, _AgProviderBackendConfig
+from .agllm import agllm
 
 try:
     import anthropic as _anthropic_sdk
@@ -57,34 +57,6 @@ def _known_anthropic_context_window(model: str) -> "int | None":
         if bare == known_id or bare.startswith(known_id + "-"):
             return window
     return None
-
-
-class agAnthropicBackendConfig(_AgProviderBackendConfig):
-    """agLLMBackendConfig restricted to the fields `_AnthropicBackend` (the
-    first-party api.anthropic.com backend) actually forwards -- see
-    `_AnthropicBackend._format_context_agency_to_backend()`, which every
-    Anthropic-family backend shares: only temperature, top_p,
-    max_tokens/max_completion_tokens, and extra_body["top_k"] are applied;
-    frequency_penalty, presence_penalty, n, stop, logprobs, seed, and the
-    vLLM-only extras are silently dropped by that method, so they're
-    excluded here rather than accepted and ignored. `provider` is fixed to
-    "anthropic"."""
-
-    _PROVIDER = "anthropic"
-    _ALLOWED_FIELDS = frozenset(
-        {
-            "model",
-            "api_key",
-            "base_url",
-            "context_limit",
-            "workspace_id",
-            "temperature",
-            "top_p",
-            "max_completion_tokens",
-            "max_tokens",
-            "extra_body",
-        }
-    )
 
 
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
@@ -266,10 +238,10 @@ class _AnthropicBackend(agllm):
 
     def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
         kwargs: dict = dict(
-            api_key=self.api_key or os.environ.get("ANTHROPIC_API_KEY"),
+            api_key=self.agconfig.api_key or os.environ.get("ANTHROPIC_API_KEY"),
             timeout=timeout,
         )
-        workspace_id = self.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
+        workspace_id = self.agconfig.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         if workspace_id:
             kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
         return kwargs
@@ -285,7 +257,9 @@ class _AnthropicBackend(agllm):
         if _anthropic_sdk is None:
             return []
         return list(
-            self.make_client(httpx.Timeout(self.model_listing_timeout_seconds)).models.list()
+            self.make_client(
+                httpx.Timeout(self.agconfig.model_listing_timeout_seconds)
+            ).models.list()
         )
 
     def tokenize_url(self) -> "str | None":
@@ -306,9 +280,11 @@ class _AnthropicBackend(agllm):
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         system, anthropic_messages = _agency_messages_to_anthropic(request["messages"])
         kwargs: dict = dict(
-            model=self.model or "",
+            model=self.agconfig.model or "",
             messages=anthropic_messages,
-            max_tokens=self.max_completion_tokens or self.max_tokens or self.default_max_tokens,
+            max_tokens=self.agconfig.max_completion_tokens
+            or self.agconfig.max_tokens
+            or self.agconfig.default_max_tokens,
         )
         if system:
             # Breakpoint on the system prompt: it's the largest, most static
@@ -316,11 +292,11 @@ class _AnthropicBackend(agllm):
             # before system in Anthropic's prefix order, so this one
             # breakpoint caches tools + system together.
             kwargs["system"] = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
-        if self.top_p is not None:
-            kwargs["top_p"] = self.top_p
-        extra_body = self.extra_body or {}
+        if self.agconfig.temperature is not None:
+            kwargs["temperature"] = self.agconfig.temperature
+        if self.agconfig.top_p is not None:
+            kwargs["top_p"] = self.agconfig.top_p
+        extra_body = self.agconfig.extra_body or {}
         if "top_k" in extra_body:
             kwargs["top_k"] = extra_body["top_k"]
         anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))

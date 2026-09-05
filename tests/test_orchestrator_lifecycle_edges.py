@@ -10,17 +10,18 @@ from unittest.mock import MagicMock
 import pytest
 
 from agency import CloseHandle, agdata, agerror, agent, agskill
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.agcontext import agcontext
 from agency.engine import AgentEngine
-from agency.orchestrator import agOrchestratorConfig, get_orchestrator
+from agency.orchestrator import get_orchestrator
 
 
 def _agent(tmp_path, *, max_engines: int | None = None) -> agent:
-    config = agConfig(
-        agOrchestratorConfig(max_concurrent_engines=max_engines),
-        {"agent": {"log_dir": str(tmp_path)}},
-        {"agllm_backend": {"api_key": "test", "model": ""}},
+    config = agconfig(
+        max_concurrent_engines=max_engines,
+        log_dir=str(tmp_path),
+        api_key="test",
+        model="m",
     )
     sandbox = MagicMock()
     sandbox._lock = threading.RLock()

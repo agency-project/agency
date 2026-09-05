@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import json
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.harness.adapters.grok import _GrokBackend
 
 
 def _backend() -> _GrokBackend:
-    return _GrokBackend(agConfig())
+    return _GrokBackend(agconfig())
 
 
 def test_harness_to_agency_plain_messages():

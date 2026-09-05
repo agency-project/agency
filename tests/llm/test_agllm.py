@@ -10,7 +10,7 @@ import httpx
 import openai
 import pytest
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.llm.agllm import agllm, BAD_REQUEST_EXCS, API_CONN_EXCS
 from agency.llm.openai import _OpenAICompatibleBackend
 from agency.llm.bedrock import (
@@ -26,9 +26,9 @@ except ImportError:
     _anthropic_sdk = None
 
 
-def _cfg(**fields) -> agConfig:
-    """Test helper: wrap agllm_backend fields in an agConfig."""
-    return agConfig({"agllm_backend": fields})
+def _cfg(**fields) -> agconfig:
+    """Test helper: build a flat agconfig."""
+    return agconfig(**fields)
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ class TestForConfig:
     def test_config_stored_on_instance(self):
         cfg = _cfg(model="some-model")
         backend = agllm.for_config(cfg)
-        assert backend.model == "some-model"
+        assert backend.agconfig.model == "some-model"
 
     def test_anthropic_provider_returns_anthropic_backend(self):
         backend = agllm.for_config(_cfg(provider="anthropic", model="claude-sonnet-5"))
@@ -136,30 +136,30 @@ class TestBackendChangeConfigAndGetConfigCopy:
     def test_change_config_replaces_agconfig(self):
         backend = agllm(_cfg(temperature=0.7))
         backend.change_config(_cfg(temperature=0.2))
-        assert backend.temperature == 0.2
+        assert backend.agconfig.temperature == 0.2
 
     def test_change_config_clones_given_agconfig(self):
         backend = agllm(_cfg())
         new_cfg = _cfg(temperature=0.2)
         backend.change_config(new_cfg)
-        new_cfg.agllm_backend.temperature = 0.9
-        assert backend.temperature == 0.2
+        new_cfg.temperature = 0.9
+        assert backend.agconfig.temperature == 0.2
 
     def test_get_config_copy_returns_clone_not_same_object(self):
         cfg = _cfg(temperature=0.7)
         backend = agllm(cfg)
         copy = backend.get_config_copy()
-        assert copy is not backend._agconfig
+        assert copy is not backend.agconfig
 
     def test_get_config_copy_reflects_current_values(self):
         backend = agllm(_cfg(temperature=0.7))
-        assert backend.get_config_copy().agllm_backend.temperature == 0.7
+        assert backend.get_config_copy().temperature == 0.7
 
     def test_mutating_get_config_copy_does_not_affect_backend(self):
         backend = agllm(_cfg(temperature=0.7))
         copy = backend.get_config_copy()
-        copy.agllm_backend.temperature = 0.1
-        assert backend.temperature == 0.7
+        copy.temperature = 0.1
+        assert backend.agconfig.temperature == 0.7
 
 
 # ---------------------------------------------------------------------------

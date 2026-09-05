@@ -5,7 +5,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.engine.clients import SandboxInteractionClient
 from agency.harness import daemon
 from agency.harness.adapters.agharness_backend import (
@@ -48,7 +48,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
 
     result = daemon._run_adapter_attempt(
         request,
-        agConfig(),
+        agconfig(),
         "http://127.0.0.1:8766",
         "model",
         "agent-1",
@@ -75,7 +75,7 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
     expected = HarnessAttemptResult(ok=True, final_text="done")
     seen = []
     manager = HarnessManager.__new__(HarnessManager)
-    manager._agconfig = agConfig()
+    manager._agconfig = agconfig()
     manager._engine_name = "agent-1"
     manager._attempt_lock = threading.Lock()
     manager._current_attempt_token = None

@@ -11,7 +11,7 @@ from .harness_daemon_launcher import ensure_harness_daemon
 from .host_servers.host_server_manager import HostServerManager
 
 if TYPE_CHECKING:
-    from ..agconfig import agConfig
+    from ..configs.agconfig import agconfig as agconfig_cls
     from ..agcontext import agcontext
     from ..agdata import agdata
     from ..agent import agent
@@ -66,7 +66,7 @@ class AgentEngine:
         self._services_closed = True
         self._pending_session_update: "tuple[agcontext, str, str, str, int | None] | None" = None
 
-    def set_config(self, agconfig: "agConfig") -> None:
+    def set_config(self, agconfig: "agconfig_cls") -> None:
         if self._host_server_manager is not None:
             self._host_server_manager.set_config(agconfig)
 

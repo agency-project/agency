@@ -25,7 +25,7 @@ from ...llm.agllm import agllm
 from ...llm.usage_tracker import LlmUsageTracker
 
 if TYPE_CHECKING:
-    from ...agconfig import agConfig
+    from ...configs.agconfig import agconfig as agconfig_cls
     from ...observability.agdatalogger import agDataLogger
 
 TRANSIENT_DISPATCH_EXCS = (
@@ -325,7 +325,7 @@ class _StreamHandle:
 class LlmHandlerServer:
     def __init__(
         self,
-        agconfig: "agConfig",
+        agconfig: "agconfig_cls",
         data_logger: "agDataLogger",
         usage_tracker: "LlmUsageTracker",
         *,
@@ -443,7 +443,7 @@ class LlmHandlerServer:
         metadata_block["request_id"] = getattr(self._invocation, "_request_id", None)
         metadata_block["skill"] = getattr(self._invocation, "skill_name", None)
 
-    def set_config(self, agconfig: "agConfig") -> None:
+    def set_config(self, agconfig: "agconfig_cls") -> None:
         self._agconfig = agconfig
         self._backend = agllm.for_config(agconfig)
 

@@ -6,24 +6,16 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..agconfig import agConfig
+    from ..configs.agconfig import agconfig as agconfig_cls
 
 
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-@dataclass
-class agDataLoggerConfigs:
-    db_path: str
-    flush_batch_size: int = 20
-    flush_interval_s: float = 0.2
 
 
 class agDataLogger:
@@ -35,7 +27,7 @@ class agDataLogger:
 
     def __init__(
         self,
-        agconfig: "agConfig",
+        agconfig: "agconfig_cls",
         *,
         default_name: "str | None" = None,
         default_object: "str | None" = None,
@@ -56,7 +48,7 @@ class agDataLogger:
 
     @property
     def db_path(self) -> str:
-        return self._configs.db_path
+        return self.agconfig.data_logger_db_path
 
     def _next_id_locked(self) -> str:
         """Caller must already hold self._lock. The zero-padded sequence
@@ -69,18 +61,24 @@ class agDataLogger:
         self._sequence += 1
         return f"{self._sequence:020d}{uuid.uuid4().hex}"
 
-    def set_config(self, agconfig: "agConfig") -> None:
-        configs = agconfig.__dict__.get("agDataLoggerConfigs")
-        if configs is None:
-            configs = getattr(self, "_configs", None)
-            if configs is None:
-                raise ValueError("agDataLogger requires agconfig.agDataLoggerConfigs on first use")
-            agconfig.agDataLoggerConfigs = configs
-        self._configs = configs
+    def set_config(self, agconfig: "agconfig_cls") -> None:
+        if agconfig.data_logger_db_path is None:
+            existing = getattr(self, "agconfig", None)
+            if existing is None or existing.data_logger_db_path is None:
+                raise ValueError("agDataLogger requires agconfig.data_logger_db_path on first use")
+            # A change_config() call rebuilding this agent's whole agconfig
+            # (e.g. new LLM settings) has no reason to also know/repeat this
+            # logger's own db path -- carry it over from what this instance
+            # was already using rather than erroring or silently redirecting
+            # to a new, empty database.
+            agconfig.data_logger_db_path = existing.data_logger_db_path
+        self.agconfig = agconfig
 
     def start(self) -> None:
-        Path(self._configs.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._configs.db_path, timeout=30, check_same_thread=False)
+        Path(self.agconfig.data_logger_db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(
+            self.agconfig.data_logger_db_path, timeout=30, check_same_thread=False
+        )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._ensure_schema()
@@ -116,9 +114,9 @@ class agDataLogger:
             connection = self._conn
             owns_connection = connection is None
             if owns_connection:
-                if self._configs.db_path == ":memory:":
+                if self.agconfig.data_logger_db_path == ":memory:":
                     return []
-                connection = sqlite3.connect(self._configs.db_path, timeout=30)
+                connection = sqlite3.connect(self.agconfig.data_logger_db_path, timeout=30)
             assert connection is not None
             try:
                 rows = connection.execute(
@@ -401,8 +399,8 @@ class agDataLogger:
     def _maybe_flush_locked(self) -> None:
         elapsed = time.time() - self._last_flush_ts
         if (
-            self._pending_count >= self._configs.flush_batch_size
-            or elapsed >= self._configs.flush_interval_s
+            self._pending_count >= self.agconfig.data_logger_flush_batch_size
+            or elapsed >= self.agconfig.data_logger_flush_interval_s
         ):
             self._flush_locked()
 

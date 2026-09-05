@@ -5,15 +5,14 @@ import shutil
 from unittest.mock import MagicMock
 import pytest
 from agency.agdata import agdata
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.agschema import agschema
 from agency.agskill import agskill
-from agency.llm.agllm import _AgLLMFields
 from agency.agtool import agtool
 
-LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
-LLM_IDLE_TIMEOUT = _AgLLMFields.idle_timeout.default
-LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
+LLM_MAX_RETRIES = agconfig().max_retries
+LLM_IDLE_TIMEOUT = agconfig().idle_timeout
+LLM_STREAM_TIMEOUT = agconfig().stream_timeout
 
 
 def _docker_available() -> bool:
@@ -331,9 +330,9 @@ def build_llm_kwargs(cfg, messages, openai_tools=None):
     return _agllm_mod.for_config(cfg).build_kwargs(messages, openai_tools)
 
 
-def _llm_cfg(**fields) -> agConfig:
-    """Test helper: wrap agllm_backend fields in an agConfig."""
-    return agConfig({"agllm_backend": fields})
+def _llm_cfg(**fields) -> agconfig:
+    """Test helper: build a flat agconfig from LLM fields."""
+    return agconfig(**fields)
 
 
 def test_build_llm_kwargs_model_and_messages():

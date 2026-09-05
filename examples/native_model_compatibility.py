@@ -23,8 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agency import agent, agdata, agskill
-from agency.agconfig import agConfig
-from agency.llm import agAnthropicBackendConfig, agOpenAIBackendConfig
+from agency.configs.agconfig import agconfig as agconfig_cls
 
 
 @dataclass(frozen=True)
@@ -46,22 +45,20 @@ MODELS = (
 PROBE_TEXT = "native-harness-ok"
 
 
-def _config_for(spec: ModelSpec) -> agConfig:
+def _config_for(spec: ModelSpec) -> agconfig_cls:
     if spec.provider == "openai":
-        return agConfig(
-            agOpenAIBackendConfig(
-                model=spec.api_model,
-                api_key=os.environ["OPENAI_API_KEY"],
-                max_completion_tokens=2048,
-                reasoning_effort="none",
-            )
-        )
-    return agConfig(
-        agAnthropicBackendConfig(
+        return agconfig_cls(
+            provider="openai",
             model=spec.api_model,
-            api_key=os.environ["ANTHROPIC_API_KEY"],
+            api_key=os.environ["OPENAI_API_KEY"],
             max_completion_tokens=2048,
+            reasoning_effort="none",
         )
+    return agconfig_cls(
+        provider="anthropic",
+        model=spec.api_model,
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        max_completion_tokens=2048,
     )
 
 

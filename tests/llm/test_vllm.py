@@ -12,31 +12,26 @@ from __future__ import annotations
 
 import pytest
 
-from agency.agconfig import agConfig
-from agency.llm import agllm
+from agency.configs.agconfig import agconfig
+from agency.llm.agllm import agllm
 from agency.llm.openai import _OpenAICompatibleBackend
-from agency.llm.vllm import agVLLMBackendConfig
-
-
-def _cfg(**fields) -> agConfig:
-    return agConfig({"agllm_backend": fields})
 
 
 class TestVllmDispatch:
     def test_vllm_with_base_url_returns_openai_compatible_backend(self):
         backend = agllm.for_config(
-            _cfg(provider="vllm", base_url="http://localhost:8000/v1", model="m")
+            agconfig(provider="vllm", base_url="http://localhost:8000/v1", model="m")
         )
         assert isinstance(backend, _OpenAICompatibleBackend)
 
     def test_vllm_without_base_url_raises_value_error(self):
         with pytest.raises(ValueError, match="requires base_url"):
-            agllm.for_config(_cfg(provider="vllm", model="m"))
+            agllm.for_config(agconfig(provider="vllm", model="m"))
 
     def test_config_fixes_provider_to_vllm(self):
-        cfg = agVLLMBackendConfig(model="m", base_url="http://localhost:8000/v1").agconfig
-        assert cfg.agllm_backend.provider == "vllm"
+        cfg = agconfig(provider="vllm", model="m", base_url="http://localhost:8000/v1")
+        assert cfg.provider == "vllm"
 
     def test_config_rejects_disallowed_field(self):
         with pytest.raises(TypeError):
-            agVLLMBackendConfig(workspace_id="w")
+            agconfig(provider="vllm", not_a_real_field="w")

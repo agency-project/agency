@@ -15,9 +15,6 @@ def _test_env(monkeypatch):
 @pytest.fixture(autouse=True)
 def reset_agent_state():
     saved = {
-        "ping_interval_s": agent.ping_interval_s,
-        "poll_interval_s": agent.poll_interval_s,
-        "max_outer_iters": agent.max_outer_iters,
         "log_dir": agent.log_dir,
         "output_dir": agent.output_dir,
     }
@@ -25,9 +22,6 @@ def reset_agent_state():
     from agency.orchestrator.orchestrator import _reset_orchestrator_for_tests
 
     _reset_orchestrator_for_tests()
-    agent.ping_interval_s = saved["ping_interval_s"]
-    agent.poll_interval_s = saved["poll_interval_s"]
-    agent.max_outer_iters = saved["max_outer_iters"]
     agent.log_dir = saved["log_dir"]
     agent.output_dir = saved["output_dir"]
     # Reset module-level name registry so tests don't bleed agnames into each other

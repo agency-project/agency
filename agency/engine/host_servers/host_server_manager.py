@@ -4,7 +4,6 @@ import hmac
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,7 +19,7 @@ from .host_mcp_server import HostMcpServer, bind_data_logger_for_current_thread
 from .llm_handler_server import LlmHandlerServer
 
 if TYPE_CHECKING:
-    from ...agconfig import agConfig
+    from ...configs.agconfig import agconfig as agconfig_cls
     from ...agent import agent
     from ...orchestrator.agresources import agResourcePool
     from ...agskill import agskill
@@ -57,13 +56,6 @@ class _AttemptFenceMiddleware:
             await self._app(scope, receive, send)
         finally:
             self._manager._release_attempt_lease(token)
-
-
-@dataclass
-class HostServerManagerConfigs:
-    uds_path: str
-    startup_timeout_s: float = 10.0
-    shutdown_timeout_s: float = 10.0
 
 
 class HostServerManager:
@@ -120,9 +112,9 @@ class HostServerManager:
     def llm_handler_server(self) -> "LlmHandlerServer":
         return self._llm_handler_server
 
-    def set_config(self, agconfig: "agConfig") -> None:
+    def set_config(self, agconfig: "agconfig_cls") -> None:
         self._ensure_runtime_configs(agconfig)
-        self._configs = agconfig.HostServerManagerConfigs
+        self._configs = agconfig
         self._llm_handler_server.set_config(agconfig)
 
     def bind_attempt_token(self, token: str) -> None:
@@ -195,13 +187,14 @@ class HostServerManager:
                 self._attempt_inflight[token] = count - 1
             self._attempt_token_condition.notify_all()
 
-    def _ensure_runtime_configs(self, agconfig: "agConfig") -> None:
-        manager_configs = agconfig.__dict__.get("HostServerManagerConfigs")
-        if manager_configs is None:
-            manager_configs = getattr(self, "_configs", None)
-        if manager_configs is None:
-            manager_configs = HostServerManagerConfigs(uds_path=new_uds_path("host"))
-        agconfig.HostServerManagerConfigs = manager_configs
+    def _ensure_runtime_configs(self, agconfig: "agconfig_cls") -> None:
+        if agconfig.host_server_uds_path is None:
+            existing = getattr(self, "_configs", None)
+            agconfig.host_server_uds_path = (
+                existing.host_server_uds_path
+                if existing is not None and existing.host_server_uds_path is not None
+                else new_uds_path("host")
+            )
 
     def start(self) -> str:
         with self._lifecycle_lock:
@@ -211,7 +204,7 @@ class HostServerManager:
                     with self._attempt_token_condition:
                         if self._attempt_admission_closed:
                             raise RuntimeError("HostServerManager shutdown is still in progress")
-                    return self._configs.uds_path
+                    return self._configs.host_server_uds_path
                 if thread is not None and thread.is_alive():
                     raise RuntimeError("HostServerManager startup is already in progress")
                 # A prior failed worker must never masquerade as a live server.
@@ -223,7 +216,7 @@ class HostServerManager:
             with self._attempt_token_condition:
                 self._attempt_admission_closed = True
 
-            Path(self._configs.uds_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(self._configs.host_server_uds_path).parent.mkdir(parents=True, exist_ok=True)
             mcp_app = self._host_mcp_server.build_app()
             sub_apps = [
                 ("/llm", self._llm_handler_server.build_app()),
@@ -247,7 +240,9 @@ class HostServerManager:
 
             for prefix, sub_app in sub_apps:
                 app.mount(prefix, sub_app)
-            config = uvicorn.Config(app, uds=self._configs.uds_path, log_level="warning")
+            config = uvicorn.Config(
+                app, uds=self._configs.host_server_uds_path, log_level="warning"
+            )
             server = uvicorn.Server(config)
 
             data_logger = self._data_logger
@@ -266,13 +261,13 @@ class HostServerManager:
                 self._server_thread = None
                 raise
 
-            deadline = time.monotonic() + self._configs.startup_timeout_s
+            deadline = time.monotonic() + self._configs.host_server_startup_timeout_s
             while time.monotonic() < deadline and not server.started and thread.is_alive():
                 time.sleep(0.01)
             if not server.started:
                 server.should_exit = True
                 server.force_exit = True
-                thread.join(timeout=self._configs.shutdown_timeout_s)
+                thread.join(timeout=self._configs.host_server_shutdown_timeout_s)
                 if thread.is_alive():
                     # Keep both references so stop() can retry the shutdown.
                     raise RuntimeError(
@@ -284,7 +279,7 @@ class HostServerManager:
             with self._attempt_token_condition:
                 self._attempt_admission_closed = False
                 self._attempt_token_condition.notify_all()
-            return self._configs.uds_path
+            return self._configs.host_server_uds_path
 
     def stop(self) -> None:
         with self._lifecycle_lock:
@@ -311,11 +306,11 @@ class HostServerManager:
             if server is not None:
                 server.should_exit = True
             if thread is not None:
-                thread.join(timeout=self._configs.shutdown_timeout_s)
+                thread.join(timeout=self._configs.host_server_shutdown_timeout_s)
                 if thread.is_alive():
                     if server is not None:
                         server.force_exit = True
-                    thread.join(timeout=self._configs.shutdown_timeout_s)
+                    thread.join(timeout=self._configs.host_server_shutdown_timeout_s)
                 if thread.is_alive():
                     server_error = RuntimeError(
                         "HostServerManager worker did not stop within the configured timeout"
@@ -330,7 +325,7 @@ class HostServerManager:
                 with self._attempt_token_condition:
                     drained = self._attempt_token_condition.wait_for(
                         lambda: not self._attempt_inflight and self._retiring_attempt_token is None,
-                        timeout=self._configs.shutdown_timeout_s,
+                        timeout=self._configs.host_server_shutdown_timeout_s,
                     )
                     if not drained:
                         lease_error = RuntimeError(

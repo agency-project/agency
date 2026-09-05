@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
 from agency.harness.adapters.claude_code import _ClaudeCodeBackend
 from agency.harness.adapters.codex import _CodexBackend
@@ -18,7 +18,7 @@ from agency.harness.adapters.opencode import _OpencodeBackend
 
 def _runtime(*, sandbox=None) -> AdapterRuntime:
     return AdapterRuntime(
-        agconfig=agConfig(),
+        agconfig=agconfig(),
         model="test-model",
         engine_name="test-agent",
         harness_base_url="http://127.0.0.1:8766",
@@ -30,7 +30,7 @@ def _runtime(*, sandbox=None) -> AdapterRuntime:
 
 @pytest.mark.parametrize("name", ["native", "claude_code", "codex", "grok", "opencode"])
 def test_every_engine_implements_daemon_attempt_seam(name):
-    adapter = agharness_backend.for_config(name, agConfig())
+    adapter = agharness_backend.for_config(name, agconfig())
     assert type(adapter).run_daemon_attempt is not agharness_backend.run_daemon_attempt
 
 
@@ -72,7 +72,7 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
     runtime = _runtime()
 
-    result = backend_cls(agConfig()).run_daemon_attempt(
+    result = backend_cls(agconfig()).run_daemon_attempt(
         runtime,
         prompt="do the thing",
         resume_session_id=None,
@@ -124,7 +124,7 @@ def test_native_adapter_launches_through_typed_runtime(monkeypatch):
         "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
     )
 
-    result = _NativeBackend(agConfig()).run_daemon_attempt(
+    result = _NativeBackend(agconfig()).run_daemon_attempt(
         _runtime(sandbox=sandbox),
         prompt="do the thing",
         resume_session_id=None,

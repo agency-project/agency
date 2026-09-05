@@ -4,39 +4,6 @@ import time
 from typing import Callable
 from .agdata import agdata, agerror
 from .utils.agutil import format_exception
-from .agconfig import DynamicConfigParam, _AgConfigViewBase
-
-
-# Exists only to register agtool's config fields (via __set_name__ at import
-# time). Reads use a throwaway instance -- _AgToolFields(agconfig) -- since
-# __init__ does nothing but (optionally) store an agconfig; there's no
-# persistent agtool instance to hang descriptors on for reading.
-class _AgToolFields:
-    timeout_s = DynamicConfigParam(
-        "agtool", default=1800
-    )  # Historical ceiling on tool execution time -- no longer enforced now
-    # that tool calls run directly in the caller's own process/thread (see
-    # agtool.__call__), kept only as a config field other code may still read.
-    output_offload_chars = DynamicConfigParam(
-        "agtool", default=40_000
-    )  # minimum floor for tool-output offloading
-    offload_id_prefix_len = DynamicConfigParam(
-        "agtool", default=12
-    )  # Chars of the tool_call_id kept when naming an offloaded-output file.
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
-class agToolConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agtool tunables in one call::
-
-        cfg = agConfig(agToolConfig(timeout_s=60))
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agtool"
 
 
 class agtool:
@@ -145,4 +112,4 @@ class agtool:
         return f"agtool(name={self.name!r})"
 
 
-__all__ = ["agtool", "agToolConfig", "_AgToolFields"]
+__all__ = ["agtool"]

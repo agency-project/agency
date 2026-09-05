@@ -49,8 +49,7 @@ from agency import (
     agskill,
     agtool,
 )
-from agency.agconfig import agConfig
-from agency.llm import agOpenAIBackendConfig
+from agency.configs.agconfig import agconfig as agconfig_cls
 
 ORDERED_MEMORY = "ORDERED-CONTEXT-731"
 CANCEL_MEMORY = "CANCEL-CONTEXT-947"
@@ -149,17 +148,16 @@ lifecycle_gate = agtool(
 )
 
 
-def _config(model: str) -> agConfig:
+def _config(model: str) -> agconfig_cls:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise SystemExit("OPENAI_API_KEY is required")
-    return agConfig(
-        agOpenAIBackendConfig(
-            model=model,
-            api_key=api_key,
-            max_completion_tokens=2048,
-            reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "none"),
-        )
+    return agconfig_cls(
+        provider="openai",
+        model=model,
+        api_key=api_key,
+        max_completion_tokens=2048,
+        reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "none"),
     )
 
 
@@ -762,7 +760,9 @@ def _exercise_destruction(
         )
 
 
-def _exercise(config: agConfig, evidence: dict, timeout_s: float, cleanup_timeout_s: float) -> None:
+def _exercise(
+    config: agconfig_cls, evidence: dict, timeout_s: float, cleanup_timeout_s: float
+) -> None:
     controlled, echo, recall = _skills()
     agents: list[Agent] = []
 

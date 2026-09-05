@@ -4,25 +4,21 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.llm.mock import (
-    agMockBackendConfig,
     constant_timing,
     exact_replay_timing,
     instant_timing,
     poisson_timing,
 )
-from agency.observability.agdatalogger import agDataLogger, agDataLoggerConfigs
+from agency.observability.agdatalogger import agDataLogger
 
 
 def _make_source_db(db_path: Path) -> agDataLogger:
-    logger = agDataLogger(
-        SimpleNamespace(agDataLoggerConfigs=agDataLoggerConfigs(db_path=str(db_path)))
-    )
+    logger = agDataLogger(agconfig(data_logger_db_path=str(db_path)))
     logger.start()
     return logger
 
@@ -69,8 +65,8 @@ _TOOL_EXCHANGE = [
 def _mock_backend(db_path: Path, **fields):
     from agency.llm.agllm import agllm
 
-    cfg = agMockBackendConfig(replay_db_path=str(db_path), **fields)
-    return agllm.for_config(cfg.agconfig)
+    cfg = agconfig(provider="mock", replay_db_path=str(db_path), **fields)
+    return agllm.for_config(cfg)
 
 
 class TestReplayOrderingAndDispatch:
@@ -236,20 +232,19 @@ class TestTimingModes:
             for _ in range(sum(chunk_counts) + 1):
                 yield 0.0
 
-        cfg = agMockBackendConfig(replay_db_path=str(db_path), timing_mode="poisson")
+        cfg = agconfig(provider="mock", replay_db_path=str(db_path), timing_mode="poisson")
         cfg.update(timing_fn=custom_timing_fn)
         from agency.llm.agllm import agllm
 
-        backend = agllm.for_config(cfg.agconfig)
+        backend = agllm.for_config(cfg)
         list(backend.dispatch_stream({"messages": []}))
         assert len(calls) == 1
 
     def test_timing_fn_not_included_in_dynamic_snapshot(self):
-        cfg = agConfig()
-        cfg.agllm_backend.provider = "mock"
-        cfg.agllm_backend.timing_fn = lambda exchange, chunk_counts: iter([0.0])
-        snapshot = cfg.dynamic_snapshot()
-        assert "timing_fn" not in snapshot.get("agllm_backend", {})
+        cfg = agconfig(provider="mock")
+        cfg.timing_fn = lambda exchange, chunk_counts: iter([0.0])
+        snapshot = cfg.safe_snapshot()
+        assert "timing_fn" not in snapshot
 
 
 class TestLlmHandlerServerIntegration:
@@ -271,7 +266,7 @@ class TestLlmHandlerServerIntegration:
         server_db = tmp_path / "server_data.sqlite3"
         server_logger = _make_source_db(server_db)
 
-        cfg = agMockBackendConfig(replay_db_path=str(source_db), timing_mode="instant").agconfig
+        cfg = agconfig(provider="mock", replay_db_path=str(source_db), timing_mode="instant")
         server = LlmHandlerServer(cfg, server_logger, LlmUsageTracker())
         handle = server.start_stream({"messages": []})
 

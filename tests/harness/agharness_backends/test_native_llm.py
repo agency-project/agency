@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import json
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.harness.adapters.native import _NativeBackend
 
 
 def _backend() -> _NativeBackend:
-    return _NativeBackend(agConfig())
+    return _NativeBackend(agconfig())
 
 
 def test_harness_to_agency_plain_messages():

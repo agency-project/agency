@@ -16,7 +16,7 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 
 from agency._agent_control import AgentControl
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
 from agency.llm.usage_tracker import LlmUsageTracker
@@ -142,8 +142,8 @@ class _FakeDataLogger:
         self.operations.append(("finalize", call_label, type))
 
 
-def _cfg(**fields) -> agConfig:
-    return agConfig({"agllm_backend": fields})
+def _cfg(**fields) -> agconfig:
+    return agconfig(**fields)
 
 
 def _make_server(create_fn=None, **fields) -> "tuple[LlmHandlerServer, _FakeClient]":
@@ -453,7 +453,7 @@ def test_resolve_model_returns_backends_model():
 
 def test_resolve_model_empty_string_when_unset():
     server, _ = _make_server()
-    server._backend.model = None
+    server._backend.agconfig.model = None
     assert server.resolve_model() == ""
 
 

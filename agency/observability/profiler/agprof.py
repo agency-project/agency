@@ -1283,21 +1283,18 @@ def start(
                 "agprof: profiling requires the optional dependencies; install with "
                 '`pip install -e ".[profiler]"`'
             ) from e
-        from types import SimpleNamespace
-
-        from ..agdatalogger import agDataLogger, agDataLoggerConfigs
+        from ..agdatalogger import agDataLogger
+        from ...configs.agconfig import agconfig as _agconfig_cls
 
         profile_session_id = uuid.uuid4().hex
         profile_db_path = (
             str(Path(out_dir) / "profile_data.sqlite3") if out_dir is not None else ":memory:"
         )
         profile_data_logger = agDataLogger(
-            SimpleNamespace(
-                agDataLoggerConfigs=agDataLoggerConfigs(
-                    db_path=profile_db_path,
-                    flush_batch_size=500,
-                    flush_interval_s=1.0,
-                )
+            _agconfig_cls(
+                data_logger_db_path=profile_db_path,
+                data_logger_flush_batch_size=500,
+                data_logger_flush_interval_s=1.0,
             ),
             default_name="agprof",
             default_object="profiler",
@@ -1311,12 +1308,10 @@ def start(
                 f"[agprof] WARNING: profiler datalogger start failed; using memory only: {exc}"
             )
             profile_data_logger = agDataLogger(
-                SimpleNamespace(
-                    agDataLoggerConfigs=agDataLoggerConfigs(
-                        db_path=":memory:",
-                        flush_batch_size=500,
-                        flush_interval_s=1.0,
-                    )
+                _agconfig_cls(
+                    data_logger_db_path=":memory:",
+                    data_logger_flush_batch_size=500,
+                    data_logger_flush_interval_s=1.0,
                 ),
                 default_name="agprof",
                 default_object="profiler",

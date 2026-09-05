@@ -7,7 +7,12 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from agency.agconfig import agConfig
+from agency.configs.agconfig import (
+    MEMORY_DETECT_FALLBACK_MB,
+    MIN_CPUS,
+    MIN_MEMORY_MB,
+    agconfig as agconfig_cls,
+)
 from agency.orchestrator.agresources import agResourcePool
 from agency.utils.agutil import (
     amd_render_node_paths_by_pci_bus,
@@ -15,7 +20,6 @@ from agency.utils.agutil import (
     detect_gpus,
     detect_memory_mb,
     _cvd_filter,
-    _AgResourcePoolFields,
 )
 
 
@@ -317,7 +321,7 @@ def test_detect_memory_mb_fallback_when_proc_missing(monkeypatch, tmp_path):
     fake.write_text("Garbage: 0\n")
     with patch("builtins.open", side_effect=FileNotFoundError):
         with patch("agency.utils.agutil.subprocess.run", side_effect=FileNotFoundError):
-            assert detect_memory_mb() == _AgResourcePoolFields.memory_detect_fallback_mb.default
+            assert detect_memory_mb() == MEMORY_DETECT_FALLBACK_MB
 
 
 # ---------------------------------------------------------------------------
@@ -345,26 +349,24 @@ def test_pool_default_idle_values():
     idle container to bound by default. container.py/update_limits() both
     treat None as "omit --memory", Docker's own native unlimited behavior."""
     pool = agResourcePool(gpus=[], total_cpus=4, total_memory_mb=8192)
-    assert pool.idle_cpus == _AgResourcePoolFields.idle_cpus.default
-    assert pool.idle_memory is None
+    assert pool.agconfig.idle_cpus == agconfig_cls().idle_cpus
+    assert pool.agconfig.idle_memory is None
 
 
 def test_disconnected_fields_instance_idle_memory_defaults_to_none():
-    """sandbox/container.py's container-creation path reads
-    idle_memory through a fresh _AgResourcePoolFields(sandbox_agconfig) bound
-    to the SANDBOX's own agconfig, not agResourcePool's — a completely
-    different, unrelated agConfig instance that never has idle_memory
+    """sandbox/container.py's container-creation path reads idle_memory off
+    the SANDBOX's own agconfig, not agResourcePool's — a completely
+    different, unrelated agconfig instance that never has idle_memory
     explicitly set on it. That means idle_memory's own class-level default
     (not anything set inside agResourcePool.__init__) is what actually
     reaches real container creation, and it must be None so --memory is
     omitted there too, not a fixed constant regardless of host size."""
-    fields = _AgResourcePoolFields(agConfig())
-    assert fields.idle_memory is None
+    assert agconfig_cls().idle_memory is None
 
 
 def test_pool_explicit_idle_memory_overrides_default():
     pool = agResourcePool(gpus=[], total_memory_mb=8192, idle_memory="1g")
-    assert pool.idle_memory == "1g"
+    assert pool.agconfig.idle_memory == "1g"
 
 
 def test_pool_initial_acquired_counts_are_zero():
@@ -687,9 +689,9 @@ def test_acquire_cpu_mem_floors_below_minimum():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=16384)
     sandbox = _sandbox()
     pool.acquire_cpu_mem(sandbox, cpus=0.1, memory_mb=10)
-    sandbox.update_limits.assert_called_once_with(cpus=pool.min_cpus, memory="1024m")
-    assert sandbox._cpu_acquired == pool.min_cpus
-    assert sandbox._memory_acquired_mb == pool.min_memory_mb
+    sandbox.update_limits.assert_called_once_with(cpus=MIN_CPUS, memory="1024m")
+    assert sandbox._cpu_acquired == MIN_CPUS
+    assert sandbox._memory_acquired_mb == MIN_MEMORY_MB
 
 
 def test_notify_thread_safe():
@@ -720,66 +722,54 @@ def test_notify_thread_safe():
 
 
 def test_pool_change_config_replaces_agconfig():
-    from agency.agconfig import agConfig
-
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
-    pool.change_config(agConfig({"agResourcePool": {"idle_cpus": 2.0}}))
-    assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
+    pool.change_config(agconfig_cls(idle_cpus=2.0))
+    assert pool.agconfig.idle_cpus == 2.0
 
 
 def test_pool_change_config_clones_given_agconfig():
-    from agency.agconfig import agConfig
-
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
-    new_cfg = agConfig({"agResourcePool": {"idle_cpus": 2.0}})
+    new_cfg = agconfig_cls(idle_cpus=2.0)
     pool.change_config(new_cfg)
-    new_cfg.agResourcePool.idle_cpus = 9.0
-    assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
+    new_cfg.idle_cpus = 9.0
+    assert pool.agconfig.idle_cpus == 2.0
 
 
 def test_pool_get_config_copy_returns_clone_not_same_object():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
     copy = pool.get_config_copy()
-    assert copy is not pool._agconfig
+    assert copy is not pool.agconfig
 
 
 def test_pool_get_config_copy_reflects_current_values():
-    from agency.agconfig import agConfig
-
     pool = agResourcePool(
         gpus=[],
         total_cpus=8,
         total_memory_mb=8192,
-        agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}),
+        agconfig=agconfig_cls(idle_cpus=2.0),
     )
-    assert pool.get_config_copy().agResourcePool.idle_cpus == 2.0
+    assert pool.get_config_copy().idle_cpus == 2.0
 
 
 def test_mutating_pool_get_config_copy_does_not_affect_pool():
-    from agency.agconfig import agConfig
-
     pool = agResourcePool(
         gpus=[],
         total_cpus=8,
         total_memory_mb=8192,
-        agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}),
+        agconfig=agconfig_cls(idle_cpus=2.0),
     )
     copy = pool.get_config_copy()
-    copy.agResourcePool.idle_cpus = 9.0
-    assert pool._agconfig.get("agResourcePool", "idle_cpus") == 2.0
+    copy.idle_cpus = 9.0
+    assert pool.agconfig.idle_cpus == 2.0
 
 
 def test_pool_change_config_none_resets_to_default_agconfig():
-    from agency.agconfig import agConfig
-
     pool = agResourcePool(
         gpus=[],
         total_cpus=8,
         total_memory_mb=8192,
-        agconfig=agConfig({"agResourcePool": {"idle_cpus": 2.0}}),
+        agconfig=agconfig_cls(idle_cpus=2.0),
     )
     pool.change_config(None)
-    # No agconfig -> field falls back to its DynamicConfigParam default, not the old value.
-    assert (
-        pool.get_config_copy().agResourcePool.idle_cpus == _AgResourcePoolFields.idle_cpus.default
-    )
+    # No agconfig -> field falls back to agconfig's own default, not the old value.
+    assert pool.get_config_copy().idle_cpus == agconfig_cls().idle_cpus
