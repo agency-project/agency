@@ -419,6 +419,11 @@ class agProxyPtrace:
         self._agconfig = agconfig
         self._allow_initial_exec = allow_initial_exec
 
+    def change_config(self, agconfig: "agconfig_cls | None") -> None:
+        """Replace this instance's agconfig. No child object holds its own
+        agconfig here -- launch() reads self._agconfig fresh every call."""
+        self._agconfig = agconfig
+
     def launch(
         self,
         argv: "list[str]",

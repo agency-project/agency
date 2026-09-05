@@ -332,11 +332,11 @@ class agent:
     def change_config(self, agconfig: "agconfig_cls") -> None:
         with self._operation_lease("change config"):
             self.agconfig = agconfig.clone()
-            self.data_logger.set_config(self.agconfig)
+            self.data_logger.change_config(self.agconfig)
             if self.sandbox is not None:
                 self.sandbox.change_config(self.agconfig)
             if self.engine is not None:
-                self.engine.set_config(self.agconfig)
+                self.engine.change_config(self.agconfig)
             self.data_logger.record_event(
                 type="agent_config",
                 payload=self.agconfig.safe_snapshot(),

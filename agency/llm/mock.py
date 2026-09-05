@@ -171,7 +171,7 @@ class _MockBackend:
     effect on the next call).
 
     Replay state (the loaded exchange list and the position within it) is
-    per-instance: reconstructing the backend (e.g. a later `set_config()`
+    per-instance: reconstructing the backend (e.g. a later `change_config()`
     call on the same `LlmHandlerServer`) starts replay over from the
     beginning. Not addressed here -- out of scope for the deterministic
     single-run-replay use case this backend targets."""

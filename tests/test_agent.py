@@ -715,11 +715,8 @@ class _GCSandbox:
     def __del__(self):
         self.destroy()
 
-    # Every agency class object exposes change_config/set_config -- a dummy
-    # no-op here is enough for this GC-lifetime stand-in.
-    def set_config(self, agconfig):
-        pass
-
+    # Every agency class object exposes change_config -- a dummy no-op here
+    # is enough for this GC-lifetime stand-in.
     def change_config(self, agconfig):
         pass
 
@@ -1771,7 +1768,7 @@ def test_agent_change_config_propagates_owned_clone_to_engine():
 
     ag.change_config(new_cfg)
 
-    engine.set_config.assert_called_once_with(ag.agconfig)
+    engine.change_config.assert_called_once_with(ag.agconfig)
     assert ag.agconfig is not new_cfg
 
 

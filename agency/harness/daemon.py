@@ -91,6 +91,9 @@ class _HarnessApiServer:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self._port}"
 
+    def change_config(self, agconfig: "agconfig_cls") -> None:
+        self._harness_backend.change_config(agconfig)
+
     def start(self, timeout_s: float = 10.0) -> None:
         app = FastAPI()
         self._harness_backend.register(app, self._bridge)
@@ -232,6 +235,10 @@ class HarnessManager:
             sandbox_uds_path,
             self._dispatch_attempt,
         )
+
+    def change_config(self, agconfig: "agconfig_cls") -> None:
+        self._agconfig = agconfig
+        self._harness_api.change_config(self._agconfig)
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = request.attempt_token

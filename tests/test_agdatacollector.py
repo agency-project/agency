@@ -77,31 +77,31 @@ def test_init_reads_configs_from_agconfig(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# set_config()
+# change_config()
 # ---------------------------------------------------------------------------
 
 
-def test_set_config_replaces_the_stored_configs_object(tmp_path):
+def test_change_config_replaces_the_stored_configs_object(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=7)
     new_agconfig = _make_agconfig(db_path, flush_batch_size=42, flush_interval_s=9.0)
-    dc.set_config(new_agconfig)
+    dc.change_config(new_agconfig)
     assert dc.agconfig.data_logger.flush_batch_size == 42
     assert dc.agconfig.data_logger.flush_interval_s == 9.0
 
 
-def test_set_config_changes_flush_threshold_at_runtime(tmp_path):
+def test_change_config_changes_flush_threshold_at_runtime(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_event("tool", {"n": 1})
     assert _select_all(db_path, "events") == []  # buffered under the old, large threshold
 
-    dc.set_config(_make_agconfig(db_path, flush_batch_size=2, flush_interval_s=1000))
+    dc.change_config(_make_agconfig(db_path, flush_batch_size=2, flush_interval_s=1000))
     dc.record_event("tool", {"n": 2})  # now 2 pending -- new threshold triggers immediately
     assert len(_select_all(db_path, "events")) == 2
     dc.stop()
 
 
-def test_set_config_changing_db_path_does_not_move_an_open_connection(tmp_path):
+def test_change_config_changing_db_path_does_not_move_an_open_connection(tmp_path):
     # Known, accepted limitation: swapping db_path while already started does
     # NOT reopen the connection -- flush() keeps writing to whatever file
     # start() originally opened, even though agconfig.data_logger_db_path now
@@ -109,7 +109,7 @@ def test_set_config_changing_db_path_does_not_move_an_open_connection(tmp_path):
     dc, original_path = _make_logger(tmp_path)
     dc.start()
     other_path = str(tmp_path / "other.db")
-    dc.set_config(_make_agconfig(other_path))
+    dc.change_config(_make_agconfig(other_path))
     assert dc.agconfig.data_logger.db_path == other_path
 
     dc.record_event("tool", {"n": 1})

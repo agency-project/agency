@@ -12,6 +12,7 @@ from agency.agdata import agdata
 from agency.agcontext import agcontext
 from agency.agschema import agschema
 from agency.agdata import agerror
+from agency.configs.agconfig import agconfig as agconfig_cls
 from agency.engine import engine as mod
 from agency.engine.engine import AgentEngine
 from agency.harness.protocol import HarnessAttemptResult, PromptPayload
@@ -83,7 +84,7 @@ class _FakeAgent:
     output_dir = None
 
     def __init__(self):
-        self.agconfig = SimpleNamespace(marker="agconfig")
+        self.agconfig = agconfig_cls()
         self.sandbox = _FakeSandbox()
         self.harness = "claude_code"
         self.agname = "test-agent"
@@ -109,7 +110,7 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             self.invocation = invocation
             self.started = False
             self.stopped = False
-            self.set_config_calls = []
+            self.change_config_calls = []
             self.active_attempt_token = None
             self.bound_attempt_tokens = []
             self.cleared_attempt_tokens = []
@@ -126,8 +127,8 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
         def stop(self) -> None:
             self.stopped = True
 
-        def set_config(self, agconfig) -> None:
-            self.set_config_calls.append(agconfig)
+        def change_config(self, agconfig) -> None:
+            self.change_config_calls.append(agconfig)
 
         def bind_attempt_token(self, token: str) -> None:
             assert self.active_attempt_token is None
@@ -195,31 +196,31 @@ def test_host_server_manager_property_raises_before_run():
 
 
 # ---------------------------------------------------------------------------
-# set_config
+# change_config
 # ---------------------------------------------------------------------------
 
 
-def test_set_config_does_not_propagate_back_to_agent():
+def test_change_config_does_not_propagate_back_to_agent():
     agent = _FakeAgent()
     engine = AgentEngine(agent)
-    new_cfg = SimpleNamespace(marker="new")
-    engine.set_config(new_cfg)
+    new_cfg = agconfig_cls()
+    engine.change_config(new_cfg)
     assert agent.change_config_calls == []
 
 
-def test_set_config_does_not_touch_host_server_manager_when_not_yet_built():
+def test_change_config_does_not_touch_host_server_manager_when_not_yet_built():
     engine = AgentEngine(_FakeAgent())
-    engine.set_config(SimpleNamespace())  # should not raise
+    engine.change_config(agconfig_cls())  # should not raise
 
 
-def test_set_config_forwards_to_host_server_manager_when_built(monkeypatch):
+def test_change_config_forwards_to_host_server_manager_when_built(monkeypatch):
     holder = _install_fake_host_server_manager(monkeypatch, results=[])
     agent = _FakeAgent()
     engine = AgentEngine(agent)
     engine._host_server_manager = mod.HostServerManager(agent, agent.sandbox, None, None)
-    new_cfg = SimpleNamespace(marker="new")
-    engine.set_config(new_cfg)
-    assert holder["manager"].set_config_calls == [new_cfg]
+    new_cfg = agconfig_cls()
+    engine.change_config(new_cfg)
+    assert holder["manager"].change_config_calls == [new_cfg]
 
 
 # ---------------------------------------------------------------------------

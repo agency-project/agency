@@ -98,24 +98,12 @@ class GlobalAgentOrchestrator:
         default_db_path: "str | Path | None" = None,
     ) -> None:
         self.agconfig = agconfig if agconfig is not None else agconfig_cls()
-        if self.agconfig.orchestrator.max_concurrent_engines is not None and (
-            not isinstance(self.agconfig.orchestrator.max_concurrent_engines, int)
-            or isinstance(self.agconfig.orchestrator.max_concurrent_engines, bool)
-            or self.agconfig.orchestrator.max_concurrent_engines <= 0
-        ):
-            raise ValueError("max_concurrent_engines must be a positive integer or None")
+        self._validate_max_concurrent_engines()
         if default_db_path is None:
             default_db_path = resolve_global_db_path(_DEFAULT_LOG_DIR)
         db_path = self.agconfig.orchestrator.db_path or default_db_path
         assert db_path is not None
-        data_logger_agconfig = agconfig_cls(
-            dataloggerconfig(
-                db_path=str(db_path),
-                flush_batch_size=self.agconfig.orchestrator.flush_batch_size,
-                flush_interval_s=self.agconfig.orchestrator.flush_interval_s,
-            )
-        )
-        self.data_logger = agDataLogger(data_logger_agconfig)
+        self.data_logger = agDataLogger(self._scoped_data_logger_config(str(db_path)))
         self.data_logger.start()
         self.agresource_pool = agResourcePool(
             mark_gpus=False,
@@ -157,6 +145,36 @@ class GlobalAgentOrchestrator:
         )
         with self._event_cond:
             self._record_scheduler_snapshot()
+
+    def _validate_max_concurrent_engines(self) -> None:
+        limit = self.agconfig.orchestrator.max_concurrent_engines
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+        ):
+            raise ValueError("max_concurrent_engines must be a positive integer or None")
+
+    def _scoped_data_logger_config(self, db_path: "str | None" = None) -> "agconfig_cls":
+        """Build the data logger's own narrow agconfig from this
+        orchestrator's current fields. *db_path* is only needed on first
+        construction -- agDataLogger.change_config() carries the existing
+        db_path forward on its own when this orchestrator's own db_path is
+        still unset."""
+        return agconfig_cls(
+            dataloggerconfig(
+                db_path=db_path if db_path is not None else self.agconfig.orchestrator.db_path,
+                flush_batch_size=self.agconfig.orchestrator.flush_batch_size,
+                flush_interval_s=self.agconfig.orchestrator.flush_interval_s,
+            )
+        )
+
+    def change_config(self, agconfig: "agconfig_cls") -> None:
+        """Replace this orchestrator's agconfig and cascade to every child
+        that holds its own agconfig composition: the global data logger
+        (its own narrow, rescoped config) and the default resource pool."""
+        self.agconfig = agconfig
+        self._validate_max_concurrent_engines()
+        self.data_logger.change_config(self._scoped_data_logger_config())
+        self.agresource_pool.change_config(self.agconfig)
 
     # ------------------------------------------------------------------
     # Public API

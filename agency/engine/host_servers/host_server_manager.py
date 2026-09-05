@@ -94,7 +94,7 @@ class HostServerManager:
             invocation=invocation,
             admit_tools=getattr(agent, "harness", None) != "native",
         )
-        self.set_config(agent.agconfig)
+        self.change_config(agent.agconfig)
 
         self._server: "uvicorn.Server | None" = None
         self._server_thread: "threading.Thread | None" = None
@@ -120,10 +120,10 @@ class HostServerManager:
     def llm_handler_server(self) -> "LlmHandlerServer":
         return self._llm_handler_server
 
-    def set_config(self, agconfig: "agconfig_cls") -> None:
+    def change_config(self, agconfig: "agconfig_cls") -> None:
         self._ensure_runtime_configs(agconfig)
         self._configs = agconfig
-        self._llm_handler_server.set_config(agconfig)
+        self._llm_handler_server.change_config(agconfig)
 
     def bind_attempt_token(self, token: str) -> None:
         """Authorize exactly one in-flight harness attempt."""

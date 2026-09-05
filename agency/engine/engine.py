@@ -61,15 +61,21 @@ class AgentEngine:
 
     def __init__(self, agent: "agent") -> None:
         self._agent = agent
+        # Cloned so this engine's own agconfig is independent of the owning
+        # agent's -- an engine belongs to exactly one dispatched request and
+        # must not silently pick up a concurrent agent.change_config() call
+        # mid-execution. Read self.agconfig, not self._agent.agconfig.
+        self.agconfig: "agconfig_cls" = agent.agconfig.clone()
         self._host_server_manager: "HostServerManager | None" = None
         self._sandbox_interaction_client: "SandboxInteractionClient | None" = None
         self._services_lock = threading.RLock()
         self._services_closed = True
         self._pending_session_update: "tuple[agcontext, str, str, str, int | None] | None" = None
 
-    def set_config(self, agconfig: "agconfig_cls") -> None:
+    def change_config(self, agconfig: "agconfig_cls") -> None:
+        self.agconfig = agconfig.clone()
         if self._host_server_manager is not None:
-            self._host_server_manager.set_config(agconfig)
+            self._host_server_manager.change_config(self.agconfig)
 
     def close(self) -> None:
         """Idempotently stop host services owned by this fresh engine."""
@@ -243,7 +249,7 @@ class AgentEngine:
                 host_uds_path,
                 engine_name,
                 self._agent.harness,
-                agconfig=self._agent.agconfig,
+                agconfig=self.agconfig,
             )
 
             # Obtain Host -> Sandbox handle

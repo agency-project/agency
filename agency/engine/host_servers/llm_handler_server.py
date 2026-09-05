@@ -353,7 +353,7 @@ class LlmHandlerServer:
         self._message_sequences: "set[int]" = set()
         self._model_redirects: dict[str, tuple] = {}
         self._model_protocol_valid: dict[str, bool] = {}
-        self.set_config(agconfig)
+        self.change_config(agconfig)
 
     def get_all_transcripts(self) -> "list[dict]":
         with self._transcript_lock:
@@ -445,7 +445,7 @@ class LlmHandlerServer:
         metadata_block["request_id"] = getattr(self._invocation, "_request_id", None)
         metadata_block["skill"] = getattr(self._invocation, "skill_name", None)
 
-    def set_config(self, agconfig: "agconfig_cls") -> None:
+    def change_config(self, agconfig: "agconfig_cls") -> None:
         self._agconfig = agconfig
         self._backend = agllm.for_config(agconfig)
 

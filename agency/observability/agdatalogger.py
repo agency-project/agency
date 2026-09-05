@@ -32,7 +32,7 @@ class agDataLogger:
         default_name: "str | None" = None,
         default_object: "str | None" = None,
     ) -> None:
-        self.set_config(agconfig)
+        self.change_config(agconfig)
         self._default_name = default_name
         self._default_object = default_object
 
@@ -61,7 +61,7 @@ class agDataLogger:
         self._sequence += 1
         return f"{self._sequence:020d}{uuid.uuid4().hex}"
 
-    def set_config(self, agconfig: "agconfig_cls") -> None:
+    def change_config(self, agconfig: "agconfig_cls") -> None:
         if agconfig.data_logger.db_path is None:
             existing = getattr(self, "agconfig", None)
             if existing is None or existing.data_logger.db_path is None:
