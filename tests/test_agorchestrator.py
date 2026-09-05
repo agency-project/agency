@@ -12,7 +12,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency.configs.agconfig import agconfig as agconfig_cls
+from agency.configs.agconfig import (
+    agconfig as agconfig_cls,
+    agentconfig,
+    llmconfig,
+    orchestratorconfig,
+)
 from agency.agcontext import agcontext
 from agency.agdata import agdata, agerror
 from agency.agent import agent
@@ -25,10 +30,9 @@ from agency.engine import AgentEngine
 
 def _agent(tmp_path, *, max_engines=None):
     config = agconfig_cls(
-        max_concurrent_engines=max_engines,
-        log_dir=str(tmp_path),
-        api_key="test",
-        model="m",
+        orchestratorconfig(max_concurrent_engines=max_engines),
+        agentconfig(log_dir=str(tmp_path)),
+        llmconfig(api_key="test", model="m"),
     )
     sandbox = MagicMock()
     sandbox._lock = threading.RLock()

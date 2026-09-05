@@ -27,18 +27,20 @@ import html2text
 import httpx
 
 from agency import agent, agdata, agfile, agskill, agteam, agsync, agtool
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.utils.agutil import format_exception as _fmt_exc
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agconfig(
-    provider="vllm",
-    base_url=os.environ.get("LLM_BASE_URL"),
-    model=os.environ.get("LLM_MODEL", ""),
-    api_key=os.environ.get("LLM_API_KEY", ""),
-    temperature=0.7,
-    top_p=0.95,
-    top_k=20,
+    llmconfig(
+        provider="vllm",
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
+    )
 )
 MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "4"))
 _MAX_CHARS = 32_000

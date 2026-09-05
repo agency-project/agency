@@ -238,10 +238,10 @@ class _AnthropicBackend(agllm):
 
     def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
         kwargs: dict = dict(
-            api_key=self.agconfig.api_key or os.environ.get("ANTHROPIC_API_KEY"),
+            api_key=self.agconfig.llm.api_key or os.environ.get("ANTHROPIC_API_KEY"),
             timeout=timeout,
         )
-        workspace_id = self.agconfig.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
+        workspace_id = self.agconfig.llm.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         if workspace_id:
             kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
         return kwargs
@@ -258,7 +258,7 @@ class _AnthropicBackend(agllm):
             return []
         return list(
             self.make_client(
-                httpx.Timeout(self.agconfig.model_listing_timeout_seconds)
+                httpx.Timeout(self.agconfig.llm.model_listing_timeout_seconds)
             ).models.list()
         )
 
@@ -280,11 +280,11 @@ class _AnthropicBackend(agllm):
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         system, anthropic_messages = _agency_messages_to_anthropic(request["messages"])
         kwargs: dict = dict(
-            model=self.agconfig.model or "",
+            model=self.agconfig.llm.model or "",
             messages=anthropic_messages,
-            max_tokens=self.agconfig.max_completion_tokens
-            or self.agconfig.max_tokens
-            or self.agconfig.default_max_tokens,
+            max_tokens=self.agconfig.llm.max_completion_tokens
+            or self.agconfig.llm.max_tokens
+            or self.agconfig.llm.default_max_tokens,
         )
         if system:
             # Breakpoint on the system prompt: it's the largest, most static
@@ -292,11 +292,11 @@ class _AnthropicBackend(agllm):
             # before system in Anthropic's prefix order, so this one
             # breakpoint caches tools + system together.
             kwargs["system"] = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
-        if self.agconfig.temperature is not None:
-            kwargs["temperature"] = self.agconfig.temperature
-        if self.agconfig.top_p is not None:
-            kwargs["top_p"] = self.agconfig.top_p
-        extra_body = self.agconfig.extra_body or {}
+        if self.agconfig.llm.temperature is not None:
+            kwargs["temperature"] = self.agconfig.llm.temperature
+        if self.agconfig.llm.top_p is not None:
+            kwargs["top_p"] = self.agconfig.llm.top_p
+        extra_body = self.agconfig.llm.extra_body or {}
         if "top_k" in extra_body:
             kwargs["top_k"] = extra_body["top_k"]
         anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))

@@ -23,17 +23,19 @@ import sys
 from pathlib import Path
 
 from agency import agent, agdata, agimage, agskill, agteam, agsync
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 cfg = agconfig(
-    provider="vllm",
-    base_url=os.environ.get("LLM_BASE_URL"),
-    model=os.environ.get("LLM_MODEL", ""),
-    api_key=os.environ.get("LLM_API_KEY", ""),
-    temperature=0.7,
-    top_p=0.95,
-    top_k=20,
+    llmconfig(
+        provider="vllm",
+        base_url=os.environ.get("LLM_BASE_URL"),
+        model=os.environ.get("LLM_MODEL", ""),
+        api_key=os.environ.get("LLM_API_KEY", ""),
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
+    )
 )
 
 # ---------------------------------------------------------------------------

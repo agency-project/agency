@@ -7,13 +7,13 @@ from unittest.mock import patch
 
 import httpx
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.openai import _OpenAICompatibleBackend
 
 
 def _cfg(**fields) -> agconfig:
-    """Test helper: build a flat agconfig."""
-    return agconfig(**fields)
+    """Test helper: build an agconfig with the given llmconfig fields."""
+    return agconfig(llmconfig(**fields))
 
 
 def _ev(**kwargs):

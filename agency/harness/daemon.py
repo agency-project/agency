@@ -20,7 +20,7 @@ from typing import Callable
 import uvicorn
 from fastapi import FastAPI
 
-from ..configs.agconfig import agconfig as agconfig_cls
+from ..configs.agconfig import agconfig as agconfig_cls, harnessadapterconfig, ptraceconfig
 from . import interaction_router, mcp_proxy
 from .adapters.agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from .clients.host_services_client import HostServicesClient
@@ -294,12 +294,16 @@ def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
 
 def main(argv: "list[str] | None" = None) -> None:
     args = _parse_args(argv)
+    payload = json.loads(args.config_json)
     manager = HarnessManager(
         args.sandbox_uds,
         args.host_uds,
         args.engine_name,
         args.harness,
-        agconfig=agconfig_cls(**json.loads(args.config_json)),
+        agconfig=agconfig_cls(
+            harnessadapterconfig(**payload.get("harness_adapter", {})),
+            ptraceconfig(**payload.get("ptrace", {})),
+        ),
         harness_api_port=args.harness_api_port,
     )
     stopped = threading.Event()

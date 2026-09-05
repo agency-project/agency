@@ -10,7 +10,12 @@ from agency.agtool import agtool
 from agency.agent import agent
 from agency._submission import Invocation
 from agency.agname import agname as _agname
-from agency.configs.agconfig import agconfig as agconfig_cls
+from agency.configs.agconfig import (
+    agconfig as agconfig_cls,
+    agentconfig,
+    llmconfig,
+    sandboxconfig,
+)
 from agency.engine import AgentEngine
 
 
@@ -125,15 +130,15 @@ def _llm_agconfig(d: dict) -> agconfig_cls:
     # leave model="" -- they care about api_key/temperature/etc., not model.
     d = dict(d)
     d.setdefault("provider", "mock")
-    return agconfig_cls(backend="docker", **d)
+    return agconfig_cls(llmconfig(**d), sandboxconfig(backend="docker"))
 
 
 def _inherited_config_snapshot(cfg: agconfig_cls) -> dict:
-    """safe_snapshot() minus data_logger_db_path -- that field is computed
+    """safe_snapshot() minus data_logger.db_path -- that field is computed
     per-agname (agname/<agname>_data.sqlite3), so a fork/clone legitimately
     gets its own value even though every other field is inherited unchanged."""
     snap = cfg.safe_snapshot()
-    snap.pop("data_logger_db_path", None)
+    snap["data_logger"].pop("db_path", None)
     return snap
 
 
@@ -233,7 +238,7 @@ def test_scheduled_run_creates_sandbox_facade_with_output_mount(monkeypatch, tmp
     assert len(created) == 1
     agname, sandbox_config = created[0]
     assert agname == ag.agname
-    assert sandbox_config.mounts == {
+    assert sandbox_config.sandbox.mounts == {
         "agent_output": (str(tmp_path / ag.agname), "/agent_output", "rw")
     }
 
@@ -260,7 +265,9 @@ def test_harness_explicit_constructor_arg():
 
 
 def test_harness_from_agconfig():
-    cfg = agconfig_cls(harness="opencode", provider="mock", api_key="k", model="")
+    cfg = agconfig_cls(
+        agentconfig(harness="opencode"), llmconfig(provider="mock", api_key="k", model="")
+    )
     ag = agent(agconfig=cfg)
     assert ag.harness == "opencode"
 
@@ -1092,12 +1099,14 @@ def test_save_redacts_secrets_from_checkpoint(tmp_path):
     import tarfile
 
     cfg = agconfig_cls(
-        provider="bedrock",
-        model="m",
-        api_key="super-secret-api-key",
-        aws_access_key="super-secret-access-key",
-        aws_secret_key="super-secret-secret-key",
-        aws_session_token="super-secret-session-token",
+        llmconfig(
+            provider="bedrock",
+            model="m",
+            api_key="super-secret-api-key",
+            aws_access_key="super-secret-access-key",
+            aws_secret_key="super-secret-secret-key",
+            aws_session_token="super-secret-session-token",
+        )
     )
     ag = agent(agconfig=cfg)
     assert ag.sandbox is None  # no skill run -- state.json-only save path
@@ -1193,7 +1202,7 @@ from agency.agschema import agschema as _agschema
 def test_prepare_inputs_in_sandbox_replaces_long_string():
 
     sandbox = MagicMock()
-    long_val = "x" * (agconfig_cls().input_offload_chars + 1)
+    long_val = "x" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(text=long_val, small="hi")
     paths, fields = _agschema(agdata(text=str, small=str)).prepare_inputs_in_sandbox(
         inp, sandbox, "mskill"
@@ -1228,7 +1237,7 @@ def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
 
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
-    long_val = "y" * (agconfig_cls().input_offload_chars + 1)
+    long_val = "y" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(text=long_val)
     paths, fields = _agschema(agdata(text=str)).prepare_inputs_in_sandbox(inp, sandbox, "skill")
     assert paths == []
@@ -1239,8 +1248,8 @@ def test_prepare_inputs_in_sandbox_sandbox_failure_leaves_field_unchanged():
 def test_prepare_inputs_in_sandbox_list_large_strings_replaced_with_paths():
 
     sandbox = MagicMock()
-    long_a = "a" * (agconfig_cls().input_offload_chars + 1)
-    long_b = "b" * (agconfig_cls().input_offload_chars + 1)
+    long_a = "a" * (agconfig_cls().schema.input_offload_chars + 1)
+    long_b = "b" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(items=[long_a, long_b])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     assert sandbox.write_file.call_count == 2
@@ -1266,7 +1275,7 @@ def test_prepare_inputs_in_sandbox_list_short_strings_unchanged():
 def test_prepare_inputs_in_sandbox_list_mixed_only_large_replaced():
 
     sandbox = MagicMock()
-    long_val = "x" * (agconfig_cls().input_offload_chars + 1)
+    long_val = "x" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(items=["short", long_val])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     sandbox.write_file.assert_called_once()
@@ -1287,7 +1296,7 @@ def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged
 
     sandbox = MagicMock()
     sandbox.write_file.side_effect = OSError("no space")
-    long_val = "x" * (agconfig_cls().input_offload_chars + 1)
+    long_val = "x" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(items=[long_val])
     paths, fields = _agschema(agdata(items=list)).prepare_inputs_in_sandbox(inp, sandbox, "sk")
     assert paths == []
@@ -1298,7 +1307,7 @@ def test_prepare_inputs_in_sandbox_list_sandbox_failure_leaves_element_unchanged
 def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
 
     sandbox = MagicMock()
-    data_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
+    data_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(frames=[data_url, data_url])
     schema = agdata(frames=list[agimage])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1310,7 +1319,7 @@ def test_prepare_inputs_in_sandbox_skips_agtype_list_fields():
 def test_prepare_inputs_in_sandbox_skips_single_agtype_field():
 
     sandbox = MagicMock()
-    data_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
+    data_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(photo=data_url)
     schema = agdata(photo=agimage)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1323,7 +1332,7 @@ def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
     sandbox = MagicMock()
     # After agbinary.prepare() the value is a short sandbox path, but the skip
     # should fire on the schema hint alone — verify with a long string too.
-    long_path = "/workspace/inputs/" + "a" * (agconfig_cls().input_offload_chars + 1)
+    long_path = "/workspace/inputs/" + "a" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(audio=long_path)
     schema = agdata(audio=agbinary)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1335,7 +1344,7 @@ def test_prepare_inputs_in_sandbox_skips_single_agbinary_field():
 def test_prepare_inputs_in_sandbox_skips_agbinary_list_fields():
 
     sandbox = MagicMock()
-    long_path = "/workspace/inputs/" + "b" * (agconfig_cls().input_offload_chars + 1)
+    long_path = "/workspace/inputs/" + "b" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(clips=[long_path, long_path])
     schema = agdata(clips=list[agbinary])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1357,7 +1366,7 @@ def test_prepare_inputs_in_sandbox_processes_agfile_field_via_prepare():
 def test_prepare_inputs_in_sandbox_offloads_agrawstring_when_long():
 
     sandbox = MagicMock()
-    long_text = "x" * (agconfig_cls().input_offload_chars + 1)
+    long_text = "x" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(prompt=long_text)
     schema = agdata(prompt=agrawstring)
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1380,7 +1389,7 @@ def test_prepare_inputs_in_sandbox_preserves_short_agrawstring():
 def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
 
     sandbox = MagicMock()
-    long_val = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
+    long_val = "data:image/jpeg;base64," + "A" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(images={"a": long_val})
     schema = agdata(images=dict[str, agimage])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1392,7 +1401,7 @@ def test_prepare_inputs_in_sandbox_skips_dict_agtype_field():
 def test_prepare_inputs_in_sandbox_skips_tuple_agtype_field():
 
     sandbox = MagicMock()
-    long_val = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
+    long_val = "data:image/jpeg;base64," + "A" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(pair=(long_val, "label"))
     schema = agdata(pair=tuple[agimage, str])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1536,7 +1545,7 @@ def test_recover_agtype_outputs_dict_of_list_agfile():
 def test_offload_skips_nested_list_agimage():
 
     sandbox = MagicMock()
-    long_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
+    long_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(batches=[[long_url], [long_url]])
     schema = agdata(batches=list[list[agimage]])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1547,7 +1556,7 @@ def test_offload_skips_nested_list_agimage():
 def test_offload_skips_dict_of_list_agimage():
 
     sandbox = MagicMock()
-    long_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().input_offload_chars + 1)
+    long_url = "data:image/jpeg;base64," + "A" * (agconfig_cls().schema.input_offload_chars + 1)
     inp = agdata(groups={"g": [long_url]})
     schema = agdata(groups=dict[str, list[agimage]])
     paths, fields = _agschema(schema).prepare_inputs_in_sandbox(inp, sandbox, "sk")
@@ -1677,7 +1686,7 @@ def test_random_offload_agtype_skip_fuzz():
     """100 randomly generated single-field schemas: _offload_large_fields must
     skip fields whose hint contains any non-agrawstring agtype at any nesting
     depth, and must offload plain str and agrawstring fields when the value
-    exceeds agconfig_cls().input_offload_chars.
+    exceeds agconfig_cls().schema.input_offload_chars.
     """
     import random
     from typing import get_origin, get_args
@@ -1711,7 +1720,7 @@ def test_random_offload_agtype_skip_fuzz():
             return any(hint_has_non_raw_agtype(a) for a in args)
         return False
 
-    long_str = "x" * (agconfig_cls().input_offload_chars + 1)
+    long_str = "x" * (agconfig_cls().schema.input_offload_chars + 1)
 
     failures = []
     for trial in range(100):
@@ -1770,15 +1779,15 @@ def test_agent_change_config_clones_given_agconfig():
     ag = make_agent()
     new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
     ag.change_config(new_cfg)
-    new_cfg.temperature = 0.9
-    assert ag.agconfig.temperature == 0.2
+    new_cfg.llm.temperature = 0.9
+    assert ag.agconfig.llm.temperature == 0.2
 
 
 def test_agent_change_config_updates_agconfig_attr():
     ag = make_agent()
     new_cfg = _llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2})
     ag.change_config(new_cfg)
-    assert ag.agconfig.temperature == 0.2
+    assert ag.agconfig.llm.temperature == 0.2
     assert ag.agconfig is not new_cfg  # cloned, not aliased
 
 
@@ -1790,17 +1799,17 @@ def test_agent_get_config_copy_returns_clone_not_same_object():
 
 def test_agent_get_config_copy_reflects_current_values():
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))
-    assert ag.get_config_copy().temperature == 0.7
+    assert ag.get_config_copy().llm.temperature == 0.7
 
 
 def test_agent_get_config_copy_after_change_config_reflects_new_values():
     ag = make_agent()
     ag.change_config(_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.2}))
-    assert ag.get_config_copy().temperature == 0.2
+    assert ag.get_config_copy().llm.temperature == 0.2
 
 
 def test_mutating_agent_get_config_copy_does_not_affect_agent():
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": "", "temperature": 0.7}))
     copy = ag.get_config_copy()
-    copy.temperature = 0.1
-    assert ag.agconfig.temperature == 0.7
+    copy.llm.temperature = 0.1
+    assert ag.agconfig.llm.temperature == 0.7

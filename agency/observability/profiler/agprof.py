@@ -1284,7 +1284,7 @@ def start(
                 '`pip install -e ".[profiler]"`'
             ) from e
         from ..agdatalogger import agDataLogger
-        from ...configs.agconfig import agconfig as _agconfig_cls
+        from ...configs.agconfig import agconfig as _agconfig_cls, dataloggerconfig
 
         profile_session_id = uuid.uuid4().hex
         profile_db_path = (
@@ -1292,9 +1292,11 @@ def start(
         )
         profile_data_logger = agDataLogger(
             _agconfig_cls(
-                data_logger_db_path=profile_db_path,
-                data_logger_flush_batch_size=500,
-                data_logger_flush_interval_s=1.0,
+                dataloggerconfig(
+                    db_path=profile_db_path,
+                    flush_batch_size=500,
+                    flush_interval_s=1.0,
+                )
             ),
             default_name="agprof",
             default_object="profiler",
@@ -1309,9 +1311,11 @@ def start(
             )
             profile_data_logger = agDataLogger(
                 _agconfig_cls(
-                    data_logger_db_path=":memory:",
-                    data_logger_flush_batch_size=500,
-                    data_logger_flush_interval_s=1.0,
+                    dataloggerconfig(
+                        db_path=":memory:",
+                        flush_batch_size=500,
+                        flush_interval_s=1.0,
+                    )
                 ),
                 default_name="agprof",
                 default_object="profiler",

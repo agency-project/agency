@@ -1,28 +1,34 @@
-"""agconfig — one flat, typed config object for the whole framework.
+"""agconfig — one config object for the whole framework, one level deep.
 
 Replaces the old tiered descriptor system (`GlobalConfigParam`/
 `StaticConfigParam`/`DynamicConfigParam`, 14 owner-scoped `*Fields` classes,
-21 `*Config` view classes spread across the codebase). Every tunable value
-in the system is now a plain member variable on this one class -- no
-owner-nesting (`cfg.temperature`, not `cfg.agllm_backend.temperature`), no
-tiers.
+21 `*Config` view classes spread across the codebase). Every tunable value in
+the system lives on a plain, typed namespace dataclass (`llmconfig`,
+`sandboxconfig`, ...), and `agconfig` itself holds exactly one instance of
+each -- one level of nesting, no deeper, no descriptors, no owner strings.
 
-Passed as ``agconfig=`` to any framework class's constructor. A parent
-object forwards its own ``agconfig`` to every child object it creates (e.g.
-``agent`` -> its ``agllm`` backend and ``agSandbox``), so one ``agconfig``
-built at the top of a script flows to everything it spawns::
+Passed as ``agconfig=`` to any framework class's constructor. A parent object
+forwards its own ``agconfig`` to every child object it creates (e.g. ``agent``
+-> its ``agllm`` backend and ``agSandbox``), so one ``agconfig`` built at the
+top of a script flows to everything it spawns::
 
-    cfg = agconfig(provider="bedrock", model="...", api_key="...", base_image="my-image:latest")
+    cfg = agconfig(
+        llmconfig(provider="bedrock", model="...", api_key="..."),
+        sandboxconfig(base_image="my-image:latest"),
+    )
     ag = agent(agconfig=cfg)
 
-Consumers hold a plain reference and read through it (``self.agconfig.model``),
+Construction takes zero or more namespace instances positionally (no keyword
+name needed -- each is recognized by its own type and dispatched to the
+matching field); any namespace not passed gets a fresh, all-defaults
+instance. Consumers read through the namespace (``self.agconfig.llm.model``),
 not a magically-inherited bare attribute -- ordinary composition, no
 descriptors involved.
 
 A handful of values that are genuinely process-wide (not meaningfully
 per-agent -- a docker call semaphore, one-time GPU/CPU/memory hardware
 detection, safety floors that must never be overridden per-agent) are
-module-level constants below, not fields on this class at all.
+module-level constants below, not fields on any namespace at all.
 
 What's deliberately dropped, not replaced, versus the old system:
 - The old tier-1 "locked after first read, can't be changed again this
@@ -79,14 +85,58 @@ def _is_json_safe(value: Any) -> bool:
     return False
 
 
+class confignamespace:
+    """Base class for every one-level namespace config dataclass (llmconfig,
+    sandboxconfig, ...) -- clone()/update()/safe_snapshot() live here once so
+    concrete namespaces only ever declare fields, never repeat this trio.
+
+    Not itself a dataclass (no fields of its own): `@dataclass(slots=True)`
+    on a concrete subclass still works fine inheriting from a plain class
+    like this one, and `dataclasses.fields()`/`__dataclass_fields__` are
+    found via the *subclass*, which is what these methods actually run
+    against through ``self``.
+    """
+
+    __slots__: "ClassVar[tuple]" = ()
+    _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset()
+
+    def clone(self):
+        """Independent copy -- mutating the clone never affects the original."""
+        return copy.deepcopy(self)
+
+    def update(self, **values: Any):
+        """Set several fields at once, e.g. from a partial webui-editor
+        payload. Raises on an unknown field name (same fail-fast intent the
+        old per-owner *Config views gave via _ALLOWED_FIELDS)."""
+        known = {f.name for f in fields(self) if not f.name.startswith("_")}
+        unknown = set(values) - known
+        if unknown:
+            raise TypeError(f"{type(self).__name__} has no field(s) {sorted(unknown)}")
+        for name, value in values.items():
+            setattr(self, name, value)
+        return self
+
+    def safe_snapshot(self) -> "dict[str, Any]":
+        """JSON-safe, secret-redacted snapshot of every field on this namespace."""
+        sensitive = self._SENSITIVE_FIELDS
+        result: "dict[str, Any]" = {}
+        for f in fields(self):
+            if f.name.startswith("_") or f.name in sensitive:
+                continue
+            value = getattr(self, f.name)
+            if not _is_json_safe(value):
+                continue
+            result[f.name] = value
+        return result
+
+
 @dataclass(slots=True)
-class agconfig:
-    # ---------------------------------------------------------------------
-    # LLM -- merges the old "agllm" (process policy) and "agllm_backend"
-    # (per-call params) owners, plus the mock/replay backend's fields --
-    # there's no structural reason to keep any of these apart once there's
-    # no owner string forcing the split.
-    # ---------------------------------------------------------------------
+class llmconfig(confignamespace):
+    """LLM backend config -- merges the old "agllm" (process policy) and
+    "agllm_backend" (per-call params) owners, plus the mock/replay backend's
+    fields, since there's no structural reason to keep any of these apart
+    once they're all one namespace."""
+
     provider: "str | None" = None
     model: str = ""
     api_key: "str | None" = None
@@ -143,19 +193,23 @@ class agconfig:
     timing_fn: "Callable | None" = None  # a plain callable -- not JSON-safe,
     # so safe_snapshot() silently omits it, same as any other non-JSON-safe value.
 
-    # ---------------------------------------------------------------------
-    # Sandbox facade (agency/sandbox/agsandbox.py)
-    # ---------------------------------------------------------------------
+    _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset(
+        {"api_key", "aws_access_key", "aws_secret_key", "aws_session_token"}
+    )
+
+
+@dataclass(slots=True)
+class sandboxconfig(confignamespace):
+    """Sandbox facade (agency/sandbox/agsandbox.py) and backend mechanics
+    (agency/sandbox/base.py) -- docker/podman daemon-call timeouts and retry
+    policy. docker_semaphore_limit moved to the process-wide
+    DOCKER_SEMAPHORE_LIMIT constant above (it gates an actual shared
+    semaphore, not a per-agent tunable)."""
+
     base_image: str = "agency-sandbox:latest"
     persistent: bool = False
     mounts: "dict[str, tuple[str, str, str]]" = field(default_factory=dict)
 
-    # ---------------------------------------------------------------------
-    # Sandbox backend mechanics (agency/sandbox/base.py) -- docker/podman
-    # daemon-call timeouts and retry policy. docker_semaphore_limit moved to
-    # the process-wide DOCKER_SEMAPHORE_LIMIT constant above (it gates an
-    # actual shared semaphore, not a per-agent tunable).
-    # ---------------------------------------------------------------------
     backend: str = "auto"  # podman | docker | chroot | auto
     inspect_timeout_s: float = 120
     exec_quick_timeout_s: float = 120
@@ -186,101 +240,184 @@ class agconfig:
     checkpoint_squash_max_depth: int = 100
     squash_timeout_s: float = 600
 
-    # ---------------------------------------------------------------------
-    # Orchestrator (agency/orchestrator/orchestrator.py) -- the
-    # orchestrator's own global data logger. Prefixed to avoid colliding
-    # with the per-agent data_logger_* fields below, which are a different
-    # database with different defaults.
-    # ---------------------------------------------------------------------
-    max_concurrent_engines: "int | None" = None
-    orchestrator_db_path: "str | None" = None
-    orchestrator_flush_batch_size: int = 500
-    orchestrator_flush_interval_s: float = 1.0
+    def add_mount(
+        self, name: str, host_path, container_path: str, mode: str = "rw"
+    ) -> "sandboxconfig":
+        self.mounts[name] = (str(host_path), container_path, mode)
+        return self
 
-    # ---------------------------------------------------------------------
-    # Resource pool (agency/orchestrator/agresources.py) -- per-agent
-    # sandbox resource footprint. Detection timeouts and min_cpus/
-    # min_memory_mb safety floors moved to the process-wide constants above.
-    # ---------------------------------------------------------------------
+    def remove_mount(self, name: str) -> "sandboxconfig":
+        self.mounts.pop(name, None)
+        return self
+
+
+@dataclass(slots=True)
+class orchestratorconfig(confignamespace):
+    """The global orchestrator's own event/data logger (agency/orchestrator/
+    orchestrator.py) -- a different database, with different defaults, from
+    the per-agent data logger (see dataloggerconfig below)."""
+
+    max_concurrent_engines: "int | None" = None
+    db_path: "str | None" = None
+    flush_batch_size: int = 500
+    flush_interval_s: float = 1.0
+
+
+@dataclass(slots=True)
+class resourcesconfig(confignamespace):
+    """Resource pool (agency/orchestrator/agresources.py) -- per-agent
+    sandbox resource footprint. Detection timeouts and min_cpus/
+    min_memory_mb safety floors moved to the process-wide constants above."""
+
     idle_cpus: "float | None" = 8.0
     idle_memory: "str | None" = None
 
-    # ---------------------------------------------------------------------
-    # Agent (agency/agent.py). log_dir/output_dir used to be plain ClassVars
-    # on `agent` (set once before creating agents, e.g. `agent.log_dir =
-    # Path(...)`) resolved through a helper function specifically to avoid a
-    # descriptor-on-a-class-attribute footgun -- that footgun doesn't exist
-    # once there's no descriptor at all, so they're now ordinary fields here:
-    # `agent.log_dir` stays a supported class-level default (checked first),
-    # a set `agconfig.log_dir` on a specific config overrides it.
-    # ---------------------------------------------------------------------
+
+@dataclass(slots=True)
+class agentconfig(confignamespace):
+    """agency/agent.py. log_dir/output_dir used to be plain ClassVars on
+    `agent` (set once before creating agents, e.g. `agent.log_dir =
+    Path(...)`) resolved through a helper function specifically to avoid a
+    descriptor-on-a-class-attribute footgun -- that footgun doesn't exist
+    once there's no descriptor at all, so they're now ordinary fields here:
+    `agent.log_dir` stays a supported class-level default (checked first), a
+    set `agconfig.agent.log_dir` on a specific config overrides it."""
+
     log_dir: "str | None" = None
     output_dir: "str | None" = None
     checkpoint_save_timeout_s: int = 600
     checkpoint_load_timeout_s: int = 600
     harness: str = "native"
 
-    # ---------------------------------------------------------------------
-    # Schema (agency/agschema.py)
-    # ---------------------------------------------------------------------
+
+@dataclass(slots=True)
+class schemaconfig(confignamespace):
+    """agency/agschema.py."""
+
     input_offload_chars: int = 40_000
     offload_context_fraction: float = 0.1
     chars_per_token: int = 4
 
-    # ---------------------------------------------------------------------
-    # Skill (agency/agskill.py)
-    # ---------------------------------------------------------------------
+
+@dataclass(slots=True)
+class skillconfig(confignamespace):
+    """agency/agskill.py."""
+
     react_max_steps: int = 4096
     agbinary_validate_exec_timeout: float = 5
     error_log_truncate: int = 300
     last_output_log_truncate: int = 2000
 
-    # ---------------------------------------------------------------------
-    # Tool (agency/agtool.py). timeout_s renamed tool_timeout_s -- it's
-    # already documented as a historical, no-longer-enforced ceiling, and
-    # "timeout_s" alone reads ambiguously next to dozens of other
-    # *_timeout_s fields once everything shares one flat namespace.
-    # ---------------------------------------------------------------------
-    tool_timeout_s: float = 1800
+
+@dataclass(slots=True)
+class toolconfig(confignamespace):
+    """agency/agtool.py."""
+
+    timeout_s: float = 1800
     output_offload_chars: int = 40_000
     offload_id_prefix_len: int = 12
 
-    # ---------------------------------------------------------------------
-    # Harness adapter (agency/harness/adapters/agharness_backend.py)
-    # ---------------------------------------------------------------------
+
+@dataclass(slots=True)
+class harnessadapterconfig(confignamespace):
+    """agency/harness/adapters/agharness_backend.py."""
+
     session_resume_id: "str | None" = None
     binary_path: "str | None" = None
     mediation_mode: str = "auto"  # ptrace | native_hooks | auto
 
-    # ---------------------------------------------------------------------
-    # ptrace harness supervisor (agency/harness/ptrace/supervisor.py)
-    # ---------------------------------------------------------------------
+
+@dataclass(slots=True)
+class ptraceconfig(confignamespace):
+    """ptrace harness supervisor (agency/harness/ptrace/supervisor.py)."""
+
     syscalls: "tuple[str, ...]" = ("execve", "execveat")
     profiler: "str | None" = None  # reserved for a future heavyweight profiler (e.g. perf)
     disable_harness_native_sandbox: bool = True
 
-    # ---------------------------------------------------------------------
-    # Per-agent data logger (agency/observability/agdatalogger.py) --
-    # replaces the old informal agDataLoggerConfigs escape-hatch dataclass.
-    # db_path is computed once per agent (log_dir/<agname>_data.sqlite3) if
-    # not already set, same as today.
-    # ---------------------------------------------------------------------
-    data_logger_db_path: "str | None" = None
-    data_logger_flush_batch_size: int = 20
-    data_logger_flush_interval_s: float = 0.2
 
-    # ---------------------------------------------------------------------
-    # Host server manager (agency/engine/host_servers/host_server_manager.py)
-    # -- replaces the old informal HostServerManagerConfigs escape-hatch
-    # dataclass. uds_path is computed once per agent if not already set.
-    # ---------------------------------------------------------------------
-    host_server_uds_path: "str | None" = None
-    host_server_startup_timeout_s: float = 10.0
-    host_server_shutdown_timeout_s: float = 10.0
+@dataclass(slots=True)
+class dataloggerconfig(confignamespace):
+    """Per-agent data logger (agency/observability/agdatalogger.py) --
+    replaces the old informal agDataLoggerConfigs escape-hatch dataclass.
+    db_path is computed once per agent (log_dir/<agname>_data.sqlite3) if
+    not already set, same as today."""
 
-    _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset(
-        {"api_key", "aws_access_key", "aws_secret_key", "aws_session_token"}
-    )
+    db_path: "str | None" = None
+    flush_batch_size: int = 20
+    flush_interval_s: float = 0.2
+
+
+@dataclass(slots=True)
+class hostserverconfig(confignamespace):
+    """Host server manager (agency/engine/host_servers/host_server_manager.py)
+    -- replaces the old informal HostServerManagerConfigs escape-hatch
+    dataclass. uds_path is computed once per agent if not already set."""
+
+    uds_path: "str | None" = None
+    startup_timeout_s: float = 10.0
+    shutdown_timeout_s: float = 10.0
+
+
+@dataclass(slots=True, init=False)
+class agconfig:
+    llm: llmconfig
+    sandbox: sandboxconfig
+    orchestrator: orchestratorconfig
+    resources: resourcesconfig
+    agent: agentconfig
+    schema: schemaconfig
+    skill: skillconfig
+    tool: toolconfig
+    harness_adapter: harnessadapterconfig
+    ptrace: ptraceconfig
+    data_logger: dataloggerconfig
+    host_server: hostserverconfig
+
+    # Maps each namespace dataclass to the agconfig field it lives on --
+    # __init__ dispatches by the *type* of each positional argument, so
+    # callers never spell out a keyword: agconfig(llmconfig(...), sandboxconfig(...)).
+    _FIELD_BY_NAMESPACE_TYPE: ClassVar[dict] = {
+        llmconfig: "llm",
+        sandboxconfig: "sandbox",
+        orchestratorconfig: "orchestrator",
+        resourcesconfig: "resources",
+        agentconfig: "agent",
+        schemaconfig: "schema",
+        skillconfig: "skill",
+        toolconfig: "tool",
+        harnessadapterconfig: "harness_adapter",
+        ptraceconfig: "ptrace",
+        dataloggerconfig: "data_logger",
+        hostserverconfig: "host_server",
+    }
+
+    def __init__(self, *namespaces: Any) -> None:
+        self.llm = llmconfig()
+        self.sandbox = sandboxconfig()
+        self.orchestrator = orchestratorconfig()
+        self.resources = resourcesconfig()
+        self.agent = agentconfig()
+        self.schema = schemaconfig()
+        self.skill = skillconfig()
+        self.tool = toolconfig()
+        self.harness_adapter = harnessadapterconfig()
+        self.ptrace = ptraceconfig()
+        self.data_logger = dataloggerconfig()
+        self.host_server = hostserverconfig()
+
+        seen: "set[str]" = set()
+        for namespace in namespaces:
+            field_name = self._FIELD_BY_NAMESPACE_TYPE.get(type(namespace))
+            if field_name is None:
+                raise TypeError(
+                    f"agconfig() received an unrecognized namespace object: "
+                    f"{type(namespace).__name__!r}"
+                )
+            if field_name in seen:
+                raise TypeError(f"agconfig() received more than one {field_name!r} namespace")
+            seen.add(field_name)
+            setattr(self, field_name, namespace)
 
     def clone(self) -> "agconfig":
         """Independent copy -- mutating the clone never affects the
@@ -290,40 +427,25 @@ class agconfig:
         objects already consumed."""
         return copy.deepcopy(self)
 
-    def update(self, **values: Any) -> "agconfig":
-        """Set several fields at once, e.g. from a partial webui-editor
-        payload. Raises on an unknown field name (same fail-fast intent the
-        old per-owner *Config views gave via _ALLOWED_FIELDS)."""
+    def update(self, **namespace_updates: "dict[str, Any]") -> "agconfig":
+        """Merge partial field updates into one or more namespaces at once,
+        e.g. from a webui-editor payload shaped ``{"llm": {...}, "sandbox":
+        {...}}``. Raises on an unknown namespace name, and each namespace's
+        own update() raises on an unknown field name within it."""
         known = {f.name for f in fields(self)}
-        unknown = set(values) - known
+        unknown = set(namespace_updates) - known
         if unknown:
-            raise TypeError(f"agconfig has no field(s) {sorted(unknown)}")
-        for name, value in values.items():
-            setattr(self, name, value)
+            raise TypeError(f"agconfig has no namespace(s) {sorted(unknown)}")
+        for namespace_name, values in namespace_updates.items():
+            getattr(self, namespace_name).update(**values)
         return self
 
-    def safe_snapshot(self) -> "dict[str, Any]":
-        """JSON-safe, secret-redacted snapshot of every field -- what's
+    def safe_snapshot(self) -> "dict[str, dict[str, Any]]":
+        """JSON-safe, secret-redacted snapshot of every namespace -- what's
         exposed to the webui's config editor and persisted into checkpoints/
-        event logs. The one canonical place that knows which fields are
-        secret; every serialization path must go through this rather than
-        hand-rolling its own filter (a second, independent filter is
-        exactly how AWS credentials used to leak into checkpoints -- see
-        the module that replaced this file's predecessor)."""
-        result: "dict[str, Any]" = {}
-        for f in fields(self):
-            if f.name.startswith("_") or f.name in self._SENSITIVE_FIELDS:
-                continue
-            value = getattr(self, f.name)
-            if not _is_json_safe(value):
-                continue
-            result[f.name] = value
-        return result
-
-    def add_mount(self, name: str, host_path, container_path: str, mode: str = "rw") -> "agconfig":
-        self.mounts[name] = (str(host_path), container_path, mode)
-        return self
-
-    def remove_mount(self, name: str) -> "agconfig":
-        self.mounts.pop(name, None)
-        return self
+        event logs. Each namespace knows which of its own fields are secret;
+        every serialization path must go through this rather than
+        hand-rolling its own filter (a second, independent filter is exactly
+        how AWS credentials used to leak into checkpoints -- see the module
+        that replaced this file's predecessor)."""
+        return {f.name: getattr(self, f.name).safe_snapshot() for f in fields(self)}

@@ -435,7 +435,9 @@ class agProxyPtrace:
         is deliberately no host-to-container relay path here.
         """
         syscalls = (
-            self._agconfig.syscalls if self._agconfig is not None else agconfig_cls().syscalls
+            self._agconfig.ptrace.syscalls
+            if self._agconfig is not None
+            else agconfig_cls().ptrace.syscalls
         )
         process_profiler = _ProcessLifecycleProfiler.for_active_session(
             ag,

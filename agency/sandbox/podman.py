@@ -83,7 +83,7 @@ class _PodmanBackend(_ContainerBackendBase):
                 self._run(
                     [self._runtime, "info", "--format", "{{json .}}"],
                     check=True,
-                    timeout=self._agconfig.inspect_timeout_s,
+                    timeout=self._agconfig.sandbox.inspect_timeout_s,
                 ).stdout.decode("utf-8", errors="replace")
             )
         except Exception as _e:

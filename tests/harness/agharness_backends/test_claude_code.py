@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig, sandboxconfig
 from agency.agdata import agdata
 from agency.agent import agent
 from agency.harness.adapters.claude_code import (
@@ -268,9 +268,8 @@ def test_real_claude_raw_text_end_to_end():
     # Bedrock bearer-token credential (AWS_BEARER_TOKEN_BEDROCK) this dev
     # environment already has.
     cfg = agconfig(
-        backend="docker",
-        provider="bedrock",
-        model="us.anthropic.claude-sonnet-5",
+        sandboxconfig(backend="docker"),
+        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
     )
 
     ag = agent(agconfig=cfg, harness="claude_code")
@@ -304,9 +303,8 @@ def test_real_claude_tool_call_history_is_not_flattened():
     2-message [user, final-assistant-text] collapse, which would silently
     discard exactly this kind of turn."""
     cfg = agconfig(
-        backend="docker",
-        provider="bedrock",
-        model="us.anthropic.claude-sonnet-5",
+        sandboxconfig(backend="docker"),
+        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
     )
     ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
@@ -338,9 +336,8 @@ def test_real_claude_structured_output_end_to_end():
     # test_real_claude_raw_text_end_to_end's comment for why the request
     # log check is against this agent's own agmanager_host.
     cfg = agconfig(
-        backend="docker",
-        provider="bedrock",
-        model="us.anthropic.claude-sonnet-5",
+        sandboxconfig(backend="docker"),
+        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
     )
 
     ag = agent(agconfig=cfg, harness="claude_code")
@@ -372,9 +369,8 @@ def test_real_claude_history_continues_across_a_fresh_sandbox():
     the agent to recall that fact via `--resume` against the captured
     session blob."""
     cfg = agconfig(
-        backend="docker",
-        provider="bedrock",
-        model="us.anthropic.claude-sonnet-5",
+        sandboxconfig(backend="docker"),
+        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
     )
     skill = agskill(name="continuity_test_skill", system_prompt="You are a test assistant.")
 

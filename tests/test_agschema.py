@@ -283,7 +283,7 @@ def test_prepare_inputs_in_sandbox_replaces_long_string():
 
     s = agschema(agdata(text=str))
     sb = MagicMock()
-    data = agdata(text="x" * (agconfig().input_offload_chars + 1))
+    data = agdata(text="x" * (agconfig().schema.input_offload_chars + 1))
     paths, fields = s.prepare_inputs_in_sandbox(data, sb, "skill")
     assert fields == ["text"]
     assert len(paths) == 1

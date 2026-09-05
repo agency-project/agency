@@ -28,10 +28,14 @@ class agteam:
     thread and returns a pending :class:`agdata` immediately.  Field access
     on the returned value blocks until the workflow finishes::
 
-        cfg = agconfig_cls(
-            model="claude-sonnet-5",
-            provider="anthropic",
-            api_key=os.environ["ANTHROPIC_API_KEY"],
+        from agency.configs.agconfig import agconfig, llmconfig
+
+        cfg = agconfig(
+            llmconfig(
+                model="claude-sonnet-5",
+                provider="anthropic",
+                api_key=os.environ["ANTHROPIC_API_KEY"],
+            )
         )
 
         class PaperCrawlerTeam(agteam):

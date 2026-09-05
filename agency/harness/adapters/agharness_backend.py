@@ -19,7 +19,7 @@ Every concrete backend implements the sandbox-daemon
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 if TYPE_CHECKING:
     from ...configs.agconfig import agconfig as agconfig_cls
@@ -73,11 +73,31 @@ class agharness_backend:
     `agharness_backend.for_config(engine, agconfig)` to get the right
     subclass; don't instantiate a subclass directly."""
 
+    # Fields with no viable fallback for a given agconfig.agent.harness --
+    # checked eagerly by _validate_config() on every construction/
+    # change_config() call. Empty today: every concrete adapter's
+    # binary_path falls back to its own _DEFAULT_BINARY when unset, so
+    # nothing about agconfig.harness_adapter is strictly required from
+    # agconfig alone. Kept as a real, populated mechanism -- not a stub --
+    # for the day a harness-specific field with no safe default is added.
+    _REQUIRED_FIELDS_BY_HARNESS: "ClassVar[dict[str, tuple[str, ...]]]" = {}
+
     def __init__(self, agconfig: "agconfig_cls") -> None:
-        self.agconfig = agconfig.clone()
+        self.change_config(agconfig)
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self.agconfig = agconfig.clone()
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        harness = self.agconfig.agent.harness
+        required = self._REQUIRED_FIELDS_BY_HARNESS.get(harness, ())
+        missing = [name for name in required if not getattr(self.agconfig.harness_adapter, name)]
+        if missing:
+            raise ValueError(
+                f"agconfig.harness_adapter with harness={harness!r} is missing "
+                f"required field(s): {', '.join(missing)}"
+            )
 
     def get_config_copy(self) -> "agconfig_cls":
         return self.agconfig.clone()

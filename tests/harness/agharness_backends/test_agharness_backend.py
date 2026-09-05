@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, harnessadapterconfig
 from agency.harness.adapters.agharness_backend import (
     AdapterRuntime,
     agharness_backend,
@@ -44,13 +44,13 @@ class TestForConfigDispatch:
 
 class TestAgHarnessConfig:
     def test_binary_path_override(self):
-        cfg = agconfig(binary_path="/custom/opencode")
+        cfg = agconfig(harnessadapterconfig(binary_path="/custom/opencode"))
         backend = agharness_backend.for_config("opencode", cfg)
-        assert backend.agconfig.binary_path == "/custom/opencode"
+        assert backend.agconfig.harness_adapter.binary_path == "/custom/opencode"
 
-    def test_unknown_field_rejected(self):
+    def test_unrecognized_namespace_rejected(self):
         with pytest.raises(TypeError):
-            agconfig(not_a_real_field=1)
+            agconfig(object())
 
 
 class TestBaseDaemonAttemptNotImplemented:
@@ -76,14 +76,16 @@ class TestBaseDaemonAttemptNotImplemented:
 class TestChangeConfigAndGetConfigCopy:
     def test_change_config_clones(self):
         backend = agharness_backend.for_config("opencode", agconfig())
-        new_cfg = agconfig(binary_path="/custom/opencode")
+        new_cfg = agconfig(harnessadapterconfig(binary_path="/custom/opencode"))
         backend.change_config(new_cfg)
-        assert backend.agconfig.binary_path == "/custom/opencode"
-        new_cfg.binary_path = "/other/opencode"
-        assert backend.agconfig.binary_path == "/custom/opencode"  # unaffected -- cloned
+        assert backend.agconfig.harness_adapter.binary_path == "/custom/opencode"
+        new_cfg.harness_adapter.binary_path = "/other/opencode"
+        assert (
+            backend.agconfig.harness_adapter.binary_path == "/custom/opencode"
+        )  # unaffected -- cloned
 
     def test_get_config_copy_returns_clone(self):
         backend = agharness_backend.for_config("opencode", agconfig())
         copy = backend.get_config_copy()
-        copy.binary_path = "/custom/opencode"
-        assert backend.agconfig.binary_path is None  # unaffected
+        copy.harness_adapter.binary_path = "/custom/opencode"
+        assert backend.agconfig.harness_adapter.binary_path is None  # unaffected

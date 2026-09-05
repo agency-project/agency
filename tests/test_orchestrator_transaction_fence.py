@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from agency import Invocation, agdata, agerror, agent, agskill
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, agentconfig, llmconfig
 from agency.agcontext import agcontext
 from agency.engine import AgentEngine
 
@@ -44,7 +44,10 @@ class _TransactionSandbox:
 
 
 def _agent(tmp_path, sandbox: _TransactionSandbox) -> agent:
-    config = agconfig(log_dir=str(tmp_path), api_key="test", model="m")
+    config = agconfig(
+        agentconfig(log_dir=str(tmp_path)),
+        llmconfig(api_key="test", model="m"),
+    )
     return agent(sandbox=sandbox, agconfig=config)
 
 

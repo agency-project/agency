@@ -464,9 +464,9 @@ class TestChrootDelayedChildSafety:
 
     def test_wait_for_processes_does_not_report_clean_while_untracked_child_alive(self):
         from agency.sandbox.agsandbox import agSandbox
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
 
-        cfg = agconfig(backend="chroot")
+        cfg = agconfig(sandboxconfig(backend="chroot"))
         sb = agSandbox(str(uuid.uuid4()), agconfig=cfg)
         try:
             self._spawn_delayed_child(sb)
@@ -1238,10 +1238,10 @@ class TestChrootImageHelpers:
 @chroot
 class TestFacadeWithChrootBackend:
     def _make_sandbox(self, **kwargs):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
         from agency.sandbox.agsandbox import agSandbox
 
-        cfg = agconfig(backend="chroot")
+        cfg = agconfig(sandboxconfig(backend="chroot"))
         uid = str(uuid.uuid4())
         return agSandbox(uid, agconfig=cfg, **kwargs)
 
@@ -1296,9 +1296,9 @@ class TestFacadeWithChrootBackend:
 @chroot
 class TestAgentSaveLoadWithChrootBackend:
     def _make_agconfig(self):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, llmconfig, sandboxconfig
 
-        return agconfig(backend="chroot", api_key="k", model="m")
+        return agconfig(sandboxconfig(backend="chroot"), llmconfig(api_key="k", model="m"))
 
     def test_save_records_chroot_image_kind(self, tmp_path):
         import json

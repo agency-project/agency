@@ -49,7 +49,7 @@ from agency import (
     agskill,
     agtool,
 )
-from agency.configs.agconfig import agconfig as agconfig_cls
+from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
 ORDERED_MEMORY = "ORDERED-CONTEXT-731"
 CANCEL_MEMORY = "CANCEL-CONTEXT-947"
@@ -153,11 +153,13 @@ def _config(model: str) -> agconfig_cls:
     if not api_key:
         raise SystemExit("OPENAI_API_KEY is required")
     return agconfig_cls(
-        provider="openai",
-        model=model,
-        api_key=api_key,
-        max_completion_tokens=2048,
-        reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "none"),
+        llmconfig(
+            provider="openai",
+            model=model,
+            api_key=api_key,
+            max_completion_tokens=2048,
+            reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "none"),
+        )
     )
 
 

@@ -10,7 +10,7 @@ import httpx
 import openai
 import pytest
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.agllm import agllm, BAD_REQUEST_EXCS, API_CONN_EXCS
 from agency.llm.openai import _OpenAICompatibleBackend
 from agency.llm.bedrock import (
@@ -27,8 +27,8 @@ except ImportError:
 
 
 def _cfg(**fields) -> agconfig:
-    """Test helper: build a flat agconfig."""
-    return agconfig(**fields)
+    """Test helper: build an agconfig with the given llmconfig fields."""
+    return agconfig(llmconfig(**fields))
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ class TestForConfig:
     def test_config_stored_on_instance(self):
         cfg = _cfg(model="some-model")
         backend = agllm.for_config(cfg)
-        assert backend.agconfig.model == "some-model"
+        assert backend.agconfig.llm.model == "some-model"
 
     def test_anthropic_provider_returns_anthropic_backend(self):
         backend = agllm.for_config(_cfg(provider="anthropic", model="claude-sonnet-5"))
@@ -136,14 +136,14 @@ class TestBackendChangeConfigAndGetConfigCopy:
     def test_change_config_replaces_agconfig(self):
         backend = agllm(_cfg(temperature=0.7))
         backend.change_config(_cfg(temperature=0.2))
-        assert backend.agconfig.temperature == 0.2
+        assert backend.agconfig.llm.temperature == 0.2
 
     def test_change_config_clones_given_agconfig(self):
         backend = agllm(_cfg())
         new_cfg = _cfg(temperature=0.2)
         backend.change_config(new_cfg)
-        new_cfg.temperature = 0.9
-        assert backend.agconfig.temperature == 0.2
+        new_cfg.llm.temperature = 0.9
+        assert backend.agconfig.llm.temperature == 0.2
 
     def test_get_config_copy_returns_clone_not_same_object(self):
         cfg = _cfg(temperature=0.7)
@@ -153,13 +153,13 @@ class TestBackendChangeConfigAndGetConfigCopy:
 
     def test_get_config_copy_reflects_current_values(self):
         backend = agllm(_cfg(temperature=0.7))
-        assert backend.get_config_copy().temperature == 0.7
+        assert backend.get_config_copy().llm.temperature == 0.7
 
     def test_mutating_get_config_copy_does_not_affect_backend(self):
         backend = agllm(_cfg(temperature=0.7))
         copy = backend.get_config_copy()
-        copy.temperature = 0.1
-        assert backend.agconfig.temperature == 0.7
+        copy.llm.temperature = 0.1
+        assert backend.agconfig.llm.temperature == 0.7
 
 
 # ---------------------------------------------------------------------------

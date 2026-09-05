@@ -1,15 +1,26 @@
-"""Tests for agconfig — the one flat, typed config dataclass that replaced
-the old tiered descriptor system (GlobalConfigParam/StaticConfigParam/
-DynamicConfigParam, owner-scoped *Fields/*Config classes). This file tests
-the new class's own behavior only: construction/defaults, typo protection,
-clone()/update(), safe_snapshot()'s JSON-safety and secret redaction, mount
-helpers, and the handful of process-wide module constants it still exposes."""
+"""Tests for agconfig — the one-level-namespaced config object that replaced
+the old flat agconfig (and, before that, the tiered descriptor system). Every
+tunable field now lives on one of twelve small per-domain namespace
+dataclasses (llmconfig, sandboxconfig, ...), each inheriting clone()/
+update()/safe_snapshot() from the shared confignamespace base. This file
+tests: type-dispatched construction (no keyword-argument form at all),
+per-namespace typo protection via __slots__, clone()/update()/safe_snapshot()
+at both the namespace level and the top agconfig level, the sandbox
+namespace's add_mount()/remove_mount() helpers, and the handful of
+process-wide module constants that this restructuring left untouched."""
 
+import json
 import sys
 
 import pytest
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import (
+    agconfig,
+    agentconfig,
+    confignamespace,
+    llmconfig,
+    sandboxconfig,
+)
 
 # `agency.configs.__init__` does `from .agconfig import agconfig`, which
 # overwrites the `agconfig` attribute on the `agency.configs` package with
@@ -21,239 +32,328 @@ agconfig_module = sys.modules["agency.configs.agconfig"]
 
 
 # ---------------------------------------------------------------------------
-# Construction & defaults
+# Construction: zero-arg defaults, type-dispatched positional namespaces,
+# no keyword-argument form at all
 # ---------------------------------------------------------------------------
 
 
-def test_no_args_produces_documented_defaults():
+def test_no_args_gives_every_namespace_fresh_defaults():
     cfg = agconfig()
-    assert cfg.provider is None
-    assert cfg.model == ""
-    assert cfg.backend == "auto"
-    assert cfg.harness == "native"
-    assert cfg.api_key is None
-    assert cfg.base_image == "agency-sandbox:latest"
-    assert cfg.mounts == {}
-    assert cfg.persistent is False
+    assert cfg.llm.model == ""
+    assert cfg.llm.provider is None
+    assert cfg.sandbox.backend == "auto"
+    assert cfg.sandbox.mounts == {}
+    assert cfg.agent.harness == "native"
 
 
-def test_kwargs_set_the_given_fields():
-    cfg = agconfig(provider="anthropic", model="claude-sonnet-5", temperature=0.5)
-    assert cfg.provider == "anthropic"
-    assert cfg.model == "claude-sonnet-5"
-    assert cfg.temperature == 0.5
-    # Untouched fields keep their defaults.
-    assert cfg.backend == "auto"
+def test_positional_namespaces_are_dispatched_by_type():
+    cfg = agconfig(
+        llmconfig(model="x", api_key="k"),
+        sandboxconfig(backend="docker"),
+    )
+    assert cfg.llm.model == "x"
+    assert cfg.llm.api_key == "k"
+    assert cfg.sandbox.backend == "docker"
+    # Untouched namespaces still get fresh defaults.
+    assert cfg.agent.harness == "native"
 
 
-# ---------------------------------------------------------------------------
-# Unknown-kwarg rejection at construction and attribute typo protection
-# ---------------------------------------------------------------------------
+def test_positional_namespaces_dispatch_regardless_of_argument_order():
+    cfg = agconfig(
+        sandboxconfig(backend="podman"),
+        llmconfig(model="y"),
+    )
+    assert cfg.llm.model == "y"
+    assert cfg.sandbox.backend == "podman"
 
 
-def test_unknown_constructor_kwarg_raises_type_error():
+def test_unrecognized_positional_type_raises_type_error():
     with pytest.raises(TypeError):
-        agconfig(nonexistent_field=1)
+        agconfig(object())
 
 
-def test_setting_unknown_attribute_on_instance_raises_attribute_error():
+def test_duplicate_namespace_type_raises_type_error():
+    with pytest.raises(TypeError):
+        agconfig(llmconfig(), llmconfig())
+
+
+def test_no_keyword_argument_form_at_all():
+    with pytest.raises(TypeError):
+        agconfig(llm=llmconfig(model="x"))
+
+
+# ---------------------------------------------------------------------------
+# Unknown field on a namespace's own constructor
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_field_on_namespace_constructor_raises_type_error():
+    with pytest.raises(TypeError):
+        llmconfig(nonexistent_field=1)
+
+
+# ---------------------------------------------------------------------------
+# Typo protection via __slots__, at both levels
+# ---------------------------------------------------------------------------
+
+
+def test_setting_unknown_attribute_on_namespace_instance_raises_attribute_error():
+    cfg = agconfig()
+    with pytest.raises(AttributeError):
+        cfg.llm.nonexistent_field = 1
+
+
+def test_setting_unknown_attribute_on_agconfig_itself_raises_attribute_error():
     cfg = agconfig()
     with pytest.raises(AttributeError):
         cfg.nonexistent_field = 1
 
 
-def test_typo_on_known_field_name_still_raises():
-    cfg = agconfig()
-    with pytest.raises(AttributeError):
-        cfg.modle = "typo"
-
-
 # ---------------------------------------------------------------------------
-# clone() independence
+# clone() independence, at both the namespace level and the top level
 # ---------------------------------------------------------------------------
 
 
-def test_clone_returns_a_different_but_equal_object():
-    cfg = agconfig(model="m", temperature=0.7)
+def test_namespace_clone_returns_independent_copy():
+    llm = llmconfig(model="original")
+    llm2 = llm.clone()
+    assert llm2 is not llm
+    llm2.model = "mutated"
+    assert llm.model == "original"
+    assert llm2.model == "mutated"
+
+
+def test_top_level_clone_deep_copies_every_namespace():
+    cfg = agconfig(llmconfig(model="original"))
     cfg2 = cfg.clone()
     assert cfg2 is not cfg
-    assert cfg2.model == cfg.model
-    assert cfg2.temperature == cfg.temperature
+    assert cfg2.llm is not cfg.llm
+    cfg2.llm.model = "mutated"
+    assert cfg.llm.model == "original"
+    assert cfg2.llm.model == "mutated"
 
 
-def test_clone_mutation_of_scalar_field_does_not_affect_original():
-    cfg = agconfig(model="original")
-    cfg2 = cfg.clone()
-    cfg2.model = "mutated"
-    assert cfg.model == "original"
-    assert cfg2.model == "mutated"
-
-
-def test_clone_mutation_of_mounts_dict_does_not_affect_original():
+def test_top_level_clone_mutable_field_does_not_leak_either_direction():
     cfg = agconfig()
-    cfg.add_mount("data", "/host/data", "/container/data")
+    cfg.sandbox.add_mount("data", "/host/data", "/container/data")
     cfg2 = cfg.clone()
-    cfg2.add_mount("extra", "/host/extra", "/container/extra")
-    assert "extra" not in cfg.mounts
-    assert "extra" in cfg2.mounts
-    # Original mount present in both, but the dicts are independent objects.
-    assert cfg.mounts["data"] == cfg2.mounts["data"]
-    assert cfg.mounts is not cfg2.mounts
 
+    cfg2.sandbox.add_mount("extra", "/host/extra", "/container/extra")
+    assert "extra" not in cfg.sandbox.mounts
+    assert "extra" in cfg2.sandbox.mounts
 
-def test_clone_mutation_on_original_does_not_affect_clone():
-    cfg = agconfig()
-    cfg.add_mount("data", "/host/data", "/container/data")
-    cfg2 = cfg.clone()
-    cfg.add_mount("more", "/host/more", "/container/more")
-    assert "more" not in cfg2.mounts
+    cfg.sandbox.add_mount("more", "/host/more", "/container/more")
+    assert "more" not in cfg2.sandbox.mounts
+
+    assert cfg.sandbox.mounts is not cfg2.sandbox.mounts
 
 
 # ---------------------------------------------------------------------------
-# update() partial merge
+# update(), at both the top level and the namespace level
 # ---------------------------------------------------------------------------
 
 
-def test_update_sets_multiple_fields_at_once():
+def test_top_level_update_merges_into_named_namespaces():
     cfg = agconfig()
-    result = cfg.update(model="m", temperature=0.9, backend="docker")
-    assert cfg.model == "m"
-    assert cfg.temperature == 0.9
-    assert cfg.backend == "docker"
+    result = cfg.update(
+        llm={"model": "x", "temperature": 0.7},
+        sandbox={"backend": "podman"},
+    )
+    assert cfg.llm.model == "x"
+    assert cfg.llm.temperature == 0.7
+    assert cfg.sandbox.backend == "podman"
     assert result is cfg
 
 
-def test_update_unknown_field_raises_type_error_naming_it():
+def test_top_level_update_unknown_namespace_raises_type_error_naming_it():
+    cfg = agconfig()
+    with pytest.raises(TypeError, match="nonexistent"):
+        cfg.update(nonexistent={"a": 1})
+
+
+def test_namespace_update_sets_multiple_fields_at_once():
+    cfg = agconfig()
+    result = cfg.llm.update(model="x", temperature=0.5)
+    assert cfg.llm.model == "x"
+    assert cfg.llm.temperature == 0.5
+    assert result is cfg.llm
+
+
+def test_namespace_update_unknown_field_raises_type_error_naming_it():
     cfg = agconfig()
     with pytest.raises(TypeError, match="bogus_field"):
-        cfg.update(bogus_field=1)
+        cfg.llm.update(bogus_field=1)
 
 
-def test_update_unknown_field_does_not_partially_apply():
+def test_namespace_update_unknown_field_does_not_partially_apply():
     cfg = agconfig()
     with pytest.raises(TypeError):
-        cfg.update(model="should-not-stick", bogus_field=1)
-    assert cfg.model == ""
+        cfg.llm.update(model="should-not-stick", bogus_field=1)
+    assert cfg.llm.model == ""
 
 
-def test_update_multiple_unknown_fields_names_all_of_them():
+# ---------------------------------------------------------------------------
+# safe_snapshot() — nested at the top level, secret-redacted within llm
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_safe_snapshot_is_nested_one_key_per_namespace():
     cfg = agconfig()
-    with pytest.raises(TypeError) as excinfo:
-        cfg.update(bogus_one=1, bogus_two=2)
-    message = str(excinfo.value)
-    assert "bogus_one" in message
-    assert "bogus_two" in message
-
-
-# ---------------------------------------------------------------------------
-# safe_snapshot() — JSON-safety and secret redaction
-# ---------------------------------------------------------------------------
-
-
-def test_safe_snapshot_returns_a_flat_dict():
-    cfg = agconfig(model="m")
     snap = cfg.safe_snapshot()
     assert isinstance(snap, dict)
-    assert snap["model"] == "m"
+    for name in (
+        "llm",
+        "sandbox",
+        "orchestrator",
+        "resources",
+        "agent",
+        "schema",
+        "skill",
+        "tool",
+        "harness_adapter",
+        "ptrace",
+        "data_logger",
+        "host_server",
+    ):
+        assert name in snap
+        assert isinstance(snap[name], dict)
+
+
+def test_top_level_safe_snapshot_reflects_namespace_field_values():
+    cfg = agconfig(llmconfig(model="m"), sandboxconfig(backend="docker"))
+    snap = cfg.safe_snapshot()
+    assert snap["llm"]["model"] == "m"
+    assert snap["sandbox"]["backend"] == "docker"
 
 
 def test_safe_snapshot_omits_secret_fields_and_their_values_entirely():
     cfg = agconfig(
-        api_key="k",
-        aws_access_key="ak",
-        aws_secret_key="sk-secret",
-        aws_session_token="tok-secret",
+        llmconfig(
+            api_key="api-key-secret-value",
+            aws_access_key="aws-access-secret-value",
+            aws_secret_key="aws-secret-key-secret-value",
+            aws_session_token="aws-session-token-secret-value",
+            model="m",
+        )
     )
     snap = cfg.safe_snapshot()
+    llm_snap = snap["llm"]
 
     for secret_field in ("api_key", "aws_access_key", "aws_secret_key", "aws_session_token"):
-        assert secret_field not in snap
+        assert secret_field not in llm_snap
 
-    secret_values = ["k", "ak", "sk-secret", "tok-secret"]
-    assert not any(k in secret_values for k in snap.keys())
-    assert not any(v in secret_values for v in snap.values())
+    secret_values = [
+        "api-key-secret-value",
+        "aws-access-secret-value",
+        "aws-secret-key-secret-value",
+        "aws-session-token-secret-value",
+    ]
+    assert not any(v in secret_values for v in llm_snap.values())
+    assert llm_snap["model"] == "m"
+
+    whole_snapshot_text = json.dumps(snap)
+    for secret_value in secret_values:
+        assert secret_value not in whole_snapshot_text
 
 
-def test_safe_snapshot_omits_secrets_even_when_none():
-    cfg = agconfig()
-    snap = cfg.safe_snapshot()
-    for secret_field in ("api_key", "aws_access_key", "aws_secret_key", "aws_session_token"):
-        assert secret_field not in snap
+def test_namespace_safe_snapshot_directly_is_also_secret_free():
+    llm = llmconfig(
+        api_key="api-key-secret-value", aws_secret_key="aws-secret-key-secret-value", model="m"
+    )
+    snap = llm.safe_snapshot()
+    assert "api_key" not in snap
+    assert "aws_secret_key" not in snap
+    assert snap["model"] == "m"
 
 
 def test_safe_snapshot_omits_non_json_safe_values():
     cfg = agconfig()
-    cfg.timing_fn = lambda: None
+    cfg.llm.timing_fn = lambda: None
     snap = cfg.safe_snapshot()
-    assert "timing_fn" not in snap
+    assert "timing_fn" not in snap["llm"]
 
 
-def test_safe_snapshot_includes_normal_json_safe_fields():
-    cfg = agconfig(model="claude-sonnet-5", temperature=0.3, backend="docker")
-    snap = cfg.safe_snapshot()
-    assert snap["model"] == "claude-sonnet-5"
-    assert snap["temperature"] == 0.3
-    assert snap["backend"] == "docker"
-
-
-def test_safe_snapshot_keeps_json_safe_containers():
+def test_safe_snapshot_excludes_private_fields_at_namespace_level():
     cfg = agconfig()
-    cfg.add_mount("data", "/host/data", "/container/data")
-    snap = cfg.safe_snapshot()
-    assert snap["mounts"] == {"data": ("/host/data", "/container/data", "rw")}
+    for namespace_name in ("llm", "sandbox", "agent"):
+        namespace_snap = getattr(cfg, namespace_name).safe_snapshot()
+        assert not any(name.startswith("_") for name in namespace_snap)
 
 
-def test_safe_snapshot_excludes_private_fields():
-    cfg = agconfig()
+def test_whole_safe_snapshot_is_json_serializable():
+    cfg = agconfig(
+        llmconfig(api_key="k", model="m"),
+        sandboxconfig(backend="docker"),
+    )
+    cfg.sandbox.add_mount("data", "/host/data", "/container/data")
     snap = cfg.safe_snapshot()
-    assert not any(name.startswith("_") for name in snap)
+    serialized = json.dumps(snap)
+    assert isinstance(serialized, str)
 
 
 # ---------------------------------------------------------------------------
-# add_mount() / remove_mount()
+# add_mount() / remove_mount() on the sandbox namespace
 # ---------------------------------------------------------------------------
 
 
 def test_add_mount_default_mode_is_rw():
     cfg = agconfig()
-    result = cfg.add_mount("data", "/host/data", "/container/data")
-    assert cfg.mounts["data"] == ("/host/data", "/container/data", "rw")
-    assert result is cfg
+    result = cfg.sandbox.add_mount("data", "/host/data", "/container/data")
+    assert cfg.sandbox.mounts["data"] == ("/host/data", "/container/data", "rw")
+    assert result is cfg.sandbox
 
 
 def test_add_mount_explicit_mode():
     cfg = agconfig()
-    cfg.add_mount("data", "/host/data", "/container/data", mode="ro")
-    assert cfg.mounts["data"] == ("/host/data", "/container/data", "ro")
+    cfg.sandbox.add_mount("data", "/host/data", "/container/data", mode="ro")
+    assert cfg.sandbox.mounts["data"] == ("/host/data", "/container/data", "ro")
 
 
 def test_add_mount_stringifies_host_path():
     from pathlib import Path
 
     cfg = agconfig()
-    cfg.add_mount("data", Path("/host/data"), "/container/data")
-    host_path, container_path, mode = cfg.mounts["data"]
+    cfg.sandbox.add_mount("data", Path("/host/data"), "/container/data")
+    host_path, container_path, mode = cfg.sandbox.mounts["data"]
     assert host_path == "/host/data"
     assert isinstance(host_path, str)
 
 
 def test_remove_mount_removes_existing_entry():
     cfg = agconfig()
-    cfg.add_mount("data", "/host/data", "/container/data")
-    result = cfg.remove_mount("data")
-    assert "data" not in cfg.mounts
-    assert result is cfg
+    cfg.sandbox.add_mount("data", "/host/data", "/container/data")
+    result = cfg.sandbox.remove_mount("data")
+    assert "data" not in cfg.sandbox.mounts
+    assert result is cfg.sandbox
 
 
 def test_remove_mount_missing_name_is_a_no_op():
     cfg = agconfig()
-    result = cfg.remove_mount("does-not-exist")
-    assert cfg.mounts == {}
-    assert result is cfg
+    result = cfg.sandbox.remove_mount("does-not-exist")
+    assert cfg.sandbox.mounts == {}
+    assert result is cfg.sandbox
 
 
 # ---------------------------------------------------------------------------
-# Process-wide module-level constants
+# confignamespace base class: shared, not redefined per-namespace
+# ---------------------------------------------------------------------------
+
+
+def test_sandboxconfig_inherits_confignamespace():
+    assert issubclass(sandboxconfig, confignamespace)
+    assert issubclass(agentconfig, confignamespace)
+    # clone/update/safe_snapshot are the base class's own methods, not
+    # per-namespace redefinitions.
+    assert sandboxconfig.clone is confignamespace.clone
+    assert sandboxconfig.update is confignamespace.update
+    assert sandboxconfig.safe_snapshot is confignamespace.safe_snapshot
+    assert agentconfig.clone is confignamespace.clone
+    assert agentconfig.update is confignamespace.update
+    assert agentconfig.safe_snapshot is confignamespace.safe_snapshot
+
+
+# ---------------------------------------------------------------------------
+# Process-wide module-level constants — unchanged by this restructuring
 # ---------------------------------------------------------------------------
 
 
@@ -268,9 +368,9 @@ def test_module_level_constants_exist_with_expected_types():
     assert isinstance(agconfig_module.IDLE_CHECK_INTERVAL_S, (int, float))
 
 
-def test_module_level_constants_are_not_fields_on_agconfig():
+def test_module_level_constants_are_not_fields_on_agconfig_or_any_namespace():
     cfg = agconfig()
-    for name in (
+    names = (
         "DOCKER_SEMAPHORE_LIMIT",
         "MIN_CPUS",
         "MIN_MEMORY_MB",
@@ -279,5 +379,8 @@ def test_module_level_constants_are_not_fields_on_agconfig():
         "MEMORY_DETECT_FALLBACK_MB",
         "MARKER_MB",
         "IDLE_CHECK_INTERVAL_S",
-    ):
+    )
+    for name in names:
         assert not hasattr(cfg, name)
+        assert not hasattr(cfg.sandbox, name)
+        assert not hasattr(cfg.llm, name)

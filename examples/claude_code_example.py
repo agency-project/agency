@@ -32,25 +32,29 @@ OpenAI-compatible API example::
 import os
 from pathlib import Path
 from agency import agent, agskill, agdata
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.agtype import agpath
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
 if os.environ.get("LLM_BASE_URL"):
     cfg = agconfig(
-        provider="vllm",
-        base_url=os.environ["LLM_BASE_URL"],
-        model=os.environ.get("LLM_MODEL", ""),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        temperature=0.7,
-        top_p=0.95,
-        top_k=20,
+        llmconfig(
+            provider="vllm",
+            base_url=os.environ["LLM_BASE_URL"],
+            model=os.environ.get("LLM_MODEL", ""),
+            api_key=os.environ.get("LLM_API_KEY", ""),
+            temperature=0.7,
+            top_p=0.95,
+            top_k=20,
+        )
     )
 else:
     # Falls back to Bedrock (picks up IAM/AWS_BEARER_TOKEN_BEDROCK from the
     # environment) when no vLLM endpoint is configured.
     cfg = agconfig(
-        provider="bedrock", model=os.environ.get("LLM_MODEL", "us.anthropic.claude-sonnet-5")
+        llmconfig(
+            provider="bedrock", model=os.environ.get("LLM_MODEL", "us.anthropic.claude-sonnet-5")
+        )
     )
 
 

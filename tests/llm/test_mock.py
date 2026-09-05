@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, dataloggerconfig, llmconfig
 from agency.llm.mock import (
     constant_timing,
     exact_replay_timing,
@@ -18,7 +18,7 @@ from agency.observability.agdatalogger import agDataLogger
 
 
 def _make_source_db(db_path: Path) -> agDataLogger:
-    logger = agDataLogger(agconfig(data_logger_db_path=str(db_path)))
+    logger = agDataLogger(agconfig(dataloggerconfig(db_path=str(db_path))))
     logger.start()
     return logger
 
@@ -65,7 +65,7 @@ _TOOL_EXCHANGE = [
 def _mock_backend(db_path: Path, **fields):
     from agency.llm.agllm import agllm
 
-    cfg = agconfig(provider="mock", replay_db_path=str(db_path), **fields)
+    cfg = agconfig(llmconfig(provider="mock", replay_db_path=str(db_path), **fields))
     return agllm.for_config(cfg)
 
 
@@ -232,8 +232,10 @@ class TestTimingModes:
             for _ in range(sum(chunk_counts) + 1):
                 yield 0.0
 
-        cfg = agconfig(provider="mock", replay_db_path=str(db_path), timing_mode="poisson")
-        cfg.update(timing_fn=custom_timing_fn)
+        cfg = agconfig(
+            llmconfig(provider="mock", replay_db_path=str(db_path), timing_mode="poisson")
+        )
+        cfg.llm.update(timing_fn=custom_timing_fn)
         from agency.llm.agllm import agllm
 
         backend = agllm.for_config(cfg)
@@ -241,9 +243,9 @@ class TestTimingModes:
         assert len(calls) == 1
 
     def test_timing_fn_not_included_in_dynamic_snapshot(self):
-        cfg = agconfig(provider="mock")
-        cfg.timing_fn = lambda exchange, chunk_counts: iter([0.0])
-        snapshot = cfg.safe_snapshot()
+        cfg = agconfig(llmconfig(provider="mock"))
+        cfg.llm.timing_fn = lambda exchange, chunk_counts: iter([0.0])
+        snapshot = cfg.llm.safe_snapshot()
         assert "timing_fn" not in snapshot
 
 
@@ -266,7 +268,9 @@ class TestLlmHandlerServerIntegration:
         server_db = tmp_path / "server_data.sqlite3"
         server_logger = _make_source_db(server_db)
 
-        cfg = agconfig(provider="mock", replay_db_path=str(source_db), timing_mode="instant")
+        cfg = agconfig(
+            llmconfig(provider="mock", replay_db_path=str(source_db), timing_mode="instant")
+        )
         server = LlmHandlerServer(cfg, server_logger, LlmUsageTracker())
         handle = server.start_stream({"messages": []})
 

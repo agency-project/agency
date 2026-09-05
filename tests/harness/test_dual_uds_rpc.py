@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, dataloggerconfig, hostserverconfig, llmconfig
 from agency.observability.agdatalogger import agDataLogger
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
@@ -39,9 +39,9 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
         return True, "mock policy allowed"
 
     config = agconfig(
-        model="test-model",
-        host_server_uds_path=str(host_socket),
-        data_logger_db_path=str(database),
+        llmconfig(model="test-model"),
+        hostserverconfig(uds_path=str(host_socket)),
+        dataloggerconfig(db_path=str(database)),
     )
     agent = SimpleNamespace(
         agconfig=config, data_logger=agDataLogger(config), llm_usage_tracker=LlmUsageTracker()

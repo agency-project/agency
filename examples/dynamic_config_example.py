@@ -1,11 +1,12 @@
 """
-Example: building one flat agconfig covering both LLM and sandbox fields,
+Example: building one agconfig covering both LLM and sandbox namespaces,
 and dynamically updating a field between two skill calls on the same agent.
 
-  - agconfig(...) is one flat call carrying both the LLM fields and an
-    agSandbox "data" mount (via add_mount()) -- there's no owner-nesting to
-    compose, every field lives on the same object.
-  - max_completion_tokens is read fresh from ag.agconfig on every LLM call,
+  - agconfig(llmconfig(...)) plus cfg.sandbox.add_mount() builds one config
+    carrying both the LLM fields (under cfg.llm) and an agSandbox "data"
+    mount (under cfg.sandbox) -- each domain has its own one-level namespace,
+    but they're all still one object handed to agent(agconfig=cfg).
+  - max_completion_tokens is read fresh from ag.agconfig.llm on every LLM call,
     no caching or locking. Set it too low (32) and the vLLM server truncates
     the tool-call JSON mid-argument, so the skill can't complete its
     required output field within a few ReAct steps.
@@ -30,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agency import agent, agskill, agdata
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.agtype import agpath
 
 _NOTE_TEXT = (
@@ -58,16 +59,18 @@ def main():
     # max_completion_tokens) plus an agSandbox "data" mount, set once here
     # and never changed.
     cfg = agconfig(
-        provider="vllm",
-        base_url=os.environ.get("LLM_BASE_URL"),
-        model=os.environ.get("LLM_MODEL", ""),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        temperature=0.7,
-        top_p=0.95,
-        top_k=20,
-        max_completion_tokens=32,
+        llmconfig(
+            provider="vllm",
+            base_url=os.environ.get("LLM_BASE_URL"),
+            model=os.environ.get("LLM_MODEL", ""),
+            api_key=os.environ.get("LLM_API_KEY", ""),
+            temperature=0.7,
+            top_p=0.95,
+            top_k=20,
+            max_completion_tokens=32,
+        )
     )
-    cfg.add_mount("data", data_dir, "/data")
+    cfg.sandbox.add_mount("data", data_dir, "/data")
 
     write_note = agskill(
         name="write_note",
@@ -102,16 +105,18 @@ def main():
         "Bumping max_completion_tokens: 32 -> 4096 (dynamic update via ag.change_config, same agent)\n"
     )
     new_cfg = agconfig(
-        provider="vllm",
-        base_url=os.environ.get("LLM_BASE_URL"),
-        model=os.environ.get("LLM_MODEL", ""),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        temperature=0.7,
-        top_p=0.95,
-        top_k=20,
-        max_completion_tokens=4096,
+        llmconfig(
+            provider="vllm",
+            base_url=os.environ.get("LLM_BASE_URL"),
+            model=os.environ.get("LLM_MODEL", ""),
+            api_key=os.environ.get("LLM_API_KEY", ""),
+            temperature=0.7,
+            top_p=0.95,
+            top_k=20,
+            max_completion_tokens=4096,
+        )
     )
-    new_cfg.add_mount("data", data_dir, "/data")
+    new_cfg.sandbox.add_mount("data", data_dir, "/data")
     ag.change_config(new_cfg)
 
     print(">> [call 2] max_completion_tokens=4096")

@@ -54,10 +54,12 @@ def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
     # Python objects. Keeping this allow-list narrow also keeps secrets out
     # of the detached process command line.
     return {
-        "binary_path": agconfig.binary_path,
-        "syscalls": list(agconfig.syscalls),
-        "profiler": agconfig.profiler,
-        "disable_harness_native_sandbox": agconfig.disable_harness_native_sandbox,
+        "harness_adapter": {"binary_path": agconfig.harness_adapter.binary_path},
+        "ptrace": {
+            "syscalls": list(agconfig.ptrace.syscalls),
+            "profiler": agconfig.ptrace.profiler,
+            "disable_harness_native_sandbox": agconfig.ptrace.disable_harness_native_sandbox,
+        },
     }
 
 

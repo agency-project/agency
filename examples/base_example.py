@@ -17,25 +17,21 @@ OpenAI-compatible API example::
         LLM_BASE_URL="http://localhost:8000/v1" uv run python example.py
 """
 
+import os
 from pathlib import Path
 from agency import agent, agskill, agdata
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.agtype import agpath
 
 # See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
-# cfg = agconfig(
-#     provider="bedrock",
-#     model="nvidia.nemotron-super-3-120b",
-#     api_key=os.getenv("BEDROCK_API_KEY"),
-#     region="us-west-2",
-#     context_limit=100000,
-# )
-
 cfg = agconfig(
-    provider="mock",
-    model="mock",
-    replay_db_path="/home/ubuntu/agency/runs/2026-09-04_11-09-26_base_example/logs/agent_alex_0000_data.sqlite3",
-    timing_mode="instant",  # or "instant" for zero-delay, or "poisson" + poisson_rate_hz/poisson_ttft_mean_s
+    llmconfig(
+        provider="bedrock",
+        model="nvidia.nemotron-super-3-120b",
+        api_key=os.getenv("BEDROCK_API_KEY"),
+        region="us-west-2",
+        context_limit=100000,
+    )
 )
 
 

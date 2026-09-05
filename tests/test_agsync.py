@@ -7,14 +7,14 @@ from agency.agteam import agteam
 from agency.agdata import agdata
 from agency.agent import agent
 from agency.agteam import _active_team
-from agency.configs.agconfig import agconfig as agconfig_cls
+from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
-LLM_AGCONFIG = agconfig_cls(api_key="k", model="m")
+LLM_AGCONFIG = agconfig_cls(llmconfig(api_key="k", model="m"))
 
 
 class _SimpleTeam(agteam):

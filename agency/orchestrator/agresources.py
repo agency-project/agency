@@ -81,9 +81,9 @@ class agResourcePool:
     ) -> None:
         self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         if idle_cpus is not None:
-            self.agconfig.idle_cpus = idle_cpus
+            self.agconfig.resources.idle_cpus = idle_cpus
         if idle_memory is not None:
-            self.agconfig.idle_memory = idle_memory
+            self.agconfig.resources.idle_memory = idle_memory
         self.gpus = list(gpus) if gpus is not None else detect_gpus()
         self.total_cpus = total_cpus if total_cpus is not None else detect_cpus()
         self.total_memory_mb = (
@@ -285,8 +285,8 @@ class agResourcePool:
         held_cpus = sandbox._cpu_acquired if cpu else 0.0
         held_mb = sandbox._memory_acquired_mb if memory else 0
         sandbox.update_limits(
-            cpus=_floor(self.agconfig.idle_cpus, MIN_CPUS) if cpu else None,
-            memory=self.agconfig.idle_memory if memory else None,
+            cpus=_floor(self.agconfig.resources.idle_cpus, MIN_CPUS) if cpu else None,
+            memory=self.agconfig.resources.idle_memory if memory else None,
         )
         if cpu:
             sandbox._cpu_acquired = 0.0
@@ -337,5 +337,5 @@ class agResourcePool:
         return (
             f"agResourcePool(gpus={self.gpus!r}, "
             f"total_cpus={self.total_cpus}, total_memory_mb={self.total_memory_mb}, "
-            f"idle_cpus={self.agconfig.idle_cpus}, idle_memory={self.agconfig.idle_memory!r})"
+            f"idle_cpus={self.agconfig.resources.idle_cpus}, idle_memory={self.agconfig.resources.idle_memory!r})"
         )

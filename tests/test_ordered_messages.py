@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agency import MessageSubmission, agdata, agent, agskill
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, agentconfig, llmconfig, orchestratorconfig
 from agency.agname import agname as _agname
 from agency.engine import AgentEngine
 from agency.engine import engine as engine_module
@@ -20,10 +20,9 @@ from agency.orchestrator import get_orchestrator
 
 def _config(tmp_path, *, max_engines: int | None = None) -> agconfig:
     return agconfig(
-        max_concurrent_engines=max_engines,
-        log_dir=str(tmp_path),
-        api_key="test",
-        model="m",
+        orchestratorconfig(max_concurrent_engines=max_engines),
+        agentconfig(log_dir=str(tmp_path)),
+        llmconfig(api_key="test", model="m"),
     )
 
 

@@ -253,7 +253,7 @@ def _probe_chroot_available() -> bool:
             proc = subprocess.run(
                 [*prefix, "--user", "--map-root-user", "--mount", "true"],
                 capture_output=True,
-                timeout=agconfig_cls().inspect_timeout_s,
+                timeout=agconfig_cls().sandbox.inspect_timeout_s,
             )
         except Exception as _e:
             # This candidate prefix isn't usable (missing binary, exec
@@ -454,6 +454,7 @@ class _ChrootBackend(agsandbox_backend):
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
+        self._validate_config(self._agconfig)
         self._name = name
         self._mounts = mounts
         self._root = _CHROOT_JAILS_DIR / name
@@ -461,6 +462,7 @@ class _ChrootBackend(agsandbox_backend):
 
     def change_config(self, agconfig: "agconfig_cls | None") -> None:
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
+        self._validate_config(self._agconfig)
 
     def get_config_copy(self) -> "agconfig_cls":
         return self._agconfig.clone()
@@ -574,7 +576,7 @@ class _ChrootBackend(agsandbox_backend):
             '  echo "$__p $__ppid $__pgid $__st"\n'
             "done"
         )
-        output, _ = self._read_proc_table(script, timeout=self._agconfig.inspect_timeout_s)
+        output, _ = self._read_proc_table(script, timeout=self._agconfig.sandbox.inspect_timeout_s)
 
         proc_info: "dict[int, tuple[int, int, str]]" = {}
         for line in output.splitlines():
@@ -843,7 +845,7 @@ class _ChrootBackend(agsandbox_backend):
                 _call,
                 args=args,
                 timeout=timeout,
-                grace_s=self._agconfig.unkillable_child_grace_s,
+                grace_s=self._agconfig.sandbox.unkillable_child_grace_s,
             )
             output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
             return output, proc.returncode, (pgid_holder[0] if pgid_holder else None)
@@ -883,7 +885,7 @@ class _ChrootBackend(agsandbox_backend):
                 lambda: subprocess.run(["sh", "-c", script], capture_output=True, timeout=timeout),
                 args=["sh", "-c", script],
                 timeout=timeout,
-                grace_s=self._agconfig.unkillable_child_grace_s,
+                grace_s=self._agconfig.sandbox.unkillable_child_grace_s,
             )
             output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
             return output, proc.returncode

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..observability.agdatalogger import agDataLogger, resolve_global_db_path
-from ..configs.agconfig import agconfig as agconfig_cls
+from ..configs.agconfig import agconfig as agconfig_cls, dataloggerconfig
 from ..agcontext import agcontext
 from ..agdata import agdata, agerror
 from .._submission import Invocation, MessageSubmission, Submission
@@ -98,20 +98,22 @@ class GlobalAgentOrchestrator:
         default_db_path: "str | Path | None" = None,
     ) -> None:
         self.agconfig = agconfig if agconfig is not None else agconfig_cls()
-        if self.agconfig.max_concurrent_engines is not None and (
-            not isinstance(self.agconfig.max_concurrent_engines, int)
-            or isinstance(self.agconfig.max_concurrent_engines, bool)
-            or self.agconfig.max_concurrent_engines <= 0
+        if self.agconfig.orchestrator.max_concurrent_engines is not None and (
+            not isinstance(self.agconfig.orchestrator.max_concurrent_engines, int)
+            or isinstance(self.agconfig.orchestrator.max_concurrent_engines, bool)
+            or self.agconfig.orchestrator.max_concurrent_engines <= 0
         ):
             raise ValueError("max_concurrent_engines must be a positive integer or None")
         if default_db_path is None:
             default_db_path = resolve_global_db_path(_DEFAULT_LOG_DIR)
-        db_path = self.agconfig.orchestrator_db_path or default_db_path
+        db_path = self.agconfig.orchestrator.db_path or default_db_path
         assert db_path is not None
         data_logger_agconfig = agconfig_cls(
-            data_logger_db_path=str(db_path),
-            data_logger_flush_batch_size=self.agconfig.orchestrator_flush_batch_size,
-            data_logger_flush_interval_s=self.agconfig.orchestrator_flush_interval_s,
+            dataloggerconfig(
+                db_path=str(db_path),
+                flush_batch_size=self.agconfig.orchestrator.flush_batch_size,
+                flush_interval_s=self.agconfig.orchestrator.flush_interval_s,
+            )
         )
         self.data_logger = agDataLogger(data_logger_agconfig)
         self.data_logger.start()
@@ -139,7 +141,7 @@ class GlobalAgentOrchestrator:
         # very large ceiling preserves the public ``None`` (unlimited) setting
         # without imposing ThreadPoolExecutor's much smaller implicit default;
         # workers are still created lazily and reused after a request finishes.
-        execution_worker_limit = self.agconfig.max_concurrent_engines or sys.maxsize
+        execution_worker_limit = self.agconfig.orchestrator.max_concurrent_engines or sys.maxsize
         self._execution_workers = ThreadPoolExecutor(
             max_workers=execution_worker_limit,
             thread_name_prefix="agency-execution",
@@ -150,7 +152,7 @@ class GlobalAgentOrchestrator:
         self._scheduler_thread.start()
         self._record_global_event(
             "scheduler_started",
-            {"max_concurrent_engines": self.agconfig.max_concurrent_engines},
+            {"max_concurrent_engines": self.agconfig.orchestrator.max_concurrent_engines},
             update_latest_snapshot=True,
         )
         with self._event_cond:
@@ -586,7 +588,7 @@ class GlobalAgentOrchestrator:
         admission.set()
 
     def _has_capacity_locked(self) -> bool:
-        limit = self.agconfig.max_concurrent_engines
+        limit = self.agconfig.orchestrator.max_concurrent_engines
         return limit is None or len(self._active_by_agent) < limit
 
     def _engine_worker(self, request: _ExecutionRequest) -> None:
@@ -759,7 +761,7 @@ class GlobalAgentOrchestrator:
             input_dict = local_skill_input.to_dict()
             result_dict = result.to_dict()
             if result_dict.get("error"):
-                truncate = ag.agconfig.error_log_truncate
+                truncate = ag.agconfig.skill.error_log_truncate
                 logger.record_event(
                     type="skill_error",
                     payload={"skill": skill.name, "error": str(result_dict["error"])},
@@ -1148,7 +1150,7 @@ class GlobalAgentOrchestrator:
             }
         return {
             "state": self._state,
-            "max_concurrent_engines": self.agconfig.max_concurrent_engines,
+            "max_concurrent_engines": self.agconfig.orchestrator.max_concurrent_engines,
             "ready_count": sum(request.state == "ready" for request in requests),
             "blocked_count": sum(request.state == "blocked" for request in requests),
             "running_count": len(self._active_by_agent),

@@ -180,11 +180,15 @@ class agschema:
         warning telling the LLM to read those files).
         """
         _cfg = agconfig if agconfig is not None else agconfig_cls()
-        _input_offload_chars = _cfg.input_offload_chars
+        _input_offload_chars = _cfg.schema.input_offload_chars
         _threshold = (
             min(
                 _input_offload_chars,
-                int(context_limit * _cfg.offload_context_fraction * _cfg.chars_per_token),
+                int(
+                    context_limit
+                    * _cfg.schema.offload_context_fraction
+                    * _cfg.schema.chars_per_token
+                ),
             )
             if context_limit
             else _input_offload_chars

@@ -2,9 +2,9 @@
 
 Split by concrete backend: `.agllm` (the backend class, selection logic, and
 the cross-SDK exception tuples), `.openai`, `.anthropic`, `.bedrock`,
-`.mock`. Every field any backend reads lives directly on `agency.configs.agconfig`
+`.mock`. Every field any backend reads lives on `agency.configs.agconfig.llmconfig`
 -- there's no per-provider config class anymore; select a provider with
-`agconfig(provider="...")` and pass whatever fields that provider reads.
+`agconfig(llmconfig(provider="..."))` and pass whatever fields that provider reads.
 """
 
 from .agllm import (

@@ -7,17 +7,16 @@ from concurrent.futures import Future
 from unittest.mock import MagicMock
 
 from agency import Invocation, MessageSubmission, agdata, agent, agskill
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, agentconfig, llmconfig, orchestratorconfig
 from agency.engine import AgentEngine
 from agency.orchestrator import get_orchestrator
 
 
 def _agent(tmp_path, *, max_engines=None) -> agent:
     config = agconfig(
-        max_concurrent_engines=max_engines,
-        log_dir=str(tmp_path),
-        api_key="test",
-        model="m",
+        orchestratorconfig(max_concurrent_engines=max_engines),
+        agentconfig(log_dir=str(tmp_path)),
+        llmconfig(api_key="test", model="m"),
     )
     sandbox = MagicMock()
     sandbox._lock = threading.RLock()

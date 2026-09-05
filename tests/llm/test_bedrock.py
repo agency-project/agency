@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.bedrock import (
     _AnthropicAWSBackend,
     _AnthropicBedrockBackend,
@@ -20,8 +20,8 @@ from agency.llm.bedrock import (
 
 
 def _cfg(**fields) -> agconfig:
-    """Test helper: build a flat agconfig."""
-    return agconfig(**fields)
+    """Test helper: build an agconfig with the given llmconfig fields."""
+    return agconfig(llmconfig(**fields))
 
 
 # ---------------------------------------------------------------------------

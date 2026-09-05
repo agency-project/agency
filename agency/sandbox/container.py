@@ -108,7 +108,7 @@ def _runtime_works(runtime: str) -> bool:
         proc = subprocess.run(
             [runtime, "info"],
             capture_output=True,
-            timeout=agconfig_cls().inspect_timeout_s,
+            timeout=agconfig_cls().sandbox.inspect_timeout_s,
         )
         return proc.returncode == 0
     except Exception:
@@ -222,7 +222,7 @@ def _do_reap_orphaned_containers() -> None:
     result = subprocess.run(
         [runtime, "ps", "-a", "--filter", f"label={_AGENCY_OWNER_PID_LABEL}", "--format", fmt],
         capture_output=True,
-        timeout=agconfig_cls().inspect_timeout_s,
+        timeout=agconfig_cls().sandbox.inspect_timeout_s,
     )
     if result.returncode != 0:
         return
@@ -297,7 +297,7 @@ def _reap_orphaned_lifecycle_images(runtime: str, own_pid: int) -> None:
             "{{.Repository}}:{{.Tag}}",
         ],
         capture_output=True,
-        timeout=agconfig_cls().inspect_timeout_s,
+        timeout=agconfig_cls().sandbox.inspect_timeout_s,
     )
     if result.returncode != 0:
         return
@@ -315,7 +315,7 @@ def _reap_orphaned_lifecycle_images(runtime: str, own_pid: int) -> None:
                     tag,
                 ],
                 capture_output=True,
-                timeout=agconfig_cls().inspect_timeout_s,
+                timeout=agconfig_cls().sandbox.inspect_timeout_s,
             )
             if label_result.returncode != 0:
                 continue
@@ -339,7 +339,7 @@ def _reap_orphaned_lifecycle_images(runtime: str, own_pid: int) -> None:
             in_use = subprocess.run(
                 [runtime, "ps", "-a", "--filter", f"ancestor={tag}", "--format", "{{.ID}}"],
                 capture_output=True,
-                timeout=agconfig_cls().stop_ps_check_timeout_s,
+                timeout=agconfig_cls().sandbox.stop_ps_check_timeout_s,
             )
             if in_use.returncode != 0:
                 continue  # couldn't confirm safety -- skip rather than risk it
@@ -520,7 +520,7 @@ def _gpu_flags(runtime: str) -> list[str]:
 # applying independently to threads in each process.
 def _keyring_container_limit() -> int:
     """Return the concurrent-container cap derived from the kernel keyring quota."""
-    _fields = agconfig_cls()
+    _fields = agconfig_cls().sandbox
     try:
         maxkeys = int(Path("/proc/sys/kernel/keys/maxkeys").read_text().strip())
         return max(_fields.container_limit_floor, maxkeys - _fields.container_limit_buffer)
@@ -640,11 +640,11 @@ class _ContainerBackendBase(agsandbox_backend):
         after a name-conflict is resolved in _run_with_conflict_retry(), in
         case a quota was *also* exhausted (e.g. the container object got
         created then hit the limit)."""
-        deadline = time.monotonic() + self._agconfig.keyring_wait_timeout_s
+        deadline = time.monotonic() + self._agconfig.sandbox.keyring_wait_timeout_s
         while time.monotonic() < deadline:
             if keyring_quota().get("free", 0) > 0:
                 return
-            time.sleep(self._agconfig.keyring_poll_interval_s)
+            time.sleep(self._agconfig.sandbox.keyring_poll_interval_s)
 
     def _quota_diagnostics(self) -> str:
         """Return a short diagnostic string describing quota state, appended
@@ -732,6 +732,7 @@ class _ContainerBackendBase(agsandbox_backend):
         # not a regression).
         self._squash_base_diff_ids: "list[str] | None" = None
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
+        self._validate_config(self._agconfig)
         self._name = name
         self._base_image = base_image
         self._vol_flags: list[str] = []
@@ -740,6 +741,7 @@ class _ContainerBackendBase(agsandbox_backend):
 
     def change_config(self, agconfig: "agconfig_cls | None") -> None:
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
+        self._validate_config(self._agconfig)
 
     def get_config_copy(self) -> "agconfig_cls":
         return self._agconfig.clone()
@@ -749,7 +751,7 @@ class _ContainerBackendBase(agsandbox_backend):
         result = self._run(
             [self._runtime, "inspect", "--format", "{{.State.Running}}", self._name],
             check=False,
-            timeout=self._agconfig.inspect_timeout_s,
+            timeout=self._agconfig.sandbox.inspect_timeout_s,
         )
         return result.returncode == 0 and result.stdout.strip() == b"true"
 
@@ -758,7 +760,7 @@ class _ContainerBackendBase(agsandbox_backend):
         result = self._run(
             [self._runtime, "inspect", "--format", "{{.State.Status}}", self._name],
             check=False,
-            timeout=self._agconfig.inspect_timeout_s,
+            timeout=self._agconfig.sandbox.inspect_timeout_s,
         )
         if result.returncode != 0:
             return ""
@@ -782,7 +784,7 @@ class _ContainerBackendBase(agsandbox_backend):
             cmd = [self._runtime, "top", self._container_name(), "hpid"]
         else:
             cmd = [self._runtime, "top", self._container_name(), "-eo", "pid"]
-        result = self._run(cmd, check=False, timeout=self._agconfig.inspect_timeout_s)
+        result = self._run(cmd, check=False, timeout=self._agconfig.sandbox.inspect_timeout_s)
         if result.returncode != 0:
             return set()
         pids: set[int] = set()
@@ -811,7 +813,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 self._name,
             ],
             check=False,
-            timeout=self._agconfig.inspect_timeout_s,
+            timeout=self._agconfig.sandbox.inspect_timeout_s,
         )
         if result.returncode != 0:
             return (False, "")
@@ -920,10 +922,10 @@ class _ContainerBackendBase(agsandbox_backend):
             else:
                 image = self._resolve_image(self._base_image)
                 limit_flags = []
-                if self._agconfig.idle_memory is not None:
-                    limit_flags.append(f"--memory={self._agconfig.idle_memory}")
+                if self._agconfig.resources.idle_memory is not None:
+                    limit_flags.append(f"--memory={self._agconfig.resources.idle_memory}")
                 if self._cfs_supported():
-                    limit_flags.append(f"--cpus={self._agconfig.idle_cpus}")
+                    limit_flags.append(f"--cpus={self._agconfig.resources.idle_cpus}")
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
@@ -989,7 +991,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 self._name,
             ],
             check=False,
-            timeout=self._agconfig.inspect_timeout_s,
+            timeout=self._agconfig.sandbox.inspect_timeout_s,
         )
         raw_inspect = result.stdout.decode("utf-8", errors="replace").strip()
         container_id, separator, pid_text = raw_inspect.partition("|")
@@ -1067,7 +1069,7 @@ class _ContainerBackendBase(agsandbox_backend):
             "  __p=${__d##*/}\n"
             '  [ "$__p" != "$__SELF" ] && echo "$__p"\n'
             "done",
-            timeout=self._agconfig.inspect_timeout_s,
+            timeout=self._agconfig.sandbox.inspect_timeout_s,
             shell="sh",
         )
         pids: set[int] = set()
@@ -1093,8 +1095,8 @@ class _ContainerBackendBase(agsandbox_backend):
         here.
         """
         _last_stderr = ""
-        for attempt in range(self._agconfig.conflict_retry_max_attempts):
-            result = self._run(run_cmd, timeout=self._agconfig.docker_run_timeout_s)
+        for attempt in range(self._agconfig.sandbox.conflict_retry_max_attempts):
+            result = self._run(run_cmd, timeout=self._agconfig.sandbox.docker_run_timeout_s)
             if result.returncode == 0:
                 return
             stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
@@ -1114,17 +1116,17 @@ class _ContainerBackendBase(agsandbox_backend):
                 # Leftover container in a non-running state — remove it.
                 # Wait until it's actually gone before retrying run.
                 self._rm_container(name)
-                deadline = time.monotonic() + self._agconfig.container_removal_wait_s
+                deadline = time.monotonic() + self._agconfig.sandbox.container_removal_wait_s
                 while time.monotonic() < deadline:
                     if not self._container_status():
                         break
-                    time.sleep(self._agconfig.container_removal_poll_interval_s)
+                    time.sleep(self._agconfig.sandbox.container_removal_poll_interval_s)
                 # If a quota is also exhausted (e.g. the object got created
                 # then hit the limit), wait for a slot before retrying —
                 # otherwise we'll create another "Created" container and loop
                 # on conflicts. No-op for runtimes with no quota to wait on.
                 self._wait_for_quota_slot()
-                time.sleep(self._agconfig.conflict_retry_backoff_base_s * (attempt + 1))
+                time.sleep(self._agconfig.sandbox.conflict_retry_backoff_base_s * (attempt + 1))
             else:
                 msg = f"{' '.join(run_cmd[:3])} failed (exit {result.returncode})"
                 if stderr:
@@ -1152,9 +1154,10 @@ class _ContainerBackendBase(agsandbox_backend):
         to remove-and-retry on -- only the quota-wait loop applies.
         """
         _last_stderr = ""
-        for attempt in range(self._agconfig.conflict_retry_max_attempts):
+        for attempt in range(self._agconfig.sandbox.conflict_retry_max_attempts):
             result = self._run(
-                [self._runtime, "start", name], timeout=self._agconfig.docker_start_timeout_s
+                [self._runtime, "start", name],
+                timeout=self._agconfig.sandbox.docker_start_timeout_s,
             )
             if result.returncode == 0:
                 return
@@ -1162,7 +1165,7 @@ class _ContainerBackendBase(agsandbox_backend):
             _last_stderr = stderr
             if self._is_quota_exhaustion_error(stderr):
                 self._wait_for_quota_slot()
-                time.sleep(self._agconfig.conflict_retry_backoff_base_s * (attempt + 1))
+                time.sleep(self._agconfig.sandbox.conflict_retry_backoff_base_s * (attempt + 1))
             else:
                 msg = f"{self._runtime} start {name} failed (exit {result.returncode})"
                 if stderr:
@@ -1224,7 +1227,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 ),
                 args=args,
                 timeout=timeout,
-                grace_s=self._agconfig.unkillable_child_grace_s,
+                grace_s=self._agconfig.sandbox.unkillable_child_grace_s,
                 on_give_up=_release_once,
             )
         except subprocess.CalledProcessError as e:
@@ -1241,7 +1244,7 @@ class _ContainerBackendBase(agsandbox_backend):
         self._run(
             [self._runtime, "rm", "-f", name],
             check=True,
-            timeout=self._agconfig.docker_rm_timeout_s,
+            timeout=self._agconfig.sandbox.docker_rm_timeout_s,
         )
 
     def _rmi(self, image_ref: str, *, force: bool = False) -> None:
@@ -1250,7 +1253,7 @@ class _ContainerBackendBase(agsandbox_backend):
         if force:
             cmd.append("-f")
         cmd.append(image_ref)
-        self._run(cmd, check=True, timeout=self._agconfig.image_timeout_s)
+        self._run(cmd, check=True, timeout=self._agconfig.sandbox.image_timeout_s)
 
     def _container_exec(
         self,
@@ -1327,7 +1330,7 @@ class _ContainerBackendBase(agsandbox_backend):
             "-c",
             sh_cmd,
         ]
-        self._run(args, check=True, timeout=self._agconfig.exec_quick_timeout_s)
+        self._run(args, check=True, timeout=self._agconfig.sandbox.exec_quick_timeout_s)
 
     def update_limits(
         self,
@@ -1346,7 +1349,7 @@ class _ContainerBackendBase(agsandbox_backend):
         if len(cmd) == 2:
             return  # nothing to update
         cmd.append(self._container_name())
-        self._run(cmd, timeout=self._agconfig.inspect_timeout_s)
+        self._run(cmd, timeout=self._agconfig.sandbox.inspect_timeout_s)
 
     def _image_diff_ids(self, image_ref: str) -> "list[str]":
         """The image's uncompressed layer content digests, in order --
@@ -1359,7 +1362,7 @@ class _ContainerBackendBase(agsandbox_backend):
         result = self._run(
             [self._runtime, "inspect", "--format={{json .RootFS.Layers}}", image_ref],
             check=True,
-            timeout=self._agconfig.stop_inspect_timeout_s,
+            timeout=self._agconfig.sandbox.stop_inspect_timeout_s,
         )
         return json.loads(result.stdout.decode("utf-8", errors="replace"))
 
@@ -1557,7 +1560,7 @@ class _ContainerBackendBase(agsandbox_backend):
             self._run(
                 [self._runtime, "inspect", tag],
                 check=True,
-                timeout=self._agconfig.stop_inspect_timeout_s,
+                timeout=self._agconfig.sandbox.stop_inspect_timeout_s,
             ).stdout.decode("utf-8", errors="replace")
         )[0]
 
@@ -1591,7 +1594,7 @@ class _ContainerBackendBase(agsandbox_backend):
             self._run(
                 [self._runtime, "load", "-i", str(out_tar_path)],
                 check=True,
-                timeout=self._agconfig.squash_timeout_s,
+                timeout=self._agconfig.sandbox.squash_timeout_s,
             )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1655,7 +1658,7 @@ class _ContainerBackendBase(agsandbox_backend):
         export_result = self._run(
             [self._runtime, "export", self._container_name()],
             check=True,
-            timeout=self._agconfig.squash_timeout_s,
+            timeout=self._agconfig.sandbox.squash_timeout_s,
         )
         self._run(
             [
@@ -1668,7 +1671,7 @@ class _ContainerBackendBase(agsandbox_backend):
             ],
             input=export_result.stdout,
             check=True,
-            timeout=self._agconfig.squash_timeout_s,
+            timeout=self._agconfig.sandbox.squash_timeout_s,
         )
         try:
             self._squash_base_diff_ids = self._image_diff_ids(tag)
@@ -1725,9 +1728,15 @@ class _ContainerBackendBase(agsandbox_backend):
         stop_exc: Exception | None = None
         try:
             self._run(
-                [self._runtime, "stop", "-t", str(self._agconfig.docker_stop_grace_s), name],
+                [
+                    self._runtime,
+                    "stop",
+                    "-t",
+                    str(self._agconfig.sandbox.docker_stop_grace_s),
+                    name,
+                ],
                 check=True,
-                timeout=self._agconfig.docker_stop_timeout_s,
+                timeout=self._agconfig.sandbox.docker_stop_timeout_s,
             )
         except Exception as _e:
             stop_exc = _e
@@ -1789,15 +1798,15 @@ class _ContainerBackendBase(agsandbox_backend):
         # run -- an unconfirmed removal must reach the caller, but shouldn't
         # cut short a release that's still legitimately possible to check.
         rm_exc: Exception | None = None
-        for _attempt in range(self._agconfig.rm_retry_attempts):
+        for _attempt in range(self._agconfig.sandbox.rm_retry_attempts):
             try:
                 self._rm_container(name)
                 rm_exc = None
                 break
             except Exception as _e:
                 rm_exc = _e
-                if _attempt != self._agconfig.rm_retry_attempts - 1:
-                    time.sleep(self._agconfig.rm_retry_backoff_s)
+                if _attempt != self._agconfig.sandbox.rm_retry_attempts - 1:
+                    time.sleep(self._agconfig.sandbox.rm_retry_backoff_s)
         if had_container and not self._container_running():
             self._release_runtime_slot()
         if (
@@ -1864,7 +1873,7 @@ class _ContainerBackendBase(agsandbox_backend):
             _prev_result = self._run(
                 [self._runtime, "inspect", "--format={{.Id}}", tag],
                 check=False,
-                timeout=self._agconfig.stop_inspect_timeout_s,
+                timeout=self._agconfig.sandbox.stop_inspect_timeout_s,
             )
             if _prev_result and _prev_result.returncode == 0:
                 previous_image_id = (
@@ -1885,20 +1894,20 @@ class _ContainerBackendBase(agsandbox_backend):
         #    due, never a replacement for it, so an ordinary commit's cost
         #    never regresses.
         commit_exc: Exception | None = None
-        for _attempt in range(self._agconfig.commit_retry_attempts):
+        for _attempt in range(self._agconfig.sandbox.commit_retry_attempts):
             try:
                 self._run(
                     [self._runtime, "commit", self._container_name(), tag],
                     check=True,
-                    timeout=self._agconfig.commit_timeout_s,
+                    timeout=self._agconfig.sandbox.commit_timeout_s,
                 )
                 self._checkpoint_image = tag
                 commit_exc = None
                 break
             except Exception as _e:
                 commit_exc = _e
-                if _attempt != self._agconfig.commit_retry_attempts - 1:
-                    time.sleep(self._agconfig.commit_retry_backoff_s)
+                if _attempt != self._agconfig.sandbox.commit_retry_attempts - 1:
+                    time.sleep(self._agconfig.sandbox.commit_retry_backoff_s)
         if commit_exc is not None:
             raise commit_exc
 
@@ -1923,7 +1932,7 @@ class _ContainerBackendBase(agsandbox_backend):
                         "{{.ID}}",
                     ],
                     check=False,
-                    timeout=self._agconfig.stop_ps_check_timeout_s,
+                    timeout=self._agconfig.sandbox.stop_ps_check_timeout_s,
                 )
                 if _in_use and _in_use.stdout.strip():
                     pass  # a container (e.g. a fork) still runs from this image — leave it
@@ -1949,7 +1958,7 @@ class _ContainerBackendBase(agsandbox_backend):
         should_squash = False
         try:
             should_squash = (
-                len(self._image_diff_ids(tag)) >= self._agconfig.checkpoint_squash_max_depth
+                len(self._image_diff_ids(tag)) >= self._agconfig.sandbox.checkpoint_squash_max_depth
             )
         except Exception as _e:
             # DATACOLLECTOR: append, agname=self._agname -- degrade warning (squash may run more often than intended).
@@ -1981,7 +1990,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 result = self._run(
                     [self._runtime, "inspect", "--format={{.Id}}", tag],
                     check=False,
-                    timeout=self._agconfig.stop_inspect_timeout_s,
+                    timeout=self._agconfig.sandbox.stop_inspect_timeout_s,
                 )
                 if result and result.returncode == 0:
                     old_image_id = result.stdout.decode("utf-8", errors="replace").strip() or None
@@ -2048,7 +2057,7 @@ class _ContainerBackendBase(agsandbox_backend):
                             "{{.ID}}",
                         ],
                         check=False,
-                        timeout=self._agconfig.stop_ps_check_timeout_s,
+                        timeout=self._agconfig.sandbox.stop_ps_check_timeout_s,
                     )
                     if in_use and in_use.stdout.strip():
                         pass  # containers still running from this image — leave it
@@ -2076,7 +2085,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 try:
                     self._container_exec(
                         f"kill {pids} 2>/dev/null; true",
-                        timeout=self._agconfig.exec_quick_timeout_s,
+                        timeout=self._agconfig.sandbox.exec_quick_timeout_s,
                         shell="sh",
                     )
                 except Exception as _e:
@@ -2109,7 +2118,7 @@ class _ContainerBackendBase(agsandbox_backend):
             try:
                 self._container_exec(
                     f"kill {pids} 2>/dev/null; true",
-                    timeout=self._agconfig.exec_quick_timeout_s,
+                    timeout=self._agconfig.sandbox.exec_quick_timeout_s,
                     shell="sh",
                 )
             except Exception as _e:

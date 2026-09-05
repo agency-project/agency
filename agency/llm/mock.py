@@ -166,8 +166,8 @@ _BUILTIN_TIMING_MODES: "dict[str, Callable]" = {
 
 class _MockBackend:
     """Backend selected by `provider="mock"`. Holds the given agconfig
-    directly (not a clone -- so `agconfig.timing_fn = ...`/
-    `agconfig.timing_mode = ...` mutations made after construction take
+    directly (not a clone -- so `agconfig.llm.timing_fn = ...`/
+    `agconfig.llm.timing_mode = ...` mutations made after construction take
     effect on the next call).
 
     Replay state (the loaded exchange list and the position within it) is
@@ -180,20 +180,31 @@ class _MockBackend:
         self.agconfig = agconfig
         self._exchanges: "list[list[dict]] | None" = None
         self._next_index = 0
+        self._validate_config()
+
+    def change_config(self, agconfig: "agconfig_cls") -> None:
+        """Replace the held agconfig (not cloned -- see class docstring) and
+        re-validate it, then restart replay from the beginning."""
+        self.agconfig = agconfig
+        self._exchanges = None
+        self._next_index = 0
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        if not self.agconfig.llm.replay_db_path:
+            raise ValueError(
+                "mock LLM backend: replay_db_path is not set -- point it at the "
+                "source agent's own <agname>_data.sqlite3 (agconfig(llmconfig("
+                "provider='mock', replay_db_path=...)))"
+            )
 
     @property
     def model(self) -> str:
-        return self.agconfig.model
+        return self.agconfig.llm.model
 
     def _ensure_loaded(self) -> "list[list[dict]]":
         if self._exchanges is None:
-            if not self.agconfig.replay_db_path:
-                raise ValueError(
-                    "mock LLM backend: replay_db_path is not set -- point it at the "
-                    "source agent's own <agname>_data.sqlite3 (agconfig(provider='mock',"
-                    " replay_db_path=...))"
-                )
-            self._exchanges = _load_replay_exchanges(self.agconfig.replay_db_path)
+            self._exchanges = _load_replay_exchanges(self.agconfig.llm.replay_db_path)
         return self._exchanges
 
     def _next_exchange(self) -> "list[dict]":
@@ -201,28 +212,32 @@ class _MockBackend:
         if self._next_index >= len(exchanges):
             raise RuntimeError(
                 f"mock LLM backend: replay exhausted after {self._next_index} exchange(s) "
-                f"from {self.agconfig.replay_db_path!r}"
+                f"from {self.agconfig.llm.replay_db_path!r}"
             )
         blocks = exchanges[self._next_index]
         self._next_index += 1
         return blocks
 
     def _resolve_timing_fn(self) -> "Callable[[dict, list[int]], Iterator[float]]":
-        if self.agconfig.timing_fn is not None:
-            return self.agconfig.timing_fn
-        if self.agconfig.timing_mode == "poisson":
+        if self.agconfig.llm.timing_fn is not None:
+            return self.agconfig.llm.timing_fn
+        if self.agconfig.llm.timing_mode == "poisson":
             return poisson_timing(
-                self.agconfig.poisson_rate_hz,
-                self.agconfig.poisson_ttft_mean_s,
-                self.agconfig.poisson_seed,
+                self.agconfig.llm.poisson_rate_hz,
+                self.agconfig.llm.poisson_ttft_mean_s,
+                self.agconfig.llm.poisson_seed,
             )
-        if self.agconfig.timing_mode == "constant":
-            return constant_timing(self.agconfig.constant_ttft_s, self.agconfig.constant_tpot_s)
-        return _BUILTIN_TIMING_MODES.get(self.agconfig.timing_mode, exact_replay_timing)
+        if self.agconfig.llm.timing_mode == "constant":
+            return constant_timing(
+                self.agconfig.llm.constant_ttft_s, self.agconfig.llm.constant_tpot_s
+            )
+        return _BUILTIN_TIMING_MODES.get(self.agconfig.llm.timing_mode, exact_replay_timing)
 
     def fetch_context_limit(self) -> int:
         return (
-            int(self.agconfig.context_limit) if self.agconfig.context_limit is not None else 200_000
+            int(self.agconfig.llm.context_limit)
+            if self.agconfig.llm.context_limit is not None
+            else 200_000
         )
 
     def dispatch(self, request: dict) -> dict:

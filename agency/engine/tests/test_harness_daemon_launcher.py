@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, agentconfig, harnessadapterconfig, llmconfig
 from agency.engine import harness_daemon_launcher as launcher
 
 
@@ -25,7 +25,7 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
         "/tmp/agency/gw/run/host-agent.sock",
         "agent-1",
         "claude_code",
-        agconfig=agconfig(binary_path="/bin/claude"),
+        agconfig=agconfig(harnessadapterconfig(binary_path="/bin/claude")),
         timeout_s=1.0,
     )
 
@@ -87,11 +87,17 @@ def test_duplicate_ensure_reuses_ready_daemon_without_relaunching(monkeypatch):
 
 
 def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
-    config = agconfig(binary_path="/bin/claude", api_key="secret", harness="claude_code")
+    config = agconfig(
+        harnessadapterconfig(binary_path="/bin/claude"),
+        llmconfig(api_key="secret"),
+        agentconfig(harness="claude_code"),
+    )
 
     assert launcher._daemon_config(config) == {
-        "binary_path": "/bin/claude",
-        "syscalls": list(agconfig().syscalls),
-        "profiler": None,
-        "disable_harness_native_sandbox": True,
+        "harness_adapter": {"binary_path": "/bin/claude"},
+        "ptrace": {
+            "syscalls": list(agconfig().ptrace.syscalls),
+            "profiler": None,
+            "disable_harness_native_sandbox": True,
+        },
     }

@@ -50,13 +50,13 @@ def _make_sandbox(**kwargs):
     need every sandbox to actually be a docker container regardless of the
     process-wide auto-detected default (which prefers podman when both are
     usable -- see sandbox.base.agsandbox_backend.for_config())."""
-    from agency.configs.agconfig import agconfig as agconfig_cls
+    from agency.configs.agconfig import agconfig as agconfig_cls, sandboxconfig
     from agency.sandbox.agsandbox import agSandbox
 
     uid = str(uuid.uuid4())
     cfg = kwargs.pop("agconfig", None)
     if cfg is None:
-        cfg = agconfig_cls(backend="docker")
+        cfg = agconfig_cls(sandboxconfig(backend="docker"))
     # Unit tests below mock the backend's command runner after construction.
     # Backend selection now performs a live daemon check during construction,
     # so stub only that selection probe; tests marked @docker still exercise a
@@ -188,7 +188,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._DockerBackend, "_run", fake_run):
                 with patch.object(sb._backend, "_container_status", return_value="running"):
                     with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -221,7 +221,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted(stdout=b"", returncode=1)  # tag not found
             return FakeCompleted()
 
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._DockerBackend, "_run", fake_run):
                 with patch.object(sb._backend, "_container_status", return_value="running"):
                     with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -302,7 +302,7 @@ class TestDanglingImageEagerCleanup:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._DockerBackend, "_run", fake_run):
                     with patch.object(sb._backend, "_container_status", return_value="running"):
                         with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -357,7 +357,7 @@ class TestDanglingImageEagerCleanup:
                 return FakeCompleted()
             return FakeCompleted()
 
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._DockerBackend, "_run", fake_run):
                 with patch.object(sb._backend, "_container_status", return_value="running"):
                     with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -468,7 +468,7 @@ class TestDanglingImageEagerCleanup:
             # still runs (briefly tagging a real image), then the squash
             # step must delete exactly that transient image rather than
             # leaving it dangling.
-            with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
                 sb.commit()
             after = _dangling_ids()
 
@@ -608,7 +608,7 @@ class TestCheckpointSquash:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._DockerBackend, "_run", fake_run):
                     with patch.object(sb._backend, "_container_status", return_value="running"):
                         with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -631,7 +631,7 @@ class TestCheckpointSquash:
         import agency.sandbox.docker as _mod
 
         sb = self._sb()
-        max_depth = sb._backend._agconfig.checkpoint_squash_max_depth
+        max_depth = sb._backend._agconfig.sandbox.checkpoint_squash_max_depth
         deep_chain = [f"sha256:layer{i}" for i in range(max_depth)]
         calls = []
 
@@ -731,7 +731,7 @@ class TestCheckpointSquash:
                 return _FakeCompleted(stdout=b'["sha256:layer0"]')
             return _FakeCompleted()
 
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._DockerBackend, "_run", fake_run):
                 with patch.object(sb._backend, "_container_status", return_value="running"):
                     with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -768,7 +768,7 @@ class TestCheckpointSquash:
                 return _FakeCompleted(stdout=b'["sha256:flattened-single-layer"]')
             return _FakeCompleted()
 
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._DockerBackend, "_run", fake_run):
                 with patch.object(sb._backend, "_container_status", return_value="running"):
                     with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -804,7 +804,7 @@ class TestCheckpointSquash:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._DockerBackend, "_run", fake_run):
                     with patch.object(sb._backend, "_container_status", return_value="running"):
                         with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -846,7 +846,7 @@ class TestCheckpointSquash:
                 return _FakeCompleted(stdout=b'["sha256:flattened-1"]')
             return _FakeCompleted()
 
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             with patch.object(_mod._DockerBackend, "_run", fake_run_cycle1):
                 with patch.object(sb._backend, "_container_status", return_value="running"):
                     with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -874,7 +874,7 @@ class TestCheckpointSquash:
                 )
             return _FakeCompleted()
 
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 2):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 2):
             with patch.object(_mod._DockerBackend, "_run", fake_run_cycle2):
                 with patch.object(
                     _mod._DockerBackend, "_locate_layer_diff_dir", return_value=diff_dir
@@ -911,7 +911,7 @@ class TestCheckpointSquash:
         old_stderr = sys.stderr
         sys.stderr = captured
         try:
-            with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
                 with patch.object(_mod._DockerBackend, "_run", fake_run):
                     with patch.object(sb._backend, "_container_status", return_value="running"):
                         with patch.object(sb._backend, "_gpu_count_requested", 0):
@@ -1827,7 +1827,7 @@ class TestCheckpointAccumulator:
         sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
 
         t0 = time.time()
-        with patch.object(sb._backend._agconfig, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             sb.commit()  # this cycle commits AND squashes
         elapsed = time.time() - t0
 

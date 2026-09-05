@@ -136,7 +136,7 @@ class _CodexBackend(agharness_backend):
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
 
-        binary = self.agconfig.binary_path or self._DEFAULT_BINARY
+        binary = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
         resolved = shutil.which(binary)
         if resolved is None:
             return AttemptResult(

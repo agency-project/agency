@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Generator
+from typing import ClassVar, Generator
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
 from ..configs.agconfig import agconfig as agconfig_cls
@@ -65,16 +65,39 @@ class agllm:
     call).
     """
 
+    # Fields with no viable runtime/env-var fallback for a given provider --
+    # checked eagerly on every config change rather than failing lazily deep
+    # inside a request. Providers not listed here (openai/anthropic/bedrock/
+    # anthropicAWS) have no field that's *strictly* required from agconfig
+    # alone: credentials fall back to environment variables/IAM, and an
+    # empty model is a real (if useless) request rather than a malformed
+    # config.
+    _REQUIRED_FIELDS_BY_PROVIDER: "ClassVar[dict[str, tuple[str, ...]]]" = {
+        "vllm": ("base_url",),
+    }
+
     def __init__(self, agconfig: "agconfig_cls") -> None:
-        self.agconfig = agconfig.clone()
+        self.change_config(agconfig)
 
     @property
     def model(self) -> str:
-        return self.agconfig.model or ""
+        return self.agconfig.llm.model or ""
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
-        """Replace this instance's agconfig with a clone of the given one."""
+        """Replace this instance's agconfig with a clone of the given one,
+        then validate it's internally consistent for its own provider."""
         self.agconfig = agconfig.clone()
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        provider = self.agconfig.llm.provider
+        required = self._REQUIRED_FIELDS_BY_PROVIDER.get(provider, ())
+        missing = [name for name in required if not getattr(self.agconfig.llm, name)]
+        if missing:
+            raise ValueError(
+                f"agconfig.llm with provider={provider!r} is missing required "
+                f"field(s): {', '.join(missing)}"
+            )
 
     def get_config_copy(self) -> "agconfig_cls":
         """Return a clone of this instance's agconfig."""
@@ -91,8 +114,8 @@ class agllm:
         from .anthropic import _AnthropicBackend
         from .openai import _OpenAICompatibleBackend
 
-        provider = agconfig.provider
-        model = agconfig.model or ""
+        provider = agconfig.llm.provider
+        model = agconfig.llm.model or ""
         if provider == "mock":
             from .mock import _MockBackend
 
@@ -105,11 +128,9 @@ class agllm:
             return _AnthropicAWSBackend(agconfig)
         if provider == "anthropic":
             return _AnthropicBackend(agconfig)
-        if provider == "vllm" and not agconfig.base_url:
-            raise ValueError(
-                "provider='vllm' requires base_url -- point it at your "
-                "vLLM/OpenAI-compatible endpoint (e.g. 'http://localhost:8000/v1')."
-            )
+        # _OpenAICompatibleBackend.__init__ -> change_config() validates
+        # provider="vllm"'s required base_url -- no need to duplicate that
+        # check here just to fail one call frame earlier.
         return _OpenAICompatibleBackend(agconfig)
 
     def make_client(self, timeout: httpx.Timeout):
@@ -120,7 +141,7 @@ class agllm:
         """Best-effort model listing, used for context-limit lookups. Exceptions
         propagate to the caller (fetch_context_limit already wraps this).
         Override to return [] for backends with no listing capability."""
-        client = self.make_client(httpx.Timeout(self.agconfig.model_listing_timeout_seconds))
+        client = self.make_client(httpx.Timeout(self.agconfig.llm.model_listing_timeout_seconds))
         return list(client.models.list())
 
     def tokenize_url(self) -> "str | None":
@@ -138,16 +159,16 @@ class agllm:
         (never cached) -- call it fresh whenever the current value matters.
 
         Priority:
-        1. ``self.agconfig.context_limit`` — explicit user override
+        1. ``self.agconfig.llm.context_limit`` — explicit user override
         2. Live API model listing — vLLM's ``max_model_len`` (a model_extra
            field) or the Anthropic API's ``max_input_tokens`` (a typed field)
         3. ``self.known_context_limit()`` — static fallback (e.g. Bedrock,
            which has no model-listing API at all)
-        4. ``self.agconfig.default_context_limit`` — safe fallback so compaction always runs
+        4. ``self.agconfig.llm.default_context_limit`` — safe fallback so compaction always runs
         """
-        if self.agconfig.context_limit is not None:
-            return int(self.agconfig.context_limit)
-        model_id = self.agconfig.model or ""
+        if self.agconfig.llm.context_limit is not None:
+            return int(self.agconfig.llm.context_limit)
+        model_id = self.agconfig.llm.model or ""
         try:
             all_models = self.list_models()
             candidates = [m for m in all_models if m.id == model_id] or all_models
@@ -164,16 +185,16 @@ class agllm:
         if known is not None:
             return known
         print(
-            f"[agllm] WARNING: context limit unknown, falling back to {self.agconfig.default_context_limit}"
+            f"[agllm] WARNING: context limit unknown, falling back to {self.agconfig.llm.default_context_limit}"
         )
-        return self.agconfig.default_context_limit
+        return self.agconfig.llm.default_context_limit
 
     def _client_timeout(self) -> httpx.Timeout:
         return httpx.Timeout(
-            connect=self.agconfig.http_connect_timeout,
-            read=self.agconfig.stream_timeout,
-            write=self.agconfig.http_write_timeout,
-            pool=self.agconfig.http_pool_timeout,
+            connect=self.agconfig.llm.http_connect_timeout,
+            read=self.agconfig.llm.stream_timeout,
+            write=self.agconfig.llm.http_write_timeout,
+            pool=self.agconfig.llm.http_pool_timeout,
         )
 
     def dispatch(self, request: dict) -> dict:
@@ -257,21 +278,21 @@ class agllm:
                 wire_msg = {"role": role, "content": text}
             wire_messages.append(wire_msg)
         kwargs: dict = dict(
-            model=self.agconfig.model or "",
+            model=self.agconfig.llm.model or "",
             messages=wire_messages,
         )
         for _p in _OPENAI_GEN_PARAMS:
-            val = getattr(self.agconfig, _p)
+            val = getattr(self.agconfig.llm, _p)
             if val is not None:
                 kwargs[_p] = val
-        if self.agconfig.max_tokens is not None:
+        if self.agconfig.llm.max_tokens is not None:
             print(
                 "[agllm] WARNING: llm_config['max_tokens'] is deprecated; use 'max_completion_tokens' instead."
             )
-            kwargs.setdefault("max_completion_tokens", self.agconfig.max_tokens)
-        _extra_body: dict = dict(self.agconfig.extra_body or {})
+            kwargs.setdefault("max_completion_tokens", self.agconfig.llm.max_tokens)
+        _extra_body: dict = dict(self.agconfig.llm.extra_body or {})
         for _p in _EXTRA_BODY_GEN_PARAMS:
-            val = getattr(self.agconfig, _p)
+            val = getattr(self.agconfig.llm, _p)
             if val is not None:
                 _extra_body[_p] = val
         if _extra_body:

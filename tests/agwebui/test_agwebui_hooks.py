@@ -13,9 +13,9 @@ import time
 
 def _make_agent():
     from agency.agent import agent
-    from agency.configs.agconfig import agconfig
+    from agency.configs.agconfig import agconfig, llmconfig
 
-    return agent(agconfig=agconfig(provider="mock", api_key="k", model=""))
+    return agent(agconfig=agconfig(llmconfig(provider="mock", api_key="k", model="")))
 
 
 def test_dispatch_pause_command_pauses_named_agent():
@@ -71,25 +71,25 @@ def test_dispatch_update_config_applies_to_named_agent():
         {
             "type": "update_config",
             "agname": ag.agname,
-            "config": {"react_max_steps": 7},
+            "config": {"skill": {"react_max_steps": 7}},
         }
     )
-    assert ag.agconfig.react_max_steps == 7
+    assert ag.agconfig.skill.react_max_steps == 7
 
 
 def test_dispatch_update_config_ignores_unknown_agname():
     from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
-    before = ag.agconfig.react_max_steps
+    before = ag.agconfig.skill.react_max_steps
     _dispatch_command(
         {
             "type": "update_config",
             "agname": "__no_such_agent__",
-            "config": {"react_max_steps": 999},
+            "config": {"skill": {"react_max_steps": 999}},
         }
     )
-    assert ag.agconfig.react_max_steps == before
+    assert ag.agconfig.skill.react_max_steps == before
 
 
 def test_dispatch_update_config_all_applies_to_every_agent():
@@ -99,11 +99,11 @@ def test_dispatch_update_config_all_applies_to_every_agent():
     _dispatch_command(
         {
             "type": "update_config_all",
-            "config": {"react_max_steps": 11},
+            "config": {"skill": {"react_max_steps": 11}},
         }
     )
-    assert a.agconfig.react_max_steps == 11
-    assert b.agconfig.react_max_steps == 11
+    assert a.agconfig.skill.react_max_steps == 11
+    assert b.agconfig.skill.react_max_steps == 11
 
 
 def test_dispatch_update_config_preserves_sandbox_mounts():
@@ -112,22 +112,22 @@ def test_dispatch_update_config_preserves_sandbox_mounts():
     into lifecycle images instead of using the shared host cache bind."""
     from agency.observability.agwebui import _dispatch_command
     from agency.agent import agent
-    from agency.configs.agconfig import agconfig
+    from agency.configs.agconfig import agconfig, llmconfig
 
-    cfg = agconfig(provider="mock", api_key="k", model="", base_url="http://old")
-    cfg.add_mount("hf_cache", "/tmp/hf-cache", "/root/.cache/huggingface")
+    cfg = agconfig(llmconfig(provider="mock", api_key="k", model="", base_url="http://old"))
+    cfg.sandbox.add_mount("hf_cache", "/tmp/hf-cache", "/root/.cache/huggingface")
     ag = agent(agconfig=cfg)
 
     _dispatch_command(
         {
             "type": "update_config",
             "agname": ag.agname,
-            "config": {"base_url": "http://new"},
+            "config": {"llm": {"base_url": "http://new"}},
         }
     )
 
-    assert ag.agconfig.base_url == "http://new"
-    mounts = ag.agconfig.mounts or {}
+    assert ag.agconfig.llm.base_url == "http://new"
+    mounts = ag.agconfig.sandbox.mounts or {}
     assert "hf_cache" in mounts
     assert mounts["hf_cache"][1] == "/root/.cache/huggingface"
 
@@ -137,11 +137,11 @@ def test_dispatch_update_config_all_preserves_sandbox_mounts():
 
     from agency.observability.agwebui import _all_agteam_subclasses, _dispatch_command
     from agency.agent import agent
-    from agency.configs.agconfig import agconfig
+    from agency.configs.agconfig import agconfig, llmconfig
     from agency.agteam import agteam
 
-    cfg = agconfig(provider="mock", api_key="k", model="", base_url="http://old")
-    cfg.add_mount("hf_cache", "/tmp/hf-cache", "/root/.cache/huggingface")
+    cfg = agconfig(llmconfig(provider="mock", api_key="k", model="", base_url="http://old"))
+    cfg.sandbox.add_mount("hf_cache", "/tmp/hf-cache", "/root/.cache/huggingface")
 
     class _MountPreserveTeam(agteam):
         agconfig = cfg
@@ -162,19 +162,19 @@ def test_dispatch_update_config_all_preserves_sandbox_mounts():
     }
     try:
         team = _MountPreserveTeam()
-        assert "hf_cache" in (team.ag.agconfig.mounts or {})
+        assert "hf_cache" in (team.ag.agconfig.sandbox.mounts or {})
 
         _dispatch_command(
             {
                 "type": "update_config_all",
-                "config": {"base_url": "http://new"},
+                "config": {"llm": {"base_url": "http://new"}},
             }
         )
 
-        assert team.ag.agconfig.base_url == "http://new"
-        assert "hf_cache" in (team.ag.agconfig.mounts or {})
-        assert "hf_cache" in (team.agconfig.mounts or {})
-        assert "hf_cache" in (_MountPreserveTeam.agconfig.mounts or {})
+        assert team.ag.agconfig.llm.base_url == "http://new"
+        assert "hf_cache" in (team.ag.agconfig.sandbox.mounts or {})
+        assert "hf_cache" in (team.agconfig.sandbox.mounts or {})
+        assert "hf_cache" in (_MountPreserveTeam.agconfig.sandbox.mounts or {})
     finally:
         for team_cls, saved in saved_class_configs.items():
             team_cls.agconfig = saved
@@ -186,18 +186,18 @@ def test_dispatch_update_config_all_mutates_default_agconfig():
     clones fresh data, not just push into agents that already exist."""
     from agency.observability.agwebui import _dispatch_command
     from agency.agent import agent
-    from agency.configs.agconfig import agconfig
+    from agency.configs.agconfig import agconfig, llmconfig
 
     saved = agent.default_agconfig
     try:
-        agent.default_agconfig = agconfig(provider="mock", api_key="k", model="")
+        agent.default_agconfig = agconfig(llmconfig(provider="mock", api_key="k", model=""))
         _dispatch_command(
             {
                 "type": "update_config_all",
-                "config": {"react_max_steps": 123},
+                "config": {"skill": {"react_max_steps": 123}},
             }
         )
-        assert agent.default_agconfig.react_max_steps == 123
+        assert agent.default_agconfig.skill.react_max_steps == 123
     finally:
         agent.default_agconfig = saved
 
@@ -209,10 +209,10 @@ def test_dispatch_update_config_all_mutates_team_class_attr_for_future_construct
     not just teams/agents that already exist."""
     from agency.observability.agwebui import _dispatch_command
     from agency.agteam import agteam
-    from agency.configs.agconfig import agconfig as agconfig_cls
+    from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
     class _CfgAllTeamA(agteam):
-        agconfig = agconfig_cls(provider="mock", api_key="k", model="")
+        agconfig = agconfig_cls(llmconfig(provider="mock", api_key="k", model=""))
 
         def setup(self):
             pass
@@ -223,14 +223,14 @@ def test_dispatch_update_config_all_mutates_team_class_attr_for_future_construct
     _dispatch_command(
         {
             "type": "update_config_all",
-            "config": {"react_max_steps": 77},
+            "config": {"skill": {"react_max_steps": 77}},
         }
     )
-    assert _CfgAllTeamA.agconfig.react_max_steps == 77
+    assert _CfgAllTeamA.agconfig.skill.react_max_steps == 77
 
     # Constructed AFTER the update -- clones the now-updated class attribute.
     team = _CfgAllTeamA()
-    assert team.agconfig.react_max_steps == 77
+    assert team.agconfig.skill.react_max_steps == 77
 
 
 def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents():
@@ -239,11 +239,11 @@ def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents
     to every agent the team already tracks."""
     from agency.observability.agwebui import _dispatch_command
     from agency.agteam import agteam
-    from agency.configs.agconfig import agconfig as agconfig_cls
+    from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
     from agency.agent import agent as agent_cls
 
     class _CfgAllTeamB(agteam):
-        agconfig = agconfig_cls(provider="mock", api_key="k", model="")
+        agconfig = agconfig_cls(llmconfig(provider="mock", api_key="k", model=""))
 
         def setup(self):
             self.ag = agent_cls()
@@ -256,12 +256,12 @@ def test_dispatch_update_config_all_updates_live_team_and_cascades_to_its_agents
     _dispatch_command(
         {
             "type": "update_config_all",
-            "config": {"react_max_steps": 55},
+            "config": {"skill": {"react_max_steps": 55}},
         }
     )
 
-    assert team.agconfig.react_max_steps == 55
-    assert team.ag.agconfig.react_max_steps == 55
+    assert team.agconfig.skill.react_max_steps == 55
+    assert team.ag.agconfig.skill.react_max_steps == 55
 
 
 def test_dispatch_update_config_all_reaches_grandchild_team_class():
@@ -270,10 +270,10 @@ def test_dispatch_update_config_all_reaches_grandchild_team_class():
     __subclasses__() alone only returns direct subclasses."""
     from agency.observability.agwebui import _dispatch_command
     from agency.agteam import agteam
-    from agency.configs.agconfig import agconfig as agconfig_cls
+    from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
     class _CfgAllTeamMid(agteam):
-        agconfig = agconfig_cls(provider="mock", api_key="k", model="")
+        agconfig = agconfig_cls(llmconfig(provider="mock", api_key="k", model=""))
 
         def setup(self):
             pass
@@ -282,7 +282,7 @@ def test_dispatch_update_config_all_reaches_grandchild_team_class():
             pass
 
     class _CfgAllTeamGrandchild(_CfgAllTeamMid):
-        agconfig = agconfig_cls(provider="mock", api_key="k", model="")
+        agconfig = agconfig_cls(llmconfig(provider="mock", api_key="k", model=""))
 
         def setup(self):
             pass
@@ -293,12 +293,12 @@ def test_dispatch_update_config_all_reaches_grandchild_team_class():
     _dispatch_command(
         {
             "type": "update_config_all",
-            "config": {"react_max_steps": 88},
+            "config": {"skill": {"react_max_steps": 88}},
         }
     )
 
-    assert _CfgAllTeamMid.agconfig.react_max_steps == 88
-    assert _CfgAllTeamGrandchild.agconfig.react_max_steps == 88
+    assert _CfgAllTeamMid.agconfig.skill.react_max_steps == 88
+    assert _CfgAllTeamGrandchild.agconfig.skill.react_max_steps == 88
 
 
 def test_dispatch_update_config_all_skips_team_class_with_no_agconfig():
@@ -318,7 +318,7 @@ def test_dispatch_update_config_all_skips_team_class_with_no_agconfig():
     _dispatch_command(
         {
             "type": "update_config_all",
-            "config": {"react_max_steps": 99},
+            "config": {"skill": {"react_max_steps": 99}},
         }
     )  # must not raise
 

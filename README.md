@@ -37,17 +37,17 @@ The sandbox image installs `torch torchvision transformers datasets accelerate n
 Supply LLM backends to agents by building an `agconfig` object and passing it to the agents:
 
 ```python
-cfg = agconfig(provider="vllm", model="...", api_key="...")
+cfg = agconfig(llmconfig(provider="vllm", model="...", api_key="..."))
 ag = agent(agconfig=cfg)
 ```
 
-`agconfig` is one flat, typed object holding every tunable in the system — LLM fields, sandbox fields, and everything else — as plain member variables. Set `provider` to pick your backend (`"vllm"`, `"openai"`, `"anthropic"`, `"bedrock"`, ...); only the fields relevant to that provider are read, and an unknown field name raises immediately (`TypeError` on construction, `AttributeError` on later assignment) so typos are caught right away. Need config for more than one thing, such as an LLM backend and a sandbox mount? They're all fields on the same object — pass them all to one `agconfig(...)` call (mounts are added via `cfg.add_mount(...)`).
+`agconfig` is one typed object holding every tunable in the system, organized one level deep into small per-domain namespaces — `cfg.llm` (LLM fields), `cfg.sandbox` (sandbox fields), `cfg.orchestrator`, `cfg.agent`, and so on. Construction is positional and dispatches by type — `agconfig(llmconfig(...), sandboxconfig(...))` — so you never spell out a keyword name for the namespace; any namespace you don't pass gets a fresh, all-default instance. Set `provider` on `llmconfig` to pick your backend (`"vllm"`, `"openai"`, `"anthropic"`, `"bedrock"`, ...); only the fields relevant to that provider are read, and an unknown field name raises immediately (`TypeError` on construction, `AttributeError` on later assignment) so typos are caught right away. Need config for more than one thing, such as an LLM backend and a sandbox mount? Pass both namespace instances to the same `agconfig(...)` call (mounts are added via `cfg.sandbox.add_mount(...)`).
 
 **OpenAI-compatible serving endpoint (vLLM, local, etc.)**
 
 ```python
 from agency import agent, agskill, agdata
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 
 continuation = agskill(
     name="continuation",
@@ -57,10 +57,12 @@ continuation = agskill(
 )
 
 cfg = agconfig(
-    provider="vllm",
-    base_url="http://localhost:8000/v1", # Your serving API URL
-    model="YOUR_SERVED_MODEL",
-    api_key="YOUR_API_KEY" # Leave blank ("") if unused
+    llmconfig(
+        provider="vllm",
+        base_url="http://localhost:8000/v1", # Your serving API URL
+        model="YOUR_SERVED_MODEL",
+        api_key="YOUR_API_KEY" # Leave blank ("") if unused
+    )
 )
 
 ag = agent(agconfig=cfg)
@@ -213,13 +215,15 @@ The previous `prepare()`, `start()`, `ag.send()`, `inv.send_message()`, and `inv
 **OpenAI**
 
 ```python
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 
 cfg = agconfig(
-    provider="openai",
-    base_url="https://api.openai.com/v1",
-    model="YOUR_OPENAI_MODEL",
-    api_key="YOUR_API_KEY",
+    llmconfig(
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        model="YOUR_OPENAI_MODEL",
+        api_key="YOUR_API_KEY",
+    )
 )
 
 ag = agent(agconfig=cfg)
@@ -230,12 +234,14 @@ This is the same underlying backend used for vLLM/local endpoints above — omit
 **Anthropic**
 
 ```python
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 
 cfg = agconfig(
-    provider="anthropic",
-    model="claude-sonnet-5",
-    api_key=os.environ["ANTHROPIC_API_KEY"],
+    llmconfig(
+        provider="anthropic",
+        model="claude-sonnet-5",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+    )
 )
 
 ag = agent(agconfig=cfg)
@@ -250,18 +256,20 @@ For Claude via AWS's direct Anthropic-on-AWS API, use `provider="anthropicAWS"`.
 Credentials are picked up automatically from the environment (IAM role, `~/.aws/credentials`, SSO, etc.). `aws_bedrock_token_generator` (included in dependencies) exchanges them for a bearer token on each request.
 
 ```python
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, llmconfig
 
 cfg = agconfig(
-    provider="bedrock",
-    region="us-east-1",
-    model="nvidia.nemotron-super-3-120b",
+    llmconfig(
+        provider="bedrock",
+        region="us-east-1",
+        model="nvidia.nemotron-super-3-120b",
+    )
 )
 
 ag = agent(agconfig=cfg)
 ```
 
-Pass `api_key="bedrock-api-key-..."` to `agconfig(provider="bedrock", ...)` to use a static Bedrock API key instead of IAM credentials. For Claude models on Bedrock, stick to the fields listed under **Anthropic** above — other generation params aren't supported there.
+Pass `api_key="bedrock-api-key-..."` to `llmconfig(provider="bedrock", ...)` to use a static Bedrock API key instead of IAM credentials. For Claude models on Bedrock, stick to the fields listed under **Anthropic** above — other generation params aren't supported there.
 
 ## Usage Examples
 
@@ -282,7 +290,7 @@ See [`examples/README.md`](examples/README.md) for more details on each example.
 
 **`agskill`** — a named skill with its own system prompt, optional input/output schemas, and an optional tool list. `agskill.run(agent, input)` uses the same orchestrator path and returns the same `Invocation` shape as `agent.run()`. Harness execution begins only after scheduler admission.
 
-**`GlobalAgentOrchestrator`** -- the process-wide scheduler, dependency resolver, context-only message executor, ready queue, and reusable execution-worker owner. Submission, control changes, dependency completion, engine completion, and shutdown push events to one condition-backed scheduler thread; there is no completion polling. Its asynchronous global collector stores scheduler, team, and resource events plus a lightweight agent-database catalog in `agency.sqlite3`; detailed agent history remains in each agent's own database. Configure active engine capacity with `agconfig(max_concurrent_engines=...)`, and inspect, flush, or stop it through `get_orchestrator().snapshot()`, `.flush()`, and `.shutdown()`.
+**`GlobalAgentOrchestrator`** -- the process-wide scheduler, dependency resolver, context-only message executor, ready queue, and reusable execution-worker owner. Submission, control changes, dependency completion, engine completion, and shutdown push events to one condition-backed scheduler thread; there is no completion polling. Its asynchronous global collector stores scheduler, team, and resource events plus a lightweight agent-database catalog in `agency.sqlite3`; detailed agent history remains in each agent's own database. Configure active engine capacity with `agconfig(orchestratorconfig(max_concurrent_engines=...))`, and inspect, flush, or stop it through `get_orchestrator().snapshot()`, `.flush()`, and `.shutdown()`.
 
 **`agtool`** — a named callable an LLM can invoke via function calling. It exposes an OpenAI-compatible tool schema and calls its function directly in the execution-owning process and thread, preserving closures over live host state. The optional timeout argument is retained for call-site compatibility but is not enforced by `agtool` itself. Sandbox commit or rollback belongs to the enclosing invocation transaction.
 

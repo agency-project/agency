@@ -4,15 +4,15 @@ import pytest
 from agency.agteam import agteam
 from agency.agskill import agskill
 from agency.agdata import agdata
-from agency.configs.agconfig import agconfig as agconfig_cls
+from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
 
 def _llm_agconfig(d: dict) -> agconfig_cls:
-    return agconfig_cls(**d)
+    return agconfig_cls(llmconfig(**d))
 
 
 def _llm_view(cfg: agconfig_cls, ref: dict) -> dict:
-    return {k: getattr(cfg, k) for k in ref}
+    return {k: getattr(cfg.llm, k) for k in ref}
 
 
 _ECHO_LLM = {"api_key": "k", "model": "m"}
@@ -484,21 +484,21 @@ def test_agent_created_outside_team_requires_explicit_llm_config():
 def test_team_change_config_replaces_agconfig():
     team = _EchoTeam()
     team.change_config(_llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2}))
-    assert team.agconfig.temperature == 0.2
+    assert team.agconfig.llm.temperature == 0.2
 
 
 def test_team_change_config_clones_given_agconfig():
     team = _EchoTeam()
     new_cfg = _llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2})
     team.change_config(new_cfg)
-    new_cfg.temperature = 0.9
-    assert team.agconfig.temperature == 0.2
+    new_cfg.llm.temperature = 0.9
+    assert team.agconfig.llm.temperature == 0.2
 
 
 def test_team_change_config_propagates_to_spawned_agents():
     team = _EchoTeam()
     team.change_config(_llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2}))
-    assert team.agent.agconfig.temperature == 0.2
+    assert team.agent.agconfig.llm.temperature == 0.2
 
 
 def test_team_get_config_copy_returns_clone_not_same_object():
@@ -509,11 +509,11 @@ def test_team_get_config_copy_returns_clone_not_same_object():
 
 def test_team_get_config_copy_reflects_current_values():
     team = _EchoTeam()
-    assert team.get_config_copy().model == "m"
+    assert team.get_config_copy().llm.model == "m"
 
 
 def test_mutating_team_get_config_copy_does_not_affect_team():
     team = _EchoTeam()
     copy = team.get_config_copy()
-    copy.temperature = 0.9
-    assert team.agconfig.temperature is None
+    copy.llm.temperature = 0.9
+    assert team.agconfig.llm.temperature is None

@@ -16,12 +16,13 @@ from .utils.agutil import _DEFAULT_LOG_DIR
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 # Whitelisted LLM fields that round-trip through checkpoints/creation-event
-# logging -- NOT the whole flat agconfig (sandbox/orchestrator/etc. fields
-# were never meant to be part of a checkpoint). Built on agconfig.safe_snapshot()
-# so this is the same one canonical redaction path the webui's config editor
-# uses, rather than a second, independently-hand-maintained secret filter --
-# that's exactly how AWS credentials used to leak into checkpoints while only
-# api_key was stripped by hand here.
+# logging -- NOT the whole agconfig (sandbox/orchestrator/etc. namespaces
+# were never meant to be part of a checkpoint). Built on
+# agconfig.llm.safe_snapshot() so this is the same one canonical redaction
+# path the webui's config editor uses, rather than a second,
+# independently-hand-maintained secret filter -- that's exactly how AWS
+# credentials used to leak into checkpoints while only api_key was stripped
+# by hand here.
 _LLM_CHECKPOINT_FIELDS = (
     "provider", "model", "base_url", "region", "context_limit",
     "temperature", "reasoning_effort", "max_completion_tokens", "max_tokens",
@@ -33,9 +34,9 @@ _LLM_CHECKPOINT_FIELDS = (
 
 def _llm_config_snapshot(agconfig: "agconfig_cls") -> dict:
     """Backend config fields for logging/checkpointing, with secrets
-    redacted via agconfig.safe_snapshot() -- a fresh, cheap (no network I/O)
-    read each call, not a persisted instance."""
-    safe = agconfig.safe_snapshot()
+    redacted via agconfig.llm.safe_snapshot() -- a fresh, cheap (no network
+    I/O) read each call, not a persisted instance."""
+    safe = agconfig.llm.safe_snapshot()
     return {k: safe[k] for k in _LLM_CHECKPOINT_FIELDS if safe.get(k) is not None}
 
 
@@ -58,11 +59,11 @@ if TYPE_CHECKING:
 
 def _resolve_agent_default(agconfig: "agconfig_cls | None", field: str, classvar_default):
     """Resolve one of agent's own knobs (log_dir, output_dir): a set
-    agconfig.<field> wins; otherwise the plain ClassVar default (``agent.log_dir
-    = Path(...)``, set once before creating agents)."""
+    agconfig.agent.<field> wins; otherwise the plain ClassVar default
+    (``agent.log_dir = Path(...)``, set once before creating agents)."""
     if agconfig is None:
         return classvar_default
-    value = getattr(agconfig, field)
+    value = getattr(agconfig.agent, field)
     return value if value is not None else classvar_default
 
 
@@ -121,12 +122,12 @@ class agent:
         harness: "str | None",
     ) -> None:
         def _has_llm_config(cfg: "agconfig_cls | None") -> bool:
-            # A flat agconfig always has every field present (with its
-            # default), so "has the caller configured an LLM backend at
-            # all" can no longer mean "was any agllm_backend field ever
-            # .set()" -- model/provider being non-default is the pragmatic
-            # stand-in: either one identifies a real backend selection.
-            return cfg is not None and bool(cfg.model or cfg.provider)
+            # cfg.llm always has every field present (with its default), so
+            # "has the caller configured an LLM backend at all" can no
+            # longer mean "was any agllm_backend field ever .set()" --
+            # model/provider being non-default is the pragmatic stand-in:
+            # either one identifies a real backend selection.
+            return cfg is not None and bool(cfg.llm.model or cfg.llm.provider)
 
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
 
@@ -143,7 +144,7 @@ class agent:
             else:
                 raise TypeError(
                     "agent() requires an agconfig with LLM fields set "
-                    "(e.g. agconfig(model=..., provider=...)) when called "
+                    "(e.g. agconfig(llmconfig(model=..., provider=...))) when called "
                     "outside an agteam context"
                 )
 
@@ -159,7 +160,7 @@ class agent:
             None  # [REFACTOR]  Why do we need to keep reference of parent agent id?
         )
 
-        self.harness: str = harness if harness is not None else self.agconfig.harness
+        self.harness: str = harness if harness is not None else self.agconfig.agent.harness
         self.context: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
@@ -205,8 +206,8 @@ class agent:
         _log_dir_val = _resolve_agent_default(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
 
-        if not (reuse_data_logger_configs and self.agconfig.data_logger_db_path):
-            self.agconfig.data_logger_db_path = str(log_dir / f"{self.agname}_data.sqlite3")
+        if not (reuse_data_logger_configs and self.agconfig.data_logger.db_path):
+            self.agconfig.data_logger.db_path = str(log_dir / f"{self.agname}_data.sqlite3")
         self.data_logger = agDataLogger(
             self.agconfig, default_name=str(self.agname), default_object="agent"
         )
@@ -505,7 +506,7 @@ class agent:
         agent_output_dir = self.output_path
         if agent_output_dir is not None:
             sandbox_config = sandbox_config.clone()
-            sandbox_config.add_mount("agent_output", agent_output_dir, "/agent_output")
+            sandbox_config.sandbox.add_mount("agent_output", agent_output_dir, "/agent_output")
         self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
         return self.sandbox
 
@@ -588,7 +589,7 @@ class agent:
         sb_cfg = ag.agconfig
         if _out is not None:
             sb_cfg = sb_cfg.clone()
-            sb_cfg.add_mount("agent_output", _out, "/agent_output")
+            sb_cfg.sandbox.add_mount("agent_output", _out, "/agent_output")
         ag.sandbox = (
             src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
         )
@@ -722,7 +723,7 @@ class agent:
             backend_cls = type(self.sandbox._backend)
             backend_cls.tag_image(self.sandbox._checkpoint_image, image_tag)
             try:
-                _save_timeout = self.agconfig.checkpoint_save_timeout_s
+                _save_timeout = self.agconfig.agent.checkpoint_save_timeout_s
                 # Scrub the owning process's PID before embedding -- it's
                 # meaningless (and, since a .ckpt file can be restored by
                 # an unrelated process on a different host entirely,
@@ -779,7 +780,7 @@ class agent:
         checkpoint: str | None = None
         image_kind = state.get("sandbox_image_kind", "container")
         if image_bytes is not None:
-            _load_timeout = (agconfig or agconfig_cls()).checkpoint_load_timeout_s
+            _load_timeout = (agconfig or agconfig_cls()).agent.checkpoint_load_timeout_s
             backend_cls = agSandbox.backend_for_image_kind(image_kind)
             backend_cls.import_image(image_bytes, _load_timeout)
             original_tag = f"agency/ckpt-{state['agname']}"
@@ -798,16 +799,16 @@ class agent:
         ag._parent_agent_id = state.get("parent_agent_id")
         _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
         ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agconfig_cls()
-        # A flat agconfig always has every field present, so "was this field
+        # cfg.llm always has every field present, so "was this field
         # explicitly set by the caller" can no longer mean "present in
         # .data" -- a field still at its class default is treated as
         # unset, so the checkpoint's own value fills it in; anything the
-        # caller already changed (e.g. cfg.api_key = ..., restoring the
+        # caller already changed (e.g. cfg.llm.api_key = ..., restoring the
         # secret save() stripped) wins over the checkpoint.
         _defaults = agconfig_cls()
         for k, v in state.get("llm_config", {}).items():
-            if getattr(ag.agconfig, k) == getattr(_defaults, k):
-                setattr(ag.agconfig, k, v)
+            if getattr(ag.agconfig.llm, k) == getattr(_defaults.llm, k):
+                setattr(ag.agconfig.llm, k, v)
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
         ag.engine = None
@@ -822,7 +823,7 @@ class agent:
         sb_cfg = ag.agconfig
         if _out is not None:
             sb_cfg = sb_cfg.clone()
-            sb_cfg.add_mount("agent_output", _out, "/agent_output")
+            sb_cfg.sandbox.add_mount("agent_output", _out, "/agent_output")
         if checkpoint and image_kind == "chroot":
             # Force the matching backend -- auto-detection (podman/docker
             # preferred when usable) would otherwise reconstruct this
@@ -831,7 +832,7 @@ class agent:
             # picking podman vs. docker for them was already safe before
             # chroot existed.
             sb_cfg = sb_cfg.clone()
-            sb_cfg.backend = "chroot"
+            sb_cfg.sandbox.backend = "chroot"
         ag.sandbox = (
             agSandbox(ag.agname, checkpoint_image=checkpoint, agconfig=sb_cfg)
             if checkpoint

@@ -38,9 +38,9 @@ def _reset_runtime_cache():
 
 class TestBackendSelection:
     def test_unknown_backend_raises_value_error(self):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
 
-        cfg = agconfig(backend="not-a-real-backend")
+        cfg = agconfig(sandboxconfig(backend="not-a-real-backend"))
         with pytest.raises(ValueError, match="Unknown agsandbox_backend.backend"):
             agsandbox_backend.for_config(
                 cfg,
@@ -52,9 +52,9 @@ class TestBackendSelection:
             )
 
     def test_explicit_docker_raises_when_unusable(self):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
 
-        cfg = agconfig(backend="docker")
+        cfg = agconfig(sandboxconfig(backend="docker"))
         with patch("agency.sandbox.base.shutil.which", return_value=None):
             with pytest.raises(RuntimeError, match="docker"):
                 agsandbox_backend.for_config(
@@ -67,9 +67,9 @@ class TestBackendSelection:
                 )
 
     def test_explicit_chroot_raises_when_unavailable(self):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
 
-        cfg = agconfig(backend="chroot")
+        cfg = agconfig(sandboxconfig(backend="chroot"))
         with patch("agency.sandbox.chroot.chroot_available", return_value=False):
             with pytest.raises(RuntimeError, match="chroot"):
                 agsandbox_backend.for_config(
@@ -82,10 +82,10 @@ class TestBackendSelection:
                 )
 
     def test_explicit_chroot_builds_chroot_backend(self):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
         from agency.sandbox.chroot import _ChrootBackend
 
-        cfg = agconfig(backend="chroot")
+        cfg = agconfig(sandboxconfig(backend="chroot"))
         with patch("agency.sandbox.chroot.chroot_available", return_value=True):
             backend = agsandbox_backend.for_config(
                 cfg,
@@ -99,10 +99,10 @@ class TestBackendSelection:
         backend.destroy()
 
     def test_explicit_docker_builds_docker_backend(self):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
         from agency.sandbox.docker import _DockerBackend
 
-        cfg = agconfig(backend="docker")
+        cfg = agconfig(sandboxconfig(backend="docker"))
         with patch("agency.sandbox.container._runtime_works", return_value=True):
             # shutil.which is a single shared module object (both base.py and
             # container.py do plain `import shutil`) -- a return_value= mock
@@ -127,10 +127,10 @@ class TestBackendSelection:
         assert isinstance(backend, _DockerBackend)
 
     def test_explicit_podman_builds_podman_backend(self):
-        from agency.configs.agconfig import agconfig
+        from agency.configs.agconfig import agconfig, sandboxconfig
         from agency.sandbox.podman import _PodmanBackend
 
-        cfg = agconfig(backend="podman")
+        cfg = agconfig(sandboxconfig(backend="podman"))
         with patch("agency.sandbox.container._runtime_works", return_value=True):
             # See test_explicit_docker_builds_docker_backend's comment --
             # argument-aware for the same reason (shutil.which is one

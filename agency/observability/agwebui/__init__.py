@@ -37,15 +37,16 @@ _active: "agwebui | None" = None
 
 
 def _merge_config_fields(agconfig: Any, config: dict) -> None:
-    """Mutate *agconfig*'s own fields in place, field by field, rather than
-    replacing it with a new object. agconfig.clone() (called by every
-    agent()/agteam() construction) just snapshots whatever is currently set
-    -- so anything that hasn't cloned this exact object yet will pick up the
-    change on its next construction, with no cooperation needed from
-    whatever code holds another reference to it (e.g. a user script's own
-    module-level config variable)."""
-    for name, value in config.items():
-        setattr(agconfig, name, value)
+    """Mutate *agconfig*'s own namespaces in place, field by field, rather
+    than replacing it with a new object. *config* is shaped like
+    ``agconfig.safe_snapshot()``'s output: ``{"llm": {...}, "sandbox":
+    {...}}``. agconfig.clone() (called by every agent()/agteam()
+    construction) just snapshots whatever is currently set -- so anything
+    that hasn't cloned this exact object yet will pick up the change on its
+    next construction, with no cooperation needed from whatever code holds
+    another reference to it (e.g. a user script's own module-level config
+    variable)."""
+    agconfig.update(**config)
 
 
 def _apply_config_update(target: Any, config: dict, agconfig_cls: Any) -> None:
@@ -59,7 +60,9 @@ def _apply_config_update(target: Any, config: dict, agconfig_cls: Any) -> None:
         _merge_config_fields(merged, config)
         target.change_config(merged)
     else:
-        target.change_config(agconfig_cls(**config))
+        fresh = agconfig_cls()
+        _merge_config_fields(fresh, config)
+        target.change_config(fresh)
 
 
 def _all_agteam_subclasses(cls):

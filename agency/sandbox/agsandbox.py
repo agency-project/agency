@@ -39,7 +39,7 @@ class agSandbox:
     Owns nothing about *how* isolation is achieved -- that's entirely the
     backend's job (see agsandbox_backend.py: a container today, potentially
     a chroot jail or another mechanism in the future, selected via
-    ``agconfig.backend``). This class resolves the image/mounts vocabulary
+    ``agconfig.sandbox.backend``). This class resolves the image/mounts vocabulary
     that's meaningful regardless of backend, builds the backend via
     ``agsandbox_backend.for_config()``, and forwards every sandboxing
     operation to it.
@@ -86,14 +86,14 @@ class agSandbox:
         self._name = f"sandbox-{_RUN_ID}-{self._agname}"
 
         # Resolve image/mounts once, here, rather than lazily -- a running
-        # backend is physically fixed once created; agconfig.base_image/
+        # backend is physically fixed once created; agconfig.sandbox.base_image/
         # mounts aren't re-read after this. Mounts are handed to the backend
         # raw (host, container, mode) -- formatting them into a CLI flag (`-v
         # host:container:mode` for docker/podman, a bind mount for chroot) is
         # each backend's own business, not the facade's.
-        base_image = self.agconfig.base_image
+        base_image = self.agconfig.sandbox.base_image
         mounts: dict[str, tuple[str, str, str]] = {}
-        for mount_name, (host, container, mode) in self.agconfig.mounts.items():
+        for mount_name, (host, container, mode) in self.agconfig.sandbox.mounts.items():
             host_path = Path(host)
             host_path.mkdir(parents=True, exist_ok=True)
             mounts[mount_name] = (str(host_path.resolve()), container, mode)

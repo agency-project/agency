@@ -171,9 +171,9 @@ def test_db_provided_term_message_wins_over_synthesis(server):
 
 def _make_data_logger(db_path: Path):
     from agency.observability.agdatalogger import agDataLogger
-    from agency.configs.agconfig import agconfig
+    from agency.configs.agconfig import agconfig, dataloggerconfig
 
-    logger = agDataLogger(agconfig(data_logger_db_path=str(db_path)))
+    logger = agDataLogger(agconfig(dataloggerconfig(db_path=str(db_path))))
     logger.start()
     return logger
 

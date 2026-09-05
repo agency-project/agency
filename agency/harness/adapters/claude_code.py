@@ -270,7 +270,7 @@ class _ClaudeCodeBackend(agharness_backend):
         from ...observability.profiler import agprof
         from ..ptrace.supervisor import agProxyPtrace
 
-        binary = self.agconfig.binary_path or self._DEFAULT_BINARY
+        binary = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
         # A docker/podman-backed sandbox runs the harness INSIDE the
         # container (its own PID namespace, so its filesystem writes land
         # in the same workspace the rest of that agent's tools see), a

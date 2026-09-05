@@ -12,6 +12,7 @@ from agency.configs.agconfig import (
     MIN_CPUS,
     MIN_MEMORY_MB,
     agconfig as agconfig_cls,
+    resourcesconfig,
 )
 from agency.orchestrator.agresources import agResourcePool
 from agency.utils.agutil import (
@@ -349,8 +350,8 @@ def test_pool_default_idle_values():
     idle container to bound by default. container.py/update_limits() both
     treat None as "omit --memory", Docker's own native unlimited behavior."""
     pool = agResourcePool(gpus=[], total_cpus=4, total_memory_mb=8192)
-    assert pool.agconfig.idle_cpus == agconfig_cls().idle_cpus
-    assert pool.agconfig.idle_memory is None
+    assert pool.agconfig.resources.idle_cpus == agconfig_cls().resources.idle_cpus
+    assert pool.agconfig.resources.idle_memory is None
 
 
 def test_disconnected_fields_instance_idle_memory_defaults_to_none():
@@ -361,12 +362,12 @@ def test_disconnected_fields_instance_idle_memory_defaults_to_none():
     (not anything set inside agResourcePool.__init__) is what actually
     reaches real container creation, and it must be None so --memory is
     omitted there too, not a fixed constant regardless of host size."""
-    assert agconfig_cls().idle_memory is None
+    assert agconfig_cls().resources.idle_memory is None
 
 
 def test_pool_explicit_idle_memory_overrides_default():
     pool = agResourcePool(gpus=[], total_memory_mb=8192, idle_memory="1g")
-    assert pool.agconfig.idle_memory == "1g"
+    assert pool.agconfig.resources.idle_memory == "1g"
 
 
 def test_pool_initial_acquired_counts_are_zero():
@@ -723,16 +724,16 @@ def test_notify_thread_safe():
 
 def test_pool_change_config_replaces_agconfig():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
-    pool.change_config(agconfig_cls(idle_cpus=2.0))
-    assert pool.agconfig.idle_cpus == 2.0
+    pool.change_config(agconfig_cls(resourcesconfig(idle_cpus=2.0)))
+    assert pool.agconfig.resources.idle_cpus == 2.0
 
 
 def test_pool_change_config_clones_given_agconfig():
     pool = agResourcePool(gpus=[], total_cpus=8, total_memory_mb=8192)
-    new_cfg = agconfig_cls(idle_cpus=2.0)
+    new_cfg = agconfig_cls(resourcesconfig(idle_cpus=2.0))
     pool.change_config(new_cfg)
-    new_cfg.idle_cpus = 9.0
-    assert pool.agconfig.idle_cpus == 2.0
+    new_cfg.resources.idle_cpus = 9.0
+    assert pool.agconfig.resources.idle_cpus == 2.0
 
 
 def test_pool_get_config_copy_returns_clone_not_same_object():
@@ -746,9 +747,9 @@ def test_pool_get_config_copy_reflects_current_values():
         gpus=[],
         total_cpus=8,
         total_memory_mb=8192,
-        agconfig=agconfig_cls(idle_cpus=2.0),
+        agconfig=agconfig_cls(resourcesconfig(idle_cpus=2.0)),
     )
-    assert pool.get_config_copy().idle_cpus == 2.0
+    assert pool.get_config_copy().resources.idle_cpus == 2.0
 
 
 def test_mutating_pool_get_config_copy_does_not_affect_pool():
@@ -756,11 +757,11 @@ def test_mutating_pool_get_config_copy_does_not_affect_pool():
         gpus=[],
         total_cpus=8,
         total_memory_mb=8192,
-        agconfig=agconfig_cls(idle_cpus=2.0),
+        agconfig=agconfig_cls(resourcesconfig(idle_cpus=2.0)),
     )
     copy = pool.get_config_copy()
-    copy.idle_cpus = 9.0
-    assert pool.agconfig.idle_cpus == 2.0
+    copy.resources.idle_cpus = 9.0
+    assert pool.agconfig.resources.idle_cpus == 2.0
 
 
 def test_pool_change_config_none_resets_to_default_agconfig():
@@ -768,8 +769,8 @@ def test_pool_change_config_none_resets_to_default_agconfig():
         gpus=[],
         total_cpus=8,
         total_memory_mb=8192,
-        agconfig=agconfig_cls(idle_cpus=2.0),
+        agconfig=agconfig_cls(resourcesconfig(idle_cpus=2.0)),
     )
     pool.change_config(None)
     # No agconfig -> field falls back to agconfig's own default, not the old value.
-    assert pool.get_config_copy().idle_cpus == agconfig_cls().idle_cpus
+    assert pool.get_config_copy().resources.idle_cpus == agconfig_cls().resources.idle_cpus

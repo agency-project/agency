@@ -38,13 +38,13 @@ class _OpenAICompatibleBackend(agllm):
 
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
         return openai.OpenAI(
-            api_key=self.agconfig.api_key or "EMPTY",
-            base_url=self.agconfig.base_url,
+            api_key=self.agconfig.llm.api_key or "EMPTY",
+            base_url=self.agconfig.llm.base_url,
             timeout=timeout,
         )
 
     def tokenize_url(self) -> "str | None":
-        base_url: str = self.agconfig.base_url or ""
+        base_url: str = self.agconfig.llm.base_url or ""
         root = base_url.rstrip("/")
         if root.endswith("/v1"):
             root = root[:-3]

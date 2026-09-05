@@ -3,7 +3,7 @@
 An `agSandbox` instance builds exactly one `agsandbox_backend` from its config
 (via `agsandbox_backend.for_config()`) and delegates every sandboxing
 operation (exec, file I/O, lifecycle, checkpointing) to it. Backend selection
-logic (podman vs. docker vs. chroot, see `agconfig.backend`)
+logic (podman vs. docker vs. chroot, see `agconfig.sandbox.backend`)
 lives here instead of being hardcoded into `agSandbox` itself.
 
 Every backend exposes the same surface `agSandbox` uses: `exec()`,
@@ -29,7 +29,7 @@ import subprocess
 import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as _FutureTimeoutError
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, ClassVar
 
 from ..configs.agconfig import agconfig as agconfig_cls
 
@@ -145,6 +145,25 @@ class agsandbox_backend(AgSandboxBackendFields):
     # than assuming the container backend unconditionally.
     IMAGE_KIND: "str" = ""
 
+    # Fields with no viable fallback for a given agconfig.sandbox.backend --
+    # checked eagerly by _validate_config() on every construction/
+    # change_config() call. Empty today: docker/podman/chroot's own timeout
+    # and retry fields all ship sensible defaults, so nothing about them is
+    # strictly required from agconfig alone (unlike agllm's per-provider
+    # requirements). Kept as a real, populated mechanism -- not a stub --
+    # for the day a backend-specific field with no safe default is added.
+    _REQUIRED_FIELDS_BY_BACKEND: "ClassVar[dict[str, tuple[str, ...]]]" = {}
+
+    def _validate_config(self, agconfig: "agconfig_cls") -> None:
+        backend = agconfig.sandbox.backend
+        required = self._REQUIRED_FIELDS_BY_BACKEND.get(backend, ())
+        missing = [name for name in required if not getattr(agconfig.sandbox, name)]
+        if missing:
+            raise ValueError(
+                f"agconfig.sandbox with backend={backend!r} is missing required "
+                f"field(s): {', '.join(missing)}"
+            )
+
     def _own_host_pids(self) -> "set[int]":
         """Return the host PIDs of every process this sandbox currently has
         running. Overridden per-backend; default is empty (no sandbox
@@ -164,7 +183,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         from .chroot import chroot_available
         from .container import _runtime_works
 
-        requested = (agconfig.backend if agconfig else None) or "auto"
+        requested = (agconfig.sandbox.backend if agconfig else None) or "auto"
 
         if requested == "auto":
             runtime = _auto_detect_runtime()
@@ -405,12 +424,14 @@ class agsandbox_backend(AgSandboxBackendFields):
         import base64
 
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=self._agconfig.file_io_timeout_s, shell="sh"
+            f"base64 {shlex.quote(path)}",
+            timeout=self._agconfig.sandbox.file_io_timeout_s,
+            shell="sh",
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
                 f"test -d {shlex.quote(path)}",
-                timeout=self._agconfig.exec_quick_timeout_s,
+                timeout=self._agconfig.sandbox.exec_quick_timeout_s,
                 shell="sh",
             )
             if dir_rc == 0:
@@ -441,12 +462,14 @@ class agsandbox_backend(AgSandboxBackendFields):
         import base64
 
         b64, rc = self._container_exec(
-            f"base64 {shlex.quote(path)}", timeout=self._agconfig.file_io_timeout_s, shell="sh"
+            f"base64 {shlex.quote(path)}",
+            timeout=self._agconfig.sandbox.file_io_timeout_s,
+            shell="sh",
         )
         if rc != 0:
             _, dir_rc = self._container_exec(
                 f"test -d {shlex.quote(path)}",
-                timeout=self._agconfig.exec_quick_timeout_s,
+                timeout=self._agconfig.sandbox.exec_quick_timeout_s,
                 shell="sh",
             )
             if dir_rc == 0:
@@ -468,7 +491,9 @@ class agsandbox_backend(AgSandboxBackendFields):
         sh_cmd = (
             f"mkdir -p $(dirname {quoted}) && printf '%s' {shlex.quote(b64)} | base64 -d > {quoted}"
         )
-        _, rc = self._container_exec(sh_cmd, timeout=self._agconfig.file_io_timeout_s, shell="sh")
+        _, rc = self._container_exec(
+            sh_cmd, timeout=self._agconfig.sandbox.file_io_timeout_s, shell="sh"
+        )
         if rc != 0:
             raise OSError(f"Failed to write binary file {path} in container")
 
@@ -478,7 +503,7 @@ class agsandbox_backend(AgSandboxBackendFields):
         _, rc = self._container_exec(
             sh_cmd,
             stdin=content.encode("utf-8"),
-            timeout=self._agconfig.file_io_timeout_s,
+            timeout=self._agconfig.sandbox.file_io_timeout_s,
             shell="sh",
         )
         if rc != 0:
@@ -587,7 +612,7 @@ class agsandbox_backend(AgSandboxBackendFields):
             '  echo "$__p $__ppid $__st $__nm"\n'
             "done"
         )
-        output, _ = self._read_proc_table(script, timeout=self._agconfig.inspect_timeout_s)
+        output, _ = self._read_proc_table(script, timeout=self._agconfig.sandbox.inspect_timeout_s)
 
         proc_info: dict[int, tuple[int, str, str]] = {}  # pid → (ppid, state, name)
         for line in output.splitlines():

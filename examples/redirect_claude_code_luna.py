@@ -24,7 +24,7 @@ from contextlib import contextmanager
 
 from agency import Agent, agdata, agrawstring, agskill, agtool
 from agency._agent_control import InvocationHandle
-from agency.configs.agconfig import agconfig as agconfig_cls
+from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 from agency.llm.openai import _OpenAICompatibleBackend
 
 
@@ -99,11 +99,13 @@ def _config() -> agconfig_cls:
     if shutil.which("claude") is None:
         raise SystemExit("the claude CLI is required")
     return agconfig_cls(
-        provider="openai",
-        model="gpt-5.6-luna",
-        api_key=api_key,
-        reasoning_effort="none",
-        max_completion_tokens=1024,
+        llmconfig(
+            provider="openai",
+            model="gpt-5.6-luna",
+            api_key=api_key,
+            reasoning_effort="none",
+            max_completion_tokens=1024,
+        )
     )
 
 
