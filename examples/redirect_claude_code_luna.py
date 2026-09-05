@@ -24,8 +24,7 @@ from contextlib import contextmanager
 
 from agency import Agent, agdata, agrawstring, agskill, agtool
 from agency._agent_control import InvocationHandle
-from agency.agconfig import agConfig
-from agency.llm import agOpenAIBackendConfig
+from agency.configs.agconfig import agconfig as agconfig_cls
 from agency.llm.openai import _OpenAICompatibleBackend
 
 
@@ -93,19 +92,18 @@ redirect_gate = agtool(
 )
 
 
-def _config() -> agConfig:
+def _config() -> agconfig_cls:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise SystemExit("OPENAI_API_KEY is required")
     if shutil.which("claude") is None:
         raise SystemExit("the claude CLI is required")
-    return agConfig(
-        agOpenAIBackendConfig(
-            model="gpt-5.6-luna",
-            api_key=api_key,
-            reasoning_effort="none",
-            max_completion_tokens=1024,
-        )
+    return agconfig_cls(
+        provider="openai",
+        model="gpt-5.6-luna",
+        api_key=api_key,
+        reasoning_effort="none",
+        max_completion_tokens=1024,
     )
 
 
@@ -144,7 +142,7 @@ TWO_TOOL_SKILL = agskill(
 )
 
 
-def _new_agent(config: agConfig, name: str) -> Agent:
+def _new_agent(config: agconfig_cls, name: str) -> Agent:
     return Agent(agname=f"redirect-e2e-{name}", agconfig=config, harness="claude_code")
 
 
@@ -269,7 +267,7 @@ def probe_final_checkpoint(probe: FinalCheckpointProbe):
         InvocationHandle._checkpoint_final_answer = original
 
 
-def case_no_redirect(config: agConfig) -> None:
+def case_no_redirect(config: agconfig_cls) -> None:
     ticket = GATES.arm("happy-tool", released=True)
     agent = _new_agent(config, "happy")
     try:
@@ -283,7 +281,7 @@ def case_no_redirect(config: agConfig) -> None:
         _destroy(agent)
 
 
-def case_redirect_while_tool_runs(config: agConfig) -> None:
+def case_redirect_while_tool_runs(config: agconfig_cls) -> None:
     first = GATES.arm("running-A")
     second = GATES.arm("must-not-run-B", released=True)
     calls_before = len(GATES.calls())
@@ -310,7 +308,7 @@ def case_redirect_while_tool_runs(config: agConfig) -> None:
 
 
 def _case_redirect_during_generation(
-    config: agConfig,
+    config: agconfig_cls,
     *,
     skill: agskill,
     inputs: agdata,
@@ -338,7 +336,7 @@ def _case_redirect_during_generation(
         _destroy(agent)
 
 
-def case_redirect_while_model_generates(config: agConfig) -> None:
+def case_redirect_while_model_generates(config: agconfig_cls) -> None:
     stale_ticket = GATES.arm("stale-generated-tool", released=True)
     _case_redirect_during_generation(
         config,
@@ -354,7 +352,7 @@ def case_redirect_while_model_generates(config: agConfig) -> None:
     )
 
 
-def case_redirect_races_with_final(config: agConfig) -> None:
+def case_redirect_races_with_final(config: agconfig_cls) -> None:
     accepted_probe = FinalCheckpointProbe("before")
     accepted_agent = _new_agent(config, "redirect-wins-final")
     try:
@@ -393,7 +391,7 @@ def case_redirect_races_with_final(config: agConfig) -> None:
         _destroy(closing_agent)
 
 
-def case_failed_model_retains_redirect(config: agConfig) -> None:
+def case_failed_model_retains_redirect(config: agconfig_cls) -> None:
     probe = ProviderProbe(fail_first=True)
     agent = _new_agent(config, "failed-model")
     try:
@@ -412,7 +410,7 @@ def case_failed_model_retains_redirect(config: agConfig) -> None:
         _destroy(agent)
 
 
-def case_multiple_redirects_fifo(config: agConfig) -> None:
+def case_multiple_redirects_fifo(config: agconfig_cls) -> None:
     probe = ProviderProbe(pause_first_response=True)
     agent = _new_agent(config, "fifo")
     try:

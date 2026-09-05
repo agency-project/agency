@@ -47,7 +47,7 @@ def test_claude_session_title_request_is_answered_without_model_dispatch(stream)
         dispatch_stream=MagicMock(side_effect=AssertionError("title request reached the model")),
         log_warning=MagicMock(),
     )
-    _ClaudeCodeBackend(agConfig()).register(app, bridge)
+    _ClaudeCodeBackend(agconfig()).register(app, bridge)
     body = {
         "stream": stream,
         "messages": [
