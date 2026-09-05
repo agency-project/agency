@@ -115,7 +115,7 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
     )
 
     class FakeLoop:
-        def __init__(self, syscalls, syscall_hook):
+        def __init__(self, syscalls, syscall_hook, syscall_exit_hook=None):
             self.syscall_hook = syscall_hook
             self.spawn_callbacks = []
             self.exec_callbacks = []
@@ -229,7 +229,7 @@ def test_profiler_callback_failure_cannot_abort_ptrace_lifecycle(monkeypatch, fa
     monkeypatch.setattr(agprof, "start_external_span", start_external_span)
 
     class FakeLoop:
-        def __init__(self, syscalls, syscall_hook):
+        def __init__(self, syscalls, syscall_hook, syscall_exit_hook=None):
             self.spawn_callbacks = []
             self.exec_callbacks = []
             self.exit_callbacks = []
@@ -664,6 +664,61 @@ def test_launch_resolves_openat_path():
     assert any(e.path and "hostname" in e.path for e in openat_events), [
         (e.syscall, e.path) for e in openat_events
     ]
+
+
+@ptrace
+def test_admitted_syscall_reports_completion_with_return_value_and_call_id():
+    from agency.configs.agconfig import agconfig, ptraceconfig
+
+    completions = []
+
+    class CompletionPolicy:
+        def check(self, ag, event):
+            return (True, None, f"call-{event.syscall}-{event.pid}")
+
+        def check_completion(self, ag, call_id, return_value):
+            completions.append((call_id, return_value))
+
+    cfg = agconfig(ptraceconfig(syscalls=("execve", "execveat", "openat", "open")))
+    px = agProxyPtrace(cfg)
+    handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=CompletionPolicy())
+    stdout, stderr, rc = handle.wait(timeout=10)
+    assert rc == 0
+
+    openat_completions = [c for c in completions if "openat" in c[0] or "open" in c[0]]
+    assert openat_completions, completions
+    # A successful open(2)/openat(2) returns the new fd, a small non-negative int.
+    assert any(
+        return_value is not None and return_value >= 0 for _cid, return_value in openat_completions
+    )
+
+
+@ptrace
+def test_denied_syscall_reports_no_completion():
+    class DenyAndRecordPolicy:
+        def __init__(self):
+            self.completions = []
+
+        def check(self, ag, event):
+            if event.syscall in ("openat", "open") and event.path and "hostname" in event.path:
+                return (False, "denied", "call-for-denied-hostname-open")
+            return (True, None, f"call-{event.syscall}-{event.pid}")
+
+        def check_completion(self, ag, call_id, return_value):
+            self.completions.append((call_id, return_value))
+
+    from agency.configs.agconfig import agconfig, ptraceconfig
+
+    cfg = agconfig(ptraceconfig(syscalls=("execve", "execveat", "openat", "open")))
+    policy = DenyAndRecordPolicy()
+    px = agProxyPtrace(cfg)
+    handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=policy)
+    stdout, stderr, rc = handle.wait(timeout=10)
+    assert rc != 0
+    # A deny-decision's call_id (even though this policy still returned one)
+    # never reaches completion -- the tracer loop only tracks a pending exit
+    # for an admitted (non-deny) syscall in the first place.
+    assert "call-for-denied-hostname-open" not in [cid for cid, _rv in policy.completions]
 
 
 @ptrace

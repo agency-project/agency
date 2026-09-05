@@ -193,10 +193,12 @@ def run_react_loop(
             fn_name = tc["function"]["name"]
             fn_args = tc["function"]["arguments"]
             handler = dispatch_table.get(fn_name)
+            call_id = None
             if handler is None:
                 result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
             elif bridge is not None:
                 decision = bridge.check_tool_policy(fn_name, _parse_tool_input(fn_args))
+                call_id = decision.get("call_id")
                 if decision.get("decision") == "deny":
                     result_content = json.dumps(
                         {"error": f"denied by policy: {decision.get('reason', 'no reason given')}"}
@@ -208,6 +210,8 @@ def run_react_loop(
             result_content = tools.offload_if_oversized(
                 fn_name, tc["id"], result_content, offload_dir
             )
+            if bridge is not None:
+                bridge.complete_tool_policy(call_id, result_content)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_content})
             if bridge is not None:
                 decision = bridge.checkpoint(

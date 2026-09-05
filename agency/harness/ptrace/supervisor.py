@@ -56,6 +56,7 @@ TracerLoop = _load_tracer_loop
 @dataclass
 class _TraceDecision:
     kind: str
+    call_id: "str | None" = None
 
 
 def ptrace_available() -> bool:
@@ -477,9 +478,20 @@ class agProxyPtrace:
             )
             decision = policy.check(ag, event)
             allowed = decision[0] if isinstance(decision, tuple) else decision
-            return _TraceDecision(kind="allow" if allowed else "deny")
+            call_id = decision[2] if isinstance(decision, tuple) and len(decision) > 2 else None
+            return _TraceDecision(kind="allow" if allowed else "deny", call_id=call_id)
 
-        loop = TracerLoop(syscalls=syscalls, syscall_hook=syscall_hook)
+        check_completion = getattr(policy, "check_completion", None)
+
+        def syscall_exit_hook(stop, call_id, return_value) -> None:
+            del stop  # the admission-time event already carried the syscall's shape
+            if check_completion is None or call_id is None:
+                return
+            check_completion(ag, call_id, return_value)
+
+        loop = TracerLoop(
+            syscalls=syscalls, syscall_hook=syscall_hook, syscall_exit_hook=syscall_exit_hook
+        )
         handle = agProxyPtraceHandle(loop, process_profiler)
         if process_profiler is not None:
             handle.on_spawn(_isolated_profiler_callback(process_profiler.on_spawn))

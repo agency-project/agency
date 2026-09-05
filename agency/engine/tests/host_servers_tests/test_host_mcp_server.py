@@ -12,6 +12,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agtool import agtool
+from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.engine.host_servers.host_mcp_server import HostMcpServer
 
 _FIXED_TOOL_NAMES = {
@@ -68,9 +69,13 @@ class _FakeResourcePool:
 class _FakeDataLogger:
     def __init__(self):
         self.events = []
+        self.spans = []
 
     def record_event(self, type, payload, call_label=None, update_latest_snapshot=False, **_kw):
         self.events.append((type, payload, call_label, update_latest_snapshot))
+
+    def record_span(self, name, start_ts, end_ts, attributes, **_kw):
+        self.spans.append((name, start_ts, end_ts, attributes))
 
 
 def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, output_schema=None):
@@ -82,7 +87,9 @@ def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, outp
         add_host_mcp_tools=add_host_mcp_tools,
         output_schema=output_schema,
     )
-    server = HostMcpServer(sandbox, skill, resource_pool, _FakeDataLogger())
+    data_logger = _FakeDataLogger()
+    interaction_server = HostInteractionServer(skill, data_logger)
+    server = HostMcpServer(sandbox, skill, resource_pool, data_logger, interaction_server)
     server.build_app()
     return server, sandbox, resource_pool
 
@@ -203,6 +210,57 @@ def test_call_tool_records_tool_result_with_arguments_and_result():
     assert payload["tool"] == "echo"
     assert payload["arguments"] == {"msg": "hello"}
     assert payload["result"]["msg"] == "hello"
+
+
+def test_call_tool_records_admission_call_and_a_completion_span():
+    echo = agtool(
+        name="echo",
+        description="Echo back the message.",
+        fn=lambda d: agdata(msg=d._data["msg"]),
+        params={
+            "type": "object",
+            "properties": {"msg": {"type": "string"}},
+            "required": ["msg"],
+        },
+    )
+    server, _, _ = _make_server(add_host_mcp_tools=[echo])
+    asyncio.run(server._mcp_server.call_tool("echo", {"msg": "hello"}))
+
+    call_events = [e for e in server._data_logger.events if e[0] == "tool_call"]
+    assert len(call_events) == 1
+    assert call_events[0][1]["tool"] == "echo"
+    assert len(server._data_logger.spans) == 1
+    assert server._data_logger.spans[0][0] == "tool:echo"
+
+
+def test_call_tool_denied_by_policy_never_runs_and_records_no_result():
+    calls = []
+    tool = agtool(
+        name="danger",
+        description="d",
+        params={"type": "object", "properties": {}},
+        fn=lambda d: calls.append("ran") or agdata(ok=True),
+    )
+    sandbox = SimpleNamespace()
+    resource_pool = SimpleNamespace()
+    from agency.agpolicy import agpolicy
+
+    skill = agskill(
+        name="s",
+        system_prompt="p",
+        add_host_mcp_tools=[tool],
+        policy=agpolicy(default_to_deny=True),
+    )
+    data_logger = _FakeDataLogger()
+    interaction_server = HostInteractionServer(skill, data_logger)
+    server = HostMcpServer(sandbox, skill, resource_pool, data_logger, interaction_server)
+    server.build_app()
+
+    result = asyncio.run(server._mcp_server.call_tool("danger", {}))
+    assert calls == []
+    assert "error" in result.content[0].text
+    assert [e[0] for e in data_logger.events] == ["tool_call"]
+    assert data_logger.spans == []
 
 
 def test_dynamic_tool_missing_required_field_raises_tool_error():

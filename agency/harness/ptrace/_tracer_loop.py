@@ -52,6 +52,10 @@ class SeccompStop:
 class StopDecision:
     kind: str  # "allow" | "deny" | "rewrite"
     new_args: "list[str] | None" = None
+    # Correlates this admission with its later completion report (see
+    # syscall_exit_hook below) -- opaque to this module, just threaded
+    # through from whatever syscall_hook's own policy.check() returned.
+    call_id: "str | None" = None
 
 
 _EPERM = 1
@@ -132,10 +136,16 @@ class TracerLoop:
         syscalls: "list[str] | tuple[str, ...]",
         syscall_hook: "Callable[[SeccompStop], StopDecision]",
         poll_interval_s: float = 0.002,
+        syscall_exit_hook: "Callable[[SeccompStop, str | None, int], None] | None" = None,
     ) -> None:
         self._syscalls = tuple(syscalls)
         self._syscall_hook = syscall_hook
         self._poll_interval_s = poll_interval_s
+        # Called (stop, call_id, return_value) after an admitted syscall's
+        # matching exit-stop -- None (the default) skips exit-tracing
+        # entirely, resuming every admitted syscall with PTRACE_CONT exactly
+        # as before this existed.
+        self._syscall_exit_hook = syscall_exit_hook
 
         self.root_pid: "int | None" = None
         self.stdout_r: "int | None" = None
@@ -145,6 +155,10 @@ class TracerLoop:
         self._process_pids: "set[int]" = set()
         self._pending_clone_pids: "set[int]" = set()
         self._pending_exec_paths: "dict[int, str | None]" = {}
+        # pid -> (SeccompStop, call_id) for an admitted syscall resumed with
+        # PTRACE_SYSCALL instead of PTRACE_CONT, awaiting its matching
+        # syscall-exit-stop. Only populated when _syscall_exit_hook is set.
+        self._pending_syscall_exit: "dict[int, tuple]" = {}
         self._options_applied: "set[int]" = set()
         self._returncode: "int | None" = None
         self._finished = threading.Event()
@@ -409,6 +423,12 @@ class TracerLoop:
         if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_SECCOMP:
             self._handle_seccomp_stop(pid)
             return
+        if sig == signal.SIGTRAP and event == 0:
+            with self._lock:
+                pending_exit = self._pending_syscall_exit.pop(pid, None)
+            if pending_exit is not None:
+                self._handle_syscall_exit_stop(pid, pending_exit)
+                return
         if sig == signal.SIGTRAP and event in (
             pt.PTRACE_EVENT_FORK,
             pt.PTRACE_EVENT_VFORK,
@@ -500,7 +520,33 @@ class TracerLoop:
                         if decision.kind == "rewrite" and decision.new_args
                         else path
                     )
-        pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+        if decision.kind != "deny" and self._syscall_exit_hook is not None:
+            # Request the matching syscall-exit-stop instead of resuming
+            # freely, so the return value and duration can be reported. A
+            # successful exec never reaches it (PTRACE_EVENT_EXEC fires
+            # instead, see _commit_exec/_forget's own cleanup of this same
+            # entry); a failed exec still returns normally and is handled
+            # like any other syscall's exit.
+            with self._lock:
+                self._pending_syscall_exit[pid] = (stop, decision.call_id)
+            pt.ptrace(pt.PTRACE_SYSCALL, pid, 0, 0)
+        else:
+            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+
+    def _handle_syscall_exit_stop(self, pid: int, pending: tuple) -> None:
+        stop, call_id = pending
+        try:
+            regs = pt.get_regs(pid)
+            return_value = ctypes.c_longlong(regs.rax).value
+        except OSError:
+            # Tracee may have raced ahead to exit between the exit-stop
+            # notification and this GETREGS -- best-effort, skip reporting
+            # rather than crash the whole tracer loop over one lost value.
+            return_value = None
+        finally:
+            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+        if self._syscall_exit_hook is not None and return_value is not None:
+            self._syscall_exit_hook(stop, call_id, return_value)
 
     def _remember_spawn(self, pid: int, *, is_process: "bool | None" = True) -> None:
         with self._lock:
@@ -538,6 +584,9 @@ class TracerLoop:
         procfs_path = _kernel_executable_path(pid)
         with self._lock:
             staged_path = self._pending_exec_paths.pop(pid, None)
+            # A successful exec never produces the syscall-exit-stop this
+            # entry was waiting for -- PTRACE_EVENT_EXEC preempts it.
+            self._pending_syscall_exit.pop(pid, None)
             executable_path = staged_path or procfs_path
             if pid not in self._process_pids:
                 return
@@ -556,6 +605,7 @@ class TracerLoop:
             self._known_pids.discard(pid)
             self._pending_clone_pids.discard(pid)
             self._pending_exec_paths.pop(pid, None)
+            self._pending_syscall_exit.pop(pid, None)
             self._options_applied.discard(pid)
             if pid == self.root_pid:
                 self._returncode = exit_code

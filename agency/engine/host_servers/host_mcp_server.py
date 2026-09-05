@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ...agskill import agskill
     from ...agtool import agtool
     from ...sandbox.agsandbox import agSandbox
+    from .host_interaction_server import HostInteractionServer
 
 _current_data_logger = threading.local()
 
@@ -76,6 +77,7 @@ class HostMcpServer:
         skill: "agskill",
         resource_pool: "agResourcePool",
         data_logger: "agDataLogger",
+        interaction_server: "HostInteractionServer",
         *,
         invocation=None,
     ) -> None:
@@ -83,6 +85,7 @@ class HostMcpServer:
         self._skill = skill
         self._resource_pool = resource_pool
         self._data_logger = data_logger
+        self._interaction_server = interaction_server
         self._invocation = invocation
         self._persistent_vars: "dict[str, object]" = {}
         self._mcp_server: "MCPServer | None" = None
@@ -102,6 +105,9 @@ class HostMcpServer:
                     return {
                         "error": "Invocation redirected. Return to the model before taking another action."
                     }
+            admission = self._interaction_server.admit_tool_call(tool.name, kwargs)
+            if not admission["allowed"]:
+                return {"error": admission.get("reason") or "denied by policy"}
             self._data_logger.record_event(
                 type="agent_state",
                 payload={"state": "running_tools", "tool": tool.name},
@@ -124,11 +130,7 @@ class HostMcpServer:
             # orchestrator._record_execution_results) -- never let a
             # telemetry failure take down the actual tool call over it.
             try:
-                self._data_logger.record_event(
-                    type="tool_result",
-                    payload={"tool": tool.name, "arguments": kwargs, "result": result},
-                    flush=True,
-                )
+                self._interaction_server.complete_tool_call(admission["call_id"], result)
             except Exception as exc:
                 print(
                     f"[host_mcp_server] WARNING: tool_result logging failed for {tool.name}: {exc}"

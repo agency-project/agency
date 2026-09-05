@@ -447,11 +447,13 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
             assert client.get("/llm/resolve_model", headers=headers).json() == {
                 "model": "test-model"
             }
-            assert client.post(
+            check_tool_body = client.post(
                 "/interaction/check_tool",
                 headers=headers,
                 json={"tool_name": "unknown", "tool_input": {}},
-            ).json() == {"allowed": True, "reason": None}
+            ).json()
+            assert check_tool_body["allowed"] is True
+            assert check_tool_body["reason"] is None
             assert client.get("/LlmHandlerServer/resolve_model", headers=headers).status_code == 404
 
             assert manager.clear_attempt_token(attempt_token) is True

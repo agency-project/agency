@@ -34,6 +34,63 @@ def opencode_available() -> bool:
     return shutil.which("opencode") is not None
 
 
+# See _OpencodeBackend._write_agpolicy_plugin's docstring for the caveats
+# on this plugin's exact hook shape/denial mechanism.
+_AGPOLICY_PLUGIN_JS = """\
+export const AgpolicyPlugin = async () => {
+  const baseUrl = process.env.AGPOLICY_BASE_URL
+  const token = process.env.AGPOLICY_TOKEN
+  const pending = new Map()
+
+  async function post(path, body) {
+    const response = await fetch(baseUrl.replace(/\\/$/, "") + path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + token,
+      },
+      body: JSON.stringify(body),
+    })
+    return response.json()
+  }
+
+  return {
+    "tool.execute.before": async (input, output) => {
+      if (!baseUrl || !token) return
+      let decision
+      try {
+        decision = await post("/agpolicy/check_tool", {
+          tool_name: input.tool,
+          tool_input: output.args,
+        })
+      } catch (err) {
+        throw new Error("Cannot check invocation admission: agpolicy request failed: " + err)
+      }
+      if (decision.call_id) pending.set(input.callID, decision.call_id)
+      if (decision.decision === "deny") {
+        throw new Error(decision.reason || "denied by agpolicy")
+      }
+    },
+    "tool.execute.after": async (input, output) => {
+      if (!baseUrl || !token) return
+      const callId = pending.get(input.callID)
+      pending.delete(input.callID)
+      if (!callId) return
+      try {
+        await post("/agpolicy/complete_tool", {
+          call_id: callId,
+          result: output.output,
+          error: null,
+        })
+      } catch (err) {
+        console.error("[agpolicy plugin] complete_tool request failed:", err)
+      }
+    },
+  }
+}
+"""
+
+
 _STOP_REASON_TO_OPENAI = {
     "end_turn": "stop",
     "tool_use": "tool_calls",
@@ -105,11 +162,13 @@ class _OpencodeBackend(agharness_backend):
             runtime.engine_name, runtime.token, runtime.harness_base_url
         )
         try:
+            plugin_path = self._write_agpolicy_plugin(config_home)
             self._write_opencode_config(
                 config_home,
                 runtime.harness_base_url,
                 runtime.token,
                 runtime.model or "default",
+                plugin_path,
             )
 
             argv = [resolved, "run", "--format", "json", prompt]
@@ -117,6 +176,14 @@ class _OpencodeBackend(agharness_backend):
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
                 "HOME": str(config_home),
                 "OPENCODE_CONFIG": str(config_home / "opencode.json"),
+                # Read directly (via process.env) by agpolicy_plugin.js --
+                # unlike the subprocess-per-hook-firing CLIs (Claude Code/
+                # Codex/Grok), an opencode plugin is one long-lived JS
+                # module for the whole run, so it can just keep admitted
+                # call_ids in an in-memory Map between tool.execute.before
+                # and tool.execute.after -- no on-disk state dir needed.
+                "AGPOLICY_BASE_URL": runtime.harness_base_url,
+                "AGPOLICY_TOKEN": runtime.token,
             }
 
             px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
@@ -140,7 +207,9 @@ class _OpencodeBackend(agharness_backend):
         final_text = self._parse_output_events(stdout)
         return AttemptResult(ok=True, final_text=final_text)
 
-    def _write_opencode_config(self, config_home, base_url: str, token: str, model: str) -> None:
+    def _write_opencode_config(
+        self, config_home, base_url: str, token: str, model: str, plugin_path
+    ) -> None:
         config = {
             "provider": {
                 self._PROVIDER_NAME: {
@@ -151,8 +220,27 @@ class _OpencodeBackend(agharness_backend):
                 }
             },
             "model": f"{self._PROVIDER_NAME}/{model}",
+            # Per opencode.ai/docs/config's `plugin` array: local plugins are
+            # referenced by file:// URL alongside npm-package/version specs.
+            "plugin": [f"file://{plugin_path}"],
         }
         (config_home / "opencode.json").write_text(json.dumps(config))
+
+    def _write_agpolicy_plugin(self, config_home):
+        """Bridge opencode's own `tool.execute.before`/`tool.execute.after`
+        plugin hooks (per opencode.ai/docs/plugins) to agpolicy admission
+        and the host's tool-call completion endpoint. Unverified against a
+        live `opencode` binary (none available in this environment, see
+        this module's docstring) -- in particular, throwing from
+        `tool.execute.before` is this plugin's best-effort mechanism for
+        denying a call; opencode's docs describe the hook as able to
+        "modify or block" execution but don't spell out the exact
+        denial API."""
+        plugin_dir = config_home / "plugin"
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        plugin_path = plugin_dir / "agpolicy_plugin.js"
+        plugin_path.write_text(_AGPOLICY_PLUGIN_JS)
+        return plugin_path
 
     @staticmethod
     def _parse_output_events(stdout: str) -> str:

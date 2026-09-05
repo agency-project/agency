@@ -228,3 +228,46 @@ def test_harness_manager_returns_attempt_result_on_original_rpc():
 
     assert seen == [request]
     assert result == expected
+
+
+def test_host_syscall_policy_check_forwards_to_host_services():
+    from agency.harness.daemon import _HostSyscallPolicy
+
+    class _FakeHostServices:
+        def __init__(self):
+            self.check_calls = []
+            self.complete_calls = []
+
+        def check_syscall_policy(self, token, syscall):
+            self.check_calls.append((token, syscall))
+            return (True, None, "call-1")
+
+        def complete_syscall_policy(self, token, call_id, return_value):
+            self.complete_calls.append((token, call_id, return_value))
+
+    host_services = _FakeHostServices()
+    policy = _HostSyscallPolicy(host_services, "attempt-token")
+
+    decision = policy.check(None, "fake-syscall-event")
+    assert decision == (True, None, "call-1")
+    assert host_services.check_calls == [("attempt-token", "fake-syscall-event")]
+
+    policy.check_completion(None, "call-1", 3)
+    assert host_services.complete_calls == [("attempt-token", "call-1", 3)]
+
+
+def test_host_syscall_policy_check_completion_is_a_noop_without_a_call_id():
+    from agency.harness.daemon import _HostSyscallPolicy
+
+    class _FakeHostServices:
+        def __init__(self):
+            self.complete_calls = []
+
+        def complete_syscall_policy(self, token, call_id, return_value):
+            self.complete_calls.append((token, call_id, return_value))
+
+    host_services = _FakeHostServices()
+    policy = _HostSyscallPolicy(host_services, "attempt-token")
+
+    policy.check_completion(None, None, 3)
+    assert host_services.complete_calls == []

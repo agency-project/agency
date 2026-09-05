@@ -1,47 +1,48 @@
-"""Standalone Claude Code hook bridging policy and tool telemetry.
+"""Standalone hook bridging policy admission and tool-call telemetry to
+Agency's host-side endpoints.
 
 Deliberately self-contained -- stdlib only (`json`, `os`, `sys`,
 `urllib.request`), ZERO imports from the `agency` package -- because it
-runs as a subprocess of the harness binary itself (e.g. `claude` invoking
-its own hook), not inside this process, and can't reach into
-this process's Python state directly. `claude_code.py` writes this file
-into the launch's own `config_home` and registers it via `--settings`'
-`hooks.PreToolUse`/`hooks.PostToolUse` blocks;
-`AGPOLICY_BASE_URL`/`AGPOLICY_TOKEN` (set on the
-harness's own env, the same values ANTHROPIC_BASE_URL's bearer token
-already uses) tell it where to reach `agproxy_llm.py`'s
-`/agpolicy/check_tool` route -- the one thing this subprocess and that
-route share is the per-run bearer token, so that's the auth.
+runs as a subprocess of the harness binary itself (e.g. `claude`/`codex`/
+`grok` invoking their own hook), not inside this process, and can't reach
+into this process's Python state directly. Each harness adapter that uses
+it (`claude_code.py`, `codex.py`, `grok.py` -- their PreToolUse/PostToolUse
+hook payload shapes are near-identical) writes this file into the launch's
+own `config_home` and registers it via that CLI's own hook-config format.
+`AGPOLICY_BASE_URL`/`AGPOLICY_TOKEN` (set on the harness's own env, the same
+values ANTHROPIC_BASE_URL's bearer token already uses) tell it where to
+reach the daemon's `/agpolicy/check_tool`/`/agpolicy/complete_tool` routes
+-- the one thing this subprocess and those routes share is the per-run
+bearer token, so that's the auth.
 
-For ``PreToolUse`` it performs the existing policy POST first and only opens
-a profiler span when the call will be allowed.  For ``PostToolUse``
-(and ``PostToolUseFailure``) it closes the span with the matching
-``tool_use_id``. Profiler POSTs go to the container-reachable agproxy HTTP
-bridge, which forwards them to agProfilerIngest's separate host UDS; the
-bearer token is header-only and is never included in the semantic payload.
+For ``PreToolUse`` it posts to `/agpolicy/check_tool`, which both decides
+allow/deny AND opens a host-side pending span, returning a `call_id`. For
+``PostToolUse``/``PostToolUseFailure`` it posts to `/agpolicy/complete_tool`
+to close that span and record the tool's result. Since each hook firing is
+a fresh subprocess with no memory of the last one, the `call_id` returned
+by PreToolUse is persisted to a small per-`tool_use_id` file under
+`AGPOLICY_STATE_DIR` (each adapter points this at its own per-launch
+`config_home`, so it's cleaned up the same way the rest of that directory
+is) and read back (then deleted) by PostToolUse.
 
 Tool admission fails closed: only an explicit allow from Agency may start a
 new tool. This preserves redirect, pause, and cancellation fences when the
-policy gateway is unavailable. Profiler delivery remains best-effort;
-telemetry failures do not revoke an admitted tool.
+policy gateway is unavailable. Completion telemetry is best-effort; its
+failure never revokes an already-admitted tool call.
 """
 
 import json
 import os
 import sys
-import time
 import urllib.request
 
 _POLICY_TIMEOUT_S = 5.0
-# Telemetry is best-effort and synchronous in Claude Code's hook process.
-# Keep the combined Pre + Post profiler budget at or below 200 ms when the
-# local gateway is wedged.  Healthy requests still return immediately.  A
-# 50 ms boundary proved too short for two concurrent Claude hook processes on
-# EC2 (interpreter startup plus the local HTTP -> host UDS hop), causing an
-# otherwise valid PostToolUse event to be discarded and honestly downgraded
-# to transcript-derived timing.
-_PROFILER_TIMEOUT_S = 0.1
-_MAX_PROFILER_FIELD_CHARS = 64 * 1024
+# Telemetry is best-effort and synchronous in the hook process. Keep the
+# PostToolUse completion POST bounded well under Claude Code's own hook
+# timeout even when the local gateway is wedged; healthy requests still
+# return immediately.
+_COMPLETION_TIMEOUT_S = 2.0
+_MAX_RESULT_FIELD_CHARS = 64 * 1024
 
 
 def main() -> int:
@@ -61,17 +62,14 @@ def main() -> int:
     hook_event_name = payload.get("hook_event_name") or "PreToolUse"
     if hook_event_name != "PreToolUse":
         if hook_event_name in ("PostToolUse", "PostToolUseFailure"):
-            _post_profiler_event(payload, hook_event_name)
+            _report_completion(payload, hook_event_name)
         else:
             _emit("deny", "Cannot check invocation admission: unknown hook event")
         return 0
 
-    kind, reason = _check_tool_policy(payload)
+    kind, reason, call_id = _check_tool_policy(payload)
     if kind == "allow":
-        # A denied PreToolUse does not receive a matching PostToolUse. Open
-        # only after policy explicitly allows so no denied call leaves
-        # an unmatched profiler span behind.
-        _post_profiler_event(payload, hook_event_name)
+        _remember_call_id(payload, call_id)
         _emit("allow", reason)
     elif kind == "deny":
         _emit("deny", reason or "denied by agpolicy")
@@ -83,11 +81,11 @@ def main() -> int:
     return 0
 
 
-def _check_tool_policy(payload: dict) -> "tuple[str, str | None]":
+def _check_tool_policy(payload: dict) -> "tuple[str, str | None, str | None]":
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input", {})
     if not isinstance(tool_name, str) or not tool_name.strip() or not isinstance(tool_input, dict):
-        return "deny", "Cannot check invocation admission: invalid tool name or input"
+        return "deny", "Cannot check invocation admission: invalid tool name or input", None
 
     base_url = os.environ.get("AGPOLICY_BASE_URL")
     token = os.environ.get("AGPOLICY_TOKEN")
@@ -96,7 +94,7 @@ def _check_tool_policy(payload: dict) -> "tuple[str, str | None]":
             "[agpolicy hook] AGPOLICY_BASE_URL/AGPOLICY_TOKEN not set, denying tool",
             file=sys.stderr,
         )
-        return "deny", "Cannot check invocation admission: agpolicy gateway not configured"
+        return "deny", "Cannot check invocation admission: agpolicy gateway not configured", None
 
     try:
         body = json.dumps({"tool_name": tool_name, "tool_input": tool_input}).encode()
@@ -109,84 +107,102 @@ def _check_tool_policy(payload: dict) -> "tuple[str, str | None]":
         with urllib.request.urlopen(req, timeout=_POLICY_TIMEOUT_S) as resp:
             result = json.loads(resp.read())
         if not isinstance(result, dict) or result.get("decision") not in ("allow", "deny"):
-            return "deny", "Cannot check invocation admission: invalid agpolicy decision"
+            return "deny", "Cannot check invocation admission: invalid agpolicy decision", None
         reason = result.get("reason")
         if reason is not None and not isinstance(reason, str):
-            return "deny", "Cannot check invocation admission: invalid agpolicy reason"
+            return "deny", "Cannot check invocation admission: invalid agpolicy reason", None
     except Exception as exc:
         print(f"[agpolicy hook] check_tool request failed: {exc!r}, denying tool", file=sys.stderr)
         return (
             "deny",
             "Cannot check invocation admission: agpolicy request failed; return to the model",
+            None,
         )
 
-    return result["decision"], reason
+    return result["decision"], reason, result.get("call_id")
 
 
-def _post_profiler_event(payload: dict, hook_event_name: str) -> None:
-    base_url = os.environ.get("AGPROF_BASE_URL")
-    token = os.environ.get("AGPROF_TOKEN")
-    if not base_url or not token:
+def _call_state_path(tool_use_id: str) -> "str | None":
+    state_dir = os.environ.get("AGPOLICY_STATE_DIR")
+    if not state_dir:
+        return None
+    return os.path.join(state_dir, f".agpolicy_call_{tool_use_id}.json")
+
+
+def _remember_call_id(payload: dict, call_id: "str | None") -> None:
+    """Persist *call_id* so the separate PostToolUse subprocess can find it
+    -- best-effort: a missing/unwritable state dir just means completion
+    telemetry is skipped later, never that admission itself fails."""
+    if not call_id:
         return
     tool_use_id = payload.get("tool_use_id")
     if not isinstance(tool_use_id, str) or not tool_use_id:
-        # DATACOLLECTOR: append, correlate (tool_use_id, missing here) -- same no-transport gap as above.
+        return
+    path = _call_state_path(tool_use_id)
+    if path is None:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"call_id": call_id}, f)
+    except OSError as exc:
+        print(f"[agpolicy hook] could not persist call_id: {exc!r}", file=sys.stderr)
+
+
+def _report_completion(payload: dict, hook_event_name: str) -> None:
+    tool_use_id = payload.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id:
         print(
-            f"[agprof hook] {hook_event_name} missing tool_use_id; telemetry skipped",
+            f"[agpolicy hook] {hook_event_name} missing tool_use_id; telemetry skipped",
             file=sys.stderr,
         )
         return
+    path = _call_state_path(tool_use_id)
+    if path is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            call_id = json.load(f).get("call_id")
+    except (OSError, json.JSONDecodeError):
+        # No matching PreToolUse admission (denied, or state dir wasn't
+        # configured) -- nothing to complete.
+        return
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if not call_id:
+        return
 
-    # Capture the hook boundary before the HTTP round trip.  The token stays
-    # exclusively in Authorization; even a caller-supplied top-level token is
-    # stripped from the semantic payload before forwarding.
-    safe_payload = {
-        key: payload[key]
-        for key in (
-            "hook_event_name",
-            "tool_use_id",
-            "tool_name",
-            "tool_input",
-            "tool_response",
-            "error",
-            "duration_ms",
-            "pid",
-        )
-        if key in payload
-    }
-    for key in ("tool_input", "tool_response", "error"):
-        if key not in safe_payload:
-            continue
-        encoded = json.dumps(safe_payload[key], default=str)
-        if len(encoded) <= _MAX_PROFILER_FIELD_CHARS:
-            continue
-        preview = encoded[:_MAX_PROFILER_FIELD_CHARS] + "…[truncated]"
-        safe_payload[key] = {"_truncated_json": preview} if key == "tool_input" else preview
-    body = json.dumps(
-        {
-            "hook_event_name": hook_event_name,
-            "wall_ns": time.time_ns(),
-            "perf_ns": time.perf_counter_ns(),
-            "payload": safe_payload,
-        }
-    ).encode()
+    base_url = os.environ.get("AGPOLICY_BASE_URL")
+    token = os.environ.get("AGPOLICY_TOKEN")
+    if not base_url or not token:
+        return
+
+    result = payload.get("tool_response")
+    error = payload.get("error")
+    encoded_result = json.dumps(result, default=str)
+    if len(encoded_result) > _MAX_RESULT_FIELD_CHARS:
+        result = {"_truncated_json": encoded_result[:_MAX_RESULT_FIELD_CHARS] + "…[truncated]"}
+    if isinstance(error, str) and len(error) > _MAX_RESULT_FIELD_CHARS:
+        error = error[:_MAX_RESULT_FIELD_CHARS] + "…[truncated]"
+
+    body = json.dumps({"call_id": call_id, "result": result, "error": error}).encode()
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/agprof/hook",
+        base_url.rstrip("/") + "/agpolicy/complete_tool",
         data=body,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
     try:
-        # A profiler outage must add a small bounded hiccup, never the five
-        # second policy budget, at both boundaries of every tool call.
-        with urllib.request.urlopen(req, timeout=_PROFILER_TIMEOUT_S) as resp:
-            result = json.loads(resp.read() or b"{}")
-        if not result.get("ok"):
-            # DATACOLLECTOR: append, correlate (tool_use_id) -- same no-transport gap as above.
-            print(f"[agprof hook] ingest rejected event: {result!r}", file=sys.stderr)
+        # A gateway outage must add a small bounded hiccup, never block the
+        # harness's own PostToolUse handling on Agency's telemetry.
+        with urllib.request.urlopen(req, timeout=_COMPLETION_TIMEOUT_S) as resp:
+            resp.read()
     except Exception as exc:
-        # DATACOLLECTOR: append, correlate (tool_use_id) -- same no-transport gap as above.
-        print(f"[agprof hook] profiler request failed: {exc!r}, failing open", file=sys.stderr)
+        # DATACOLLECTOR: append, correlate (tool_use_id) -- this subprocess has no transport
+        # to agDataCollector today; folding needs a new HTTP call here, not just a type name.
+        print(f"[agpolicy hook] complete_tool request failed: {exc!r}", file=sys.stderr)
 
 
 def _emit(decision: str, reason: "str | None") -> None:

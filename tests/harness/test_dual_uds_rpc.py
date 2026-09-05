@@ -71,7 +71,8 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
                 "read_file",
                 {"path": "/workspace/example.py"},
             )
-            assert decision == {"decision": "allow", "reason": "mock policy allowed"}
+            assert decision["decision"] == "allow"
+            assert decision["reason"] == "mock policy allowed"
             reverse_rpc_completed.set()
             assert release_attempt_result.wait(timeout=2.0)
             return HarnessAttemptResult(

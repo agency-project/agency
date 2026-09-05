@@ -76,6 +76,7 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
         assert bridge.check_tool_policy("token", "bash", {"cmd": "x"}) == {
             "decision": "deny",
             "reason": "blocked",
+            "call_id": None,
         }
         syscall = agsyscallevent(
             syscall="execve",
@@ -86,7 +87,7 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             path="/bin/true",
             timestamp=1.0,
         )
-        assert bridge.check_syscall_policy("token", syscall) is True
+        assert bridge.check_syscall_policy("token", syscall) == (True, None, None)
     finally:
         bridge.close()
 
@@ -112,6 +113,34 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             "tool_name": None,
             "tool_args": None,
         },
+    ]
+
+
+def test_bridge_complete_tool_and_syscall_policy_post_expected_routes():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True})
+
+    bridge = _bridge(handler)
+    try:
+        bridge.complete_tool_policy("token", "call-1", result={"stdout": "ok"})
+        bridge.complete_syscall_policy("token", "call-2", return_value=3)
+    finally:
+        bridge.close()
+
+    assert seen == [
+        (
+            "POST",
+            "/interaction/complete_tool",
+            {"call_id": "call-1", "result": {"stdout": "ok"}, "error": None},
+        ),
+        (
+            "POST",
+            "/interaction/complete_syscall",
+            {"call_id": "call-2", "return_value": 3, "error": None},
+        ),
     ]
 
 

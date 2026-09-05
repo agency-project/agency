@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -33,6 +35,14 @@ class HostInteractionServer:
         # another request's lifecycle state.
         self._invocation = invocation
         self._admit_tools = admit_tools
+        # Correlates an admission decision with its later completion report,
+        # across the tool/syscall admission <-> completion round trip (which
+        # may cross the daemon<->host UDS bridge, or an external harness's
+        # own PreToolUse/PostToolUse hook subprocess). Value: (kind, name,
+        # attributes, start_ts). Only admitted (allowed) calls are stashed --
+        # a denied call never really runs, so it has nothing to complete.
+        self._pending_calls: "dict[str, tuple]" = {}
+        self._pending_calls_lock = threading.Lock()
 
     def checkpoint(self, boundary_id: str, *, allow_messages: bool, phase: str) -> dict:
         if self._invocation is None:
@@ -139,6 +149,68 @@ class HostInteractionServer:
             return (False, f"hook raised: {exc}")
         return result if isinstance(result, tuple) else (result, None)
 
+    def _record_admission(self, kind: str, name: str, attributes: dict, allowed: bool) -> str:
+        call_id = uuid.uuid4().hex
+        self.record_event(
+            f"{kind}_call",
+            {**attributes, "call_id": call_id, "allowed": allowed},
+        )
+        if allowed:
+            with self._pending_calls_lock:
+                self._pending_calls[call_id] = (kind, name, attributes, time.time())
+        return call_id
+
+    def _record_completion(self, kind: str, call_id: str, extra: dict) -> None:
+        with self._pending_calls_lock:
+            pending = self._pending_calls.pop(call_id, None)
+        if pending is None:
+            # Unknown, already-completed, or never-admitted (denied) call --
+            # a no-op, not an error: callers report completion best-effort
+            # and shouldn't have to track admission outcomes themselves.
+            return
+        _kind, name, attributes, start_ts = pending
+        end_ts = time.time()
+        self.record_event(f"{kind}_result", {**attributes, **extra, "call_id": call_id})
+        self.record_span(f"{kind}:{name}", start_ts, end_ts, {**attributes, "call_id": call_id})
+
+    def admit_tool_call(self, tool_name: str, tool_input: dict) -> dict:
+        """Admission + telemetry entry point for a tool call: decide
+        allow/deny via `check_tool()`, then record a `tool_call` event and
+        (if allowed) open a pending span completed later by
+        `complete_tool_call()`."""
+        allowed, reason = self.check_tool(tool_name, tool_input)
+        call_id = self._record_admission(
+            "tool", tool_name, {"tool": tool_name, "arguments": tool_input}, allowed
+        )
+        return {"allowed": allowed, "reason": reason, "call_id": call_id}
+
+    def complete_tool_call(
+        self, call_id: str, result: object = None, error: "str | None" = None
+    ) -> None:
+        self._record_completion("tool", call_id, {"result": result, "error": error})
+
+    def admit_syscall(self, syscall: "agsyscallevent") -> dict:
+        """Admission + telemetry entry point for a syscall, symmetric with
+        `admit_tool_call()`."""
+        allowed, reason = self.check_syscall(syscall)
+        call_id = self._record_admission(
+            "syscall",
+            syscall.syscall,
+            {
+                "syscall": syscall.syscall,
+                "pid": syscall.pid,
+                "path": syscall.path,
+                "argv": syscall.argv,
+            },
+            allowed,
+        )
+        return {"allowed": allowed, "reason": reason, "call_id": call_id}
+
+    def complete_syscall(
+        self, call_id: str, return_value: "int | None" = None, error: "str | None" = None
+    ) -> None:
+        self._record_completion("syscall", call_id, {"return_value": return_value, "error": error})
+
     def record_event(
         self,
         type: str,
@@ -186,13 +258,23 @@ class HostInteractionServer:
 
         @app.post("/check_tool")
         def _check_tool(request: dict) -> JSONResponse:
-            allowed, reason = self.check_tool(request["tool_name"], request["tool_input"])
-            return JSONResponse({"allowed": allowed, "reason": reason})
+            return JSONResponse(self.admit_tool_call(request["tool_name"], request["tool_input"]))
+
+        @app.post("/complete_tool")
+        def _complete_tool(request: dict) -> JSONResponse:
+            self.complete_tool_call(request["call_id"], request.get("result"), request.get("error"))
+            return JSONResponse({"ok": True})
 
         @app.post("/check_syscall")
         def _check_syscall(request: dict) -> JSONResponse:
-            allowed, reason = self.check_syscall(agsyscallevent(**request))
-            return JSONResponse({"allowed": allowed, "reason": reason})
+            return JSONResponse(self.admit_syscall(agsyscallevent(**request)))
+
+        @app.post("/complete_syscall")
+        def _complete_syscall(request: dict) -> JSONResponse:
+            self.complete_syscall(
+                request["call_id"], request.get("return_value"), request.get("error")
+            )
+            return JSONResponse({"ok": True})
 
         @app.post("/checkpoint")
         async def _checkpoint(request: dict, raw_request: Request) -> JSONResponse:

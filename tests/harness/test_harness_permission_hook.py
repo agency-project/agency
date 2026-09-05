@@ -32,43 +32,34 @@ def _payload(event="PreToolUse", tool_use_id="tool-1"):
     }
 
 
-def test_pretooluse_allow_checks_policy_then_posts_profiler_header_only(monkeypatch, capsys):
+def test_pretooluse_allow_checks_policy_and_persists_call_id(monkeypatch, capsys, tmp_path):
     requests = []
-    timeouts = []
 
     def urlopen(request, timeout):
         requests.append(request)
-        timeouts.append(timeout)
-        if request.full_url.endswith("/agpolicy/check_tool"):
-            return _Response({"decision": "allow", "reason": "safe"})
-        return _Response({"ok": True})
+        return _Response({"decision": "allow", "reason": "safe", "call_id": "call-abc"})
 
     monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
     monkeypatch.setenv("AGPOLICY_TOKEN", "secret-token")
-    monkeypatch.setenv("AGPROF_BASE_URL", "http://gateway")
-    monkeypatch.setenv("AGPROF_TOKEN", "secret-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload())))
     monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
 
     assert hook.main() == 0
 
-    assert [request.full_url for request in requests] == [
-        "http://gateway/agpolicy/check_tool",
-        "http://gateway/agprof/hook",
-    ]
-    assert timeouts == [hook._POLICY_TIMEOUT_S, hook._PROFILER_TIMEOUT_S]
-    profiler_request = requests[1]
-    profiler_body = json.loads(profiler_request.data)
-    assert profiler_request.get_header("Authorization") == "Bearer secret-token"
-    assert "token" not in profiler_body
-    assert "token" not in profiler_body["payload"]
-    assert profiler_body["hook_event_name"] == "PreToolUse"
-    assert profiler_body["payload"]["tool_use_id"] == "tool-1"
+    assert [request.full_url for request in requests] == ["http://gateway/agpolicy/check_tool"]
+    request = requests[0]
+    assert request.get_header("Authorization") == "Bearer secret-token"
+    body = json.loads(request.data)
+    assert body == {"tool_name": "Bash", "tool_input": {"command": "printf ok"}}
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
 
+    state_file = tmp_path / ".agpolicy_call_tool-1.json"
+    assert json.loads(state_file.read_text()) == {"call_id": "call-abc"}
 
-def test_denied_pretooluse_does_not_open_profiler_span(monkeypatch, capsys):
+
+def test_denied_pretooluse_persists_no_call_id(monkeypatch, capsys, tmp_path):
     requests = []
 
     def urlopen(request, timeout):
@@ -77,8 +68,7 @@ def test_denied_pretooluse_does_not_open_profiler_span(monkeypatch, capsys):
 
     monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
     monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
-    monkeypatch.setenv("AGPROF_BASE_URL", "http://gateway")
-    monkeypatch.setenv("AGPROF_TOKEN", "profiler-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload())))
     monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
 
@@ -87,35 +77,98 @@ def test_denied_pretooluse_does_not_open_profiler_span(monkeypatch, capsys):
     assert [request.full_url for request in requests] == ["http://gateway/agpolicy/check_tool"]
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_posttooluse_only_posts_profiler_and_emits_no_hook_response(monkeypatch, capsys):
+def test_posttooluse_reads_call_id_and_posts_completion(monkeypatch, capsys, tmp_path):
+    (tmp_path / ".agpolicy_call_tool-1.json").write_text(json.dumps({"call_id": "call-abc"}))
     requests = []
     payload = _payload("PostToolUse")
     payload["tool_response"] = {"stdout": "ok"}
-    payload["duration_ms"] = 12.5
 
     def urlopen(request, timeout):
         requests.append(request)
         return _Response({"ok": True})
 
-    monkeypatch.setenv("AGPROF_BASE_URL", "http://gateway")
-    monkeypatch.setenv("AGPROF_TOKEN", "profiler-token")
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
     monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
 
     assert hook.main() == 0
 
-    assert [request.full_url for request in requests] == ["http://gateway/agprof/hook"]
-    posted_payload = json.loads(requests[0].data)["payload"]
-    assert posted_payload["tool_response"] == {"stdout": "ok"}
-    assert posted_payload["duration_ms"] == 12.5
+    assert [request.full_url for request in requests] == ["http://gateway/agpolicy/complete_tool"]
+    posted = json.loads(requests[0].data)
+    assert posted == {"call_id": "call-abc", "result": {"stdout": "ok"}, "error": None}
+    assert requests[0].get_header("Authorization") == "Bearer policy-token"
     assert capsys.readouterr().out == ""
+    # The state file is consumed exactly once.
+    assert not (tmp_path / ".agpolicy_call_tool-1.json").exists()
 
 
-def test_missing_tool_use_id_skips_profiler_without_blocking(monkeypatch, capsys):
-    monkeypatch.setenv("AGPROF_BASE_URL", "http://gateway")
-    monkeypatch.setenv("AGPROF_TOKEN", "profiler-token")
+def test_posttoolusefailure_forwards_the_error_field(monkeypatch, tmp_path):
+    (tmp_path / ".agpolicy_call_tool-1.json").write_text(json.dumps({"call_id": "call-abc"}))
+    requests = []
+    payload = _payload("PostToolUseFailure")
+    payload["error"] = "boom"
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return _Response({"ok": True})
+
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+
+    assert hook.main() == 0
+    posted = json.loads(requests[0].data)
+    assert posted["error"] == "boom"
+
+
+def test_posttooluse_with_no_matching_admission_is_a_noop(monkeypatch, tmp_path):
+    """No PreToolUse ever admitted this tool_use_id (denied, or the hook
+    process never got as far as persisting a call_id) -- completion has
+    nothing to report and must not guess at one."""
+    requests = []
+    payload = _payload("PostToolUse")
+    payload["tool_response"] = {"stdout": "ok"}
+
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(
+        hook.urllib.request,
+        "urlopen",
+        lambda *a, **kw: requests.append(a) or _Response({"ok": True}),
+    )
+
+    assert hook.main() == 0
+    assert requests == []
+
+
+def test_posttooluse_without_state_dir_configured_is_a_noop(monkeypatch):
+    requests = []
+    payload = _payload("PostToolUse")
+    payload["tool_response"] = {"stdout": "ok"}
+
+    monkeypatch.delenv("AGPOLICY_STATE_DIR", raising=False)
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(
+        hook.urllib.request,
+        "urlopen",
+        lambda *a, **kw: requests.append(a) or _Response({"ok": True}),
+    )
+
+    assert hook.main() == 0
+    assert requests == []
+
+
+def test_missing_tool_use_id_skips_completion_without_blocking(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload("PostToolUse", ""))))
     monkeypatch.setattr(
         hook.urllib.request,
@@ -127,17 +180,11 @@ def test_missing_tool_use_id_skips_profiler_without_blocking(monkeypatch, capsys
     assert "missing tool_use_id" in capsys.readouterr().err
 
 
-def test_profiler_timeout_budget_stays_at_or_below_200ms_per_tool():
-    # Pre and Post each make at most one synchronous telemetry request.
-    assert hook._PROFILER_TIMEOUT_S * 2 <= 0.2
-
-
 @pytest.fixture
-def pretool(monkeypatch):
+def pretool(monkeypatch, tmp_path):
     monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
     monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
-    monkeypatch.setenv("AGPROF_BASE_URL", "http://gateway")
-    monkeypatch.setenv("AGPROF_TOKEN", "profiler-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload())))
     return monkeypatch
 
@@ -151,7 +198,7 @@ def _assert_denied(capsys):
 
 
 @pytest.mark.parametrize("missing", ["AGPOLICY_BASE_URL", "AGPOLICY_TOKEN"])
-def test_missing_policy_configuration_denies_without_profiler(pretool, capsys, missing):
+def test_missing_policy_configuration_denies(pretool, capsys, missing):
     pretool.delenv(missing)
     requests = []
     pretool.setattr(hook.urllib.request, "urlopen", lambda *a, **kw: requests.append(a))
@@ -168,7 +215,7 @@ def test_missing_policy_configuration_denies_without_profiler(pretool, capsys, m
         urllib.error.HTTPError("http://gateway", 503, "unavailable", {}, None),
     ],
 )
-def test_policy_transport_failure_denies_without_profiler(pretool, capsys, failure):
+def test_policy_transport_failure_denies(pretool, capsys, failure):
     requests = []
 
     def urlopen(request, timeout):
@@ -194,7 +241,7 @@ def test_policy_transport_failure_denies_without_profiler(pretool, capsys, failu
         "invalid-json",
     ],
 )
-def test_malformed_policy_response_denies_without_profiler(pretool, capsys, response):
+def test_malformed_policy_response_denies(pretool, capsys, response):
     requests = []
 
     def urlopen(request, timeout):
@@ -226,17 +273,23 @@ def test_bad_gateway_url_denies_instead_of_crashing(pretool, capsys):
     _assert_denied(capsys)
 
 
-def test_profiler_failure_does_not_revoke_explicit_admission(pretool, capsys):
-    def urlopen(request, timeout):
-        if request.full_url.endswith("/agpolicy/check_tool"):
-            return _Response({"decision": "allow"})
-        raise TimeoutError("profiler down")
+def test_completion_failure_is_swallowed(monkeypatch, capsys, tmp_path):
+    (tmp_path / ".agpolicy_call_tool-1.json").write_text(json.dumps({"call_id": "call-abc"}))
+    payload = _payload("PostToolUse")
+    payload["tool_response"] = {"stdout": "ok"}
 
-    pretool.setattr(hook.urllib.request, "urlopen", urlopen)
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(
+        hook.urllib.request,
+        "urlopen",
+        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("gateway down")),
+    )
+
     assert hook.main() == 0
-    output = capsys.readouterr()
-    assert json.loads(output.out)["hookSpecificOutput"]["permissionDecision"] == "allow"
-    assert "profiler request failed" in output.err
+    assert "complete_tool request failed" in capsys.readouterr().err
 
 
 def test_pending_redirect_denies_claude_tool_until_acknowledged(pretool, capsys):
@@ -257,8 +310,6 @@ def test_pending_redirect_denies_claude_tool_until_acknowledged(pretool, capsys)
 
     def urlopen(request, timeout):
         requests.append(request.full_url)
-        if request.full_url.endswith("/agprof/hook"):
-            return _Response({"ok": True})
         payload = json.loads(request.data)
         allowed, reason = server.check_tool(payload["tool_name"], payload["tool_input"])
         return _Response({"decision": "allow" if allowed else "deny", "reason": reason})

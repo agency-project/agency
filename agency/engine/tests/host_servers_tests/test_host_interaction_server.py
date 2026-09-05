@@ -245,7 +245,10 @@ def test_build_app_check_tool_route_allows():
     client = TestClient(server.build_app())
     response = client.post("/check_tool", json={"tool_name": "bash", "tool_input": {"cmd": "ls"}})
     assert response.status_code == 200
-    assert response.json() == {"allowed": True, "reason": None}
+    body = response.json()
+    assert body["allowed"] is True
+    assert body["reason"] is None
+    assert isinstance(body["call_id"], str) and body["call_id"]
 
 
 def test_build_app_check_tool_route_denies_with_reason():
@@ -256,7 +259,9 @@ def test_build_app_check_tool_route_denies_with_reason():
     client = TestClient(server.build_app())
     response = client.post("/check_tool", json={"tool_name": "bash", "tool_input": {"cmd": "ls"}})
     assert response.status_code == 200
-    assert response.json() == {"allowed": False, "reason": "nope"}
+    body = response.json()
+    assert body["allowed"] is False
+    assert body["reason"] == "nope"
 
 
 def test_build_app_check_tool_route_denies_when_hook_raises():
@@ -432,7 +437,10 @@ def test_build_app_check_syscall_route_allows():
         },
     )
     assert response.status_code == 200
-    assert response.json() == {"allowed": True, "reason": None}
+    body = response.json()
+    assert body["allowed"] is True
+    assert body["reason"] is None
+    assert isinstance(body["call_id"], str) and body["call_id"]
 
 
 def test_build_app_check_syscall_route_denies_with_reason():
@@ -454,7 +462,9 @@ def test_build_app_check_syscall_route_denies_with_reason():
         },
     )
     assert response.status_code == 200
-    assert response.json() == {"allowed": False, "reason": "sensitive path"}
+    body = response.json()
+    assert body["allowed"] is False
+    assert body["reason"] == "sensitive path"
 
 
 def test_build_app_check_syscall_route_denies_when_hook_raises():
@@ -561,6 +571,136 @@ def test_build_app_record_span_route_delegates_to_data_logger():
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert logger.spans == [("llm:attempt", 0.0, 1.0, {"model": "x"}, None, None, None, None, None)]
+
+
+# ---------------------------------------------------------------------------
+# admit_tool_call / complete_tool_call / admit_syscall / complete_syscall
+# ---------------------------------------------------------------------------
+
+
+def test_admit_tool_call_records_call_event_and_returns_call_id():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    result = server.admit_tool_call("bash", {"cmd": "ls"})
+    assert result["allowed"] is True
+    assert result["reason"] is None
+    call_id = result["call_id"]
+    assert isinstance(call_id, str) and call_id
+    assert logger.events == [
+        (
+            "tool_call",
+            {"tool": "bash", "arguments": {"cmd": "ls"}, "call_id": call_id, "allowed": True},
+            None,
+            False,
+            None,
+            False,
+        )
+    ]
+    assert logger.spans == []
+
+
+def test_admit_tool_call_denied_records_call_event_but_no_pending_span():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(default_to_deny=True), data_logger=logger)
+    result = server.admit_tool_call("bash", {"cmd": "ls"})
+    assert result["allowed"] is False
+    server.complete_tool_call(result["call_id"], result={"ignored": True})
+    # Denied call was never stashed as pending -- completion is a no-op, and
+    # no tool_result/span is recorded for a call that never really ran.
+    assert [e[0] for e in logger.events] == ["tool_call"]
+    assert logger.spans == []
+
+
+def test_complete_tool_call_records_result_event_and_span():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    call_id = server.admit_tool_call("bash", {"cmd": "ls"})["call_id"]
+    server.complete_tool_call(call_id, result={"stdout": "ok"})
+    assert [e[0] for e in logger.events] == ["tool_call", "tool_result"]
+    result_payload = logger.events[1][1]
+    assert result_payload["tool"] == "bash"
+    assert result_payload["arguments"] == {"cmd": "ls"}
+    assert result_payload["result"] == {"stdout": "ok"}
+    assert result_payload["call_id"] == call_id
+    assert len(logger.spans) == 1
+    span_name, start_ts, end_ts, attributes = logger.spans[0][:4]
+    assert span_name == "tool:bash"
+    assert end_ts >= start_ts
+    assert attributes["call_id"] == call_id
+
+
+def test_complete_tool_call_with_unknown_call_id_is_a_noop():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    server.complete_tool_call("does-not-exist", result={"stdout": "ok"})
+    assert logger.events == []
+    assert logger.spans == []
+
+
+def test_complete_tool_call_fires_once_even_if_called_twice():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    call_id = server.admit_tool_call("bash", {})["call_id"]
+    server.complete_tool_call(call_id, result="first")
+    server.complete_tool_call(call_id, result="second")
+    assert [e[0] for e in logger.events] == ["tool_call", "tool_result"]
+    assert len(logger.spans) == 1
+
+
+def test_admit_syscall_and_complete_syscall_record_event_and_span():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    result = server.admit_syscall(_make_syscall(syscall="openat", path="/tmp/x"))
+    assert result["allowed"] is True
+    call_id = result["call_id"]
+    server.complete_syscall(call_id, return_value=3)
+    assert [e[0] for e in logger.events] == ["syscall_call", "syscall_result"]
+    result_payload = logger.events[1][1]
+    assert result_payload["syscall"] == "openat"
+    assert result_payload["return_value"] == 3
+    assert len(logger.spans) == 1
+    assert logger.spans[0][0] == "syscall:openat"
+
+
+def test_build_app_complete_tool_route_records_result_and_span():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    client = TestClient(server.build_app())
+    admitted = client.post(
+        "/check_tool", json={"tool_name": "bash", "tool_input": {"cmd": "ls"}}
+    ).json()
+    response = client.post(
+        "/complete_tool", json={"call_id": admitted["call_id"], "result": {"stdout": "ok"}}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert [e[0] for e in logger.events] == ["tool_call", "tool_result"]
+    assert len(logger.spans) == 1
+
+
+def test_build_app_complete_syscall_route_records_result_and_span():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    client = TestClient(server.build_app())
+    admitted = client.post(
+        "/check_syscall",
+        json={
+            "syscall": "openat",
+            "pid": 1,
+            "tid": 1,
+            "argv": None,
+            "envp": None,
+            "path": "/tmp/x",
+            "timestamp": 0.0,
+        },
+    ).json()
+    response = client.post(
+        "/complete_syscall", json={"call_id": admitted["call_id"], "return_value": 3}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert [e[0] for e in logger.events] == ["syscall_call", "syscall_result"]
+    assert len(logger.spans) == 1
 
 
 def test_external_tool_admission_fences_redirects_before_policy_hook():

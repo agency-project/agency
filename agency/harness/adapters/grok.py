@@ -120,6 +120,7 @@ class _GrokBackend(agharness_backend):
                 runtime.token,
                 runtime.model or "default",
             )
+            self._write_grok_hooks(config_home)
 
             argv = [resolved, "-p", prompt, "--output-format", "json"]
             envp = {
@@ -129,8 +130,16 @@ class _GrokBackend(agharness_backend):
                 # and the documented isolation mechanism here: xAI's docs don't
                 # expose a Claude-Code-style "--setting-sources ''"/"--ignore-user-
                 # config" flag, so this is what actually keeps a scripted run from
-                # touching (or reading) the caller's real ~/.grok.
+                # touching (or reading) the caller's real ~/.grok. Per docs.x.ai/
+                # build/features/hooks, project/personal hooks normally live under
+                # <home>/hooks/*.json -- assumed (unverified, no live binary, see
+                # module docstring) to follow GROK_HOME the same way config.toml
+                # does.
                 "GROK_HOME": str(config_home),
+                # Read by agpolicy_hook.py (registered by _write_grok_hooks).
+                "AGPOLICY_BASE_URL": runtime.harness_base_url,
+                "AGPOLICY_TOKEN": runtime.token,
+                "AGPOLICY_STATE_DIR": str(config_home),
             }
 
             px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
@@ -175,6 +184,26 @@ class _GrokBackend(agharness_backend):
             f'api_backend = "chat_completions"\n'
         )
         (config_home / "config.toml").write_text(config_toml)
+
+    def _write_grok_hooks(self, config_home) -> None:
+        """Bridge Grok Build's own PreToolUse/PostToolUse hooks (per docs.
+        x.ai/build/features/hooks, near-identical payload shape to Claude
+        Code's/Codex's -- same shared hook script, see
+        _harness_permission_hook.py) to agpolicy admission and the host's
+        tool-call completion endpoint. Unverified against a live `grok`
+        binary (none available in this environment, see this module's
+        docstring)."""
+        from pathlib import Path
+
+        hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
+        hooks_dir = config_home / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook_path = hooks_dir / "agpolicy_hook.py"
+        hook_path.write_bytes(hook_src)
+        hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
+        (hooks_dir / "agpolicy.json").write_text(
+            json.dumps({"hooks": {"PreToolUse": [hook_command], "PostToolUse": [hook_command]}})
+        )
 
     @staticmethod
     def _parse_result_json(stdout: str) -> "tuple[str, dict, str | None]":

@@ -19,9 +19,10 @@ class _DenyPolicy:
 class _FakeLoop:
     decisions = []
 
-    def __init__(self, *, syscalls, syscall_hook) -> None:
+    def __init__(self, *, syscalls, syscall_hook, syscall_exit_hook=None) -> None:
         self.syscalls = syscalls
         self.syscall_hook = syscall_hook
+        self.syscall_exit_hook = syscall_exit_hook
 
     def start(self, argv, envp, cwd) -> None:
         del cwd

@@ -267,7 +267,6 @@ class _ClaudeCodeBackend(agharness_backend):
         max_steps: "int | None",
     ) -> AttemptResult:
         from .. import agharness
-        from ...observability.profiler import agprof
         from ..ptrace.supervisor import agProxyPtrace
 
         binary = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
@@ -313,15 +312,18 @@ class _ClaudeCodeBackend(agharness_backend):
                 )
 
             # Bridge Claude Code's PreToolUse permission check to agpolicy
-            # and its PreToolUse/PostToolUse boundaries to agprof: write the
-            # self-contained hook script into this launch's own
+            # and its PostToolUse/PostToolUseFailure boundaries to the same
+            # host-side admission+completion endpoints (agpolicy_hook.py):
+            # write the self-contained hook script into this launch's own
             # config_home (visible to `claude` in both the host and
             # in-container case, unlike a path in this package's own
             # install location, which the container can't see), then
             # register it via `--settings`' `hooks` block -- confirmed
             # directly against the real CLI that this composes fine with
             # `--setting-sources ""` below, and that omitting `matcher`
-            # hooks every tool call, not just one.
+            # hooks every tool call, not just one. Post hooks always run
+            # now (not gated on profiling) -- they report tool-call
+            # completion telemetry, not just profiler spans.
             hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
             hook_path = f"{config_home}/agpolicy_hook.py"
             if in_container:
@@ -329,15 +331,15 @@ class _ClaudeCodeBackend(agharness_backend):
             else:
                 Path(hook_path).write_bytes(hook_src)
             hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
-            hooks = {"PreToolUse": [hook_command]}
-            profile_hook_events = agprof.enabled()
-            if profile_hook_events:
-                # Post hooks exist solely for exact profiling. Do not make
-                # an unprofiled run spawn an extra Python process after
-                # every tool call just to discover AGPROF_* is unset.
-                hooks["PostToolUse"] = [hook_command]
-                hooks["PostToolUseFailure"] = [hook_command]
-            hooks_settings = json.dumps({"hooks": hooks})
+            hooks_settings = json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [hook_command],
+                        "PostToolUse": [hook_command],
+                        "PostToolUseFailure": [hook_command],
+                    }
+                }
+            )
 
             # --mcp-config -- point Claude Code's own native MCP client at
             # agmanager_harness's own "/mcp" reverse proxy (resource-control
@@ -372,6 +374,13 @@ class _ClaudeCodeBackend(agharness_backend):
                 # same per-run bearer token identifies the same agent.
                 "AGPOLICY_BASE_URL": runtime.harness_base_url,
                 "AGPOLICY_TOKEN": runtime.token,
+                # Lets agpolicy_hook.py persist a PreToolUse admission's
+                # call_id to a small per-tool_use_id file here, since the
+                # matching PostToolUse hook is a separate subprocess with no
+                # memory of it otherwise. Reuses config_home -- already a
+                # writable, per-launch directory this same process wrote
+                # the hook script into.
+                "AGPOLICY_STATE_DIR": str(config_home),
                 # Also explicitly unset so the CLI can't fall back to a
                 # locally-configured Bedrock/API-key credential path.
                 "CLAUDE_CODE_USE_BEDROCK": "0",
@@ -387,11 +396,6 @@ class _ClaudeCodeBackend(agharness_backend):
                 # logic and never cleaned up by cleanup_config_home either.
                 "CLAUDE_CONFIG_DIR": str(config_home),
             }
-            if profile_hook_events:
-                # Off-path stays free when profiling is disabled: without
-                # these variables the shared hook skips its profiler POST.
-                envp["AGPROF_BASE_URL"] = runtime.harness_base_url
-                envp["AGPROF_TOKEN"] = runtime.token
             if in_container:
                 # Deliberately does NOT forward the host's HOME: it points
                 # to a path that's meaningless (or, worse, coincidentally

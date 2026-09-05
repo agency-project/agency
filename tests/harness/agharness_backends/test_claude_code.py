@@ -148,11 +148,10 @@ def test_run_attempt_does_not_override_home(monkeypatch, _patch_which_finds_clau
     assert captured_envp.get("ANTHROPIC_AUTH_TOKEN") == "tok-1"
     assert "ANTHROPIC_API_KEY" not in captured_envp
     settings = json.loads(captured_argv[captured_argv.index("--settings") + 1])
-    assert set(settings["hooks"]) == {"PreToolUse"}
-    assert "AGPROF_BASE_URL" not in captured_envp
+    assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
 
 
-def test_run_attempt_enables_exact_claude_hooks_only_while_profiling(_patch_which_finds_claude):
+def test_run_attempt_always_registers_admission_and_completion_hooks(_patch_which_finds_claude):
     backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)
     handle = _make_handle(stdout='{"result": "ok"}')
@@ -163,17 +162,15 @@ def test_run_attempt_enables_exact_claude_hooks_only_while_profiling(_patch_whic
         captured["envp"] = envp
         return handle
 
-    with (
-        patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls,
-        patch("agency.observability.profiler.agprof.enabled", return_value=True),
-    ):
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls:
         ptrace_cls.return_value.launch.side_effect = fake_launch
         _run_attempt(backend, ag, harness_base_url="http://harness.local", token="tok-1")
 
     settings = json.loads(captured["argv"][captured["argv"].index("--settings") + 1])
     assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
-    assert captured["envp"]["AGPROF_BASE_URL"] == "http://harness.local"
-    assert captured["envp"]["AGPROF_TOKEN"] == "tok-1"
+    assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
+    assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
+    assert captured["envp"]["AGPOLICY_STATE_DIR"]
 
 
 def test_run_attempt_nonzero_exit_returns_error(_patch_which_finds_claude):

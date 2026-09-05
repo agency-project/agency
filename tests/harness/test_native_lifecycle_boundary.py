@@ -67,6 +67,10 @@ class _ControlBridge:
     def check_tool_policy(_tool_name, _tool_input):
         return {"decision": "allow", "reason": None}
 
+    @staticmethod
+    def complete_tool_policy(_call_id, _result):
+        pass
+
 
 def _tool_response(*labels):
     return {

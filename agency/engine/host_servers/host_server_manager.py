@@ -80,19 +80,20 @@ class HostServerManager:
             invocation=invocation,
             enable_message_overlay=getattr(agent, "harness", None) != "native",
         )
-        self._host_mcp_server = HostMcpServer(
-            sandbox,
-            skill,
-            resource_pool,
-            self._data_logger,
-            # Native tools have already passed the loop's admission fence.
-            invocation=invocation if getattr(agent, "harness", None) != "native" else None,
-        )
         self._interaction_server = HostInteractionServer(
             skill,
             self._data_logger,
             invocation=invocation,
             admit_tools=getattr(agent, "harness", None) != "native",
+        )
+        self._host_mcp_server = HostMcpServer(
+            sandbox,
+            skill,
+            resource_pool,
+            self._data_logger,
+            self._interaction_server,
+            # Native tools have already passed the loop's admission fence.
+            invocation=invocation if getattr(agent, "harness", None) != "native" else None,
         )
         self.change_config(agent.agconfig)
 

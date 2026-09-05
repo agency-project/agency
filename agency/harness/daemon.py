@@ -40,6 +40,14 @@ class _HostSyscallPolicy:
     def check(self, _agent, syscall):
         return self._host_services.check_syscall_policy(self._attempt_token, syscall)
 
+    def check_completion(self, _agent, call_id: "str | None", return_value: int) -> None:
+        # A denied (never admitted) syscall has no call_id -- the ptrace
+        # exit-hook only fires for admitted syscalls anyway (see
+        # _tracer_loop.py), but stay defensive here too.
+        if not call_id:
+            return
+        self._host_services.complete_syscall_policy(self._attempt_token, call_id, return_value)
+
 
 class _LocalSandboxBackend:
     IMAGE_KIND = "container"

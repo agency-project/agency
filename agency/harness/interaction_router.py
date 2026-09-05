@@ -40,6 +40,20 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
         )
         return JSONResponse(decision)
 
+    @router.post("/agpolicy/complete_tool")
+    async def agpolicy_complete_tool(request: Request):
+        token = extract_bearer_token(request)
+        if not token or not bridge.validate_token(token):
+            return JSONResponse({"error": "unknown or missing bearer token"}, status_code=401)
+        body = await request.json()
+        call_id = body.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return JSONResponse({"error": "invalid call_id"}, status_code=400)
+        await asyncio.to_thread(
+            bridge.complete_tool_policy, token, call_id, body.get("result"), body.get("error")
+        )
+        return JSONResponse({"ok": True})
+
     @router.post("/agprof/hook")
     async def agprof_hook(request: Request):
         token = extract_bearer_token(request)

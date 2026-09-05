@@ -133,6 +133,8 @@ class _CodexBackend(agharness_backend):
         prior_session_blob: "bytes | None",
         max_steps: "int | None",
     ) -> AttemptResult:
+        from pathlib import Path
+
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
 
@@ -151,6 +153,22 @@ class _CodexBackend(agharness_backend):
                 config_home, runtime.harness_base_url, runtime.model or "default"
             )
 
+            # Bridge Codex's own PreToolUse/PostToolUse hooks (near-identical
+            # payload shape to Claude Code's -- same shared hook script, see
+            # _harness_permission_hook.py) to agpolicy admission and the
+            # host's tool-call completion endpoint. Unverified against a
+            # live `codex` binary (none available in this environment, see
+            # this module's docstring) -- modeled on Claude Code's own
+            # settings.json `hooks` shape and CODEX_HOME redirecting the
+            # whole config directory the same way it does for config.toml.
+            hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
+            hook_path = config_home / "agpolicy_hook.py"
+            hook_path.write_bytes(hook_src)
+            hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
+            (config_home / "hooks.json").write_text(
+                json.dumps({"hooks": {"PreToolUse": [hook_command], "PostToolUse": [hook_command]}})
+            )
+
             # --ignore-user-config keeps this run from inheriting the
             # caller's own ~/.codex/config.toml, matching the same
             # isolated-config-home intent as the other two backends.
@@ -162,6 +180,10 @@ class _CodexBackend(agharness_backend):
                 # provider's API key from the env var *named* there, not
                 # from an inline value in config.toml.
                 self._ENV_KEY_NAME: runtime.token,
+                # Read by agpolicy_hook.py (registered above).
+                "AGPOLICY_BASE_URL": runtime.harness_base_url,
+                "AGPOLICY_TOKEN": runtime.token,
+                "AGPOLICY_STATE_DIR": str(config_home),
             }
 
             px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)

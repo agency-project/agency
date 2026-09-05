@@ -206,11 +206,22 @@ class HostServicesClient:
         return {
             "decision": "allow" if result.get("allowed") else "deny",
             "reason": result.get("reason"),
+            "call_id": result.get("call_id"),
         }
+
+    def complete_tool_policy(
+        self, token: str, call_id: str, result: object = None, error: "str | None" = None
+    ) -> None:
+        response = self.client.post(
+            "/interaction/complete_tool",
+            json={"call_id": call_id, "result": result, "error": error},
+            headers=self._attempt_headers(token),
+        )
+        response.raise_for_status()
 
     def check_syscall_policy(
         self, token: str, syscall: "agsyscallevent"
-    ) -> "bool | tuple[bool, str]":
+    ) -> "tuple[bool, str | None, str | None]":
         response = self.client.post(
             "/interaction/check_syscall",
             json=asdict(syscall),
@@ -218,9 +229,21 @@ class HostServicesClient:
         )
         response.raise_for_status()
         result = response.json()
-        allowed = bool(result.get("allowed"))
-        reason = result.get("reason")
-        return (allowed, reason) if reason else allowed
+        return bool(result.get("allowed")), result.get("reason"), result.get("call_id")
+
+    def complete_syscall_policy(
+        self,
+        token: str,
+        call_id: str,
+        return_value: "int | None" = None,
+        error: "str | None" = None,
+    ) -> None:
+        response = self.client.post(
+            "/interaction/complete_syscall",
+            json={"call_id": call_id, "return_value": return_value, "error": error},
+            headers=self._attempt_headers(token),
+        )
+        response.raise_for_status()
 
     def dispatch(self, token: str, agency_context: dict) -> dict:
         resp = self.client.post(
