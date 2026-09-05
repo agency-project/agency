@@ -329,7 +329,7 @@ def test_checkpoint_route_validates_wire_shape_and_uses_noop_without_invocation(
 def test_paused_checkpoint_disconnect_wakes_and_joins_its_worker():
     control = AgentControl()
     invocation = control.begin_invocation("native")
-    invocation.send_message("keep for reconnect")
+    invocation.redirect("keep for reconnect")
     invocation.pause()
     worker_exited = threading.Event()
     original_checkpoint = invocation._checkpoint_interruptibly
@@ -561,3 +561,22 @@ def test_build_app_record_span_route_delegates_to_data_logger():
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert logger.spans == [("llm:attempt", 0.0, 1.0, {"model": "x"}, None, None, None, None, None)]
+
+
+def test_external_tool_admission_fences_redirects_before_policy_hook():
+    handle = AgentControl().begin_invocation("external")
+    called = []
+    server = _make_server(
+        policy=agpolicy(tool_hooks={"tool": lambda args: called.append(args) or True}),
+        invocation=handle,
+    )
+    assert server.check_tool("tool", {"first": True})[0]
+    handle.redirect("stop these actions")
+    allowed, reason = server.check_tool("tool", {"stale": True})
+    assert not allowed
+    assert "Return to the model" in reason
+    assert called == [{"first": True}]
+    snapshot = handle._checkpoint("model", allow_messages=True, phase="model")
+    assert not server.check_tool("tool", {})[0]
+    handle._acknowledge_redirects(snapshot.invocation_messages)
+    assert server.check_tool("tool", {"revised": True})[0]

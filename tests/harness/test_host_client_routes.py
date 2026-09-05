@@ -27,6 +27,10 @@ def _bridge(handler, token: str = "token"):
         transport=httpx.MockTransport(handler),
         base_url="http://agency-host",
     )
+    bridge._new_mcp_async_client = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://agency-host",
+    )
     bridge._profiler_synced_tokens = set()
     bridge._attempt_token_lock = threading.Lock()
     bridge._active_attempt_token = None
@@ -358,12 +362,16 @@ def test_checkpoint_route_cancels_its_upstream_uds_request_on_client_disconnect(
 def test_mcp_proxy_requires_active_token_replaces_spoofed_header_and_preserves_response_headers():
     seen = []
 
+    class JsonResponseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"jsonrpc":"2.0","result":{}}'
+
     def handler(request):
         seen.append(request)
         assert request.headers[ATTEMPT_TOKEN_HEADER] == "token"
         return httpx.Response(
             200,
-            content=b'{"jsonrpc":"2.0","result":{}}',
+            stream=JsonResponseStream(),
             headers={
                 "content-type": "application/json",
                 "mcp-session-id": "session-1",
@@ -392,3 +400,83 @@ def test_mcp_proxy_requires_active_token_replaces_spoofed_header_and_preserves_r
     assert response.json() == {"jsonrpc": "2.0", "result": {}}
     assert len(seen) == 1
     assert dict(seen[0].url.params) == {"mode": "test"}
+
+
+def test_mcp_proxy_streams_and_closes_long_lived_upstream_on_client_disconnect():
+    class LongLivedStream(httpx.AsyncByteStream):
+        def __init__(self):
+            self.closed = asyncio.Event()
+            self.keep_open = asyncio.Event()
+
+        async def __aiter__(self):
+            yield b"event: endpoint\ndata: /messages\n\n"
+            await self.keep_open.wait()
+
+        async def aclose(self):
+            self.closed.set()
+
+    async def scenario():
+        stream = LongLivedStream()
+        seen = []
+
+        async def handler(request):
+            seen.append(request)
+            return httpx.Response(
+                200,
+                stream=stream,
+                headers={"content-type": "text/event-stream"},
+            )
+
+        bridge = _bridge(handler)
+        app = FastAPI()
+        app.include_router(build_mcp_router(bridge))
+        first_chunk_sent = asyncio.Event()
+        request_delivered = False
+        sent = []
+
+        async def receive():
+            nonlocal request_delivered
+            if not request_delivered:
+                request_delivered = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await first_chunk_sent.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_chunk_sent.set()
+
+        await app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/mcp",
+                "raw_path": b"/mcp",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [(b"authorization", b"Bearer token")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+            },
+            receive,
+            send,
+        )
+        bridge.close()
+        stream.keep_open.set()
+
+        assert len(seen) == 1
+        assert seen[0].headers[ATTEMPT_TOKEN_HEADER] == "token"
+        assert sent[0]["type"] == "http.response.start"
+        assert sent[0]["status"] == 200
+        assert any(
+            message["type"] == "http.response.body"
+            and message.get("body") == b"event: endpoint\ndata: /messages\n\n"
+            for message in sent
+        )
+        assert stream.closed.is_set()
+
+    asyncio.run(scenario())

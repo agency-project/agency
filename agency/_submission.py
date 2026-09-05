@@ -192,7 +192,7 @@ class MessageSubmission(Submission, _AgdataResultHandle):
             self._state = "CANCELLING"
 
     def __getattr__(self, name: str):
-        if name in {"send_message", "pause", "resume", "cancel"}:
+        if name in {"redirect", "pause", "resume", "cancel"}:
             raise AttributeError(f"MessageSubmission has no {name}() control")
         return super().__getattr__(name)
 

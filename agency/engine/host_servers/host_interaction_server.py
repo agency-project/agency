@@ -24,6 +24,7 @@ class HostInteractionServer:
         data_logger: "agDataLogger",
         *,
         invocation=None,
+        admit_tools: bool = True,
     ) -> None:
         self._policy = skill.policy
         self._data_logger = data_logger
@@ -31,10 +32,14 @@ class HostInteractionServer:
         # sandbox never supplies an invocation id and therefore cannot target
         # another request's lifecycle state.
         self._invocation = invocation
+        self._admit_tools = admit_tools
 
     def checkpoint(self, boundary_id: str, *, allow_messages: bool, phase: str) -> dict:
         if self._invocation is None:
-            return {"cancelled": False, "destroyed": False, "invocation_messages": []}
+            result = {"cancelled": False, "destroyed": False, "invocation_messages": []}
+            if phase == "action":
+                result["action_admitted"] = True
+            return result
         decision = self._invocation._checkpoint(
             boundary_id,
             allow_messages=allow_messages,
@@ -49,7 +54,7 @@ class HostInteractionServer:
                 item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
             )
 
-        return {
+        result = {
             "cancelled": bool(value(decision, "cancelled", False)),
             "destroyed": bool(value(decision, "destroyed", False)),
             "invocation_messages": [
@@ -60,6 +65,9 @@ class HostInteractionServer:
                 for entry in (value(decision, "invocation_messages", ()) or ())
             ],
         }
+        if value(decision, "action_admitted", False):
+            result["action_admitted"] = True
+        return result
 
     def _checkpoint_interruptibly(
         self,
@@ -73,7 +81,7 @@ class HostInteractionServer:
             return (
                 None
                 if abort_event.is_set()
-                else {"cancelled": False, "destroyed": False, "invocation_messages": []}
+                else self.checkpoint(boundary_id, allow_messages=allow_messages, phase=phase)
             )
         checkpoint = getattr(self._invocation, "_checkpoint_interruptibly", None)
         if checkpoint is None:
@@ -101,6 +109,17 @@ class HostInteractionServer:
         abort(abort_event)
 
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
+        if self._invocation is not None and self._admit_tools:
+            decision = self._invocation._checkpoint(
+                "external:action", allow_messages=False, phase="action"
+            )
+            if decision.destroyed or decision.cancelled:
+                return False, "agent invocation stopped"
+            if not decision.action_admitted:
+                return (
+                    False,
+                    "Invocation redirected. Return to the model before taking another action.",
+                )
         hook = (self._policy.tool_hooks or {}).get(tool_name)
         if hook is None:
             return (not self._policy.default_to_deny, None)

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 
 class _NoopDecision:
+    action_admitted = True
     cancelled = False
     destroyed = False
     invocation_messages: tuple = ()

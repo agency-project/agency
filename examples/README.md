@@ -17,6 +17,21 @@ Please refer to the main README.md at project root for other LLM APIs, such as O
 
 ---
 
+## redirect_claude_code_luna.py
+
+**What it shows:** The smallest deterministic `Invocation.redirect()` test using
+the Claude Code harness with OpenAI's `gpt-5.6-luna` model. The agent is suspended
+before submission so the redirect is queued before the first model request, then
+resumed to produce the redirected answer (`blue` instead of `red`).
+
+Requires `OPENAI_API_KEY` and an installed, authenticated `claude` CLI.
+
+```bash
+uv run python examples/redirect_claude_code_luna.py
+```
+
+---
+
 ## base_example.py
 
 **What it shows:** The simplest complete agent — one agent, two skills, shared history.

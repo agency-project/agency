@@ -13,8 +13,9 @@ import socket
 import struct
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AsyncIterator
 
 import httpx
 
@@ -251,7 +252,8 @@ class HostServicesClient:
                 if item["type"] == "done":
                     return
 
-    def forward_mcp_request(
+    @asynccontextmanager
+    async def forward_mcp_request(
         self,
         token: str,
         method: str,
@@ -259,20 +261,36 @@ class HostServicesClient:
         content: bytes,
         headers: dict[str, str],
         params: dict[str, str],
-    ) -> httpx.Response:
-        """Forward MCP while replacing any sandbox-supplied attempt header."""
+    ) -> AsyncIterator[httpx.Response]:
+        """Stream MCP while replacing any sandbox-supplied attempt header.
+
+        A streamable-HTTP GET may stay open for the lifetime of an MCP client.
+        Keeping the async response context open lets the proxy forward chunks
+        immediately and, critically, cancel the UDS request when that client
+        disconnects.
+        """
         upstream_headers = {
             key: value
             for key, value in headers.items()
             if key.lower() != ATTEMPT_TOKEN_HEADER.lower()
         }
         upstream_headers.update(self._attempt_headers(token))
-        return self.client.request(
-            method,
-            "/mcp",
-            content=content,
-            headers=upstream_headers,
-            params=params,
+        async with self._new_mcp_async_client() as client:
+            async with client.stream(
+                method,
+                "/mcp",
+                content=content,
+                headers=upstream_headers,
+                params=params,
+            ) as response:
+                yield response
+
+    def _new_mcp_async_client(self) -> httpx.AsyncClient:
+        transport = httpx.AsyncHTTPTransport(uds=self._uds_path)
+        return httpx.AsyncClient(
+            transport=transport,
+            base_url="http://agmanager-host",
+            timeout=self._timeout_s,
         )
 
     def forward_profiler_event(self, token: str, event: dict) -> dict:
