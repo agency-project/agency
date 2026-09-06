@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from ...harness._syscall_event import agsyscallevent
+from ...observability.profiler import agprof
 
 if TYPE_CHECKING:
     from ...observability.agdatalogger import agDataLogger
@@ -28,7 +29,11 @@ class HostInteractionServer:
         *,
         invocation=None,
         admit_tools: bool = True,
+        parent_context=None,
+        profile_attributes: dict | None = None,
     ) -> None:
+        self._profile_context = parent_context
+        self._profile_attributes = dict(profile_attributes or {})
         self._policy = skill.policy
         self._data_logger = data_logger
         self._agname = agname  # for _record_admission's term_message tag
@@ -184,21 +189,61 @@ class HostInteractionServer:
         )
         if allowed:
             with self._pending_calls_lock:
-                self._pending_calls[call_id] = (kind, name, attributes, time.time())
+                started = time.time_ns()
+                profile_span = agprof.start_external_span(
+                    f"{kind}:{name}",
+                    start_perf_ns=time.perf_counter_ns(),
+                    start_wall_ns=started,
+                    metadata={
+                        **self._profile_attributes,
+                        "call_id": call_id,
+                        "timing": "hook_boundary",
+                        "provenance": "host_observed",
+                    },
+                    parent_context=self._profile_context,
+                )
+                self._pending_calls[call_id] = (kind, name, attributes, started / 1e9, profile_span)
         return call_id
 
     def _record_completion(self, kind: str, call_id: str, extra: dict) -> None:
         with self._pending_calls_lock:
-            pending = self._pending_calls.pop(call_id, None)
+            pending = self._pending_calls.get(call_id)
+            if pending is not None and pending[0] == kind:
+                self._pending_calls.pop(call_id)
+            else:
+                pending = None
         if pending is None:
             # Unknown, already-completed, or never-admitted (denied) call --
             # a no-op, not an error: callers report completion best-effort
             # and shouldn't have to track admission outcomes themselves.
             return
-        _kind, name, attributes, start_ts = pending
-        end_ts = time.time()
+        _kind, name, attributes, start_ts, profile_span = pending
+        end_perf_ns, end_wall_ns = time.perf_counter_ns(), time.time_ns()
+        end_ts = end_wall_ns / 1e9
+        outcome = "failure" if extra.get("error") is not None else "success"
+        if kind == "syscall" and extra.get("return_value") is None and extra.get("error") is None:
+            outcome = "unknown"
+        if profile_span is not None:
+            profile_span.end(
+                end_perf_ns=end_perf_ns, end_wall_ns=end_wall_ns, metadata={"outcome": outcome}
+            )
         self.record_event(f"{kind}_result", {**attributes, **extra, "call_id": call_id})
-        self.record_span(f"{kind}:{name}", start_ts, end_ts, {**attributes, "call_id": call_id})
+        self.record_span(
+            f"{kind}:{name}",
+            start_ts,
+            end_ts,
+            {**attributes, "call_id": call_id, "outcome": outcome, "timing": "hook_boundary"},
+        )
+
+    def finalize_profile(self) -> None:
+        """Retired attempts cannot finish later; retain unmatched starts explicitly."""
+        with self._pending_calls_lock:
+            pending = list(self._pending_calls.values())
+            self._pending_calls.clear()
+        for _kind, _name, _attrs, _start, span in pending:
+            agprof.interrupt_external_span(span)
+        if pending:
+            agprof.telemetry_error("unmatched_completions", len(pending))
 
     def admit_tool_call(self, tool_name: str, tool_input: dict) -> dict:
         """Admission + telemetry entry point for a tool call: decide

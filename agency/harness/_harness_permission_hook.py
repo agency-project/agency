@@ -181,6 +181,8 @@ def _report_completion(payload: dict, hook_event_name: str) -> None:
 
     result = payload.get("tool_response")
     error = payload.get("error")
+    if hook_event_name == "PostToolUseFailure" and error is None:
+        error = "Tool reported failure"
     encoded_result = json.dumps(result, default=str)
     if len(encoded_result) > _MAX_RESULT_FIELD_CHARS:
         result = {"_truncated_json": encoded_result[:_MAX_RESULT_FIELD_CHARS] + "…[truncated]"}

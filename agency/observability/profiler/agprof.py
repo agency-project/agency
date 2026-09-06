@@ -643,12 +643,25 @@ class _ObservedSpan:
         with _open_spans_lock:
             _open_spans[id(self)] = self
 
+    def context(self):
+        """Durable parent identity, available before the interval completes."""
+        from opentelemetry.trace import set_span_in_context
+
+        with self._lock:
+            if self._span is None:
+                self._span = self._tracer.start_span(
+                    self._name, context=self._parent_context, start_time=self._wall0
+                )
+            return set_span_in_context(self._span)
+
     def update(self, name: "str | None" = None, **metadata) -> None:
         with self._lock:
             if self._ended or self._interrupted or self._cancelled:
                 return
             if name is not None and name != self._name:
                 self._name = name
+                if self._span is not None:
+                    self._span.update_name(name)
             self._metadata.update(metadata)
 
     def end(
@@ -688,10 +701,8 @@ class _ObservedSpan:
                 "agency.perf_start_ns": effective_start_perf_ns,
                 "agency.wall_ns": wall_ns,
             }
-            span = self._tracer.start_span(
-                self._name,
-                context=self._parent_context,
-                start_time=effective_start_wall_ns,
+            span = self._span or self._tracer.start_span(
+                self._name, context=self._parent_context, start_time=effective_start_wall_ns
             )
             self._span = span
             for key, value in {**completed_metadata, **measurements}.items():
@@ -727,10 +738,8 @@ class _ObservedSpan:
                 "agency.perf_start_ns": self._t0,
                 "agency.wall_ns": wall_ns,
             }
-            span = self._tracer.start_span(
-                self._name,
-                context=self._parent_context,
-                start_time=self._wall0,
+            span = self._span or self._tracer.start_span(
+                self._name, context=self._parent_context, start_time=self._wall0
             )
             self._span = span
             for key, value in attributes.items():
@@ -775,6 +784,24 @@ def span(name: str, *, parent_context=None):
     if s is None:
         return _NULL
     return s.span(name, parent_context=parent_context)
+
+
+def register_engine(engine: str) -> None:
+    if not enabled():
+        return
+    _engine_coverage[str(engine)] = {
+        "llm": "host_observed",
+        "tools": "admission_completion_boundaries",
+        "turns": "container_asserted" if engine == "native" else "unavailable",
+        "retries": "unavailable",
+        "automatic_functions": "host_only",
+        "reason": "External harness internals require cooperative events; no transcript timing inference.",
+    }
+
+
+def telemetry_error(kind: str, count: int = 1) -> None:
+    if enabled():
+        _health[kind] += count
 
 
 def current_span_context():
@@ -928,6 +955,8 @@ def cancel_external_span(external_span: "_ObservedSpan | None") -> None:
                 return
             external_span._ended = True
             external_span._cancelled = True
+            if external_span._span is not None:
+                external_span._span.end(end_time=time.time_ns())
 
 
 def _resolve_auto_roots(include) -> list[tuple[str, str]]:

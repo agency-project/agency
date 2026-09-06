@@ -513,6 +513,7 @@ class GlobalAgentOrchestrator:
             start_wall_ns=submitted_wall_ns,
             metadata={
                 "request_kind": kind,
+                "harness": ag.harness,
                 "request_id": request_id,
                 "skill": skill_name,
                 "agency.run_id": request_id,
@@ -522,6 +523,8 @@ class GlobalAgentOrchestrator:
             parent_context=parent_context,
             data_span_name="request:submission_to_completion",
         )
+        if request.run_span is not None:
+            request.parent_context = request.run_span.context()
         submission._bind_request(request_id)
         self._requests[request_id] = request
         self._future_producers[request.result_future] = request_id

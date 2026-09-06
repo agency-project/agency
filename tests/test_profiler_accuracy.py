@@ -40,3 +40,42 @@ def test_unreported_retries_and_resources_are_unavailable():
     assert result["coverage"]["resources"]["state"] == "unavailable"
     assert result["coverage"]["tools"]["state"] == "unavailable"
     assert result["sampling"]["lossless"] is False
+
+
+def test_admission_spans_reach_profile_and_keep_parent_on_retirement(monkeypatch, tmp_path):
+    import time
+    from types import SimpleNamespace
+    from agency.agpolicy import agpolicy
+    from agency.engine.host_servers.host_interaction_server import HostInteractionServer
+
+    class Logger:
+        def record_event(self, *args, **kwargs):
+            pass
+
+        def record_span(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    with agprof.session(tmp_path, sample_hz=0, auto_functions=False):
+        run = agprof.start_external_span(
+            "run0:test:agent", start_perf_ns=time.perf_counter_ns(), start_wall_ns=time.time_ns()
+        )
+        server = HostInteractionServer(
+            SimpleNamespace(policy=agpolicy()), Logger(), parent_context=run.context()
+        )
+        completed = server.admit_tool_call("read", {})["call_id"]
+        lost = server.admit_tool_call("write", {})["call_id"]
+        # A completion of the wrong kind cannot consume a tool admission.
+        server.complete_syscall(lost, 0)
+        server.complete_tool_call(completed, error="failed")
+        server.complete_tool_call(completed)
+        server.finalize_profile()
+        run.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
+    records = {r[1]: r for r in agprof.profile_records()}
+    assert records["tool:read"][8] == records["run0:test:agent"][7]
+    assert records["tool:read"][6]["outcome"] == "failure"
+    result = agprof.summary_metrics()
+    assert result["tool_metrics"]["completed"] == 1
+    assert result["tool_metrics"]["interrupted"] == 1
+    assert result["tool_metrics"]["latency"]["p95_ms"] is None
+    assert result["sampling"]["telemetry_errors"]["unmatched_completions"] == 1

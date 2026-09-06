@@ -70,6 +70,7 @@ class HostServerManager:
     ) -> None:
         from ...observability.profiler import agprof
 
+        agprof.register_engine(getattr(agent, "harness", "unknown"))
         self._ensure_runtime_configs(agent.agconfig)
         self._data_logger = agent.data_logger
         self._llm_handler_server = LlmHandlerServer(
@@ -86,6 +87,11 @@ class HostServerManager:
             agent.agname,
             invocation=invocation,
             admit_tools=getattr(agent, "harness", None) != "native",
+            parent_context=agprof.current_span_context(),
+            profile_attributes={
+                **agprof.current_span_attributes(),
+                "harness": getattr(agent, "harness", "unknown"),
+            },
         )
         self._host_mcp_server = HostMcpServer(
             sandbox,
@@ -156,6 +162,7 @@ class HostServerManager:
             )
             self._attempt_inflight.pop(token, None)
             self._retiring_attempt_token = None
+            self._interaction_server.finalize_profile()
             self._attempt_token_condition.notify_all()
             return True
 
@@ -341,6 +348,7 @@ class HostServerManager:
                             "HostServerManager attempt traffic did not drain during shutdown"
                         )
 
+            self._interaction_server.finalize_profile()
             if server_error is not None:
                 raise server_error
             if lease_error is not None:
