@@ -211,6 +211,10 @@ class sandboxconfig(confignamespace):
     mounts: "dict[str, tuple[str, str, str]]" = field(default_factory=dict)
 
     backend: str = "auto"  # podman | docker | chroot | auto
+    # Container creation constraints, retained across hibernation and rollback.
+    # Changing these on an existing container requires recreating that container.
+    cpuset_cpus: "str | None" = None
+    cpuset_mems: "str | None" = None
     inspect_timeout_s: float = 120
     exec_quick_timeout_s: float = 120
     docker_run_timeout_s: float = 120

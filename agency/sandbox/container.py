@@ -905,6 +905,17 @@ class _ContainerBackendBase(agsandbox_backend):
             cgroup_flags = [f"--cgroup-parent={cgroup_parent}"]
         self._acquire_runtime_slot()
         try:
+            # A restored image does not carry HostConfig resource constraints.
+            # Apply the same limits on fresh creation and rollback recreation.
+            limit_flags = []
+            if self._agconfig.resources.idle_memory is not None:
+                limit_flags.append(f"--memory={self._agconfig.resources.idle_memory}")
+            if self._cfs_supported():
+                limit_flags.append(f"--cpus={self._agconfig.resources.idle_cpus}")
+            if self._agconfig.sandbox.cpuset_cpus is not None:
+                limit_flags.append(f"--cpuset-cpus={self._agconfig.sandbox.cpuset_cpus}")
+            if self._agconfig.sandbox.cpuset_mems is not None:
+                limit_flags.append(f"--cpuset-mems={self._agconfig.sandbox.cpuset_mems}")
             if self._checkpoint_image is not None:
                 # Restart from last committed checkpoint (set by commit()).
                 # /workspace and all state from the previous tool call are preserved.
@@ -912,6 +923,7 @@ class _ContainerBackendBase(agsandbox_backend):
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
+                    + limit_flags
                     + cgroup_flags
                     + gpu_flags
                     + self._vol_flags
@@ -921,11 +933,6 @@ class _ContainerBackendBase(agsandbox_backend):
                 # Keep _checkpoint_image — not a one-shot restore, needed for future restarts.
             else:
                 image = self._resolve_image(self._base_image)
-                limit_flags = []
-                if self._agconfig.resources.idle_memory is not None:
-                    limit_flags.append(f"--memory={self._agconfig.resources.idle_memory}")
-                if self._cfs_supported():
-                    limit_flags.append(f"--cpus={self._agconfig.resources.idle_cpus}")
                 run_cmd = (
                     [self._runtime, "run", "-d", "--init", "--name", name]
                     + ["--label", f"{_AGENCY_OWNER_PID_LABEL}={self._owner_pid}"]
