@@ -45,6 +45,18 @@ python examples/base_example.py
 
 ---
 
+## sandbox_mcp_tools.py
+
+**What it shows:** The smallest sandbox-side MCP tool: `double` is an `agtool`
+sent to the sandbox only via `add_sandbox_mcp_tools`, using Claude Code on
+GPT-5.6-luna.
+
+```bash
+uv run python examples/sandbox_mcp_tools.py
+```
+
+---
+
 ## parallel_exec.py
 
 **What it shows:** The two natural parallelism patterns the framework enables.
