@@ -581,6 +581,8 @@ def test_profiler_routes_all_spans_to_agprofs_own_data_logger(monkeypatch, tmp_p
     )
     assert engine_attributes["request_id"] == "run0"
     assert engine_attributes["skill"] == "profiled"
+    assert engine_attributes["outcome"] == "success"
+    assert engine_attributes["lifecycle_outcome"] == "succeeded"
 
 
 def test_agents_keep_separate_data_loggers(tmp_path):

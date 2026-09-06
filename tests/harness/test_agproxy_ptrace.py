@@ -416,9 +416,13 @@ def test_exec_callback_is_success_only_kernel_named_and_replay_safe(monkeypatch)
 
     from agency.harness.ptrace import _tracer_loop
 
+    completions = []
     loop = _tracer_loop.TracerLoop(
         syscalls=("execve",),
-        syscall_hook=lambda _stop: _tracer_loop.StopDecision(kind="allow"),
+        syscall_hook=lambda _stop: _tracer_loop.StopDecision(kind="allow", call_id="exec-call"),
+        syscall_exit_hook=lambda stop, call_id, return_value: completions.append(
+            (stop.path, call_id, return_value)
+        ),
     )
     pid = 9201
     loop._remember_spawn(pid)
@@ -440,6 +444,7 @@ def test_exec_callback_is_success_only_kernel_named_and_replay_safe(monkeypatch)
     monkeypatch.setattr(_tracer_loop, "_kernel_executable_path", lambda _pid: kernel_path[0])
     loop._handle_seccomp_stop(pid)
     loop._commit_exec(pid)
+    assert completions == [("/tmp/credential-parent/old-image", "exec-call", 0)]
 
     # Registration after a successful exec replays the committed image.
     execs = []
@@ -452,6 +457,7 @@ def test_exec_callback_is_success_only_kernel_named_and_replay_safe(monkeypatch)
     loop._handle_seccomp_stop(pid)
     assert loop._pending_exec_paths[pid] == "/does/not/exist"
     assert execs == [(pid, "/tmp/credential-parent/old-image")]
+    assert completions == [("/tmp/credential-parent/old-image", "exec-call", 0)]
 
     # A subsequent success overwrites the stale candidate. The confirmed
     # syscall pathname wins over attacker-controlled argv[0] and keeps a
@@ -460,6 +466,7 @@ def test_exec_callback_is_success_only_kernel_named_and_replay_safe(monkeypatch)
     kernel_path[0] = "/usr/bin/true"
     loop._handle_seccomp_stop(pid)
     loop._commit_exec(pid)
+    assert completions[-1] == ("/tmp/credential-parent/symlink", "exec-call", 0)
     assert execs == [
         (pid, "/tmp/credential-parent/old-image"),
         (pid, "/tmp/credential-parent/symlink"),

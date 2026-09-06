@@ -84,6 +84,13 @@ def test_external_profiler_span_flows_to_agprofs_own_data_logger(monkeypatch, tm
     assert row[:3] == ("sync:scheduler_queue", 2.0, 2.25)
     assert row[3] is None  # Remote CPU/wait were not measured.
     assert json.loads(row[4])["request_id"] == "run3"
+    record = agprof.profile_records()[0]
+    assert record[4] is None
+    assert record[5] is None
+    summary_row = agprof.summary_metrics()["span_metrics"][0]
+    assert summary_row["cpu_ms"] is None
+    assert summary_row["runqueue_ms"] is None
+    assert summary_row["blocked_ms"] is None
 
 
 def test_external_data_span_name_preserves_profiler_trace_name(monkeypatch):

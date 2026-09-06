@@ -155,7 +155,11 @@ class agDataLogger:
                     profile_span_name,
                     int(start_perf_ns),
                     int(wall_ns),
-                    int(attributes.get("agency.cpu_ns", 0)),
+                    (
+                        None
+                        if attributes.get("agency.cpu_ns") is None
+                        else int(attributes["agency.cpu_ns"])
+                    ),
                     (
                         None
                         if attributes.get("agency.runq_ns") is None

@@ -631,7 +631,8 @@ class GlobalAgentOrchestrator:
                 )
                 completion = self._perform_execution(request)
                 agprof.annotate(
-                    outcome=completion.outcome,
+                    outcome="success" if completion.outcome == "succeeded" else "failure",
+                    lifecycle_outcome=completion.outcome,
                     error_type="skill_error" if completion.failed else None,
                 )
         except BaseException as exc:

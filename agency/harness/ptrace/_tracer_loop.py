@@ -585,16 +585,24 @@ class TracerLoop:
         with self._lock:
             staged_path = self._pending_exec_paths.pop(pid, None)
             # A successful exec never produces the syscall-exit-stop this
-            # entry was waiting for -- PTRACE_EVENT_EXEC preempts it.
-            self._pending_syscall_exit.pop(pid, None)
+            # entry was waiting for -- PTRACE_EVENT_EXEC preempts it. Retain
+            # the admission so the exec event can complete it below.
+            pending_exit = self._pending_syscall_exit.pop(pid, None)
             executable_path = staged_path or procfs_path
-            if pid not in self._process_pids:
-                return
-            self._exec_log.append((pid, executable_path))
-            callbacks = list(self._exec_callbacks)
+            is_process = pid in self._process_pids
+            if is_process:
+                self._exec_log.append((pid, executable_path))
+                callbacks = list(self._exec_callbacks)
+            else:
+                callbacks = []
+        if pending_exit is not None and self._syscall_exit_hook is not None:
+            stop, call_id = pending_exit
+            # execve has no userspace return on success. The kernel exec event
+            # is the authoritative successful completion boundary.
+            self._syscall_exit_hook(stop, call_id, 0)
         for callback in callbacks:
             callback(pid, executable_path)
-        if pid == self.root_pid:
+        if is_process and pid == self.root_pid:
             # Callbacks are synchronous while the tracee is stopped. Publish
             # readiness only after lifecycle consumers have applied the
             # kernel-confirmed executable name.
