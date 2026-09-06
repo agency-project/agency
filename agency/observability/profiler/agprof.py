@@ -48,6 +48,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import Counter
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -74,6 +75,8 @@ _open_spans_lock = threading.Lock()
 _interrupted_spans: "list[dict]" = []
 _last_summary: "dict[str, dict] | None" = None
 _last_run_summary: "dict | None" = None
+_health = Counter()
+_engine_coverage: dict[str, dict] = {}
 
 _tls = threading.local()  # per-thread schedstat file cache only
 _span_stack: "ContextVar[tuple[_TimedSpan, ...]]" = ContextVar("agprof_span_stack", default=())
@@ -405,7 +408,11 @@ def _record_data_logger_span(
     if data_logger is None:
         return False
     wall_ns = max(0, end_wall_ns - start_wall_ns)
-    blocked_ns = max(0, wall_ns - (cpu_ns or 0) - (runqueue_ns or 0))
+    blocked_ns = (
+        None
+        if cpu_ns is None or runqueue_ns is None
+        else max(0, attributes.get("agency.wall_ns", wall_ns) - cpu_ns - runqueue_ns)
+    )
     logger_attributes = dict(attributes)
     if profile_session_id is not None:
         logger_attributes["agency.profile_session_id"] = profile_session_id
@@ -423,7 +430,7 @@ def _record_data_logger_span(
             logger_attributes,
             cpu_ms=None if cpu_ns is None else cpu_ns / 1_000_000,
             runqueue_ms=None if runqueue_ns is None else runqueue_ns / 1_000_000,
-            blocked_ms=blocked_ns / 1_000_000,
+            blocked_ms=None if blocked_ns is None else blocked_ns / 1_000_000,
             parent=None if parent_span_id is None else f"{parent_span_id:016x}",
             call_label=attributes.get("agency.run_id"),
         )
@@ -431,6 +438,7 @@ def _record_data_logger_span(
     except Exception as exc:
         # Profiling and persistence are observational. Neither may alter the
         # execution result whose span is being recorded.
+        _health["span_export_failures"] += 1
         _agprof_print(f"[agprof] WARNING: datalogger span export failed: {exc}")
         return False
 
@@ -444,6 +452,7 @@ def _load_profile_records(profile_session_id: "str | None") -> list[tuple]:
         data_logger.flush()
         records = data_logger.read_profile_records(profile_session_id)
     except Exception as exc:
+        _health["span_read_failures"] += 1
         _agprof_print(f"[agprof] WARNING: datalogger span read failed: {exc}")
         return []
     records.sort(key=lambda record: (record[2], record[0], record[1]))
@@ -1814,6 +1823,8 @@ def start(
         _profile_session_id = profile_session_id
         _profile_data_logger = profile_data_logger
         _last_profile_records = []
+        _health.clear()
+        _engine_coverage.clear()
         _interrupted_spans.clear()
         with _open_spans_lock:
             _open_spans.clear()
@@ -2216,7 +2227,7 @@ def _build_run_summary(
             },
         )
         label_records = completed_by_label.get(label, [])
-        outcomes = [record[6].get("outcome", "success") for record in label_records]
+        outcomes = [record[6].get("outcome", "unknown") for record in label_records]
         wall_values = [record[3] / 1e6 for record in label_records]
         wall_ms = row["wall_ms"]
         span_rows.append(
@@ -2225,13 +2236,23 @@ def _build_run_summary(
                 "calls": row["calls"],
                 "started": row["calls"] + len(interrupted_by_label.get(label, [])),
                 "succeeded": outcomes.count("success"),
-                "failed": sum(outcome not in ("success", "interrupted") for outcome in outcomes),
+                "unknown": outcomes.count("unknown"),
+                "failed": sum(outcome in ("failure", "failed", "error") for outcome in outcomes),
                 "interrupted": len(interrupted_by_label.get(label, [])),
                 "wall_ms": round(wall_ms, 3),
-                "cpu_ms": round(row["cpu_ms"], 3),
-                "runqueue_ms": round(row["runq_ms"], 3),
-                "blocked_ms": round(row["blocked_ms"], 3),
-                "cpu_percent": round(100 * row["cpu_ms"] / wall_ms, 1) if wall_ms else 0.0,
+                "cpu_ms": round(row["cpu_ms"], 3)
+                if any(r[4] is not None for r in label_records)
+                else None,
+                "runqueue_ms": round(row["runq_ms"], 3)
+                if any(r[5] is not None for r in label_records)
+                else None,
+                "blocked_ms": round(row["blocked_ms"], 3)
+                if label_records
+                and all(r[4] is not None and r[5] is not None for r in label_records)
+                else None,
+                "cpu_percent": round(100 * row["cpu_ms"] / wall_ms, 1)
+                if wall_ms and any(r[4] is not None for r in label_records)
+                else None,
                 **_latency_stats(wall_values),
             }
         )
@@ -2307,7 +2328,7 @@ def _build_run_summary(
 
     completed_runs = [record for record in completed_records if is_run_label(record[1])]
     interrupted_runs = [span for span in interrupted if is_run_label(span["label"])]
-    run_outcomes = [record[6].get("outcome", "success") for record in completed_runs]
+    run_outcomes = [record[6].get("outcome", "unknown") for record in completed_runs]
     duration_s = duration_ms / 1e3
     run_metrics = {
         "started": len(completed_runs) + len(interrupted_runs),
@@ -2340,24 +2361,36 @@ def _build_run_summary(
     calls = sum(record[1].startswith("llm:attempt[0]") for record in attempt_records) + sum(
         span["label"].startswith("llm:attempt[0]") for span in interrupted_attempts
     )
-    retries = len(attempt_records) + len(interrupted_attempts) - calls
+    retry_indices = [metadata.get("retry_index") for metadata in attempt_metadata]
+    retries = (
+        sum(index > 0 for index in retry_indices)
+        if retry_indices
+        and all(isinstance(index, int) for index in retry_indices)
+        and not interrupted_attempts
+        else None
+    )
+    if retries is None and any(
+        not record[1].startswith("llm:attempt[0]") for record in attempt_records
+    ):
+        retries = len(attempt_records) + len(interrupted_attempts) - calls
     llm_metrics = {
         "calls": calls,
         "successful_calls": sum(
-            metadata.get("outcome", "success") == "success" for metadata in attempt_metadata
+            metadata.get("outcome", "unknown") == "success" for metadata in attempt_metadata
         ),
         "failed_calls": sum(
-            metadata.get("outcome", "success") != "success" and not metadata.get("retrying")
+            metadata.get("outcome", "unknown") != "success" and not metadata.get("retrying")
             for metadata in attempt_metadata
         ),
         "interrupted_calls": len(interrupted_attempts),
         "attempts": len(attempt_records) + len(interrupted_attempts),
         "retries": retries,
+        "retry_coverage": "reported" if retries is not None else "unavailable",
         "successful_attempts": sum(
-            metadata.get("outcome", "success") == "success" for metadata in attempt_metadata
+            metadata.get("outcome", "unknown") == "success" for metadata in attempt_metadata
         ),
         "failed_attempts": sum(
-            metadata.get("outcome", "success") != "success" for metadata in attempt_metadata
+            metadata.get("outcome", "unknown") != "success" for metadata in attempt_metadata
         ),
         "interrupted_attempts": len(interrupted_attempts),
         "total_wait_ms": round(sum(record[3] for record in attempt_records) / 1e6, 3),
@@ -2372,14 +2405,31 @@ def _build_run_summary(
 
     tool_records = [record for record in completed_records if record[1].startswith("tool:")]
     interrupted_tools = [span for span in interrupted if span["label"].startswith("tool:")]
-    tool_outcomes = [record[6].get("outcome", "success") for record in tool_records]
+    tool_outcomes = [record[6].get("outcome", "unknown") for record in tool_records]
     tool_metrics = {
         "started": len(tool_records) + len(interrupted_tools),
         "completed": len(tool_records),
         "succeeded": tool_outcomes.count("success"),
-        "failed": sum(outcome != "success" for outcome in tool_outcomes),
+        "unknown": tool_outcomes.count("unknown"),
+        "failed": sum(outcome in ("failure", "failed", "error") for outcome in tool_outcomes),
         "interrupted": len(interrupted_tools),
-        "latency": _latency_stats([record[3] / 1e6 for record in tool_records]),
+        "latency": _latency_stats(
+            [
+                record[3] / 1e6
+                for record in tool_records
+                if record[6].get("timing", "exact") == "exact"
+            ]
+        ),
+        "latency_by_timing": {
+            timing: _latency_stats(
+                [
+                    record[3] / 1e6
+                    for record in tool_records
+                    if record[6].get("timing", "exact") == timing
+                ]
+            )
+            for timing in sorted({record[6].get("timing", "exact") for record in tool_records})
+        },
         "by_tool": [],
     }
     tool_names = sorted(
@@ -2391,16 +2441,25 @@ def _build_run_summary(
         matching_interrupted = [
             span for span in interrupted_tools if span["label"] == f"tool:{tool_name}"
         ]
-        matching_outcomes = [record[6].get("outcome", "success") for record in matching]
+        matching_outcomes = [record[6].get("outcome", "unknown") for record in matching]
         tool_metrics["by_tool"].append(
             {
                 "name": tool_name,
                 "started": len(matching) + len(matching_interrupted),
                 "completed": len(matching),
                 "succeeded": matching_outcomes.count("success"),
-                "failed": sum(outcome != "success" for outcome in matching_outcomes),
+                "unknown": matching_outcomes.count("unknown"),
+                "failed": sum(
+                    outcome in ("failure", "failed", "error") for outcome in matching_outcomes
+                ),
                 "interrupted": len(matching_interrupted),
-                **_latency_stats([record[3] / 1e6 for record in matching]),
+                **_latency_stats(
+                    [
+                        record[3] / 1e6
+                        for record in matching
+                        if record[6].get("timing", "exact") == "exact"
+                    ]
+                ),
             }
         )
 
@@ -2515,14 +2574,35 @@ def _build_run_summary(
         }
         for kind in ("io_read", "io_write", "net_receive", "net_transmit"):
             metric = resource_by_name.get(prefix + f"{kind}_mb_s")
-            row[f"{kind}_mb"] = metric.get("total", 0.0) if metric else 0.0
+            row[f"{kind}_mb"] = metric.get("total") if metric else None
         sandbox_metrics.append(row)
 
     tick_times = sorted({timestamp for timestamp, _series, _value in samples})
     sampled_duration_s = (tick_times[-1] - tick_times[0]) / 1e9 if len(tick_times) >= 2 else 0.0
     return {
-        "schema_version": 5,
-        "data_source": "measured",
+        "schema_version": 6,
+        "data_source": "mixed"
+        if any(
+            record[6].get("timing") in ("derived", "hook_boundary", "container_asserted")
+            for record in completed_records
+        )
+        else "measured",
+        "coverage": {
+            "engines": copy.deepcopy(_engine_coverage),
+            "tools": {
+                "state": "partial" if tool_records or interrupted_tools else "unavailable",
+                "reason": "Only instrumented admission/completion events are observable; absence is not zero.",
+                "timing_counts": dict(
+                    Counter(record[6].get("timing", "exact") for record in tool_records)
+                ),
+            },
+            "resources": {
+                "state": "sampled" if samples else "unavailable",
+                "reason": "Gauges and PID membership are sampled; brief peaks and short-lived processes may be missed.",
+                "gpu_process_power": "estimated",
+                "cpu_attribution": "thread intervals, inclusive of concurrent work; remote CPU unavailable",
+            },
+        },
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "duration_ms": round(duration_ms, 3),
         "run_metrics": run_metrics,
@@ -2541,6 +2621,8 @@ def _build_run_summary(
             "gpu_requested": sample_gpu,
             "gpu_available": gpu_sampling_available,
             "raw_samples": len(samples),
+            "telemetry_errors": dict(_health),
+            "lossless": False,
         },
         "span_metrics": span_rows,
         "resource_metrics": resource_rows,
@@ -2582,7 +2664,7 @@ def _render_summary_markdown(summary: dict) -> str:
         "# agprof summary",
         "",
     ]
-    if summary.get("data_source") != "measured":
+    if summary.get("data_source") not in ("measured", "mixed"):
         lines.extend(
             [
                 "> **MOCK DATA — illustrative only. These values were not measured.**",
@@ -2598,7 +2680,7 @@ def _render_summary_markdown(summary: dict) -> str:
             f"- Completed throughput: **{runs['completed_per_second']:.3f} runs/s**",
             f"- LLM: **{llm['calls']} calls**, {llm['successful_calls']} succeeded, "
             f"{llm['failed_calls']} failed, {llm['interrupted_calls']} interrupted, "
-            f"{llm['retries']} {'retry' if llm['retries'] == 1 else 'retries'}, "
+            f"{number(llm['retries'], 0)} reported retries, "
             f"{llm['total_wait_ms'] / 1e3:.3f} s total wait",
             f"- Tools: **{tools['completed']}/{tools['started']} completed**, "
             f"{tools['failed']} failed, {tools['interrupted']} interrupted",
@@ -2634,6 +2716,21 @@ def _render_summary_markdown(summary: dict) -> str:
             "",
         ]
     )
+    lines.extend(
+        [
+            "",
+            "### Coverage",
+            "",
+            "Tool latency percentiles include exact intervals only; other timings are separated in JSON.",
+            f"Unknown tool outcomes: {tools.get('unknown', 0)}. Missing measurements are not zero.",
+            "Resources are sampled; per-process GPU power is estimated. Telemetry is not lossless.",
+            f"Telemetry errors: {json.dumps(summary.get('sampling', {}).get('telemetry_errors', {}), sort_keys=True)}",
+        ]
+    )
+    for engine, coverage in summary.get("coverage", {}).get("engines", {}).items():
+        lines.append(
+            f"- {_markdown_escape(engine)}: {_markdown_escape(json.dumps(coverage, sort_keys=True))}"
+        )
     if tools["by_tool"]:
         lines.extend(
             [
@@ -2782,8 +2879,8 @@ def _render_summary_markdown(summary: dict) -> str:
             lines.append(
                 f"| {_markdown_escape(row['label'])} | {row['calls']}/{row['started']} | "
                 f"{row['failed']} | {row['interrupted']} | "
-                f"{row['wall_ms'] / 1e3:.3f} | {row['cpu_ms'] / 1e3:.3f} | "
-                f"{row['blocked_ms'] / 1e3:.3f} | {number(row['mean_ms'])} | "
+                f"{row['wall_ms'] / 1e3:.3f} | {number(None if row['cpu_ms'] is None else row['cpu_ms'] / 1e3)} | "
+                f"{number(None if row['blocked_ms'] is None else row['blocked_ms'] / 1e3)} | {number(row['mean_ms'])} | "
                 f"{number(row['p50_ms'])} | {number(row['p95_ms'])} |"
             )
     else:

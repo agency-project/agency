@@ -48,7 +48,7 @@ def test_completed_profiler_spans_flow_to_agprofs_own_data_logger(monkeypatch, t
     parent = by_name["parent"]
     child_row = by_name["child"]
     assert parent[1] is not None
-    assert parent[3] >= 0
+    assert parent[3] is None if parent[2] is None else parent[3] >= 0
     parent_attributes = json.loads(parent[5])
     child_attributes = json.loads(child_row[5])
     assert parent_attributes["agency.run_id"] == "run7"
@@ -82,7 +82,7 @@ def test_external_profiler_span_flows_to_agprofs_own_data_logger(monkeypatch, tm
         connection.close()
 
     assert row[:3] == ("sync:scheduler_queue", 2.0, 2.25)
-    assert row[3] == 250.0
+    assert row[3] is None  # Remote CPU/wait were not measured.
     assert json.loads(row[4])["request_id"] == "run3"
 
 
@@ -266,7 +266,7 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     machine_summary = json.loads((tmp_path / "summary.json").read_text())
     human_summary = (tmp_path / "summary.md").read_text()
     trace = json.loads((tmp_path / "agprof.trace.json").read_text())
-    assert machine_summary["schema_version"] == 5
+    assert machine_summary["schema_version"] == 6
     assert "workload_metrics" in machine_summary
     assert machine_summary["process_metrics"] == []
     assert "host_metrics" not in machine_summary
