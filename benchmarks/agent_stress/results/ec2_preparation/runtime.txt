@@ -1,0 +1,123 @@
+## eric/benchmark-tests...origin/eric/benchmark-tests
+ M .DS_Store
+ M .gitignore
+ M README.md
+ M agency/__init__.py
+ M agency/agconfig.py
+ M agency/agent.py
+ M agency/agmap.py
+ M agency/agpause.py
+ M agency/agresources.py
+ M agency/agschema.py
+ M agency/agskill.py
+ M agency/agteam.py
+ M agency/agtool.py
+ M agency/agtype.py
+ M agency/agutil.py
+ M agency/common_skills/agbuild.py
+ M agency/common_skills/agplan.py
+ M agency/profiler/__init__.py
+ M agency/profiler/agprof.py
+ M agency/tools/__init__.py
+ M agency/tools/glob.py
+ M agency/tools/grep.py
+ M agency/tools/human.py
+ M agency/tools/read.py
+ M agency/tools/todowrite.py
+ M agency/tools/webfetch.py
+ M benchmarks/cli.py
+ M docs/Design_architecture.md
+ M docs/Design_configuration.md
+ M docs/Design_execution_loop.md
+ M docs/Design_resource_control.md
+ M docs/Design_sandbox_lifecycle.md
+ M docs/agconfig.md
+ M docs/agent.md
+ M docs/agllm.md
+ M docs/agresources.md
+ M docs/agsandbox.md
+ M docs/agskill.md
+ M docs/agteam.md
+ M docs/agtools.md
+ M docs/agutil.md
+ M docs/agwebui.md
+ M examples/base_example.py
+ M examples/custom_tools.py
+ M examples/dynamic_config_example.py
+ M examples/human_in_the_loop.py
+ M examples/image_processing.py
+ M examples/parallel_exec.py
+ M examples/sandbox_handoff.py
+ M pyproject.toml
+ M tests/agwebui/test_agwebui_hooks.py
+ M tests/conftest.py
+ M tests/test_agbinary.py
+ M tests/test_agconfig.py
+ M tests/test_agent.py
+ M tests/test_agfile.py
+ M tests/test_agllm.py
+ M tests/test_aglog.py
+ M tests/test_agmap.py
+ M tests/test_agpath.py
+ M tests/test_agprof.py
+ M tests/test_agrawstring.py
+ M tests/test_agsandbox.py
+ M tests/test_agschema.py
+ M tests/test_agteam.py
+ M tests/test_agterm.py
+ M tests/test_agutil.py
+ M tests/test_tools.py
+ M uv.lock
+?? .benchmark_cache/
+?? .claude/
+?? agency/agdata_pure.py
+?? agency/agllm_pure.py
+?? agency/agpolicy.py
+?? agency/agtool_pure.py
+?? agency/engine/
+?? agency/harness/
+?? agency/llm/
+?? agency/native_harness/
+?? agency/profiler/agprof_derive.py
+?? agency/profiler/agprof_emit.py
+?? agency/profiler/agprof_trace.py
+?? agency/sandbox/
+?? data/
+?? docs/Design_chroot_v2.md
+?? docs/Design_external_harness_execution_loop.md
+?? docs/Design_harness_filesystem.md
+?? docs/Design_harness_history.md
+?? docs/Design_harness_integration.md
+?? docs/Design_profiler_harness_integration.md
+?? docs/Discussion_coverage_declaration.md
+?? docs/agharness.md
+?? docs/agpolicy.md
+?? docs/harness/
+?? docs/llm/
+?? docs/sandbox/
+?? examples/_manual_native_react_pipeline_probe.py
+?? examples/_manual_v1messages_pipeline_probe.py
+?? examples/claude_code_example.py
+?? examples/native_model_compatibility.py
+?? examples/profiler_claude_code_example.py
+?? examples/profiler_claude_code_example.py.bak
+?? examples/profiler_native_example.py
+?? overview.md
+?? refactor.txt
+?? target_diagram.txt
+?? tests/fixtures/
+?? tests/harness/
+?? tests/llm/
+?? tests/sandbox/
+?? tests/test_agdata_pure.py
+?? tests/test_agllm_pure.py
+?? tests/test_agpolicy.py
+?? tests/test_agprof_derive.py
+?? tests/test_agprof_harness.py
+?? tests/test_agtool_pure.py
+f709bc1b73372005ecefb1340cd274ea6c74543b
+Python 3.12.13
+[{"name": "pip", "version": "26.2.1"}]
+sha256:1958879d1dd78eb7f5ae5fc411ff9213ec15f874a0d609b459903e786e0dac99 amd64 linux
+4
+cgroup2fs

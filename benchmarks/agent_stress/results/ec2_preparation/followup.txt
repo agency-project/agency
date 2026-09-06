@@ -1,0 +1,133 @@
+total 12728
+drwxr-x--- 37 eric eric    4096 Sep  4 23:26 .
+drwxr-xr-x  7 root root    4096 Aug 10 01:49 ..
+-rw-rw-r--  1 eric eric      47 Aug 25 23:24 .agency_luna_last_result
+-rw-rw-r--  1 eric eric      56 Aug 25 23:59 .agency_profiler_luna_last_result
+drwxrwxr-x  3 eric eric    4096 Aug  7 23:05 .aws
+-rw-------  1 eric eric   49755 Sep  6 05:01 .bash_history
+-rw-r--r--  1 eric eric     220 Jul 26 02:27 .bash_logout
+-rw-r--r--  1 eric eric    3985 Aug  8 13:10 .bashrc
+-rw-r--r--  1 eric eric    3797 Aug  8 13:10 .bashrc.bak.1786194647
+drwx------  8 eric eric    4096 Aug  8 13:02 .cache
+drwxrwxr-x  6 eric eric    4096 Aug 31 00:10 .claude
+-rw-------  1 eric eric     524 Aug 31 00:10 .claude.json
+drwxrwxr-x  4 eric eric    4096 Aug 16 05:55 .codex
+drwx------  6 eric eric    4096 Aug  8 13:02 .config
+drwx------  3 eric eric    4096 Jul 27 08:32 .docker
+drwxrwxr-x  6 eric eric    4096 Aug  8 13:10 .grok
+-rw-------  1 eric eric      20 Aug  2 17:34 .lesshst
+drwxrwxr-x  6 eric eric    4096 Aug  8 12:52 .local
+drwxrwxr-x  4 eric eric    4096 Aug  8 12:52 .npm
+drwx------  3 eric eric    4096 Jul 27 08:41 .nv
+-rw-r--r--  1 eric eric     833 Aug  2 17:31 .profile
+drwx------  2 eric eric    4096 Aug  2 17:29 .ssh
+-rw-r--r--  1 eric eric       0 Jul 26 02:27 .sudo_as_admin_successful
+drwxrwxr-x  4 eric eric    4096 Aug 25 23:00 .venv
+-rw-rw-r--  1 eric eric      26 Aug  2 17:31 .zshrc
+drwxrwxr-x 10 eric eric    4096 Aug  2 18:19 SWE-bench
+drwxr-xr-x 19 eric eric    4096 Aug 25 23:00 agency
+drwxr-xr-x 13 eric eric    4096 Aug 16 03:32 agency-context-sync-vzTExL
+drwxr-xr-x 16 eric eric    4096 Aug 31 00:20 agency-eric-refactor-inbox
+drwxrwxr-x 12 eric eric    4096 Aug  8 03:55 agency-harness-current
+-rw-r--r--  1 eric eric 2166296 Aug  7 23:21 agency-harness-current.bundle
+drwxrwxr-x  3 eric eric    4096 Aug  7 23:18 agency-harness-probe
+drwxr-xr-x 12 eric eric    4096 Aug 16 03:54 agency-harness-result-20260815
+drwx------  5 eric eric    4096 Sep  1 23:32 agency-lifecycle-feae3ac-F3eS7W
+drwx------ 11 eric eric    4096 Sep  2 01:55 agency-lifecycle-refactor-Q7c4xi
+drwx------  5 eric eric    4096 Sep  1 23:52 agency-lifecycle-refactor-master-0339e32-zh0sxm
+drwxr-xr-x 15 eric eric    4096 Aug 25 23:43 agency-local-sync
+drwxrwxr-x  4 eric eric    4096 Aug 25 23:49 agency-luna-results-20260825-232438
+drwxrwxr-x 15 eric eric    4096 Aug  8 05:43 agency-m1-profiler-test
+drwxrwxr-x 17 eric eric    4096 Aug  8 09:55 agency-m5-test-20260808
+drwxr-xr-x 15 eric eric    4096 Aug 24 10:51 agency-profiler-e2e
+-rw-r--r--  1 eric eric 6237427 Aug 24 10:47 agency-profiler-e2e.tar.gz
+drwxrwxr-x  4 eric eric    4096 Aug 26 00:02 agency-profiler-luna-results-20260825-235920
+drwxrwxr-x  4 eric eric    4096 Aug 31 08:03 agency-public-api-e2e-20260831T075124Z
+drwxrwxr-x  2 eric eric    4096 Aug 31 07:12 agency-public-api-test-20260831-001243
+drwxrwxr-x  6 eric eric    4096 Sep  4 21:55 agency-redirect
+drwxrwxr-x  4 eric eric    4096 Sep  4 21:50 agency-redirect-clean
+drwxrwxr-x  6 eric eric    4096 Sep  4 23:26 agency-redirect-retest-20260904
+drwxrwxr-x 13 eric eric    4096 Aug 10 19:14 agency-ultracode-20260808
+-rw-r--r--  1 eric eric 2347825 Aug  8 12:34 agency-ultracode-20260808.bundle
+-rw-r--r--  1 eric eric 2029465 Aug  2 17:31 agency.bundle
+drwxrwxr-x 11 eric eric    4096 Aug  8 04:37 agprof-m0b-test-20260807
+-rw-rw-r--  1 eric eric       0 Aug 24 11:09 profiler-e2e-code-fixes.patch
+/usr/bin/pidstat
+/usr/bin/iostat
+/usr/bin/numactl
+PID                 PPID                COMMAND
+2516194             2516170             tail
+PID                 PPID                COMMAND
+2492937             2492912             tail
+/test-eager-f66767eb 2516194 map[com.nvidia.build.id:313520559 com.nvidia.build.ref:30a5fc6cbfce157e75fae3d0cf1fd8e273a3dc25 com.nvidia.cublas.version:13.4.1.1 com.nvidia.cublasmp.version:0.8.1.2360 com.nvidia.cuda.version:9.0 com.nvidia.cudla.version:13.2.75 com.nvidia.cudnn.version:9.22.0.52 com.nvidia.cufft.version:12.2.0.46 com.nvidia.curand.version:10.4.2.55 com.nvidia.cusolver.version:12.2.0.1 com.nvidia.cusolvermp.version:0.8.0.3126 com.nvidia.cusparse.version:12.7.10.1 com.nvidia.cusparselt.version:0.9.1.1 com.nvidia.nccl.version:2.30.4 com.nvidia.npp.version:13.1.0.48 com.nvidia.nsightcompute.version:2026.1.1.2 com.nvidia.nsightsystems.version:2026.2.1.210 com.nvidia.nvjpeg.version:13.1.0.48 com.nvidia.nvvm.version:13.2.78 com.nvidia.pytorch.version:2.12.0a0+5aff392 com.nvidia.tensorrt.version:10.16.1.11 com.nvidia.tensorrtoss.version: com.nvidia.volumes.needed:nvidia_driver org.opencontainers.image.version:24.04]
+/test-eager-d93e9c79 2492937 map[com.nvidia.build.id:313520559 com.nvidia.build.ref:30a5fc6cbfce157e75fae3d0cf1fd8e273a3dc25 com.nvidia.cublas.version:13.4.1.1 com.nvidia.cublasmp.version:0.8.1.2360 com.nvidia.cuda.version:9.0 com.nvidia.cudla.version:13.2.75 com.nvidia.cudnn.version:9.22.0.52 com.nvidia.cufft.version:12.2.0.46 com.nvidia.curand.version:10.4.2.55 com.nvidia.cusolver.version:12.2.0.1 com.nvidia.cusolvermp.version:0.8.0.3126 com.nvidia.cusparse.version:12.7.10.1 com.nvidia.cusparselt.version:0.9.1.1 com.nvidia.nccl.version:2.30.4 com.nvidia.npp.version:13.1.0.48 com.nvidia.nsightcompute.version:2026.1.1.2 com.nvidia.nsightsystems.version:2026.2.1.210 com.nvidia.nvjpeg.version:13.1.0.48 com.nvidia.nvvm.version:13.2.78 com.nvidia.pytorch.version:2.12.0a0+5aff392 com.nvidia.tensorrt.version:10.16.1.11 com.nvidia.tensorrtoss.version: com.nvidia.volumes.needed:nvidia_driver org.opencontainers.image.version:24.04]
+Reference ID    : A9FEA97B (169.254.169.123)
+Stratum         : 4
+Ref time (UTC)  : Sun Sep 06 05:04:38 2026
+System time     : 0.000002120 seconds fast of NTP time
+Last offset     : +0.000013632 seconds
+RMS offset      : 0.000005918 seconds
+Frequency       : 46.393 ppm slow
+Residual freq   : +0.175 ppm
+Skew            : 0.150 ppm
+Root delay      : 0.000365628 seconds
+Root dispersion : 0.000295496 seconds
+Update interval : 16.0 seconds
+Leap status     : Normal
+Linux 6.17.0-1019-aws (ip-172-31-8-241) 	09/06/26 	_x86_64_	(32 CPU)
+
+05:04:47      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:04:48        0      1431    0.00    0.00    0.00    0.00    0.00    17  containerd
+05:04:48        0      1552    0.00    0.00    0.00    0.00    0.00    12  dockerd
+05:04:48     1000     21349    0.00    0.00    0.00    0.00    0.00     2  claude
+05:04:48     1000   1167798    1.00    0.00    0.00    0.00    1.00    17  claude
+05:04:48     1003   2262264    0.00    0.00    0.00    0.00    0.00     1  claude
+
+05:04:47      UID       PID  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+05:04:48        0      1431      0.00      0.00 4456760  100916   0.08  containerd
+05:04:48        0      1552      0.00      0.00 5847756  146652   0.12  dockerd
+05:04:48     1000     21349      0.00      0.00 7405228  408688   0.32  claude
+05:04:48     1000   1167798      2.00      0.00 5624836  467592   0.37  claude
+05:04:48     1003   2262264      0.00      0.00 5576464  350328   0.28  claude
+
+05:04:48      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:04:49        0      1431    0.00    0.00    0.00    0.00    0.00    17  containerd
+05:04:49        0      1552    0.00    0.00    0.00    0.00    0.00    12  dockerd
+05:04:49     1000     21349    0.00    0.00    0.00    0.00    0.00     2  claude
+05:04:49     1000   1167798    1.00    0.00    0.00    0.00    1.00    17  claude
+05:04:49     1003   2262264    0.00    0.00    0.00    0.00    0.00     1  claude
+
+05:04:48      UID       PID  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+05:04:49        0      1431      0.00      0.00 4456760  100916   0.08  containerd
+05:04:49        0      1552      0.00      0.00 5847756  146652   0.12  dockerd
+05:04:49     1000     21349      0.00      0.00 7405228  408688   0.32  claude
+05:04:49     1000   1167798      2.00      0.00 5624836  467592   0.37  claude
+05:04:49     1003   2262264      0.00      0.00 5576464  350328   0.28  claude
+
+05:04:49      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+05:04:50        0      1431    0.00    0.00    0.00    0.00    0.00    17  containerd
+05:04:50        0      1552    0.00    0.00    0.00    0.00    0.00    12  dockerd
+05:04:50     1000     21349    0.00    0.00    0.00    0.00    0.00     2  claude
+05:04:50     1000   1167798    5.00    0.00    0.00    0.00    5.00    17  claude
+05:04:50     1003   2262264    1.00    0.00    0.00    0.00    1.00     1  claude
+
+05:04:49      UID       PID  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+05:04:50        0      1431      0.00      0.00 4456760  100916   0.08  containerd
+05:04:50        0      1552      0.00      0.00 5847756  146652   0.12  dockerd
+05:04:50     1000     21349      0.00      0.00 7405228  408688   0.32  claude
+05:04:50     1000   1167798      2.00      0.00 5624836  467592   0.37  claude
+05:04:50     1003   2262264      0.00      0.00 5576464  350328   0.28  claude
+
+Average:      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+Average:        0      1431    0.00    0.00    0.00    0.00    0.00     -  containerd
+Average:        0      1552    0.00    0.00    0.00    0.00    0.00     -  dockerd
+Average:     1000     21349    0.00    0.00    0.00    0.00    0.00     -  claude
+Average:     1000   1167798    2.33    0.00    0.00    0.00    2.33     -  claude
+Average:     1003   2262264    0.33    0.00    0.00    0.00    0.33     -  claude
+
+Average:      UID       PID  minflt/s  majflt/s     VSZ     RSS   %MEM  Command
+Average:        0      1431      0.00      0.00 4456760  100916   0.08  containerd
+Average:        0      1552      0.00      0.00 5847756  146652   0.12  dockerd
+Average:     1000     21349      0.00      0.00 7405228  408688   0.32  claude
+Average:     1000   1167798      2.00      0.00 5624836  467592   0.37  claude
+Average:     1003   2262264      0.00      0.00 5576464  350328   0.28  claude

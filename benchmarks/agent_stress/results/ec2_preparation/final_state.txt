@@ -1,0 +1,27 @@
+Sun Sep  6 05:16:43 UTC 2026
+ 05:16:43 up 12 days, 13:08,  3 users,  load average: 0.48, 0.31, 0.10
+               total        used        free      shared  buff/cache   available
+Mem:     130090360832  4051136512 91657764864     3600384 35650523136 126039224320
+Swap:              0           0           0
+test-eager-f66767eb Up 8 days
+test-eager-d93e9c79 Up 8 days
+name, memory.used [MiB], utilization.gpu [%]
+NVIDIA L4, 0 MiB, 0 %
+USER         PID    PPID %CPU %MEM   RSS     ELAPSED STAT COMMAND
+eric     2507862       1 18.1  0.0 11512       00:00 Ss   systemd
+root        1431       1  3.8  0.0 113524 12-13:08:27 Ssl containerd
+ubuntu   1167798  157217  1.9  0.3 473712 1-13:33:39 Sl+  claude
+root         981       1  1.2  0.0 21692 12-13:08:30 Ssl  nv-hostengine
+root     2507858  786031  0.8  0.0 10532       00:01 Ss   sshd
+root        1552       1  0.7  0.1 149604 12-13:08:26 Ssl dockerd
+jerry    2262264 2262247  0.5  0.2 356464   12:24:10 Sl+  claude
+ubuntu     21349   20830  0.1  0.3 411600 12-03:34:02 Sl+ claude
+root         220       2  0.0  0.0     0 12-13:08:41 S    kcompactd0
+root     1553621       1  0.0  0.0  8788  4-22:43:34 Ss   systemd-udevd
+ubuntu    157216       1  0.0  0.0  6096 11-21:17:24 Ss   tmux: server
+root         996       1  0.0  0.0 11996 12-13:08:30 Ssl  soci-snapshotte
+root          15       2  0.0  0.0     0 12-13:08:41 I    rcu_sched
+root           1       0  0.0  0.0 14516 12-13:08:41 Ss   systemd
+jerry     842127       1  0.0  0.0 10020 10-13:34:40 Ss   tmux: server
+jerry     304907       1  0.0  0.0  8496 11-05:40:20 Ss   systemd
+ubuntu     19316       1  0.0  0.0  8696 12-03:36:13 Ss   systemd

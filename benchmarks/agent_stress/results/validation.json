@@ -1,0 +1,35 @@
+{
+  "scope": "Payload and evidence checks only; no sandbox concurrency demonstrated",
+  "checks": [
+    {
+      "command": [
+        ".venv/bin/python",
+        "benchmarks/agent_stress/test_evidence.py"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "...\n----------------------------------------------------------------------\nRan 3 tests in 0.860s\n\nOK\n"
+    },
+    {
+      "command": [
+        ".venv/bin/ruff",
+        "check",
+        "benchmarks/agent_stress"
+      ],
+      "returncode": 0,
+      "stdout": "All checks passed!\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        ".venv/bin/ruff",
+        "format",
+        "--check",
+        "benchmarks/agent_stress"
+      ],
+      "returncode": 0,
+      "stdout": "2 files already formatted\n",
+      "stderr": ""
+    }
+  ]
+}
