@@ -343,6 +343,7 @@ class LlmHandlerServer:
         # Keep the durable OTel context captured by HostServerManager and use
         # it explicitly for every LLM attempt span.
         self._parent_context = parent_context
+        self._profile_context_provider = None
         # Non-streaming exchanges only
         self._transcript: "list[dict]" = []
         self._transcript_lock = threading.Lock()
@@ -503,7 +504,14 @@ class LlmHandlerServer:
             finalize_error(error)
 
         try:
-            with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
+            with agprof.span(
+                "llm:attempt[0]",
+                parent_context=(
+                    self._profile_context_provider()
+                    if self._profile_context_provider
+                    else self._parent_context
+                ),
+            ) as attempt_span:
                 _annotate(
                     attempt_span,
                     model=self._backend.model,
@@ -1328,7 +1336,14 @@ class LlmHandlerServer:
             if handle._cancel_event.is_set():
                 finalize_cancelled()
                 return
-            with agprof.span("llm:attempt[0]", parent_context=self._parent_context) as attempt_span:
+            with agprof.span(
+                "llm:attempt[0]",
+                parent_context=(
+                    self._profile_context_provider()
+                    if self._profile_context_provider
+                    else self._parent_context
+                ),
+            ) as attempt_span:
                 _annotate(
                     attempt_span, model=self._backend.model, provider=type(self._backend).__name__
                 )

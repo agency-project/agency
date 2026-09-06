@@ -50,7 +50,13 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
         if not isinstance(call_id, str) or not call_id:
             return JSONResponse({"error": "invalid call_id"}, status_code=400)
         await asyncio.to_thread(
-            bridge.complete_tool_policy, token, call_id, body.get("result"), body.get("error")
+            bridge.complete_tool_policy,
+            token,
+            call_id,
+            body.get("result"),
+            body.get("error"),
+            **({"duration_ns": body["duration_ns"]} if "duration_ns" in body else {}),
+            **({"started_perf_ns": body["started_perf_ns"]} if "started_perf_ns" in body else {}),
         )
         return JSONResponse({"ok": True})
 
@@ -148,6 +154,19 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
                 checkpoint_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await checkpoint_task
+
+    @router.post("/agprof/{operation}")
+    async def agprof_events(operation: str, request: Request):
+        if operation not in ("config", "events"):
+            return JSONResponse({"error": "unknown profiler operation"}, status_code=404)
+        token = extract_bearer_token(request)
+        if not token or not bridge.validate_token(token):
+            return JSONResponse({"error": "unknown or missing bearer token"}, status_code=401)
+        if len(await request.body()) > 1_048_576:
+            return JSONResponse({"error": "profile batch too large"}, status_code=413)
+        return JSONResponse(
+            await asyncio.to_thread(bridge.profile_request, token, operation, await request.json())
+        )
 
     return router
 

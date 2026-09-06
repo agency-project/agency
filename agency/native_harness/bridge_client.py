@@ -47,7 +47,15 @@ class BridgeClient:
             # silently become "allow everything."
             return {"decision": "deny", "reason": f"policy bridge unreachable: {e}"}
 
-    def complete_tool_policy(self, call_id: "str | None", result: object) -> None:
+    def complete_tool_policy(
+        self,
+        call_id: "str | None",
+        result: object,
+        *,
+        duration_ns: int | None = None,
+        started_perf_ns: int | None = None,
+        error: str | None = None,
+    ) -> None:
         """Report a tool call's completion for telemetry. Best-effort: no
         call_id (an unreachable bridge at admission time, or a denied call
         that never ran) or a failed post never blocks/affects the tool
@@ -55,12 +63,22 @@ class BridgeClient:
         if not call_id:
             return
         try:
-            self._client.post(
+            response = self._client.post(
                 "/agpolicy/complete_tool",
-                json={"call_id": call_id, "result": result, "error": None},
+                json={
+                    "call_id": call_id,
+                    "result": result,
+                    "error": error,
+                    **({"duration_ns": duration_ns} if duration_ns is not None else {}),
+                    **({"started_perf_ns": started_perf_ns} if started_perf_ns is not None else {}),
+                },
                 headers={"Authorization": f"Bearer {self.token}"},
             )
+            response.raise_for_status()
         except Exception as exc:
+            profiler = getattr(self, "_profiler", None)
+            if profiler is not None:
+                profiler.dropped += 1
             print(f"[bridge_client] complete_tool_policy request failed: {exc!r}")
 
     def checkpoint(

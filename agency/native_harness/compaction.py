@@ -22,6 +22,7 @@ real overflow."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from .profiling import span as profile_span
 
 if TYPE_CHECKING:
     from .llm_client import LLMClient
@@ -265,7 +266,8 @@ def maybe_compact(
     summary_messages = build_summary_prompt_messages(task_input, head, previous_summary)
     # Housekeeping generation must not consume invocation messages or establish the
     # final-answer fence for the task generation that follows it.
-    resp = llm.dispatch(model, summary_messages, internal_kind="compaction")
+    with profile_span(llm, "llm:compact"):
+        resp = llm.dispatch(model, summary_messages, internal_kind="compaction")
     if "error" in resp:
         return messages, previous_summary
     summary = (resp["message"].get("content") or "").strip()

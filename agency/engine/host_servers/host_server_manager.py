@@ -93,6 +93,9 @@ class HostServerManager:
                 "harness": getattr(agent, "harness", "unknown"),
             },
         )
+        self._llm_handler_server._profile_context_provider = (
+            self._interaction_server.profile_parent_context
+        )
         self._host_mcp_server = HostMcpServer(
             sandbox,
             skill,

@@ -37,6 +37,7 @@ import random
 import time
 
 import httpx
+from .profiling import span as profile_span
 
 _DISPATCH_MAX_RETRIES = 4
 _DISPATCH_BASE_BACKOFF_S = 0.5
@@ -83,7 +84,8 @@ class LLMClient:
                         resp.read()
                         last_error = f"dispatch failed: {resp.status_code} {resp.text}"
                         if attempt < _DISPATCH_MAX_RETRIES - 1:
-                            time.sleep(_retry_backoff_s(attempt))
+                            with profile_span(self, f"llm:retry_backoff[{attempt}]"):
+                                time.sleep(_retry_backoff_s(attempt))
                             continue
                         return {"error": last_error}
                     if resp.status_code != 200:
@@ -131,7 +133,8 @@ class LLMClient:
             except (httpx.ConnectError, httpx.TimeoutException) as e:
                 last_error = f"llm endpoint unreachable: {e}"
                 if attempt < _DISPATCH_MAX_RETRIES - 1:
-                    time.sleep(_retry_backoff_s(attempt))
+                    with profile_span(self, f"llm:retry_backoff[{attempt}]"):
+                        time.sleep(_retry_backoff_s(attempt))
                     continue
                 return {"error": last_error}
 

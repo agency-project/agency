@@ -50,6 +50,10 @@ class HostInteractionServer:
         # a denied call never really runs, so it has nothing to complete.
         self._pending_calls: "dict[str, tuple]" = {}
         self._pending_calls_lock = threading.Lock()
+        self._remote_spans: dict[str, object] = {}
+        self._remote_turn: str | None = None
+        self._profile_session_id = None
+        self._profile_pid = -2 - agprof.next_index("remote-profile")
 
     def checkpoint(self, boundary_id: str, *, allow_messages: bool, phase: str) -> dict:
         if self._invocation is None:
@@ -200,7 +204,7 @@ class HostInteractionServer:
                         "timing": "hook_boundary",
                         "provenance": "host_observed",
                     },
-                    parent_context=self._profile_context,
+                    parent_context=self.profile_parent_context(),
                 )
                 self._pending_calls[call_id] = (kind, name, attributes, started / 1e9, profile_span)
         return call_id
@@ -223,16 +227,48 @@ class HostInteractionServer:
         outcome = "failure" if extra.get("error") is not None else "success"
         if kind == "syscall" and extra.get("return_value") is None and extra.get("error") is None:
             outcome = "unknown"
+        timing = "hook_boundary"
+        duration_ns = extra.get("duration_ns")
+        overrides = {}
+        if duration_ns is not None:
+            measured_start = extra.get("started_perf_ns")
+            if (
+                isinstance(duration_ns, int)
+                and not isinstance(duration_ns, bool)
+                and duration_ns >= 0
+                and isinstance(measured_start, int)
+                and profile_span is not None
+                and measured_start >= profile_span._t0 - 1_000_000_000
+                and measured_start + duration_ns <= end_perf_ns + 1_000_000_000
+            ):
+                timing = "exact"
+                measured_end = measured_start + duration_ns
+                measured_wall = end_wall_ns + measured_end - end_perf_ns
+                end_perf_ns, end_wall_ns = measured_end, measured_wall
+                overrides = {
+                    "start_perf_ns": measured_start,
+                    "start_wall_ns": measured_wall - duration_ns,
+                }
+                start_ts, end_ts = (measured_wall - duration_ns) / 1e9, measured_wall / 1e9
+            else:
+                agprof.telemetry_error("invalid_tool_durations")
         if profile_span is not None:
             profile_span.end(
-                end_perf_ns=end_perf_ns, end_wall_ns=end_wall_ns, metadata={"outcome": outcome}
+                end_perf_ns=end_perf_ns,
+                end_wall_ns=end_wall_ns,
+                metadata={
+                    "outcome": outcome,
+                    "timing": timing,
+                    "provenance": "container_asserted" if timing == "exact" else "host_observed",
+                },
+                **overrides,
             )
         self.record_event(f"{kind}_result", {**attributes, **extra, "call_id": call_id})
         self.record_span(
             f"{kind}:{name}",
             start_ts,
             end_ts,
-            {**attributes, "call_id": call_id, "outcome": outcome, "timing": "hook_boundary"},
+            {**attributes, "call_id": call_id, "outcome": outcome, "timing": timing},
         )
 
     def finalize_profile(self) -> None:
@@ -240,10 +276,138 @@ class HostInteractionServer:
         with self._pending_calls_lock:
             pending = list(self._pending_calls.values())
             self._pending_calls.clear()
+        for span in self._remote_spans.values():
+            agprof.interrupt_external_span(span)
+        self._remote_spans.clear()
+        self._remote_turn = None
         for _kind, _name, _attrs, _start, span in pending:
             agprof.interrupt_external_span(span)
         if pending:
             agprof.telemetry_error("unmatched_completions", len(pending))
+
+    def profile_parent_context(self):
+        turn = self._remote_spans.get(self._remote_turn)
+        return turn.context() if turn is not None else self._profile_context
+
+    def profile_config(self) -> dict:
+        self._profile_session_id = agprof._profile_session_id
+        settings = agprof._auto_settings
+        engine = self._profile_attributes.get("harness")
+        if engine == "native" and engine in agprof._engine_coverage:
+            agprof._engine_coverage[engine]["automatic_functions"] = (
+                "host_and_native_python" if settings else "disabled"
+            )
+            agprof._engine_coverage[engine]["retries"] = "container_reported"
+        return {
+            "enabled": agprof.enabled(),
+            "session_id": self._profile_session_id,
+            "host_perf_ns": time.perf_counter_ns(),
+            "automatic": None
+            if settings is None
+            else {
+                key: settings[key]
+                for key in ("min_duration_ms", "max_depth", "max_events", "include_dependencies")
+            },
+        }
+
+    def profile_events(self, request: dict) -> dict:
+        """Accept bounded telemetry only inside the manager's authenticated attempt fence."""
+        if (
+            not agprof.enabled()
+            or request.get("session_id") != self._profile_session_id
+            or self._profile_session_id != agprof._profile_session_id
+        ):
+            return {"ok": False, "error": "inactive profile session"}
+        events = request.get("events", [])
+        if not isinstance(events, list) or len(events) > 128:
+            return {"ok": False, "error": "profile batch exceeds 128 events"}
+        now = time.perf_counter_ns()
+        rejected = 0
+        for event in events:
+            try:
+                name = event["name"]
+                if not isinstance(name, str) or not name or len(name) > 512:
+                    raise ValueError("invalid name")
+                started = int(event["perf_ns"])
+                if started < agprof._session_started_ns or started > now + 1_000_000_000:
+                    raise ValueError("timestamp outside profile session")
+                wall = time.time_ns() + started - time.perf_counter_ns()
+                kind = event["kind"]
+                if kind == "automatic":
+                    duration = int(event["duration_ns"])
+                    if duration < 0 or started + duration > now + 1_000_000_000:
+                        raise ValueError("invalid interval")
+                    settings = agprof._auto_settings
+                    if settings is None:
+                        continue
+                    if len(agprof._auto_records) >= settings["max_events"]:
+                        agprof.telemetry_error("remote_auto_dropped")
+                        continue
+                    agprof._auto_records.append(
+                        (
+                            self._profile_pid,
+                            int(event["tid"]),
+                            name,
+                            str(event.get("filename", ""))[:1024],
+                            int(event.get("lineno", 0)),
+                            started,
+                            duration,
+                            str(event.get("outcome", "unknown"))[:32],
+                            "Native Python",
+                        )
+                    )
+                elif kind == "start":
+                    identifier = event["id"]
+                    if (
+                        not isinstance(identifier, str)
+                        or len(identifier) > 128
+                        or identifier in self._remote_spans
+                    ):
+                        raise ValueError("invalid or duplicate span id")
+                    if len(self._remote_spans) >= 1024:
+                        raise ValueError("too many open remote spans")
+                    parent_id = event.get("parent_id")
+                    if parent_id is not None and parent_id not in self._remote_spans:
+                        raise ValueError("unknown parent")
+                    parent = self._remote_spans.get(parent_id)
+                    span = agprof.start_external_span(
+                        name,
+                        start_perf_ns=started,
+                        start_wall_ns=wall,
+                        parent_context=parent.context() if parent else self._profile_context,
+                        metadata={
+                            **self._profile_attributes,
+                            "timing": "exact",
+                            "provenance": "container_asserted",
+                            "clock_uncertainty_ns": max(
+                                0, min(int(request.get("clock_uncertainty_ns", 0)), 1_000_000_000)
+                            ),
+                        },
+                    )
+                    self._remote_spans[identifier] = span
+                    if name.startswith("turn"):
+                        self._remote_turn = identifier
+                elif kind == "end":
+                    identifier = event["id"]
+                    span = self._remote_spans.get(identifier)
+                    if span is None or started < span._t0:
+                        raise ValueError("unmatched end")
+                    self._remote_spans.pop(identifier)
+                    outcome = event.get("outcome", "unknown")
+                    if outcome not in ("success", "failure", "unknown"):
+                        outcome = "unknown"
+                    span.end(end_perf_ns=started, end_wall_ns=wall, metadata={"outcome": outcome})
+                    if self._remote_turn == identifier:
+                        self._remote_turn = None
+                else:
+                    raise ValueError("invalid event kind")
+            except (KeyError, ValueError, TypeError, OverflowError):
+                rejected += 1
+                agprof.telemetry_error("remote_events_rejected")
+        dropped = request.get("dropped", 0)
+        if isinstance(dropped, int) and dropped > 0:
+            agprof.telemetry_error("remote_events_dropped", dropped)
+        return {"ok": rejected == 0, "rejected": rejected}
 
     def admit_tool_call(self, tool_name: str, tool_input: dict) -> dict:
         """Admission + telemetry entry point for a tool call: decide
@@ -257,9 +421,23 @@ class HostInteractionServer:
         return {"allowed": allowed, "reason": reason, "call_id": call_id}
 
     def complete_tool_call(
-        self, call_id: str, result: object = None, error: "str | None" = None
+        self,
+        call_id: str,
+        result: object = None,
+        error: "str | None" = None,
+        duration_ns: int | None = None,
+        started_perf_ns: int | None = None,
     ) -> None:
-        self._record_completion("tool", call_id, {"result": result, "error": error})
+        self._record_completion(
+            "tool",
+            call_id,
+            {
+                "result": result,
+                "error": error,
+                **({"duration_ns": duration_ns} if duration_ns is not None else {}),
+                **({"started_perf_ns": started_perf_ns} if started_perf_ns is not None else {}),
+            },
+        )
 
     def admit_syscall(self, syscall: "agsyscallevent") -> dict:
         """Admission + telemetry entry point for a syscall, symmetric with
@@ -329,13 +507,27 @@ class HostInteractionServer:
     def build_app(self) -> FastAPI:
         app = FastAPI()
 
+        @app.post("/profile/config")
+        def _profile_config() -> JSONResponse:
+            return JSONResponse(self.profile_config())
+
+        @app.post("/profile/events")
+        def _profile_events(request: dict) -> JSONResponse:
+            return JSONResponse(self.profile_events(request))
+
         @app.post("/check_tool")
         def _check_tool(request: dict) -> JSONResponse:
             return JSONResponse(self.admit_tool_call(request["tool_name"], request["tool_input"]))
 
         @app.post("/complete_tool")
         def _complete_tool(request: dict) -> JSONResponse:
-            self.complete_tool_call(request["call_id"], request.get("result"), request.get("error"))
+            self.complete_tool_call(
+                request["call_id"],
+                request.get("result"),
+                request.get("error"),
+                request.get("duration_ns"),
+                request.get("started_perf_ns"),
+            )
             return JSONResponse({"ok": True})
 
         @app.post("/check_syscall")

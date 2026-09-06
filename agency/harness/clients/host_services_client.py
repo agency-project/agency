@@ -210,11 +210,23 @@ class HostServicesClient:
         }
 
     def complete_tool_policy(
-        self, token: str, call_id: str, result: object = None, error: "str | None" = None
+        self,
+        token: str,
+        call_id: str,
+        result: object = None,
+        error: "str | None" = None,
+        duration_ns: int | None = None,
+        started_perf_ns: int | None = None,
     ) -> None:
         response = self.client.post(
             "/interaction/complete_tool",
-            json={"call_id": call_id, "result": result, "error": error},
+            json={
+                "call_id": call_id,
+                "result": result,
+                "error": error,
+                **({"duration_ns": duration_ns} if duration_ns is not None else {}),
+                **({"started_perf_ns": started_perf_ns} if started_perf_ns is not None else {}),
+            },
             headers=self._attempt_headers(token),
         )
         response.raise_for_status()
@@ -315,6 +327,16 @@ class HostServicesClient:
             base_url="http://agmanager-host",
             timeout=self._timeout_s,
         )
+
+    def profile_request(self, token: str, path: str, payload: dict) -> dict:
+        response = self.client.post(
+            "/interaction/profile/" + path,
+            json=payload,
+            headers=self._attempt_headers(token),
+            timeout=2.0,
+        )
+        response.raise_for_status()
+        return response.json()
 
     def forward_profiler_event(self, token: str, event: dict) -> dict:
         if not self.validate_token(token):

@@ -44,6 +44,7 @@ import os
 import re
 import signal
 import subprocess
+import sysconfig
 import sys
 import threading
 import time
@@ -102,6 +103,7 @@ _auto_stacks: "dict[tuple[int, int], list[tuple]]" = {}
 _auto_code_labels: dict = {}
 _auto_settings: "dict | None" = None
 _auto_dropped = 0
+_auto_filtered = Counter()
 _auto_tool_in_use = False
 
 _DEFAULT_AUTO_MIN_DURATION_MS = 1.0
@@ -675,6 +677,8 @@ class _ObservedSpan:
     ) -> bool:
         if (start_perf_ns is None) != (start_wall_ns is None):
             raise ValueError("start_perf_ns and start_wall_ns must be overridden together")
+        if self._span is not None and start_perf_ns is not None:
+            raise ValueError("a span used as a parent cannot be retimed")
         with _open_spans_lock:
             if _open_spans.pop(id(self), None) is None:
                 return False
@@ -995,6 +999,7 @@ def _make_auto_settings(
     min_duration_ms: float = _DEFAULT_AUTO_MIN_DURATION_MS,
     max_depth: int = _DEFAULT_AUTO_MAX_DEPTH,
     max_events: int = _DEFAULT_AUTO_MAX_EVENTS,
+    include_dependencies: bool = False,
 ) -> dict:
     if min_duration_ms < 0:
         raise ValueError("agprof: auto_min_duration_ms must be >= 0")
@@ -1004,10 +1009,17 @@ def _make_auto_settings(
         raise ValueError("agprof: auto_max_events must be >= 1")
     excluded = [] if exclude is None else ([exclude] if isinstance(exclude, str) else list(exclude))
     roots = _resolve_auto_roots(include)
+    if include_dependencies:
+        roots.extend(
+            (path, "")
+            for path in {sysconfig.get_path("purelib"), sysconfig.get_path("stdlib")}
+            if path
+        )
     if not roots:
         raise ValueError("agprof: auto_include did not resolve to any Python source roots")
     return {
         "roots": roots,
+        "include_dependencies": include_dependencies,
         "exclude": tuple(str(item) for item in excluded),
         "min_duration_ns": int(min_duration_ms * 1e6),
         "min_duration_ms": float(min_duration_ms),
@@ -1030,9 +1042,12 @@ def _auto_label_for_code(code) -> "tuple[str, str, int] | None":
     absolute = os.path.abspath(filename)
     normalized = absolute.replace(os.sep, "/")
     if (
-        any(
-            part in normalized
-            for part in ("/site-packages/", "/dist-packages/", "/.venv/", "/venv/")
+        (
+            not settings["include_dependencies"]
+            and any(
+                part in normalized
+                for part in ("/site-packages/", "/dist-packages/", "/.venv/", "/venv/")
+            )
         )
         or absolute.startswith(os.path.dirname(__file__) + os.sep)
         or any(
@@ -1145,19 +1160,23 @@ def _thread_label(pid: int, tid: int) -> str:
     return remembered[1] if remembered is not None else "Python thread"
 
 
-def _record_auto_call(entry: tuple, ended_ns: int, outcome: str) -> None:
+def _record_auto_call(entry: tuple, ended_ns: int, outcome: str, *, identity=None) -> None:
     global _auto_dropped
     _code, started_ns, label, filename, lineno = entry
     if started_ns is None:
+        _auto_filtered["depth"] += 1
         return
     duration_ns = max(0, ended_ns - started_ns)
     settings = _auto_settings
-    if settings is None or duration_ns < settings["min_duration_ns"]:
+    if settings is None:
+        return
+    if duration_ns < settings["min_duration_ns"]:
+        _auto_filtered["duration"] += 1
         return
     if len(_auto_records) >= settings["max_events"]:
         _auto_dropped += 1
         return
-    pid, tid = os.getpid(), threading.get_native_id()
+    pid, tid = identity or (os.getpid(), threading.get_native_id())
     _auto_records.append(
         (
             pid,
@@ -1268,9 +1287,9 @@ def _disable_auto_functions() -> list[tuple]:
         monitoring.free_tool_id(tool_id)
         _auto_tool_in_use = False
     ended_ns = time.perf_counter_ns()
-    for stack in list(_auto_stacks.values()):
+    for identity, stack in list(_auto_stacks.items()):
         for entry in stack:
-            _record_auto_call(entry, ended_ns, "interrupted")
+            _record_auto_call(entry, ended_ns, "interrupted", identity=identity)
     _auto_stacks.clear()
     events = list(_auto_records)
     _auto_settings = None
@@ -1770,6 +1789,7 @@ def start(
     sample_hz: float = 10.0,
     sample_gpu: bool = True,
     auto_functions: bool = True,
+    auto_include_dependencies: bool = False,
     auto_include=None,
     auto_exclude=None,
     auto_min_duration_ms: float = _DEFAULT_AUTO_MIN_DURATION_MS,
@@ -1793,6 +1813,7 @@ def start(
     auto_settings = (
         _make_auto_settings(
             include=auto_include,
+            include_dependencies=auto_include_dependencies,
             exclude=auto_exclude,
             min_duration_ms=auto_min_duration_ms,
             max_depth=auto_max_depth,
@@ -1866,6 +1887,7 @@ def start(
         _leases_open.clear()
         _auto_records.clear()
         _auto_dropped = 0
+        _auto_filtered.clear()
         _last_summary = None
         _last_run_summary = None
         started_ns = time.perf_counter_ns()
@@ -1987,6 +2009,10 @@ def stop():
                 "enabled": auto_settings is not None,
                 "captured": len(auto_events),
                 "dropped": _auto_dropped,
+                "filtered": dict(_auto_filtered),
+                "include_dependencies": auto_settings["include_dependencies"]
+                if auto_settings
+                else False,
                 "min_duration_ms": auto_settings["min_duration_ms"] if auto_settings else None,
                 "max_depth": auto_settings["max_depth"] if auto_settings else None,
                 "max_events": auto_settings["max_events"] if auto_settings else None,
@@ -2415,6 +2441,8 @@ def _build_run_summary(
         "attempts": len(attempt_records) + len(interrupted_attempts),
         "retries": retries,
         "retry_coverage": "reported" if retries is not None else "unavailable",
+        "retries_reported": sum(r[1].startswith("llm:retry_backoff") for r in completed_records)
+        + sum(r["label"].startswith("llm:retry_backoff") for r in interrupted),
         "successful_attempts": sum(
             metadata.get("outcome", "unknown") == "success" for metadata in attempt_metadata
         ),
@@ -2612,7 +2640,8 @@ def _build_run_summary(
         "schema_version": 6,
         "data_source": "mixed"
         if any(
-            record[6].get("timing") in ("derived", "hook_boundary", "container_asserted")
+            record[6].get("provenance") == "container_asserted"
+            or record[6].get("timing") in ("derived", "hook_boundary", "container_asserted")
             for record in completed_records
         )
         else "measured",
@@ -3001,6 +3030,7 @@ def session(
     sample_hz: float = 10.0,
     sample_gpu: bool = True,
     auto_functions: bool = True,
+    auto_include_dependencies: bool = False,
     auto_include=None,
     auto_exclude=None,
     auto_min_duration_ms: float = _DEFAULT_AUTO_MIN_DURATION_MS,
@@ -3015,6 +3045,7 @@ def session(
         sample_hz=sample_hz,
         sample_gpu=sample_gpu,
         auto_functions=auto_functions,
+        auto_include_dependencies=auto_include_dependencies,
         auto_include=auto_include,
         auto_exclude=auto_exclude,
         auto_min_duration_ms=auto_min_duration_ms,
@@ -3146,4 +3177,6 @@ def _initialize_environment_profiling() -> None:
         _agprof_print(f"[agprof] WARNING: process-scope profiling failed to start: {exc}")
 
 
-_initialize_environment_profiling()
+# The native collector loads this stdlib-only module without starting a host session.
+if __name__ != "_agency_container_profiler":
+    _initialize_environment_profiling()
