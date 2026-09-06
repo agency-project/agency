@@ -1,11 +1,9 @@
-"""Cross-cutting regression guards for harness profiling.
+"""Cross-cutting interruption and thread-parentage guards.
 
-The end-to-end golden described by M8 depends on a deterministic mock/replay
-endpoint for the five harness engines.  That endpoint is deliberately owned
-outside the profiler roadmap and is not present in this repository yet.  Keep
-the independently useful interruption and static guards here now; add the
-engine golden beside them once the replay endpoint has a concrete protocol and
-fixture.
+The deterministic HTTP adapter/profiler and shared tool-contract golden tests
+live in test_profiler_native.py. They exercise all five wire adapters with a
+fake provider; real CLI binaries, Linux ptrace, cgroups and GPU devices still
+require their environment-specific integration runs.
 """
 
 from __future__ import annotations

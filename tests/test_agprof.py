@@ -541,8 +541,10 @@ def test_derived_rollups_include_outcomes_percentiles_tokens_energy_and_interrup
     assert summary["run_metrics"]["p50_ms"] == 1500.0
     assert summary["llm_metrics"]["calls"] == 2
     assert summary["llm_metrics"]["retries"] == 1
-    assert summary["llm_metrics"]["input_tokens"] == 60
-    assert summary["llm_metrics"]["output_tokens"] == 90
+    assert summary["llm_metrics"]["input_tokens"] is None
+    assert summary["llm_metrics"]["reported_input_tokens"] == 60
+    assert summary["llm_metrics"]["output_tokens"] is None
+    assert summary["llm_metrics"]["reported_output_tokens"] == 90
     assert summary["llm_metrics"]["ttft"]["p50_ms"] == 150.0
     assert summary["llm_metrics"]["output_tokens_per_second"] == 100.0
     assert summary["tool_metrics"]["started"] == 3

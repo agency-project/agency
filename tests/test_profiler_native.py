@@ -236,3 +236,41 @@ def test_adapter_http_dispatch_reaches_real_profiler(engine, monkeypatch, tmp_pa
         "output_tokens": 3,
         "retries": None,
     }
+
+
+def test_profiler_gateway_authenticates_and_forwards_attempt_header():
+    from fastapi import FastAPI
+    from agency.harness.clients.host_services_client import HostServicesClient
+    from agency.harness.interaction_router import build_router
+    from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
+
+    requests = []
+
+    def receive(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    bridge = HostServicesClient("/unused", None)
+    bridge.client.close()
+    bridge.client = httpx.Client(base_url="http://host", transport=httpx.MockTransport(receive))
+    bridge.register_attempt_token("current")
+    app = FastAPI()
+    app.include_router(build_router(bridge))
+    with TestClient(app) as client:
+        assert client.post("/agprof/events", json={}).status_code == 401
+        assert not requests
+        response = client.post(
+            "/agprof/events", json={"events": []}, headers={"Authorization": "Bearer current"}
+        )
+        assert response.json() == {"ok": True}
+        assert requests[0].url.path == "/interaction/profile/events"
+        assert requests[0].headers[ATTEMPT_TOKEN_HEADER] == "current"
+        bridge.clear_attempt_token("current")
+        assert (
+            client.post(
+                "/agprof/events", json={}, headers={"Authorization": "Bearer current"}
+            ).status_code
+            == 401
+        )
+        assert len(requests) == 1
+    bridge.client.close()

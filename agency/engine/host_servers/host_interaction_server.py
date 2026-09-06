@@ -53,6 +53,7 @@ class HostInteractionServer:
         self._remote_spans: dict[str, object] = {}
         self._remote_turn: str | None = None
         self._profile_session_id = None
+        self._clock_uncertainty_ns = 0
         self._profile_pid = -2 - agprof.next_index("remote-profile")
 
     def checkpoint(self, boundary_id: str, *, allow_messages: bool, phase: str) -> dict:
@@ -238,8 +239,8 @@ class HostInteractionServer:
                 and duration_ns >= 0
                 and isinstance(measured_start, int)
                 and profile_span is not None
-                and measured_start >= profile_span._t0 - 1_000_000_000
-                and measured_start + duration_ns <= end_perf_ns + 1_000_000_000
+                and measured_start >= profile_span._t0 - self._clock_uncertainty_ns
+                and measured_start + duration_ns <= end_perf_ns + self._clock_uncertainty_ns
             ):
                 timing = "exact"
                 measured_end = measured_start + duration_ns
@@ -260,6 +261,7 @@ class HostInteractionServer:
                     "outcome": outcome,
                     "timing": timing,
                     "provenance": "container_asserted" if timing == "exact" else "host_observed",
+                    "clock_uncertainty_ns": self._clock_uncertainty_ns if timing == "exact" else 0,
                 },
                 **overrides,
             )
@@ -321,6 +323,10 @@ class HostInteractionServer:
         events = request.get("events", [])
         if not isinstance(events, list) or len(events) > 128:
             return {"ok": False, "error": "profile batch exceeds 128 events"}
+        uncertainty = request.get("clock_uncertainty_ns", 0)
+        if not isinstance(uncertainty, int) or uncertainty < 0 or uncertainty > 1_000_000_000:
+            return {"ok": False, "error": "invalid clock uncertainty"}
+        self._clock_uncertainty_ns = uncertainty
         now = time.perf_counter_ns()
         rejected = 0
         for event in events:
@@ -360,6 +366,7 @@ class HostInteractionServer:
                     identifier = event["id"]
                     if (
                         not isinstance(identifier, str)
+                        or not identifier
                         or len(identifier) > 128
                         or identifier in self._remote_spans
                     ):
@@ -370,6 +377,8 @@ class HostInteractionServer:
                     if parent_id is not None and parent_id not in self._remote_spans:
                         raise ValueError("unknown parent")
                     parent = self._remote_spans.get(parent_id)
+                    if parent is not None and started < parent._t0:
+                        raise ValueError("child starts before parent")
                     span = agprof.start_external_span(
                         name,
                         start_perf_ns=started,

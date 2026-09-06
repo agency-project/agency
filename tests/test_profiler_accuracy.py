@@ -79,3 +79,31 @@ def test_admission_spans_reach_profile_and_keep_parent_on_retirement(monkeypatch
     assert result["tool_metrics"]["interrupted"] == 1
     assert result["tool_metrics"]["latency"]["p95_ms"] is None
     assert result["sampling"]["telemetry_errors"]["unmatched_completions"] == 1
+
+
+def test_missing_wait_counter_is_unknown_in_trace_and_legacy_summary(monkeypatch):
+    from agency.observability.profiler import agprof_trace
+
+    records = [(1, "work", 0, 100, 25, None, {"outcome": "success"})]
+    row = agprof._build_summary(records)["work"]
+    assert row["cpu_ms"] == 25 / 1e6
+    assert row["runq_ms"] is None
+    assert row["blocked_ms"] is None
+    monkeypatch.setattr(agprof, "_last_summary", {"work": row})
+    assert "n/a" in agprof.summary_table()
+    trace = agprof_trace.build_trace(records, [], [], observations=[])
+    event = next(e for e in trace["traceEvents"] if e["name"] == "work")
+    assert event["args"]["blocked_ms"] == "n/a"
+
+
+def test_partial_usage_does_not_look_like_a_complete_token_total():
+    result = summary(
+        [
+            (1, "llm:attempt[0]", 0, 10, 0, 0, {"input_tokens": 10, "output_tokens": 5}),
+            (1, "llm:attempt[0]", 0, 10, 0, 0, {}),
+        ]
+    )["llm_metrics"]
+    assert result["input_tokens"] is None
+    assert result["reported_input_tokens"] == 10
+    assert result["usage_missing_attempts"] == 1
+    assert result["failed_attempts"] == 0

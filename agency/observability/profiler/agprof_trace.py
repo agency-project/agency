@@ -148,7 +148,7 @@ def _iter_trace_events(
             args.update(
                 cpu_ms=round(cpu / 1e6, 3),
                 runqueue_ms=(round(runq / 1e6, 3) if runq is not None else "n/a"),
-                blocked_ms=round(blocked / 1e6, 3),
+                blocked_ms=round(blocked / 1e6, 3) if runq is not None else "n/a",
                 cpu_pct=(round(100 * cpu / wall, 1) if wall > 0 else 0.0),
             )
         if span_id is not None:

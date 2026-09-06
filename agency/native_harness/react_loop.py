@@ -230,6 +230,7 @@ def run_react_loop(
                         tool_duration_ns = time.perf_counter_ns() - tool_started_ns
                 else:
                     result_content = handler(fn_args)
+                result_error = _parse_tool_input(result_content).get("error")
                 result_content = tools.offload_if_oversized(
                     fn_name, tc["id"], result_content, offload_dir
                 )
@@ -243,6 +244,7 @@ def run_react_loop(
                             result_content,
                             duration_ns=tool_duration_ns,
                             started_perf_ns=tool_started_ns + bridge._profiler.offset,
+                            error=str(result_error) if result_error is not None else None,
                         )
                     else:
                         bridge.complete_tool_policy(call_id, result_content)

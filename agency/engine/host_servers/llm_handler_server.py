@@ -578,8 +578,8 @@ class LlmHandlerServer:
                     _annotate(
                         attempt_span,
                         outcome="success",
-                        input_tokens=(usage or {}).get("prompt_tokens", 0),
-                        output_tokens=(usage or {}).get("completion_tokens", 0),
+                        input_tokens=(usage or {}).get("prompt_tokens"),
+                        output_tokens=(usage or {}).get("completion_tokens"),
                     )
                     self._tag_metadata_block(request["messages"], message)
                     self._record_exchange(request, message, usage, stop_reason)
@@ -1551,8 +1551,8 @@ class LlmHandlerServer:
                 _annotate(
                     attempt_span,
                     outcome="success",
-                    input_tokens=(usage or {}).get("prompt_tokens", 0),
-                    output_tokens=(usage or {}).get("completion_tokens", 0),
+                    input_tokens=(usage or {}).get("prompt_tokens"),
+                    output_tokens=(usage or {}).get("completion_tokens"),
                 )
                 message = _blocks_to_message(blocks)
                 try:

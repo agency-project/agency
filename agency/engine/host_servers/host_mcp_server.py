@@ -10,7 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
 from mcp.server.transport_security import TransportSecuritySettings
 
-from ...agdata import agdata
+from ...agdata import agdata, agerror
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette

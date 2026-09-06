@@ -914,6 +914,12 @@ def _append_interrupted_span(open_span, ended_perf_ns: int) -> None:
     if getattr(open_span, "_interrupted", False) or getattr(open_span, "_ended", False):
         return
     open_span.interrupt(ended_perf_ns)
+    span = getattr(open_span, "_span", None)
+    identity = {}
+    if span is not None and hasattr(span, "get_span_context"):
+        identity["span_id"] = f"{span.get_span_context().span_id:016x}"
+        if span.parent is not None:
+            identity["parent_span_id"] = f"{span.parent.span_id:016x}"
     _interrupted_spans.append(
         {
             "thread_id": open_span._tid,
@@ -921,6 +927,7 @@ def _append_interrupted_span(open_span, ended_perf_ns: int) -> None:
             "started_ns": open_span._t0,
             "duration_ms": round(max(0, ended_perf_ns - open_span._t0) / 1e6, 3),
             **copy.deepcopy(open_span._metadata),
+            **identity,
             "outcome": "interrupted",
         }
     )
@@ -1424,6 +1431,7 @@ class _Sampler(threading.Thread):
                     pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())
                 ]
             except Exception:
+                _health["gpu_initialization_failures"] += 1
                 self._nvml = None
         self._process_cgroup = _process_cgroup_dir()
         self._proc_root = Path("/proc")
@@ -2182,13 +2190,19 @@ def _build_summary(records) -> "dict[str, dict]":
         )
         row["calls"] += 1
         row["wall_ms"] += wall / 1e6
-        # Some externally observed spans have no local CPU measurement, so
-        # they contribute wall time but no CPU/blocked split.
-        if cpu is not None:
-            row["cpu_ms"] += cpu / 1e6
-            rq = runq or 0
-            row["runq_ms"] += rq / 1e6
-            row["blocked_ms"] += max(0, wall - cpu - rq) / 1e6
+        # A partial sum is not a total. Keep the entire aggregate unknown
+        # if any constituent lacks the required counter.
+        row["cpu_ms"] = (
+            row["cpu_ms"] + cpu / 1e6 if row["cpu_ms"] is not None and cpu is not None else None
+        )
+        row["runq_ms"] = (
+            row["runq_ms"] + runq / 1e6 if row["runq_ms"] is not None and runq is not None else None
+        )
+        row["blocked_ms"] = (
+            row["blocked_ms"] + max(0, wall - cpu - runq) / 1e6
+            if row["blocked_ms"] is not None and cpu is not None and runq is not None
+            else None
+        )
     return out
 
 
@@ -2296,17 +2310,17 @@ def _build_run_summary(
                 "interrupted": len(interrupted_by_label.get(label, [])),
                 "wall_ms": round(wall_ms, 3),
                 "cpu_ms": round(row["cpu_ms"], 3)
-                if any(r[4] is not None for r in label_records)
+                if row["cpu_ms"] is not None and label_records
                 else None,
                 "runqueue_ms": round(row["runq_ms"], 3)
-                if any(r[5] is not None for r in label_records)
+                if row["runq_ms"] is not None and label_records
                 else None,
                 "blocked_ms": round(row["blocked_ms"], 3)
                 if label_records
                 and all(r[4] is not None and r[5] is not None for r in label_records)
                 else None,
                 "cpu_percent": round(100 * row["cpu_ms"] / wall_ms, 1)
-                if wall_ms and any(r[4] is not None for r in label_records)
+                if wall_ms and row["cpu_ms"] is not None and label_records
                 else None,
                 **_latency_stats(wall_values),
             }
@@ -2410,7 +2424,13 @@ def _build_run_summary(
         for metadata in attempt_metadata
         if metadata.get("ttft_ms") is not None
     ]
-    generation_ms = sum(float(metadata.get("generation_ms") or 0) for metadata in attempt_metadata)
+    generation_pairs = [
+        metadata
+        for metadata in attempt_metadata
+        if metadata.get("generation_ms") is not None and metadata.get("output_tokens") is not None
+    ]
+    generation_ms = sum(float(metadata["generation_ms"]) for metadata in generation_pairs)
+    generated_tokens = sum(int(metadata["output_tokens"]) for metadata in generation_pairs)
     input_tokens = sum(int(metadata.get("input_tokens") or 0) for metadata in attempt_metadata)
     output_tokens = sum(int(metadata.get("output_tokens") or 0) for metadata in attempt_metadata)
     calls = sum(record[1].startswith("llm:attempt[0]") for record in attempt_records) + sum(
@@ -2434,7 +2454,8 @@ def _build_run_summary(
             metadata.get("outcome", "unknown") == "success" for metadata in attempt_metadata
         ),
         "failed_calls": sum(
-            metadata.get("outcome", "unknown") != "success" and not metadata.get("retrying")
+            metadata.get("outcome", "unknown") in ("failure", "failed", "error")
+            and not metadata.get("retrying")
             for metadata in attempt_metadata
         ),
         "interrupted_calls": len(interrupted_attempts),
@@ -2447,13 +2468,30 @@ def _build_run_summary(
             metadata.get("outcome", "unknown") == "success" for metadata in attempt_metadata
         ),
         "failed_attempts": sum(
-            metadata.get("outcome", "unknown") != "success" for metadata in attempt_metadata
+            metadata.get("outcome", "unknown") in ("failure", "failed", "error")
+            for metadata in attempt_metadata
         ),
         "interrupted_attempts": len(interrupted_attempts),
         "total_wait_ms": round(sum(record[3] for record in attempt_records) / 1e6, 3),
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "output_tokens_per_second": round(output_tokens / (generation_ms / 1e3), 3)
+        "reported_input_tokens": input_tokens,
+        "reported_output_tokens": output_tokens,
+        "usage_missing_attempts": sum(
+            m.get("input_tokens") is None or m.get("output_tokens") is None
+            for m in attempt_metadata
+        )
+        + len(interrupted_attempts),
+        "input_tokens": input_tokens
+        if not interrupted_attempts
+        and attempt_metadata
+        and all(m.get("input_tokens") is not None for m in attempt_metadata)
+        else None,
+        "output_tokens": output_tokens
+        if not interrupted_attempts
+        and attempt_metadata
+        and all(m.get("output_tokens") is not None for m in attempt_metadata)
+        else None,
+        "throughput_measured_attempts": len(generation_pairs),
+        "output_tokens_per_second": round(generated_tokens / (generation_ms / 1e3), 3)
         if generation_ms
         else None,
         "latency": _latency_stats([record[3] / 1e6 for record in attempt_records]),
@@ -2763,7 +2801,7 @@ def _render_summary_markdown(summary: dict) -> str:
             f"{number(llm['latency']['p95_ms'])} ms |",
             f"| LLM TTFT p50 / p95 | {number(llm['ttft']['p50_ms'])} / "
             f"{number(llm['ttft']['p95_ms'])} ms |",
-            f"| LLM input / output tokens | {llm['input_tokens']} / {llm['output_tokens']} |",
+            f"| LLM input / output tokens | {number(llm['input_tokens'], 0)} / {number(llm['output_tokens'], 0)} |",
             f"| LLM output throughput | {number(llm['output_tokens_per_second'])} tokens/s |",
             f"| LLM attempts | {llm['attempts']} total, {llm['successful_attempts']} succeeded, "
             f"{llm['failed_attempts']} failed, {llm['interrupted_attempts']} interrupted |",
@@ -3012,11 +3050,19 @@ def summary_table(sort_by: str = "wall_ms", row_limit: int = 30) -> str:
         f"{'label':<28} {'calls':>5} {'wall_s':>9} {'cpu_s':>8} {'runq_s':>8} {'blocked_s':>9} {'cpu%':>6}"
     ]
     lines.append("-" * len(lines[0]))
+
+    def seconds(value):
+        return "n/a" if value is None else f"{value / 1e3:.2f}"
+
     for name, r in rows[:row_limit]:
-        cpu_pct = 100 * r["cpu_ms"] / r["wall_ms"] if r["wall_ms"] else 0.0
+        cpu_pct = (
+            f"{100 * r['cpu_ms'] / r['wall_ms']:.1f}%"
+            if r["cpu_ms"] is not None and r["wall_ms"]
+            else "n/a"
+        )
         lines.append(
-            f"{name:<28} {r['calls']:>5} {r['wall_ms'] / 1e3:>9.2f} {r['cpu_ms'] / 1e3:>8.2f} "
-            f"{r['runq_ms'] / 1e3:>8.2f} {r['blocked_ms'] / 1e3:>9.2f} {cpu_pct:>5.1f}%"
+            f"{name:<28} {r['calls']:>5} {seconds(r['wall_ms']):>9} {seconds(r['cpu_ms']):>8} "
+            f"{seconds(r['runq_ms']):>8} {seconds(r['blocked_ms']):>9} {cpu_pct:>6}"
         )
     return "\n".join(lines)
 
