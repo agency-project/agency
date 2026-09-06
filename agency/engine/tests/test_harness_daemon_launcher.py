@@ -17,6 +17,12 @@ class _FakeSandbox:
 
 def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeypatch):
     sandbox = _FakeSandbox()
+    installed = []
+    monkeypatch.setattr(
+        launcher,
+        "ensure_python_packages_in_container",
+        lambda _sandbox, packages, **kwargs: installed.extend(packages),
+    )
     readiness = iter([False, True])
     monkeypatch.setattr(launcher, "_is_ready", lambda _handle, timeout_s=0.5: next(readiness))
 
@@ -39,6 +45,7 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
     assert "--harness claude_code" in command
     assert '"binary_path":"/bin/claude"' in command
     assert workdir == "/workspace"
+    assert "cloudpickle" in installed
 
 
 def test_ensure_harness_daemon_waits_for_readiness_before_returning(monkeypatch):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -135,3 +137,41 @@ def test_native_adapter_launches_through_typed_runtime(monkeypatch):
     assert result.ok
     assert result.final_text == "native-ok"
     assert any("native_harness.cli" in command for command in sandbox.commands)
+
+
+@pytest.mark.parametrize("backend_cls", [_NativeBackend, _ClaudeCodeBackend])
+@pytest.mark.parametrize("has_sandbox_tools", [False, True])
+def test_mcp_adapters_include_separate_sandbox_config(monkeypatch, backend_cls, has_sandbox_tools):
+    captured = {}
+    sandbox = _NativeSandbox() if backend_cls is _NativeBackend else None
+
+    def launch(_self, argv, envp, **kwargs):
+        captured["argv"] = argv
+        handle = MagicMock()
+        handle.wait.return_value = ('{"result": "done"}', "", 0)
+        return handle
+
+    monkeypatch.setattr("shutil.which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+    )
+    runtime = replace(_runtime(sandbox=sandbox), has_sandbox_mcp_tools=has_sandbox_tools)
+    result = backend_cls(agconfig()).run_daemon_attempt(
+        runtime, prompt="test", resume_session_id=None, prior_session_blob=None, max_steps=2
+    )
+    assert result.ok
+    argv = (
+        shlex.split(next(cmd for cmd in sandbox.commands if "native_harness.cli" in cmd))
+        if sandbox is not None
+        else captured["argv"]
+    )
+    servers = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]
+    assert set(servers) == ({"agency", "agency-sandbox"} if has_sandbox_tools else {"agency"})
+    assert servers["agency"]["url"] == f"{runtime.harness_base_url}/mcp"
+    if has_sandbox_tools:
+        assert servers["agency-sandbox"] == {
+            "type": "http",
+            "url": f"{runtime.harness_base_url}/sandbox/mcp",
+            "headers": {"Authorization": f"Bearer {runtime.token}"},
+        }

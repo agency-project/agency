@@ -94,6 +94,20 @@ def test_pickle_round_trip():
     assert result.echoed == {"message": "ping"}
 
 
+def test_cloudpickle_preserves_persistent_factories_and_tool_definition():
+    import cloudpickle
+
+    seed = 7
+    tool = make_tool()
+    tool.persistent_vars = {"state": lambda: {"count": seed}}
+    restored = cloudpickle.loads(cloudpickle.dumps(tool))
+
+    assert restored is not tool
+    assert restored.to_openai_tool() == tool.to_openai_tool()
+    assert restored.persistent_vars["state"]() == {"count": 7}
+    assert restored(agdata(message="hello")).echoed == {"message": "hello"}
+
+
 # test_process_pool_runs_in_different_pid was retired here: agtool.__call__
 # no longer has a subprocess-pool path at all -- every call always runs in
 # the calling thread/process (see agtool.py's own module docstring).

@@ -5,6 +5,8 @@ import threading
 import uuid
 from pathlib import Path
 
+import pytest
+
 from agency.configs.agconfig import agconfig
 from agency.engine.clients import SandboxInteractionClient
 from agency.harness import daemon
@@ -17,7 +19,8 @@ from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
 
-def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
+@pytest.mark.parametrize("sandbox_payload", [None, "serialized-tools"])
+def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_payload):
     seen = {}
 
     class FakeAdapter(agharness_backend):
@@ -44,6 +47,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
         resume_session_id="session-1",
         prior_session_blob_b64=base64.b64encode(b"prior session state").decode("ascii"),
         attempt_token="attempt-one",
+        sandbox_mcp_tools_b64=sandbox_payload,
     )
 
     result = daemon._run_adapter_attempt(
@@ -61,6 +65,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch):
     assert seen["runtime"].engine_name == "agent-1"
     assert seen["runtime"].model == "model"
     assert seen["runtime"].token == "attempt-one"
+    assert seen["runtime"].has_sandbox_mcp_tools is (sandbox_payload is not None)
     assert result.session_id == "session-2"
     assert base64.b64decode(result.session_blob_b64) == b"updated session state"
 

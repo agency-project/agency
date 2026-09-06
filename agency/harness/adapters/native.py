@@ -116,7 +116,11 @@ class _NativeBackend(agharness_backend):
                     _session_file_path(scratch_dir, resume_session_id), prior_session_blob
                 )
 
-            mcp_config = agharness.mcp_config_for(runtime.harness_base_url, runtime.token)
+            mcp_config = agharness.mcp_config_for(
+                runtime.harness_base_url,
+                runtime.token,
+                has_sandbox_mcp_tools=runtime.has_sandbox_mcp_tools,
+            )
             pkg_pythonpath = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/agency"
             run_id = uuid.uuid4().hex[:8]
             stdout_path = f"{scratch_dir}/stdout-{run_id}.json"

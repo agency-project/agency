@@ -26,6 +26,8 @@ class HarnessAttemptRequest:
     # Fresh for each host -> sandbox RPC. The long-lived daemon and host
     # gateway accept only the token belonging to the currently active attempt.
     attempt_token: "str | None" = None
+    # Explicit sandbox tools only; host tools and the skill stay on the host.
+    sandbox_mcp_tools_b64: "str | None" = None
 
 
 @dataclass

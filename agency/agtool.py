@@ -12,8 +12,8 @@ class agtool:
     Provides the OpenAI tool schema and executes when called, directly in
     the calling thread/process -- whichever process actually holds the real
     `fn` closure and whatever host state it references (a sandbox object, a
-    live resource pool, etc.), never shipped across a process boundary to
-    run elsewhere.
+    live resource pool, etc.). Only tools explicitly supplied through
+    ``add_sandbox_mcp_tools`` are serialized and reconstructed sandbox-side.
 
     Logging
     -------
@@ -53,11 +53,13 @@ class agtool:
             "params": self.params,
             "_log_fn": self._log_fn,
             "run_in_subprocess": self.run_in_subprocess,
+            "persistent_vars": self.persistent_vars,
         }
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self.run_in_subprocess = state.get("run_in_subprocess", True)
+        self.persistent_vars = state.get("persistent_vars", {})
 
     # ------------------------------------------------------------------
     # Logging — override by supplying log_fn to __init__

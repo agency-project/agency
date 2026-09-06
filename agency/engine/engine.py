@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import threading
 import uuid
 from typing import TYPE_CHECKING
+
+import cloudpickle
 
 from ..harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 from ..observability.profiler import agprof
@@ -17,6 +20,7 @@ if TYPE_CHECKING:
     from ..agent import agent
     from ..orchestrator.agresources import agResourcePool
     from ..agskill import agskill
+    from ..agtool import agtool
     from .._submission import Invocation
     from .clients import SandboxInteractionClient
 
@@ -292,6 +296,7 @@ class AgentEngine:
                     max_steps=max_steps,
                     resume_session_id=resume_session_id,
                     prior_session_blob_b64=prior_session_blob_b64,
+                    sandbox_mcp_tools=skill.sandbox_mcp_tools,
                 )
                 if not attempt.ok:
                     break
@@ -407,6 +412,7 @@ class AgentEngine:
         max_steps: "int | None" = None,
         resume_session_id: "str | None" = None,
         prior_session_blob_b64: "str | None" = None,
+        sandbox_mcp_tools: "list[agtool] | None" = None,
     ) -> HarnessAttemptResult:
         client = self._sandbox_interaction_client
         manager = self._host_server_manager
@@ -418,6 +424,20 @@ class AgentEngine:
         attempt_token = uuid.uuid4().hex
         manager.bind_attempt_token(attempt_token)
         try:
+            sandbox_mcp_tools_b64 = None
+            if sandbox_mcp_tools:
+                try:
+                    sandbox_mcp_tools_b64 = base64.b64encode(
+                        cloudpickle.dumps(sandbox_mcp_tools)
+                    ).decode("ascii")
+                except Exception as exc:
+                    # Exception text can contain callable state or payload contents.
+                    return HarnessAttemptResult(
+                        ok=False,
+                        error_message=(
+                            f"sandbox MCP setup failed during serialization ({type(exc).__name__})"
+                        ),
+                    )
             request = HarnessAttemptRequest(
                 prompt=prompt,
                 harness=self._agent.harness,
@@ -425,6 +445,7 @@ class AgentEngine:
                 resume_session_id=resume_session_id,
                 prior_session_blob_b64=prior_session_blob_b64,
                 attempt_token=attempt_token,
+                sandbox_mcp_tools_b64=sandbox_mcp_tools_b64,
             )
             return client.run_harness_attempt(request)
         finally:

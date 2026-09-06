@@ -16,6 +16,7 @@ def test_harness_attempt_request_round_trips_through_json():
         resume_session_id="session-122",
         prior_session_blob_b64="cHJpb3I=",
         attempt_token="attempt-123",
+        sandbox_mcp_tools_b64="cGF5bG9hZA==",
         prompt=PromptPayload(
             system_instruction="system",
             user_content="fix the bug",
@@ -35,6 +36,7 @@ def test_harness_attempt_request_round_trips_through_json():
         "resume_session_id": "session-122",
         "prior_session_blob_b64": "cHJpb3I=",
         "attempt_token": "attempt-123",
+        "sandbox_mcp_tools_b64": "cGF5bG9hZA==",
     }
     prompt = PromptPayload(**decoded.pop("prompt"))
     assert HarnessAttemptRequest(prompt=prompt, **decoded) == request
@@ -45,6 +47,7 @@ def test_attempt_token_crosses_the_sandbox_attempt_route():
         prompt=PromptPayload("system", "user"),
         harness="native",
         attempt_token="attempt-current",
+        sandbox_mcp_tools_b64="cGF5bG9hZA==",
     )
     seen = []
     expected = HarnessAttemptResult(ok=True, final_text="done")

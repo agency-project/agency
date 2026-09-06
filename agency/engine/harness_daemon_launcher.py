@@ -103,7 +103,7 @@ def ensure_harness_daemon(
 
     ensure_python_packages_in_container(
         sandbox,
-        ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp"],
+        ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp", "cloudpickle"],
         timeout_s=180,
     )
 

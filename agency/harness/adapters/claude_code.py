@@ -341,16 +341,18 @@ class _ClaudeCodeBackend(agharness_backend):
                 }
             )
 
-            # --mcp-config -- point Claude Code's own native MCP client at
-            # agmanager_harness's own "/mcp" reverse proxy (resource-control
-            # + submit_output tools, same surface every engine gets).
-            # --strict-mcp-config restricts this launch to ONLY that
-            # server, ignoring any other MCP config source -- redundant
+            # --mcp-config exposes the host proxy and any attempt-local
+            # sandbox tools as separate servers. --strict-mcp-config
+            # restricts this launch to those servers -- redundant
             # with the isolated config_home/cwd (no `.mcp.json` lives
             # there) but cheap, explicit insurance against ever silently
             # inheriting some other server.
             mcp_config = json.dumps(
-                agharness.mcp_config_for(runtime.harness_base_url, runtime.token)
+                agharness.mcp_config_for(
+                    runtime.harness_base_url,
+                    runtime.token,
+                    has_sandbox_mcp_tools=runtime.has_sandbox_mcp_tools,
+                )
             )
 
             envp = {

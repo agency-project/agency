@@ -59,6 +59,7 @@ class SandboxInteractionServer:
                 resume_session_id=payload.get("resume_session_id"),
                 prior_session_blob_b64=payload.get("prior_session_blob_b64"),
                 attempt_token=payload.get("attempt_token"),
+                sandbox_mcp_tools_b64=payload.get("sandbox_mcp_tools_b64"),
             )
             return JSONResponse(asdict(self._attempt_handler(request)))
 

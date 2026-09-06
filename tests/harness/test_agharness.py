@@ -10,6 +10,21 @@ from agency.agdata import agdata
 from agency.agskill import agskill
 
 
+def test_mcp_config_preserves_host_entry_and_adds_separate_sandbox_endpoint():
+    host = {
+        "type": "http",
+        "url": "http://harness/mcp",
+        "headers": {"Authorization": "Bearer attempt"},
+    }
+    assert agharness.mcp_config_for("http://harness", "attempt") == {"mcpServers": {"agency": host}}
+    assert agharness.mcp_config_for("http://harness", "attempt", has_sandbox_mcp_tools=True) == {
+        "mcpServers": {
+            "agency": host,
+            "agency-sandbox": {**host, "url": "http://harness/sandbox/mcp"},
+        }
+    }
+
+
 def _make_agent(agname="test-agent"):
     ag = MagicMock()
     ag.agname = agname

@@ -8,22 +8,26 @@ HTTP-over-UDS request that submitted them.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import signal
 import subprocess
 import threading
 import time
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Callable
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from ..configs.agconfig import agconfig as agconfig_cls, harnessadapterconfig, ptraceconfig
-from . import interaction_router, mcp_proxy
+from . import interaction_router, mcp_proxy, sandbox_mcp
 from .adapters.agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from .clients.host_services_client import HostServicesClient
+from .common import extract_bearer_token
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
 from .servers import SandboxInteractionServer
 
@@ -94,6 +98,8 @@ class _HarnessApiServer:
         self._harness_backend = harness_backend
         self._server: "uvicorn.Server | None" = None
         self._thread: "threading.Thread | None" = None
+        self._loop: "asyncio.AbstractEventLoop | None" = None
+        self._sandbox_mcp_app = None
 
     @property
     def base_url(self) -> str:
@@ -103,10 +109,19 @@ class _HarnessApiServer:
         self._harness_backend.change_config(agconfig)
 
     def start(self, timeout_s: float = 10.0) -> None:
-        app = FastAPI()
+        @asynccontextmanager
+        async def lifespan(app):
+            self._loop = asyncio.get_running_loop()
+            try:
+                yield
+            finally:
+                self._loop = None
+
+        app = FastAPI(lifespan=lifespan)
         self._harness_backend.register(app, self._bridge)
         app.include_router(interaction_router.build_router(self._bridge))
         app.include_router(mcp_proxy.build_router(self._bridge))
+        app.mount("/sandbox", self._sandbox_mcp_endpoint)
         server = uvicorn.Server(
             uvicorn.Config(app, host="127.0.0.1", port=self._port, log_level="warning")
         )
@@ -123,6 +138,42 @@ class _HarnessApiServer:
         if not server.started:
             self.stop()
             raise RuntimeError("harness-facing API did not start within timeout")
+        self._port = server.servers[0].sockets[0].getsockname()[1]
+
+    async def _sandbox_mcp_endpoint(self, scope, receive, send) -> None:
+        token = extract_bearer_token(Request(scope))
+        app = self._sandbox_mcp_app
+        if app is None or not token or not self._bridge.validate_token(token):
+            response = JSONResponse({"error": "inactive sandbox MCP attempt"}, status_code=401)
+            await response(scope, receive, send)
+            return
+        await app(scope, receive, send)
+
+    async def run_sandbox_attempt(self, request, handler) -> HarnessAttemptResult:
+        # Enter and exit MCP's task-group lifespan in the same API-loop task.
+        # Closing it drains admitted tool calls before another attempt can start.
+        async with AsyncExitStack() as stack:
+            try:
+                app = sandbox_mcp.build_app(
+                    request.sandbox_mcp_tools_b64,
+                    lambda: (
+                        self._sandbox_mcp_app is app
+                        and self._bridge.validate_token(request.attempt_token)
+                    ),
+                )
+                await stack.enter_async_context(app.router.lifespan_context(app))
+            except Exception as exc:
+                message = (
+                    str(exc)
+                    if isinstance(exc, sandbox_mcp.SandboxMcpSetupError)
+                    else (f"sandbox MCP setup failed starting server ({type(exc).__name__})")
+                )
+                return HarnessAttemptResult(ok=False, error_message=message)
+            self._sandbox_mcp_app = app
+            try:
+                return await asyncio.to_thread(handler, request)
+            finally:
+                self._sandbox_mcp_app = None
 
     def stop(self) -> None:
         if self._server is not None:
@@ -189,6 +240,7 @@ def _run_adapter_attempt(
             token=attempt_token,
             syscall_policy=syscall_policy,
             sandbox=_LocalSandbox() if request.harness == "native" else None,
+            has_sandbox_mcp_tools=request.sandbox_mcp_tools_b64 is not None,
         )
         result: AttemptResult = adapter.run_daemon_attempt(
             runtime,
@@ -262,6 +314,11 @@ class HarnessManager:
                 )
             self._current_attempt_token = token
             try:
+                if request.sandbox_mcp_tools_b64 is not None:
+                    return asyncio.run_coroutine_threadsafe(
+                        self._harness_api.run_sandbox_attempt(request, self._attempt_handler),
+                        self._harness_api._loop,
+                    ).result()
                 return self._attempt_handler(request)
             finally:
                 self._current_attempt_token = None

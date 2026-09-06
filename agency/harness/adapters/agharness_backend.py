@@ -65,6 +65,7 @@ class AdapterRuntime:
     token: str
     syscall_policy: object
     sandbox: "AdapterSandbox | None" = None
+    has_sandbox_mcp_tools: bool = False
 
 
 class agharness_backend:

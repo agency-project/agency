@@ -74,14 +74,11 @@ def cleanup_config_home_in_container(sandbox, path: str) -> None:
     sandbox.exec(f"rm -rf {shlex.quote(path)}", workdir="/")
 
 
-def mcp_config_for(harness_base_url: str, token: str) -> dict:
-    """The `--mcp-config`-shaped dict every container-backed harness needs
-    to reach `agmanager_harness`'s `/mcp` mount -- one shared shape, since
-    every harness (Claude Code today, native_harness and eventually Codex/
-    opencode/Grok tomorrow) wants the identical
-    resource-control/submit_output/ask_human tool surface at the same
-    bridged URL."""
-    return {
+def mcp_config_for(
+    harness_base_url: str, token: str, *, has_sandbox_mcp_tools: bool = False
+) -> dict:
+    """Host tools plus the separate attempt-local sandbox server, when present."""
+    config = {
         "mcpServers": {
             "agency": {
                 "type": "http",
@@ -90,6 +87,13 @@ def mcp_config_for(harness_base_url: str, token: str) -> dict:
             }
         }
     }
+    if has_sandbox_mcp_tools:
+        config["mcpServers"]["agency-sandbox"] = {
+            "type": "http",
+            "url": f"{harness_base_url}/sandbox/mcp",
+            "headers": {"Authorization": f"Bearer {token}"},
+        }
+    return config
 
 
 # [REFACTOR] Why do we have this wrapper?

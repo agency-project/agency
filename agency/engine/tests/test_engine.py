@@ -12,10 +12,67 @@ from agency.agdata import agdata
 from agency.agcontext import agcontext
 from agency.agschema import agschema
 from agency.agdata import agerror
+from agency.agskill import agskill
+from agency.agtool import agtool
 from agency.configs.agconfig import agconfig as agconfig_cls
 from agency.engine import engine as mod
 from agency.engine.engine import AgentEngine
 from agency.harness.protocol import HarnessAttemptResult, PromptPayload
+
+
+def test_execute_transports_only_explicit_sandbox_tools(monkeypatch):
+    import base64
+    import cloudpickle
+    import threading
+
+    holder = _install_fake_host_server_manager(
+        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
+    )
+    host_lock = threading.Lock()
+
+    def host_only(arg):
+        with host_lock:
+            return arg
+
+    skill = agskill(
+        name="transport",
+        system_prompt="test",
+        add_host_mcp_tools=[agtool("host", "", host_only)],
+        add_sandbox_mcp_tools=[agtool("sandbox", "local", lambda arg: arg)],
+    )
+    engine = AgentEngine(_FakeAgent())
+    result = engine.execute(agcontext(), skill, agdata(), None, engine._agent.sandbox)
+
+    assert not isinstance(result, agerror)
+    request = holder["requests"][0]
+    restored = cloudpickle.loads(base64.b64decode(request.sandbox_mcp_tools_b64))
+    assert [tool.name for tool in restored] == ["sandbox"]
+    assert restored[0](agdata(answer=42)).answer == 42
+
+
+def test_sandbox_tool_serialization_failure_returns_error_and_retires_token(monkeypatch):
+    holder = _install_fake_host_server_manager(monkeypatch, results=[])
+
+    class Unserializable:
+        def __reduce__(self):
+            raise ValueError("private callable contents")
+
+    skill = agskill(
+        name="broken",
+        system_prompt="test",
+        add_sandbox_mcp_tools=[agtool("broken", "", Unserializable())],
+    )
+    engine = AgentEngine(_FakeAgent())
+    result = engine.execute(agcontext(), skill, agdata(), None, engine._agent.sandbox)
+
+    assert isinstance(result, agerror)
+    assert result.error == "sandbox MCP setup failed during serialization (ValueError)"
+    assert holder["requests"] == []
+    manager = holder["manager"]
+    assert manager.bound_attempt_tokens == manager.cleared_attempt_tokens
+    assert manager.active_attempt_token is None
+    assert engine._agent.sandbox.events == ["acquire", "discard", "release"]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -114,6 +171,7 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             self.active_attempt_token = None
             self.bound_attempt_tokens = []
             self.cleared_attempt_tokens = []
+            self.llm_handler_server = SimpleNamespace(get_main_transcript=lambda _needle: [])
 
             self.host_mcp_server = SimpleNamespace(
                 collected_output=lambda: next(collected_iter) if collected_iter is not None else {}
@@ -661,7 +719,7 @@ def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypa
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("launch failed")),
     )
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
+    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=3)
     with pytest.raises(RuntimeError, match="launch failed"):
         engine.execute(
             SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
@@ -678,7 +736,7 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     execution = agdata(result="done")
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
-    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
+    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=3)
     invocation = AgentControl().begin_invocation("controlled")
 
     result = engine.execute(
@@ -731,7 +789,7 @@ def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeyp
         harness_message_cursors={"claude_code": 1},
         harness_sessions={"claude_code": {"session_id": "prior", "blob_b64": "cHJpb3I="}},
     )
-    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
+    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=0)
 
     result = engine.execute(
         context,
@@ -762,7 +820,9 @@ def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypa
     execution = agerror("boom")
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
-    skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=3
+    )
 
     result = engine.execute(
         agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
@@ -793,7 +853,9 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
         lambda missing, *, system_instruction: next(prompts),
     )
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
-    skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=3)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=3
+    )
 
     result = engine.execute(
         agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
@@ -837,7 +899,9 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args, **_kwargs: prompt)
     monkeypatch.setattr(engine, "_build_retry_prompt", lambda *_args, **_kwargs: prompt)
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
-    skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=1)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=1
+    )
 
     def observe_commit_boundary():
         assert context.harness_sessions["claude_code"] == {
@@ -892,7 +956,7 @@ def test_commit_failure_discards_staged_session_and_still_tears_down_services(mo
         lambda *_args, **_kwargs: PromptPayload("system", "prompt"),
     )
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(done=True))
-    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
+    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=0)
 
     with pytest.raises(RuntimeError, match="commit failed"):
         engine.execute(context, skill, SimpleNamespace(), SimpleNamespace(), agent.sandbox)
@@ -945,7 +1009,7 @@ def test_cancelled_transaction_never_publishes_its_staged_session_or_cursor(monk
         return agdata(done=True)
 
     monkeypatch.setattr(engine, "_build_execution_result", cancel_with_result)
-    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=0)
+    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=0)
 
     result = engine.execute(
         context,
@@ -984,7 +1048,9 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
         lambda missing, *, system_instruction: retry,
     )
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
-    skill = SimpleNamespace(output_schema=agdata(summary=str), max_output_schema_retries=2)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=2
+    )
 
     result = engine.execute(
         agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
@@ -1012,7 +1078,7 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
         return expected
 
     monkeypatch.setattr(engine, "_build_execution_result", fake_build_result)
-    skill = SimpleNamespace(output_schema=None, max_output_schema_retries=3)
+    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=3)
     context = SimpleNamespace(marker="ctx", harness_sessions={})
 
     result = engine.execute(
