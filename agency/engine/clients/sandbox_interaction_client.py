@@ -27,6 +27,21 @@ class SandboxInteractionClient:
         response.raise_for_status()
         return response.json() == {"ready": True}
 
+    def daemon_identity(self) -> "tuple[int, int] | None":
+        response = self._client.get("/health")
+        response.raise_for_status()
+        value = response.headers.get("X-Agency-Daemon-Pid")
+        start = response.headers.get("X-Agency-Daemon-Start-Ticks")
+        if (
+            value is None
+            or not value.isdecimal()
+            or int(value) <= 0
+            or start is None
+            or not start.isdecimal()
+        ):
+            return None
+        return int(value), int(start)
+
     def close(self) -> None:
         self._client.close()
 

@@ -33,6 +33,7 @@ def test_native_turn_tool_hierarchy_and_measured_duration(monkeypatch, tmp_path)
             server = HostInteractionServer(
                 SimpleNamespace(policy=agpolicy()),
                 Logger(),
+                "test-agent",
                 parent_context=agprof.current_span_context(),
             )
             app = TestClient(server.build_app())
@@ -69,7 +70,7 @@ def test_native_turn_tool_hierarchy_and_measured_duration(monkeypatch, tmp_path)
 def test_profile_ingest_rejects_stale_sessions_and_unknown_parents(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
     with agprof.session(tmp_path, sample_hz=0, auto_functions=False):
-        server = HostInteractionServer(SimpleNamespace(policy=agpolicy()), Logger())
+        server = HostInteractionServer(SimpleNamespace(policy=agpolicy()), Logger(), "test-agent")
         config = server.profile_config()
         assert not server.profile_events({"session_id": "stale"})["ok"]
         result = server.profile_events(
@@ -139,7 +140,10 @@ def test_common_harness_profile_contract_matches_golden(engine, monkeypatch, tmp
     with agprof.session(tmp_path, sample_hz=0, auto_functions=False):
         agprof.register_engine(engine)
         server = HostInteractionServer(
-            SimpleNamespace(policy=agpolicy()), Logger(), profile_attributes={"harness": engine}
+            SimpleNamespace(policy=agpolicy()),
+            Logger(),
+            "test-agent",
+            profile_attributes={"harness": engine},
         )
         client = TestClient(server.build_app())
         admitted = client.post("/check_tool", json={"tool_name": "read", "tool_input": {}}).json()

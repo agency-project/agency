@@ -177,15 +177,39 @@ class AgentEngine:
                     try:
                         sandbox.commit()
                     finally:
-                        if not sandbox._has_pending_background_work():
+                        pending = sandbox._has_pending_background_work()
+                        diagnostic = None
+                        if getattr(self.agconfig.sandbox, "hibernation_diagnostics", False):
+                            from ..sandbox.pid_diagnostics import decision_snapshot
+
+                            diagnostic = decision_snapshot(sandbox._backend, pending)
+                            diagnostic["request_id"] = getattr(invocation, "_request_id", None)
+                            diagnostic["ordering_id"] = getattr(invocation, "ordering_id", None)
+                            self._agent.data_logger.record_event(
+                                type="hibernation_decision", payload=diagnostic, flush=True
+                            )
+                        hibernation = "skipped_pending_work" if pending else "performed"
+                        if not pending:
                             try:
                                 sandbox.stop()
                             except Exception as exc:
+                                hibernation = "failed"
                                 # DATACOLLECTOR: append -- ad-hoc print, uncaptured by any structured channel today.
                                 print(
                                     f"[engine] WARNING: post-commit hibernate failed "
                                     f"for {self._agent.agname}: {exc}"
                                 )
+                        if diagnostic is not None:
+                            self._agent.data_logger.record_event(
+                                type="hibernation_outcome",
+                                payload={
+                                    "request_id": diagnostic["request_id"],
+                                    "ordering_id": diagnostic["ordering_id"],
+                                    "outcome": hibernation,
+                                    "decision_epoch": diagnostic["decision_epoch"],
+                                },
+                                flush=True,
+                            )
                 self._commit_pending_session_update()
                 failed = False
                 return output

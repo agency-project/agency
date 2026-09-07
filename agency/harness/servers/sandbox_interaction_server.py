@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import os
 import time
 import stat
 from dataclasses import asdict
@@ -47,7 +48,15 @@ class SandboxInteractionServer:
 
         @app.get("/health")
         def _health() -> JSONResponse:
-            return JSONResponse({"ready": True})
+            # Keep the health payload compatible while identifying the owned
+            # daemon in its sandbox PID namespace for process monitoring.
+            headers = {"X-Agency-Daemon-Pid": str(os.getpid())}
+            try:
+                raw = Path("/proc/self/stat").read_text()
+                headers["X-Agency-Daemon-Start-Ticks"] = raw.rsplit(")", 1)[1].split()[19]
+            except (OSError, IndexError):
+                pass  # Non-Linux health checks remain supported; identity is unavailable.
+            return JSONResponse({"ready": True}, headers=headers)
 
         @app.post("/harness_attempt")
         def _harness_attempt(payload: dict) -> JSONResponse:

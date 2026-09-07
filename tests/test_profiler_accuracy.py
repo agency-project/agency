@@ -61,7 +61,10 @@ def test_admission_spans_reach_profile_and_keep_parent_on_retirement(monkeypatch
             "run0:test:agent", start_perf_ns=time.perf_counter_ns(), start_wall_ns=time.time_ns()
         )
         server = HostInteractionServer(
-            SimpleNamespace(policy=agpolicy()), Logger(), parent_context=run.context()
+            SimpleNamespace(policy=agpolicy()),
+            Logger(),
+            "test-agent",
+            parent_context=run.context(),
         )
         completed = server.admit_tool_call("read", {})["call_id"]
         lost = server.admit_tool_call("write", {})["call_id"]

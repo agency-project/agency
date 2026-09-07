@@ -208,6 +208,7 @@ class sandboxconfig(confignamespace):
 
     base_image: str = "agency-sandbox:latest"
     persistent: bool = False
+    hibernation_diagnostics: bool = False
     mounts: "dict[str, tuple[str, str, str]]" = field(default_factory=dict)
 
     backend: str = "auto"  # podman | docker | chroot | auto

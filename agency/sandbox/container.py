@@ -100,12 +100,13 @@ def _get_docker_semaphore() -> threading.Semaphore:
 
 @_contextmanager
 def _docker_semaphore_slot():
-    """Hold a docker/podman CLI slot; profile only the acquire wait."""
+    """Profile acquisition separately from the grouped docker/podman slot hold."""
     sem = _get_docker_semaphore()
     with agprof.span("sync:container"):
         sem.acquire()
     try:
-        yield
+        with agprof.span("runtime:container_slot_hold"):
+            yield
     finally:
         sem.release()
 
@@ -1235,15 +1236,19 @@ class _ContainerBackendBase(agsandbox_backend):
                 sem.release()
 
         try:
-            return run_with_unkillable_child_grace(
-                lambda: subprocess.run(
-                    args, input=input, capture_output=True, timeout=timeout, check=check
-                ),
-                args=args,
-                timeout=timeout,
-                grace_s=self._agconfig.sandbox.unkillable_child_grace_s,
-                on_give_up=_release_once,
-            )
+            # Excludes semaphore acquisition; includes CLI/daemon response time.
+            # Record only the operation verb, never command payloads or credentials.
+            operation = args[1] if len(args) > 1 else "unknown"
+            with agprof.span(f"runtime:container_call:{operation}"):
+                return run_with_unkillable_child_grace(
+                    lambda: subprocess.run(
+                        args, input=input, capture_output=True, timeout=timeout, check=check
+                    ),
+                    args=args,
+                    timeout=timeout,
+                    grace_s=self._agconfig.sandbox.unkillable_child_grace_s,
+                    on_give_up=_release_once,
+                )
         except subprocess.CalledProcessError as e:
             err = (e.stderr or b"").decode("utf-8", errors="replace").strip()
             msg = f"{' '.join(args)} failed (exit {e.returncode})"
@@ -1743,6 +1748,8 @@ class _ContainerBackendBase(agsandbox_backend):
         self._watched_pids = {}
         self._baseline_pids = None  # force a fresh capture on the next _ensure_started()
         self._ptrace_managed_pids = set()
+        self._daemon_pids = set()  # PIDs do not identify daemons across a restart.
+        self._infrastructure_pids = {}
         name = self._container_name()
         stop_exc: Exception | None = None
         try:
@@ -1812,6 +1819,8 @@ class _ContainerBackendBase(agsandbox_backend):
         self._watched_pids = {}
         self._baseline_pids = None
         self._ptrace_managed_pids = set()
+        self._daemon_pids = set()
+        self._infrastructure_pids = {}
         name = self._container_name()
         # rm_exc is raised at the end, after the release checks below still
         # run -- an unconfirmed removal must reach the caller, but shouldn't

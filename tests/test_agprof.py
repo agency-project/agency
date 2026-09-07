@@ -3,7 +3,6 @@
 import asyncio
 import json
 import sqlite3
-import os
 import threading
 import time
 from contextlib import contextmanager
@@ -1006,9 +1005,6 @@ def test_environment_cgroup_reexec_falls_back_to_sudo_without_user_scope(monkeyp
     monkeypatch.setattr(agprof, "_user_scope_available", lambda: False)
     monkeypatch.setattr(agprof.sys, "orig_argv", ["python", "bench.py", "--quick"])
     monkeypatch.setattr(agprof.sys, "executable", "/venv/bin/python")
-    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
-    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: True)
-
     monkeypatch.setattr(agprof.os, "getuid", lambda: 1234)
     monkeypatch.setattr(agprof.os, "getgid", lambda: 5678)
     monkeypatch.setenv("USER", "benchmark")

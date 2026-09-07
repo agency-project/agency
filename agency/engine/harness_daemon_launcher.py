@@ -95,6 +95,26 @@ def _preclaim_host_daemon_log(sandbox: "agSandbox") -> None:
     path.chmod(0o666)
 
 
+def _register_daemon(sandbox, handle):
+    # The daemon is infrastructure, not a user background job. Explicitly
+    # register its PID so a liveness refresh can still discover user children.
+    if not hasattr(sandbox, "_register_harness_pid"):
+        return  # Minimal direct-call sandbox adapters may not track processes.
+    try:
+        with handle.client(timeout_s=1) as client:
+            identity = client.daemon_identity()
+        if identity is not None:
+            sandbox._register_harness_pid(*identity)
+        else:
+            print(
+                "[engine] WARNING: harness daemon did not report its PID; hibernation may be deferred"
+            )
+    except Exception as exc:
+        print(
+            f"[engine] WARNING: harness daemon PID registration unavailable: {type(exc).__name__}"
+        )
+
+
 def ensure_harness_daemon(
     sandbox: "agSandbox",
     host_uds_path: str,
@@ -112,6 +132,7 @@ def ensure_harness_daemon(
 
     existing = handles.get(engine_name)
     if existing is not None and _is_ready(existing):
+        _register_daemon(sandbox, existing)
         return existing
 
     host_path = Path(host_uds_path)
@@ -151,6 +172,7 @@ def ensure_harness_daemon(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _is_ready(handle):
+            _register_daemon(sandbox, handle)
             handles[engine_name] = handle
             return handle
         time.sleep(0.05)

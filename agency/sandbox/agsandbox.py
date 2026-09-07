@@ -335,6 +335,9 @@ class agSandbox:
     def release_daemon(self, pid: int) -> None:
         self._backend.release_daemon(pid)
 
+    def _register_harness_pid(self, pid: int, start_ticks: int) -> None:
+        self._backend._register_harness_pid(pid, start_ticks)
+
     def get_live_pids(self) -> set[int]:
         return self._backend.get_live_pids()
 

@@ -31,6 +31,8 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 from typing import TYPE_CHECKING, Callable, ClassVar
 
+from . import pid_diagnostics
+
 from ..configs.agconfig import agconfig as agconfig_cls
 
 if TYPE_CHECKING:
@@ -309,6 +311,11 @@ class agsandbox_backend(AgSandboxBackendFields):
         against the real host /proc, outside the jail, while still running
         *cmd* itself chrooted for filesystem containment.
         """
+        identity_capture = (
+            pid_diagnostics.IDENTITY_SHELL
+            if getattr(self._agconfig.sandbox, "hibernation_diagnostics", False)
+            else ""
+        )
         wrapped = (
             f"exec 2>&1\n"  # merge stderr into stdout so the BGPIDS marker is never split
             # Snapshot every live PID in the container before the command runs.
@@ -326,7 +333,8 @@ class agsandbox_backend(AgSandboxBackendFields):
             f"  __p=${{__d##*/}}\n"
             f'  case " $__AGENCY_BEFORE $__AGENCY_SHELL " in\n'
             f'    *" $__p "*) ;;\n'
-            f'    *) __AGENCY_BGPIDS="$__AGENCY_BGPIDS $__p" ;;\n'
+            f'    *) __AGENCY_BGPIDS="$__AGENCY_BGPIDS $__p"\n'
+            f"{identity_capture} ;;\n"
             f"  esac\n"
             f"done\n"
             f"printf '\\n{_BGPIDS_MARKER}%s' \"$__AGENCY_BGPIDS\"\n"
@@ -369,6 +377,9 @@ class agsandbox_backend(AgSandboxBackendFields):
         )
 
         output, rc = self._exec_with_pid_tracking(env_export, cmd, workdir, timeout)
+        identities = {}
+        if getattr(self._agconfig.sandbox, "hibernation_diagnostics", False):
+            output, identities = pid_diagnostics.extract_identities(output)
 
         if _BGPIDS_MARKER in output:
             parts = output.rsplit(_BGPIDS_MARKER, 1)
@@ -378,7 +389,9 @@ class agsandbox_backend(AgSandboxBackendFields):
                 now = time.monotonic()
                 for pid_s in pids_str.split():
                     try:
-                        self._watched_pids[int(pid_s)] = now
+                        pid = int(pid_s)
+                        self._watched_pids[pid] = now
+                        pid_diagnostics.register(self, pid, "exec_proc_diff", identities.get(pid))
                     except ValueError:
                         # Ignore malformed PID tokens in __BGPIDS__ output.
                         # PID capture is best-effort and should not fail exec().
@@ -518,6 +531,14 @@ class agsandbox_backend(AgSandboxBackendFields):
         self._daemon_pids.add(pid)
         self._watched_pids.pop(pid, None)
 
+    def _register_harness_pid(self, pid: int, start_ticks: int) -> None:
+        # Exempt only the manager itself. Unlike release_daemon(), its user
+        # workload descendants must remain eligible for monitoring.
+        if not hasattr(self, "_infrastructure_pids"):
+            self._infrastructure_pids = {}
+        self._infrastructure_pids[pid] = start_ticks
+        self._watched_pids.pop(pid, None)
+
     def ingest_ptrace_pids(
         self, spawned: "set[int] | None" = None, exited: "set[int] | None" = None
     ) -> None:
@@ -550,6 +571,7 @@ class agsandbox_backend(AgSandboxBackendFields):
             if pid in baseline_pids or pid in self._daemon_pids:
                 continue
             self._watched_pids.setdefault(pid, now)
+            pid_diagnostics.register(self, pid, "ptrace_spawn")
             self._ptrace_managed_pids.add(pid)
         for pid in exited or ():
             self._watched_pids.pop(pid, None)
@@ -563,21 +585,13 @@ class agsandbox_backend(AgSandboxBackendFields):
     _adopt_unwatched_live_pids: bool = True
 
     def _has_pending_background_work(self) -> bool:
-        """Cheap fast-path check backing `agSandbox.wait_for_processes()`:
-        is there ANYTHING this sandbox might still need to be waited on for?
+        """Refresh tracked work before deciding whether hibernation is safe.
 
-        Default: just check `_watched_pids`. For docker/podman, an isolated
-        container's own procfs means `_watched_pids` (with
-        `_adopt_unwatched_live_pids` adopting anything new) accurately
-        reflects everything that could possibly be running there, so an
-        empty `_watched_pids` really does mean nothing to wait for.
-        Overridden by `_ChrootBackend`, whose host-wide /proc means
-        `_watched_pids` can under-count a process spawned after the
-        `exec()` call that started its parent already returned (see its
-        module docstring) -- that override also checks a fresh, live,
-        non-mutating scan rather than trusting `_watched_pids` alone.
+        CPU-only execs can retain exited runtime helpers in the watched set.
+        Use the existing liveness/descendant rules rather than treating a stale
+        dictionary entry as work. Chroot retains its own PGID-based override.
         """
-        return bool(self._watched_pids)
+        return bool(self.get_live_pids()) if self._watched_pids else False
 
     def get_live_pids(self) -> set[int]:
         if not self._watched_pids:
@@ -593,6 +607,14 @@ class agsandbox_backend(AgSandboxBackendFields):
         # before the scan even reaches it. Reading /proc/<pid>/status
         # line-by-line via the `read` builtin is dramatically faster since
         # nothing forks per entry.
+        identity_capture = (
+            pid_diagnostics.IDENTITY_SHELL
+            if (
+                getattr(self._agconfig.sandbox, "hibernation_diagnostics", False)
+                or getattr(self, "_infrastructure_pids", {})
+            )
+            else ""
+        )
         script = (
             "__SELF=$$\n"
             "for __d in /proc/[0-9]*; do\n"
@@ -610,9 +632,16 @@ class agsandbox_backend(AgSandboxBackendFields):
             "    esac\n"
             '  done < "$__d/status"\n'
             '  echo "$__p $__ppid $__st $__nm"\n'
+            f"{identity_capture}"
             "done"
         )
-        output, _ = self._read_proc_table(script, timeout=self._agconfig.sandbox.inspect_timeout_s)
+        output, rc = self._read_proc_table(script, timeout=self._agconfig.sandbox.inspect_timeout_s)
+        if rc != 0:
+            # An unreadable process table is not evidence that work finished.
+            return set(self._watched_pids)
+        identities = {}
+        if identity_capture:
+            output, identities = pid_diagnostics.extract_identities(output)
 
         proc_info: dict[int, tuple[int, str, str]] = {}  # pid → (ppid, state, name)
         for line in output.splitlines():
@@ -678,6 +707,10 @@ class agsandbox_backend(AgSandboxBackendFields):
         for pid, (_, state, _) in proc_info.items():
             if (
                 pid in baseline_pids
+                or (
+                    pid in getattr(self, "_infrastructure_pids", {})
+                    and identities.get(pid, {}).get("start_ticks") == self._infrastructure_pids[pid]
+                )
                 or pid in system_pids
                 or pid in self._daemon_pids
                 or state == "Z"
@@ -687,6 +720,7 @@ class agsandbox_backend(AgSandboxBackendFields):
                 alive.add(pid)
             elif self._adopt_unwatched_live_pids:
                 self._watched_pids[pid] = now
+                pid_diagnostics.register(self, pid, "proc_scan_adoption", identities.get(pid))
                 alive.add(pid)
 
         # ptrace-managed pids (see ingest_ptrace_pids()) are trusted as alive

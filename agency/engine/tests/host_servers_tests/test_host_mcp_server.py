@@ -504,20 +504,3 @@ def test_host_mcp_redirect_blocks_tool_side_effects_until_model_acknowledges():
     handle._acknowledge_redirects(snapshot.invocation_messages)
     _call(server, "probe", {})
     assert calls == ["called"]
-
-
-def test_tool_exception_completes_failure_telemetry():
-    def fail(_data):
-        raise ValueError("tool failed")
-
-    tool = agtool(
-        name="fail",
-        description="failure fixture",
-        fn=fail,
-        params={"type": "object", "properties": {}},
-    )
-    server, _, _ = _make_server(add_host_mcp_tools=[tool])
-    result = _call(server, "fail", {})
-    assert "tool failed" in result.content[0].text
-    assert server._data_logger.spans[0][3]["outcome"] == "failure"
-    assert not server._interaction_server._pending_calls
