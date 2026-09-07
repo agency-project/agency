@@ -77,12 +77,8 @@ def _is_ready(handle: DaemonHandle, timeout_s: float = 0.5) -> bool:
 
 
 def _host_daemon_log_path(sandbox: "agSandbox") -> Path:
-    """This run's host-side counterpart of `_DAEMON_LOG_PATH`, mirroring
-    agsandbox.py's own derivation of the directory it bind-mounts as
-    `_agency_logs` (agconfig.data_logger.db_path's parent, falling back to
-    `_DEFAULT_LOG_DIR`) -- must stay identical to that derivation or this
-    touches a different file than the one actually mounted into the
-    container."""
+    """Host-side counterpart of `_DAEMON_LOG_PATH` -- must match
+    agsandbox.py's own derivation of the `_agency_logs` mount source."""
     from ..utils.agutil import _DEFAULT_LOG_DIR
 
     db_path = sandbox.agconfig.data_logger.db_path
@@ -91,22 +87,8 @@ def _host_daemon_log_path(sandbox: "agSandbox") -> Path:
 
 
 def _preclaim_host_daemon_log(sandbox: "agSandbox") -> None:
-    """Create this run's daemon.log on the HOST side, world-writable,
-    before the container ever touches it.
-
-    Without this, whichever side opens the (bind-mounted, shared) path
-    first with a normal, non-existent file wins its ownership. The
-    container's shell redirection runs as the container's own user
-    (commonly root, unlike this host process) -- if it's first, the
-    resulting file is root-owned on the host, inside a directory
-    (agency_runs/) meant to be freely removable by whoever ran the agent.
-    Opening an EXISTING file for writing never changes its ownership
-    (unlike creating one), so pre-creating it here as this process's own
-    uid, permissive enough for the container's write, keeps it host-owned
-    regardless of which side writes to it after. Safe every time this is
-    called: each run gets a brand-new, never-before-existing directory, so
-    there is never a stale file from a previous run at this exact path.
-    """
+    """Touch daemon.log host-side, world-writable, before the container's
+    root process can create it first and leave it root-owned."""
     path = _host_daemon_log_path(sandbox)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch(exist_ok=True)

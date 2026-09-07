@@ -1446,12 +1446,9 @@ class _ContainerBackendBase(agsandbox_backend):
         treats any error as "fall back to export/import".
         """
         if self._accumulator_dir is None:
-            # A fresh, uniquely-named subdirectory of the run's shared
-            # scratch/ dir -- not scratch/ itself, since _reset_accumulator()
-            # rmtree's this whole path and scratch/ is shared by every
-            # sandbox in the run (a bare tempfile.mkdtemp() already
-            # guarantees the uniqueness; `dir=` just parents it under the
-            # run's own directory instead of the bare OS tempdir).
+            # A unique subdir of scratch/, not scratch/ itself --
+            # _reset_accumulator() rmtree's this whole path, and scratch/
+            # is shared by every sandbox in the run.
             self._accumulator_dir = Path(
                 tempfile.mkdtemp(prefix="agency-accum-", dir=str(agency_run_scratch_dir()))
             )

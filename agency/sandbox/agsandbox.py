@@ -124,18 +124,11 @@ class agSandbox:
             "_agharness_llm_gateway",
             (str(agharness_llm_gateway_dir()), AGENCY_LLM_GATEWAY_CONTAINER_MOUNT, "rw"),
         )
-        # Same rationale, for this agent's logs/ directory: lets an
-        # in-container process (the harness daemon's crash log today, see
-        # harness_daemon_launcher.py) write somewhere the host can read
-        # without a separate copy-out step, exactly like the gateway
-        # socket dir above. Derived from agconfig.data_logger.db_path's
-        # parent, not the bare _DEFAULT_LOG_DIR constant -- agent.py always
-        # resolves and sets db_path before constructing a sandbox (see
-        # agent.py's _ensure_sandbox), including when the caller overrode
-        # agconfig.agent.log_dir away from the default, so this follows
-        # wherever this agent's own logs actually are. Falls back to
-        # _DEFAULT_LOG_DIR only for a sandbox built without going through
-        # agent.py at all (e.g. directly in a test).
+        # Same rationale, for this agent's logs/ directory (the harness
+        # daemon's crash log, see harness_daemon_launcher.py). Derived from
+        # db_path's parent, not _DEFAULT_LOG_DIR, so it follows a caller-set
+        # agconfig.agent.log_dir; falls back for a sandbox built outside
+        # agent.py (e.g. a test).
         _log_dir = (
             Path(self.agconfig.data_logger.db_path).parent
             if self.agconfig.data_logger.db_path
