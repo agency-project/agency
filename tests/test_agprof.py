@@ -850,8 +850,12 @@ def test_profile_scope(monkeypatch, value, expected):
     assert agprof.profile_scope() == expected
 
 
-def test_non_linux_environment_profiling_fails_before_cgroup_or_profiler(monkeypatch):
+def test_non_linux_environment_profiling_degrades_before_cgroup_or_profiler(monkeypatch, capsys):
+    """AGENCY_PROFILE defaults to on, so this must not crash import on a
+    non-Linux host -- it degrades to running unprofiled instead, same as
+    the sudo/cgroup-unavailable case."""
     monkeypatch.setenv("AGENCY_PROFILE", "1")
+    monkeypatch.setenv("AGENCY_PROFILE_SCOPE", "process")
     monkeypatch.setattr(agprof.sys, "platform", "darwin")
     monkeypatch.setattr(
         agprof,
@@ -864,11 +868,50 @@ def test_non_linux_environment_profiling_fails_before_cgroup_or_profiler(monkeyp
         lambda: pytest.fail("must reject before profiler startup"),
     )
 
-    with pytest.raises(RuntimeError, match="profiling is Linux-only"):
-        agprof._initialize_environment_profiling()
+    agprof._initialize_environment_profiling()  # must not raise
+
+    assert "profiling is Linux-only" in capsys.readouterr().out
 
 
-def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
+class _FakeExeced(Exception):
+    """Marks a mocked os.execvp call as 'succeeded' -- the real os.execvp
+    never returns on success (the process image is replaced), so a mock
+    that just records args and returns would wrongly let
+    _ensure_environment_cgroup's code fall through to try the NEXT
+    candidate command too. Raising something other than OSError instead
+    stops it there, the same way a real successful exec would."""
+
+
+def test_environment_cgroup_reexec_tries_user_scope_before_sudo(monkeypatch):
+    """The no-sudo systemd --user scope must be tried first -- passwordless
+    sudo is a fallback, not a hard requirement, on a host with ordinary
+    systemd user-session cgroup delegation."""
+    captured = {}
+
+    def fake_execvp(executable, argv):
+        captured.update(executable=executable, argv=argv)
+        raise _FakeExeced
+
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", raising=False)
+    monkeypatch.setattr(agprof, "_user_scope_available", lambda: True)
+    monkeypatch.setattr(agprof.sys, "orig_argv", ["python", "bench.py", "--quick"])
+    monkeypatch.setattr(agprof.sys, "executable", "/venv/bin/python")
+    monkeypatch.setattr(agprof.uuid, "uuid4", lambda: type("U", (), {"hex": "abcdef012345"})())
+    monkeypatch.setattr(agprof.os, "execvp", fake_execvp)
+
+    with pytest.raises(_FakeExeced):
+        agprof._ensure_environment_cgroup()
+
+    assert captured["executable"] == "systemd-run"
+    command = captured["argv"]
+    assert command[:5] == ["systemd-run", "--user", "--scope", "--collect", "--quiet"]
+    assert "sudo" not in command
+    assert "AGENCY_PROFILE_CGROUP_USER_REEXEC=1" in command
+    assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
+
+
+def test_environment_cgroup_reexec_falls_back_to_sudo_without_user_scope(monkeypatch):
     """argv[0] must be the resolved interpreter (sys.executable), not whatever
     bare name the caller typed -- the reconstructed command runs through
     sudo/systemd-run/setpriv, whose secure_path can override $PATH even under
@@ -876,6 +919,8 @@ def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
     the one actually running and silently lose the active venv."""
     captured = {}
     monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", raising=False)
+    monkeypatch.setattr(agprof, "_user_scope_available", lambda: False)
     monkeypatch.setattr(agprof.sys, "orig_argv", ["python", "bench.py", "--quick"])
     monkeypatch.setattr(agprof.sys, "executable", "/venv/bin/python")
     monkeypatch.setattr(agprof.os, "getuid", lambda: 1234)
@@ -901,6 +946,27 @@ def test_environment_cgroup_reexec_wraps_original_command(monkeypatch):
         arg == f"AGENCY_PROFILE_CGROUP=/sys/fs/cgroup/agprof.slice/{slice_name}" for arg in command
     )
     assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
+
+
+def test_environment_cgroup_adopts_current_dir_after_user_scope_landing(tmp_path, monkeypatch):
+    """A --user-scope cgroup's exact path isn't predictable in advance the
+    way the sudo system-slice path's is, so after landing inside it, the
+    process must discover (not re-exec into) its own current cgroup."""
+    (tmp_path / "cpu.stat").write_text("usage_usec 0\n")
+    (tmp_path / "memory.current").write_text("0")
+    (tmp_path / "cgroup.procs").write_text(f"{__import__('os').getpid()}\n")
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", "1")
+    monkeypatch.setattr(agprof, "_current_cgroup_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        agprof.os,
+        "execvp",
+        lambda *_a, **_k: pytest.fail("must not re-exec a second time"),
+    )
+
+    agprof._ensure_environment_cgroup()
+
+    assert agprof.os.environ["AGENCY_PROFILE_CGROUP"] == str(tmp_path)
 
 
 def test_workload_cgroup_sampler_reads_aggregate_cpu_memory_and_io(tmp_path, monkeypatch):

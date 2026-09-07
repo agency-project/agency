@@ -95,6 +95,12 @@ _CGROUP_DIR_ENV = "AGENCY_PROFILE_CGROUP"
 _CGROUP_PARENT_ENV = "AGENCY_PROFILE_CGROUP_PARENT"
 _CGROUP_SLICE_RE = re.compile(r"^agprof-[0-9a-f]+\.slice$")
 
+# Marks a process already re-exec'd through the no-sudo systemd --user
+# scope path (see _user_cgroup_reexec_command); its cgroup path isn't
+# predictable in advance like the sudo path's, so it's discovered after
+# landing instead.
+_CGROUP_USER_REEXEC_ENV = "AGENCY_PROFILE_CGROUP_USER_REEXEC"
+
 # Container cgroup registry — filled by the sandbox backends at container
 # start (docker + podman)
 _cg_registry: "dict[str, str]" = {}  # label (agname) -> cgroup dir
@@ -195,8 +201,55 @@ def _cgroup_reexec_command(slice_name: str, cgroup_dir: str) -> list[str]:
     ]
 
 
+def _user_scope_available() -> bool:
+    """Probe whether systemd user-session cgroup delegation works here --
+    a real subprocess, not a re-exec, so a failure can fall back cleanly."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--collect", "--quiet", "true"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _user_cgroup_reexec_command() -> list[str]:
+    """No-sudo systemd --user re-exec command -- no privilege separation
+    needed since this never changes uid. Doesn't set _CGROUP_PARENT_ENV:
+    a user-session scope isn't usable as a docker --cgroup-parent (dockerd
+    runs as root, outside this delegated subtree)."""
+    orig_argv = getattr(sys, "orig_argv", None)
+    original_argv = [sys.executable, *orig_argv[1:]] if orig_argv else [sys.executable, *sys.argv]
+    run_id = f"{os.getpid():x}{uuid.uuid4().hex[:8]}"
+    scope_name = f"agprof-{run_id}.scope"
+    profiler_environment = [
+        f"{key}={os.environ[key]}"
+        for key in ("AGENCY_PROFILE", "AGENCY_PROFILE_DIR", "AGENCY_PROFILE_SCOPE")
+        if key in os.environ
+    ]
+    return [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--same-dir",
+        f"--unit={scope_name}",
+        "env",
+        f"{_CGROUP_USER_REEXEC_ENV}=1",
+        *profiler_environment,
+        *original_argv,
+    ]
+
+
 def _ensure_environment_cgroup() -> None:
-    """Re-exec environment-enabled profiling inside a dedicated cgroup."""
+    """Re-exec environment-enabled profiling inside a dedicated cgroup.
+    Tries the no-sudo systemd --user scope first, falling back to
+    sudo/system-slice only if that's unavailable."""
     configured = os.environ.get(_CGROUP_DIR_ENV)
     if configured:
         cgroup_dir = _process_cgroup_dir()
@@ -210,6 +263,27 @@ def _ensure_environment_cgroup() -> None:
             ) from e
         return
 
+    if os.environ.get(_CGROUP_USER_REEXEC_ENV):
+        # Already landed inside the --user scope's own cgroup -- discover
+        # it rather than re-exec'ing again.
+        cgroup_dir = _current_cgroup_dir()
+        required = ("cpu.stat", "memory.current", "cgroup.procs")
+        missing = [name for name in required if not (cgroup_dir / name).is_file()]
+        if missing:
+            raise RuntimeError(
+                f"agprof: user-scope workload cgroup {cgroup_dir} is unusable "
+                f"(missing {', '.join(missing)}); profiling requires Linux cgroups v2"
+            )
+        os.environ[_CGROUP_DIR_ENV] = str(cgroup_dir)
+        return
+
+    if _user_scope_available():
+        command = _user_cgroup_reexec_command()
+        try:
+            os.execvp(command[0], command)
+        except OSError:
+            pass  # fall through to the sudo/system-slice path below
+
     run_id = f"{os.getpid():x}{uuid.uuid4().hex[:8]}"
     slice_name = f"agprof-{run_id}.slice"
     cgroup_dir = f"/sys/fs/cgroup/agprof.slice/{slice_name}"
@@ -218,9 +292,11 @@ def _ensure_environment_cgroup() -> None:
         os.execvp(command[0], command)
     except OSError as e:
         raise RuntimeError(
-            "agprof: unable to create the dedicated workload cgroup with "
-            "sudo/systemd-run; profiling requires Linux cgroups v2 and "
-            "passwordless permission to create a transient systemd scope"
+            "agprof: unable to create the dedicated workload cgroup via either "
+            "the systemd --user scope or sudo/systemd-run; profiling requires "
+            "Linux cgroups v2 and either systemd user-session cgroup "
+            "delegation or passwordless permission to create a transient "
+            "systemd scope"
         ) from e
 
 
@@ -2376,7 +2452,10 @@ def profile_scope() -> str:
 
 
 def _env_enabled() -> bool:
-    return os.environ.get("AGENCY_PROFILE", "").strip().lower() in ("1", "true")
+    """On by default -- unset means "profile". AGENCY_PROFILE=0 opts out."""
+    if "AGENCY_PROFILE" not in os.environ:
+        return True
+    return os.environ["AGENCY_PROFILE"].strip().lower() in ("1", "true")
 
 
 def _env_out_dir() -> str:
@@ -2397,10 +2476,19 @@ def workload():
     The context owns a session only for ``AGENCY_PROFILE_SCOPE=workload`` (the
     default) and only when no explicit session is already active. This keeps
     callers free of scope conditionals and prevents the context from stopping
-    a session it did not start.
+    a session it did not start. A failed start() degrades to running
+    unprofiled rather than blocking the actual work.
     """
-    owns_session = _env_enabled() and profile_scope() == "workload" and not enabled()
-    prof = start(_env_out_dir()) if owns_session else _profiler
+    owns_session = False
+    prof = _profiler
+    if _env_enabled() and profile_scope() == "workload" and not enabled():
+        try:
+            prof = start(_env_out_dir())
+            owns_session = True
+        except RuntimeError as exc:
+            _agprof_print(
+                f"[agprof] WARNING: workload profiling failed to start, continuing unprofiled: {exc}"
+            )
     try:
         yield prof
     finally:
@@ -2450,12 +2538,26 @@ def _process_profile_signal_handler(signum, _frame) -> None:
 
 
 def _initialize_environment_profiling() -> None:
-    """Validate and isolate env-requested profiling before workload startup."""
-    if not _env_enabled():
+    """Validate and isolate env-requested profiling before workload startup.
+    Only AGENCY_PROFILE_SCOPE=process needs the dedicated cgroup this sets
+    up; the default `workload` scope samples whatever cgroup this process
+    is already in, no privilege needed. Degrades to unprofiled rather than
+    blocking startup if the cgroup setup fails."""
+    if not _env_enabled() or profile_scope() != "process":
         return
-    _require_linux()
-    _ensure_environment_cgroup()
-    _maybe_autostart()
+    try:
+        _require_linux()
+        _ensure_environment_cgroup()
+    except RuntimeError as exc:
+        _agprof_print(
+            "[agprof] WARNING: environment profiling unavailable, continuing "
+            f"unprofiled at the process level: {exc}"
+        )
+        return
+    try:
+        _maybe_autostart()
+    except RuntimeError as exc:
+        _agprof_print(f"[agprof] WARNING: process-scope profiling failed to start: {exc}")
 
 
 _initialize_environment_profiling()
