@@ -8,7 +8,6 @@ import subprocess
 import threading
 import time
 import traceback as _traceback
-import uuid as _uuid_mod
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -251,15 +250,18 @@ def _b36_suffix(n: int, width: int = 4) -> str:
 # usable length is one less: the path is NUL-terminated inside the array.
 UDS_SUN_PATH_MAX = 108
 
-# Records which process owns a gateway directory, so a later run can prove
+# Records which process owns a per-run directory, so a later run can prove
 # the owner is dead before removing it -- the directory-level counterpart to
-# container.py's `agency.owner_pid` label.
-_GATEWAY_OWNER_FILE = "owner.pid"
+# container.py's `agency.owner_pid` label. One per run directory (covering
+# gateways/, scratch/, sandboxes/, config_homes/ together), not one per
+# subdirectory.
+_RUN_DIR_OWNER_FILE = "owner.pid"
 
 _AGENCY_RUN_ID: "str | None" = None
+_run_dir: "Path | None" = None
+_run_dir_lock = threading.Lock()
+_run_dir_reap_done = False
 _gateway_dir = None
-_gateway_lock = threading.Lock()
-_gateway_reap_done = False
 
 
 def pid_alive(pid: int) -> bool:
@@ -281,10 +283,13 @@ def pid_alive(pid: int) -> bool:
 
 
 def agency_run_id() -> str:
-    """Stable per-process id used to namespace this run's host-side runtime
-    state. A uuid rather than a pid, matching `container.py`'s `_RUN_ID`:
-    pids are recycled, so a successive run could otherwise inherit a dead
-    run's name and adopt its leftovers."""
+    """Stable per-process id used to namespace every run-scoped path this
+    process owns -- this run's directory under `agency_tmp_dir()`
+    (gateways/scratch/sandboxes/config_homes) and under `agency_runs_dir()`
+    (logs/profiler), and (via `sandbox/container.py`'s own
+    `_RUN_ID = agency_run_id()`) every container/image name. A uuid rather
+    than a pid: pids are recycled, so a successive run could otherwise
+    inherit a dead run's name and adopt its leftovers."""
     global _AGENCY_RUN_ID
     if _AGENCY_RUN_ID is None:
         import uuid
@@ -293,12 +298,26 @@ def agency_run_id() -> str:
     return _AGENCY_RUN_ID
 
 
-def agency_tmp_root():
-    """Root of every host-side runtime path agency owns: run logs
-    (`agent._DEFAULT_LOG_DIR`) and the UDS gateway (`agharness_llm_gateway_dir`)
-    both live under here.
+_RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    Deliberately hardcoded to `/tmp/agency` rather than derived from
+
+def agency_run_dir_name() -> str:
+    """The `{timestamp}_{run_id}` directory-name fragment shared by this
+    run's directory under BOTH `agency_tmp_dir()` and `agency_runs_dir()`
+    -- using one function for both guarantees the two trees' run
+    directories are identically named (not just conventionally similar), so
+    a run's ephemeral-local half (sockets, scratch) and its visible half
+    (logs, saves) are trivially correlatable by directory name alone."""
+    return f"{_RUN_TS}_{agency_run_id()}"
+
+
+def agency_tmp_dir():
+    """Root of every host-side runtime path that must live on a local
+    (non-network) filesystem: this run's UDS gateway sockets, docker/podman
+    squash scratch files, chroot sandbox state, and harness config-home
+    dirs all live under `agency_tmp_dir()/agency_run_dir_name()/...`.
+
+    Deliberately hardcoded to `/tmp/agency-{uid}` rather than derived from
     `tempfile.gettempdir()`: `gettempdir()` honours `$TMPDIR`, which on a
     shared host is routinely redirected to scratch space under an aggressive
     cleanup policy. Files there are *supposed* to be deletable, which is
@@ -306,29 +325,136 @@ def agency_tmp_root():
     socket leaves the server advertising a path that no longer exists, and
     every request across the bridge then fails with a bare ENOENT (observed
     in practice: a `$TMPDIR` on a full shared volume being swept every few
-    minutes, taking live sockets with it). Logs were already immune only
-    because `_DEFAULT_LOG_DIR` happened to hardcode `/tmp` while this
-    function honoured `$TMPDIR`; both now share one root, so one policy
-    covers both.
+    minutes, taking live sockets with it).
+
+    The `-{uid}` suffix (and creating the directory `0o700`) is per-user
+    isolation on a multi-tenant host -- the same pattern `tmux`
+    (`/tmp/tmux-$UID`) and X11 use for exactly this problem: without it,
+    `/tmp/agency` is a single shared parent across every user, and whoever's
+    process creates it first owns it, leaving another user's sockets and
+    sqlite DBs potentially listable depending on the resulting permissions.
+    Overridable via `AGENCY_TMP_ROOT` for a caller that needs a specific
+    location (e.g. a guaranteed-local scratch disk) -- overriding it onto a
+    network filesystem breaks UDS sockets, since AF_UNIX generally cannot
+    bind on NFS-mounted paths.
 
     A short root matters for a second reason -- see `UDS_SUN_PATH_MAX` and
     `new_uds_path`: every character here is spent from a 108-byte budget.
+
+    Bind-mounted (via `agsandbox.py`) as the *source* of a docker/podman
+    mount into every container-backed sandbox. If this path doesn't exist
+    yet when a container is created, the confirmed behavior is that the
+    container runtime's own daemon (running as root) creates it FOR us --
+    owned by root, not by this process. `_ensure_owned_by_us` below turns
+    that into a clear error at the point it's discovered rather than a
+    bare, deep-stack `PermissionError` the next time anything tries to
+    create something inside it.
     """
-    return Path("/tmp/agency")
+    root = Path(os.environ.get("AGENCY_TMP_ROOT", f"/tmp/agency-{os.getuid()}"))
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_owned_by_us(root)
+    return root
 
 
-# Single run-level ID for the default log directory -- shared by agent.py and
-# orchestrator.py (both need it, and neither may import the other at module
-# level), and moved out of agent.py for that reason.
-# [REFACTOR] combine with the RUN_ID in agcontainer
-_RUN_ID = _uuid_mod.uuid4().hex[:12]
-_RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-_DEFAULT_LOG_DIR = agency_tmp_root() / f"{_RUN_TS}_{_RUN_ID}"
+def _ensure_owned_by_us(path: Path) -> None:
+    """Raise a clear, actionable error if *path* exists but isn't owned by
+    this process's own uid -- see `agency_tmp_dir`'s docstring for the
+    concrete way this happens (a container runtime's root daemon
+    auto-creating a missing bind-mount source). Nothing here can fix
+    ownership without root, so this only ever diagnoses, never repairs."""
+    owner_uid = path.stat().st_uid
+    if owner_uid != os.getuid():
+        raise RuntimeError(
+            f"{path} exists but is owned by uid {owner_uid}, not this "
+            f"process's uid {os.getuid()}. This commonly happens when a "
+            "container runtime's root daemon auto-creates a missing "
+            "bind-mount source directory before Agency's own code gets to "
+            f"-- remove {path} as its owner (likely root) and retry; "
+            "nothing here can fix ownership without root."
+        )
+
+
+def agency_runs_dir():
+    """Root of every host-side runtime path meant to be found and inspected
+    by a human during or after a run: this run's logs/DBs and profiler
+    output, plus cross-run agent saves, live under here. Plain files only
+    (no sockets) -- unlike `agency_tmp_dir()`, safe on any filesystem
+    including a network-mounted CWD.
+
+    Defaults to `./agency_runs`, resolved relative to the current working
+    directory the first time it's needed -- deliberately visible next to
+    wherever the caller is working, not hidden under `/tmp` or `$HOME`,
+    since the whole point of this root is that a human can find it.
+    Overridable via `AGENCY_RUNS_ROOT`.
+
+    Also bind-mounted into every container-backed sandbox (this run's
+    `logs/` subdirectory specifically, for the harness daemon's log) --
+    same root-auto-creation hazard as `agency_tmp_dir()`, same guard.
+    """
+    root = Path(os.environ.get("AGENCY_RUNS_ROOT", "agency_runs")).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    _ensure_owned_by_us(root)
+    return root
+
+
+def agency_cache_root():
+    """Root of every host-side path meant to persist across runs and be
+    found without knowing which run created it (today: just the harness
+    binary cache, see `agharness_binary_cache_dir`). Under the user's home
+    directory by default (`~/.cache/agency`), not `agency_tmp_dir()`/
+    `agency_runs_dir()`: those are both run-scoped by design, and
+    cross-run content has no run id to nest under. Overridable via
+    `AGENCY_CACHE_ROOT`.
+    """
+    return Path(os.environ.get("AGENCY_CACHE_ROOT", str(Path.home() / ".cache" / "agency")))
+
+
+# Default log directory -- shared by agent.py and orchestrator.py (both need
+# it, and neither may import the other at module level), and moved out of
+# agent.py for that reason.
+_DEFAULT_LOG_DIR = agency_runs_dir() / agency_run_dir_name() / "logs"
+
+
+def _agency_run_dir() -> Path:
+    """This process's own per-run directory under `agency_tmp_dir()` --
+    the shared parent of `gateways/`, `scratch/`, `sandboxes/`, and
+    `config_homes/`. Created (and its `owner.pid` stamped, and orphaned
+    sibling run dirs from dead SIGKILL'd processes reaped) exactly once per
+    process, lazily, on first need from any of those four subdirectory
+    accessors -- one run directory and one owner file cover all four, where
+    each used to be independently unscoped or (for the gateway dir) the only
+    one with any run-scoping at all.
+    """
+    global _run_dir
+    if _run_dir is not None:
+        return _run_dir
+    with _run_dir_lock:
+        if _run_dir is not None:
+            return _run_dir
+        d = agency_tmp_dir() / agency_run_dir_name()
+        d.mkdir(parents=True, exist_ok=True)
+        # The directory-level equivalent of a container's `agency.owner_pid`
+        # label: ownership is recorded as a pid so a later run can *prove*
+        # this run is gone before deleting anything, while the directory NAME
+        # stays a uuid (a pid could be recycled by an unrelated process --
+        # the same split container.py's _RUN_ID comment describes).
+        (d / _RUN_DIR_OWNER_FILE).write_text(f"{os.getpid()}\n", encoding="utf-8")
+        _run_dir = d
+        _register_run_dir_cleanup(d)
+        _reap_orphaned_run_dirs()
+        return d
 
 
 def agharness_llm_gateway_dir():
     """Fixed, well-known host directory a docker/podman-backed harness
-    launch's Unix-domain-socket LLM gateway lives in. Shared between
+    launch's Unix-domain-socket LLM gateway lives in -- `gw/` under
+    this run's own directory (see `_agency_run_dir`). Named `gw` rather than
+    `gateways` purely for path length: this directory name is spent from
+    every socket's 108-byte `sun_path` budget (see `new_uds_path`), the one
+    subdirectory here that actually carries that constraint (`scratch/`,
+    `sandboxes/`, `config_homes/` hold plain files, subject only to
+    `PATH_MAX`) -- the longest prefix already only has ~25 bytes of margin
+    with the abbreviated name. Shared between
     `agsandbox.py` (which bind-mounts this directory into every
     container-backed sandbox unconditionally -- cheap and harmless for a
     sandbox that never runs a harness, the same "attach unconditionally,
@@ -343,12 +469,6 @@ def agharness_llm_gateway_dir():
     safe for the socket file to not exist yet at container-creation time
     and appear later once a harness actually launches.
 
-    Named `gw` rather than `agency_llm_gateway` purely for path length: the
-    directory name is spent from every socket's 108-byte `sun_path` budget
-    (see `new_uds_path`), and the container side of the bind mount keeps the
-    long, self-describing name (`/var/run/agency_llm_gateway`) where no such
-    budget applies.
-
     Scoped to one subdirectory per run, for the same three reasons container
     names are (`sandbox/container.py`'s `_RUN_ID`):
 
@@ -356,7 +476,7 @@ def agharness_llm_gateway_dir():
       never externally cleaned; a flat directory shared by every run would
       accumulate sockets with no owner and no disposal point. A per-run
       directory makes cleanup a single atomic removal -- see
-      `_register_gateway_cleanup`.
+      `_register_run_dir_cleanup`.
     * **Isolation.** `agsandbox.py` bind-mounts this directory read-write
       into *every* container, so a flat directory would let any container
       read, connect to, and delete every concurrent run's sockets on the
@@ -373,25 +493,38 @@ def agharness_llm_gateway_dir():
     global _gateway_dir
     if _gateway_dir is not None:
         return _gateway_dir
-    with _gateway_lock:
-        if _gateway_dir is not None:
-            return _gateway_dir
-        d = agency_tmp_root() / "gw" / agency_run_id()
-        d.mkdir(parents=True, exist_ok=True)
-        # The directory-level equivalent of a container's `agency.owner_pid`
-        # label: ownership is recorded as a pid so a later run can *prove*
-        # this run is gone before deleting anything, while the directory NAME
-        # stays a uuid (a pid could be recycled by an unrelated process --
-        # the same split container.py's _RUN_ID comment describes).
-        (d / _GATEWAY_OWNER_FILE).write_text(f"{os.getpid()}\n", encoding="utf-8")
-        _gateway_dir = d
-        _register_gateway_cleanup(d)
-        _reap_orphaned_gateway_dirs()
-        return d
+    d = _agency_run_dir() / "gw"
+    d.mkdir(parents=True, exist_ok=True)
+    _gateway_dir = d
+    return d
 
 
-def _register_gateway_cleanup(own_dir) -> None:
-    """Remove this run's socket directory on normal exit -- the counterpart
+def agency_run_scratch_dir():
+    """Per-run scratch directory (`scratch/` under this run's own directory,
+    see `_agency_run_dir`) for docker/podman squash/accumulator working
+    files (`container.py`'s `_fold_overlay_diff_into_accumulator` and its
+    squash-commit path) -- was an unscoped, bare `tempfile.mkdtemp()`
+    before this. Each squash cycle already names its own file uniquely
+    (`cycle-<nonce>.tar`, `accum-<nonce>.tar`), so multiple concurrent
+    squash operations safely share this one directory."""
+    d = _agency_run_dir() / "scratch"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def agency_config_homes_dir():
+    """Parent directory (`config_homes/` under this run's own directory, see
+    `_agency_run_dir`) for each harness launch's isolated config-home
+    directory (`agharness.py`'s `materialize_config_home`) -- was an
+    unscoped, bare `tempfile.mkdtemp()` before this."""
+    d = _agency_run_dir() / "config_homes"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _register_run_dir_cleanup(own_dir) -> None:
+    """Remove this run's entire per-run directory (gateways/, scratch/,
+    sandboxes/, config_homes/ together) on normal exit -- the counterpart
     to `agsandbox.py`'s `_cleanup_all_sandboxes`, and best-effort in exactly
     the same way (a failure here must never take down an exiting process)."""
     import atexit
@@ -401,13 +534,14 @@ def _register_gateway_cleanup(own_dir) -> None:
         try:
             shutil.rmtree(own_dir, ignore_errors=True)
         except Exception as _e:  # pragma: no cover -- interpreter teardown
-            print(f"[agutil] WARNING: gateway cleanup failed for {own_dir}: {_e}")
+            print(f"[agutil] WARNING: run dir cleanup failed for {own_dir}: {_e}")
 
     atexit.register(_cleanup)
 
 
 def _dir_has_live_listener(d) -> bool:
-    """True if any socket in *d* still has something accepting on it.
+    """True if any socket under *d*'s `gw/` subdirectory still has
+    something accepting on it.
 
     The safety check before a destructive sweep, mirroring the "no container
     still uses this image as its ancestor" confirmation
@@ -417,7 +551,10 @@ def _dir_has_live_listener(d) -> bool:
     """
     import socket as _socket
 
-    for sock in d.glob("*.sock"):
+    gateways_dir = d / "gw"
+    if not gateways_dir.is_dir():
+        return False
+    for sock in gateways_dir.glob("*.sock"):
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         try:
             s.settimeout(0.5)
@@ -430,8 +567,8 @@ def _dir_has_live_listener(d) -> bool:
     return False
 
 
-def _reap_orphaned_gateway_dirs() -> None:
-    """Remove gateway directories left by SIGKILL'd runs, whose `atexit`
+def _reap_orphaned_run_dirs() -> None:
+    """Remove per-run directories left by SIGKILL'd runs, whose `atexit`
     cleanup never got to run.
 
     Deliberately keyed on proof the owner is gone (`pid_alive`) and never on
@@ -443,19 +580,19 @@ def _reap_orphaned_gateway_dirs() -> None:
     Runs once per process, best-effort throughout, mirroring
     `container.py`'s `reap_orphaned_containers()`.
     """
-    global _gateway_reap_done
-    if _gateway_reap_done:
+    global _run_dir_reap_done
+    if _run_dir_reap_done:
         return
-    _gateway_reap_done = True
+    _run_dir_reap_done = True
     import shutil
 
     try:
-        root = agency_tmp_root() / "gw"
+        root = agency_tmp_dir()
         own_pid = os.getpid()
         for d in root.iterdir():
-            if not d.is_dir() or d == _gateway_dir:
+            if not d.is_dir() or d == _run_dir:
                 continue
-            owner = d / _GATEWAY_OWNER_FILE
+            owner = d / _RUN_DIR_OWNER_FILE
             try:
                 owner_pid = int(owner.read_text(encoding="utf-8").strip())
             except (OSError, ValueError):
@@ -465,13 +602,13 @@ def _reap_orphaned_gateway_dirs() -> None:
             if _dir_has_live_listener(d):
                 continue  # stale owner record over a live run -- leave it
             print(
-                f"[agutil] Reaping gateway dir {d.name!r}, orphaned by dead "
+                f"[agutil] Reaping run dir {d.name!r}, orphaned by dead "
                 f"process {owner_pid} (likely SIGKILL'd)",
                 flush=True,
             )
             shutil.rmtree(d, ignore_errors=True)
     except Exception as _e:
-        print(f"[agutil] WARNING: startup gateway reap failed: {_e}")
+        print(f"[agutil] WARNING: startup run dir reap failed: {_e}")
 
 
 def new_uds_path(prefix: str) -> str:
@@ -495,7 +632,7 @@ def new_uds_path(prefix: str) -> str:
             f"Unix-domain socket path is {len(path)} bytes, which exceeds the "
             f"{UDS_SUN_PATH_MAX}-byte sockaddr_un.sun_path limit: {path!r}. "
             "This is a kernel ABI limit on socket paths, unrelated to PATH_MAX -- "
-            "shorten the gateway directory (see agutil.agency_tmp_root)."
+            "shorten the gateway directory (see agutil.agency_tmp_dir)."
         )
     return path
 
@@ -532,13 +669,11 @@ def agharness_binary_cache_dir():
     (see `agharness_backends/claude_code.py`'s in-container binary
     resolution) -- never fetched from the network by Agency itself, only
     copied from whatever the host's own `shutil.which()` already resolves,
-    so this never depends on knowing an install URL. Under the user's home
-    directory rather than a tempdir (unlike the gateway socket dir above):
-    this should survive process restarts so the ~250MB copy happens once
-    per host, not once per Agency process lifetime."""
-    from pathlib import Path
-
-    d = Path.home() / ".cache" / "agency_harness_bin"
+    so this never depends on knowing an install URL. Under `agency_cache_root()`
+    rather than a run-scoped tempdir (unlike the gateway socket dir above):
+    this should survive process restarts and successive runs so the ~250MB
+    copy happens once per host, not once per Agency process lifetime."""
+    d = agency_cache_root() / "harness_bin"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -549,6 +684,14 @@ def agharness_binary_cache_dir():
 # container-relocated agproxy_llm) that needs to know where to point
 # PYTHONPATH to import agency.
 AGENCY_PACKAGE_CONTAINER_MOUNT = "/opt/agency_pkg"
+
+# Fixed container-side mount points for agharness_llm_gateway_dir() and this
+# run's logs/ directory -- shared between agsandbox.py (which bind-mounts
+# them) and harness_daemon_launcher.py (which points the in-container
+# daemon at them), so the literal is defined exactly once instead of
+# hardcoded independently in both files.
+AGENCY_LLM_GATEWAY_CONTAINER_MOUNT = "/var/run/agency_llm_gateway"
+AGENCY_LOGS_CONTAINER_MOUNT = "/var/run/agency_logs"
 
 
 def agency_package_dir():

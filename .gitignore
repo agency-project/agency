@@ -5,5 +5,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 runs/
+agency_runs/
 AGENT_INSTRUCTIONS/
 artifacts/

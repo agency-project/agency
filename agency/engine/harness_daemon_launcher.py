@@ -9,15 +9,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_in_container
+from ..utils.agutil import (
+    AGENCY_LLM_GATEWAY_CONTAINER_MOUNT,
+    AGENCY_LOGS_CONTAINER_MOUNT,
+    AGENCY_PACKAGE_CONTAINER_MOUNT,
+    ensure_python_packages_in_container,
+)
 from .clients import SandboxInteractionClient
 
 if TYPE_CHECKING:
     from ..configs.agconfig import agconfig as agconfig_cls
     from ..sandbox.agsandbox import agSandbox
 
-_CONTAINER_GATEWAY_DIR = "/var/run/agency_llm_gateway"
-_DAEMON_LOG_PATH = "/tmp/agency-harness-daemon.log"
+_CONTAINER_GATEWAY_DIR = AGENCY_LLM_GATEWAY_CONTAINER_MOUNT
+_DAEMON_LOG_PATH = f"{AGENCY_LOGS_CONTAINER_MOUNT}/daemon.log"
 
 
 @dataclass(frozen=True)

@@ -177,7 +177,7 @@ import uuid as _uuid
 from pathlib import Path
 
 from ..configs.agconfig import agconfig as agconfig_cls
-from ..utils.agutil import amd_render_node_paths_by_pci_bus
+from ..utils.agutil import agency_run_dir_name, agency_tmp_dir, amd_render_node_paths_by_pci_bus
 from .base import (
     AgSandboxBackendFields,
     agsandbox_backend,
@@ -280,7 +280,12 @@ def _chroot_unshare_prefix() -> "list[str]":
     return _chroot_unshare_prefix_cache or ["unshare"]
 
 
-_CHROOT_STATE_ROOT = Path(tempfile.gettempdir()) / "agency-chroot-sandboxes"
+# Under agency_tmp_dir()'s per-run directory, not tempfile.gettempdir():
+# gettempdir() honours $TMPDIR, which is exactly the aggressive-cleanup-sweep
+# hazard agency_tmp_dir() is deliberately hardcoded to avoid (see its
+# docstring) -- a chroot jail is as live as a UDS socket and just as
+# unsafe to have swept out from under a running sandbox.
+_CHROOT_STATE_ROOT = agency_tmp_dir() / agency_run_dir_name() / "sandboxes"
 _CHROOT_JAILS_DIR = _CHROOT_STATE_ROOT / "jails"
 _CHROOT_SNAPSHOTS_DIR = _CHROOT_STATE_ROOT / "snapshots"
 

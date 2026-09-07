@@ -42,7 +42,12 @@ from pathlib import Path
 
 from ..observability.profiler import agprof
 from ..configs.agconfig import DOCKER_SEMAPHORE_LIMIT, agconfig as agconfig_cls
-from ..utils.agutil import amd_render_node_paths_by_pci_bus, detect_gpus
+from ..utils.agutil import (
+    agency_run_id,
+    agency_run_scratch_dir,
+    amd_render_node_paths_by_pci_bus,
+    detect_gpus,
+)
 from .base import AgSandboxBackendFields, agsandbox_backend, run_with_unkillable_child_grace
 from ._layer_squash import merge_layer_tars, overlay_diff_to_tar, sha256_file, build_save_archive
 
@@ -62,9 +67,11 @@ class _ContainerAlreadyRunning(Exception):
 _RUNTIME: str | None = None
 
 # Per-run ID so concurrent and successive runs never share container/image names.
-# UUID avoids PID-reuse collisions and prevents stale lifecycle images from crashed
-# runs being accidentally picked up by a new run that happens to get the same PID.
-_RUN_ID = f"r{_uuid.uuid4().hex[:8]}"
+# The same process-wide id every other run-scoped path uses (the LLM gateway/
+# UDS socket directory, the default log directory) -- avoids PID-reuse
+# collisions and prevents stale lifecycle images from crashed runs being
+# accidentally picked up by a new run that happens to get the same PID.
+_RUN_ID = agency_run_id()
 
 # Limit the number of containers starting simultaneously.  Each concrete
 # container backend construction acquires one slot for the duration of its
@@ -1439,7 +1446,15 @@ class _ContainerBackendBase(agsandbox_backend):
         treats any error as "fall back to export/import".
         """
         if self._accumulator_dir is None:
-            self._accumulator_dir = Path(tempfile.mkdtemp(prefix="agency-accum-"))
+            # A fresh, uniquely-named subdirectory of the run's shared
+            # scratch/ dir -- not scratch/ itself, since _reset_accumulator()
+            # rmtree's this whole path and scratch/ is shared by every
+            # sandbox in the run (a bare tempfile.mkdtemp() already
+            # guarantees the uniqueness; `dir=` just parents it under the
+            # run's own directory instead of the bare OS tempdir).
+            self._accumulator_dir = Path(
+                tempfile.mkdtemp(prefix="agency-accum-", dir=str(agency_run_scratch_dir()))
+            )
         nonce = _uuid.uuid4().hex
         cycle_tar = self._accumulator_dir / f"cycle-{nonce}.tar"
         overlay_diff_to_tar(diff_dir, cycle_tar, uid_gid_translate=self._host_to_container_id)
@@ -1586,7 +1601,7 @@ class _ContainerBackendBase(agsandbox_backend):
         new_config_bytes = json.dumps(new_config).encode()
         new_config_digest = hashlib.sha256(new_config_bytes).hexdigest()
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="agency-squash-"))
+        tmp_dir = Path(tempfile.mkdtemp(prefix="agency-squash-", dir=str(agency_run_scratch_dir())))
         try:
             out_tar_path = tmp_dir / "out.tar"
             build_save_archive(

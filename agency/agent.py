@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from .utils.agutil import _DEFAULT_LOG_DIR
+from .utils.agutil import _DEFAULT_LOG_DIR, agency_runs_dir
 
 # Global weak registry of all live agent instances.
 _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
@@ -623,8 +623,8 @@ class agent:
         return list(_live_agents)
 
     @classmethod
-    def save_all(cls, directory: "Path | str") -> "list[Path]":
-        directory = Path(directory)
+    def save_all(cls, directory: "Path | str | None" = None) -> "list[Path]":
+        directory = Path(directory) if directory is not None else agency_runs_dir() / "saves"
         directory.mkdir(parents=True, exist_ok=True)
         paths: list[Path] = []
         for ag in cls.all():
@@ -636,10 +636,10 @@ class agent:
     @classmethod
     def load_all(
         cls,
-        directory: "Path | str",
+        directory: "Path | str | None" = None,
         agconfig: "agconfig_cls | None" = None,
     ) -> "list[agent]":
-        directory = Path(directory)
+        directory = Path(directory) if directory is not None else agency_runs_dir() / "saves"
         live_names = {ag.agname: ag for ag in cls.all()}
         restored: list[agent] = []
 
@@ -668,14 +668,17 @@ class agent:
     # Checkpointing
     # ------------------------------------------------------------------
 
-    def save(self, path: "Path | str") -> None:
-        """Checkpoint this agent to a single .ckpt file."""
+    def save(self, path: "Path | str | None" = None) -> None:
+        """Checkpoint this agent to a single .ckpt file. Defaults to
+        `agency_runs/saves/{agname}.ckpt` when *path* is omitted."""
         with self._operation_lease("save"):
             self._save_leased(path)
 
-    def _save_leased(self, path: "Path | str") -> None:
+    def _save_leased(self, path: "Path | str | None") -> None:
         """Write one checkpoint while explicit destruction waits for this lease."""
-        path = Path(path)
+        path = (
+            Path(path) if path is not None else agency_runs_dir() / "saves" / f"{self.agname}.ckpt"
+        )
         image_tag = f"agency/ckpt-{self.agname}"
 
         with self._orchestrator._event_cond:

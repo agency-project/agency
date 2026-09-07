@@ -19,6 +19,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..utils.agutil import agency_config_homes_dir
+
 if TYPE_CHECKING:
     from ..agent import agent
     from ..agdata import agdata
@@ -34,8 +36,15 @@ def materialize_config_home(ag: "agent | str", token: str, base_url: str) -> Pat
     home. Concrete backends write their own harness-specific config files
     (env vars, provider blocks, etc. pointing at *base_url* with *token*)
     into this directory -- what to write is backend-specific, only the
-    "give me an isolated directory" part is shared."""
-    return Path(tempfile.mkdtemp(prefix=f"agharness-{_runtime_name(ag)}-"))
+    "give me an isolated directory" part is shared. Nested under this run's
+    own config_homes/ directory (agutil.agency_config_homes_dir()) rather
+    than a bare OS tempdir, so it's cleaned up with the rest of the run's
+    ephemeral state; still one uniquely-named directory per launch."""
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f"agharness-{_runtime_name(ag)}-", dir=str(agency_config_homes_dir())
+        )
+    )
 
 
 def cleanup_config_home(path: Path) -> None:

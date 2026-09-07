@@ -2380,7 +2380,14 @@ def _env_enabled() -> bool:
 
 
 def _env_out_dir() -> str:
-    return os.environ.get("AGENCY_PROFILE_DIR", "agprof_trace")
+    # Lazy import: agutil is a low-level, widely-imported module and agprof
+    # is imported from many places (container.py, agsandbox.py, ...);
+    # importing at call time rather than module load time avoids adding a
+    # module-level import-order constraint between the two.
+    from ...utils.agutil import agency_run_dir_name, agency_runs_dir
+
+    default = str(agency_runs_dir() / agency_run_dir_name() / "profiler")
+    return os.environ.get("AGENCY_PROFILE_DIR", default)
 
 
 @contextmanager

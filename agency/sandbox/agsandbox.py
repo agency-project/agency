@@ -111,6 +111,9 @@ class agSandbox:
         # live view, not a copy -- the socket file inside this directory
         # doesn't need to exist yet.
         from ..utils.agutil import (
+            _DEFAULT_LOG_DIR,
+            AGENCY_LLM_GATEWAY_CONTAINER_MOUNT,
+            AGENCY_LOGS_CONTAINER_MOUNT,
             AGENCY_PACKAGE_CONTAINER_MOUNT,
             agency_package_dir,
             agharness_binary_cache_dir,
@@ -119,7 +122,29 @@ class agSandbox:
 
         mounts.setdefault(
             "_agharness_llm_gateway",
-            (str(agharness_llm_gateway_dir()), "/var/run/agency_llm_gateway", "rw"),
+            (str(agharness_llm_gateway_dir()), AGENCY_LLM_GATEWAY_CONTAINER_MOUNT, "rw"),
+        )
+        # Same rationale, for this agent's logs/ directory: lets an
+        # in-container process (the harness daemon's crash log today, see
+        # harness_daemon_launcher.py) write somewhere the host can read
+        # without a separate copy-out step, exactly like the gateway
+        # socket dir above. Derived from agconfig.data_logger.db_path's
+        # parent, not the bare _DEFAULT_LOG_DIR constant -- agent.py always
+        # resolves and sets db_path before constructing a sandbox (see
+        # agent.py's _ensure_sandbox), including when the caller overrode
+        # agconfig.agent.log_dir away from the default, so this follows
+        # wherever this agent's own logs actually are. Falls back to
+        # _DEFAULT_LOG_DIR only for a sandbox built without going through
+        # agent.py at all (e.g. directly in a test).
+        _log_dir = (
+            Path(self.agconfig.data_logger.db_path).parent
+            if self.agconfig.data_logger.db_path
+            else _DEFAULT_LOG_DIR
+        )
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        mounts.setdefault(
+            "_agency_logs",
+            (str(_log_dir), AGENCY_LOGS_CONTAINER_MOUNT, "rw"),
         )
         # Same rationale, for the harness binary cache (see
         # agutil.agharness_binary_cache_dir's docstring): read-only,
