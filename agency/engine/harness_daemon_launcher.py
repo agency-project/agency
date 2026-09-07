@@ -76,6 +76,43 @@ def _is_ready(handle: DaemonHandle, timeout_s: float = 0.5) -> bool:
         return False
 
 
+def _host_daemon_log_path(sandbox: "agSandbox") -> Path:
+    """This run's host-side counterpart of `_DAEMON_LOG_PATH`, mirroring
+    agsandbox.py's own derivation of the directory it bind-mounts as
+    `_agency_logs` (agconfig.data_logger.db_path's parent, falling back to
+    `_DEFAULT_LOG_DIR`) -- must stay identical to that derivation or this
+    touches a different file than the one actually mounted into the
+    container."""
+    from ..utils.agutil import _DEFAULT_LOG_DIR
+
+    db_path = sandbox.agconfig.data_logger.db_path
+    log_dir = Path(db_path).parent if db_path else _DEFAULT_LOG_DIR
+    return log_dir / "daemon.log"
+
+
+def _preclaim_host_daemon_log(sandbox: "agSandbox") -> None:
+    """Create this run's daemon.log on the HOST side, world-writable,
+    before the container ever touches it.
+
+    Without this, whichever side opens the (bind-mounted, shared) path
+    first with a normal, non-existent file wins its ownership. The
+    container's shell redirection runs as the container's own user
+    (commonly root, unlike this host process) -- if it's first, the
+    resulting file is root-owned on the host, inside a directory
+    (agency_runs/) meant to be freely removable by whoever ran the agent.
+    Opening an EXISTING file for writing never changes its ownership
+    (unlike creating one), so pre-creating it here as this process's own
+    uid, permissive enough for the container's write, keeps it host-owned
+    regardless of which side writes to it after. Safe every time this is
+    called: each run gets a brand-new, never-before-existing directory, so
+    there is never a stale file from a previous run at this exact path.
+    """
+    path = _host_daemon_log_path(sandbox)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+    path.chmod(0o666)
+
+
 def ensure_harness_daemon(
     sandbox: "agSandbox",
     host_uds_path: str,
@@ -111,6 +148,8 @@ def ensure_harness_daemon(
         ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp", "cloudpickle"],
         timeout_s=180,
     )
+
+    _preclaim_host_daemon_log(sandbox)
 
     # Actual launch of the daemon
     command = (
