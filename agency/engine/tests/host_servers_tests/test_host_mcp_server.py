@@ -12,7 +12,6 @@ from mcp.server.mcpserver.exceptions import ToolError
 from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agtool import agtool
-from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.engine.host_servers.host_mcp_server import HostMcpServer
 
 _FIXED_TOOL_NAMES = {
@@ -88,8 +87,7 @@ def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, outp
         output_schema=output_schema,
     )
     data_logger = _FakeDataLogger()
-    interaction_server = HostInteractionServer(skill, data_logger)
-    server = HostMcpServer(sandbox, skill, resource_pool, data_logger, interaction_server)
+    server = HostMcpServer(sandbox, skill, resource_pool, data_logger)
     server.build_app()
     return server, sandbox, resource_pool
 
@@ -186,54 +184,10 @@ def test_dynamic_tool_dispatch_invokes_the_agtool_fn():
     assert "hello" in result.content[0].text
 
 
-def test_call_tool_records_tool_result_with_arguments_and_result():
-    """Tool arguments/results aren't in any llm_block row (only the model's
-    own tool_use block is) -- this is the only place a tool's actual return
-    value ever gets persisted, needed for live per-agent transcript
-    reconstruction in the webui."""
-    echo = agtool(
-        name="echo",
-        description="Echo back the message.",
-        fn=lambda d: agdata(msg=d._data["msg"]),
-        params={
-            "type": "object",
-            "properties": {"msg": {"type": "string"}},
-            "required": ["msg"],
-        },
-    )
-    server, _, _ = _make_server(add_host_mcp_tools=[echo])
-    asyncio.run(server._mcp_server.call_tool("echo", {"msg": "hello"}))
-
-    tool_result_events = [e for e in server._data_logger.events if e[0] == "tool_result"]
-    assert len(tool_result_events) == 1
-    _type, payload, _call_label, _snapshot = tool_result_events[0]
-    assert payload["tool"] == "echo"
-    assert payload["arguments"] == {"msg": "hello"}
-    assert payload["result"]["msg"] == "hello"
-
-
-def test_call_tool_records_admission_call_and_a_completion_span():
-    echo = agtool(
-        name="echo",
-        description="Echo back the message.",
-        fn=lambda d: agdata(msg=d._data["msg"]),
-        params={
-            "type": "object",
-            "properties": {"msg": {"type": "string"}},
-            "required": ["msg"],
-        },
-    )
-    server, _, _ = _make_server(add_host_mcp_tools=[echo])
-    asyncio.run(server._mcp_server.call_tool("echo", {"msg": "hello"}))
-
-    call_events = [e for e in server._data_logger.events if e[0] == "tool_call"]
-    assert len(call_events) == 1
-    assert call_events[0][1]["tool"] == "echo"
-    assert len(server._data_logger.spans) == 1
-    assert server._data_logger.spans[0][0] == "tool:echo"
-
-
-def test_call_tool_denied_by_policy_never_runs_and_records_no_result():
+def test_call_tool_does_not_check_policy_itself():
+    """Admission now always happens upstream (PreToolUse hook or
+    react_loop's bridge check) -- HostMcpServer no longer consults the
+    skill's own agpolicy, so default_to_deny here must not block the call."""
     calls = []
     tool = agtool(
         name="danger",
@@ -252,14 +206,13 @@ def test_call_tool_denied_by_policy_never_runs_and_records_no_result():
         policy=agpolicy(default_to_deny=True),
     )
     data_logger = _FakeDataLogger()
-    interaction_server = HostInteractionServer(skill, data_logger)
-    server = HostMcpServer(sandbox, skill, resource_pool, data_logger, interaction_server)
+    server = HostMcpServer(sandbox, skill, resource_pool, data_logger)
     server.build_app()
 
     result = asyncio.run(server._mcp_server.call_tool("danger", {}))
-    assert calls == []
-    assert "error" in result.content[0].text
-    assert [e[0] for e in data_logger.events] == ["tool_call"]
+    assert calls == ["ran"]
+    assert result.is_error is False
+    assert data_logger.events == []
     assert data_logger.spans == []
 
 

@@ -44,7 +44,10 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
         dataloggerconfig(db_path=str(database)),
     )
     agent = SimpleNamespace(
-        agconfig=config, data_logger=agDataLogger(config), llm_usage_tracker=LlmUsageTracker()
+        agname="agent-1",
+        agconfig=config,
+        data_logger=agDataLogger(config),
+        llm_usage_tracker=LlmUsageTracker(),
     )
     skill = agskill(
         name="mock-attempt",

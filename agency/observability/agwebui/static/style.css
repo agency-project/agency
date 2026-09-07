@@ -209,6 +209,10 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 .log-line + .log-line { }
 
+.log-ts {
+  color: var(--dim);
+}
+
 .done-banner {
   color: var(--green);
   font-weight: bold;

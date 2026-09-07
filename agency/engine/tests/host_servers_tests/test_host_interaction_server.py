@@ -67,10 +67,10 @@ def _make_skill(policy=None):
     return SimpleNamespace(policy=policy if policy is not None else agpolicy())
 
 
-def _make_server(policy=None, data_logger=None, invocation=None):
+def _make_server(policy=None, data_logger=None, invocation=None, agname="agent-1"):
     skill = _make_skill(policy)
     data_logger = data_logger if data_logger is not None else _FakeDataLogger()
-    return HostInteractionServer(skill, data_logger, invocation=invocation)
+    return HostInteractionServer(skill, data_logger, agname, invocation=invocation)
 
 
 def _make_syscall(
@@ -594,9 +594,41 @@ def test_admit_tool_call_records_call_event_and_returns_call_id():
             False,
             None,
             False,
-        )
+        ),
+        (
+            "agent_state",
+            {"state": "running_tool", "tool": "bash"},
+            None,
+            True,
+            "[agent-1] TOOL    ▶  bash  args={'cmd': 'ls'}",
+            True,
+        ),
     ]
     assert logger.spans == []
+
+
+def test_admit_tool_call_with_large_arguments_truncates_term_message():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(), data_logger=logger)
+    big_content = "y" * 5000
+
+    server.admit_tool_call("write_file", {"content": big_content})
+
+    term_message = logger.events[1][4]
+    assert term_message is not None
+    assert "…" in term_message
+    assert len(term_message) < len(big_content)
+
+
+def test_admit_tool_call_denied_term_message_still_shows_args():
+    logger = _FakeDataLogger()
+    server = _make_server(policy=agpolicy(default_to_deny=True), data_logger=logger)
+
+    server.admit_tool_call("bash", {"cmd": "rm -rf /"})
+
+    term_message = logger.events[1][4]
+    assert "args={'cmd': 'rm -rf /'}" in term_message
+    assert "DENIED" in term_message
 
 
 def test_admit_tool_call_denied_records_call_event_but_no_pending_span():
@@ -607,7 +639,8 @@ def test_admit_tool_call_denied_records_call_event_but_no_pending_span():
     server.complete_tool_call(result["call_id"], result={"ignored": True})
     # Denied call was never stashed as pending -- completion is a no-op, and
     # no tool_result/span is recorded for a call that never really ran.
-    assert [e[0] for e in logger.events] == ["tool_call"]
+    assert [e[0] for e in logger.events] == ["tool_call", "agent_state"]
+    assert logger.events[1][1] == {"state": "tool_denied", "tool": "bash"}
     assert logger.spans == []
 
 
@@ -616,8 +649,8 @@ def test_complete_tool_call_records_result_event_and_span():
     server = _make_server(policy=agpolicy(), data_logger=logger)
     call_id = server.admit_tool_call("bash", {"cmd": "ls"})["call_id"]
     server.complete_tool_call(call_id, result={"stdout": "ok"})
-    assert [e[0] for e in logger.events] == ["tool_call", "tool_result"]
-    result_payload = logger.events[1][1]
+    assert [e[0] for e in logger.events] == ["tool_call", "agent_state", "tool_result"]
+    result_payload = logger.events[2][1]
     assert result_payload["tool"] == "bash"
     assert result_payload["arguments"] == {"cmd": "ls"}
     assert result_payload["result"] == {"stdout": "ok"}
@@ -643,7 +676,7 @@ def test_complete_tool_call_fires_once_even_if_called_twice():
     call_id = server.admit_tool_call("bash", {})["call_id"]
     server.complete_tool_call(call_id, result="first")
     server.complete_tool_call(call_id, result="second")
-    assert [e[0] for e in logger.events] == ["tool_call", "tool_result"]
+    assert [e[0] for e in logger.events] == ["tool_call", "agent_state", "tool_result"]
     assert len(logger.spans) == 1
 
 
@@ -654,8 +687,8 @@ def test_admit_syscall_and_complete_syscall_record_event_and_span():
     assert result["allowed"] is True
     call_id = result["call_id"]
     server.complete_syscall(call_id, return_value=3)
-    assert [e[0] for e in logger.events] == ["syscall_call", "syscall_result"]
-    result_payload = logger.events[1][1]
+    assert [e[0] for e in logger.events] == ["syscall_call", "agent_state", "syscall_result"]
+    result_payload = logger.events[2][1]
     assert result_payload["syscall"] == "openat"
     assert result_payload["return_value"] == 3
     assert len(logger.spans) == 1
@@ -674,7 +707,7 @@ def test_build_app_complete_tool_route_records_result_and_span():
     )
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert [e[0] for e in logger.events] == ["tool_call", "tool_result"]
+    assert [e[0] for e in logger.events] == ["tool_call", "agent_state", "tool_result"]
     assert len(logger.spans) == 1
 
 
@@ -699,7 +732,7 @@ def test_build_app_complete_syscall_route_records_result_and_span():
     )
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert [e[0] for e in logger.events] == ["syscall_call", "syscall_result"]
+    assert [e[0] for e in logger.events] == ["syscall_call", "agent_state", "syscall_result"]
     assert len(logger.spans) == 1
 
 

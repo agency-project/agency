@@ -304,6 +304,7 @@ def test_pending_redirect_denies_claude_tool_until_acknowledged(pretool, capsys)
     server = HostInteractionServer(
         SimpleNamespace(policy=agpolicy(default_to_deny=False)),
         None,
+        "agent-1",
         invocation=invocation,
     )
     requests = []

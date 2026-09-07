@@ -81,6 +81,7 @@ def sandbox_manager():
             dataloggerconfig(db_path=f"{directory}/agent.db"),
         )
         agent = SimpleNamespace(
+            agname="agent-1",
             agconfig=config,
             harness="native",
             data_logger=agDataLogger(config),

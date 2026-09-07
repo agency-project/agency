@@ -318,15 +318,19 @@ function appendLog(line) {
 // "[agname] rest of the message" -- color just the agent tag, matching the
 // old terminal-based agui's per-agent-colored `[agname]` prefix, and leave
 // the rest to ansiToHtml (term_message never contains ANSI codes, but this
-// keeps escaping consistent with every other log line).
-function appendAgentLog(termMessage, color) {
+// keeps escaping consistent with every other log line). Every event carries
+// its own `ts` (see server.py's _build_envelope), so a short HH:MM:SS
+// prefix -- dim, like the old terminal-based agui's -- rides along whenever
+// one's available.
+function appendAgentLog(termMessage, color, ts) {
+  const tsPrefix = ts ? `<span class="log-ts">${fmtTs(ts)}</span> ` : '';
   const m = /^(\[[^\]]+\])(.*)$/s.exec(termMessage);
   if (!m || !color) {
-    appendLog(termMessage);
+    _appendLogLine(tsPrefix + ansiToHtml(termMessage));
     return;
   }
   const tag = `<span style="color:${color};font-weight:bold">${esc(m[1])}</span>`;
-  _appendLogLine(tag + ansiToHtml(m[2]));
+  _appendLogLine(tsPrefix + tag + ansiToHtml(m[2]));
 }
 
 // ---------------------------------------------------------------------------
@@ -683,7 +687,7 @@ function handleEvent(ev) {
   // stderr (e.g. "[agent] SKILL OK ..."). Nothing emits a dedicated `log`
   // event to the global stream anymore, so this is how the shared log
   // panel sees anything beyond the few cases above that append explicitly.
-  if (ev.term_message) appendAgentLog(ev.term_message, ev.color);
+  if (ev.term_message) appendAgentLog(ev.term_message, ev.color, ev.ts);
 }
 
 // Keep team agents contiguous and before standalone agents

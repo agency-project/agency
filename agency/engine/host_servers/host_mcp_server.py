@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from ...agskill import agskill
     from ...agtool import agtool
     from ...sandbox.agsandbox import agSandbox
-    from .host_interaction_server import HostInteractionServer
 
 _current_data_logger = threading.local()
 
@@ -77,7 +76,6 @@ class HostMcpServer:
         skill: "agskill",
         resource_pool: "agResourcePool",
         data_logger: "agDataLogger",
-        interaction_server: "HostInteractionServer",
         *,
         invocation=None,
     ) -> None:
@@ -85,7 +83,6 @@ class HostMcpServer:
         self._skill = skill
         self._resource_pool = resource_pool
         self._data_logger = data_logger
-        self._interaction_server = interaction_server
         self._invocation = invocation
         self._persistent_vars: "dict[str, object]" = {}
         self._mcp_server: "MCPServer | None" = None
@@ -105,37 +102,20 @@ class HostMcpServer:
                     return {
                         "error": "Invocation redirected. Return to the model before taking another action."
                     }
-            admission = self._interaction_server.admit_tool_call(tool.name, kwargs)
-            if not admission["allowed"]:
-                return {"error": admission.get("reason") or "denied by policy"}
-            self._data_logger.record_event(
-                type="agent_state",
-                payload={"state": "running_tools", "tool": tool.name},
-                update_latest_snapshot=True,
-                flush=True,
-            )
+            # No admit_tool_call() here -- the caller (PreToolUse hook or
+            # react_loop.py's bridge check) already admitted; doing it again
+            # would double-admit every MCP tool call.
             persistent = {
                 var_name: self._persistent_vars.setdefault(var_name, factory())
                 for var_name, factory in tool.persistent_vars.items()
             }
-            result = tool(
+            return tool(
                 agdata(**kwargs),
                 sandbox=self._sandbox,
                 resource_pool=self._resource_pool,
                 output_schema=self._skill.output_schema,
                 **persistent,
             ).to_dict()
-            # Best-effort: a tool's return shape isn't guaranteed JSON-safe
-            # the way skill_success's logged field *names* are (see
-            # orchestrator._record_execution_results) -- never let a
-            # telemetry failure take down the actual tool call over it.
-            try:
-                self._interaction_server.complete_tool_call(admission["call_id"], result)
-            except Exception as exc:
-                print(
-                    f"[host_mcp_server] WARNING: tool_result logging failed for {tool.name}: {exc}"
-                )
-            return result
 
         call_tool.__name__ = tool.name
         call_tool.__signature__ = inspect.Signature(

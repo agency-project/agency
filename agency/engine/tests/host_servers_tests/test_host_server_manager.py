@@ -35,6 +35,7 @@ def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code")
         dataloggerconfig(db_path=str(tmp_path / "agent.db")),
     )
     agent = SimpleNamespace(
+        agname="agent-1",
         agconfig=cfg,
         harness=harness,
         data_logger=agDataLogger(cfg),
@@ -390,7 +391,10 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
         dataloggerconfig(db_path=db_path),
     )
     agent = SimpleNamespace(
-        agconfig=cfg, data_logger=agDataLogger(cfg), llm_usage_tracker=LlmUsageTracker()
+        agname="agent-1",
+        agconfig=cfg,
+        data_logger=agDataLogger(cfg),
+        llm_usage_tracker=LlmUsageTracker(),
     )
     sandbox = SimpleNamespace()
     skill = agskill(name="s", system_prompt="p", policy=agpolicy())

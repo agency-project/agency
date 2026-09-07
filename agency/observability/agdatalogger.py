@@ -18,6 +18,12 @@ def _ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _term_line(ts: float, term_message: str) -> str:
+    """term_message prefixed with a grey HH:MM:SS (webui's own ts-based
+    prefix is the HTML counterpart, see app.js's appendAgentLog)."""
+    return f"\x1b[90m{datetime.fromtimestamp(ts):%H:%M:%S}\x1b[0m {term_message}"
+
+
 class agDataLogger:
     """A logger instance is reused across the system: one per agent (holding
     that agent's own high-frequency execution data) and one shared global
@@ -179,7 +185,7 @@ class agDataLogger:
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
         if term_message is not None:
-            print(term_message, file=sys.stderr)
+            print(_term_line(timestamp, term_message), file=sys.stderr)
         with self._lock:
             self._event_rows.append(
                 (
@@ -255,7 +261,7 @@ class agDataLogger:
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
         if term_message is not None:
-            print(term_message, file=sys.stderr)
+            print(_term_line(timestamp, term_message), file=sys.stderr)
         with self._lock:
             self._stream_delta_rows = [
                 row for row in self._stream_delta_rows if row[5] != call_label
@@ -299,7 +305,7 @@ class agDataLogger:
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
         if term_message is not None:
-            print(term_message, file=sys.stderr)
+            print(_term_line(end_ts, term_message), file=sys.stderr)
         with self._lock:
             self._span_rows.append(
                 (

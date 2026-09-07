@@ -24,12 +24,14 @@ class HostInteractionServer:
         self,
         skill: "agskill",
         data_logger: "agDataLogger",
+        agname: str,
         *,
         invocation=None,
         admit_tools: bool = True,
     ) -> None:
         self._policy = skill.policy
         self._data_logger = data_logger
+        self._agname = agname  # for _record_admission's term_message tag
         # Bound by HostServerManager to the exact orchestrator request.  The
         # sandbox never supplies an invocation id and therefore cannot target
         # another request's lifecycle state.
@@ -149,11 +151,36 @@ class HostInteractionServer:
             return (False, f"hook raised: {exc}")
         return result if isinstance(result, tuple) else (result, None)
 
-    def _record_admission(self, kind: str, name: str, attributes: dict, allowed: bool) -> str:
+    _ADMISSION_LABEL = {"tool": "TOOL   ", "syscall": "SYSCALL"}
+
+    def _record_admission(
+        self, kind: str, name: str, attributes: dict, allowed: bool, reason: "str | None" = None
+    ) -> str:
         call_id = uuid.uuid4().hex
         self.record_event(
             f"{kind}_call",
             {**attributes, "call_id": call_id, "allowed": allowed},
+        )
+        label = self._ADMISSION_LABEL[kind]
+        args_suffix = ""
+        if kind == "tool":
+            args_text = repr(attributes["arguments"])
+            if len(args_text) > 200:
+                args_text = f"{args_text[:200]}…"
+            args_suffix = f"  args={args_text}"
+        if allowed:
+            term_message = f"[{self._agname}] {label} ▶  {name}{args_suffix}"
+        else:
+            term_message = (
+                f"[{self._agname}] {label} ✗  {name}{args_suffix}  "
+                f"DENIED: {reason or 'no reason given'}"
+            )
+        self.record_event(
+            "agent_state",
+            {"state": f"running_{kind}" if allowed else f"{kind}_denied", kind: name},
+            update_latest_snapshot=True,
+            term_message=term_message,
+            flush=True,
         )
         if allowed:
             with self._pending_calls_lock:
@@ -180,7 +207,7 @@ class HostInteractionServer:
         `complete_tool_call()`."""
         allowed, reason = self.check_tool(tool_name, tool_input)
         call_id = self._record_admission(
-            "tool", tool_name, {"tool": tool_name, "arguments": tool_input}, allowed
+            "tool", tool_name, {"tool": tool_name, "arguments": tool_input}, allowed, reason
         )
         return {"allowed": allowed, "reason": reason, "call_id": call_id}
 
@@ -203,6 +230,7 @@ class HostInteractionServer:
                 "argv": syscall.argv,
             },
             allowed,
+            reason,
         )
         return {"allowed": allowed, "reason": reason, "call_id": call_id}
 
