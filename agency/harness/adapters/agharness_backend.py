@@ -74,6 +74,8 @@ class agharness_backend:
     `agharness_backend.for_config(engine, agconfig)` to get the right
     subclass; don't instantiate a subclass directly."""
 
+    _DEFAULT_BINARY: ClassVar[str | None] = None
+
     # Fields with no viable fallback for a given agconfig.agent.harness --
     # checked eagerly by _validate_config() on every construction/
     # change_config() call. Empty today: every concrete adapter's

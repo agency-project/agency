@@ -92,19 +92,6 @@ def _run_attempt(
     )
 
 
-def test_run_attempt_returns_error_when_binary_missing(monkeypatch):
-    import shutil as _shutil
-
-    monkeypatch.setattr(_shutil, "which", lambda name: None)
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-
-    attempt = _run_attempt(backend, ag)
-
-    assert not attempt.ok
-    assert "not found" in attempt.error_message
-
-
 def test_run_attempt_parses_json_result_field(_patch_which_finds_claude):
     backend = _ClaudeCodeBackend(agconfig())
     ag = _make_agent(with_sandbox=False)

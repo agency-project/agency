@@ -1920,6 +1920,12 @@ class TestAgSandboxPIDTracking:
         live = self.sb.get_live_pids()
         assert len(live) == 0
 
+    def test_hibernation_check_refreshes_exited_cpu_only_work(self):
+        self.sb.exec("sleep 1 >/dev/null 2>&1 &")
+        assert self.sb._has_pending_background_work() is True
+        time.sleep(1.2)
+        assert self.sb._has_pending_background_work() is False
+
     def test_get_live_pids_empty_when_no_background(self):
         self.sb.exec("echo hi")
         assert self.sb.get_live_pids() == set()

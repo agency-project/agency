@@ -116,7 +116,6 @@ class agSandbox:
             AGENCY_LOGS_CONTAINER_MOUNT,
             AGENCY_PACKAGE_CONTAINER_MOUNT,
             agency_package_dir,
-            agharness_binary_cache_dir,
             agharness_llm_gateway_dir,
         )
 
@@ -139,21 +138,20 @@ class agSandbox:
             "_agency_logs",
             (str(_log_dir), AGENCY_LOGS_CONTAINER_MOUNT, "rw"),
         )
-        # Same rationale, for the harness binary cache (see
-        # agutil.agharness_binary_cache_dir's docstring): read-only,
-        # since a container should never be able to write back into a
-        # cache shared across every sandbox on this host.
-        mounts.setdefault(
-            "_agharness_bin_cache",
-            (str(agharness_binary_cache_dir()), "/opt/agency_harness_bin", "ro"),
-        )
+        from ..harness.executable import harness_installation_mounts
+
+        for name, mount in harness_installation_mounts(self.agconfig).items():
+            for existing in mounts.values():
+                if existing[1] == mount[1] and existing != mount:
+                    raise ValueError(f"Conflicting harness installation mount at {mount[1]}")
+            mounts[name] = mount
         # Same rationale again, for the `agency` package itself (see
         # agutil.agency_package_dir's docstring) -- needed by a persistent
         # in-container entrypoint (agharness_backends/native.py's
         # react-loop process, or a container-relocated agproxy_llm) to
         # `import agency` and run the EXACT same code as the host process,
         # not a second copy baked into the sandbox's base image. Read-only,
-        # same reasoning as the binary cache.
+        # same reasoning as the harness installation mounts.
         mounts.setdefault(
             "_agency_package",
             (str(agency_package_dir()), AGENCY_PACKAGE_CONTAINER_MOUNT, "ro"),

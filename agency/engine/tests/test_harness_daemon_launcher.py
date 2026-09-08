@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import json
+import shlex
+from unittest.mock import Mock
+
+import pytest
+
 from agency.configs.agconfig import (
     agconfig,
     agentconfig,
@@ -18,7 +24,10 @@ class _FakeSandbox:
     def exec_detached(self, command, workdir):
         self.detached.append((command, workdir))
 
-    def exec(self, *_args, **_kwargs):
+    def exec(self, command, **_kwargs):
+        if "command -v" in command:
+            binary = shlex.split(command)[-1]
+            return binary if "/" in binary else f"/usr/bin/{binary}", 0
         return "daemon log", 0
 
 
@@ -147,3 +156,31 @@ def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
             "disable_harness_native_sandbox": True,
         },
     }
+
+
+@pytest.mark.parametrize("harness", ["claude_code", "codex", "grok", "opencode"])
+def test_all_external_harnesses_receive_prepared_path(monkeypatch, tmp_path, harness):
+    sandbox = _fake_sandbox(tmp_path, agentconfig(harness=harness))
+    prepared = f"/host/install/{harness}/bin/cli"
+    prepare = Mock(return_value=prepared)
+    monkeypatch.setattr(launcher, "prepare_harness_executable", prepare)
+    monkeypatch.setattr(launcher, "ensure_python_packages_in_container", lambda *a, **kw: None)
+    monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: True)
+    launcher.ensure_harness_daemon(
+        sandbox, "/tmp/host.sock", "agent-1", harness, agconfig=sandbox.agconfig
+    )
+    prepare.assert_called_once_with(sandbox, harness, sandbox.agconfig)
+    command = shlex.split(sandbox.detached[0][0])
+    config = json.loads(command[command.index("--config-json") + 1])
+    assert config["harness_adapter"]["binary_path"] == prepared
+    assert sandbox.agconfig.harness_adapter.binary_path is None
+
+
+def test_preparation_failure_prevents_daemon_launch(monkeypatch, tmp_path):
+    sandbox = _fake_sandbox(tmp_path)
+    monkeypatch.setattr(
+        launcher, "prepare_harness_executable", Mock(side_effect=RuntimeError("missing runtime"))
+    )
+    with pytest.raises(RuntimeError, match="missing runtime"):
+        launcher.ensure_harness_daemon(sandbox, "/tmp/host.sock", "agent-1", "codex")
+    assert not sandbox.detached

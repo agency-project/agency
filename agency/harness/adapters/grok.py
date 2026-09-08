@@ -30,6 +30,7 @@ from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
+from ..executable import HARNESS_PATH
 
 
 def grok_available() -> bool:
@@ -103,12 +104,8 @@ class _GrokBackend(agharness_backend):
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
 
-        binary = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-        resolved = shutil.which(binary)
-        if resolved is None:
-            return AttemptResult(
-                ok=False, error_message=f"grok binary {binary!r} not found on PATH"
-            )
+        # The host preparation layer supplies an executable in this namespace.
+        resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
 
         config_home = agharness.materialize_config_home(
             runtime.engine_name, runtime.token, runtime.harness_base_url
@@ -124,7 +121,7 @@ class _GrokBackend(agharness_backend):
 
             argv = [resolved, "-p", prompt, "--output-format", "json"]
             envp = {
-                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PATH": HARNESS_PATH,
                 # GROK_HOME redirects the *entire* config directory (config.toml,
                 # auth.json, sessions/) -- the closest analog to Codex's CODEX_HOME,
                 # and the documented isolation mechanism here: xAI's docs don't

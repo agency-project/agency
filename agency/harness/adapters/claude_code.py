@@ -17,54 +17,14 @@ from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
+from ..executable import HARNESS_PATH
 
 
 def claude_code_available() -> bool:
     return shutil.which("claude") is not None
 
 
-_BIN_CACHE_MOUNT = "/opt/agency_harness_bin"
-
 _DEFAULT_TIMEOUT_S = 600
-
-
-def _resolve_binary_in_container(sandbox, binary: str) -> "str | None":
-    """Find *binary* for a container-backed launch, in order: (1) already
-    on the container image's own PATH -- e.g. a purpose-built image that
-    bakes it in; (2) the host-side binary cache every container-backed
-    sandbox has bind-mounted read-only at `_BIN_CACHE_MOUNT` (see
-    `agutil.agharness_binary_cache_dir`); (3) seed that cache, on the HOST,
-    from the host's own `shutil.which(binary)` -- never fetched over the
-    network by Agency itself, so this never depends on knowing an install
-    URL, and never requires the container to have network egress. Returns
-    None only if none of the three has it."""
-    import shlex
-
-    out, rc = sandbox.exec(f"which {shlex.quote(binary)}", workdir="/")
-    if rc == 0 and out.strip():
-        return out.strip()
-
-    cached_path = f"{_BIN_CACHE_MOUNT}/{binary}"
-    out, rc = sandbox.exec(f"test -x {shlex.quote(cached_path)}", workdir="/")
-    if rc == 0:
-        return cached_path
-
-    from ...utils.agutil import agharness_binary_cache_dir
-
-    cache_file = agharness_binary_cache_dir() / binary
-    if not cache_file.exists():
-        host_path = shutil.which(binary)
-        if host_path is None:
-            return None
-        shutil.copy2(host_path, cache_file)
-        cache_file.chmod(0o755)
-
-    # The bind mount is a live view of the host directory, so the file
-    # just written is already visible inside the container -- re-check
-    # rather than assume, since the copy above could still race a
-    # concurrent launch for a different agent seeding the same cache.
-    out, rc = sandbox.exec(f"test -x {shlex.quote(cached_path)}", workdir="/")
-    return cached_path if rc == 0 else None
 
 
 # -- Native session continuity ----------------------------------------------
@@ -94,21 +54,16 @@ def _session_path(config_home: str, session_id: str) -> str:
     return f"{config_home}/projects/{_session_slug(config_home)}/{session_id}.jsonl"
 
 
-def _read_session_blob(sandbox, in_container: bool, path: str) -> "bytes | None":
+def _read_session_blob(path: str) -> "bytes | None":
     try:
-        if in_container:
-            return sandbox.read_file_bytes(path)
         return Path(path).read_bytes()
     except (FileNotFoundError, OSError):
         return None
 
 
-def _write_session_blob(sandbox, in_container: bool, path: str, data: bytes) -> None:
-    if in_container:
-        sandbox.write_file_bytes(path, data)
-    else:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_bytes(data)
+def _write_session_blob(path: str, data: bytes) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_bytes(data)
 
 
 def _stringify_anthropic_content(content) -> str:
@@ -269,44 +224,16 @@ class _ClaudeCodeBackend(agharness_backend):
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
 
-        binary = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-        # A docker/podman-backed sandbox runs the harness INSIDE the
-        # container (its own PID namespace, so its filesystem writes land
-        # in the same workspace the rest of that agent's tools see), a
-        # chroot-backed (or no) sandbox keeps the existing bare-host launch
-        # -- the jail already IS a real host directory, nothing to bridge.
-        in_container = agharness.is_container_backed(runtime.sandbox)
+        # The host preparation layer supplies an executable in this namespace.
+        resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
 
-        if in_container:
-            resolved = _resolve_binary_in_container(runtime.sandbox, binary)
-        else:
-            resolved = shutil.which(binary)
-        if resolved is None:
-            where = (
-                "inside the sandbox container, in the harness binary cache "
-                "(~/.cache/agency_harness_bin), or on this host's own PATH "
-                "to seed that cache from"
-                if in_container
-                else "on PATH (the host PATH)"
-            )
-            return AttemptResult(
-                ok=False, error_message=f"claude binary {binary!r} not found {where}"
-            )
-
-        if in_container:
-            config_home = agharness.materialize_config_home_in_container(
-                runtime.engine_name, runtime.sandbox, runtime.token
-            )
-        else:
-            config_home = agharness.materialize_config_home(
-                runtime.engine_name, runtime.token, runtime.harness_base_url
-            )
+        config_home = agharness.materialize_config_home(
+            runtime.engine_name, runtime.token, runtime.harness_base_url
+        )
 
         try:
             if resume_session_id and prior_session_blob is not None:
                 _write_session_blob(
-                    runtime.sandbox,
-                    in_container,
                     _session_path(str(config_home), resume_session_id),
                     prior_session_blob,
                 )
@@ -315,9 +242,7 @@ class _ClaudeCodeBackend(agharness_backend):
             # and its PostToolUse/PostToolUseFailure boundaries to the same
             # host-side admission+completion endpoints (agpolicy_hook.py):
             # write the self-contained hook script into this launch's own
-            # config_home (visible to `claude` in both the host and
-            # in-container case, unlike a path in this package's own
-            # install location, which the container can't see), then
+            # config_home inside the sandbox daemon's filesystem, then
             # register it via `--settings`' `hooks` block -- confirmed
             # directly against the real CLI that this composes fine with
             # `--setting-sources ""` below, and that omitting `matcher`
@@ -326,10 +251,7 @@ class _ClaudeCodeBackend(agharness_backend):
             # completion telemetry, not just profiler spans.
             hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
             hook_path = f"{config_home}/agpolicy_hook.py"
-            if in_container:
-                runtime.sandbox.write_file_bytes(hook_path, hook_src)
-            else:
-                Path(hook_path).write_bytes(hook_src)
+            Path(hook_path).write_bytes(hook_src)
             hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
             hooks_settings = json.dumps(
                 {
@@ -356,7 +278,7 @@ class _ClaudeCodeBackend(agharness_backend):
             )
 
             envp = {
-                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PATH": HARNESS_PATH,
                 # Point Claude Code's own LLM traffic at agmanager_harness's
                 # translated Anthropic Messages route instead of any real
                 # Anthropic endpoint -- ANTHROPIC_AUTH_TOKEN sends this
@@ -398,31 +320,10 @@ class _ClaudeCodeBackend(agharness_backend):
                 # logic and never cleaned up by cleanup_config_home either.
                 "CLAUDE_CONFIG_DIR": str(config_home),
             }
-            if in_container:
-                # Deliberately does NOT forward the host's HOME: it points
-                # to a path that's meaningless (or, worse, coincidentally
-                # exists and means something else entirely) inside the
-                # container's own filesystem. No OAuth-credential concern
-                # to preserve here either, unlike the host-level case below
-                # -- the container has no real Anthropic login to begin
-                # with, and ANTHROPIC_AUTH_TOKEN always takes precedence
-                # regardless. Left unset, so the container image's own
-                # default HOME applies.
-                pass
-            else:
-                # Deliberately does NOT override HOME: Claude Code's OAuth
-                # credentials live under the real $HOME (~/.claude/
-                # .credentials.json), and --setting-sources "" above is
-                # already what provides the "don't inherit CLAUDE.md/settings"
-                # isolation this backend needs -- overriding HOME too would
-                # additionally (and unintentionally) cut off the real login,
-                # forcing "Not logged in" for every run (hit and fixed during
-                # development against the real CLI). This doesn't matter for
-                # authentication anymore since ANTHROPIC_AUTH_TOKEN above
-                # always takes precedence over OAuth login, but HOME is still
-                # left alone since other CLI state may expect it.
-                if "HOME" in os.environ:
-                    envp["HOME"] = os.environ["HOME"]
+            # HOME, when present, belongs to the sandbox daemon. Real host
+            # credentials are not forwarded across the daemon boundary.
+            if "HOME" in os.environ:
+                envp["HOME"] = os.environ["HOME"]
 
             # Agency selected this exact root CLI executable. Authorize only
             # its initial exec; descendant executions remain policy-controlled.
@@ -469,8 +370,6 @@ class _ClaudeCodeBackend(agharness_backend):
             if session_id:
                 try:
                     session_blob = _read_session_blob(
-                        runtime.sandbox,
-                        in_container,
                         _session_path(str(config_home), session_id),
                     )
                 except Exception:  # noqa: S110 - session persistence is best-effort
@@ -485,10 +384,7 @@ class _ClaudeCodeBackend(agharness_backend):
                 session_blob=session_blob,
             )
         finally:
-            if in_container:
-                agharness.cleanup_config_home_in_container(runtime.sandbox, config_home)
-            else:
-                agharness.cleanup_config_home(config_home)
+            agharness.cleanup_config_home(config_home)
 
     @staticmethod
     def _parse_result_json(stdout: str) -> "tuple[str, dict, str | None]":

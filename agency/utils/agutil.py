@@ -350,7 +350,7 @@ def agency_runs_dir():
 
 def agency_cache_root():
     """Root for cross-run state found without knowing which run created it
-    (today: the harness binary cache). Under `~/.cache/agency` by default,
+    (when a caller needs a persistent cache). Under `~/.cache/agency` by default,
     not run-scoped like the other two roots. Overridable via
     `AGENCY_CACHE_ROOT`."""
     return Path(os.environ.get("AGENCY_CACHE_ROOT", str(Path.home() / ".cache" / "agency")))
@@ -583,29 +583,6 @@ def uds_listener_is_live(path: "str | None", thread) -> bool:
     return thread is not None and thread.is_alive()
 
 
-def agharness_binary_cache_dir():
-    """Fixed, well-known host directory holding a cached copy of each
-    external harness binary (e.g. `claude`), bind-mounted read-only into
-    every docker/podman-backed sandbox unconditionally -- same
-    "attach unconditionally, gate on use" pattern as
-    `agharness_llm_gateway_dir`. Exists because the sandbox's own base
-    image (built for arbitrary agent tasks) has no reason to carry a
-    ~250MB+ harness binary, and re-copying one into every fresh container
-    on every launch would be slow and, for a network-isolated sandbox,
-    impossible. Populated lazily, on the host, the first time a
-    container-backed launch needs a binary this cache doesn't have yet
-    (see `agharness_backends/claude_code.py`'s in-container binary
-    resolution) -- never fetched from the network by Agency itself, only
-    copied from whatever the host's own `shutil.which()` already resolves,
-    so this never depends on knowing an install URL. Under `agency_cache_root()`
-    rather than a run-scoped tempdir (unlike the gateway socket dir above):
-    this should survive process restarts and successive runs so the ~250MB
-    copy happens once per host, not once per Agency process lifetime."""
-    d = agency_cache_root() / "harness_bin"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 # Fixed container-side mount point for agency_package_dir() below -- shared
 # between agsandbox.py (which bind-mounts it) and any in-container
 # entrypoint (agharness_backends/native.py's react-loop process, or a
@@ -628,7 +605,7 @@ def agency_package_dir():
     i.e. what needs to be on `PYTHONPATH` for `import agency` to resolve.
     Bind-mounted read-only into every container-backed sandbox at
     `AGENCY_PACKAGE_CONTAINER_MOUNT`, same "attach unconditionally, gate on
-    use" pattern as `agharness_llm_gateway_dir`/`agharness_binary_cache_dir`
+    use" pattern as `agharness_llm_gateway_dir`
     above -- so an in-container entrypoint always runs the EXACT same code
     the host process is running, not a second, potentially-stale copy
     baked into the sandbox's base image.

@@ -28,6 +28,7 @@ from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
+from ..executable import HARNESS_PATH
 
 
 def opencode_available() -> bool:
@@ -151,12 +152,8 @@ class _OpencodeBackend(agharness_backend):
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
 
-        binary = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-        resolved = shutil.which(binary)
-        if resolved is None:
-            return AttemptResult(
-                ok=False, error_message=f"opencode binary {binary!r} not found on PATH"
-            )
+        # The host preparation layer supplies an executable in this namespace.
+        resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
 
         config_home = agharness.materialize_config_home(
             runtime.engine_name, runtime.token, runtime.harness_base_url
@@ -173,7 +170,7 @@ class _OpencodeBackend(agharness_backend):
 
             argv = [resolved, "run", "--format", "json", prompt]
             envp = {
-                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PATH": HARNESS_PATH,
                 "HOME": str(config_home),
                 "OPENCODE_CONFIG": str(config_home / "opencode.json"),
                 # Read directly (via process.env) by agpolicy_plugin.js --

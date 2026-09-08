@@ -502,10 +502,12 @@ class agent:
         """Create the sandbox lazily on the admitted engine thread."""
         if self.sandbox is not None:
             return self.sandbox
-        sandbox_config = self.agconfig
+        sandbox_config = self.agconfig.clone()
+        # The explicit Agent(harness=...) choice can override agentconfig.
+        # Installation mounts must follow the actual engine before creation.
+        sandbox_config.agent.harness = self.harness
         agent_output_dir = self.output_path
         if agent_output_dir is not None:
-            sandbox_config = sandbox_config.clone()
             sandbox_config.sandbox.add_mount("agent_output", agent_output_dir, "/agent_output")
         self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
         return self.sandbox
@@ -586,7 +588,8 @@ class agent:
                 ag.context = source_context.copy()
         _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
-        sb_cfg = ag.agconfig
+        sb_cfg = ag.agconfig.clone()
+        sb_cfg.agent.harness = ag.harness
         if _out is not None:
             sb_cfg = sb_cfg.clone()
             sb_cfg.sandbox.add_mount("agent_output", _out, "/agent_output")
@@ -823,7 +826,8 @@ class agent:
         )
         _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
-        sb_cfg = ag.agconfig
+        sb_cfg = ag.agconfig.clone()
+        sb_cfg.agent.harness = ag.harness
         if _out is not None:
             sb_cfg = sb_cfg.clone()
             sb_cfg.sandbox.add_mount("agent_output", _out, "/agent_output")

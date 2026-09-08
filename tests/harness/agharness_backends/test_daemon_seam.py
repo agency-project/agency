@@ -89,6 +89,46 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     assert "do the thing" in captured["argv"]
 
 
+@pytest.mark.parametrize("sandbox", [None, object()])
+def test_claude_uses_staged_path_and_local_session_files(monkeypatch, tmp_path, sandbox):
+    from agency.configs.agconfig import harnessadapterconfig
+    from agency.harness.adapters.claude_code import _session_path
+
+    binary = tmp_path / "mounted-cache" / "claude"
+    binary.parent.mkdir()
+    binary.write_bytes(b"staged executable")
+    binary.chmod(0o755)
+    config = agconfig(harnessadapterconfig(binary_path=str(binary)))
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home", lambda *args: config_home
+    )
+    session = Path(_session_path(str(config_home), "session-one"))
+
+    def launch(_self, argv, envp, *, cwd, **kwargs):
+        assert argv[0] == str(binary)
+        assert argv[argv.index("--resume") + 1] == "session-one"
+        assert session.read_bytes() == b"prior transcript"
+        assert Path(cwd, "agpolicy_hook.py").is_file()
+        session.write_bytes(b"updated transcript")
+        handle = MagicMock()
+        handle.wait.return_value = ('{"result":"done","session_id":"session-one"}', "", 0)
+        return handle
+
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+    result = _ClaudeCodeBackend(config).run_daemon_attempt(
+        replace(_runtime(sandbox=sandbox), agconfig=config),
+        prompt="continue",
+        resume_session_id="session-one",
+        prior_session_blob=b"prior transcript",
+        max_steps=4,
+    )
+    assert result.ok
+    assert result.session_blob == b"updated transcript"
+    assert not config_home.exists()
+
+
 class _NativeSandbox:
     class _Backend:
         IMAGE_KIND = "container"

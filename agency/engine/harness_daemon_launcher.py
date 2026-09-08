@@ -15,6 +15,7 @@ from ..utils.agutil import (
     AGENCY_PACKAGE_CONTAINER_MOUNT,
     ensure_python_packages_in_container,
 )
+from ..harness.executable import HARNESS_PATH, prepare_harness_executable
 from .clients import SandboxInteractionClient
 
 if TYPE_CHECKING:
@@ -144,7 +145,12 @@ def ensure_harness_daemon(
         container_sandbox_uds_path=_container_socket_path(sandbox_path),
         engine_name=engine_name,
     )
-    config_json = json.dumps(_daemon_config(agconfig), separators=(",", ":"))
+    daemon_config = _daemon_config(agconfig)
+    config = agconfig if agconfig is not None else sandbox.agconfig
+    binary_path = prepare_harness_executable(sandbox, harness, config)
+    if binary_path is not None:
+        daemon_config.setdefault("harness_adapter", {})["binary_path"] = binary_path
+    config_json = json.dumps(daemon_config, separators=(",", ":"))
 
     ensure_python_packages_in_container(
         sandbox,
@@ -156,7 +162,7 @@ def ensure_harness_daemon(
 
     # Actual launch of the daemon
     command = (
-        "PATH=/opt/agency_harness_bin:/usr/local/bin:/usr/bin:/bin "
+        f"PATH={HARNESS_PATH} "
         f"PYTHONPATH={shlex.quote(AGENCY_PACKAGE_CONTAINER_MOUNT)} "
         "exec python3 -m agency.harness.daemon "
         f"--sandbox-uds {shlex.quote(handle.container_sandbox_uds_path)} "
