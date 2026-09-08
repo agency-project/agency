@@ -31,7 +31,7 @@ def test_opencode_available_reflects_real_which():
     assert opencode_available() == (shutil.which("opencode") is not None)
 
 
-def test_run_attempt_writes_and_registers_the_agpolicy_plugin(monkeypatch):
+def test_run_attempt_writes_and_registers_the_agpolicy_plugin(monkeypatch, tmp_path):
     import shutil as _shutil
 
     monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -39,14 +39,22 @@ def test_run_attempt_writes_and_registers_the_agpolicy_plugin(monkeypatch):
     ag = _make_agent()
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
+    config_home = tmp_path / "opencode-config"
+    config_home.mkdir()
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home", lambda *args: config_home
+    )
 
     def fake_launch(argv, envp, *, cwd, policy, ag):
         from pathlib import Path
 
-        config_home = Path(cwd)
+        launched_config_home = Path(envp["HOME"])
         captured["envp"] = envp
-        captured["config"] = json.loads((config_home / "opencode.json").read_text())
-        captured["plugin_exists"] = (config_home / "plugin" / "agpolicy_plugin.js").exists()
+        captured["cwd"] = cwd
+        captured["config"] = json.loads((launched_config_home / "opencode.json").read_text())
+        captured["plugin_exists"] = (
+            launched_config_home / "plugin" / "agpolicy_plugin.js"
+        ).exists()
         return handle
 
     runtime = AdapterRuntime(
@@ -70,6 +78,10 @@ def test_run_attempt_writes_and_registers_the_agpolicy_plugin(monkeypatch):
     assert captured["config"]["plugin"][0].endswith("agpolicy_plugin.js")
     assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
     assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
+    assert captured["cwd"] == "/workspace"
+    assert captured["envp"]["HOME"] == str(config_home)
+    assert captured["envp"]["OPENCODE_CONFIG"] == str(config_home / "opencode.json")
+    assert not config_home.exists()
 
 
 def test_parse_output_events_extracts_last_text_from_ndjson():

@@ -31,7 +31,7 @@ def test_codex_available_reflects_real_which():
     assert codex_available() == (shutil.which("codex") is not None)
 
 
-def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeypatch):
+def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeypatch, tmp_path):
     import shutil as _shutil
 
     monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -39,16 +39,21 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     ag = _make_agent()
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
+    config_home = tmp_path / "codex-config"
+    config_home.mkdir()
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home", lambda *args: config_home
+    )
 
     def fake_launch(argv, envp, *, cwd, policy, ag):
         from pathlib import Path
 
-        config_home = Path(cwd)
+        launched_config_home = Path(envp["CODEX_HOME"])
         captured["argv"] = argv
         captured["envp"] = envp
         captured["cwd"] = cwd
-        captured["config_home_hooks"] = (config_home / "hooks.json").read_text()
-        captured["config_home_hook_script"] = (config_home / "agpolicy_hook.py").exists()
+        captured["config_home_hooks"] = (launched_config_home / "hooks.json").read_text()
+        captured["config_home_hook_script"] = (launched_config_home / "agpolicy_hook.py").exists()
         return handle
 
     runtime = AdapterRuntime(
@@ -71,7 +76,10 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     assert captured["config_home_hook_script"] is True
     assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
     assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
-    assert captured["envp"]["AGPOLICY_STATE_DIR"] == captured["cwd"]
+    assert captured["cwd"] == "/workspace"
+    assert captured["envp"]["CODEX_HOME"] == str(config_home)
+    assert captured["envp"]["AGPOLICY_STATE_DIR"] == str(config_home)
+    assert not config_home.exists()
 
 
 def test_parse_output_events_ignores_non_agent_message_items():

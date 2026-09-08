@@ -67,7 +67,12 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     def launch(_self, argv, envp, *, cwd, policy, ag):
         captured.update(argv=argv, envp=envp, cwd=cwd, policy=policy, ag=ag)
         if config_name is not None:
-            captured["config"] = (Path(cwd) / config_name).read_text()
+            if "OPENCODE_CONFIG" in envp:
+                config_path = Path(envp["OPENCODE_CONFIG"])
+            else:
+                config_home = Path(envp.get("CODEX_HOME") or envp["GROK_HOME"])
+                config_path = config_home / config_name
+            captured["config"] = config_path.read_text()
         return handle
 
     monkeypatch.setattr("shutil.which", lambda binary: f"/usr/bin/{binary}")

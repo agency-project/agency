@@ -31,7 +31,7 @@ def test_grok_available_reflects_real_which():
     assert grok_available() == (shutil.which("grok") is not None)
 
 
-def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeypatch):
+def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeypatch, tmp_path):
     import shutil as _shutil
 
     monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -39,15 +39,22 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     ag = _make_agent()
     handle = _make_handle(stdout='{"text": "ok"}')
     captured = {}
+    config_home = tmp_path / "grok-config"
+    config_home.mkdir()
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home", lambda *args: config_home
+    )
 
     def fake_launch(argv, envp, *, cwd, policy, ag):
         from pathlib import Path
 
-        config_home = Path(cwd)
+        launched_config_home = Path(envp["GROK_HOME"])
         captured["envp"] = envp
         captured["cwd"] = cwd
-        captured["hooks_json"] = (config_home / "hooks" / "agpolicy.json").read_text()
-        captured["hook_script_exists"] = (config_home / "hooks" / "agpolicy_hook.py").exists()
+        captured["hooks_json"] = (launched_config_home / "hooks" / "agpolicy.json").read_text()
+        captured["hook_script_exists"] = (
+            launched_config_home / "hooks" / "agpolicy_hook.py"
+        ).exists()
         return handle
 
     runtime = AdapterRuntime(
@@ -70,7 +77,10 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     assert captured["hook_script_exists"] is True
     assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
     assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
-    assert captured["envp"]["AGPOLICY_STATE_DIR"] == captured["cwd"]
+    assert captured["cwd"] == "/workspace"
+    assert captured["envp"]["GROK_HOME"] == str(config_home)
+    assert captured["envp"]["AGPOLICY_STATE_DIR"] == str(config_home)
+    assert not config_home.exists()
 
 
 def test_parse_result_json_extracts_text_usage_and_session():

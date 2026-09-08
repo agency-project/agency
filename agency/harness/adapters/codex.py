@@ -187,7 +187,7 @@ class _CodexBackend(agharness_backend):
             handle = px.launch(
                 argv,
                 envp,
-                cwd=str(config_home),
+                cwd="/workspace",
                 policy=runtime.syscall_policy,
                 ag=None,
             )
