@@ -10,6 +10,7 @@ smoke test, not just a config/capability check, is the authoritative signal.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -130,7 +131,8 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
         def on_exec(self, callback):
             self.exec_callbacks.append(callback)
 
-        def start(self, argv, envp, cwd):
+        def start(self, argv, envp, cwd, *, stdin_data=None):
+            del stdin_data
             for callback in self.spawn_callbacks:
                 callback(4321)
             self.syscall_hook(
@@ -243,7 +245,8 @@ def test_profiler_callback_failure_cannot_abort_ptrace_lifecycle(monkeypatch, fa
         def on_exit(self, callback):
             self.exit_callbacks.append(callback)
 
-        def start(self, argv, envp, cwd):
+        def start(self, argv, envp, cwd, *, stdin_data=None):
+            del stdin_data
             for callback in self.spawn_callbacks:
                 callback(4501)
             reached.append("spawn")
@@ -492,6 +495,111 @@ def test_launch_basic_echo():
     assert stdout == "hello\n"
     assert stderr == ""
     assert rc == 0
+
+
+@ptrace
+def test_launch_without_stdin_data_uses_devnull():
+    script = "import os; print(os.readlink('/proc/self/fd/0'))"
+    handle = agProxyPtrace().launch(
+        [sys.executable, "-c", script],
+        {},
+        cwd="/tmp",
+        policy=_AllowPolicy(),
+    )
+
+    stdout, stderr, rc = handle.wait(timeout=10)
+
+    assert rc == 0
+    assert stderr == ""
+    assert stdout.strip() == "/dev/null"
+
+
+@ptrace
+def test_launch_delivers_stdin_data_and_eof():
+    payload = b"prompt delivered through stdin"
+    script = "import sys; data = sys.stdin.buffer.read(); sys.stdout.buffer.write(data)"
+    handle = agProxyPtrace().launch(
+        [sys.executable, "-c", script],
+        {},
+        cwd="/tmp",
+        stdin_data=payload,
+        policy=_AllowPolicy(),
+    )
+
+    stdout, stderr, rc = handle.wait(timeout=10)
+
+    assert rc == 0
+    assert stderr == ""
+    assert stdout.encode() == payload
+
+
+@ptrace
+def test_large_stdin_data_does_not_deadlock():
+    payload = (b"large-prompt-contents\n" * 150_000) + b"done"
+    expected = hashlib.sha256(payload).hexdigest()
+    script = (
+        "import hashlib, sys; data = sys.stdin.buffer.read(); "
+        "print(len(data), hashlib.sha256(data).hexdigest())"
+    )
+    handle = agProxyPtrace().launch(
+        [sys.executable, "-c", script],
+        {},
+        cwd="/tmp",
+        stdin_data=payload,
+        policy=_AllowPolicy(),
+    )
+
+    stdout, stderr, rc = handle.wait(timeout=20)
+
+    assert rc == 0
+    assert stderr == ""
+    assert stdout.strip() == f"{len(payload)} {expected}"
+
+
+@ptrace
+def test_early_child_exit_does_not_strand_stdin_writer():
+    handle = agProxyPtrace().launch(
+        ["/bin/true"],
+        {},
+        cwd="/tmp",
+        stdin_data=b"x" * (4 * 1024 * 1024),
+        policy=_AllowPolicy(),
+    )
+
+    stdout, stderr, rc = handle.wait(timeout=10)
+
+    assert (stdout, stderr, rc) == ("", "", 0)
+    assert handle._loop._stdin_writer is not None
+    assert not handle._loop._stdin_writer.is_alive()
+
+
+@ptrace
+def test_stdin_writer_retries_partial_writes_and_closes_for_eof(monkeypatch):
+    import os
+
+    from agency.harness.ptrace import _tracer_loop
+
+    read_fd, write_fd = os.pipe()
+    payload = b"partial-write-check" * 20
+    real_write = os.write
+    write_sizes = []
+
+    def partial_write(fd, data):
+        if fd != write_fd:
+            return real_write(fd, data)
+        chunk_size = max(1, len(data) // 3)
+        write_sizes.append(chunk_size)
+        return real_write(fd, data[:chunk_size])
+
+    monkeypatch.setattr(_tracer_loop.os, "write", partial_write)
+    try:
+        _tracer_loop.TracerLoop._write_stdin(write_fd, payload)
+        assert os.read(read_fd, len(payload) + 1) == payload
+        assert os.read(read_fd, 1) == b""
+    finally:
+        os.close(read_fd)
+
+    assert len(write_sizes) > 1
 
 
 @ptrace

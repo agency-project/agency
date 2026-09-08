@@ -168,7 +168,7 @@ class _OpencodeBackend(agharness_backend):
                 plugin_path,
             )
 
-            argv = [resolved, "run", "--format", "json", prompt]
+            argv = [resolved, "run", "--format", "json"]
             envp = {
                 "PATH": HARNESS_PATH,
                 "HOME": str(config_home),
@@ -188,6 +188,7 @@ class _OpencodeBackend(agharness_backend):
                 argv,
                 envp,
                 cwd="/workspace",
+                stdin_data=prompt.encode("utf-8"),
                 policy=runtime.syscall_policy,
                 ag=None,
             )

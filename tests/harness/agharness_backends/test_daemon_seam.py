@@ -64,8 +64,15 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     handle.wait.return_value = (stdout, "", 0)
     captured = {}
 
-    def launch(_self, argv, envp, *, cwd, policy, ag):
-        captured.update(argv=argv, envp=envp, cwd=cwd, policy=policy, ag=ag)
+    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
+        captured.update(
+            argv=argv,
+            envp=envp,
+            cwd=cwd,
+            policy=policy,
+            ag=ag,
+            stdin_data=stdin_data,
+        )
         if config_name is not None:
             if "OPENCODE_CONFIG" in envp:
                 config_path = Path(envp["OPENCODE_CONFIG"])
@@ -91,7 +98,12 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     assert result.final_text == expected
     assert captured["policy"] is runtime.syscall_policy
     assert captured["ag"] is None
-    assert "do the thing" in captured["argv"]
+    if backend_cls is _GrokBackend:
+        assert "do the thing" in captured["argv"]
+        assert captured["stdin_data"] is None
+    else:
+        assert "do the thing" not in captured["argv"]
+        assert captured["stdin_data"] == b"do the thing"
 
 
 @pytest.mark.parametrize("sandbox", [None, object()])
@@ -111,9 +123,11 @@ def test_claude_uses_staged_path_and_local_session_files(monkeypatch, tmp_path, 
     )
     session = Path(_session_path(str(config_home), "session-one"))
 
-    def launch(_self, argv, envp, *, cwd, **kwargs):
+    def launch(_self, argv, envp, *, cwd, stdin_data, **kwargs):
         assert argv[0] == str(binary)
         assert argv[argv.index("--resume") + 1] == "session-one"
+        assert "continue" not in argv
+        assert stdin_data == b"continue"
         assert session.read_bytes() == b"prior transcript"
         assert Path(cwd, "agpolicy_hook.py").is_file()
         session.write_bytes(b"updated transcript")

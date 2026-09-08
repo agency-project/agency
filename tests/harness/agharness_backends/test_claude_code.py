@@ -120,9 +120,10 @@ def test_run_attempt_does_not_override_home(monkeypatch, _patch_which_finds_clau
     captured_envp = {}
     captured_argv = []
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
         captured_argv.extend(argv)
         captured_envp.update(envp)
+        assert stdin_data == b"go"
         return handle
 
     with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
@@ -144,9 +145,10 @@ def test_run_attempt_always_registers_admission_and_completion_hooks(_patch_whic
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
         captured["argv"] = argv
         captured["envp"] = envp
+        captured["stdin_data"] = stdin_data
         return handle
 
     with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls:
@@ -158,6 +160,8 @@ def test_run_attempt_always_registers_admission_and_completion_hooks(_patch_whic
     assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
     assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
     assert captured["envp"]["AGPOLICY_STATE_DIR"]
+    assert "go" not in captured["argv"]
+    assert captured["stdin_data"] == b"go"
 
 
 def test_run_attempt_nonzero_exit_returns_error(_patch_which_finds_claude):
@@ -183,8 +187,9 @@ def test_run_attempt_threads_resume_session_id_into_argv(_patch_which_finds_clau
     handle = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
         captured["argv"] = argv
+        assert stdin_data == b"go"
         return handle
 
     with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
@@ -202,8 +207,9 @@ def test_run_attempt_omits_resume_flag_for_a_fresh_session(_patch_which_finds_cl
     handle = _make_handle(stdout='{"result": "ok"}')
     captured = {}
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
         captured["argv"] = argv
+        assert stdin_data == b"go"
         return handle
 
     with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:

@@ -24,8 +24,8 @@ class _FakeLoop:
         self.syscall_hook = syscall_hook
         self.syscall_exit_hook = syscall_exit_hook
 
-    def start(self, argv, envp, cwd) -> None:
-        del cwd
+    def start(self, argv, envp, cwd, *, stdin_data=None) -> None:
+        del cwd, stdin_data
         self.root_pid = 101
         root = SimpleNamespace(
             syscall="execve",

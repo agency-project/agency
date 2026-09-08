@@ -50,13 +50,14 @@ def test_run_attempt_uses_isolated_generated_config(monkeypatch, tmp_path):
         "agency.harness.agharness.materialize_config_home", lambda *args: config_home
     )
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
         from pathlib import Path
 
         launched_config_home = Path(envp["CODEX_HOME"])
         captured["argv"] = argv
         captured["envp"] = envp
         captured["cwd"] = cwd
+        captured["stdin_data"] = stdin_data
         captured["config_path"] = launched_config_home / "config.toml"
         captured["config"] = tomllib.loads(captured["config_path"].read_text())
         captured["config_home_hooks"] = (launched_config_home / "hooks.json").read_text()
@@ -81,7 +82,9 @@ def test_run_attempt_uses_isolated_generated_config(monkeypatch, tmp_path):
     hooks = json.loads(captured["config_home_hooks"])
     assert set(hooks["hooks"]) == {"PreToolUse", "PostToolUse"}
     assert captured["config_home_hook_script"] is True
-    assert captured["argv"] == ["codex", "exec", "--json", "go"]
+    assert captured["argv"] == ["codex", "exec", "--json", "-"]
+    assert "go" not in captured["argv"]
+    assert captured["stdin_data"] == b"go"
     assert "--ignore-user-config" not in captured["argv"]
     assert captured["config_path"] == config_home / "config.toml"
     assert captured["config"]["model"] == "test-model"

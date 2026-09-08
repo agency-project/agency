@@ -47,12 +47,14 @@ def test_run_attempt_writes_and_registers_the_agpolicy_plugin(monkeypatch, tmp_p
         "agency.harness.agharness.materialize_config_home", lambda *args: config_home
     )
 
-    def fake_launch(argv, envp, *, cwd, policy, ag):
+    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
         from pathlib import Path
 
         launched_config_home = Path(envp["HOME"])
         captured["envp"] = envp
         captured["cwd"] = cwd
+        captured["argv"] = argv
+        captured["stdin_data"] = stdin_data
         captured["config"] = json.loads((launched_config_home / "opencode.json").read_text())
         captured["plugin_exists"] = (
             launched_config_home / "plugin" / "agpolicy_plugin.js"
@@ -81,6 +83,9 @@ def test_run_attempt_writes_and_registers_the_agpolicy_plugin(monkeypatch, tmp_p
     assert captured["config"]["plugin"][0].endswith("agpolicy_plugin.js")
     assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
     assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
+    assert captured["argv"] == ["opencode", "run", "--format", "json"]
+    assert "go" not in captured["argv"]
+    assert captured["stdin_data"] == b"go"
     assert captured["cwd"] == "/workspace"
     assert captured["envp"]["HOME"] == str(config_home)
     assert captured["envp"]["OPENCODE_CONFIG"] == str(config_home / "opencode.json")

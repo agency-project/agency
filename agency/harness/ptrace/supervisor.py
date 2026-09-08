@@ -431,6 +431,7 @@ class agProxyPtrace:
         envp: "dict[str, str]",
         *,
         cwd: str = "",
+        stdin_data: "bytes | None" = None,
         policy: "agpolicy",
         ag: "agent | None" = None,
     ) -> agProxyPtraceHandle:
@@ -438,7 +439,9 @@ class agProxyPtrace:
 
         The Harness Manager daemon already runs inside the sandbox, so the
         traced child is forked in the correct PID and mount namespaces. There
-        is deliberately no host-to-container relay path here.
+        is deliberately no host-to-container relay path here. ``stdin_data``
+        is written through a dedicated pipe-writer thread; when omitted, the
+        child receives ``/dev/null`` on fd 0 rather than inheriting daemon stdin.
         """
         syscalls = (
             self._agconfig.ptrace.syscalls
@@ -501,7 +504,7 @@ class agProxyPtrace:
                 include_exit_code=True,
             )
         try:
-            loop.start(argv, envp, cwd)
+            loop.start(argv, envp, cwd, stdin_data=stdin_data)
         except BaseException:
             if process_profiler is not None:
                 process_profiler.finalize()

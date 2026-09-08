@@ -176,6 +176,7 @@ class TracerLoop:
         self._stderr_buf = bytearray()
         self._stdout_reader: "threading.Thread | None" = None
         self._stderr_reader: "threading.Thread | None" = None
+        self._stdin_writer: "threading.Thread | None" = None
 
         self._spawn_callbacks: "list[Callable[[int], None]]" = []
         self._exec_callbacks: "list[Callable[[int, str | None], None]]" = []
@@ -214,7 +215,14 @@ class TracerLoop:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def start(self, argv: "list[str]", envp: "dict[str, str]", cwd: str) -> None:
+    def start(
+        self,
+        argv: "list[str]",
+        envp: "dict[str, str]",
+        cwd: str,
+        *,
+        stdin_data: "bytes | None" = None,
+    ) -> None:
         """Starts the fork + trace loop on ONE dedicated thread and blocks
         until the child exists and its first executable image is confirmed
         (or forking/the initial stop/exec failed). The fork itself MUST happen on the same
@@ -230,7 +238,7 @@ class TracerLoop:
 
         def run_with_fork() -> None:
             try:
-                self._fork_and_exec(argv, envp, cwd)
+                self._fork_and_exec(argv, envp, cwd, stdin_data)
             except BaseException as exc:  # noqa: BLE001 -- surfaced to start()'s caller below
                 start_error.append(exc)
                 started.set()
@@ -248,7 +256,13 @@ class TracerLoop:
             self.kill()
             raise RuntimeError("ptrace child did not exec or exit within 30s")
 
-    def _fork_and_exec(self, argv: "list[str]", envp: "dict[str, str]", cwd: str) -> None:
+    def _fork_and_exec(
+        self,
+        argv: "list[str]",
+        envp: "dict[str, str]",
+        cwd: str,
+        stdin_data: "bytes | None",
+    ) -> None:
         """Runs on the dedicated tracer thread, before `_run()`. Forks,
         starts the output-reader threads, and blocks for the child's
         initial post-TRACEME stop + PTRACE_SETOPTIONS -- all on this
@@ -256,15 +270,37 @@ class TracerLoop:
         always issued by the same thread that attached."""
         stdout_r, stdout_w = os.pipe()
         stderr_r, stderr_w = os.pipe()
+        stdin_r, stdin_w = os.pipe() if stdin_data is not None else (None, None)
         self.stdout_r, self.stderr_r = stdout_r, stderr_r
 
-        pid = os.fork()
+        try:
+            pid = os.fork()
+        except BaseException:
+            for fd in (stdout_r, stdout_w, stderr_r, stderr_w, stdin_r, stdin_w):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            raise
         if pid == 0:
-            self._child_exec(argv, envp, cwd, stdout_r, stdout_w, stderr_r, stderr_w)
+            self._child_exec(
+                argv,
+                envp,
+                cwd,
+                stdout_r,
+                stdout_w,
+                stderr_r,
+                stderr_w,
+                stdin_r,
+                stdin_w,
+            )
             os._exit(127)  # unreachable: _child_exec always execve()s or _exit()s
 
         os.close(stdout_w)
         os.close(stderr_w)
+        if stdin_r is not None:
+            os.close(stdin_r)
         self.root_pid = pid
         # Goes through _remember_spawn (not a bare _known_pids.add) so the
         # root pid reaches on_spawn callbacks too, not just its forked
@@ -289,12 +325,52 @@ class TracerLoop:
         self._stdout_reader.start()
         self._stderr_reader.start()
 
-        _, status = os.waitpid(pid, 0)
-        assert os.WIFSTOPPED(status), f"expected initial stop, got status={status:#x}"
-        pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
-        with self._lock:
-            self._options_applied.add(pid)
-        pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+        try:
+            _, status = os.waitpid(pid, 0)
+            assert os.WIFSTOPPED(status), f"expected initial stop, got status={status:#x}"
+            pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
+            with self._lock:
+                self._options_applied.add(pid)
+            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+        except BaseException:
+            if stdin_w is not None:
+                os.close(stdin_w)
+            raise
+
+        if stdin_w is not None:
+            writer = threading.Thread(
+                target=self._write_stdin,
+                args=(stdin_w, stdin_data),
+                name=f"agproxy_ptrace-{pid}-stdin",
+                daemon=True,
+            )
+            try:
+                writer.start()
+            except BaseException:
+                os.close(stdin_w)
+                raise
+            self._stdin_writer = writer
+
+    @staticmethod
+    def _write_stdin(fd: int, data: bytes) -> None:
+        """Write all of *data* off the tracer thread, then deliver EOF."""
+        try:
+            remaining = memoryview(data)
+            while remaining:
+                try:
+                    written = os.write(fd, remaining)
+                except InterruptedError:
+                    continue
+                except BrokenPipeError:
+                    break
+                if written <= 0:
+                    break
+                remaining = remaining[written:]
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def _drain_pipe(self, fd: int, buf: bytearray) -> None:
         """Runs on a dedicated reader thread for the lifetime of the launch
@@ -324,7 +400,18 @@ class TracerLoop:
             stderr = bytes(self._stderr_buf)
         return stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
-    def _child_exec(self, argv, envp, cwd, stdout_r, stdout_w, stderr_r, stderr_w) -> None:
+    def _child_exec(
+        self,
+        argv,
+        envp,
+        cwd,
+        stdout_r,
+        stdout_w,
+        stderr_r,
+        stderr_w,
+        stdin_r,
+        stdin_w,
+    ) -> None:
         """Runs ONLY in the forked child, right up until execve replaces it
         (or it _exit()s on failure). No agency machinery is safe to touch
         here -- this is the traced target's process image until exec."""
@@ -334,16 +421,24 @@ class TracerLoop:
         os.dup2(stderr_w, 2)
         os.close(stdout_w)
         os.close(stderr_w)
-        # The traced target always receives its prompt via argv, never
-        # stdin -- but without this, it inherits whatever fd 0 the parent
-        # Python process happened to have. If that's an open, unfed,
-        # non-tty pipe (e.g. this launch itself was invoked from something
-        # piping stdin), newer Claude Code CLI builds detect the non-tty
-        # stdin and stall for a few seconds waiting for data that will
-        # never arrive before giving up (confirmed against the real CLI).
-        devnull_fd = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(devnull_fd, 0)
-        os.close(devnull_fd)
+        if stdin_r is None:
+            # Never inherit the daemon's stdin. Without this, an open,
+            # unfed non-tty pipe can make CLIs wait for input that will
+            # never arrive.
+            devnull_fd = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(devnull_fd, 0)
+            if devnull_fd != 0:
+                os.close(devnull_fd)
+            else:
+                os.set_inheritable(0, True)
+        else:
+            assert stdin_w is not None
+            os.close(stdin_w)
+            os.dup2(stdin_r, 0)
+            if stdin_r != 0:
+                os.close(stdin_r)
+            else:
+                os.set_inheritable(0, True)
         if cwd:
             os.chdir(cwd)
         pt.ptrace(pt.PTRACE_TRACEME, 0, 0, 0)
@@ -648,6 +743,8 @@ class TracerLoop:
             self._stdout_reader.join()
         if self._stderr_reader is not None:
             self._stderr_reader.join()
+        if self._stdin_writer is not None:
+            self._stdin_writer.join()
         return self._returncode
 
     def kill(self) -> None:

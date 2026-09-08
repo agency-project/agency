@@ -166,7 +166,7 @@ class _CodexBackend(agharness_backend):
                 json.dumps({"hooks": {"PreToolUse": [hook_command], "PostToolUse": [hook_command]}})
             )
 
-            argv = [resolved, "exec", "--json", prompt]
+            argv = [resolved, "exec", "--json", "-"]
             envp = {
                 "PATH": HARNESS_PATH,
                 "CODEX_HOME": str(config_home),
@@ -185,6 +185,7 @@ class _CodexBackend(agharness_backend):
                 argv,
                 envp,
                 cwd="/workspace",
+                stdin_data=prompt.encode("utf-8"),
                 policy=runtime.syscall_policy,
                 ag=None,
             )

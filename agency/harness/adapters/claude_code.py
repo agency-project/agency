@@ -344,12 +344,12 @@ class _ClaudeCodeBackend(agharness_backend):
             ]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
-            argv.append(prompt)
 
             handle = px.launch(
                 argv,
                 envp,
                 cwd=str(config_home),
+                stdin_data=prompt.encode("utf-8"),
                 policy=runtime.syscall_policy,
                 ag=None,
             )

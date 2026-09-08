@@ -48,7 +48,7 @@ _BARE_THREAD_ALLOWLIST = {
     (
         "agency/harness/ptrace/_tracer_loop.py",
         "TracerLoop._fork_and_exec",
-    ): (2, "subprocess pipe readers"),
+    ): (3, "subprocess pipe readers/writer"),
     # General background I/O and UI maintenance.
     ("agency/utils/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
     (
