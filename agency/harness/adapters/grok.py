@@ -118,8 +118,17 @@ class _GrokBackend(agharness_backend):
                 runtime.model or "default",
             )
             self._write_grok_hooks(config_home)
+            prompt_path = config_home / "prompt.txt"
+            prompt_path.write_text(prompt, encoding="utf-8")
 
-            argv = [resolved, "-p", prompt, "--output-format", "json"]
+            argv = [
+                resolved,
+                "--prompt-file",
+                str(prompt_path),
+                "--output-format",
+                "json",
+                "--yolo",
+            ]
             envp = {
                 "PATH": HARNESS_PATH,
                 # GROK_HOME redirects the *entire* config directory (config.toml,
@@ -168,12 +177,13 @@ class _GrokBackend(agharness_backend):
     def _write_grok_config(self, config_home, base_url: str, token: str, model: str) -> None:
         # config.toml, per docs.x.ai/build's configuration guide: a
         # [model.<name>] block with base_url/api_key/api_backend, and a
-        # top-level `model` key selecting the active one -- api_backend =
+        # [models] table selecting the default model -- api_backend =
         # "chat_completions" is what makes this usable via agproxy_llm's
         # existing passthrough route with no translation, the same as
         # opencode's @ai-sdk/openai-compatible provider.
         config_toml = (
-            f"model = {_toml_string(self._MODEL_NAME)}\n\n"
+            f"[models]\n"
+            f"default = {_toml_string(self._MODEL_NAME)}\n\n"
             f"[model.{self._MODEL_NAME}]\n"
             f"model = {_toml_string(model)}\n"
             f"base_url = {_toml_string(f'{base_url}/v1')}\n"
@@ -204,7 +214,7 @@ class _GrokBackend(agharness_backend):
 
     @staticmethod
     def _parse_result_json(stdout: str) -> "tuple[str, dict, str | None]":
-        """Parse `grok -p ... --output-format json`'s single JSON result
+        """Parse `grok --prompt-file ... --output-format json`'s JSON result
         object -- `{"text": "...", "usage": {...}, "sessionId": "...", ...}`
         per xAI's published headless-mode docs (not verified against a
         live run -- see this module's docstring)."""

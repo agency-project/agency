@@ -80,6 +80,9 @@ def test_external_cli_adapters_launch_through_typed_runtime(
                 config_home = Path(envp.get("CODEX_HOME") or envp["GROK_HOME"])
                 config_path = config_home / config_name
             captured["config"] = config_path.read_text()
+        if backend_cls is _GrokBackend:
+            prompt_path = Path(argv[argv.index("--prompt-file") + 1])
+            captured["prompt"] = prompt_path.read_text(encoding="utf-8")
         return handle
 
     monkeypatch.setattr("shutil.which", lambda binary: f"/usr/bin/{binary}")
@@ -99,7 +102,8 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     assert captured["policy"] is runtime.syscall_policy
     assert captured["ag"] is None
     if backend_cls is _GrokBackend:
-        assert "do the thing" in captured["argv"]
+        assert "do the thing" not in captured["argv"]
+        assert captured["prompt"] == "do the thing"
         assert captured["stdin_data"] is None
     else:
         assert "do the thing" not in captured["argv"]

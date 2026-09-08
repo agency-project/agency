@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.agharness_backend import AdapterRuntime
 from agency.harness.adapters.grok import _GrokBackend, grok_available
@@ -41,6 +43,7 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     captured = {}
     config_home = tmp_path / "grok-config"
     config_home.mkdir()
+    prompt = "first line\nUnicode: Grök 🚀\nlast line"
     monkeypatch.setattr(
         "agency.harness.agharness.materialize_config_home", lambda *args: config_home
     )
@@ -49,8 +52,14 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
         from pathlib import Path
 
         launched_config_home = Path(envp["GROK_HOME"])
+        prompt_path = Path(argv[argv.index("--prompt-file") + 1])
+        captured["argv"] = argv
         captured["envp"] = envp
         captured["cwd"] = cwd
+        captured["config_toml"] = (launched_config_home / "config.toml").read_text()
+        captured["prompt_path"] = prompt_path
+        captured["prompt_exists_at_launch"] = prompt_path.exists()
+        captured["prompt_text"] = prompt_path.read_text(encoding="utf-8")
         captured["hooks_json"] = (launched_config_home / "hooks" / "agpolicy.json").read_text()
         captured["hook_script_exists"] = (
             launched_config_home / "hooks" / "agpolicy_hook.py"
@@ -68,8 +77,8 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     )
     with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls:
         ptrace_cls.return_value.launch.side_effect = fake_launch
-        backend.run_daemon_attempt(
-            runtime, prompt="go", resume_session_id=None, prior_session_blob=None, max_steps=None
+        result = backend.run_daemon_attempt(
+            runtime, prompt=prompt, resume_session_id=None, prior_session_blob=None, max_steps=None
         )
 
     hooks = json.loads(captured["hooks_json"])
@@ -80,6 +89,56 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     assert captured["cwd"] == "/workspace"
     assert captured["envp"]["GROK_HOME"] == str(config_home)
     assert captured["envp"]["AGPOLICY_STATE_DIR"] == str(config_home)
+    assert captured["config_toml"] == (
+        "[models]\n"
+        'default = "agency-proxy"\n\n'
+        "[model.agency-proxy]\n"
+        'model = "test-model"\n'
+        'base_url = "http://harness.local/v1"\n'
+        'api_key = "tok-1"\n'
+        'api_backend = "chat_completions"\n'
+    )
+    assert "--yolo" in captured["argv"]
+    assert "--prompt-file" in captured["argv"]
+    assert prompt not in captured["argv"]
+    assert "-p" not in captured["argv"]
+    assert "--single" not in captured["argv"]
+    assert captured["prompt_exists_at_launch"] is True
+    assert captured["prompt_text"] == prompt
+    assert captured["prompt_path"].parent == config_home
+    assert not config_home.exists()
+    assert result.ok is True
+    assert result.final_text == "ok"
+
+
+def test_run_attempt_cleans_config_home_when_launch_fails(monkeypatch, tmp_path):
+    backend = _GrokBackend(agconfig())
+    config_home = tmp_path / "grok-config"
+    config_home.mkdir()
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home", lambda *args: config_home
+    )
+
+    runtime = AdapterRuntime(
+        agconfig=agconfig(),
+        model="test-model",
+        engine_name="test-agent",
+        harness_base_url="http://harness.local",
+        token="tok-1",
+        syscall_policy=MagicMock(),
+        sandbox=None,
+    )
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls:
+        ptrace_cls.return_value.launch.side_effect = RuntimeError("launch failed")
+        with pytest.raises(RuntimeError, match="launch failed"):
+            backend.run_daemon_attempt(
+                runtime,
+                prompt="cleanup me",
+                resume_session_id=None,
+                prior_session_blob=None,
+                max_steps=None,
+            )
+
     assert not config_home.exists()
 
 

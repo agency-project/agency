@@ -32,6 +32,15 @@ def _payload(event="PreToolUse", tool_use_id="tool-1"):
     }
 
 
+def _grok_payload(event="PreToolUse", tool_use_id="grok-call-1"):
+    return {
+        "hook_event_name": event,
+        "toolName": "run_terminal_command",
+        "toolInput": {"command": "printf ok"},
+        "toolUseId": tool_use_id,
+    }
+
+
 def test_pretooluse_allow_checks_policy_and_persists_call_id(monkeypatch, capsys, tmp_path):
     requests = []
 
@@ -57,6 +66,51 @@ def test_pretooluse_allow_checks_policy_and_persists_call_id(monkeypatch, capsys
 
     state_file = tmp_path / ".agpolicy_call_tool-1.json"
     assert json.loads(state_file.read_text()) == {"call_id": "call-abc"}
+
+
+def test_grok_pretooluse_and_posttooluse_use_canonical_policy_and_shared_call_id(
+    monkeypatch, capsys, tmp_path
+):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        if request.full_url.endswith("/agpolicy/check_tool"):
+            return _Response({"decision": "allow", "reason": "safe", "call_id": "call-grok"})
+        return _Response({"ok": True})
+
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "secret-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_grok_payload())))
+
+    assert hook.main() == 0
+    assert json.loads(requests[0].data) == {
+        "tool_name": "run_terminal_command",
+        "tool_input": {"command": "printf ok"},
+    }
+    state_file = tmp_path / ".agpolicy_call_grok-call-1.json"
+    assert json.loads(state_file.read_text()) == {"call_id": "call-grok"}
+    assert (
+        json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "allow"
+    )
+
+    post_payload = _grok_payload("PostToolUse")
+    post_payload["tool_response"] = {"stdout": "ok"}
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(post_payload)))
+
+    assert hook.main() == 0
+    assert [request.full_url for request in requests] == [
+        "http://gateway/agpolicy/check_tool",
+        "http://gateway/agpolicy/complete_tool",
+    ]
+    assert json.loads(requests[1].data) == {
+        "call_id": "call-grok",
+        "result": {"stdout": "ok"},
+        "error": None,
+    }
+    assert not state_file.exists()
 
 
 def test_denied_pretooluse_persists_no_call_id(monkeypatch, capsys, tmp_path):
@@ -262,6 +316,22 @@ def test_malformed_policy_response_denies(pretool, capsys, response):
 )
 def test_malformed_hook_input_denies_before_request(pretool, capsys, payload):
     pretool.setattr(hook.sys, "stdin", io.StringIO(payload))
+    requests = []
+    pretool.setattr(hook.urllib.request, "urlopen", lambda *a, **kw: requests.append(a))
+    _assert_denied(capsys)
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"hook_event_name": "PreToolUse", "toolName": 3, "toolInput": {}},
+        {"hook_event_name": "PreToolUse", "toolName": "run_terminal_command", "toolInput": []},
+        {"hook_event_name": "PreToolUse", "toolInput": {"command": "printf ok"}},
+    ],
+)
+def test_malformed_grok_hook_input_denies_before_request(pretool, capsys, payload):
+    pretool.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
     requests = []
     pretool.setattr(hook.urllib.request, "urlopen", lambda *a, **kw: requests.append(a))
     _assert_denied(capsys)

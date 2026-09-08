@@ -82,8 +82,10 @@ def main() -> int:
 
 
 def _check_tool_policy(payload: dict) -> "tuple[str, str | None, str | None]":
-    tool_name = payload.get("tool_name")
-    tool_input = payload.get("tool_input", {})
+    tool_name = payload.get("tool_name") or payload.get("toolName")
+    tool_input = (
+        payload.get("tool_input") if "tool_input" in payload else payload.get("toolInput", {})
+    )
     if not isinstance(tool_name, str) or not tool_name.strip() or not isinstance(tool_input, dict):
         return "deny", "Cannot check invocation admission: invalid tool name or input", None
 
@@ -135,7 +137,7 @@ def _remember_call_id(payload: dict, call_id: "str | None") -> None:
     telemetry is skipped later, never that admission itself fails."""
     if not call_id:
         return
-    tool_use_id = payload.get("tool_use_id")
+    tool_use_id = payload.get("tool_use_id") or payload.get("toolUseId")
     if not isinstance(tool_use_id, str) or not tool_use_id:
         return
     path = _call_state_path(tool_use_id)
@@ -149,7 +151,7 @@ def _remember_call_id(payload: dict, call_id: "str | None") -> None:
 
 
 def _report_completion(payload: dict, hook_event_name: str) -> None:
-    tool_use_id = payload.get("tool_use_id")
+    tool_use_id = payload.get("tool_use_id") or payload.get("toolUseId")
     if not isinstance(tool_use_id, str) or not tool_use_id:
         print(
             f"[agpolicy hook] {hook_event_name} missing tool_use_id; telemetry skipped",
