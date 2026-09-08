@@ -245,6 +245,7 @@ class _OpencodeBackend(agharness_backend):
         `opencode run --format json`'s output -- see this module's
         docstring on why this is deliberately defensive rather than a
         strict schema parse."""
+        text_parts = []
         last_text = ""
         for line in stdout.splitlines():
             line = line.strip()
@@ -256,10 +257,22 @@ class _OpencodeBackend(agharness_backend):
                 continue
             if not isinstance(event, dict):
                 continue
+            part = event.get("part")
+            if (
+                event.get("type") == "text"
+                and isinstance(part, dict)
+                and part.get("type") == "text"
+            ):
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+                    continue
             for key in ("text", "content", "result", "message"):
                 value = event.get(key)
                 if isinstance(value, str) and value:
                     last_text = value
+        if text_parts:
+            return "".join(text_parts)
         if last_text:
             return last_text
         # Fall back to the raw stdout itself (e.g. a plain-text response
