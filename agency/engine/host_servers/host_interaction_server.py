@@ -172,12 +172,13 @@ class HostInteractionServer:
             {**attributes, "call_id": call_id, "allowed": allowed},
         )
         label = self._ADMISSION_LABEL[kind]
-        args_suffix = ""
         if kind == "tool":
             args_text = repr(attributes["arguments"])
-            if len(args_text) > 200:
-                args_text = f"{args_text[:200]}…"
-            args_suffix = f"  args={args_text}"
+        else:
+            args_text = repr(attributes["argv"] or attributes["path"])
+        if len(args_text) > 200:
+            args_text = f"{args_text[:200]}…"
+        args_suffix = f"  args={args_text}"
         if allowed:
             term_message = f"[{self._agname}] {label} ▶  {name}{args_suffix}"
         else:
@@ -265,7 +266,18 @@ class HostInteractionServer:
                 },
                 **overrides,
             )
-        self.record_event(f"{kind}_result", {**attributes, **extra, "call_id": call_id})
+        term_message = None
+        if kind == "tool":
+            mark = {"success": "✓", "failure": "✗", "unknown": "?"}[outcome]
+            result_text = repr(extra["error"] if outcome == "failure" else extra.get("result"))
+            if len(result_text) > 200:
+                result_text = f"{result_text[:200]}…"
+            term_message = (
+                f"[{self._agname}] {self._ADMISSION_LABEL[kind]} {mark}  {name}  ={result_text}"
+            )
+        self.record_event(
+            f"{kind}_result", {**attributes, **extra, "call_id": call_id}, term_message=term_message
+        )
         self.record_span(
             f"{kind}:{name}",
             start_ts,

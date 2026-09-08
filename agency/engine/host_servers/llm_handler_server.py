@@ -1249,17 +1249,21 @@ class LlmHandlerServer:
             raise _DispatchError(_INVOCATION_CANCELLED_MESSAGE, status_code=409, transient=False)
 
     def _finalize_error(self, call_label: "str | None", error: BaseException) -> None:
+        agname = getattr(self._data_logger, "_default_name", None)
         self._data_logger.finalize_stream(
             call_label,
             type="llm_stream_error",
             payloads=[{"error": f"{type(error).__name__}: {error}"}],
+            term_message=f"[{agname}] LLM    ✗  {type(error).__name__}: {error}",
         )
 
     def _finalize_cancelled(self, call_label: "str | None") -> None:
+        agname = getattr(self._data_logger, "_default_name", None)
         self._data_logger.finalize_stream(
             call_label,
             type="llm_stream_cancelled",
             payloads=[{"cancelled": True}],
+            term_message=f"[{agname}] LLM    ✗  cancelled",
         )
 
     def _finalize_success(self, call_label: "str | None", payloads: "list[dict]") -> None:

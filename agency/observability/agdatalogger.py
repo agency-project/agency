@@ -270,7 +270,7 @@ class agDataLogger:
             self._stream_delta_rows = [
                 row for row in self._stream_delta_rows if row[5] != call_label
             ]
-            for payload in payloads:
+            for i, payload in enumerate(payloads):
                 self._event_rows.append(
                     (
                         self._next_id_locked(),
@@ -280,7 +280,7 @@ class agDataLogger:
                         object,
                         call_label,
                         json.dumps(payload),
-                        None,
+                        term_message if i == 0 else None,
                     )
                 )
                 self._pending_count += 1
